@@ -1,0 +1,31 @@
+[project]
+name = "windows-supporter"
+version = "0.1.0"
+description = "Windows hotkey helper tool"
+requires-python = ">=3.14"
+dependencies = [
+    "pyautogui",
+    "pyperclip",
+    "keyboard",
+    "pygetwindow",
+    "pywin32",
+    "comtypes",
+    "psutil",
+    "playwright",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller",
+]
+
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["src", "src.apps", "src.utils"]

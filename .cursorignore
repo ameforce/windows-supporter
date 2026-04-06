@@ -1,0 +1,12 @@
+build/
+dist/
+out/
+bin/
+obj/
+CMakeFiles/
+node_modules/
+.vscode/
+.venv/
+__pycache__/
+*.pyc
+*.log

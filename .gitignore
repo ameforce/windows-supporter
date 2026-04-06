@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# Local IDE / agent state
+.idea/
+.cursor/
+.omx/
+.pytest_cache/
+clipboard_dumps/
+session-summary.md
+
+# PyInstaller
+build/
+dist/
+*.spec
+windows-supporter.exe
+*.egg-info/
+
+# Logs
+*.log

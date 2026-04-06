@@ -1,0 +1,54 @@
+- **진행 중**
+    - [[한국언론진흥재단] [PG10] [엑셀 변환 속도 느린 건 문의 요청] [CAS] - 특정 환경에서 간헐적으로 엑셀에 대해서만 PG 계정 응답이 없는 상황 분석 지원](https://www.wrike.com/open.htm?id=4367592792)
+        - [02/04] 상황 공유 받은 뒤, 추후 액션 및 방향성에 대해 논의 - 김동준 선임님
+        - [02/10 ~ 02/12] 특정 환경에서 간헐적으로 엑셀에 대해서만 PG 계정 응답이 없는 상황 분석 지원
+    - [[인프라] - MEW 서버에서 deployPoby가 올바르게 동작하지 않는 현상 분석 및 개선](https://www.wrike.com/open.htm?id=4370204718)
+        - [02/09]
+    - [CAS-Solution-Sydney에서 사용 가능한 QATool 개발](https://www.wrike.com/open.htm?id=4362535220)
+    - [[CAS-Solution-Sydney에서 사용 가능한 QATool 개발] [QATool] - Jenkins Build가 아니어도 개인 로컬에서 돌려볼 수 있는 기능 추가](https://www.wrike.com/open.htm?id=4362537012)
+        - [01/29 ~ 01/30] \\192.168.0.3\Share\release\base\CAS\11.0 에서 파일 리스트를 가져오는 기능 추가
+        - [01/30] Installer 리스트를 선택하면 로컬에 설치하여 설치 경로의 lpdfier, aps를 바라본 상태로 QA Test를 돌리는 기능 추가
+    - [[CAS] - 구조적 취약한 부분 분석 및 개선](https://www.wrike.com/open.htm?id=4378785464)
+        - [[CAS] [구조적 취약한 부분 분석 및 개선] [lpdfier] - lpdfier의 콘솔 출력에서 output 존재 여부 체크 에러 반환 기능 추가](https://www.wrike.com/open.htm?id=4378796500)
+            - [02/19] 분석 및 개선 완료
+        - [[CAS] - 구조적 취약한 부분 분석](https://www.wrike.com/open.htm?id=4381637503)
+            - [02/19 ~ 02/23] 구조적 취약한 부분 분석
+            - [03/03] 발견된 현상 및 결함과 관련된 내용에 대해 전체적인 분석
+            - [03/04] pdfier는 PCC_OK인데, aps가 popup thread에서 행이 걸려 900204(cas: timeout)로 승격되는 현상 분석
+            - [03/05] Excel worker가 진행 없이 멎거나 output 없이 0으로 종료하는 현상 분석
+            - [03/05] shared desktop에 대한 내용 연구 및 shared desktop을 사용하고 있는 구조 분석
+            - [03/05] PG00으로 편향되어 warm-up 하고 있는 구조 분석
+            - [03/06] PG00으로 편향되어 warm-up 하고 있는 구조 분석
+            - [03/06] channel-user mismatch 가능성을 야기할 수 있는 구조 분석
+            - [03/06] Excel to PDF 변환 실패 후 stale cache가 잔존할 수 있는 구조 분석\
+            - [03/06 ~ 03/08] Windows 11 Pro에서 Excel to PDF 변환 시, 104029(MS-Excel failed to set property)에러가 항상 발생하는 현상 분석
+            - [03/09] printer/COM 초기화가 완전히 되지 않는 구조 결함 분석
+            - [03/09] print UI 제어 불안정 현상 분석
+            - [03/09] cp949 console encoding 문제 분석
+        - [[CAS] - 구조적 취약한 부분 개선](https://www.wrike.com/open.htm?id=4392243125)
+            - 
+    - [[인프라] - deployPoby에서 실패가 발생 했을 때, 후속 retry가 전부 실패하는 현상 분석 및 개선](https://www.wrike.com/open.htm?id=4389240237)
+    - [[한국언론진흥재단] [PG10] [엑셀 변환 속도 느린 건 문의 요청 // 디버깅 & 증상 재현테스트] [CAS] - PR 및 보완 가능한 부분 개선 진행](https://www.wrike.com/open.htm?id=4392239804)
+        - [03/08] asd
+    - [[pdfcmd] - 2.1.1.2524 버전에서 iText 사용 및 라이선스 위반에 관한 분석 및 대응](https://www.wrike.com/open.htm?id=4384825323)
+        - [03/02] pdfcmd 과거 버전(2.1.1.2524)에서의 iText 라이브러리 사용 여부 분석
+        - [03/02] 고객이 클레임 걸었던 PDF의 Producer에 기재된 "modified using iText 5.0.4 (c) 1T3XT BVBA"의 출처 분석
+        - [03/02] AI Tool을 사용한 Svn의 sdp7/PG7 코드베이스 기반 코드 다이어그램 작성
+        - [03/03] 과거 Wrike 이력에서 다뤘던 iText 관련 태스크 리스트업
+        - [03/03] iText가 지원하는 기능 분석
+        - [03/03] 과거 pdfcmd의 libpdf2 라이브러리를 최신 pdfv로 마이그레이션 대체 가능성 분석
+- **진행 완료**
+    - **WebRender**
+        - [[WebRender] - 병렬 빌드 시, 간헐적으로 실패가 발생하는 현상 분석 및 개선](https://www.wrike.com/open.htm?id=4381636980)
+            - [03/11] 병렬 빌드 시, 간헐적으로 실패가 발생하는 현상 분석 및 개선
+            
+    - **인프라**
+        - [[인프라] - 나온소프트 전용 OpenVPN 계정 발급](https://www.wrike.com/open.htm?id=4392394111)
+            - [03/09] 나온소프트 전용 OpenVPN 계정 발급 및 대응
+        - [[인프라] - SiteOx에서 대여하는 방법 가이드](https://www.wrike.com/open.htm?id=4399374818)
+            - [03/11] 내용 기반 Notion 작성
+    - **내부업무**
+        - [[솔루션개발] [Weekly Scrum] - 03월 05일 Weekly Scrum](https://www.wrike.com/open.htm?id=4390270069)
+            - [03/05] 03월 05일 Weekly Scrum 진행
+
+- **회의 내용**
