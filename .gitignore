@@ -12,6 +12,7 @@ __pycache__/
 .pytest_cache/
 clipboard_dumps/
 session-summary.md
+PLAN.md
 
 # PyInstaller
 build/
