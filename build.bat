@@ -38,6 +38,18 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Stop leftover PyInstaller worker processes from previous failed builds
+echo | set /p="Stopping stale PyInstaller workers..."
+call :clear_log
+powershell -NoProfile -ExecutionPolicy Bypass -File "tools\stop_stale_pyinstaller_workers.ps1" "%CURRENT_DIR:~0,-1%" > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo Failed to stop stale PyInstaller worker processes.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+
 REM Remove stale virtual environment if its base Python path is no longer valid
 call "tools\ensure_venv_ready.bat" "%CURRENT_DIR:~0,-1%"
 if errorlevel 1 (
@@ -68,6 +80,13 @@ if errorlevel 1 (
   call :print_log
   exit /b 1
 )
+echo [ Success !! ]
+
+REM Remove stale PyInstaller byproducts before starting a new build
+echo | set /p="Cleaning prior PyInstaller byproducts..."
+call :clear_log
+call :remove_pyinstaller_byproducts " before build"
+if errorlevel 1 exit /b 1
 echo [ Success !! ]
 
 REM Build the executable
@@ -104,34 +123,8 @@ echo [ Success !! ]
 REM Remove build byproducts
 echo | set /p="Remove build byproducts..."
 call :clear_log
-if exist "%EXE_BASE%.spec" (
-  call "tools\remove_path_with_retry.bat" "%EXE_BASE%.spec" 5 1 > "%STEP_LOG%" 2>&1
-  if exist "%EXE_BASE%.spec" (
-    echo Failure
-    echo Failed to remove generated spec file.
-    call :print_log
-    exit /b 1
-  )
-)
-if exist "build" (
-  call "tools\remove_path_with_retry.bat" "build" 5 1 >> "%STEP_LOG%" 2>&1
-  if exist "build" (
-    echo Failure
-    echo Failed to remove build directory.
-    call :print_log
-    exit /b 1
-  )
-)
-if exist "dist" (
-  call "tools\remove_path_with_retry.bat" "dist" 5 1 >> "%STEP_LOG%" 2>&1
-  if exist "dist" (
-    echo Failure
-    echo Failed to remove dist directory.
-    call :print_log
-    exit /b 1
-  )
-)
-call :clear_log
+call :remove_pyinstaller_byproducts ""
+if errorlevel 1 exit /b 1
 echo [ Success !! ]
 
 REM Launch the built executable
@@ -153,6 +146,38 @@ echo [ Success !! ]
 
 call :clear_log
 endlocal
+exit /b 0
+
+:remove_pyinstaller_byproducts
+set "FAILURE_SUFFIX=%~1"
+if exist "%EXE_BASE%.spec" (
+  call "tools\remove_path_with_retry.bat" "%EXE_BASE%.spec" 15 1 > "%STEP_LOG%" 2>&1
+  if exist "%EXE_BASE%.spec" (
+    echo Failure
+    echo Failed to remove generated spec file%FAILURE_SUFFIX%.
+    call :print_log
+    exit /b 1
+  )
+)
+if exist "build" (
+  call "tools\remove_path_with_retry.bat" "build" 15 1 >> "%STEP_LOG%" 2>&1
+  if exist "build" (
+    echo Failure
+    echo Failed to remove build directory%FAILURE_SUFFIX%.
+    call :print_log
+    exit /b 1
+  )
+)
+if exist "dist" (
+  call "tools\remove_path_with_retry.bat" "dist" 15 1 >> "%STEP_LOG%" 2>&1
+  if exist "dist" (
+    echo Failure
+    echo Failed to remove dist directory%FAILURE_SUFFIX%.
+    call :print_log
+    exit /b 1
+  )
+)
+call :clear_log
 exit /b 0
 
 :clear_log
