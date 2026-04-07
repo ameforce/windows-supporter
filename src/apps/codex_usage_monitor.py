@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import html
 import json
 import re
+import shutil
 import threading
 import traceback
 from datetime import timedelta, timezone
@@ -54,7 +55,6 @@ USAGE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
         "credits remaining",
     ),
 }
-
 
 def normalize_usage_value(value: str) -> str:
     text = str(value or "").replace("\r", "\n")
@@ -319,7 +319,11 @@ def compute_usage_changes(
 
 
 class CodexUsageMonitor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        config_dir: str | None = None,
+        profile_dir: str | None = None,
+    ) -> None:
         self.__lib = LibConnector()
         self.__root = None
         self.__event_queue = None
@@ -336,12 +340,23 @@ class CodexUsageMonitor:
         self.__next_collect_due_ts = 0.0
         self.__manual_query_waiting_result = False
         self.__manual_query_state_lock = threading.Lock()
+        self.__monitor_state = "idle"
+        self.__session_state = "logged_in"
+        self.__logout_in_progress = False
+        self.__collect_cancel_event = threading.Event()
+        self.__release_wait_timeout_sec = 8.0
+        self.__release_poll_interval_sec = 0.1
         self.__playwright_checked = False
         self.__playwright_available = False
+        self.__collection_mode = "playwright"
+        self.__playwright_launch_retry_count = 2
         self.__last_login_notice_ts = 0.0
         self.__login_notice_cooldown_sec = 600.0
         self.__last_playwright_notice_ts = 0.0
         self.__playwright_notice_cooldown_sec = 1800.0
+        self.__last_profile_in_use_notice_ts = 0.0
+        self.__profile_in_use_notice_cooldown_sec = 600.0
+        self.__profile_in_use_detected = False
         self.__last_interactive_login_ts = 0.0
         self.__interactive_login_cooldown_sec = 600.0
         self.__manual_interactive_reopen_cooldown_sec = 3.0
@@ -349,6 +364,12 @@ class CodexUsageMonitor:
         self.__hidden_cdp_proc = None
         self.__hidden_cdp_port = 0
         self.__pending_hidden_cdp_clear = False
+        self.__last_successful_cdp_port = 0
+        self.__cdp_port_attempt_limit = 6
+        self.__cdp_total_launch_timeout_sec = 28.0
+        self.__api_failure_count = 0
+        self.__api_failover_threshold = 2
+        self.__api_request_timeout_sec = 12.0
 
         self.__settings_version = 1
         self.__enabled = True
@@ -372,7 +393,11 @@ class CodexUsageMonitor:
             base_dir = self.__lib.os.path.expanduser("~")
         local_base = self.__lib.os.getenv("LOCALAPPDATA") or base_dir
 
-        self.__config_dir = self.__lib.os.path.join(base_dir, "windows-supporter")
+        normalized_config_dir = str(config_dir or "").strip()
+        if normalized_config_dir:
+            self.__config_dir = normalized_config_dir
+        else:
+            self.__config_dir = self.__lib.os.path.join(base_dir, "windows-supporter")
         self.__settings_path = self.__lib.os.path.join(
             self.__config_dir,
             "codex_usage_settings.json",
@@ -382,28 +407,36 @@ class CodexUsageMonitor:
             "codex_usage_state.json",
         )
         self.__log_path = self.__lib.os.path.join(self.__config_dir, "codex_usage.log")
-        self.__profile_dir = self.__lib.os.path.join(
-            local_base,
-            "windows-supporter",
-            "chatgpt-profile",
-        )
+        normalized_profile_dir = str(profile_dir or "").strip()
+        if normalized_profile_dir:
+            self.__profile_dir = normalized_profile_dir
+        else:
+            self.__profile_dir = self.__lib.os.path.join(
+                local_base,
+                "windows-supporter",
+                "chatgpt-profile",
+            )
 
         self.__load_settings()
         self.__load_state()
+        self.__refresh_session_state_from_profile()
         return
 
     def attach(self, root, event_queue=None) -> None:
         self.__root = root
         self.__event_queue = event_queue
+        self.__refresh_session_state_from_profile()
         self.__restart_monitor()
         return
 
     def get_settings_snapshot(self) -> dict[str, Any]:
+        self.__force_playwright_mode()
         return {
             "enabled": bool(self.__enabled),
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "usage_url": str(self.__usage_url),
+            "collection_mode": str(self.__collection_mode or "playwright"),
             "settings_path": str(self.__settings_path),
             "state_path": str(self.__state_path),
             "profile_dir": str(self.__profile_dir),
@@ -433,14 +466,266 @@ class CodexUsageMonitor:
         self.__usage_url = usage_url
         self.__interval_sec = float(interval_sec)
         self.__tooltip_duration_ms = int(tooltip_ms)
+        self.__force_playwright_mode()
+        self.__refresh_session_state_from_profile()
         self.__save_settings()
         self.__restart_monitor()
         return True, None
+
+    def release_profile_session(self) -> tuple[bool, str]:
+        acquired = False
+        self.__logout_in_progress = True
+        self.__set_monitor_state("cancelling")
+        self.__request_collect_cancel()
+        self.__pause_background_monitor()
+        try:
+            self.__worker_epoch = int(self.__worker_epoch) + 1
+        except Exception:
+            self.__worker_epoch = 1
+        wait_timeout = float(self.__release_wait_timeout_sec)
+        if wait_timeout < 0.2:
+            wait_timeout = 0.2
+        poll_interval = float(self.__release_poll_interval_sec)
+        if poll_interval <= 0.0:
+            poll_interval = 0.05
+        start_ts = 0.0
+        try:
+            start_ts = float(self.__lib.time.monotonic())
+        except Exception:
+            start_ts = 0.0
+
+        while True:
+            acquired = self.__acquire_collect_lock_non_blocking()
+            if acquired:
+                break
+            now = 0.0
+            try:
+                now = float(self.__lib.time.monotonic())
+            except Exception:
+                now = start_ts + wait_timeout + 1.0
+            if (now - start_ts) >= wait_timeout:
+                self.__set_monitor_state("idle")
+                self.__logout_in_progress = False
+                self.__clear_collect_cancel()
+                return (
+                    False,
+                    "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+            try:
+                self.__lib.time.sleep(poll_interval)
+            except Exception:
+                pass
+
+        try:
+            self.__pending_hidden_cdp_clear = False
+            self.__clear_hidden_cdp_process(terminate=True)
+            self.__terminate_profile_remote_debugging_processes()
+            self.__terminate_profile_chrome_processes()
+            ok, message = self.__clear_profile_directory()
+            if not ok:
+                return False, message
+            self.__last_snapshot = UsageSnapshot()
+            self.__save_state()
+            self.__playwright_checked = False
+            self.__playwright_available = False
+            self.__failure_count = 0
+            self.__manual_query_waiting_result = False
+            self.__set_session_state("logged_out")
+            self.__pause_background_monitor()
+            return (
+                True,
+                message or "로그아웃되었습니다. 다시 사용하려면 로그인 후 조회해 주세요.",
+            )
+        except Exception as exc:
+            self.__log_exception("release profile session failed", exc)
+            return False, "로그아웃 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+        finally:
+            if acquired:
+                try:
+                    self.__collect_lock.release()
+                except Exception:
+                    pass
+            self.__logout_in_progress = False
+            self.__set_monitor_state("idle")
+            self.__clear_collect_cancel()
+
+    def __clear_profile_directory(self) -> tuple[bool, str]:
+        profile_dir = str(self.__profile_dir or "").strip()
+        if not profile_dir:
+            return False, "로그인 세션 경로를 확인하지 못했습니다."
+        try:
+            if not self.__lib.os.path.isdir(profile_dir):
+                return True, "이미 로그아웃된 상태입니다."
+        except Exception:
+            return False, "로그인 세션 경로 확인 중 오류가 발생했습니다."
+        try:
+            shutil.rmtree(profile_dir)
+            return True, "로그아웃되었습니다."
+        except Exception as exc:
+            self.__log_exception("profile directory delete failed", exc)
+
+        stamp = "0"
+        try:
+            stamp = str(int(float(self.__lib.time.time())))
+        except Exception:
+            stamp = "0"
+        moved_path = f"{profile_dir}.released-{stamp}"
+        try:
+            if self.__lib.os.path.exists(moved_path):
+                shutil.rmtree(moved_path, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            self.__lib.os.replace(profile_dir, moved_path)
+            try:
+                shutil.rmtree(moved_path, ignore_errors=True)
+            except Exception:
+                pass
+            return True, "로그아웃되었습니다."
+        except Exception as exc:
+            self.__log_exception("profile directory rename failed", exc)
+            return (
+                False,
+                "로그인 세션 폴더가 사용 중입니다. 관련 창을 닫고 다시 시도해 주세요.",
+            )
+
+    def __force_playwright_mode(self) -> None:
+        self.__collection_mode = "playwright"
+        return
+
+    def __set_monitor_state(self, state: str) -> None:
+        normalized = normalize_usage_value(state).lower()
+        if normalized not in {"idle", "running", "cancelling"}:
+            normalized = "idle"
+        self.__monitor_state = normalized
+        return
+
+    def __set_session_state(self, state: str) -> None:
+        normalized = normalize_usage_value(state).lower()
+        if normalized not in {"logged_in", "logged_out"}:
+            normalized = "logged_out"
+        self.__session_state = normalized
+        return
+
+    def __is_logged_in_session(self) -> bool:
+        return str(self.__session_state) == "logged_in"
+
+    def __has_profile_session(self) -> bool:
+        profile_dir = str(self.__profile_dir or "").strip()
+        if not profile_dir:
+            return False
+        try:
+            if not self.__lib.os.path.isdir(profile_dir):
+                return False
+        except Exception:
+            return False
+        try:
+            return bool(self.__lib.os.listdir(profile_dir))
+        except Exception:
+            return False
+
+    def __refresh_session_state_from_profile(self) -> None:
+        if self.__has_profile_session():
+            self.__set_session_state("logged_in")
+        else:
+            self.__set_session_state("logged_out")
+        return
+
+    def __should_run_background_collection(self) -> bool:
+        return bool(
+            self.__enabled
+            and self.__is_logged_in_session()
+            and not bool(self.__logout_in_progress)
+        )
+
+    def __request_collect_cancel(self) -> None:
+        try:
+            self.__collect_cancel_event.set()
+        except Exception:
+            pass
+        return
+
+    def __clear_collect_cancel(self) -> None:
+        try:
+            self.__collect_cancel_event.clear()
+        except Exception:
+            pass
+        return
+
+    def __is_collect_cancel_requested(self) -> bool:
+        if bool(self.__logout_in_progress):
+            return True
+        try:
+            return bool(self.__collect_cancel_event.is_set())
+        except Exception:
+            return False
+
+    def __acquire_collect_lock_non_blocking(self) -> bool:
+        try:
+            return bool(self.__collect_lock.acquire(blocking=False))
+        except TypeError:
+            try:
+                return bool(self.__collect_lock.acquire(False))
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def __pause_background_monitor(self) -> None:
+        root = self.__root
+        if root is not None:
+            try:
+                if self.__monitor_after_id is not None:
+                    root.after_cancel(self.__monitor_after_id)
+            except Exception:
+                pass
+        self.__monitor_after_id = None
+        self.__next_collect_due_ts = 0.0
+        self.__monitor_running = False
+        self.__startup_warmup_running = False
+        self.__set_monitor_state("idle")
+        return
+
+    def __clear_monitor_schedule(self) -> None:
+        root = self.__root
+        if root is not None:
+            try:
+                if self.__monitor_after_id is not None:
+                    root.after_cancel(self.__monitor_after_id)
+            except Exception:
+                pass
+        self.__monitor_after_id = None
+        self.__next_collect_due_ts = 0.0
+        return
+
+    def __pause_monitor_countdown_for_manual_query(self) -> None:
+        self.__clear_monitor_schedule()
+        return
+
+    def __reset_monitor_countdown_after_manual_query(self) -> None:
+        self.__clear_monitor_schedule()
+        if not self.__should_run_background_collection():
+            return
+        if bool(self.__monitor_running or self.__startup_warmup_running):
+            return
+        self.__schedule_monitor_tick(initial_delay_sec=self.__interval_sec)
+        return
+
+    def __resume_background_monitor_if_needed(self) -> None:
+        if not self.__should_run_background_collection():
+            return
+        if self.__monitor_after_id is not None:
+            return
+        if bool(self.__monitor_running or self.__startup_warmup_running):
+            return
+        self.__schedule_monitor_tick(initial_delay_sec=self.__interval_sec)
+        return
 
     def get_last_snapshot(self) -> UsageSnapshot:
         return UsageSnapshot.from_dict(self.__last_snapshot.to_dict())
 
     def get_runtime_status(self) -> dict[str, Any]:
+        self.__force_playwright_mode()
         now = 0.0
         try:
             now = float(self.__lib.time.monotonic())
@@ -448,29 +733,50 @@ class CodexUsageMonitor:
             now = 0.0
         remain: float | None = None
         estimated = False
-        due = float(self.__next_collect_due_ts or 0.0)
-        if due > 0.0:
-            remain = due - now
-            if remain < 0.0:
-                remain = 0.0
-        elif bool(self.__monitor_running or self.__startup_warmup_running):
-            started = float(self.__collect_started_ts or 0.0)
-            if started > 0.0:
-                remain = float(self.__interval_sec) - (now - started)
+        if (
+            self.__should_run_background_collection()
+            and not bool(self.__profile_in_use_detected)
+            and not bool(self.__collect_inflight)
+        ):
+            due = float(self.__next_collect_due_ts or 0.0)
+            if due > 0.0:
+                remain = due - now
                 if remain < 0.0:
                     remain = 0.0
-            else:
-                remain = float(self.__interval_sec)
-            estimated = True
+        monitor_state = str(self.__monitor_state or "idle")
+        if bool(self.__logout_in_progress):
+            monitor_state = "cancelling"
+        elif bool(self.__collect_inflight):
+            monitor_state = "running"
+        elif bool(self.__profile_in_use_detected):
+            monitor_state = "paused_profile_in_use"
+        can_login = bool(
+            str(self.__session_state) == "logged_out"
+            and not bool(self.__logout_in_progress)
+            and not bool(self.__collect_inflight)
+        )
+        can_logout = bool(
+            (str(self.__session_state) == "logged_in" or bool(self.__collect_inflight))
+            and not bool(self.__logout_in_progress)
+        )
         return {
             "enabled": bool(self.__enabled),
             "collect_inflight": bool(self.__collect_inflight),
             "collect_source": str(self.__collect_inflight_source or ""),
+            "collection_mode": str(self.__collection_mode or "unknown"),
             "monitor_running": bool(self.__monitor_running),
             "startup_warmup_running": bool(self.__startup_warmup_running),
             "next_collect_in_sec": remain,
             "next_collect_estimated": bool(estimated),
             "failure_count": int(self.__failure_count),
+            "api_failure_count": int(self.__api_failure_count),
+            "session_state": str(self.__session_state or "logged_out"),
+            "monitor_state": monitor_state,
+            "logout_in_progress": bool(self.__logout_in_progress),
+            "profile_in_use": bool(self.__profile_in_use_detected),
+            "auto_monitoring_active": bool(self.__should_run_background_collection()),
+            "can_login": can_login,
+            "can_logout": can_logout,
         }
 
     def format_captured_at_for_display(self, value: str) -> str:
@@ -486,6 +792,13 @@ class CodexUsageMonitor:
             snapshot = None if bool(force_refresh) else self.get_last_snapshot()
             error = None
             try:
+                if bool(self.__logout_in_progress):
+                    self.__ui_post(
+                        lambda: self.__show_tooltip(
+                            "로그아웃 진행 중입니다. 완료 후 다시 시도해 주세요."
+                        )
+                    )
+                    return
                 if bool(force_refresh):
                     refreshed, error = self.__collect_snapshot_guarded(
                         source="manual_query",
@@ -497,15 +810,35 @@ class CodexUsageMonitor:
                         ),
                     )
                     if error == "collect_busy":
+                        if bool(self.__profile_in_use_detected):
+                            latest = self.get_last_snapshot()
+                            if latest is not None and latest.has_any_metric():
+                                self.__ui_post(
+                                    lambda: self.__show_snapshot_tooltip(
+                                        latest,
+                                        title="Codex 최근 사용량 (자동 조회 일시중지)",
+                                    )
+                                )
+                            else:
+                                self.__ui_post(
+                                    lambda: self.__show_tooltip(
+                                        "다른 Chrome 세션에서 프로필을 사용 중이라 자동 조회를 잠시 건너뜁니다."
+                                    )
+                                )
+                            return
                         self.__set_manual_query_pending_result()
                         self.__ui_post(self.__show_busy_collect_tooltip)
                         return
+                    if error == "collect_cancelled":
+                        self.__ui_post(lambda: self.__show_tooltip("조회가 취소되었습니다."))
+                        return
                     self.__consume_manual_query_pending_result()
-                    if error is not None:
+                    if error is not None and error != "profile_in_use":
                         self.__handle_collect_error(error, source="manual_query")
                     if refreshed is not None:
                         if not self.__is_worker_epoch_current(worker_epoch):
                             return
+                        self.__set_session_state("logged_in")
                         merged = merge_snapshot_with_previous(
                             refreshed,
                             self.__last_snapshot if self.__last_snapshot.has_any_metric() else None,
@@ -513,6 +846,24 @@ class CodexUsageMonitor:
                         self.__last_snapshot = merged
                         self.__save_state()
                         snapshot = merged
+                        self.__profile_in_use_detected = False
+                        self.__resume_background_monitor_if_needed()
+                if error == "profile_in_use":
+                    latest = self.get_last_snapshot()
+                    if latest is not None and latest.has_any_metric():
+                        self.__ui_post(
+                            lambda: self.__show_snapshot_tooltip(
+                                latest,
+                                title="Codex 최근 사용량 (자동 조회 일시중지)",
+                            )
+                        )
+                        return
+                    self.__ui_post(
+                        lambda: self.__show_tooltip(
+                            "다른 Chrome 세션에서 프로필을 사용 중이라 자동 조회를 잠시 건너뜁니다."
+                        )
+                    )
+                    return
                 if snapshot is not None and snapshot.has_any_metric():
                     self.__ui_post(
                         lambda: self.__show_snapshot_tooltip(
@@ -552,32 +903,25 @@ class CodexUsageMonitor:
         merged = merge_snapshot_with_previous(snapshot, prev)
         if not merged.has_any_metric():
             return []
+        self.__profile_in_use_detected = False
         changes = compute_usage_changes(prev, merged)
         self.__last_snapshot = merged
         self.__save_state()
         return changes
 
     def __restart_monitor(self) -> None:
-        root = self.__root
-        if root is None:
-            return
-        try:
-            if self.__monitor_after_id is not None:
-                root.after_cancel(self.__monitor_after_id)
-        except Exception:
-            pass
-        self.__monitor_after_id = None
-        self.__next_collect_due_ts = 0.0
+        self.__pause_background_monitor()
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
             self.__worker_epoch = 1
-        self.__monitor_running = False
-        self.__startup_warmup_running = False
+        self.__clear_collect_cancel()
         if bool(self.__collect_inflight):
             self.__pending_hidden_cdp_clear = True
         else:
             self.__clear_hidden_cdp_process(terminate=True)
+        if not self.__should_run_background_collection():
+            return
         self.__start_startup_warmup()
         return
 
@@ -585,19 +929,21 @@ class CodexUsageMonitor:
         root = self.__root
         if root is None:
             return
-        if not self.__enabled:
-            self.__schedule_monitor_tick(initial_delay_sec=self.__interval_sec)
+        if not self.__should_run_background_collection():
+            self.__set_monitor_state("idle")
             return
         if self.__startup_warmup_running:
             return
         self.__startup_warmup_running = True
         self.__monitor_running = True
+        self.__set_monitor_state("running")
         worker_epoch = int(self.__worker_epoch)
 
         def worker() -> None:
             next_delay = float(self.__interval_sec)
             try:
                 self.__log("startup warmup begin mode=headful-hidden-first")
+                self.__profile_in_use_detected = False
                 snapshot, error = self.__collect_snapshot_guarded(source="startup_warmup")
                 if not self.__is_worker_epoch_current(worker_epoch):
                     self.__log("startup warmup stale result ignored")
@@ -606,6 +952,21 @@ class CodexUsageMonitor:
                     if error == "collect_busy":
                         self.__log("startup warmup skipped reason=busy")
                         next_delay = min(self.__interval_sec, 5.0)
+                        return
+                    if error == "profile_in_use":
+                        self.__log("startup warmup skipped reason=profile_in_use")
+                        self.__profile_in_use_detected = True
+                        next_delay = min(self.__interval_sec, 20.0)
+                        self.__ui_post(
+                            lambda snap=self.get_last_snapshot(): self.__show_pending_manual_result_if_needed(
+                                snap if snap is not None and snap.has_any_metric() else None,
+                                error="profile_in_use",
+                            )
+                        )
+                        self.__handle_collect_error(error, source="startup_warmup")
+                        return
+                    if error == "collect_cancelled":
+                        self.__log("startup warmup cancelled")
                         return
                     if error in {"parse_failed", "collect_failed"} and self.__has_manual_query_pending_result():
                         retry_snapshot, retry_error = self.__collect_snapshot_guarded(
@@ -675,11 +1036,16 @@ class CodexUsageMonitor:
             if worker_epoch == int(self.__worker_epoch):
                 self.__startup_warmup_running = False
                 self.__monitor_running = False
+                self.__set_monitor_state("idle")
             self.__log_exception("startup warmup thread start failed", exc)
             self.__schedule_monitor_tick(initial_delay_sec=min(self.__interval_sec, 10.0))
         return
 
     def __schedule_monitor_tick(self, initial_delay_sec: float | None = None) -> None:
+        if not self.__should_run_background_collection():
+            self.__monitor_after_id = None
+            self.__next_collect_due_ts = 0.0
+            return
         root = self.__root
         if root is None:
             return
@@ -701,18 +1067,20 @@ class CodexUsageMonitor:
     def __monitor_tick(self) -> None:
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
-        if not self.__enabled:
-            self.__schedule_monitor_tick(initial_delay_sec=self.__interval_sec)
+        if not self.__should_run_background_collection():
+            self.__set_monitor_state("idle")
             return
         if self.__monitor_running:
             self.__schedule_monitor_tick(initial_delay_sec=min(self.__interval_sec, 5.0))
             return
         self.__monitor_running = True
+        self.__set_monitor_state("running")
         worker_epoch = int(self.__worker_epoch)
 
         def worker() -> None:
             next_delay = float(self.__interval_sec)
             try:
+                self.__profile_in_use_detected = False
                 snapshot, error = self.__collect_snapshot_guarded(source="monitor_tick")
                 if not self.__is_worker_epoch_current(worker_epoch):
                     self.__log("monitor worker stale result ignored")
@@ -721,6 +1089,21 @@ class CodexUsageMonitor:
                     if error == "collect_busy":
                         self.__log("monitor tick skipped reason=busy")
                         next_delay = min(self.__interval_sec, 5.0)
+                        return
+                    if error == "profile_in_use":
+                        self.__log("monitor tick skipped reason=profile_in_use")
+                        self.__profile_in_use_detected = True
+                        next_delay = min(self.__interval_sec, 20.0)
+                        self.__ui_post(
+                            lambda snap=self.get_last_snapshot(): self.__show_pending_manual_result_if_needed(
+                                snap if snap is not None and snap.has_any_metric() else None,
+                                error="profile_in_use",
+                            )
+                        )
+                        self.__handle_collect_error(error, source="monitor_tick")
+                        return
+                    if error == "collect_cancelled":
+                        self.__log("monitor tick cancelled")
                         return
                     if error in {"parse_failed", "collect_failed"} and self.__has_manual_query_pending_result():
                         retry_snapshot, retry_error = self.__collect_snapshot_guarded(
@@ -786,6 +1169,7 @@ class CodexUsageMonitor:
             threading.Thread(target=worker, daemon=True).start()
         except Exception as exc:
             self.__monitor_running = False
+            self.__set_monitor_state("idle")
             self.__log_exception("monitor thread start failed", exc)
             self.__schedule_monitor_tick(initial_delay_sec=min(self.__interval_sec, 15.0))
         return
@@ -801,6 +1185,10 @@ class CodexUsageMonitor:
         if from_startup:
             self.__startup_warmup_running = False
         self.__monitor_running = False
+        self.__set_monitor_state("idle")
+        if not self.__should_run_background_collection():
+            self.__next_collect_due_ts = 0.0
+            return
         self.__schedule_monitor_tick(initial_delay_sec=next_delay)
         return
 
@@ -817,24 +1205,19 @@ class CodexUsageMonitor:
         source: str,
         on_acquired=None,
     ) -> tuple[UsageSnapshot | None, str | None]:
-        acquired = False
-        try:
-            acquired = bool(self.__collect_lock.acquire(blocking=False))
-        except TypeError:
-            try:
-                acquired = bool(self.__collect_lock.acquire(False))
-            except Exception as exc:
-                self.__log_exception("collect lock acquire failed", exc)
-                return None, "collect_failed"
-        except Exception as exc:
-            self.__log_exception("collect lock acquire failed", exc)
-            return None, "collect_failed"
+        source_key = normalize_usage_value(source).lower()
+        if self.__is_collect_cancel_requested():
+            return None, "collect_cancelled"
+        acquired = self.__acquire_collect_lock_non_blocking()
         if not acquired:
             self.__log(f"collect skip source={source} reason=busy")
             return None, "collect_busy"
         try:
             self.__collect_inflight = True
             self.__collect_inflight_source = str(source or "")
+            self.__set_monitor_state("running")
+            if source_key == "manual_query":
+                self.__ui_post(self.__pause_monitor_countdown_for_manual_query)
             try:
                 self.__collect_started_ts = float(self.__lib.time.monotonic())
             except Exception:
@@ -845,6 +1228,8 @@ class CodexUsageMonitor:
                     on_acquired()
                 except Exception:
                     pass
+            if self.__is_collect_cancel_requested():
+                return None, "collect_cancelled"
             snapshot, error = self.__collect_snapshot(source=str(source or ""))
             self.__log(f"collect end source={source} error={error or 'none'}")
             return snapshot, error
@@ -852,6 +1237,10 @@ class CodexUsageMonitor:
             self.__collect_inflight = False
             self.__collect_inflight_source = ""
             self.__collect_started_ts = 0.0
+            if not bool(self.__logout_in_progress):
+                self.__set_monitor_state("idle")
+            if source_key == "manual_query":
+                self.__ui_post(self.__reset_monitor_countdown_after_manual_query)
             if bool(self.__pending_hidden_cdp_clear):
                 self.__pending_hidden_cdp_clear = False
                 self.__clear_hidden_cdp_process(terminate=True)
@@ -886,8 +1275,13 @@ class CodexUsageMonitor:
         if root is None or not changes:
             return
         current = snapshot if isinstance(snapshot, UsageSnapshot) else self.get_last_snapshot()
+        metric_colors: dict[str, str] = {}
+        for item in changes:
+            color = self.__resolve_change_color(item)
+            if color:
+                metric_colors[str(item.key)] = color
         lines: list[tuple[str, str | None]] = [("Codex 현재 사용량", None)]
-        lines.extend(self.__build_snapshot_lines(current))
+        lines.extend(self.__build_snapshot_lines(current, metric_colors=metric_colors))
         lines.append(("", None))
         lines.append(("변경 항목", None))
         for item in changes:
@@ -951,6 +1345,13 @@ class CodexUsageMonitor:
             return
         err = normalize_usage_value(str(error or ""))
         if err:
+            if err == "profile_in_use":
+                latest = snapshot if isinstance(snapshot, UsageSnapshot) else self.get_last_snapshot()
+                if latest is not None and latest.has_any_metric():
+                    self.__show_snapshot_tooltip(latest, title="Codex 최근 사용량 (자동 조회 일시중지)")
+                    return
+                self.__show_tooltip("다른 Chrome 세션에서 프로필을 사용 중이라 자동 조회를 잠시 건너뜁니다.")
+                return
             self.__show_tooltip(
                 f"진행 중이던 조회가 실패했습니다. {self.__describe_collect_error_for_user(err)}"
             )
@@ -972,6 +1373,8 @@ class CodexUsageMonitor:
             "login_required": "로그인이 필요합니다.",
             "cloudflare_challenge": "Cloudflare 인증이 필요합니다.",
             "collect_busy": "이미 조회가 진행 중입니다.",
+            "collect_cancelled": "요청에 의해 조회가 취소되었습니다.",
+            "profile_in_use": "다른 Chrome 세션에서 프로필을 사용 중이라 자동 조회를 잠시 건너뜁니다.",
         }
         return mapping.get(key, "잠시 후 다시 시도해 주세요.")
 
@@ -979,6 +1382,7 @@ class CodexUsageMonitor:
         self,
         snapshot: UsageSnapshot | None,
         section_title: str | None = None,
+        metric_colors: dict[str, str] | None = None,
     ) -> list[tuple[str, str | None]]:
         payload = snapshot.to_dict() if isinstance(snapshot, UsageSnapshot) else {}
         lines: list[tuple[str, str | None]] = []
@@ -989,7 +1393,10 @@ class CodexUsageMonitor:
             value = normalize_usage_value(payload.get(key, ""))
             if not value:
                 value = "-"
-            lines.append((f"{label}: {value}", None))
+            line_color: str | None = None
+            if isinstance(metric_colors, dict):
+                line_color = metric_colors.get(str(key))
+            lines.append((f"{label}: {value}", line_color))
         captured_at = normalize_usage_value(payload.get("captured_at", ""))
         if captured_at:
             lines.append((f"확인 시각: {self.__format_timestamp_display(captured_at)}", None))
@@ -1103,13 +1510,16 @@ class CodexUsageMonitor:
 
     def __handle_collect_error(self, error: str, source: str = "") -> None:
         msg = str(error or "unknown_error")
-        if msg == "collect_busy":
+        if msg in {"collect_busy", "collect_cancelled"}:
             return
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = normalized_source == "manual_query"
 
         if msg in {"login_required", "cloudflare_challenge"}:
+            if msg == "login_required":
+                self.__set_session_state("logged_out")
+                self.__pause_background_monitor()
             now = 0.0
             try:
                 now = float(self.__lib.time.monotonic())
@@ -1144,6 +1554,16 @@ class CodexUsageMonitor:
                         message,
                     )
                 )
+        elif msg == "profile_in_use":
+            self.__profile_in_use_detected = True
+            if is_manual_query:
+                self.__ui_post(
+                    lambda: self.__show_tooltip(
+                        "현재 Chrome에서 같은 프로필을 사용 중입니다. 자동 창 생성 대신 수동 조회만 허용됩니다."
+                    )
+                )
+                return
+            return
         elif msg == "playwright_unavailable":
             now = 0.0
             try:
@@ -1170,6 +1590,9 @@ class CodexUsageMonitor:
         return
 
     def __collect_snapshot(self, source: str = "") -> tuple[UsageSnapshot | None, str | None]:
+        if self.__is_collect_cancel_requested():
+            return None, "collect_cancelled"
+        self.__force_playwright_mode()
         self.__configure_playwright_env()
         if not self.__ensure_playwright_available():
             return None, "playwright_unavailable"
@@ -1178,12 +1601,26 @@ class CodexUsageMonitor:
         except Exception:
             return None, "playwright_unavailable"
 
+        retry_count = 1
         try:
-            with sync_playwright() as playwright_obj:
-                return self.__collect_with_playwright_obj(playwright_obj, source=str(source or ""))
-        except Exception as exc:
-            self.__log_exception("collect snapshot failed", exc)
-            return None, "collect_failed"
+            retry_count = int(getattr(self, "_CodexUsageMonitor__playwright_launch_retry_count", 1) or 1)
+        except Exception:
+            retry_count = 1
+        if retry_count < 1:
+            retry_count = 1
+
+        for attempt in range(retry_count):
+            if self.__is_collect_cancel_requested():
+                return None, "collect_cancelled"
+            try:
+                with sync_playwright() as playwright_obj:
+                    return self.__collect_with_playwright_obj(playwright_obj, source=str(source or ""))
+            except Exception as exc:
+                self.__log_exception("collect snapshot failed", exc)
+                if attempt >= (retry_count - 1):
+                    return None, "collect_failed"
+                self.__log(f"collect snapshot retry attempt={attempt + 2}")
+        return None, "collect_failed"
 
     def __collect_with_playwright_obj(
         self,
@@ -1200,6 +1637,8 @@ class CodexUsageMonitor:
             force_hidden=True,
             prefer_system_channel=True,
         )
+        if error == "collect_cancelled":
+            return None, "collect_cancelled"
         if is_manual_query and error in {"login_required", "cloudflare_challenge"}:
             self.__log(
                 f"collect strategy=headful-hidden-first pre-interactive-retry reason={error} "
@@ -1215,10 +1654,14 @@ class CodexUsageMonitor:
             if retry_error is None and retry_snapshot is not None:
                 return retry_snapshot, None
             if retry_error is not None:
+                if str(retry_error) == "collect_cancelled":
+                    return None, "collect_cancelled"
                 error = str(retry_error)
                 snapshot = retry_snapshot
         if error not in {"login_required", "cloudflare_challenge"}:
             return snapshot, error
+        if self.__is_collect_cancel_requested():
+            return None, "collect_cancelled"
         if not self.__should_open_interactive_recovery(source=source):
             self.__log(
                 f"collect strategy=headful-hidden-first interactive=skip reason={error} "
@@ -1252,6 +1695,8 @@ class CodexUsageMonitor:
         # Background collectors should never open visible auth windows.
         if normalized_source != "manual_query":
             return False
+        if bool(self.__logout_in_progress) or self.__is_collect_cancel_requested():
+            return False
         now = 0.0
         try:
             now = float(self.__lib.time.monotonic())
@@ -1275,10 +1720,7 @@ class CodexUsageMonitor:
         )
         # Interactive recovery must not attach to stale hidden CDP sessions.
         self.__pending_hidden_cdp_clear = False
-        had_hidden_proc = self.__hidden_cdp_proc is not None
         self.__clear_hidden_cdp_process(terminate=True)
-        if not bool(had_hidden_proc):
-            self.__terminate_profile_remote_debugging_processes()
         return
 
     def __collect_snapshot_once(
@@ -1290,10 +1732,14 @@ class CodexUsageMonitor:
         prefer_system_channel: bool = False,
         initial_url: str | None = None,
     ) -> tuple[UsageSnapshot | None, str | None]:
+        if self.__is_collect_cancel_requested():
+            return None, "collect_cancelled"
         context = None
         cdp_browser = None
         cdp_proc = None
         keep_hidden_cdp_process = False
+        page = None
+        close_collect_page = False
         usage_url = str(self.__usage_url)
         start_url = normalize_usage_value(initial_url)
         if not start_url:
@@ -1312,6 +1758,8 @@ class CodexUsageMonitor:
                         playwright_obj,
                         launch_url=start_url,
                     )
+                    if context is None and self.__is_profile_locked_without_remote_debugging():
+                        return None, "profile_in_use"
                 else:
                     context, cdp_browser, cdp_proc = self.__launch_interactive_context_via_cdp(
                         playwright_obj,
@@ -1330,24 +1778,45 @@ class CodexUsageMonitor:
                 effective_headless = bool(launch_headless)
             if context is None:
                 return None, "collect_failed"
+            if self.__is_collect_cancel_requested():
+                return None, "collect_cancelled"
             if bool(effective_headless):
                 self.__apply_headless_fast_routes(context)
+            is_external_cdp = self.__is_external_cdp_handle(cdp_proc)
+            is_monitor_managed_cdp = self.__is_monitor_managed_cdp_handle(cdp_proc)
+            should_hide_cdp_window = bool((not is_external_cdp) or is_monitor_managed_cdp)
             if cdp_proc is not None:
-                if bool(force_hidden):
+                if bool(force_hidden) and bool(should_hide_cdp_window):
                     self.__set_cdp_window_visibility(cdp_proc, visible=False, bring_to_front=False)
-                elif bool(allow_interactive_recovery):
-                    self.__set_cdp_window_visibility(cdp_proc, visible=True, bring_to_front=True)
-            page = self.__select_collect_page(
-                context,
-                preferred_url=start_url,
-                close_extra_blank_tabs=bool(force_hidden) and not bool(allow_interactive_recovery),
-            )
+            if bool(is_external_cdp) and not bool(is_monitor_managed_cdp):
+                try:
+                    page = context.new_page()
+                    close_collect_page = True
+                except Exception:
+                    page = self.__select_collect_page(
+                        context,
+                        preferred_url=start_url,
+                        close_extra_blank_tabs=False,
+                    )
+            else:
+                page = self.__select_collect_page(
+                    context,
+                    preferred_url=start_url,
+                    close_extra_blank_tabs=not bool(effective_headless),
+                )
+            if self.__is_collect_cancel_requested():
+                return None, "collect_cancelled"
             page.goto(
                 str(start_url),
                 wait_until="domcontentloaded",
                 timeout=int(self.__navigation_timeout_ms),
             )
-            if cdp_proc is not None and bool(force_hidden) and not bool(allow_interactive_recovery):
+            if (
+                cdp_proc is not None
+                and bool(force_hidden)
+                and not bool(allow_interactive_recovery)
+                and bool(should_hide_cdp_window)
+            ):
                 # Navigation can trigger profile popups; re-hide the window defensively.
                 self.__set_cdp_window_visibility(cdp_proc, visible=False, bring_to_front=False)
 
@@ -1367,27 +1836,33 @@ class CodexUsageMonitor:
                         timeout_sec=grace_sec,
                     )
                     if not ok_cf:
+                        if self.__is_collect_cancel_requested():
+                            return None, "collect_cancelled"
                         return None, "cloudflare_challenge"
                 else:
-                    if cdp_proc is not None:
-                        self.__set_cdp_window_visibility(cdp_proc, visible=True, bring_to_front=True)
                     ok_cf = self.__wait_until_cloudflare_cleared(
                         page,
                         timeout_sec=max(float(self.__login_timeout_sec), 420.0),
                     )
                     if not ok_cf:
+                        if self.__is_collect_cancel_requested():
+                            return None, "collect_cancelled"
                         return None, "cloudflare_challenge"
 
             if self.__is_login_required(page):
                 if bool(effective_headless) or not bool(allow_interactive_recovery):
+                    self.__set_session_state("logged_out")
                     return None, "login_required"
-                if cdp_proc is not None:
-                    self.__set_cdp_window_visibility(cdp_proc, visible=True, bring_to_front=True)
                 ok = self.__wait_until_logged_in(page, timeout_sec=self.__login_timeout_sec)
                 if not ok:
+                    if self.__is_collect_cancel_requested():
+                        return None, "collect_cancelled"
+                    self.__set_session_state("logged_out")
                     return None, "login_required"
             if needs_usage_navigation:
                 try:
+                    if self.__is_collect_cancel_requested():
+                        return None, "collect_cancelled"
                     page.goto(
                         usage_url,
                         wait_until="domcontentloaded",
@@ -1399,6 +1874,19 @@ class CodexUsageMonitor:
 
             snapshot = self.__build_snapshot_from_page(page)
             if snapshot is not None:
+                self.__set_session_state("logged_in")
+                if (
+                    not bool(effective_headless)
+                    and bool(allow_interactive_recovery)
+                    and cdp_proc is not None
+                ):
+                    if self.__promote_cdp_process_for_hidden_reuse(cdp_proc):
+                        keep_hidden_cdp_process = True
+                        self.__set_cdp_window_visibility(
+                            cdp_proc,
+                            visible=False,
+                            bring_to_front=False,
+                        )
                 return snapshot, None
             if bool(effective_headless):
                 return self.__wait_for_snapshot_ready(
@@ -1406,7 +1894,19 @@ class CodexUsageMonitor:
                     timeout_sec=min(float(self.__login_timeout_sec), float(self.__headless_wait_timeout_sec)),
                 )
             if not bool(effective_headless) and bool(allow_interactive_recovery):
-                return self.__wait_for_snapshot_ready(page, timeout_sec=self.__login_timeout_sec)
+                waited_snapshot, waited_error = self.__wait_for_snapshot_ready(
+                    page,
+                    timeout_sec=self.__login_timeout_sec,
+                )
+                if waited_error is None and waited_snapshot is not None and cdp_proc is not None:
+                    if self.__promote_cdp_process_for_hidden_reuse(cdp_proc):
+                        keep_hidden_cdp_process = True
+                        self.__set_cdp_window_visibility(
+                            cdp_proc,
+                            visible=False,
+                            bring_to_front=False,
+                        )
+                return waited_snapshot, waited_error
             if not bool(effective_headless):
                 return self.__wait_for_snapshot_ready(
                     page,
@@ -1422,11 +1922,18 @@ class CodexUsageMonitor:
                 pass
             return None, "parse_failed"
         except Exception as exc:
+            if self.__is_collect_cancel_requested():
+                return None, "collect_cancelled"
             if bool(keep_hidden_cdp_process):
                 self.__clear_hidden_cdp_process(terminate=True)
             self.__log_exception("collect snapshot once failed", exc)
             return None, "collect_failed"
         finally:
+            if bool(close_collect_page) and page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
             if context is not None and not bool(keep_hidden_cdp_process):
                 try:
                     context.close()
@@ -1438,7 +1945,7 @@ class CodexUsageMonitor:
                 except Exception:
                     pass
             if cdp_proc is not None and not bool(keep_hidden_cdp_process):
-                self.__terminate_spawned_process(cdp_proc)
+                self.__terminate_spawned_process(cdp_proc, cleanup_orphans=False)
 
     def __build_snapshot_from_page(self, page) -> UsageSnapshot | None:
         captured_at = self.__now_iso()
@@ -1464,8 +1971,11 @@ class CodexUsageMonitor:
         next_home_recovery_ts = 0.0
 
         while True:
+            if self.__is_collect_cancel_requested():
+                return None, "collect_cancelled"
             snapshot = self.__build_snapshot_from_page(page)
             if snapshot is not None:
+                self.__set_session_state("logged_in")
                 return snapshot, None
 
             now = 0.0
@@ -1504,6 +2014,7 @@ class CodexUsageMonitor:
                 if self.__is_cloudflare_challenge(page):
                     return None, "cloudflare_challenge"
                 if self.__is_login_required(page):
+                    self.__set_session_state("logged_out")
                     return None, "login_required"
                 return None, "parse_failed"
             try:
@@ -1512,6 +2023,7 @@ class CodexUsageMonitor:
                 if self.__is_cloudflare_challenge(page):
                     return None, "cloudflare_challenge"
                 if self.__is_login_required(page):
+                    self.__set_session_state("logged_out")
                     return None, "login_required"
                 return None, "parse_failed"
 
@@ -1597,9 +2109,25 @@ class CodexUsageMonitor:
             self.__lib.os.makedirs(self.__profile_dir, exist_ok=True)
         except Exception:
             pass
+        self.__prepare_profile_for_chrome_launch()
 
         last_error = None
-        for port in range(9333, 9345):
+        total_deadline = 0.0
+        try:
+            total_deadline = float(self.__lib.time.monotonic()) + float(self.__cdp_total_launch_timeout_sec)
+        except Exception:
+            total_deadline = 0.0
+        for port in self.__iter_cdp_ports():
+            if self.__is_collect_cancel_requested():
+                return None, None, None
+            if total_deadline > 0.0:
+                now = 0.0
+                try:
+                    now = float(self.__lib.time.monotonic())
+                except Exception:
+                    now = total_deadline + 1.0
+                if now >= total_deadline:
+                    break
             proc = None
             browser = None
             try:
@@ -1616,6 +2144,10 @@ class CodexUsageMonitor:
                     str(chrome_path),
                     f"--remote-debugging-port={int(port)}",
                     f"--user-data-dir={self.__profile_dir}",
+                    "--disable-session-crashed-bubble",
+                    "--hide-crash-restore-bubble",
+                    "--no-first-run",
+                    "--no-default-browser-check",
                 ]
                 if bool(start_hidden):
                     cmd.extend(
@@ -1623,9 +2155,6 @@ class CodexUsageMonitor:
                             "--window-size=1280,720",
                             "--disable-extensions",
                             "--disable-notifications",
-                            "--disable-session-crashed-bubble",
-                            "--no-first-run",
-                            "--no-default-browser-check",
                         ]
                     )
                 cmd.extend(["--new-window", str(launch_url)])
@@ -1644,12 +2173,17 @@ class CodexUsageMonitor:
                         pass
                 proc = self.__lib.subprocess.Popen(cmd, **popen_kwargs)
                 endpoint = f"http://127.0.0.1:{int(port)}"
-                deadline = 0.0
+                connect_deadline = 0.0
                 try:
-                    deadline = float(self.__lib.time.monotonic()) + 15.0
+                    connect_deadline = float(self.__lib.time.monotonic()) + 15.0
                 except Exception:
-                    deadline = 0.0
+                    connect_deadline = 0.0
+                if total_deadline > 0.0 and (connect_deadline <= 0.0 or connect_deadline > total_deadline):
+                    connect_deadline = total_deadline
                 while True:
+                    if self.__is_collect_cancel_requested():
+                        self.__terminate_spawned_process(proc, cleanup_orphans=False)
+                        return None, None, None
                     try:
                         browser = playwright_obj.chromium.connect_over_cdp(endpoint)
                         break
@@ -1659,8 +2193,8 @@ class CodexUsageMonitor:
                         try:
                             now = float(self.__lib.time.monotonic())
                         except Exception:
-                            now = deadline + 1.0
-                        if now > deadline:
+                            now = connect_deadline + 1.0
+                        if now > connect_deadline:
                             break
                         try:
                             self.__lib.time.sleep(0.35)
@@ -1668,7 +2202,7 @@ class CodexUsageMonitor:
                             pass
 
                 if browser is None:
-                    self.__terminate_spawned_process(proc)
+                    self.__terminate_spawned_process(proc, cleanup_orphans=False)
                     continue
                 contexts = []
                 try:
@@ -1680,7 +2214,7 @@ class CodexUsageMonitor:
                         browser.close()
                     except Exception:
                         pass
-                    self.__terminate_spawned_process(proc)
+                    self.__terminate_spawned_process(proc, cleanup_orphans=False)
                     last_error = RuntimeError("cdp browser has no context")
                     continue
                 spawned_pid = 0
@@ -1691,28 +2225,30 @@ class CodexUsageMonitor:
                 listener_pid = self.__find_profile_remote_debugging_pid(int(port))
                 if spawned_pid > 0 and listener_pid > 0 and listener_pid != spawned_pid:
                     self.__log(
-                        "interactive cdp endpoint mismatch "
+                        "interactive cdp listener remapped "
                         f"port={int(port)} spawned={int(spawned_pid)} listener={int(listener_pid)}"
                     )
                     try:
-                        browser.close()
+                        setattr(proc, "_ws_listener_pid", int(listener_pid))
                     except Exception:
                         pass
-                    self.__terminate_spawned_process(proc)
-                    last_error = RuntimeError("cdp endpoint pid mismatch")
-                    continue
                 if spawned_pid > 0 and (not self.__is_subprocess_running(proc)):
-                    self.__log(
-                        "interactive cdp process exited early "
-                        f"port={int(port)} pid={int(spawned_pid)}"
-                    )
+                    if listener_pid <= 0:
+                        self.__log(
+                            "interactive cdp process exited early "
+                            f"port={int(port)} pid={int(spawned_pid)}"
+                        )
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                        self.__terminate_spawned_process(proc, cleanup_orphans=False)
+                        last_error = RuntimeError("cdp spawned process exited")
+                        continue
                     try:
-                        browser.close()
+                        setattr(proc, "_ws_listener_pid", int(listener_pid))
                     except Exception:
                         pass
-                    self.__terminate_spawned_process(proc)
-                    last_error = RuntimeError("cdp spawned process exited")
-                    continue
                 self.__log(
                     f"interactive cdp connected port={int(port)} pid={int(spawned_pid)}"
                 )
@@ -1720,6 +2256,7 @@ class CodexUsageMonitor:
                     setattr(proc, "_ws_cdp_port", int(port))
                 except Exception:
                     pass
+                self.__last_successful_cdp_port = int(port)
                 return contexts[0], browser, proc
             except Exception as exc:
                 last_error = exc
@@ -1729,11 +2266,88 @@ class CodexUsageMonitor:
                     except Exception:
                         pass
                 if proc is not None:
-                    self.__terminate_spawned_process(proc)
+                    self.__terminate_spawned_process(proc, cleanup_orphans=False)
                 continue
         if last_error is not None:
             self.__log_exception("interactive cdp launch failed", last_error)
         return None, None, None
+
+    def __iter_cdp_ports(self) -> list[int]:
+        ports = list(range(9333, 9345))
+        try:
+            preferred = int(self.__last_successful_cdp_port or 0)
+        except Exception:
+            preferred = 0
+        if preferred in ports:
+            ports.remove(preferred)
+            ports.insert(0, preferred)
+        try:
+            limit = int(self.__cdp_port_attempt_limit or len(ports))
+        except Exception:
+            limit = len(ports)
+        if limit < 1:
+            limit = len(ports)
+        return ports[: min(limit, len(ports))]
+
+    def __prepare_profile_for_chrome_launch(self) -> None:
+        profile_dir = str(self.__profile_dir or "").strip()
+        if not profile_dir:
+            return
+        targets = [
+            self.__lib.os.path.join(profile_dir, "Default", "Preferences"),
+            self.__lib.os.path.join(profile_dir, "Local State"),
+        ]
+        for target in targets:
+            self.__patch_chrome_clean_exit_markers(target)
+        return
+
+    def __patch_chrome_clean_exit_markers(self, path: str) -> None:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            return
+        try:
+            if not self.__lib.os.path.isfile(raw_path):
+                return
+        except Exception:
+            return
+        try:
+            with open(raw_path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        dirty = False
+        if str(payload.get("exit_type", "") or "").lower() in {"crashed", "session_ended"}:
+            payload["exit_type"] = "Normal"
+            dirty = True
+        if payload.get("exited_cleanly") is False:
+            payload["exited_cleanly"] = True
+            dirty = True
+        profile = payload.get("profile")
+        if isinstance(profile, dict):
+            if str(profile.get("exit_type", "") or "").lower() in {"crashed", "session_ended"}:
+                profile["exit_type"] = "Normal"
+                dirty = True
+            if profile.get("exited_cleanly") is False:
+                profile["exited_cleanly"] = True
+                dirty = True
+
+        if not dirty:
+            return
+        try:
+            with open(raw_path, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False, indent=2)
+        except Exception:
+            return
+        return
+
+    def __is_pid_alive(self, pid: int) -> bool:
+        try:
+            return bool(self.__lib.psutil.pid_exists(int(pid)))
+        except Exception:
+            return False
 
     def __is_subprocess_running(self, proc) -> bool:
         if proc is None:
@@ -1741,15 +2355,191 @@ class CodexUsageMonitor:
         try:
             return proc.poll() is None
         except Exception:
-            return False
+            pass
+        try:
+            listener_pid = int(getattr(proc, "_ws_listener_pid", 0) or 0)
+        except Exception:
+            listener_pid = 0
+        if listener_pid > 0:
+            return self.__is_pid_alive(listener_pid)
+        return False
 
     def __clear_hidden_cdp_process(self, terminate: bool = False) -> None:
         proc = self.__hidden_cdp_proc
         self.__hidden_cdp_proc = None
         self.__hidden_cdp_port = 0
         if bool(terminate) and proc is not None:
-            self.__terminate_spawned_process(proc)
+            self.__terminate_spawned_process(proc, cleanup_orphans=True)
         return
+
+    def __is_external_cdp_handle(self, proc) -> bool:
+        if proc is None:
+            return False
+        try:
+            return bool(getattr(proc, "_ws_external_cdp", False))
+        except Exception:
+            return False
+
+    def __is_monitor_managed_cdp_handle(self, proc) -> bool:
+        if proc is None:
+            return False
+        try:
+            return bool(getattr(proc, "_ws_monitor_managed", False))
+        except Exception:
+            return False
+
+    def __build_external_cdp_handle(self, pid: int, port: int, monitor_managed: bool = False):
+        class _ExternalCdpHandle:
+            pass
+
+        handle = _ExternalCdpHandle()
+        safe_pid = int(pid) if int(pid or 0) > 0 else 0
+        safe_port = int(port) if int(port or 0) > 0 else 0
+        setattr(handle, "pid", safe_pid)
+        setattr(handle, "_ws_listener_pid", safe_pid)
+        setattr(handle, "_ws_cdp_port", safe_port)
+        setattr(handle, "_ws_external_cdp", True)
+        setattr(handle, "_ws_monitor_managed", bool(monitor_managed))
+        return handle
+
+    def __iter_external_profile_remote_debugging_endpoints(self) -> list[tuple[int, int, bool]]:
+        target_profile = str(self.__profile_dir or "").strip().lower()
+        if not target_profile:
+            return []
+        owned_pids: set[int] = set()
+        proc = self.__hidden_cdp_proc
+        if proc is not None:
+            for attr in ("pid", "_ws_listener_pid"):
+                try:
+                    candidate = int(getattr(proc, attr, 0) or 0)
+                except Exception:
+                    candidate = 0
+                if candidate > 0:
+                    owned_pids.add(candidate)
+        try:
+            owned_port = int(self.__hidden_cdp_port or 0)
+        except Exception:
+            owned_port = 0
+        if owned_port > 0:
+            pid_from_port = self.__find_profile_remote_debugging_pid(owned_port)
+            if pid_from_port > 0:
+                owned_pids.add(int(pid_from_port))
+
+        try:
+            proc_iter = self.__lib.psutil.process_iter(attrs=["pid", "name", "cmdline"])
+        except Exception:
+            return []
+
+        items: list[tuple[int, int, bool]] = []
+        for item in proc_iter:
+            try:
+                info = item.info if hasattr(item, "info") else {}
+                pid = int((info or {}).get("pid") or 0)
+                if pid > 0 and pid in owned_pids:
+                    continue
+                name = str((info or {}).get("name") or "").lower()
+                if "chrome" not in name:
+                    continue
+                cmdline = (info or {}).get("cmdline") or []
+                cmd_text = " ".join(str(x) for x in cmdline).lower()
+                if not cmd_text:
+                    continue
+                if f"--user-data-dir={target_profile}" not in cmd_text:
+                    continue
+                if "--type=" in cmd_text:
+                    continue
+                port = 0
+                for token in cmdline:
+                    text = str(token or "").strip().lower()
+                    prefix = "--remote-debugging-port="
+                    if not text.startswith(prefix):
+                        continue
+                    raw_port = str(text[len(prefix) :]).strip()
+                    try:
+                        parsed = int(raw_port)
+                    except Exception:
+                        parsed = 0
+                    if parsed > 0:
+                        port = int(parsed)
+                        break
+                if port <= 0:
+                    continue
+                managed_tokens = (
+                    "--disable-session-crashed-bubble",
+                    "--hide-crash-restore-bubble",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                    "--disable-notifications",
+                )
+                managed_hit = 0
+                for token in managed_tokens:
+                    if token in cmd_text:
+                        managed_hit += 1
+                monitor_managed = managed_hit >= 4
+                items.append((int(port), int(pid if pid > 0 else 0), bool(monitor_managed)))
+            except Exception:
+                continue
+
+        dedup: list[tuple[int, int, bool]] = []
+        seen_ports: set[int] = set()
+        for port, pid, monitor_managed in items:
+            if port in seen_ports:
+                continue
+            seen_ports.add(port)
+            dedup.append((int(port), int(pid), bool(monitor_managed)))
+
+        try:
+            preferred = int(self.__last_successful_cdp_port or 0)
+        except Exception:
+            preferred = 0
+        if preferred > 0:
+            for idx, item in enumerate(dedup):
+                if int(item[0]) != preferred:
+                    continue
+                dedup.insert(0, dedup.pop(idx))
+                break
+        return dedup
+
+    def __connect_existing_profile_remote_debug_context(self, playwright_obj):
+        last_error = None
+        for port, pid, monitor_managed in self.__iter_external_profile_remote_debugging_endpoints():
+            endpoint = f"http://127.0.0.1:{int(port)}"
+            browser = None
+            try:
+                browser = playwright_obj.chromium.connect_over_cdp(endpoint)
+                contexts = []
+                try:
+                    contexts = list(browser.contexts or [])
+                except Exception:
+                    contexts = []
+                if not contexts:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    continue
+                self.__log(
+                    "hidden cdp attached existing process "
+                    f"port={int(port)} pid={int(pid)} managed={bool(monitor_managed)}"
+                )
+                handle = self.__build_external_cdp_handle(
+                    int(pid),
+                    int(port),
+                    monitor_managed=bool(monitor_managed),
+                )
+                return contexts[0], browser, handle, True
+            except Exception as exc:
+                last_error = exc
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                continue
+        if last_error is not None:
+            self.__log_exception("hidden cdp attach existing failed", last_error)
+        return None, None, None, False
 
     def __connect_hidden_cdp_context(self, playwright_obj, launch_url: str | None = None):
         proc = self.__hidden_cdp_proc
@@ -1786,6 +2576,16 @@ class CodexUsageMonitor:
                     pass
             self.__clear_hidden_cdp_process(terminate=True)
 
+        ext_context, ext_browser, ext_proc, ext_keep = (
+            self.__connect_existing_profile_remote_debug_context(playwright_obj)
+        )
+        if ext_context is not None:
+            return ext_context, ext_browser, ext_proc, ext_keep
+
+        if self.__is_profile_locked_without_remote_debugging():
+            self.__log("hidden cdp launch skipped reason=profile_locked_non_debug")
+            return None, None, None, False
+
         context, browser, proc = self.__launch_interactive_context_via_cdp(
             playwright_obj,
             start_hidden=True,
@@ -1803,6 +2603,27 @@ class CodexUsageMonitor:
             return context, browser, proc, True
         return context, browser, proc, False
 
+    def __promote_cdp_process_for_hidden_reuse(self, proc) -> bool:
+        if proc is None:
+            return False
+        if self.__is_external_cdp_handle(proc):
+            return False
+        try:
+            port = int(getattr(proc, "_ws_cdp_port", 0) or 0)
+        except Exception:
+            port = 0
+        if port <= 0:
+            return False
+        prev = self.__hidden_cdp_proc
+        try:
+            self.__hidden_cdp_proc = proc
+            self.__hidden_cdp_port = int(port)
+        except Exception:
+            return False
+        if prev is not None and prev is not proc:
+            self.__terminate_spawned_process(prev, cleanup_orphans=True)
+        return True
+
     def __set_cdp_window_visibility(
         self,
         proc,
@@ -1812,15 +2633,49 @@ class CodexUsageMonitor:
     ) -> bool:
         if proc is None:
             return False
-        try:
-            pid = int(getattr(proc, "pid", 0) or 0)
-        except Exception:
-            pid = 0
-        if pid <= 0:
+        pid_candidates: list[int] = []
+        for attr in ("_ws_listener_pid", "pid"):
+            try:
+                candidate = int(getattr(proc, attr, 0) or 0)
+            except Exception:
+                candidate = 0
+            if candidate > 0:
+                pid_candidates.append(candidate)
+        for alt_pid in self.__list_profile_chrome_pids():
+            try:
+                candidate = int(alt_pid)
+            except Exception:
+                continue
+            if candidate > 0:
+                pid_candidates.append(candidate)
+        unique_pids: list[int] = []
+        seen: set[int] = set()
+        for pid in pid_candidates:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            unique_pids.append(pid)
+        if not unique_pids:
             return False
+
+        if not bool(visible):
+            hidden_any = False
+            hide_timeout = float(timeout_sec)
+            if hide_timeout > 1.0:
+                hide_timeout = 1.0
+            for candidate in unique_pids:
+                if self.__set_windows_visibility_for_pid(
+                    pid=candidate,
+                    visible=False,
+                    bring_to_front=False,
+                    timeout_sec=hide_timeout,
+                ):
+                    hidden_any = True
+            return hidden_any
+
         primary = self.__set_windows_visibility_for_pid(
-            pid=pid,
-            visible=bool(visible),
+            pid=unique_pids[0],
+            visible=True,
             bring_to_front=bool(bring_to_front),
             timeout_sec=float(timeout_sec),
         )
@@ -1829,16 +2684,10 @@ class CodexUsageMonitor:
         fallback_timeout = float(timeout_sec)
         if fallback_timeout > 1.0:
             fallback_timeout = 1.0
-        for alt_pid in self.__list_profile_chrome_pids():
-            try:
-                candidate = int(alt_pid)
-            except Exception:
-                continue
-            if candidate <= 0 or candidate == pid:
-                continue
+        for candidate in unique_pids[1:]:
             if self.__set_windows_visibility_for_pid(
                 pid=candidate,
-                visible=bool(visible),
+                visible=True,
                 bring_to_front=bool(bring_to_front),
                 timeout_sec=fallback_timeout,
             ):
@@ -1968,6 +2817,60 @@ class CodexUsageMonitor:
             ordered.append(pid)
         return ordered
 
+    def __is_profile_locked_without_remote_debugging(self) -> bool:
+        if self.__root is None:
+            return False
+        target_profile = str(self.__profile_dir or "").strip().lower()
+        if not target_profile:
+            return False
+        owned_pids: set[int] = set()
+        proc = self.__hidden_cdp_proc
+        if proc is not None:
+            for attr in ("pid", "_ws_listener_pid"):
+                try:
+                    candidate = int(getattr(proc, attr, 0) or 0)
+                except Exception:
+                    candidate = 0
+                if candidate > 0:
+                    owned_pids.add(candidate)
+        try:
+            owned_port = int(self.__hidden_cdp_port or 0)
+        except Exception:
+            owned_port = 0
+        if owned_port > 0:
+            pid_from_port = self.__find_profile_remote_debugging_pid(owned_port)
+            if pid_from_port > 0:
+                owned_pids.add(int(pid_from_port))
+        try:
+            proc_iter = self.__lib.psutil.process_iter(attrs=["pid", "name", "cmdline"])
+        except Exception:
+            return False
+        for item in proc_iter:
+            try:
+                info = item.info if hasattr(item, "info") else {}
+                pid = int((info or {}).get("pid") or 0)
+                if pid > 0 and pid in owned_pids:
+                    continue
+                name = str((info or {}).get("name") or "").lower()
+                if "chrome" not in name:
+                    continue
+                cmdline = (info or {}).get("cmdline") or []
+                cmd_text = " ".join(str(x) for x in cmdline).lower()
+                if not cmd_text:
+                    continue
+                if f"--user-data-dir={target_profile}" not in cmd_text:
+                    continue
+                if "--type=" in cmd_text:
+                    # Renderer/GPU helper processes inherit user-data-dir
+                    # but should not be treated as profile lock owners.
+                    continue
+                if "--remote-debugging-pipe" in cmd_text:
+                    continue
+                return True
+            except Exception:
+                continue
+        return False
+
     def __find_profile_remote_debugging_pid(self, port: int) -> int:
         target_profile = str(self.__profile_dir or "").strip().lower()
         if not target_profile:
@@ -2041,7 +2944,17 @@ class CodexUsageMonitor:
                 continue
         return ""
 
-    def __terminate_spawned_process(self, proc) -> None:
+    def __terminate_spawned_process(self, proc, cleanup_orphans: bool = True) -> None:
+        spawned_pid = 0
+        listener_pid = 0
+        try:
+            spawned_pid = int(getattr(proc, "pid", 0) or 0)
+        except Exception:
+            spawned_pid = 0
+        try:
+            listener_pid = int(getattr(proc, "_ws_listener_pid", 0) or 0)
+        except Exception:
+            listener_pid = 0
         # 1) Stop the direct spawned process (if still alive).
         if proc is not None:
             running = False
@@ -2066,10 +2979,43 @@ class CodexUsageMonitor:
                     except Exception:
                         pass
 
-        # 2) Cleanup orphaned Chrome instances attached to this monitor profile.
+        # 2) When CDP listener was remapped to another pid, terminate that
+        # listener explicitly to avoid leaving detached blank windows behind.
+        if listener_pid > 0 and listener_pid != spawned_pid:
+            self.__terminate_pid_tree(listener_pid)
+
+        # 3) Cleanup orphaned Chrome instances attached to this monitor profile.
         # Some Chrome launches can detach from the original parent process,
         # leaving visible windows even after the collected snapshot returns.
-        self.__terminate_profile_remote_debugging_processes()
+        if bool(cleanup_orphans):
+            self.__terminate_profile_remote_debugging_processes()
+        return
+
+    def __terminate_pid_tree(self, pid: int) -> None:
+        try:
+            target = self.__lib.psutil.Process(int(pid))
+        except Exception:
+            return
+        try:
+            children = target.children(recursive=True)
+        except Exception:
+            children = []
+        for child in children:
+            try:
+                child.terminate()
+            except Exception:
+                continue
+        try:
+            target.terminate()
+        except Exception:
+            return
+        try:
+            target.wait(timeout=2.0)
+        except Exception:
+            try:
+                target.kill()
+            except Exception:
+                pass
         return
 
     def __terminate_profile_remote_debugging_processes(self) -> None:
@@ -2124,6 +3070,36 @@ class CodexUsageMonitor:
                     item.kill()
                 except Exception:
                     continue
+
+    def __terminate_profile_chrome_processes(self) -> None:
+        pids = self.__list_profile_chrome_pids()
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                proc = self.__lib.psutil.Process(int(pid))
+            except Exception:
+                continue
+            try:
+                children = proc.children(recursive=True)
+            except Exception:
+                children = []
+            for child in children:
+                try:
+                    child.terminate()
+                except Exception:
+                    continue
+            try:
+                proc.terminate()
+            except Exception:
+                continue
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def __apply_headless_fast_routes(self, context) -> None:
         try:
@@ -2227,6 +3203,8 @@ class CodexUsageMonitor:
         stagnant_count = 0
         last_url = ""
         while True:
+            if self.__is_collect_cancel_requested():
+                return False
             if self.__is_cloudflare_challenge(page):
                 now_cf = 0.0
                 try:
@@ -2238,6 +3216,7 @@ class CodexUsageMonitor:
                     return False
 
             if not self.__is_login_required(page):
+                self.__set_session_state("logged_in")
                 return True
 
             did_open = self.__try_open_login_entry(
@@ -2264,10 +3243,12 @@ class CodexUsageMonitor:
             except Exception:
                 now = deadline + 1.0
             if now > deadline:
+                self.__set_session_state("logged_out")
                 return False
             try:
                 page.wait_for_timeout(1000)
             except Exception:
+                self.__set_session_state("logged_out")
                 return False
 
     def __try_open_login_entry(self, page, force: bool = False) -> bool:
@@ -2452,6 +3433,8 @@ class CodexUsageMonitor:
         except Exception:
             deadline = 0.0
         while True:
+            if self.__is_collect_cancel_requested():
+                return False
             if not self.__is_cloudflare_challenge(page):
                 return True
             now = 0.0
@@ -2580,9 +3563,11 @@ class CodexUsageMonitor:
             return False
 
     def __load_settings(self) -> None:
+        self.__force_playwright_mode()
         data = self.__read_json_file(self.__settings_path)
         if not isinstance(data, dict):
             data = {}
+        dirty = False
         try:
             self.__enabled = bool(data.get("enabled", self.__enabled))
         except Exception:
@@ -2594,6 +3579,7 @@ class CodexUsageMonitor:
         min_interval = float(getattr(self, "_CodexUsageMonitor__min_interval_sec", 10.0) or 10.0)
         if interval < min_interval:
             interval = min_interval
+            dirty = True
         self.__interval_sec = float(interval)
         try:
             tooltip = int(data.get("tooltip_duration_ms", self.__tooltip_duration_ms))
@@ -2601,11 +3587,13 @@ class CodexUsageMonitor:
             tooltip = self.__tooltip_duration_ms
         if tooltip < 1200:
             tooltip = 1200
+            dirty = True
         self.__tooltip_duration_ms = int(tooltip)
         usage_url = normalize_usage_value(data.get("usage_url", self.__usage_url))
         if usage_url:
             self.__usage_url = usage_url
-        self.__save_settings()
+        if bool(dirty):
+            self.__save_settings()
         return
 
     def __save_settings(self) -> None:

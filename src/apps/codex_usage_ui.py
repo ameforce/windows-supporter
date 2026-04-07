@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 
@@ -18,6 +19,8 @@ class CodexUsageSettingsView:
         self._usage_url_var = None
         self._status_var = None
         self._status_label = None
+        self._login_button = None
+        self._logout_button = None
         self._runtime_after_id = None
         self._collect_state_var = None
         self._next_collect_var = None
@@ -91,6 +94,14 @@ class CodexUsageSettingsView:
         btn_row.pack(side="right")
         ttk.Button(btn_row, text="저장", command=self._on_save).pack(side="right")
         ttk.Button(btn_row, text="로드하기", command=self._on_reload).pack(
+            side="right", padx=(0, 8)
+        )
+        self._logout_button = ttk.Button(btn_row, text="로그아웃", command=self._on_release_profile)
+        self._logout_button.pack(
+            side="right", padx=(0, 8)
+        )
+        self._login_button = ttk.Button(btn_row, text="로그인", command=self._on_login)
+        self._login_button.pack(
             side="right", padx=(0, 8)
         )
 
@@ -342,6 +353,91 @@ class CodexUsageSettingsView:
         self._set_status("로드 완료", level="ok")
         return
 
+    def _on_login(self) -> None:
+        if not hasattr(self._codex, "show_current_status"):
+            self._set_status("로그인 기능을 사용할 수 없습니다.", level="error")
+            return
+        try:
+            runtime = self._safe_get_runtime()
+            if bool(runtime.get("logout_in_progress", False)):
+                self._set_status("로그아웃 진행 중입니다. 완료 후 다시 시도해 주세요.", level="info")
+                return
+            can_login = bool(runtime.get("can_login", True))
+            if not can_login:
+                self._set_status("현재 상태에서는 로그인 요청을 시작할 수 없습니다.", level="info")
+                return
+        except Exception:
+            pass
+        self._set_status("로그인/조회 요청을 시작합니다...", level="info")
+        try:
+            self._codex.show_current_status(force_refresh=True)
+        except Exception:
+            self._set_status("로그인 요청 중 오류가 발생했습니다.", level="error")
+            return
+        return
+
+    def _on_release_profile(self) -> None:
+        tk = self._tk
+        if tk is None:
+            return
+        if not hasattr(self._codex, "release_profile_session"):
+            self._set_status("로그아웃 기능을 사용할 수 없습니다.", level="error")
+            return
+        confirmed = True
+        try:
+            from tkinter import messagebox
+
+            confirmed = bool(
+                messagebox.askyesno(
+                    "로그아웃",
+                    "현재 Codex 로그인 세션에서 로그아웃하시겠습니까?\n"
+                    "로그아웃 후에는 로그인 버튼 또는 Ctrl+Alt+C로 다시 로그인할 수 있습니다.",
+                    parent=self._win,
+                )
+            )
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            return
+
+        self._set_status("로그아웃 중...", level="info")
+
+        def worker() -> None:
+            ok = False
+            message = ""
+            try:
+                ok, message = self._codex.release_profile_session()
+            except Exception:
+                ok = False
+                message = "로그아웃 중 오류가 발생했습니다."
+            if not message:
+                message = "로그아웃이 완료되었습니다." if ok else "로그아웃에 실패했습니다."
+
+            def done() -> None:
+                if ok:
+                    self._load_settings()
+                    self._refresh_runtime_status()
+                    self._set_status(message, level="ok")
+                    return
+                self._set_status(message, level="error")
+                return
+
+            win = self._win
+            if win is not None:
+                try:
+                    win.after(0, done)
+                    return
+                except Exception:
+                    pass
+            done()
+            return
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._set_status("로그아웃 작업을 시작하지 못했습니다.", level="error")
+        return
+
     def _parse_seconds(self, text: str, default: float) -> float:
         raw = str(text or "").strip()
         if not raw:
@@ -431,15 +527,25 @@ class CodexUsageSettingsView:
         if win is None:
             return
         runtime = self._safe_get_runtime()
+        session_state = str(runtime.get("session_state", "logged_out") or "logged_out")
+        monitor_state = str(runtime.get("monitor_state", "idle") or "idle")
+        logout_in_progress = bool(runtime.get("logout_in_progress", False))
+        profile_in_use = bool(runtime.get("profile_in_use", False))
         try:
             inflight = bool(runtime.get("collect_inflight", False))
         except Exception:
             inflight = False
         source = str(runtime.get("collect_source", "") or "")
-        if inflight:
+        if logout_in_progress or monitor_state == "cancelling":
+            state = "로그아웃 중"
+        elif inflight:
             state = "조회 중"
             if source:
                 state = f"조회 중 ({source})"
+        elif profile_in_use or monitor_state == "paused_profile_in_use":
+            state = "프로필 사용 중 (자동 일시중지)"
+        elif session_state == "logged_out":
+            state = "로그인 필요"
         else:
             state = "대기 중"
 
@@ -447,7 +553,12 @@ class CodexUsageSettingsView:
         remain = runtime.get("next_collect_in_sec", None)
         is_estimated = bool(runtime.get("next_collect_estimated", False))
         try:
-            if remain is not None:
+            if (
+                remain is not None
+                and session_state != "logged_out"
+                and not profile_in_use
+                and not inflight
+            ):
                 seconds = float(remain)
                 if seconds < 0:
                     seconds = 0.0
@@ -505,7 +616,40 @@ class CodexUsageSettingsView:
         except Exception:
             pass
 
+        self._refresh_action_buttons(runtime=runtime)
         self._schedule_runtime_refresh(1000)
+        return
+
+    def _refresh_action_buttons(self, runtime: dict[str, Any]) -> None:
+        login_button = self._login_button
+        logout_button = self._logout_button
+        try:
+            can_login = bool(runtime.get("can_login", False))
+        except Exception:
+            can_login = False
+        try:
+            can_logout = bool(runtime.get("can_logout", False))
+        except Exception:
+            can_logout = False
+        self._set_button_enabled(login_button, can_login)
+        self._set_button_enabled(logout_button, can_logout)
+        return
+
+    def _set_button_enabled(self, button: Any, enabled: bool) -> None:
+        if button is None:
+            return
+        try:
+            if bool(enabled):
+                button.state(["!disabled"])
+            else:
+                button.state(["disabled"])
+            return
+        except Exception:
+            pass
+        try:
+            button.configure(state="normal" if bool(enabled) else "disabled")
+        except Exception:
+            pass
         return
 
     def _open_path(self, path: str) -> None:
