@@ -86,14 +86,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ) as collect_once:
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__ui_post",
-                side_effect=lambda fn: fn(),
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=None,
             ):
-                with patch.object(self.monitor, "_CodexUsageMonitor__show_tooltip") as show_tip:
-                    snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                        object(),
-                        source="manual_query",
-                    )
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__ui_post",
+                    side_effect=lambda fn: fn(),
+                ):
+                    with patch.object(self.monitor, "_CodexUsageMonitor__show_tooltip") as show_tip:
+                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="manual_query",
+                        )
 
         self.assertEqual(err, "parse_failed")
         self.assertIsNone(snap)
@@ -104,6 +109,107 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertFalse(first_call.kwargs.get("allow_interactive_recovery"))
         self.assertTrue(first_call.kwargs.get("force_hidden"))
         self.assertFalse(show_tip.called)
+
+    def test_collect_with_playwright_obj_recovers_from_profile_in_use_via_raw_cdp(self) -> None:
+        recovered = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "code_review": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T11:05:00",
+        )
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            return_value=(None, "profile_in_use"),
+        ) as collect_once:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=recovered,
+            ) as raw_collect:
+                snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                    object(),
+                    source="manual_query",
+                )
+
+        self.assertIsNone(err)
+        self.assertIs(snap, recovered)
+        self.assertEqual(collect_once.call_count, 1)
+        self.assertEqual(raw_collect.call_count, 1)
+
+    def test_collect_with_playwright_obj_recovers_from_cloudflare_via_raw_cdp(self) -> None:
+        recovered = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "code_review": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T11:05:00",
+        )
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            return_value=(None, "cloudflare_challenge"),
+        ) as collect_once:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=recovered,
+            ) as raw_collect:
+                snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                    object(),
+                    source="manual_query",
+                )
+
+        self.assertIsNone(err)
+        self.assertIs(snap, recovered)
+        self.assertEqual(collect_once.call_count, 1)
+        self.assertEqual(raw_collect.call_count, 1)
+
+    def test_collect_with_playwright_obj_does_not_use_raw_cdp_for_login_required(self) -> None:
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            return_value=(None, "login_required"),
+        ) as collect_once:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                side_effect=AssertionError("raw cdp recovery should not run"),
+            ):
+                self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                    object(),
+                    source="startup_warmup",
+                )
+
+        self.assertEqual(collect_once.call_count, 1)
+
+    def test_raw_cdp_probe_target_executes_probe_function_expression(self) -> None:
+        payload = {
+            "url": "https://chatgpt.com/codex/cloud/settings/usage",
+            "mainText": "Usage",
+            "metricBlocks": [],
+        }
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__raw_cdp_send",
+            return_value={"result": {"result": {"value": payload}}},
+        ) as raw_send:
+            probe = self.monitor._CodexUsageMonitor__raw_cdp_probe_target(
+                object(),
+                "session-1",
+            )
+
+        self.assertEqual(probe["url"], payload["url"])
+        params = raw_send.call_args.args[2]
+        self.assertTrue(str(params.get("expression", "")).startswith("("))
+        self.assertTrue(str(params.get("expression", "")).endswith(")()"))
 
     def test_collect_with_playwright_obj_retries_hidden_before_opening_interactive(self) -> None:
         recovered = UsageSnapshot.from_metrics(
@@ -126,14 +232,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ) as collect_once:
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__ui_post",
-                side_effect=lambda fn: fn(),
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=None,
             ):
-                with patch.object(self.monitor._CodexUsageMonitor__lib.time, "monotonic", return_value=2000.0):
-                    snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                        object(),
-                        source="manual_query",
-                    )
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__ui_post",
+                    side_effect=lambda fn: fn(),
+                ):
+                    with patch.object(self.monitor._CodexUsageMonitor__lib.time, "monotonic", return_value=2000.0):
+                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="manual_query",
+                        )
 
         self.assertIsNone(err)
         self.assertIsNotNone(snap)
@@ -170,22 +281,27 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ) as collect_once:
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__ui_post",
-                side_effect=lambda fn: fn(),
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=None,
             ):
                 with patch.object(
                     self.monitor,
-                    "_CodexUsageMonitor__prepare_interactive_recovery_launch",
-                ) as prepare_interactive:
+                    "_CodexUsageMonitor__ui_post",
+                    side_effect=lambda fn: fn(),
+                ):
                     with patch.object(
-                        self.monitor._CodexUsageMonitor__lib.time,
-                        "monotonic",
-                        return_value=2000.0,
-                    ):
-                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                            object(),
-                            source="manual_query",
-                        )
+                        self.monitor,
+                        "_CodexUsageMonitor__prepare_interactive_recovery_launch",
+                    ) as prepare_interactive:
+                        with patch.object(
+                            self.monitor._CodexUsageMonitor__lib.time,
+                            "monotonic",
+                            return_value=2000.0,
+                        ):
+                            snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                                object(),
+                                source="manual_query",
+                            )
 
         self.assertTrue(prepare_interactive.called)
         self.assertEqual(
@@ -210,7 +326,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertFalse(third_call.kwargs.get("force_hidden"))
         self.assertEqual(
             third_call.kwargs.get("initial_url"),
-            "https://chatgpt.com/auth/login?next=/codex/settings/usage",
+            "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
         )
 
     def test_collect_with_playwright_obj_skips_interactive_for_background_source(self) -> None:
@@ -221,14 +337,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ) as collect_once:
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__ui_post",
-                side_effect=lambda fn: fn(),
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=None,
             ):
-                with patch.object(self.monitor, "_CodexUsageMonitor__show_tooltip") as show_tip:
-                    snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                        object(),
-                        source="startup_warmup",
-                    )
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__ui_post",
+                    side_effect=lambda fn: fn(),
+                ):
+                    with patch.object(self.monitor, "_CodexUsageMonitor__show_tooltip") as show_tip:
+                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="startup_warmup",
+                        )
 
         self.assertEqual(err, "cloudflare_challenge")
         self.assertIsNone(snap)
@@ -280,7 +401,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_is_cloudflare_challenge_detects_html_marker_with_empty_body_text(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def evaluate(self, _expr):
                 return ""
@@ -299,7 +420,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
     def test_is_cloudflare_challenge_detects_cf_query_token(self) -> None:
         class _DummyPage:
             url = (
-                "https://chatgpt.com/codex/settings/usage?"
+                "https://chatgpt.com/codex/cloud/settings/usage?"
                 "__cf_chl_rt_tk=token-123"
             )
 
@@ -316,7 +437,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
     def test_is_cloudflare_challenge_ignores_cf_token_when_usage_content_visible(self) -> None:
         class _DummyPage:
             url = (
-                "https://chatgpt.com/codex/settings/usage?"
+                "https://chatgpt.com/codex/cloud/settings/usage?"
                 "__cf_chl_rt_tk=token-123"
             )
 
@@ -341,7 +462,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_is_cloudflare_challenge_ignores_html_marker_when_usage_content_visible(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def evaluate(self, _expr):
                 return (
@@ -392,7 +513,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_wait_until_logged_in_performs_active_login_entry(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def wait_for_timeout(self, _ms):
                 return None
@@ -580,7 +701,165 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIn("https://chatgpt.com/codex/settings/usage", page.goto_calls)
+        self.assertIn("https://chatgpt.com/codex/cloud/settings/usage", page.goto_calls)
+
+    def test_build_snapshot_accepts_semantic_limit_metric_snapshot(self) -> None:
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__probe_usage_page",
+            return_value={
+                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "mainText": "Usage 5-hour usage limit 25% weekly usage limit 28%",
+                "metricBlocks": [
+                    {
+                        "metric_key": "five_hour_limit",
+                        "label_text": "5-hour usage limit",
+                        "block_text": "5-hour usage limit 25%",
+                        "value_candidates": ["25%"],
+                    },
+                    {
+                        "metric_key": "weekly_limit",
+                        "label_text": "weekly usage limit",
+                        "block_text": "weekly usage limit 28%",
+                        "value_candidates": ["28%"],
+                    },
+                ],
+            },
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__now_iso",
+                return_value="2026-03-30T12:05:00",
+            ):
+                snap = self.monitor._CodexUsageMonitor__build_snapshot_from_page(_DummyPage())
+
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.five_hour_limit, "25%")
+        self.assertEqual(snap.weekly_limit, "28%")
+
+    def test_build_snapshot_rejects_metric_block_when_value_normalization_fails(self) -> None:
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__probe_usage_page",
+            return_value={
+                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "mainText": "Usage 5-hour usage limit Connectors",
+                "metricBlocks": [
+                    {
+                        "metric_key": "five_hour_limit",
+                        "label_text": "5-hour usage limit",
+                        "block_text": "5-hour usage limit Connectors",
+                        "value_candidates": ["Connectors"],
+                    }
+                ],
+            },
+        ):
+            snap = self.monitor._CodexUsageMonitor__build_snapshot_from_page(_DummyPage())
+
+        self.assertIsNone(snap)
+
+    def test_wait_for_snapshot_ready_returns_parse_failed_when_usage_page_reached_but_no_metric_blocks(self) -> None:
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
+
+            def wait_for_timeout(self, _ms):
+                return None
+
+        probes = [
+            {
+                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "mainText": "Usage loading",
+                "metricBlocks": [],
+            },
+            {
+                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "mainText": "Usage loading",
+                "metricBlocks": [],
+            },
+        ]
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__probe_usage_page",
+            side_effect=probes,
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__is_cloudflare_challenge",
+                return_value=False,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__is_login_required",
+                    return_value=False,
+                ):
+                    with patch.object(
+                        self.monitor._CodexUsageMonitor__lib.time,
+                        "monotonic",
+                        side_effect=[0.0, 0.1, 5.1],
+                    ):
+                        got, err = self.monitor._CodexUsageMonitor__wait_for_snapshot_ready(
+                            _DummyPage(),
+                            timeout_sec=5.0,
+                        )
+
+        self.assertIsNone(got)
+        self.assertEqual(err, "parse_failed")
+
+    def test_wait_for_snapshot_ready_retries_until_dom_ready_then_accepts_snapshot(self) -> None:
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
+
+            def wait_for_timeout(self, _ms):
+                return None
+
+        probe_loading = {
+            "url": "https://chatgpt.com/codex/cloud/settings/usage",
+            "mainText": "Usage loading",
+            "metricBlocks": [],
+        }
+        probe_ready = {
+            "url": "https://chatgpt.com/codex/cloud/settings/usage",
+            "mainText": "Usage 5-hour usage limit 24%",
+            "metricBlocks": [
+                {
+                    "metric_key": "five_hour_limit",
+                    "label_text": "5-hour usage limit",
+                    "block_text": "5-hour usage limit 24%",
+                    "value_candidates": ["24%"],
+                }
+            ],
+        }
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__probe_usage_page",
+            side_effect=[probe_loading, probe_ready],
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__now_iso",
+                return_value="2026-03-30T12:07:00",
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib.time,
+                    "monotonic",
+                    side_effect=[0.0, 0.2, 0.4],
+                ):
+                    got, err = self.monitor._CodexUsageMonitor__wait_for_snapshot_ready(
+                        _DummyPage(),
+                        timeout_sec=5.0,
+                    )
+
+        self.assertIsNone(err)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.five_hour_limit, "24%")
 
     def test_collect_snapshot_once_prefers_cdp_context_for_interactive(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
@@ -594,7 +873,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -640,7 +919,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 headless=False,
                                 allow_interactive_recovery=True,
                                 prefer_system_channel=True,
-                                initial_url="https://chatgpt.com/auth/login?next=/codex/settings/usage",
+                                initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
                             )
 
         self.assertIsNone(err)
@@ -669,7 +948,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -733,7 +1012,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                     allow_interactive_recovery=True,
                                     force_hidden=False,
                                     prefer_system_channel=True,
-                                    initial_url="https://chatgpt.com/auth/login?next=/codex/settings/usage",
+                                    initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
                                 )
 
         self.assertIsNone(err)
@@ -763,7 +1042,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -826,7 +1105,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                         allow_interactive_recovery=True,
                                         force_hidden=False,
                                         prefer_system_channel=True,
-                                        initial_url="https://chatgpt.com/auth/login?next=/codex/settings/usage",
+                                        initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
                                     )
 
         self.assertIsNone(err)
@@ -852,7 +1131,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             pid = 12345
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -935,9 +1214,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         class _DummyChromium:
             def __init__(self):
                 self.endpoints: list[str] = []
+                self.timeouts: list[int | None] = []
 
-            def connect_over_cdp(self, endpoint):
+            def connect_over_cdp(self, endpoint, timeout=None, **_kwargs):
                 self.endpoints.append(str(endpoint))
+                self.timeouts.append(timeout)
                 return _DummyBrowser()
 
         class _DummyPlaywright:
@@ -968,7 +1249,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             ):
                 context, browser, proc, keep = self.monitor._CodexUsageMonitor__connect_hidden_cdp_context(
                     playwright_obj,
-                    launch_url="https://chatgpt.com/codex/settings/usage",
+                    launch_url="https://chatgpt.com/codex/cloud/settings/usage",
                 )
 
         self.assertIsNotNone(context)
@@ -977,6 +1258,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(bool(getattr(proc, "_ws_external_cdp", False)))
         self.assertEqual(int(getattr(proc, "_ws_cdp_port", 0)), 9333)
         self.assertEqual(playwright_obj.chromium.endpoints, ["http://127.0.0.1:9333"])
+        self.assertEqual(
+            playwright_obj.chromium.timeouts,
+            [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
+        )
 
     def test_collect_snapshot_once_external_cdp_avoids_window_hide_and_closes_temp_page(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
@@ -1229,11 +1514,16 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyChromium:
-            def connect_over_cdp(self, _endpoint):
+            def __init__(self):
+                self.timeouts: list[int | None] = []
+
+            def connect_over_cdp(self, _endpoint, timeout=None, **_kwargs):
+                self.timeouts.append(timeout)
                 return _DummyBrowser()
 
         class _DummyPlaywright:
-            chromium = _DummyChromium()
+            def __init__(self):
+                self.chromium = _DummyChromium()
 
         popen_calls: list[tuple[list[str], dict]] = []
 
@@ -1246,6 +1536,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 self.dwFlags = 0
                 self.wShowWindow = 0
 
+        playwright_obj = _DummyPlaywright()
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__resolve_chrome_executable_path",
@@ -1272,7 +1563,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         ):
                             context, browser, proc = (
                                 self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
-                                    _DummyPlaywright(),
+                                    playwright_obj,
                                     start_hidden=True,
                                 )
                             )
@@ -1288,8 +1579,12 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--hide-crash-restore-bubble", cmd)
         self.assertNotIn("--window-position=-32000,-32000", cmd)
         self.assertNotIn("about:blank", cmd)
-        self.assertIn("https://chatgpt.com/codex/settings/usage", cmd)
+        self.assertIn("https://chatgpt.com/codex/cloud/settings/usage", cmd)
         self.assertIn("startupinfo", kwargs)
+        self.assertEqual(
+            playwright_obj.chromium.timeouts,
+            [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
+        )
 
     def test_launch_interactive_context_via_cdp_accepts_listener_pid_remap(self) -> None:
         class _DummyProc:
@@ -1310,11 +1605,16 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyChromium:
-            def connect_over_cdp(self, _endpoint):
+            def __init__(self):
+                self.timeouts: list[int | None] = []
+
+            def connect_over_cdp(self, _endpoint, timeout=None, **_kwargs):
+                self.timeouts.append(timeout)
                 return _DummyBrowser()
 
         class _DummyPlaywright:
-            chromium = _DummyChromium()
+            def __init__(self):
+                self.chromium = _DummyChromium()
 
         popen_calls: list[list[str]] = []
         popen_pids = [11111]
@@ -1323,6 +1623,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             popen_calls.append(list(cmd))
             return _DummyProc(popen_pids[len(popen_calls) - 1])
 
+        playwright_obj = _DummyPlaywright()
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__resolve_chrome_executable_path",
@@ -1348,7 +1649,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         ):
                             context, browser, proc = (
                                 self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
-                                    _DummyPlaywright(),
+                                    playwright_obj,
                                     start_hidden=False,
                                 )
                             )
@@ -1363,6 +1664,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--disable-session-crashed-bubble", popen_calls[0])
         self.assertIn("--hide-crash-restore-bubble", popen_calls[0])
         self.assertIn("--no-first-run", popen_calls[0])
+        self.assertEqual(
+            playwright_obj.chromium.timeouts,
+            [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
+        )
 
     def test_collect_snapshot_once_reuses_hidden_cdp_process_between_calls(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
@@ -1383,7 +1688,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1408,9 +1713,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         class _DummyChromium:
             def __init__(self):
                 self.connect_calls = 0
+                self.timeouts: list[int | None] = []
 
-            def connect_over_cdp(self, _endpoint):
+            def connect_over_cdp(self, _endpoint, timeout=None, **_kwargs):
                 self.connect_calls += 1
+                self.timeouts.append(timeout)
                 return _DummyBrowser()
 
         class _DummyPlaywright:
@@ -1472,6 +1779,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNotNone(got1)
         self.assertIsNotNone(got2)
         self.assertEqual(launch_cdp.call_count, 1)
+        self.assertEqual(
+            pw.chromium.timeouts,
+            [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
+        )
 
     def test_select_collect_page_prefers_non_blank_and_closes_extra_blank_tabs(self) -> None:
         class _DummyPage:
@@ -1493,13 +1804,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return p
 
         blank1 = _DummyPage("about:blank")
-        usage = _DummyPage("https://chatgpt.com/codex/settings/usage")
+        usage = _DummyPage("https://chatgpt.com/codex/cloud/settings/usage")
         blank2 = _DummyPage("chrome://newtab/")
         ctx = _DummyContext([blank1, usage, blank2])
 
         selected = self.monitor._CodexUsageMonitor__select_collect_page(
             ctx,
-            preferred_url="https://chatgpt.com/codex/settings/usage",
+            preferred_url="https://chatgpt.com/codex/cloud/settings/usage",
             close_extra_blank_tabs=True,
         )
 
@@ -1522,7 +1833,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             pid = 12345
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1587,7 +1898,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             pid = 12345
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1649,7 +1960,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1763,7 +2074,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1815,8 +2126,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
     def test_build_snapshot_rejects_remaining_credit_only_noise(self) -> None:
         with patch.object(
             self.monitor,
-            "_CodexUsageMonitor__extract_metrics",
-            return_value={"remaining_credit": "0"},
+            "_CodexUsageMonitor__probe_usage_page",
+            return_value={
+                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "mainText": "Usage remaining credit 0",
+                "metricBlocks": [
+                    {
+                        "metric_key": "remaining_credit",
+                        "label_text": "remaining credit",
+                        "block_text": "remaining credit 0",
+                        "value_candidates": ["0"],
+                    }
+                ],
+            },
         ):
             with patch.object(
                 self.monitor,
@@ -2521,7 +2843,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         "enabled": True,
                         "interval_sec": 10,
                         "tooltip_duration_ms": 7000,
-                        "usage_url": "https://chatgpt.com/codex/settings/usage",
+                        "usage_url": "https://chatgpt.com/codex/cloud/settings/usage",
                     }
                 )
 
@@ -2958,7 +3280,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         "enabled": True,
                         "interval_sec": 30,
                         "tooltip_duration_ms": 7000,
-                        "usage_url": "https://chatgpt.com/codex/settings/usage",
+                        "usage_url": "https://chatgpt.com/codex/cloud/settings/usage",
                         "collection_mode": "api",
                     }
                 )
@@ -2981,7 +3303,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 "enabled": True,
                 "interval_sec": 15,
                 "tooltip_duration_ms": 7000,
-                "usage_url": "https://chatgpt.com/codex/settings/usage",
+                "usage_url": "https://chatgpt.com/codex/cloud/settings/usage",
                 "collection_mode": "api",
             },
         ):
@@ -3228,7 +3550,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -3285,7 +3607,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 allow_interactive_recovery=True,
                                 force_hidden=False,
                                 prefer_system_channel=True,
-                                initial_url="https://chatgpt.com/auth/login?next=/codex/settings/usage",
+                                initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
                             )
 
         self.assertIsNone(err)
