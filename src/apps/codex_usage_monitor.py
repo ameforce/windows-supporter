@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
-import html
+import hashlib
 import json
+import os
 import re
 import shutil
+import socket
 import threading
 import traceback
+import urllib.request
 from datetime import timedelta, timezone
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
+
+try:
+    import websocket
+except Exception:  # pragma: no cover - optional runtime bridge
+    websocket = None
 
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
@@ -27,6 +37,315 @@ USAGE_METRIC_LABELS: dict[str, str] = {
     "code_review": "코드 검토",
     "remaining_credit": "남은 크레딧",
 }
+
+CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/usage"
+CODEX_USAGE_PAGE_PATHS = (
+    "/codex/settings/usage",
+    "/codex/cloud/settings/usage",
+)
+RAW_CDP_COMMAND_TIMEOUT_SEC = 8.0
+
+
+class _FallbackWebSocketClient:
+    _ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(
+        self,
+        url: str,
+        timeout: float | None = None,
+        suppress_origin: bool = True,
+    ) -> None:
+        _ = suppress_origin
+        self._url = str(url or "")
+        self._timeout = float(timeout or RAW_CDP_COMMAND_TIMEOUT_SEC)
+        if self._timeout <= 0.0:
+            self._timeout = float(RAW_CDP_COMMAND_TIMEOUT_SEC)
+        self._sock: socket.socket | None = None
+        self._recv_buffer = bytearray()
+        self._connect()
+
+    def _connect(self) -> None:
+        parsed = urlsplit(self._url)
+        if str(parsed.scheme or "").lower() != "ws":
+            raise ValueError("only ws:// raw CDP websocket endpoints are supported")
+        host = str(parsed.hostname or "").strip()
+        if not host:
+            raise ValueError("raw CDP websocket host is required")
+        port = int(parsed.port or 80)
+        path = str(parsed.path or "/")
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+        sock = socket.create_connection((host, port), timeout=self._timeout)
+        sock.settimeout(self._timeout)
+        sock.sendall(request)
+        response = self._recv_http_headers(sock)
+        header_blob, _, tail = response.partition(b"\r\n\r\n")
+        status_line, _, header_lines = header_blob.partition(b"\r\n")
+        if b" 101 " not in status_line:
+            sock.close()
+            raise ConnectionError(
+                f"raw CDP websocket upgrade failed: {status_line.decode('utf-8', 'replace')}"
+            )
+        headers: dict[str, str] = {}
+        for raw_line in header_lines.split(b"\r\n"):
+            if b":" not in raw_line:
+                continue
+            key_bytes, value_bytes = raw_line.split(b":", 1)
+            headers[key_bytes.decode("utf-8", "replace").strip().lower()] = (
+                value_bytes.decode("utf-8", "replace").strip()
+            )
+        expected_accept = base64.b64encode(
+            hashlib.sha1(f"{key}{self._ACCEPT_GUID}".encode("ascii")).digest()
+        ).decode("ascii")
+        if headers.get("sec-websocket-accept", "") != expected_accept:
+            sock.close()
+            raise ConnectionError("raw CDP websocket handshake validation failed")
+        self._sock = sock
+        if tail:
+            self._recv_buffer.extend(tail)
+
+    def _recv_http_headers(self, sock: socket.socket) -> bytes:
+        data = bytearray()
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
+
+    def settimeout(self, timeout: float) -> None:
+        self._timeout = float(timeout or RAW_CDP_COMMAND_TIMEOUT_SEC)
+        if self._timeout <= 0.0:
+            self._timeout = float(RAW_CDP_COMMAND_TIMEOUT_SEC)
+        if self._sock is not None:
+            self._sock.settimeout(self._timeout)
+
+    def _recv_exact(self, count: int) -> bytes:
+        while len(self._recv_buffer) < int(count):
+            if self._sock is None:
+                raise EOFError("raw CDP websocket is closed")
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise EOFError("raw CDP websocket closed while receiving frame")
+            self._recv_buffer.extend(chunk)
+        data = bytes(self._recv_buffer[:count])
+        del self._recv_buffer[:count]
+        return data
+
+    def _send_frame(self, payload: bytes, opcode: int) -> None:
+        if self._sock is None:
+            raise EOFError("raw CDP websocket is closed")
+        payload_bytes = payload or b""
+        header = bytearray()
+        header.append(0x80 | (int(opcode) & 0x0F))
+        payload_len = len(payload_bytes)
+        if payload_len < 126:
+            header.append(0x80 | payload_len)
+        elif payload_len < (1 << 16):
+            header.append(0x80 | 126)
+            header.extend(payload_len.to_bytes(2, "big"))
+        else:
+            header.append(0x80 | 127)
+            header.extend(payload_len.to_bytes(8, "big"))
+        mask = os.urandom(4)
+        header.extend(mask)
+        masked = bytes(
+            value ^ mask[idx % 4] for idx, value in enumerate(payload_bytes)
+        )
+        self._sock.sendall(bytes(header) + masked)
+
+    def send(self, payload: str) -> None:
+        self._send_frame(str(payload or "").encode("utf-8"), opcode=0x1)
+
+    def recv(self) -> str:
+        chunks: list[bytes] = []
+        message_opcode = 0
+        while True:
+            first = self._recv_exact(2)
+            fin = bool(first[0] & 0x80)
+            opcode = int(first[0] & 0x0F)
+            masked = bool(first[1] & 0x80)
+            payload_len = int(first[1] & 0x7F)
+            if payload_len == 126:
+                payload_len = int.from_bytes(self._recv_exact(2), "big")
+            elif payload_len == 127:
+                payload_len = int.from_bytes(self._recv_exact(8), "big")
+            mask = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(payload_len) if payload_len > 0 else b""
+            if masked and mask:
+                payload = bytes(
+                    value ^ mask[idx % 4] for idx, value in enumerate(payload)
+                )
+            if opcode == 0x8:
+                self.close()
+                raise EOFError("raw CDP websocket received close frame")
+            if opcode == 0x9:
+                self._send_frame(payload, opcode=0xA)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode not in (0x0, 0x1, 0x2):
+                continue
+            if opcode != 0x0:
+                message_opcode = opcode
+            chunks.append(payload)
+            if not fin:
+                continue
+            message = b"".join(chunks)
+            if message_opcode == 0x2:
+                return message.decode("utf-8", "replace")
+            return message.decode("utf-8", "replace")
+
+    def close(self) -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        try:
+            self._send_frame(b"", opcode=0x8)
+        except Exception:
+            pass
+        self._sock = None
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _create_raw_websocket_connection(url: str, timeout: float) -> Any:
+    if websocket is not None:
+        return websocket.create_connection(
+            str(url),
+            timeout=float(timeout),
+            suppress_origin=True,
+        )
+    return _FallbackWebSocketClient(
+        str(url),
+        timeout=float(timeout),
+        suppress_origin=True,
+    )
+
+USAGE_PAGE_PROBE_SCRIPT = r"""
+() => {
+  const normalize = (value) =>
+    String(value || '')
+      .replace(/\r/g, '\n')
+      .split('\n')
+      .map((line) => line.trim().replace(/\s+/g, ' '))
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+  const normalizeToken = (value) =>
+    normalize(value).toLowerCase().replace(/[\s:：\-_|\t]/g, '');
+  const valuePattern = /(\d+(?:\.\d+)?\s*\/\s*\d+(?:\.\d+)?)|(\d+(?:\.\d+)?\s*%)/;
+  const headingTags = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+  const aliases = {
+    five_hour_limit: ['5시간 사용 한도', '5시간한도', '5-hour usage limit', '5 hour usage limit', '5h usage limit'],
+    weekly_limit: ['주간 사용 한도', '주간한도', 'weekly usage limit', 'weekly limit'],
+    code_review: ['코드 검토', '코드리뷰', 'code review', 'reviews'],
+    remaining_credit: ['남은 크레딧', '잔여 크레딧', 'remaining credit', 'credits remaining'],
+  };
+  const scope = document.querySelector('main') || document.body;
+  if (!scope) {
+    return { url: location.href, title: document.title, mainText: '', metricBlocks: [] };
+  }
+  const metricKeys = Object.keys(aliases);
+  const getMetricKey = (text) => {
+    const token = normalizeToken(text);
+    if (!token) return '';
+    for (const key of metricKeys) {
+      const candidates = aliases[key] || [];
+      for (const alias of candidates) {
+        if (normalizeToken(alias) && token.includes(normalizeToken(alias))) {
+          return key;
+        }
+      }
+    }
+    return '';
+  };
+  const collectValueCandidates = (boundary, labelText) => {
+    const values = [];
+    const seen = new Set();
+    const nodes = [boundary, ...Array.from(boundary.querySelectorAll('*'))];
+    for (const node of nodes) {
+      const text = normalize(node.innerText || node.textContent || '');
+      if (!text || text === normalize(labelText) || text.length > 80) continue;
+      if (!/[0-9]/.test(text)) continue;
+      if (!seen.has(text)) {
+        seen.add(text);
+        values.push(text);
+      }
+    }
+    return values;
+  };
+  const findBoundary = (labelEl) => {
+    let boundary = labelEl;
+    let current = labelEl;
+    while (current && current !== scope) {
+      const text = normalize(current.innerText || current.textContent || '');
+      if (text && text.length <= 260 && valuePattern.test(text)) {
+        const labelsInside = Array.from(current.querySelectorAll('*'))
+          .map((el) => getMetricKey(el.innerText || el.textContent || ''))
+          .filter(Boolean);
+        if (labelsInside.length <= 2) {
+          boundary = current;
+          break;
+        }
+      }
+      current = current.parentElement;
+    }
+    return boundary;
+  };
+  const findHeading = (boundary) => {
+    let current = boundary;
+    while (current && current !== scope) {
+      const heading = Array.from(current.children || []).find((child) => headingTags.has(child.tagName));
+      if (heading) return normalize(heading.innerText || heading.textContent || '');
+      current = current.parentElement;
+    }
+    return '';
+  };
+  const metricBlocks = [];
+  const seen = new Set();
+  const elements = [scope, ...Array.from(scope.querySelectorAll('*'))];
+  for (const element of elements) {
+    const text = normalize(element.innerText || element.textContent || '');
+    if (!text || text.length > 120) continue;
+    const metricKey = getMetricKey(text);
+    if (!metricKey) continue;
+    const boundary = findBoundary(element);
+    const blockText = normalize(boundary.innerText || boundary.textContent || '');
+    if (!blockText) continue;
+    const dedupeKey = `${metricKey}::${blockText}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    metricBlocks.push({
+      metric_key: metricKey,
+      label_text: text,
+      block_text: blockText,
+      heading_text: findHeading(boundary),
+      value_candidates: collectValueCandidates(boundary, text),
+      boundary_tag: boundary.tagName || '',
+      boundary_role: boundary.getAttribute ? (boundary.getAttribute('role') || '') : '',
+    });
+  }
+  return {
+    url: location.href,
+    title: document.title,
+    mainText: normalize(scope.innerText || scope.textContent || ''),
+    metricBlocks,
+  };
+}
+"""
 
 USAGE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     "five_hour_limit": (
@@ -212,6 +531,124 @@ def parse_usage_metrics_from_text(raw_text: str) -> dict[str, str]:
     return parsed
 
 
+def canonicalize_codex_usage_url(value: str) -> str:
+    text = normalize_usage_value(value)
+    if not text:
+        return CURRENT_CODEX_USAGE_URL
+    try:
+        parsed = urlsplit(text)
+    except Exception:
+        return text
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    path = str(parsed.path or "").rstrip("/")
+    if path == "/codex/settings/usage":
+        path = "/codex/cloud/settings/usage"
+    elif path == "":
+        path = str(parsed.path or "")
+    if not path:
+        path = "/codex/cloud/settings/usage"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def build_codex_login_entry_url(usage_url: str) -> str:
+    normalized = canonicalize_codex_usage_url(usage_url)
+    try:
+        parsed = urlsplit(normalized)
+    except Exception:
+        return "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
+    path = str(parsed.path or "").rstrip("/")
+    if not path:
+        path = "/codex/cloud/settings/usage"
+    next_target = path
+    query = str(parsed.query or "").strip()
+    if query:
+        next_target = f"{next_target}?{query}"
+    return f"https://chatgpt.com/auth/login?next={quote(next_target, safe='/?=&')}"
+
+
+def is_codex_usage_url(value: str) -> bool:
+    text = normalize_usage_value(value)
+    if not text:
+        return False
+    try:
+        parsed = urlsplit(text)
+    except Exception:
+        return False
+    if str(parsed.netloc or "").lower() != "chatgpt.com":
+        return False
+    path = str(parsed.path or "").rstrip("/")
+    return path in CODEX_USAGE_PAGE_PATHS
+
+
+def are_equivalent_codex_usage_urls(left: str, right: str) -> bool:
+    left_text = normalize_usage_value(left)
+    right_text = normalize_usage_value(right)
+    if not left_text or not right_text:
+        return left_text == right_text
+    if is_codex_usage_url(left_text) and is_codex_usage_url(right_text):
+        return canonicalize_codex_usage_url(left_text) == canonicalize_codex_usage_url(right_text)
+    return left_text == right_text
+
+
+def _find_metric_key_for_label(text: str) -> str | None:
+    line = normalize_usage_value(text)
+    if not line:
+        return None
+    for key, aliases in USAGE_METRIC_ALIASES.items():
+        alias, _ = _find_alias_in_line(line, aliases)
+        if alias is not None:
+            return key
+    return None
+
+
+def _normalize_value_candidates(raw_value: Any) -> list[str]:
+    if isinstance(raw_value, list):
+        values = raw_value
+    elif raw_value is None:
+        values = []
+    else:
+        values = [raw_value]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = normalize_usage_value(str(item or ""))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return normalized
+
+
+def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str]:
+    if not isinstance(raw_blocks, list):
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_block in raw_blocks:
+        if not isinstance(raw_block, dict):
+            continue
+        key = normalize_usage_value(raw_block.get("metric_key", ""))
+        if not key:
+            key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
+        if key not in USAGE_METRIC_KEYS:
+            continue
+        if key in parsed:
+            continue
+        candidates = _normalize_value_candidates(raw_block.get("value_candidates", []))
+        if not candidates:
+            block_text = normalize_usage_value(raw_block.get("block_text", ""))
+            if block_text:
+                candidates = [block_text]
+        value = ""
+        for candidate in candidates:
+            value = _normalize_metric_candidate(key, candidate)
+            if value:
+                break
+        if value:
+            parsed[key] = value
+    return parsed
+
+
 @dataclass
 class UsageSnapshot:
     five_hour_limit: str = ""
@@ -367,6 +804,7 @@ class CodexUsageMonitor:
         self.__last_successful_cdp_port = 0
         self.__cdp_port_attempt_limit = 6
         self.__cdp_total_launch_timeout_sec = 28.0
+        self.__cdp_connect_timeout_ms = 3000
         self.__api_failure_count = 0
         self.__api_failover_threshold = 2
         self.__api_request_timeout_sec = 12.0
@@ -376,8 +814,8 @@ class CodexUsageMonitor:
         self.__interval_sec = 90.0
         self.__min_interval_sec = 10.0
         self.__tooltip_duration_ms = 7000
-        self.__usage_url = "https://chatgpt.com/codex/settings/usage"
-        self.__login_entry_url = "https://chatgpt.com/auth/login?next=/codex/settings/usage"
+        self.__usage_url = CURRENT_CODEX_USAGE_URL
+        self.__login_entry_url = build_codex_login_entry_url(self.__usage_url)
         self.__navigation_timeout_ms = 30000
         self.__login_timeout_sec = 180.0
         self.__headless_wait_timeout_sec = 10.0
@@ -429,6 +867,11 @@ class CodexUsageMonitor:
         self.__restart_monitor()
         return
 
+    def __set_usage_url(self, value: str) -> None:
+        self.__usage_url = canonicalize_codex_usage_url(value)
+        self.__login_entry_url = build_codex_login_entry_url(self.__usage_url)
+        return
+
     def get_settings_snapshot(self) -> dict[str, Any]:
         self.__force_playwright_mode()
         return {
@@ -463,7 +906,7 @@ class CodexUsageMonitor:
         if tooltip_ms < 1200:
             tooltip_ms = 1200
         self.__enabled = enabled
-        self.__usage_url = usage_url
+        self.__set_usage_url(usage_url)
         self.__interval_sec = float(interval_sec)
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__force_playwright_mode()
@@ -1637,6 +2080,11 @@ class CodexUsageMonitor:
             force_hidden=True,
             prefer_system_channel=True,
         )
+        if error in {"profile_in_use", "collect_failed", "parse_failed", "cloudflare_challenge"}:
+            raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp()
+            if raw_snapshot is not None:
+                self.__log("collect strategy=headful-hidden-first recovered=raw_cdp_external")
+                return raw_snapshot, None
         if error == "collect_cancelled":
             return None, "collect_cancelled"
         if is_manual_query and error in {"login_required", "cloudflare_challenge"}:
@@ -1744,7 +2192,7 @@ class CodexUsageMonitor:
         start_url = normalize_usage_value(initial_url)
         if not start_url:
             start_url = usage_url
-        needs_usage_navigation = str(start_url) != usage_url
+        needs_usage_navigation = not are_equivalent_codex_usage_urls(str(start_url), usage_url)
         effective_headless = bool(headless)
         try:
             if (not bool(effective_headless)) and bool(prefer_system_channel):
@@ -1948,19 +2396,8 @@ class CodexUsageMonitor:
                 self.__terminate_spawned_process(cdp_proc, cleanup_orphans=False)
 
     def __build_snapshot_from_page(self, page) -> UsageSnapshot | None:
-        captured_at = self.__now_iso()
-        metrics = self.__extract_metrics(page)
-        if not metrics:
-            return None
-        limit_keys = ("five_hour_limit", "weekly_limit", "code_review")
-        has_limit_metric = any(normalize_usage_value(metrics.get(k, "")) for k in limit_keys)
-        if not has_limit_metric:
-            # Guard against noisy partial parses like standalone "0" values.
-            return None
-        snapshot = UsageSnapshot.from_metrics(metrics, captured_at=captured_at)
-        if not snapshot.has_any_metric():
-            return None
-        return snapshot
+        probe = self.__probe_usage_page(page)
+        return self.__build_snapshot_from_probe(probe)
 
     def __wait_for_snapshot_ready(self, page, timeout_sec: float) -> tuple[UsageSnapshot | None, str | None]:
         deadline = 0.0
@@ -2046,6 +2483,9 @@ class CodexUsageMonitor:
             return True
         return False
 
+    def __is_usage_page_url(self, url: str) -> bool:
+        return bool(is_codex_usage_url(url))
+
     def __is_blank_page_url(self, url: str) -> bool:
         lowered = str(url or "").strip().lower()
         if not lowered:
@@ -2071,7 +2511,7 @@ class CodexUsageMonitor:
         selected = None
         for candidate in pages:
             url = normalize_usage_value(self.__get_page_url(candidate))
-            if preferred and url == preferred:
+            if preferred and are_equivalent_codex_usage_urls(url, preferred):
                 selected = candidate
                 break
 
@@ -2185,7 +2625,7 @@ class CodexUsageMonitor:
                         self.__terminate_spawned_process(proc, cleanup_orphans=False)
                         return None, None, None
                     try:
-                        browser = playwright_obj.chromium.connect_over_cdp(endpoint)
+                        browser = self.__connect_browser_over_cdp(playwright_obj, endpoint)
                         break
                     except Exception as exc:
                         last_error = exc
@@ -2501,13 +2941,26 @@ class CodexUsageMonitor:
                 break
         return dedup
 
+    def __connect_browser_over_cdp(self, playwright_obj, endpoint: str):
+        timeout_ms = 3000
+        try:
+            timeout_ms = int(getattr(self, "_CodexUsageMonitor__cdp_connect_timeout_ms", 3000) or 3000)
+        except Exception:
+            timeout_ms = 3000
+        if timeout_ms < 500:
+            timeout_ms = 500
+        return playwright_obj.chromium.connect_over_cdp(
+            str(endpoint),
+            timeout=int(timeout_ms),
+        )
+
     def __connect_existing_profile_remote_debug_context(self, playwright_obj):
         last_error = None
         for port, pid, monitor_managed in self.__iter_external_profile_remote_debugging_endpoints():
             endpoint = f"http://127.0.0.1:{int(port)}"
             browser = None
             try:
-                browser = playwright_obj.chromium.connect_over_cdp(endpoint)
+                browser = self.__connect_browser_over_cdp(playwright_obj, endpoint)
                 contexts = []
                 try:
                     contexts = list(browser.contexts or [])
@@ -2541,6 +2994,181 @@ class CodexUsageMonitor:
             self.__log_exception("hidden cdp attach existing failed", last_error)
         return None, None, None, False
 
+    def __try_collect_snapshot_via_raw_external_cdp(self) -> UsageSnapshot | None:
+        for port, _pid, _managed in self.__iter_external_profile_remote_debugging_endpoints():
+            snapshot = self.__collect_snapshot_via_raw_cdp_port(int(port))
+            if snapshot is not None:
+                return snapshot
+        return None
+
+    def __collect_snapshot_via_raw_cdp_port(self, port: int) -> UsageSnapshot | None:
+        try:
+            target_port = int(port)
+        except Exception:
+            return None
+        if target_port <= 0:
+            return None
+        browser_ws = self.__fetch_raw_cdp_browser_websocket_url(target_port)
+        if not browser_ws:
+            return None
+        socket_timeout_sec = float(RAW_CDP_COMMAND_TIMEOUT_SEC)
+        ws = None
+        target_id = ""
+        try:
+            ws = _create_raw_websocket_connection(browser_ws, socket_timeout_sec)
+            target_id = self.__raw_cdp_create_target(ws)
+            if not target_id:
+                return None
+            attach = self.__raw_cdp_send(
+                ws,
+                "Target.attachToTarget",
+                {"targetId": str(target_id), "flatten": True},
+            )
+            session_id = str((attach.get("result") or {}).get("sessionId") or "")
+            if not session_id:
+                self.__raw_cdp_send(
+                    ws,
+                    "Target.closeTarget",
+                    {"targetId": str(target_id)},
+                )
+                target_id = ""
+                return None
+            self.__raw_cdp_send(ws, "Runtime.enable", session_id=session_id)
+            self.__raw_cdp_send(ws, "Page.enable", session_id=session_id)
+            self.__raw_cdp_send(
+                ws,
+                "Page.navigate",
+                {"url": str(self.__usage_url)},
+                session_id=session_id,
+            )
+            deadline = 0.0
+            try:
+                deadline = float(self.__lib.time.monotonic()) + float(
+                    self.__headless_wait_timeout_sec
+                )
+            except Exception:
+                deadline = 0.0
+            while True:
+                if self.__is_collect_cancel_requested():
+                    return None
+                probe = self.__raw_cdp_probe_target(ws, session_id=session_id)
+                snapshot = self.__build_snapshot_from_probe(probe)
+                if snapshot is not None:
+                    self.__set_session_state("logged_in")
+                    self.__last_successful_cdp_port = int(target_port)
+                    self.__log(f"raw cdp snapshot collected port={int(target_port)}")
+                    return snapshot
+                now = 0.0
+                try:
+                    now = float(self.__lib.time.monotonic())
+                except Exception:
+                    now = deadline + 1.0
+                if deadline > 0.0 and now >= deadline:
+                    break
+                try:
+                    self.__lib.time.sleep(0.75)
+                except Exception:
+                    break
+        except Exception as exc:
+            self.__log_exception("raw cdp snapshot failed", exc)
+        finally:
+            if ws is not None and target_id:
+                try:
+                    self.__raw_cdp_send(
+                        ws,
+                        "Target.closeTarget",
+                        {"targetId": str(target_id)},
+                    )
+                except Exception:
+                    pass
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        return None
+
+    def __fetch_raw_cdp_browser_websocket_url(self, port: int) -> str:
+        try:
+            target_port = int(port)
+        except Exception:
+            return ""
+        if target_port <= 0:
+            return ""
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(target_port)}/json/version",
+                timeout=3,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            self.__log_exception("raw cdp version fetch failed", exc)
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        return normalize_usage_value(payload.get("webSocketDebuggerUrl", ""))
+
+    def __raw_cdp_create_target(self, ws) -> str:
+        response = self.__raw_cdp_send(
+            ws,
+            "Target.createTarget",
+            {"url": "about:blank", "newWindow": False, "background": True},
+        )
+        return str((response.get("result") or {}).get("targetId") or "")
+
+    def __raw_cdp_probe_target(self, ws, session_id: str) -> dict[str, Any]:
+        response = self.__raw_cdp_send(
+            ws,
+            "Runtime.evaluate",
+            {"expression": f"({USAGE_PAGE_PROBE_SCRIPT})()", "returnByValue": True},
+            session_id=session_id,
+        )
+        result = response.get("result") or {}
+        value = ((result.get("result") or {}).get("value") or {})
+        return self.__normalize_probe_payload(value, fallback_url=str(self.__usage_url))
+
+    def __raw_cdp_send(
+        self,
+        ws,
+        method: str,
+        params: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
+        if ws is None:
+            raise RuntimeError("raw cdp websocket unavailable")
+        request_id = 1
+        try:
+            request_id = int(getattr(ws, "_ws_request_id", 0) or 0) + 1
+        except Exception:
+            request_id = 1
+        try:
+            setattr(ws, "_ws_request_id", int(request_id))
+        except Exception:
+            pass
+        payload: dict[str, Any] = {
+            "id": int(request_id),
+            "method": str(method),
+            "params": params or {},
+        }
+        if session_id:
+            payload["sessionId"] = str(session_id)
+        effective_timeout = float(timeout_sec or RAW_CDP_COMMAND_TIMEOUT_SEC)
+        if effective_timeout <= 0.0:
+            effective_timeout = float(RAW_CDP_COMMAND_TIMEOUT_SEC)
+        try:
+            ws.settimeout(effective_timeout)
+        except Exception:
+            pass
+        ws.send(json.dumps(payload))
+        while True:
+            message = json.loads(ws.recv())
+            if int(message.get("id") or 0) != int(request_id):
+                continue
+            if message.get("error"):
+                raise RuntimeError(str(message.get("error")))
+            return message
+
     def __connect_hidden_cdp_context(self, playwright_obj, launch_url: str | None = None):
         proc = self.__hidden_cdp_proc
         port = 0
@@ -2559,7 +3187,7 @@ class CodexUsageMonitor:
             endpoint = f"http://127.0.0.1:{int(port)}"
             reconnect_browser = None
             try:
-                reconnect_browser = playwright_obj.chromium.connect_over_cdp(endpoint)
+                reconnect_browser = self.__connect_browser_over_cdp(playwright_obj, endpoint)
                 contexts = []
                 try:
                     contexts = list(reconnect_browser.contexts or [])
@@ -3449,47 +4077,80 @@ class CodexUsageMonitor:
             except Exception:
                 return False
 
-    def __extract_metrics(self, page) -> dict[str, str]:
-        body_text = ""
+    def __probe_usage_page(self, page) -> dict[str, Any]:
         try:
-            body_text = str(
-                page.evaluate("() => document && document.body ? (document.body.innerText || '') : ''")
-                or ""
-            )
+            payload = page.evaluate(USAGE_PAGE_PROBE_SCRIPT)
         except Exception:
-            body_text = ""
+            payload = {}
+        return self.__normalize_probe_payload(payload, fallback_url=self.__get_page_url(page))
 
-        metrics = parse_usage_metrics_from_text(body_text)
-        if len(metrics) >= 2:
-            return metrics
+    def __is_usage_dom_ready_from_probe(self, probe: dict[str, Any] | None) -> bool:
+        if not isinstance(probe, dict):
+            return False
+        main_text = normalize_usage_value(probe.get("mainText", ""))
+        if not main_text:
+            return False
+        lowered = main_text.lower()
+        if any(token in lowered for token in ("log in", "sign in", "로그인", "continue with google")):
+            return False
+        if isinstance(probe.get("metricBlocks"), list) and probe.get("metricBlocks"):
+            return True
+        readiness_markers = (
+            "usage",
+            "limit",
+            "review",
+            "credit",
+            "사용",
+            "한도",
+            "검토",
+            "크레딧",
+        )
+        return any(marker in lowered for marker in readiness_markers)
 
-        # Fallback: parse html source as plain text.
-        content = ""
-        try:
-            content = str(page.content() or "")
-        except Exception:
-            content = ""
-        if content:
-            plain = self.__html_to_text(content)
-            fallback_metrics = parse_usage_metrics_from_text(plain)
-            if len(fallback_metrics) > len(metrics):
-                metrics = fallback_metrics
-        return metrics
+    def __normalize_probe_payload(
+        self,
+        payload: Any,
+        fallback_url: str = "",
+    ) -> dict[str, Any]:
+        normalized_payload = payload if isinstance(payload, dict) else {}
+        default_url = normalize_usage_value(fallback_url)
+        normalized_payload.setdefault("url", default_url)
+        normalized_payload["url"] = normalize_usage_value(
+            normalized_payload.get("url", default_url)
+        )
+        normalized_payload["mainText"] = normalize_usage_value(
+            normalized_payload.get("mainText", "")
+        )
+        metric_blocks = normalized_payload.get("metricBlocks", [])
+        if not isinstance(metric_blocks, list):
+            metric_blocks = []
+        normalized_payload["metricBlocks"] = metric_blocks
+        return normalized_payload
 
-    def __html_to_text(self, html_text: str) -> str:
-        text = str(html_text or "")
-        if not text:
-            return ""
-        try:
-            import re
-
-            text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.IGNORECASE)
-            text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
-            text = re.sub(r"<[^>]+>", "\n", text)
-        except Exception:
-            pass
-        text = html.unescape(text)
-        return text
+    def __build_snapshot_from_probe(self, probe: dict[str, Any] | None) -> UsageSnapshot | None:
+        normalized_probe = self.__normalize_probe_payload(
+            probe,
+            fallback_url=str(self.__usage_url),
+        )
+        page_url = normalize_usage_value(normalized_probe.get("url", ""))
+        if not self.__is_usage_page_url(page_url):
+            return None
+        if not self.__is_usage_dom_ready_from_probe(normalized_probe):
+            return None
+        captured_at = self.__now_iso()
+        metrics = extract_usage_metrics_from_semantic_blocks(
+            normalized_probe.get("metricBlocks", [])
+        )
+        if not metrics:
+            return None
+        limit_keys = ("five_hour_limit", "weekly_limit", "code_review")
+        has_limit_metric = any(normalize_usage_value(metrics.get(k, "")) for k in limit_keys)
+        if not has_limit_metric:
+            return None
+        snapshot = UsageSnapshot.from_metrics(metrics, captured_at=captured_at)
+        if not snapshot.has_any_metric():
+            return None
+        return snapshot
 
     def __is_login_required(self, page) -> bool:
         url = ""
@@ -3591,7 +4252,10 @@ class CodexUsageMonitor:
         self.__tooltip_duration_ms = int(tooltip)
         usage_url = normalize_usage_value(data.get("usage_url", self.__usage_url))
         if usage_url:
-            self.__usage_url = usage_url
+            canonical_usage_url = canonicalize_codex_usage_url(usage_url)
+            if canonical_usage_url != usage_url:
+                dirty = True
+            self.__set_usage_url(canonical_usage_url)
         if bool(dirty):
             self.__save_settings()
         return
