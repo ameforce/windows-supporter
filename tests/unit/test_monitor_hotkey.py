@@ -43,6 +43,9 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         self.assertIn("ctrl+alt+c", fake_kb.hotkeys)
         self.assertIn("ctrl+alt+k", fake_kb.hotkeys)
         self.assertIn("ctrl+alt+w", fake_kb.hotkeys)
+        self.assertIn("alt+q", fake_kb.hotkeys)
+        self.assertIn("ctrl+q", fake_kb.hotkeys)
+        self.assertIn("ctrl+s", fake_kb.hotkeys)
         self.assertNotIn("ctrl+c", fake_kb.hotkeys)
         self.assertNotIn("enter", fake_kb.hotkeys)
         self.assertEqual([], fake_kb.press_keys)
@@ -60,6 +63,68 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         fn()
 
         codex.show_current_status.assert_called_once_with(force_refresh=True)
+
+    def test_alt_q_dispatches_wrike_action_when_wrike_is_active(self) -> None:
+        monitor = Monitor()
+        root = object()
+        monitor._Monitor__root = root
+        monitor._Monitor__event_queue = queue.SimpleQueue()
+        wrike = MagicMock()
+        wrike.is_wrike_active.return_value = True
+        monitor._Monitor__wrike = wrike
+        monitor._Monitor__wrike_attached = True
+
+        monitor._Monitor__on_alt_q()
+        fn = monitor._Monitor__event_queue.get_nowait()
+        fn()
+
+        wrike.action.assert_called_once_with(root)
+
+    def test_ctrl_q_dispatches_wrike_open_when_wrike_is_active(self) -> None:
+        monitor = Monitor()
+        root = object()
+        monitor._Monitor__root = root
+        monitor._Monitor__event_queue = queue.SimpleQueue()
+        wrike = MagicMock()
+        wrike.is_wrike_active.return_value = True
+        monitor._Monitor__wrike = wrike
+        monitor._Monitor__wrike_attached = True
+
+        monitor._Monitor__on_ctrl_q()
+        fn = monitor._Monitor__event_queue.get_nowait()
+        fn()
+
+        wrike.open_in_separate_tab.assert_called_once_with(root)
+
+    def test_ctrl_s_dispatches_notion_action_when_notion_is_active(self) -> None:
+        monitor = Monitor()
+        root = object()
+        monitor._Monitor__root = root
+        monitor._Monitor__event_queue = queue.SimpleQueue()
+        notion = MagicMock()
+        notion.is_notion_active.return_value = True
+        monitor._Monitor__notion = notion
+
+        monitor._Monitor__on_ctrl_s()
+        fn = monitor._Monitor__event_queue.get_nowait()
+        fn()
+
+        notion.action.assert_called_once_with(root)
+
+    def test_ctrl_s_ignores_when_notion_is_not_active(self) -> None:
+        monitor = Monitor()
+        root = object()
+        monitor._Monitor__root = root
+        monitor._Monitor__event_queue = queue.SimpleQueue()
+        notion = MagicMock()
+        notion.is_notion_active.return_value = False
+        monitor._Monitor__notion = notion
+
+        monitor._Monitor__on_ctrl_s()
+        fn = monitor._Monitor__event_queue.get_nowait()
+        fn()
+
+        notion.action.assert_not_called()
 
     def test_attach_starts_feature_warmup_async(self) -> None:
         monitor = Monitor()
