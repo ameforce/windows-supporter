@@ -15,7 +15,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "20 / 40",
                 "weekly_limit": "120 / 300",
-                "code_review": "10 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
                 "remaining_credit": "260",
             },
             captured_at="2026-03-30T10:00:00",
@@ -24,7 +25,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "20 / 40",
                 "weekly_limit": "120 / 300",
-                "code_review": "10 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
                 "remaining_credit": "260",
             },
             captured_at="2026-03-30T10:10:00",
@@ -33,7 +35,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "19 / 40",
                 "weekly_limit": "120 / 300",
-                "code_review": "10 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
                 "remaining_credit": "259",
             },
             captured_at="2026-03-30T10:20:00",
@@ -56,7 +59,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "20 / 40",
                 "weekly_limit": "120 / 300",
-                "code_review": "10 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
                 "remaining_credit": "260",
             },
             captured_at="2026-03-30T10:00:00",
@@ -65,7 +69,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "19 / 40",
                 "weekly_limit": "",
-                "code_review": "",
+                "gpt_5_3_codex_spark_five_hour_limit": "",
+                "gpt_5_3_codex_spark_weekly_limit": "",
                 "remaining_credit": "",
             },
             captured_at="2026-03-30T10:10:00",
@@ -115,7 +120,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "17 / 40",
                 "weekly_limit": "109 / 300",
-                "code_review": "8 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
                 "remaining_credit": "245",
             },
             captured_at="2026-03-30T11:05:00",
@@ -146,7 +152,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "17 / 40",
                 "weekly_limit": "109 / 300",
-                "code_review": "8 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
                 "remaining_credit": "245",
             },
             captured_at="2026-03-30T11:05:00",
@@ -192,7 +199,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_raw_cdp_probe_target_executes_probe_function_expression(self) -> None:
         payload = {
-            "url": "https://chatgpt.com/codex/cloud/settings/usage",
+            "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
             "mainText": "Usage",
             "metricBlocks": [],
         }
@@ -216,7 +223,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "17 / 40",
                 "weekly_limit": "109 / 300",
-                "code_review": "8 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
                 "remaining_credit": "245",
             },
             captured_at="2026-03-30T11:05:00",
@@ -264,7 +272,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "17 / 40",
                 "weekly_limit": "109 / 300",
-                "code_review": "8 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
                 "remaining_credit": "245",
             },
             captured_at="2026-03-30T11:05:00",
@@ -326,7 +335,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertFalse(third_call.kwargs.get("force_hidden"))
         self.assertEqual(
             third_call.kwargs.get("initial_url"),
-            "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
+            "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
         )
 
     def test_collect_with_playwright_obj_skips_interactive_for_background_source(self) -> None:
@@ -401,7 +410,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_is_cloudflare_challenge_detects_html_marker_with_empty_body_text(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def evaluate(self, _expr):
                 return ""
@@ -420,8 +429,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
     def test_is_cloudflare_challenge_detects_cf_query_token(self) -> None:
         class _DummyPage:
             url = (
-                "https://chatgpt.com/codex/cloud/settings/usage?"
-                "__cf_chl_rt_tk=token-123"
+                "https://chatgpt.com/codex/cloud/settings/analytics?"
+                "__cf_chl_rt_tk=token-123#usage"
             )
 
             def evaluate(self, _expr):
@@ -437,8 +446,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
     def test_is_cloudflare_challenge_ignores_cf_token_when_usage_content_visible(self) -> None:
         class _DummyPage:
             url = (
-                "https://chatgpt.com/codex/cloud/settings/usage?"
-                "__cf_chl_rt_tk=token-123"
+                "https://chatgpt.com/codex/cloud/settings/analytics?"
+                "__cf_chl_rt_tk=token-123#usage"
             )
 
             def evaluate(self, _expr):
@@ -447,8 +456,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     "12 / 40\\n"
                     "weekly usage limit\\n"
                     "111 / 300\\n"
-                    "code review\\n"
-                    "8 / 50\\n"
+                    "gpt-5.3-codex-spark 5-hour usage limit\\n"
+                    "8 / 10\\n"
+                    "gpt-5.3-codex-spark weekly usage limit\\n"
+                    "80 / 100\\n"
                     "remaining credit\\n"
                     "320"
                 )
@@ -462,7 +473,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_is_cloudflare_challenge_ignores_html_marker_when_usage_content_visible(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def evaluate(self, _expr):
                 return (
@@ -470,8 +481,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     "12 / 40\\n"
                     "weekly usage limit\\n"
                     "111 / 300\\n"
-                    "code review\\n"
-                    "8 / 50\\n"
+                    "gpt-5.3-codex-spark 5-hour usage limit\\n"
+                    "8 / 10\\n"
+                    "gpt-5.3-codex-spark weekly usage limit\\n"
+                    "80 / 100\\n"
                     "remaining credit\\n"
                     "320"
                 )
@@ -513,7 +526,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_wait_until_logged_in_performs_active_login_entry(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def wait_for_timeout(self, _ms):
                 return None
@@ -681,7 +694,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "18 / 40",
                 "weekly_limit": "110 / 300",
-                "code_review": "9 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "9 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "9 / 50",
                 "remaining_credit": "250",
             },
             captured_at="2026-03-30T12:00:00",
@@ -701,17 +715,17 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIn("https://chatgpt.com/codex/cloud/settings/usage", page.goto_calls)
+        self.assertIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", page.goto_calls)
 
     def test_build_snapshot_accepts_semantic_limit_metric_snapshot(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__probe_usage_page",
             return_value={
-                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 "mainText": "Usage 5-hour usage limit 25% weekly usage limit 28%",
                 "metricBlocks": [
                     {
@@ -740,15 +754,52 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(snap.five_hour_limit, "25%")
         self.assertEqual(snap.weekly_limit, "28%")
 
-    def test_build_snapshot_rejects_metric_block_when_value_normalization_fails(self) -> None:
+    def test_build_snapshot_accepts_fragmentless_analytics_probe_origin_when_metrics_exist(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__probe_usage_page",
             return_value={
-                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "url": "https://chatgpt.com/codex/cloud/settings/analytics",
+                "mainText": "Analytics Usage 5-hour usage limit 25% weekly usage limit 28%",
+                "metricBlocks": [
+                    {
+                        "metric_key": "five_hour_limit",
+                        "label_text": "5-hour usage limit",
+                        "block_text": "5-hour usage limit 25%",
+                        "value_candidates": ["25%"],
+                    },
+                    {
+                        "metric_key": "weekly_limit",
+                        "label_text": "weekly usage limit",
+                        "block_text": "weekly usage limit 28%",
+                        "value_candidates": ["28%"],
+                    },
+                ],
+            },
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__now_iso",
+                return_value="2026-03-30T12:05:30",
+            ):
+                snap = self.monitor._CodexUsageMonitor__build_snapshot_from_page(_DummyPage())
+
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.five_hour_limit, "25%")
+        self.assertEqual(snap.weekly_limit, "28%")
+
+    def test_build_snapshot_rejects_metric_block_when_value_normalization_fails(self) -> None:
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__probe_usage_page",
+            return_value={
+                "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 "mainText": "Usage 5-hour usage limit Connectors",
                 "metricBlocks": [
                     {
@@ -766,19 +817,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_wait_for_snapshot_ready_returns_parse_failed_when_usage_page_reached_but_no_metric_blocks(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def wait_for_timeout(self, _ms):
                 return None
 
         probes = [
             {
-                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 "mainText": "Usage loading",
                 "metricBlocks": [],
             },
             {
-                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 "mainText": "Usage loading",
                 "metricBlocks": [],
             },
@@ -814,18 +865,18 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
     def test_wait_for_snapshot_ready_retries_until_dom_ready_then_accepts_snapshot(self) -> None:
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def wait_for_timeout(self, _ms):
                 return None
 
         probe_loading = {
-            "url": "https://chatgpt.com/codex/cloud/settings/usage",
+            "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
             "mainText": "Usage loading",
             "metricBlocks": [],
         }
         probe_ready = {
-            "url": "https://chatgpt.com/codex/cloud/settings/usage",
+            "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
             "mainText": "Usage 5-hour usage limit 24%",
             "metricBlocks": [
                 {
@@ -866,14 +917,15 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -919,7 +971,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 headless=False,
                                 allow_interactive_recovery=True,
                                 prefer_system_channel=True,
-                                initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
+                                initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
                             )
 
         self.assertIsNone(err)
@@ -934,7 +986,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
@@ -948,7 +1001,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -1012,7 +1065,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                     allow_interactive_recovery=True,
                                     force_hidden=False,
                                     prefer_system_channel=True,
-                                    initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
+                                    initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
                                 )
 
         self.assertIsNone(err)
@@ -1028,7 +1081,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
@@ -1042,7 +1096,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -1105,7 +1159,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                         allow_interactive_recovery=True,
                                         force_hidden=False,
                                         prefer_system_channel=True,
-                                        initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
+                                        initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
                                     )
 
         self.assertIsNone(err)
@@ -1121,7 +1175,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
@@ -1131,7 +1186,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             pid = 12345
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1249,7 +1304,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             ):
                 context, browser, proc, keep = self.monitor._CodexUsageMonitor__connect_hidden_cdp_context(
                     playwright_obj,
-                    launch_url="https://chatgpt.com/codex/cloud/settings/usage",
+                    launch_url="https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 )
 
         self.assertIsNotNone(context)
@@ -1268,7 +1323,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
@@ -1361,7 +1417,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
@@ -1579,7 +1636,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--hide-crash-restore-bubble", cmd)
         self.assertNotIn("--window-position=-32000,-32000", cmd)
         self.assertNotIn("about:blank", cmd)
-        self.assertIn("https://chatgpt.com/codex/cloud/settings/usage", cmd)
+        self.assertIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", cmd)
         self.assertIn("startupinfo", kwargs)
         self.assertEqual(
             playwright_obj.chromium.timeouts,
@@ -1674,7 +1731,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
@@ -1688,7 +1746,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1804,13 +1862,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return p
 
         blank1 = _DummyPage("about:blank")
-        usage = _DummyPage("https://chatgpt.com/codex/cloud/settings/usage")
+        usage = _DummyPage("https://chatgpt.com/codex/cloud/settings/analytics#usage")
         blank2 = _DummyPage("chrome://newtab/")
         ctx = _DummyContext([blank1, usage, blank2])
 
         selected = self.monitor._CodexUsageMonitor__select_collect_page(
             ctx,
-            preferred_url="https://chatgpt.com/codex/cloud/settings/usage",
+            preferred_url="https://chatgpt.com/codex/cloud/settings/analytics#usage",
             close_extra_blank_tabs=True,
         )
 
@@ -1823,7 +1881,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
@@ -1833,7 +1892,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             pid = 12345
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1898,7 +1957,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             pid = 12345
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -1953,14 +2012,15 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -2067,14 +2127,15 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 
             def goto(self, _url, **_kwargs):
                 return None
@@ -2128,7 +2189,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             self.monitor,
             "_CodexUsageMonitor__probe_usage_page",
             return_value={
-                "url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 "mainText": "Usage remaining credit 0",
                 "metricBlocks": [
                     {
@@ -2155,7 +2216,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "26%",
                 "weekly_limit": "28%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "959",
             },
             captured_at="2026-03-30T12:30:00",
@@ -2168,7 +2230,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     {
                         "five_hour_limit": "25%",
                         "weekly_limit": "28%",
-                        "code_review": "100%",
+                        "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                        "gpt_5_3_codex_spark_weekly_limit": "100%",
                         "remaining_credit": "959",
                     },
                     captured_at="2026-03-30T12:35:00",
@@ -2190,9 +2253,12 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             )
 
         lines = captured.get("lines", [])
+        line_texts = [str(line[0]) for line in lines]
         joined = " | ".join(str(line[0]) for line in lines)
         self.assertTrue(lines)
         self.assertEqual(lines[0][0], "Codex 현재 사용량")
+        self.assertIn("--------------------------------", line_texts)
+        self.assertLess(line_texts.index("--------------------------------"), line_texts.index("변경 항목"))
         self.assertIn("변경 항목", joined)
         self.assertIn("남은 크레딧: 959", joined)
 
@@ -2202,7 +2268,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "25%",
                 "weekly_limit": "28%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "960",
             },
             captured_at="2026-03-30T12:40:00",
@@ -2246,7 +2313,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "25%",
                 "weekly_limit": "28%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "960",
             },
             captured_at="2026-03-30T12:45:00",
@@ -2260,7 +2328,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "25%",
                 "weekly_limit": "28%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "960",
             },
             captured_at="2026-03-30T00:00:00+00:00",
@@ -2275,7 +2344,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "25%",
                 "weekly_limit": "28%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "960",
             },
             captured_at="2026-03-30T12:50:00",
@@ -2371,7 +2441,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "24%",
                 "weekly_limit": "27%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "958",
             },
             captured_at="2026-03-30 12:58:00",
@@ -2424,7 +2495,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "24%",
                 "weekly_limit": "27%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "958",
             },
             captured_at="2026-03-30T12:55:00",
@@ -2528,7 +2600,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "24%",
                 "weekly_limit": "27%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "958",
             },
             captured_at="2026-03-30 12:58:00",
@@ -2617,7 +2690,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "24%",
                 "weekly_limit": "27%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "958",
             },
             captured_at="2026-03-30 12:58:00",
@@ -2666,7 +2740,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "24%",
                 "weekly_limit": "27%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "958",
             },
             captured_at="2026-03-30 13:05:00",
@@ -2729,7 +2804,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "24%",
                 "weekly_limit": "27%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "958",
             },
             captured_at="2026-03-30 13:05:00",
@@ -2843,7 +2919,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         "enabled": True,
                         "interval_sec": 10,
                         "tooltip_duration_ms": 7000,
-                        "usage_url": "https://chatgpt.com/codex/cloud/settings/usage",
+                        "usage_url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                     }
                 )
 
@@ -3136,7 +3212,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "25%",
                 "weekly_limit": "28%",
-                "code_review": "100%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
                 "remaining_credit": "960",
             },
             captured_at="2026-03-30T13:10:00",
@@ -3280,7 +3357,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         "enabled": True,
                         "interval_sec": 30,
                         "tooltip_duration_ms": 7000,
-                        "usage_url": "https://chatgpt.com/codex/cloud/settings/usage",
+                        "usage_url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                         "collection_mode": "api",
                     }
                 )
@@ -3303,7 +3380,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 "enabled": True,
                 "interval_sec": 15,
                 "tooltip_duration_ms": 7000,
-                "usage_url": "https://chatgpt.com/codex/cloud/settings/usage",
+                "usage_url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 "collection_mode": "api",
             },
         ):
@@ -3318,7 +3395,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "20 / 40",
                 "weekly_limit": "120 / 300",
-                "code_review": "10 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
                 "remaining_credit": "260",
             },
             captured_at="2026-03-30T10:00:00",
@@ -3385,7 +3463,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "19 / 40",
                 "weekly_limit": "120 / 300",
-                "code_review": "10 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
                 "remaining_credit": "259",
             },
             captured_at="2026-03-30T10:20:00",
@@ -3417,7 +3496,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "18 / 40",
                 "weekly_limit": "118 / 300",
-                "code_review": "9 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "9 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "9 / 50",
                 "remaining_credit": "258",
             },
             captured_at="2026-03-30T10:20:00",
@@ -3543,14 +3623,15 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {
                 "five_hour_limit": "16 / 40",
                 "weekly_limit": "108 / 300",
-                "code_review": "7 / 50",
+                "gpt_5_3_codex_spark_five_hour_limit": "7 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "7 / 50",
                 "remaining_credit": "240",
             },
             captured_at="2026-03-30T12:10:00",
         )
 
         class _DummyPage:
-            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage"
 
             def goto(self, url, **_kwargs):
                 self.url = str(url)
@@ -3607,7 +3688,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 allow_interactive_recovery=True,
                                 force_hidden=False,
                                 prefer_system_channel=True,
-                                initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage",
+                                initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
                             )
 
         self.assertIsNone(err)

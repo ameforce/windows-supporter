@@ -1,3 +1,4 @@
+import os
 import queue
 import unittest
 from unittest.mock import MagicMock, patch
@@ -36,9 +37,15 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         fake_kb = _FakeKeyboard()
         monitor._Monitor__lib.keyboard = fake_kb
 
-        monitor._Monitor__register_hotkeys()
+        with patch.dict(os.environ, {}, clear=True):
+            monitor._Monitor__register_hotkeys()
 
         self.assertIn("ctrl+alt+c", fake_kb.hotkeys)
+        self.assertIn("ctrl+alt+k", fake_kb.hotkeys)
+        self.assertIn("ctrl+alt+w", fake_kb.hotkeys)
+        self.assertNotIn("ctrl+c", fake_kb.hotkeys)
+        self.assertNotIn("enter", fake_kb.hotkeys)
+        self.assertEqual([], fake_kb.press_keys)
 
     def test_ctrl_alt_c_dispatches_codex_current_status(self) -> None:
         monitor = Monitor()

@@ -164,7 +164,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._live_time_var = _Var()
         view._live_five_hour_var = _Var()
         view._live_weekly_var = _Var()
-        view._live_code_review_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
         view._live_credit_var = _Var()
         view._refresh_action_buttons = lambda runtime: runtime
         view._safe_get_runtime = lambda: {
@@ -205,7 +206,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._live_time_var = _Var()
         view._live_five_hour_var = _Var()
         view._live_weekly_var = _Var()
-        view._live_code_review_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
         view._live_credit_var = _Var()
         view._refresh_action_buttons = lambda runtime: runtime
         view._safe_get_runtime = lambda: {

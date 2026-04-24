@@ -1,8 +1,73 @@
+from dataclasses import dataclass
 from src.utils.LibConnector import LibConnector
+from src.utils.windows_window import apply_precomputed_window_position
 
 import json
+import threading
 import win32api
 import win32con
+
+
+@dataclass(frozen=True)
+class MonitorSnapshot:
+    handle: int
+    device: str
+    display_num: int | None
+    is_primary: bool
+    work: tuple[int, int, int, int]
+    monitor: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class KakaoRuntimeSnapshot:
+    kakao_pids: tuple[int, ...]
+    chat_order: tuple[int, ...]
+    last_main_hwnd: int | None
+    monitors: tuple[MonitorSnapshot, ...]
+    next_pid_scan_time: float
+    next_monitor_scan_time: float
+
+
+@dataclass(frozen=True)
+class KakaoTargetResolution:
+    requested_display_num: int | None
+    resolved_display_num: int | None
+    resolved_monitor_handle: int | None
+    config_missing: bool
+    fallback_reason: str
+
+
+@dataclass(frozen=True)
+class WindowMove:
+    hwnd: int
+    x: int
+    y: int
+    width: int
+    height: int
+    resize: bool
+
+
+@dataclass(frozen=True)
+class WindowMovePlan:
+    moves: tuple[WindowMove, ...] = ()
+
+
+@dataclass(frozen=True)
+class KakaoWorkRequest:
+    request_generation: int
+    state_epoch: int
+    now: float
+    requested_display_num: int | None
+    runtime_snapshot: KakaoRuntimeSnapshot
+
+
+@dataclass(frozen=True)
+class KakaoWorkResult:
+    request_generation: int
+    state_epoch: int
+    runtime_snapshot: KakaoRuntimeSnapshot
+    target_resolution: KakaoTargetResolution
+    move_plan: WindowMovePlan
 
 
 class KakaoManager:
@@ -23,6 +88,8 @@ class KakaoManager:
         self.__kakao_pids = set()
         self.__chat_order = []
         self.__last_main_hwnd = None
+        self.__resolved_target_display_num = None
+        self.__resolved_target_monitor_handle = None
 
         appdata = self.__lib.os.environ.get("APPDATA")
         base_dir = appdata if appdata else self.__lib.os.path.expanduser("~")
@@ -36,18 +103,26 @@ class KakaoManager:
         self.__is_selecting = False
         self.__select_window = None
         self.__overlay_windows = []
+        self.__ui_post = None
+        self.__worker_lock = threading.Lock()
+        self.__worker_active = False
+        self.__pending_rerun = False
+        self.__latest_request_generation = 0
+        self.__state_epoch = 0
+        return
+
+    def set_ui_post(self, ui_post) -> None:
+        self.__ui_post = ui_post if callable(ui_post) else None
+        return
+
+    def request_refresh(self, root=None) -> None:
+        self.__ensure_config_state_bootstrapped()
+        self.__request_background_tick(root, self.__lib.time.monotonic())
         return
 
     def tick(self, root=None) -> None:
         now = self.__lib.time.monotonic()
-
-        if not self.__config_loaded:
-            self.__load_config()
-            self.__config_loaded = True
-
-        self.__refresh_monitors(now)
-        if self.__target_display_num is None:
-            self.__target_display_num = self.__get_default_display_num()
+        self.__ensure_config_state_bootstrapped()
 
         if root is not None and self.__config_missing and (not self.__is_selecting):
             try:
@@ -65,103 +140,536 @@ class KakaoManager:
         if now < self.__next_poll_time:
             return
         self.__next_poll_time = now + self.__poll_interval_sec
+        self.__request_background_tick(root, now)
+        return
 
-        self.__refresh_kakao_pids(now)
-        if not self.__kakao_pids:
-            self.__chat_order.clear()
-            self.__last_main_hwnd = None
-            return
+    def __ensure_config_state_bootstrapped(self) -> None:
+        if not self.__config_loaded:
+            prev_target = self.__normalize_display_num(self.__target_display_num)
+            self.__load_config()
+            self.__config_loaded = True
+            if prev_target != self.__normalize_display_num(self.__target_display_num):
+                self.__invalidate_effective_target()
+        if self.__target_display_num is None:
+            self.__target_display_num = self.__get_default_display_num()
+        return
 
-        windows = self.__get_kakao_top_windows()
-        if not windows:
-            return
+    def __normalize_display_num(self, value):
+        try:
+            if value is None:
+                return None
+            normalized = int(value)
+            return normalized if normalized > 0 else None
+        except Exception:
+            return None
 
-        win32gui = self.__lib.win32gui
-        main_hwnd = self.__pick_main_hwnd(windows)
-        if main_hwnd:
-            if self.__last_main_hwnd != main_hwnd:
-                self.__chat_order.clear()
-                self.__last_main_hwnd = main_hwnd
+    def __invalidate_effective_target(self) -> None:
+        try:
+            self.__state_epoch = int(self.__state_epoch) + 1
+        except Exception:
+            self.__state_epoch = 1
+        return
 
-        target_monitor = self.__get_target_monitor_work()
-        if not target_monitor:
-            return
+    def __set_requested_target_display(self, value) -> bool:
+        previous = self.__normalize_display_num(self.__target_display_num)
+        updated = self.__normalize_display_num(value)
+        if updated is None:
+            updated = self.__get_default_display_num()
+        self.__target_display_num = updated
+        changed = previous != updated
+        if changed:
+            self.__invalidate_effective_target()
+        return changed
 
-        chat_hwnds = []
-        for hwnd, title in windows:
-            if hwnd == main_hwnd:
-                continue
-            if title == self.__main_title:
-                continue
-            chat_hwnds.append(hwnd)
+    def __build_runtime_snapshot(self) -> KakaoRuntimeSnapshot:
+        monitors = tuple(self.__snapshot_monitor(m) for m in self.__monitors)
+        return KakaoRuntimeSnapshot(
+            kakao_pids=tuple(sorted(int(pid) for pid in self.__kakao_pids if int(pid) > 0)),
+            chat_order=tuple(int(hwnd) for hwnd in self.__chat_order if int(hwnd) > 0),
+            last_main_hwnd=self.__last_main_hwnd,
+            monitors=monitors,
+            next_pid_scan_time=float(self.__next_pid_scan_time),
+            next_monitor_scan_time=float(self.__next_monitor_scan_time),
+        )
 
-        self.__update_chat_order(chat_hwnds)
+    def __snapshot_monitor(self, monitor) -> MonitorSnapshot:
+        work = tuple(int(v) for v in tuple(monitor.get("work", (0, 0, 0, 0)))[:4])
+        monitor_rect = tuple(int(v) for v in tuple(monitor.get("monitor", (0, 0, 0, 0)))[:4])
+        return MonitorSnapshot(
+            handle=int(monitor.get("handle") or 0),
+            device=str(monitor.get("device") or ""),
+            display_num=self.__normalize_display_num(monitor.get("display_num")),
+            is_primary=bool(monitor.get("is_primary")),
+            work=work if len(work) == 4 else (0, 0, 0, 0),
+            monitor=monitor_rect if len(monitor_rect) == 4 else (0, 0, 0, 0),
+        )
 
-        place_main = bool(main_hwnd and (not win32gui.IsIconic(main_hwnd)))
-        ref_hwnd = main_hwnd if place_main else None
-        if ref_hwnd is None:
-            for h in self.__chat_order:
-                try:
-                    if not win32gui.IsIconic(h):
-                        ref_hwnd = h
-                        break
-                except Exception:
-                    continue
+    def __request_background_tick(self, root, now: float) -> None:
+        request = None
+        with self.__worker_lock:
+            self.__latest_request_generation = int(self.__latest_request_generation) + 1
+            generation = int(self.__latest_request_generation)
+            if self.__worker_active:
+                self.__pending_rerun = True
+                return
+            self.__worker_active = True
+            self.__pending_rerun = False
+            request = KakaoWorkRequest(
+                request_generation=generation,
+                state_epoch=int(self.__state_epoch),
+                now=float(now),
+                requested_display_num=self.__normalize_display_num(self.__target_display_num),
+                runtime_snapshot=self.__build_runtime_snapshot(),
+            )
 
-        if ref_hwnd is None:
+        def worker() -> None:
+            try:
+                result = self.__compute_work_result(request)
+            except Exception:
+                self.__finish_failed_worker(root)
+                return
+            if not self.__post_ui(lambda: self.__handle_work_result(root, result), root=root):
+                self.__finish_failed_worker(root)
             return
 
         try:
-            ref_left, ref_top, ref_right, ref_bottom = win32gui.GetWindowRect(ref_hwnd)
+            threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            return
-        ref_w = ref_right - ref_left
-        ref_h = ref_bottom - ref_top
-        if ref_w <= 0 or ref_h <= 0:
-            return
+            self.__finish_failed_worker(root)
+        return
 
-        work_left, work_top, _, work_bottom = target_monitor["work"]
-        target_y = ref_top
+    def __post_ui(self, fn, root=None) -> bool:
+        if not callable(fn):
+            return False
+        ui_post = self.__ui_post
+        if callable(ui_post):
+            try:
+                ui_post(fn)
+                return True
+            except Exception:
+                pass
+        if root is None:
+            return False
+        try:
+            return bool(root.after(0, fn))
+        except Exception:
+            return False
+        return False
+
+    def __finish_failed_worker(self, root=None) -> None:
+        pending = False
+        with self.__worker_lock:
+            self.__worker_active = False
+            pending = bool(self.__pending_rerun)
+            self.__pending_rerun = False
+        if pending:
+            self.__request_background_tick(root, self.__lib.time.monotonic())
+        return
+
+    def __handle_work_result(self, root, result: KakaoWorkResult) -> None:
+        rerun = False
+        with self.__worker_lock:
+            self.__worker_active = False
+            rerun = bool(self.__pending_rerun) or (
+                int(result.request_generation) != int(self.__latest_request_generation)
+            )
+            self.__pending_rerun = False
+        self.__accept_work_result(result)
+        if rerun:
+            self.__request_background_tick(root, self.__lib.time.monotonic())
+        return
+
+    def __accept_work_result(self, result: KakaoWorkResult) -> bool:
+        if int(result.request_generation) != int(self.__latest_request_generation):
+            return False
+        if int(result.state_epoch) != int(self.__state_epoch):
+            return False
+
+        runtime_snapshot = result.runtime_snapshot
+        self.__kakao_pids = {int(pid) for pid in runtime_snapshot.kakao_pids}
+        self.__chat_order = [int(hwnd) for hwnd in runtime_snapshot.chat_order]
+        self.__last_main_hwnd = runtime_snapshot.last_main_hwnd
+        self.__monitors = [
+            {
+                "handle": int(m.handle),
+                "device": str(m.device),
+                "display_num": self.__normalize_display_num(m.display_num),
+                "is_primary": bool(m.is_primary),
+                "work": tuple(m.work),
+                "monitor": tuple(m.monitor),
+            }
+            for m in runtime_snapshot.monitors
+        ]
+        self.__next_pid_scan_time = float(runtime_snapshot.next_pid_scan_time)
+        self.__next_monitor_scan_time = float(runtime_snapshot.next_monitor_scan_time)
+        self.__config_missing = bool(result.target_resolution.config_missing)
+        self.__resolved_target_display_num = self.__normalize_display_num(
+            result.target_resolution.resolved_display_num
+        )
+        try:
+            resolved_handle = int(result.target_resolution.resolved_monitor_handle or 0)
+            self.__resolved_target_monitor_handle = resolved_handle if resolved_handle > 0 else None
+        except Exception:
+            self.__resolved_target_monitor_handle = None
+
+        self.__apply_move_plan(result.move_plan)
+        return True
+
+    def __apply_move_plan(self, move_plan: WindowMovePlan) -> None:
+        for move in tuple(move_plan.moves or ()):
+            try:
+                apply_precomputed_window_position(
+                    int(move.hwnd),
+                    int(move.x),
+                    int(move.y),
+                    int(move.width),
+                    int(move.height),
+                    resize=bool(move.resize),
+                )
+            except Exception:
+                continue
+        return
+
+    def __compute_work_result(self, request: KakaoWorkRequest) -> KakaoWorkResult:
+        runtime_snapshot = request.runtime_snapshot
+        now = float(request.now)
+
+        monitors = list(runtime_snapshot.monitors)
+        next_monitor_scan_time = float(runtime_snapshot.next_monitor_scan_time)
+        if (not monitors) or now >= next_monitor_scan_time:
+            monitors = self.__collect_monitor_snapshots()
+            next_monitor_scan_time = now + self.__monitor_scan_interval_sec
+
+        resolution, target_monitor = self.__resolve_target_monitor(
+            monitors,
+            request.requested_display_num,
+        )
+
+        kakao_pids = list(runtime_snapshot.kakao_pids)
+        next_pid_scan_time = float(runtime_snapshot.next_pid_scan_time)
+        if (not kakao_pids) or now >= next_pid_scan_time:
+            kakao_pids = sorted(self.__collect_kakao_pids())
+            next_pid_scan_time = now + self.__pid_scan_interval_sec
+
+        if not kakao_pids:
+            next_snapshot = KakaoRuntimeSnapshot(
+                kakao_pids=(),
+                chat_order=(),
+                last_main_hwnd=None,
+                monitors=tuple(monitors),
+                next_pid_scan_time=next_pid_scan_time,
+                next_monitor_scan_time=next_monitor_scan_time,
+            )
+            return KakaoWorkResult(
+                request_generation=int(request.request_generation),
+                state_epoch=int(request.state_epoch),
+                runtime_snapshot=next_snapshot,
+                target_resolution=resolution,
+                move_plan=WindowMovePlan(),
+            )
+
+        window_details = self.__collect_window_details(kakao_pids)
+        if not window_details:
+            next_snapshot = KakaoRuntimeSnapshot(
+                kakao_pids=tuple(kakao_pids),
+                chat_order=tuple(runtime_snapshot.chat_order),
+                last_main_hwnd=runtime_snapshot.last_main_hwnd,
+                monitors=tuple(monitors),
+                next_pid_scan_time=next_pid_scan_time,
+                next_monitor_scan_time=next_monitor_scan_time,
+            )
+            return KakaoWorkResult(
+                request_generation=int(request.request_generation),
+                state_epoch=int(request.state_epoch),
+                runtime_snapshot=next_snapshot,
+                target_resolution=resolution,
+                move_plan=WindowMovePlan(),
+            )
+
+        main_hwnd = self.__pick_main_hwnd_from_details(window_details)
+        chat_order = tuple(runtime_snapshot.chat_order)
+        if main_hwnd and int(runtime_snapshot.last_main_hwnd or 0) != int(main_hwnd):
+            chat_order = ()
+        chat_hwnds = [
+            int(item["hwnd"])
+            for item in window_details
+            if int(item["hwnd"]) != int(main_hwnd or 0)
+            and str(item.get("title") or "") != self.__main_title
+        ]
+        updated_chat_order = tuple(self.__merge_chat_order(chat_order, chat_hwnds))
+
+        move_plan = self.__build_move_plan(
+            window_details=window_details,
+            main_hwnd=main_hwnd,
+            chat_order=updated_chat_order,
+            target_monitor=target_monitor,
+        )
+        next_snapshot = KakaoRuntimeSnapshot(
+            kakao_pids=tuple(kakao_pids),
+            chat_order=updated_chat_order,
+            last_main_hwnd=main_hwnd,
+            monitors=tuple(monitors),
+            next_pid_scan_time=next_pid_scan_time,
+            next_monitor_scan_time=next_monitor_scan_time,
+        )
+        return KakaoWorkResult(
+            request_generation=int(request.request_generation),
+            state_epoch=int(request.state_epoch),
+            runtime_snapshot=next_snapshot,
+            target_resolution=resolution,
+            move_plan=move_plan,
+        )
+
+    def __collect_monitor_snapshots(self) -> list[MonitorSnapshot]:
+        monitors = []
+        try:
+            for hmon, _, _ in win32api.EnumDisplayMonitors(None, None):
+                info = win32api.GetMonitorInfo(hmon)
+                device = info.get("Device", "")
+                display_num = self.__parse_display_num(device)
+                is_primary = bool(info.get("Flags", 0) & win32con.MONITORINFOF_PRIMARY)
+                monitors.append(
+                    MonitorSnapshot(
+                        handle=int(hmon or 0),
+                        device=str(device or ""),
+                        display_num=self.__normalize_display_num(display_num),
+                        is_primary=is_primary,
+                        work=tuple(int(v) for v in tuple(info.get("Work", (0, 0, 0, 0)))[:4]),
+                        monitor=tuple(
+                            int(v) for v in tuple(info.get("Monitor", (0, 0, 0, 0)))[:4]
+                        ),
+                    )
+                )
+        except Exception:
+            monitors = []
+        monitors.sort(
+            key=lambda m: (m.display_num if m.display_num is not None else 9999, m.work[0])
+        )
+        return monitors
+
+    def __collect_kakao_pids(self) -> set[int]:
+        pids = set()
+        try:
+            for proc in self.__lib.psutil.process_iter(["name"]):
+                try:
+                    if proc.info.get("name") == self.__process_name:
+                        pids.add(int(proc.pid))
+                except Exception:
+                    continue
+        except Exception:
+            return set()
+        return pids
+
+    def __resolve_target_monitor(
+        self,
+        monitors: list[MonitorSnapshot],
+        requested_display_num: int | None,
+    ) -> tuple[KakaoTargetResolution, MonitorSnapshot | None]:
+        requested = self.__normalize_display_num(requested_display_num)
+        if requested is not None:
+            for monitor in monitors:
+                if self.__normalize_display_num(monitor.display_num) == requested:
+                    return (
+                        KakaoTargetResolution(
+                            requested_display_num=requested,
+                            resolved_display_num=requested,
+                            resolved_monitor_handle=int(monitor.handle),
+                            config_missing=False,
+                            fallback_reason="",
+                        ),
+                        monitor,
+                    )
+        fallback_reason = ""
+        fallback = None
+        if requested is not None:
+            fallback_reason = "requested_display_unavailable"
+        for monitor in monitors:
+            if bool(monitor.is_primary):
+                fallback = monitor
+                if not fallback_reason:
+                    fallback_reason = "primary"
+                break
+        if fallback is None and monitors:
+            fallback = monitors[0]
+            if not fallback_reason:
+                fallback_reason = "first_monitor"
+
+        return (
+            KakaoTargetResolution(
+                requested_display_num=requested,
+                resolved_display_num=self.__normalize_display_num(
+                    fallback.display_num if fallback is not None else None
+                ),
+                resolved_monitor_handle=int(fallback.handle) if fallback is not None else None,
+                config_missing=bool(requested is not None and fallback is not None and fallback_reason == "requested_display_unavailable"),
+                fallback_reason=str(fallback_reason or ""),
+            ),
+            fallback,
+        )
+
+    def __collect_window_details(self, kakao_pids) -> list[dict]:
+        result = []
+        win32gui = self.__lib.win32gui
+        win32process = self.__lib.win32process
+        pid_set = {int(pid) for pid in kakao_pids if int(pid) > 0}
+
+        def cb(hwnd, _):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(pid or 0) not in pid_set:
+                    return
+                title = str(win32gui.GetWindowText(hwnd) or "").strip()
+                if not title:
+                    return
+                exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+                if exstyle & win32con.WS_EX_TOOLWINDOW:
+                    return
+                rect = tuple(int(v) for v in win32gui.GetWindowRect(hwnd))
+                result.append(
+                    {
+                        "hwnd": int(hwnd),
+                        "title": title,
+                        "rect": rect,
+                        "is_iconic": bool(win32gui.IsIconic(hwnd)),
+                    }
+                )
+            except Exception:
+                return
+
+        try:
+            win32gui.EnumWindows(cb, None)
+        except Exception:
+            return []
+        return result
+
+    def __pick_main_hwnd_from_details(self, windows) -> int | None:
+        best_hwnd = None
+        best_area = -1
+        for item in list(windows or ()):
+            if str(item.get("title") or "") != self.__main_title:
+                continue
+            rect = tuple(item.get("rect") or ())
+            if len(rect) != 4:
+                continue
+            area = max(0, int(rect[2]) - int(rect[0])) * max(0, int(rect[3]) - int(rect[1]))
+            if area > best_area:
+                best_area = area
+                best_hwnd = int(item.get("hwnd") or 0)
+        return best_hwnd if best_hwnd and best_hwnd > 0 else None
+
+    def __merge_chat_order(self, existing_order, chat_hwnds) -> list[int]:
+        chat_set = {int(hwnd) for hwnd in chat_hwnds if int(hwnd) > 0}
+        if not chat_set:
+            return []
+        merged = [int(hwnd) for hwnd in existing_order if int(hwnd) in chat_set]
+        existing = set(merged)
+        new_hwnds = [int(hwnd) for hwnd in chat_hwnds if int(hwnd) not in existing]
+        new_hwnds.sort()
+        merged.extend(new_hwnds)
+        return merged
+
+    def __build_move_plan(
+        self,
+        window_details,
+        main_hwnd: int | None,
+        chat_order,
+        target_monitor: MonitorSnapshot | None,
+    ) -> WindowMovePlan:
+        if target_monitor is None:
+            return WindowMovePlan()
+
+        detail_map = {
+            int(item.get("hwnd") or 0): item for item in list(window_details or ()) if int(item.get("hwnd") or 0) > 0
+        }
+        main_detail = detail_map.get(int(main_hwnd or 0))
+        place_main = bool(main_detail and (not bool(main_detail.get("is_iconic"))))
+        ref_detail = main_detail if place_main else None
+        if ref_detail is None:
+            for hwnd in tuple(chat_order or ()):
+                detail = detail_map.get(int(hwnd or 0))
+                if detail is None or bool(detail.get("is_iconic")):
+                    continue
+                ref_detail = detail
+                break
+        if ref_detail is None:
+            return WindowMovePlan()
+
+        ref_rect = tuple(ref_detail.get("rect") or ())
+        if len(ref_rect) != 4:
+            return WindowMovePlan()
+        ref_w = int(ref_rect[2]) - int(ref_rect[0])
+        ref_h = int(ref_rect[3]) - int(ref_rect[1])
+        if ref_w <= 0 or ref_h <= 0:
+            return WindowMovePlan()
+
+        work_left, work_top, _, work_bottom = tuple(target_monitor.work)
+        target_y = int(ref_rect[1])
         if target_y < work_top:
             target_y = work_top
-        max_y = work_bottom - ref_h
+        max_y = int(work_bottom) - ref_h
         if max_y < work_top:
             max_y = work_top
         if target_y > max_y:
             target_y = max_y
 
-        if place_main:
-            self.__move_window(main_hwnd, work_left, target_y, ref_w, ref_h, resize=False)
+        moves = []
+        if place_main and main_detail is not None:
+            main_rect = tuple(main_detail.get("rect") or ())
+            if len(main_rect) == 4 and (
+                int(main_rect[0]) != int(work_left) or int(main_rect[1]) != int(target_y)
+            ):
+                moves.append(
+                    WindowMove(
+                        hwnd=int(main_hwnd),
+                        x=int(work_left),
+                        y=int(target_y),
+                        width=int(ref_w),
+                        height=int(ref_h),
+                        resize=False,
+                    )
+                )
 
-        if not self.__chat_order:
-            return
-
-        monitors = [(target_monitor["handle"], target_monitor["work"])]
-        primary_handle = target_monitor["handle"] if place_main else None
         slot_iter = self.__iter_slots(
-            monitors,
+            [(int(target_monitor.handle), tuple(target_monitor.work))],
             ref_w,
             ref_h,
-            primary_handle=primary_handle,
+            primary_handle=int(target_monitor.handle) if place_main else None,
             y_base=target_y,
         )
-        for hwnd in self.__chat_order:
+        for hwnd in tuple(chat_order or ()):
+            detail = detail_map.get(int(hwnd or 0))
+            if detail is None or bool(detail.get("is_iconic")):
+                continue
             try:
                 x, y = next(slot_iter)
             except StopIteration:
                 break
-            try:
-                if win32gui.IsIconic(hwnd):
-                    continue
-            except Exception:
+            rect = tuple(detail.get("rect") or ())
+            if len(rect) != 4:
                 continue
-            self.__move_window(hwnd, x, y, ref_w, ref_h, resize=True)
-        return
+            cur_w = int(rect[2]) - int(rect[0])
+            cur_h = int(rect[3]) - int(rect[1])
+            if int(rect[0]) == int(x) and int(rect[1]) == int(y) and cur_w == ref_w and cur_h == ref_h:
+                continue
+            moves.append(
+                WindowMove(
+                    hwnd=int(hwnd),
+                    x=int(x),
+                    y=int(y),
+                    width=int(ref_w),
+                    height=int(ref_h),
+                    resize=True,
+                )
+            )
 
-    def open_monitor_selector(self, root, embedded_parent=None) -> None:
+        return WindowMovePlan(moves=tuple(moves))
+
+    def open_monitor_selector(self, root, embedded_parent=None) -> bool:
         if self.__is_selecting:
-            try:
-                if self.__select_window is not None:
+            if self.__select_window is not None:
+                try:
                     try:
                         self.__select_window.lift()
                     except Exception:
@@ -169,23 +677,25 @@ class KakaoManager:
                             self.__select_window.tkraise()
                         except Exception:
                             pass
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            try:
-                if not self.__overlay_windows:
-                    selected = self.__target_display_num
-                    if selected is None:
-                        selected = self.__get_default_display_num()
-                    self.show_monitor_overlays(root, duration_ms=0, selected_display_num=selected)
-            except Exception:
-                pass
-            return
+                try:
+                    if not self.__overlay_windows:
+                        selected = self.__target_display_num
+                        if selected is None:
+                            selected = self.__get_default_display_num()
+                        self.show_monitor_overlays(root, duration_ms=0, selected_display_num=selected)
+                except Exception:
+                    pass
+                return True
 
-        self.__refresh_monitors(self.__lib.time.monotonic())
+            self.__is_selecting = False
+
         items = self.__build_monitor_items()
         if not items:
-            return
+            self.request_refresh(root)
+            return False
 
         tk = self.__lib.tk
         self.__is_selecting = True
@@ -378,18 +888,23 @@ class KakaoManager:
             except Exception:
                 chosen = 1
 
-            self.__target_display_num = int(chosen) if int(chosen) > 0 else 1
+            changed = self.__set_requested_target_display(int(chosen) if int(chosen) > 0 else 1)
             self.__config_missing = False
             self.__save_config()
             close_window()
+            if changed:
+                self.request_refresh(root)
             return
 
         def cancel() -> None:
+            changed = False
             if self.__target_display_num is None:
-                self.__target_display_num = int(default_display)
+                changed = self.__set_requested_target_display(int(default_display))
             self.__config_missing = False
             self.__save_config()
             close_window()
+            if changed:
+                self.request_refresh(root)
             return
 
         show_btn = tk.Button(btn_frame, text="모니터 번호 표시", command=show_numbers)
@@ -409,7 +924,7 @@ class KakaoManager:
                 ok_btn.focus_set()
         except Exception:
             pass
-        return
+        return True
 
     def hide_monitor_overlays(self) -> None:
         try:
@@ -420,7 +935,9 @@ class KakaoManager:
 
     def show_monitor_overlays(self, root, duration_ms: int = 1500, selected_display_num=None) -> None:
         self.__destroy_overlays()
-        self.__refresh_monitors(self.__lib.time.monotonic())
+        if not self.__monitors:
+            self.request_refresh(root)
+            return
 
         tk = self.__lib.tk
         win32gui = self.__lib.win32gui

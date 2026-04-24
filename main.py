@@ -10,6 +10,7 @@ from src.apps.main_ui import WindowsSupporterMainUI
 from src.utils.StartReg import StartReg
 from src.apps.startup_apps import StartupAppManager
 from src.utils.tray_icon import SystemTrayIcon
+from src.utils.ui_event_pump import SharedUiEventPump
 
 
 def main() -> None:
@@ -51,26 +52,7 @@ def main() -> None:
         monitor.attach(root, event_queue)
     except Exception:
         pass
-    def pump_events() -> None:
-        while True:
-            try:
-                fn = event_queue.get_nowait()
-            except Exception:
-                break
-            try:
-                fn()
-            except Exception:
-                pass
-        try:
-            root.after(30, pump_events)
-        except Exception:
-            return
-        return
-
-    try:
-        root.after(30, pump_events)
-    except Exception:
-        pass
+    SharedUiEventPump(root=root, event_queue=event_queue).start()
 
     def _run_bg(fn) -> None:
         try:
