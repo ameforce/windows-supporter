@@ -11,6 +11,9 @@ from src.apps.codex_usage_monitor import CodexUsageMonitor
 
 
 class Monitor:
+    __LEGACY_HOOKS_ENV = "WINDOWS_SUPPORTER_LEGACY_KEYBOARD_HOOKS"
+    __ENABLED_ENV_VALUES = {"1", "true", "yes", "y", "on"}
+
     def __init__(self) -> None:
         self.__lib = LibConnector()
         self.__one_note = None
@@ -99,10 +102,18 @@ class Monitor:
 
     def __ensure_kakao(self):
         if self.__kakao is not None:
+            try:
+                self.__kakao.set_ui_post(self.__ui_post)
+            except Exception:
+                pass
             return self.__kakao
         with self.__component_lock:
             if self.__kakao is None:
                 self.__kakao = KakaoManager()
+            try:
+                self.__kakao.set_ui_post(self.__ui_post)
+            except Exception:
+                pass
         return self.__kakao
 
     def __ensure_lijamong(self):
@@ -127,6 +138,10 @@ class Monitor:
             return
         try:
             self.__start_kakao_tick()
+        except Exception:
+            pass
+        try:
+            self.__ensure_kakao().request_refresh(root)
         except Exception:
             pass
         try:
@@ -191,16 +206,26 @@ class Monitor:
 
             return _inner
 
-        kb.add_hotkey("ctrl+c", safe(self.__on_ctrl_c), suppress=False)
         kb.add_hotkey("ctrl+alt+c", safe(self.__on_ctrl_alt_c), suppress=False)
         kb.add_hotkey("ctrl+alt+k", safe(self.__on_ctrl_alt_k), suppress=False)
         kb.add_hotkey("ctrl+alt+w", safe(self.__on_ctrl_alt_w), suppress=False)
+        if not self.__legacy_keyboard_hooks_enabled():
+            return
+        kb.add_hotkey("ctrl+c", safe(self.__on_ctrl_c), suppress=False)
         kb.add_hotkey("alt+q", safe(self.__on_alt_q), suppress=False)
         kb.on_press_key("q", safe(self.__on_ctrl_q_key), suppress=False)
         kb.add_hotkey("ctrl+d", safe(self.__on_ctrl_d), suppress=False)
         kb.on_press_key("s", safe(self.__on_ctrl_s_key), suppress=False)
         kb.add_hotkey("enter", safe(self.__on_enter), suppress=False)
         return
+
+    def __legacy_keyboard_hooks_enabled(self) -> bool:
+        try:
+            raw = self.__lib.os.environ.get(self.__LEGACY_HOOKS_ENV, "")
+        except Exception:
+            return False
+        value = str(raw or "").strip().lower()
+        return value in self.__ENABLED_ENV_VALUES
 
     def __reset_hotkeys(self) -> None:
         kb = self.__lib.keyboard

@@ -130,3 +130,37 @@ def resize_window_to_monitor(hwnd: int, use_work_area: bool = False) -> bool:
         return True
     except Exception:
         return False
+
+
+def apply_precomputed_window_position(
+    hwnd: int,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    *,
+    resize: bool,
+) -> bool:
+    flags = (
+        win32con.SWP_NOZORDER
+        | win32con.SWP_NOOWNERZORDER
+        | win32con.SWP_NOACTIVATE
+        | win32con.SWP_ASYNCWINDOWPOS
+    )
+    if not resize:
+        flags |= win32con.SWP_NOSIZE
+        width = 0
+        height = 0
+    try:
+        win32gui.SetWindowPos(
+            int(hwnd),
+            0,
+            int(x),
+            int(y),
+            int(width),
+            int(height),
+            flags,
+        )
+        return True
+    except Exception:
+        return False
