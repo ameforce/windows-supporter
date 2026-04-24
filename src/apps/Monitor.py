@@ -99,10 +99,18 @@ class Monitor:
 
     def __ensure_kakao(self):
         if self.__kakao is not None:
+            try:
+                self.__kakao.set_ui_post(self.__ui_post)
+            except Exception:
+                pass
             return self.__kakao
         with self.__component_lock:
             if self.__kakao is None:
                 self.__kakao = KakaoManager()
+            try:
+                self.__kakao.set_ui_post(self.__ui_post)
+            except Exception:
+                pass
         return self.__kakao
 
     def __ensure_lijamong(self):
@@ -127,6 +135,10 @@ class Monitor:
             return
         try:
             self.__start_kakao_tick()
+        except Exception:
+            pass
+        try:
+            self.__ensure_kakao().request_refresh(root)
         except Exception:
             pass
         try:
