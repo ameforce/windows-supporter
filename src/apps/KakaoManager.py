@@ -223,34 +223,47 @@ class KakaoManager:
             )
 
         def worker() -> None:
-            result = self.__compute_work_result(request)
-            self.__post_ui(lambda: self.__handle_work_result(root, result), root=root)
+            try:
+                result = self.__compute_work_result(request)
+            except Exception:
+                self.__finish_failed_worker(root)
+                return
+            if not self.__post_ui(lambda: self.__handle_work_result(root, result), root=root):
+                self.__finish_failed_worker(root)
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            with self.__worker_lock:
-                self.__worker_active = False
-                self.__pending_rerun = False
+            self.__finish_failed_worker(root)
         return
 
-    def __post_ui(self, fn, root=None) -> None:
+    def __post_ui(self, fn, root=None) -> bool:
         if not callable(fn):
-            return
+            return False
         ui_post = self.__ui_post
         if callable(ui_post):
             try:
                 ui_post(fn)
-                return
+                return True
             except Exception:
                 pass
         if root is None:
-            return
+            return False
         try:
-            root.after(0, fn)
+            return bool(root.after(0, fn))
         except Exception:
-            return
+            return False
+        return False
+
+    def __finish_failed_worker(self, root=None) -> None:
+        pending = False
+        with self.__worker_lock:
+            self.__worker_active = False
+            pending = bool(self.__pending_rerun)
+            self.__pending_rerun = False
+        if pending:
+            self.__request_background_tick(root, self.__lib.time.monotonic())
         return
 
     def __handle_work_result(self, root, result: KakaoWorkResult) -> None:
@@ -653,10 +666,10 @@ class KakaoManager:
 
         return WindowMovePlan(moves=tuple(moves))
 
-    def open_monitor_selector(self, root, embedded_parent=None) -> None:
+    def open_monitor_selector(self, root, embedded_parent=None) -> bool:
         if self.__is_selecting:
-            try:
-                if self.__select_window is not None:
+            if self.__select_window is not None:
+                try:
                     try:
                         self.__select_window.lift()
                     except Exception:
@@ -664,23 +677,25 @@ class KakaoManager:
                             self.__select_window.tkraise()
                         except Exception:
                             pass
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            try:
-                if not self.__overlay_windows:
-                    selected = self.__target_display_num
-                    if selected is None:
-                        selected = self.__get_default_display_num()
-                    self.show_monitor_overlays(root, duration_ms=0, selected_display_num=selected)
-            except Exception:
-                pass
-            return
+                try:
+                    if not self.__overlay_windows:
+                        selected = self.__target_display_num
+                        if selected is None:
+                            selected = self.__get_default_display_num()
+                        self.show_monitor_overlays(root, duration_ms=0, selected_display_num=selected)
+                except Exception:
+                    pass
+                return True
+
+            self.__is_selecting = False
 
         items = self.__build_monitor_items()
         if not items:
             self.request_refresh(root)
-            return
+            return False
 
         tk = self.__lib.tk
         self.__is_selecting = True
@@ -909,7 +924,7 @@ class KakaoManager:
                 ok_btn.focus_set()
         except Exception:
             pass
-        return
+        return True
 
     def hide_monitor_overlays(self) -> None:
         try:

@@ -24,6 +24,27 @@ class _FakeThread:
         return None
 
 
+class _FakeAfterRoot:
+    def __init__(self, *, after_result="after#1", after_side_effect=None):
+        self.after_calls = []
+        self.after_result = after_result
+        self.after_side_effect = after_side_effect
+
+    def after(self, delay, callback):
+        self.after_calls.append((delay, callback))
+        if self.after_side_effect is not None:
+            raise self.after_side_effect
+        return self.after_result
+
+
+class _RaisingWindow:
+    def lift(self):
+        raise RuntimeError("lift failed")
+
+    def tkraise(self):
+        raise RuntimeError("raise failed")
+
+
 class KakaoManagerTickUnitTest(unittest.TestCase):
     def setUp(self) -> None:
         self.manager = KakaoManager()
@@ -49,8 +70,41 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
         self.manager.request_refresh = request_refresh
         self.manager._KakaoManager__monitors = []
 
-        self.manager.open_monitor_selector(root=object())
+        rendered = self.manager.open_monitor_selector(root=object())
 
+        self.assertFalse(rendered)
+        request_refresh.assert_called_once()
+
+    def test_open_monitor_selector_returns_false_for_empty_embedded_snapshot(self) -> None:
+        request_refresh = Mock()
+        self.manager.request_refresh = request_refresh
+        self.manager._KakaoManager__monitors = []
+
+        rendered = self.manager.open_monitor_selector(root=object(), embedded_parent=object())
+
+        self.assertFalse(rendered)
+        request_refresh.assert_called_once()
+
+    def test_open_monitor_selector_existing_window_returns_true_despite_lift_failures(self) -> None:
+        self.manager._KakaoManager__is_selecting = True
+        self.manager._KakaoManager__select_window = _RaisingWindow()
+        self.manager._KakaoManager__overlay_windows = [object()]
+
+        rendered = self.manager.open_monitor_selector(root=object())
+
+        self.assertTrue(rendered)
+
+    def test_open_monitor_selector_resets_stale_selecting_state_before_empty_retry(self) -> None:
+        request_refresh = Mock()
+        self.manager.request_refresh = request_refresh
+        self.manager._KakaoManager__is_selecting = True
+        self.manager._KakaoManager__select_window = None
+        self.manager._KakaoManager__monitors = []
+
+        rendered = self.manager.open_monitor_selector(root=object())
+
+        self.assertFalse(rendered)
+        self.assertFalse(self.manager._KakaoManager__is_selecting)
         request_refresh.assert_called_once()
 
     def test_request_refresh_is_single_flight_and_marks_pending_rerun(self) -> None:
@@ -63,6 +117,73 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
         self.assertTrue(self.manager._KakaoManager__worker_active)
         self.assertTrue(self.manager._KakaoManager__pending_rerun)
         self.assertEqual(self.manager._KakaoManager__latest_request_generation, 2)
+
+    def test_post_ui_reports_contract_success_and_failure(self) -> None:
+        calls = []
+        self.manager.set_ui_post(lambda fn: calls.append(fn))
+
+        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None), True)
+        self.assertEqual(len(calls), 1)
+
+        self.manager.set_ui_post(None)
+        root = _FakeAfterRoot(after_result="after#1")
+
+        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=root), True)
+        self.assertIs(self.manager._KakaoManager__post_ui(None, root=root), False)
+
+        falsey_root = _FakeAfterRoot(after_result=None)
+        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=falsey_root), False)
+
+    def test_post_ui_falls_back_after_ui_post_exception_and_reports_failure(self) -> None:
+        self.manager.set_ui_post(Mock(side_effect=RuntimeError("post failed")))
+
+        root = _FakeAfterRoot(after_result="after#1")
+        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=root), True)
+
+        failing_root = _FakeAfterRoot(after_side_effect=RuntimeError("after failed"))
+        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=failing_root), False)
+
+    def test_worker_compute_exception_cleans_active_latch(self) -> None:
+        _FakeThread.created = []
+        with patch("src.apps.KakaoManager.threading.Thread", _FakeThread):
+            self.manager.request_refresh(root=None)
+
+        with patch.object(
+            self.manager,
+            "_KakaoManager__compute_work_result",
+            side_effect=RuntimeError("compute failed"),
+        ):
+            try:
+                _FakeThread.created[0].target()
+            except RuntimeError:
+                pass
+
+        self.assertFalse(self.manager._KakaoManager__worker_active)
+        self.assertFalse(self.manager._KakaoManager__pending_rerun)
+
+    def test_worker_post_failure_cleans_latch_and_allows_next_refresh(self) -> None:
+        _FakeThread.created = []
+        with patch("src.apps.KakaoManager.threading.Thread", _FakeThread):
+            with patch.object(self.manager, "_KakaoManager__compute_work_result", return_value=object()):
+                self.manager.request_refresh(root=None)
+                _FakeThread.created[0].target()
+                self.manager.request_refresh(root=None)
+
+        self.assertFalse(self.manager._KakaoManager__pending_rerun)
+        self.assertEqual(len(_FakeThread.created), 2)
+
+    def test_failed_worker_cleanup_consumes_pending_rerun_once(self) -> None:
+        self.manager._KakaoManager__worker_active = True
+        self.manager._KakaoManager__pending_rerun = True
+
+        with patch.object(self.manager, "_KakaoManager__request_background_tick") as request_tick:
+            self.manager._KakaoManager__finish_failed_worker(root="root")
+            self.manager._KakaoManager__finish_failed_worker(root="root")
+
+        request_tick.assert_called_once()
+        self.assertEqual(request_tick.call_args.args[0], "root")
+        self.assertFalse(self.manager._KakaoManager__worker_active)
+        self.assertFalse(self.manager._KakaoManager__pending_rerun)
 
     def test_request_refresh_bootstraps_persisted_target_before_dispatch(self) -> None:
         manager = KakaoManager()

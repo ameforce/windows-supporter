@@ -8,6 +8,7 @@ class WindowsSupporterMainUI:
     _TAB_KAKAO = "kakao_monitor"
     _TAB_WRIKE = "wrike"
     _TAB_CODEX = "codex_usage"
+    _KAKAO_RETRY_DELAY_MS = 500
 
     def __init__(self, root: Any, startup_manager: Any, monitor: Any) -> None:
         self._root = root
@@ -26,6 +27,7 @@ class WindowsSupporterMainUI:
         self._startup_view = None
         self._startup_built = False
         self._kakao_built = False
+        self._kakao_retry_after_id = None
         self._wrike_view = None
         self._wrike_built = False
         self._codex_view = None
@@ -320,7 +322,7 @@ class WindowsSupporterMainUI:
         return
 
     def _ensure_kakao_built(self) -> None:
-        if self._tab_kakao is None:
+        if self._kakao_built or self._tab_kakao is None:
             return
 
         kakao = None
@@ -332,10 +334,39 @@ class WindowsSupporterMainUI:
             return
 
         try:
-            kakao.open_monitor_selector(self._root, embedded_parent=self._tab_kakao)
-            self._kakao_built = True
+            self._kakao_built = bool(
+                kakao.open_monitor_selector(self._root, embedded_parent=self._tab_kakao)
+            )
         except Exception:
             self._kakao_built = False
+        if not self._kakao_built:
+            self._schedule_kakao_build_retry()
+        return
+
+    def _schedule_kakao_build_retry(self) -> None:
+        if self._kakao_retry_after_id is not None:
+            return
+
+        def retry() -> None:
+            self._kakao_retry_after_id = None
+            if self._current_tab is not None and self._current_tab != self._TAB_KAKAO:
+                return
+            self._ensure_kakao_built()
+            return
+
+        try:
+            delay = max(500, int(self._KAKAO_RETRY_DELAY_MS))
+        except Exception:
+            delay = 500
+        try:
+            after_id = self._root.after(delay, retry)
+        except Exception:
+            self._kakao_retry_after_id = None
+            return
+        if after_id:
+            self._kakao_retry_after_id = after_id
+        else:
+            self._kakao_retry_after_id = None
         return
 
     def _ensure_wrike_built(self) -> None:
