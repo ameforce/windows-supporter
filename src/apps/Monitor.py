@@ -1,9 +1,7 @@
 from src.utils.LibConnector import LibConnector
 import threading
 
-from src.apps.OneNote import OneNote
 from src.apps.Notion import Notion
-from src.apps.Skype import Skype
 from src.apps.Wrike import Wrike
 from src.apps.KakaoManager import KakaoManager
 from src.apps.LiJaMong import LiJaMong
@@ -11,14 +9,9 @@ from src.apps.codex_usage_monitor import CodexUsageMonitor
 
 
 class Monitor:
-    __LEGACY_HOOKS_ENV = "WINDOWS_SUPPORTER_LEGACY_KEYBOARD_HOOKS"
-    __ENABLED_ENV_VALUES = {"1", "true", "yes", "y", "on"}
-
     def __init__(self) -> None:
         self.__lib = LibConnector()
-        self.__one_note = None
         self.__notion = None
-        self.__skype = None
         self.__wrike = None
         self.__kakao = None
         self.__lijamong = None
@@ -36,9 +29,6 @@ class Monitor:
 
         self.__kakao_after_id = None
         self.__kakao_tick_ms = 200
-        self.__hotkey_repeat_guard_sec = 0.35
-        self.__last_ctrl_q_ts = 0.0
-        self.__last_ctrl_s_ts = 0.0
 
         return
 
@@ -68,14 +58,6 @@ class Monitor:
             return
         return
 
-    def __ensure_one_note(self):
-        if self.__one_note is not None:
-            return self.__one_note
-        with self.__component_lock:
-            if self.__one_note is None:
-                self.__one_note = OneNote()
-        return self.__one_note
-
     def __ensure_notion(self):
         if self.__notion is not None:
             return self.__notion
@@ -83,14 +65,6 @@ class Monitor:
             if self.__notion is None:
                 self.__notion = Notion()
         return self.__notion
-
-    def __ensure_skype(self):
-        if self.__skype is not None:
-            return self.__skype
-        with self.__component_lock:
-            if self.__skype is None:
-                self.__skype = Skype()
-        return self.__skype
 
     def __ensure_wrike(self):
         if self.__wrike is not None:
@@ -172,9 +146,6 @@ class Monitor:
 
         def worker() -> None:
             try:
-                self.__ensure_one_note()
-                self.__ensure_notion()
-                self.__ensure_skype()
                 self.__ensure_wrike()
                 self.__ensure_kakao()
                 self.__ensure_lijamong()
@@ -209,23 +180,10 @@ class Monitor:
         kb.add_hotkey("ctrl+alt+c", safe(self.__on_ctrl_alt_c), suppress=False)
         kb.add_hotkey("ctrl+alt+k", safe(self.__on_ctrl_alt_k), suppress=False)
         kb.add_hotkey("ctrl+alt+w", safe(self.__on_ctrl_alt_w), suppress=False)
-        if not self.__legacy_keyboard_hooks_enabled():
-            return
-        kb.add_hotkey("ctrl+c", safe(self.__on_ctrl_c), suppress=False)
         kb.add_hotkey("alt+q", safe(self.__on_alt_q), suppress=False)
-        kb.on_press_key("q", safe(self.__on_ctrl_q_key), suppress=False)
-        kb.add_hotkey("ctrl+d", safe(self.__on_ctrl_d), suppress=False)
-        kb.on_press_key("s", safe(self.__on_ctrl_s_key), suppress=False)
-        kb.add_hotkey("enter", safe(self.__on_enter), suppress=False)
+        kb.add_hotkey("ctrl+q", safe(self.__on_ctrl_q), suppress=False)
+        kb.add_hotkey("ctrl+s", safe(self.__on_ctrl_s), suppress=False)
         return
-
-    def __legacy_keyboard_hooks_enabled(self) -> bool:
-        try:
-            raw = self.__lib.os.environ.get(self.__LEGACY_HOOKS_ENV, "")
-        except Exception:
-            return False
-        value = str(raw or "").strip().lower()
-        return value in self.__ENABLED_ENV_VALUES
 
     def __reset_hotkeys(self) -> None:
         kb = self.__lib.keyboard
@@ -235,8 +193,6 @@ class Monitor:
             pass
         self.__clear_keyboard_state(kb)
         self.__hotkeys_registered = False
-        self.__last_ctrl_q_ts = 0.0
-        self.__last_ctrl_s_ts = 0.0
         try:
             self.__register_hotkeys()
             self.__hotkeys_registered = True
@@ -270,58 +226,6 @@ class Monitor:
                 filtered_modifiers.clear()
         except Exception:
             pass
-        return
-
-    def __should_handle_ctrl_combo(self, last_ts: float):
-        kb = self.__lib.keyboard
-        try:
-            if not kb.is_pressed("ctrl"):
-                return None
-            if kb.is_pressed("alt") or kb.is_pressed("shift") or kb.is_pressed("windows"):
-                return None
-        except Exception:
-            return None
-        now = self.__lib.time.monotonic()
-        if (now - last_ts) < self.__hotkey_repeat_guard_sec:
-            return None
-        return now
-
-    def __on_ctrl_q_key(self) -> None:
-        ts = self.__should_handle_ctrl_combo(self.__last_ctrl_q_ts)
-        if ts is None:
-            return
-        self.__last_ctrl_q_ts = ts
-        self.__on_ctrl_q()
-        return
-
-    def __on_ctrl_s_key(self) -> None:
-        ts = self.__should_handle_ctrl_combo(self.__last_ctrl_s_ts)
-        if ts is None:
-            return
-        self.__last_ctrl_s_ts = ts
-        self.__on_ctrl_s()
-        return
-
-    def __on_ctrl_c(self) -> None:
-        notion = None
-        try:
-            notion = self.__ensure_notion()
-            if notion is None or not notion.is_notion_active():
-                return
-        except Exception:
-            return
-
-        def ui_task() -> None:
-            root = self.__root
-            if root is None:
-                return
-            try:
-                root.after(60, notion.rewrite_clipboard_for_wrike, root)
-            except Exception:
-                return
-            return
-
-        self.__ui_post(ui_task)
         return
 
     def __on_ctrl_alt_c(self) -> None:
@@ -426,23 +330,6 @@ class Monitor:
         self.__ui_post(ui_task)
         return
 
-    def __on_ctrl_d(self) -> None:
-        one_note = self.__ensure_one_note()
-
-        def ui_task() -> None:
-            root = self.__root
-            if root is None:
-                return
-            try:
-                if one_note.is_one_note_active():
-                    one_note.action(root)
-            except Exception:
-                return
-            return
-
-        self.__ui_post(ui_task)
-        return
-
     def __on_ctrl_s(self) -> None:
         notion = self.__ensure_notion()
 
@@ -453,23 +340,6 @@ class Monitor:
             try:
                 if notion.is_notion_active():
                     notion.action(root)
-            except Exception:
-                return
-            return
-
-        self.__ui_post(ui_task)
-        return
-
-    def __on_enter(self) -> None:
-        skype = self.__ensure_skype()
-
-        def ui_task() -> None:
-            root = self.__root
-            if root is None:
-                return
-            try:
-                if skype.is_skype_active():
-                    skype.action(root)
             except Exception:
                 return
             return
