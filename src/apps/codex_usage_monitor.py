@@ -1856,7 +1856,7 @@ class CodexUsageMonitor:
                 metric_colors[str(item.key)] = color
         lines: list[tuple[str, str | None]] = [("Codex 현재 사용량", None)]
         lines.extend(self.__build_snapshot_lines(current, metric_colors=metric_colors))
-        lines.append(("", None))
+        lines.append(("--------------------------------", None))
         lines.append(("변경 항목", None))
         for item in changes:
             before = item.before if item.before else "-"

@@ -2253,9 +2253,12 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             )
 
         lines = captured.get("lines", [])
+        line_texts = [str(line[0]) for line in lines]
         joined = " | ".join(str(line[0]) for line in lines)
         self.assertTrue(lines)
         self.assertEqual(lines[0][0], "Codex 현재 사용량")
+        self.assertIn("--------------------------------", line_texts)
+        self.assertLess(line_texts.index("--------------------------------"), line_texts.index("변경 항목"))
         self.assertIn("변경 항목", joined)
         self.assertIn("남은 크레딧: 959", joined)
 
