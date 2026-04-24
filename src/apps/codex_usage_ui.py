@@ -27,7 +27,8 @@ class CodexUsageSettingsView:
         self._live_time_var = None
         self._live_five_hour_var = None
         self._live_weekly_var = None
-        self._live_code_review_var = None
+        self._live_spark_five_hour_var = None
+        self._live_spark_weekly_var = None
         self._live_credit_var = None
         self._status_colors = {
             "info": "#6B7280",
@@ -143,7 +144,8 @@ class CodexUsageSettingsView:
         self._live_time_var = tk.StringVar(value="-")
         self._live_five_hour_var = tk.StringVar(value="-")
         self._live_weekly_var = tk.StringVar(value="-")
-        self._live_code_review_var = tk.StringVar(value="-")
+        self._live_spark_five_hour_var = tk.StringVar(value="-")
+        self._live_spark_weekly_var = tk.StringVar(value="-")
         self._live_credit_var = tk.StringVar(value="-")
 
         row = 0
@@ -262,7 +264,21 @@ class CodexUsageSettingsView:
         row += 1
         self._add_value_row(body, row, "주간 사용 한도", self._live_weekly_var, card_bg)
         row += 1
-        self._add_value_row(body, row, "코드 검토", self._live_code_review_var, card_bg)
+        self._add_value_row(
+            body,
+            row,
+            "gpt-5.3-codex-spark 5시간 사용 한도",
+            self._live_spark_five_hour_var,
+            card_bg,
+        )
+        row += 1
+        self._add_value_row(
+            body,
+            row,
+            "gpt-5.3-codex-spark 주간 사용 한도",
+            self._live_spark_weekly_var,
+            card_bg,
+        )
         row += 1
         self._add_value_row(body, row, "남은 크레딧", self._live_credit_var, card_bg)
 
@@ -611,7 +627,12 @@ class CodexUsageSettingsView:
                 self._live_time_var.set(_fmt_time(_val("captured_at")))
             self._live_five_hour_var.set(_metric_text("five_hour_limit"))
             self._live_weekly_var.set(_metric_text("weekly_limit"))
-            self._live_code_review_var.set(_metric_text("code_review"))
+            self._live_spark_five_hour_var.set(
+                _metric_text("gpt_5_3_codex_spark_five_hour_limit")
+            )
+            self._live_spark_weekly_var.set(
+                _metric_text("gpt_5_3_codex_spark_weekly_limit")
+            )
             self._live_credit_var.set(_metric_text("remaining_credit"))
         except Exception:
             pass

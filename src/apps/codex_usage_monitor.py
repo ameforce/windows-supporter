@@ -27,21 +27,29 @@ from src.utils.ToolTip import ToolTip
 USAGE_METRIC_KEYS = (
     "five_hour_limit",
     "weekly_limit",
-    "code_review",
+    "gpt_5_3_codex_spark_five_hour_limit",
+    "gpt_5_3_codex_spark_weekly_limit",
     "remaining_credit",
 )
+
+USAGE_LIMIT_METRIC_KEYS = USAGE_METRIC_KEYS[:-1]
 
 USAGE_METRIC_LABELS: dict[str, str] = {
     "five_hour_limit": "5시간 사용 한도",
     "weekly_limit": "주간 사용 한도",
-    "code_review": "코드 검토",
+    "gpt_5_3_codex_spark_five_hour_limit": "gpt-5.3-codex-spark 5시간 사용 한도",
+    "gpt_5_3_codex_spark_weekly_limit": "gpt-5.3-codex-spark 주간 사용 한도",
     "remaining_credit": "남은 크레딧",
 }
 
-CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/usage"
+CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
+CODEX_USAGE_CANONICAL_PATH = "/codex/cloud/settings/analytics"
+CODEX_USAGE_CANONICAL_FRAGMENT = "usage"
 CODEX_USAGE_PAGE_PATHS = (
     "/codex/settings/usage",
     "/codex/cloud/settings/usage",
+    "/codex/settings/analytics",
+    "/codex/cloud/settings/analytics",
 )
 RAW_CDP_COMMAND_TIMEOUT_SEC = 8.0
 
@@ -251,26 +259,56 @@ USAGE_PAGE_PROBE_SCRIPT = r"""
   const aliases = {
     five_hour_limit: ['5시간 사용 한도', '5시간한도', '5-hour usage limit', '5 hour usage limit', '5h usage limit'],
     weekly_limit: ['주간 사용 한도', '주간한도', 'weekly usage limit', 'weekly limit'],
-    code_review: ['코드 검토', '코드리뷰', 'code review', 'reviews'],
+    gpt_5_3_codex_spark_five_hour_limit: [
+      'gpt-5.3-codex-spark 5시간 사용 한도',
+      'gpt-5.3 codex spark 5시간 사용 한도',
+      'gpt-5.3-codex-spark 5-hour usage limit',
+      'gpt-5.3 codex spark 5-hour usage limit',
+      'gpt-5.3-codex-spark 5 hour usage limit',
+    ],
+    gpt_5_3_codex_spark_weekly_limit: [
+      'gpt-5.3-codex-spark 주간 사용 한도',
+      'gpt-5.3 codex spark 주간 사용 한도',
+      'gpt-5.3-codex-spark weekly usage limit',
+      'gpt-5.3 codex spark weekly usage limit',
+      'gpt-5.3-codex-spark weekly limit',
+    ],
     remaining_credit: ['남은 크레딧', '잔여 크레딧', 'remaining credit', 'credits remaining'],
   };
   const scope = document.querySelector('main') || document.body;
   if (!scope) {
     return { url: location.href, title: document.title, mainText: '', metricBlocks: [] };
   }
-  const metricKeys = Object.keys(aliases);
+  const metricAliases = Object.entries(aliases).flatMap(([key, values]) =>
+    (Array.isArray(values) ? values : []).map((alias) => ({
+      key,
+      alias,
+      aliasToken: normalizeToken(alias),
+      aliasLower: normalize(alias).toLowerCase(),
+    }))
+  );
   const getMetricKey = (text) => {
+    const raw = normalize(text).toLowerCase();
     const token = normalizeToken(text);
     if (!token) return '';
-    for (const key of metricKeys) {
-      const candidates = aliases[key] || [];
-      for (const alias of candidates) {
-        if (normalizeToken(alias) && token.includes(normalizeToken(alias))) {
-          return key;
-        }
+    let bestKey = '';
+    let bestLength = -1;
+    let bestIndex = Number.MAX_SAFE_INTEGER;
+    for (const candidate of metricAliases) {
+      if (!candidate.aliasToken) continue;
+      let index = raw.indexOf(candidate.aliasLower);
+      if (index < 0) {
+        index = token.indexOf(candidate.aliasToken);
+      }
+      if (index < 0) continue;
+      const aliasLength = candidate.aliasToken.length;
+      if (aliasLength > bestLength || (aliasLength === bestLength && index < bestIndex)) {
+        bestKey = candidate.key;
+        bestLength = aliasLength;
+        bestIndex = index;
       }
     }
-    return '';
+    return bestKey;
   };
   const collectValueCandidates = (boundary, labelText) => {
     const values = [];
@@ -361,11 +399,19 @@ USAGE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
         "weekly usage limit",
         "weekly limit",
     ),
-    "code_review": (
-        "코드 검토",
-        "코드리뷰",
-        "code review",
-        "reviews",
+    "gpt_5_3_codex_spark_five_hour_limit": (
+        "gpt-5.3-codex-spark 5시간 사용 한도",
+        "gpt-5.3 codex spark 5시간 사용 한도",
+        "gpt-5.3-codex-spark 5-hour usage limit",
+        "gpt-5.3 codex spark 5-hour usage limit",
+        "gpt-5.3-codex-spark 5 hour usage limit",
+    ),
+    "gpt_5_3_codex_spark_weekly_limit": (
+        "gpt-5.3-codex-spark 주간 사용 한도",
+        "gpt-5.3 codex spark 주간 사용 한도",
+        "gpt-5.3-codex-spark weekly usage limit",
+        "gpt-5.3 codex spark weekly usage limit",
+        "gpt-5.3-codex-spark weekly limit",
     ),
     "remaining_credit": (
         "남은 크레딧",
@@ -395,9 +441,13 @@ def _normalize_match_token(text: str) -> str:
 def _find_alias_in_line(line: str, aliases: tuple[str, ...]) -> tuple[str | None, int]:
     line_text = str(line or "")
     line_match = _normalize_match_token(line_text)
+    lowered = normalize_usage_value(line_text).lower()
     if not line_match:
         return None, -1
 
+    best_alias: str | None = None
+    best_idx = -1
+    best_length = -1
     for alias in sorted(aliases, key=len, reverse=True):
         alias_text = str(alias or "").strip()
         if not alias_text:
@@ -405,25 +455,40 @@ def _find_alias_in_line(line: str, aliases: tuple[str, ...]) -> tuple[str | None
         alias_match = _normalize_match_token(alias_text)
         if not alias_match:
             continue
-        if alias_match in line_match:
-            try:
-                idx = line_text.lower().find(alias_text.lower())
-            except Exception:
-                idx = line_text.find(alias_text)
-            return alias_text, idx
-    return None, -1
+        idx = lowered.find(alias_text.lower())
+        if idx < 0:
+            idx = line_match.find(alias_match)
+        if idx < 0:
+            continue
+        alias_length = len(alias_match)
+        if alias_length > best_length or (alias_length == best_length and idx < best_idx):
+            best_alias = alias_text
+            best_idx = idx
+            best_length = alias_length
+    return best_alias, best_idx
+
+
+def _find_metric_alias_in_line(line: str) -> tuple[str | None, str | None, int]:
+    best_key: str | None = None
+    best_alias: str | None = None
+    best_idx = -1
+    best_length = -1
+    for key in USAGE_METRIC_KEYS:
+        alias, idx = _find_alias_in_line(line, USAGE_METRIC_ALIASES.get(key, ()))
+        if alias is None:
+            continue
+        alias_length = len(_normalize_match_token(alias))
+        if alias_length > best_length or (alias_length == best_length and idx < best_idx):
+            best_key = key
+            best_alias = alias
+            best_idx = idx
+            best_length = alias_length
+    return best_key, best_alias, best_idx
 
 
 def _line_contains_any_usage_label(line: str) -> bool:
-    normalized = _normalize_match_token(line)
-    if not normalized:
-        return False
-    for aliases in USAGE_METRIC_ALIASES.values():
-        for alias in aliases:
-            alias_token = _normalize_match_token(alias)
-            if alias_token and alias_token in normalized:
-                return True
-    return False
+    key, _, _ = _find_metric_alias_in_line(line)
+    return key is not None
 
 
 def _normalize_metric_candidate(key: str, value: str) -> str:
@@ -435,7 +500,7 @@ def _normalize_metric_candidate(key: str, value: str) -> str:
     except Exception:
         return ""
 
-    if key in {"five_hour_limit", "weekly_limit", "code_review"}:
+    if key in USAGE_LIMIT_METRIC_KEYS:
         ratio = re.search(r"(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)", text)
         if ratio:
             return normalize_usage_value(ratio.group(1))
@@ -472,61 +537,44 @@ def parse_usage_metrics_from_text(raw_text: str) -> dict[str, str]:
     parsed: dict[str, str] = {}
 
     for idx, line in enumerate(lines):
-        for key in USAGE_METRIC_KEYS:
-            if key in parsed:
-                continue
-            aliases = USAGE_METRIC_ALIASES.get(key, ())
-            alias, start_idx = _find_alias_in_line(line, aliases)
-            if alias is None:
-                continue
+        key, alias, start_idx = _find_metric_alias_in_line(line)
+        if key is None or alias is None or key in parsed:
+            continue
 
-            value = ""
-            if start_idx >= 0:
-                cut = start_idx + len(alias)
-                inline_candidate = line[cut:].strip(" :：-|")
-                value = _normalize_metric_candidate(key, inline_candidate)
-            if not value:
-                j = idx + 1
-                while j < len(lines):
-                    candidate = normalize_usage_value(lines[j])
-                    if not candidate:
-                        j += 1
-                        continue
-                    if _line_contains_any_usage_label(candidate):
-                        break
-                    candidate_value = _normalize_metric_candidate(key, candidate)
-                    if candidate_value:
-                        value = candidate_value
-                        break
+        value = ""
+        if start_idx >= 0:
+            cut = start_idx + len(alias)
+            inline_candidate = line[cut:].strip(" :：-|")
+            value = _normalize_metric_candidate(key, inline_candidate)
+        if not value:
+            j = idx + 1
+            while j < len(lines):
+                candidate = normalize_usage_value(lines[j])
+                if not candidate:
                     j += 1
-            value = _normalize_metric_candidate(key, value)
-            if value:
-                parsed[key] = value
+                    continue
+                if _line_contains_any_usage_label(candidate):
+                    break
+                candidate_value = _normalize_metric_candidate(key, candidate)
+                if candidate_value:
+                    value = candidate_value
+                    break
+                j += 1
+        value = _normalize_metric_candidate(key, value)
+        if value:
+            parsed[key] = value
 
     # Fallback: robust colon parsing over the full flattened text.
     if len(parsed) < len(USAGE_METRIC_KEYS):
-        merged = "\n".join(lines)
-        try:
-            import re
-
-            for key in USAGE_METRIC_KEYS:
-                if key in parsed:
-                    continue
-                aliases = USAGE_METRIC_ALIASES.get(key, ())
-                for alias in aliases:
-                    pat = re.compile(
-                        rf"{re.escape(str(alias))}\s*[:：-]\s*([^\n]+)",
-                        re.IGNORECASE,
-                    )
-                    m = pat.search(merged)
-                    if not m:
-                        continue
-                    value = _normalize_metric_candidate(key, m.group(1))
-                    if value:
-                        parsed[key] = value
-                        break
-        except Exception:
-            pass
+        for line in lines:
+            key, alias, start_idx = _find_metric_alias_in_line(line)
+            if key is None or alias is None or key in parsed or start_idx < 0:
+                continue
+            cut = start_idx + len(alias)
+            inline_candidate = line[cut:].strip(" :：-|")
+            value = _normalize_metric_candidate(key, inline_candidate)
+            if value:
+                parsed[key] = value
 
     return parsed
 
@@ -542,13 +590,16 @@ def canonicalize_codex_usage_url(value: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return text
     path = str(parsed.path or "").rstrip("/")
-    if path == "/codex/settings/usage":
-        path = "/codex/cloud/settings/usage"
+    if path in CODEX_USAGE_PAGE_PATHS:
+        path = CODEX_USAGE_CANONICAL_PATH
     elif path == "":
         path = str(parsed.path or "")
     if not path:
-        path = "/codex/cloud/settings/usage"
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+        path = CODEX_USAGE_CANONICAL_PATH
+    fragment = str(parsed.fragment or "").strip()
+    if path == CODEX_USAGE_CANONICAL_PATH:
+        fragment = CODEX_USAGE_CANONICAL_FRAGMENT
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, fragment))
 
 
 def build_codex_login_entry_url(usage_url: str) -> str:
@@ -556,14 +607,20 @@ def build_codex_login_entry_url(usage_url: str) -> str:
     try:
         parsed = urlsplit(normalized)
     except Exception:
-        return "https://chatgpt.com/auth/login?next=/codex/cloud/settings/usage"
+        return (
+            "https://chatgpt.com/auth/login?"
+            "next=/codex/cloud/settings/analytics%23usage"
+        )
     path = str(parsed.path or "").rstrip("/")
     if not path:
-        path = "/codex/cloud/settings/usage"
+        path = CODEX_USAGE_CANONICAL_PATH
     next_target = path
     query = str(parsed.query or "").strip()
     if query:
         next_target = f"{next_target}?{query}"
+    fragment = str(parsed.fragment or "").strip()
+    if fragment:
+        next_target = f"{next_target}#{fragment}"
     return f"https://chatgpt.com/auth/login?next={quote(next_target, safe='/?=&')}"
 
 
@@ -578,7 +635,12 @@ def is_codex_usage_url(value: str) -> bool:
     if str(parsed.netloc or "").lower() != "chatgpt.com":
         return False
     path = str(parsed.path or "").rstrip("/")
-    return path in CODEX_USAGE_PAGE_PATHS
+    if path not in CODEX_USAGE_PAGE_PATHS:
+        return False
+    fragment = str(parsed.fragment or "").strip().lower()
+    if path == CODEX_USAGE_CANONICAL_PATH:
+        return fragment in ("", CODEX_USAGE_CANONICAL_FRAGMENT)
+    return True
 
 
 def are_equivalent_codex_usage_urls(left: str, right: str) -> bool:
@@ -592,14 +654,8 @@ def are_equivalent_codex_usage_urls(left: str, right: str) -> bool:
 
 
 def _find_metric_key_for_label(text: str) -> str | None:
-    line = normalize_usage_value(text)
-    if not line:
-        return None
-    for key, aliases in USAGE_METRIC_ALIASES.items():
-        alias, _ = _find_alias_in_line(line, aliases)
-        if alias is not None:
-            return key
-    return None
+    key, _, _ = _find_metric_alias_in_line(text)
+    return key
 
 
 def _normalize_value_candidates(raw_value: Any) -> list[str]:
@@ -627,9 +683,11 @@ def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str
     for raw_block in raw_blocks:
         if not isinstance(raw_block, dict):
             continue
-        key = normalize_usage_value(raw_block.get("metric_key", ""))
+        key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
         if not key:
-            key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
+            key = str(_find_metric_key_for_label(raw_block.get("block_text", "")) or "")
+        if not key:
+            key = normalize_usage_value(raw_block.get("metric_key", ""))
         if key not in USAGE_METRIC_KEYS:
             continue
         if key in parsed:
@@ -653,7 +711,8 @@ def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str
 class UsageSnapshot:
     five_hour_limit: str = ""
     weekly_limit: str = ""
-    code_review: str = ""
+    gpt_5_3_codex_spark_five_hour_limit: str = ""
+    gpt_5_3_codex_spark_weekly_limit: str = ""
     remaining_credit: str = ""
     captured_at: str = ""
 
@@ -667,7 +726,12 @@ class UsageSnapshot:
         return cls(
             five_hour_limit=normalize_usage_value(data.get("five_hour_limit", "")),
             weekly_limit=normalize_usage_value(data.get("weekly_limit", "")),
-            code_review=normalize_usage_value(data.get("code_review", "")),
+            gpt_5_3_codex_spark_five_hour_limit=normalize_usage_value(
+                data.get("gpt_5_3_codex_spark_five_hour_limit", "")
+            ),
+            gpt_5_3_codex_spark_weekly_limit=normalize_usage_value(
+                data.get("gpt_5_3_codex_spark_weekly_limit", "")
+            ),
             remaining_credit=normalize_usage_value(data.get("remaining_credit", "")),
             captured_at=normalize_usage_value(captured_at),
         )
@@ -679,7 +743,12 @@ class UsageSnapshot:
         return cls(
             five_hour_limit=normalize_usage_value(data.get("five_hour_limit", "")),
             weekly_limit=normalize_usage_value(data.get("weekly_limit", "")),
-            code_review=normalize_usage_value(data.get("code_review", "")),
+            gpt_5_3_codex_spark_five_hour_limit=normalize_usage_value(
+                data.get("gpt_5_3_codex_spark_five_hour_limit", "")
+            ),
+            gpt_5_3_codex_spark_weekly_limit=normalize_usage_value(
+                data.get("gpt_5_3_codex_spark_weekly_limit", "")
+            ),
             remaining_credit=normalize_usage_value(data.get("remaining_credit", "")),
             captured_at=normalize_usage_value(data.get("captured_at", "")),
         )
@@ -688,7 +757,12 @@ class UsageSnapshot:
         return {
             "five_hour_limit": normalize_usage_value(self.five_hour_limit),
             "weekly_limit": normalize_usage_value(self.weekly_limit),
-            "code_review": normalize_usage_value(self.code_review),
+            "gpt_5_3_codex_spark_five_hour_limit": normalize_usage_value(
+                self.gpt_5_3_codex_spark_five_hour_limit
+            ),
+            "gpt_5_3_codex_spark_weekly_limit": normalize_usage_value(
+                self.gpt_5_3_codex_spark_weekly_limit
+            ),
             "remaining_credit": normalize_usage_value(self.remaining_credit),
             "captured_at": normalize_usage_value(self.captured_at),
         }
@@ -1234,9 +1308,19 @@ class CodexUsageMonitor:
         def worker() -> None:
             snapshot = None if bool(force_refresh) else self.get_last_snapshot()
             error = None
+
+            def post_terminal(callback) -> None:
+                if bool(force_refresh):
+                    self.__ui_post_coalesced(
+                        self.__reset_monitor_countdown_after_manual_query,
+                        callback,
+                    )
+                    return
+                self.__ui_post(callback)
+
             try:
                 if bool(self.__logout_in_progress):
-                    self.__ui_post(
+                    post_terminal(
                         lambda: self.__show_tooltip(
                             "로그아웃 진행 중입니다. 완료 후 다시 시도해 주세요."
                         )
@@ -1245,35 +1329,33 @@ class CodexUsageMonitor:
                 if bool(force_refresh):
                     refreshed, error = self.__collect_snapshot_guarded(
                         source="manual_query",
-                        on_acquired=lambda: self.__ui_post(
-                            lambda: self.__show_tooltip(
-                                "Codex 사용량 조회 중...",
-                                duration_ms=0,
-                            )
+                        on_acquired=lambda: self.__show_tooltip(
+                            "Codex 사용량 조회 중...",
+                            duration_ms=0,
                         ),
                     )
                     if error == "collect_busy":
                         if bool(self.__profile_in_use_detected):
                             latest = self.get_last_snapshot()
                             if latest is not None and latest.has_any_metric():
-                                self.__ui_post(
+                                post_terminal(
                                     lambda: self.__show_snapshot_tooltip(
                                         latest,
                                         title="Codex 최근 사용량 (자동 조회 일시중지)",
                                     )
                                 )
                             else:
-                                self.__ui_post(
+                                post_terminal(
                                     lambda: self.__show_tooltip(
                                         "다른 Chrome 세션에서 프로필을 사용 중이라 자동 조회를 잠시 건너뜁니다."
                                     )
                                 )
                             return
                         self.__set_manual_query_pending_result()
-                        self.__ui_post(self.__show_busy_collect_tooltip)
+                        post_terminal(self.__show_busy_collect_tooltip)
                         return
                     if error == "collect_cancelled":
-                        self.__ui_post(lambda: self.__show_tooltip("조회가 취소되었습니다."))
+                        post_terminal(lambda: self.__show_tooltip("조회가 취소되었습니다."))
                         return
                     self.__consume_manual_query_pending_result()
                     if error is not None and error != "profile_in_use":
@@ -1294,21 +1376,21 @@ class CodexUsageMonitor:
                 if error == "profile_in_use":
                     latest = self.get_last_snapshot()
                     if latest is not None and latest.has_any_metric():
-                        self.__ui_post(
+                        post_terminal(
                             lambda: self.__show_snapshot_tooltip(
                                 latest,
                                 title="Codex 최근 사용량 (자동 조회 일시중지)",
                             )
                         )
                         return
-                    self.__ui_post(
+                    post_terminal(
                         lambda: self.__show_tooltip(
                             "다른 Chrome 세션에서 프로필을 사용 중이라 자동 조회를 잠시 건너뜁니다."
                         )
                     )
                     return
                 if snapshot is not None and snapshot.has_any_metric():
-                    self.__ui_post(
+                    post_terminal(
                         lambda: self.__show_snapshot_tooltip(
                             snapshot,
                             title="Codex 현재 사용량",
@@ -1320,10 +1402,10 @@ class CodexUsageMonitor:
                     if error is None
                     else f"사용량 조회 실패: {self.__describe_collect_error_for_user(error)}"
                 )
-                self.__ui_post(lambda: self.__show_tooltip(msg))
+                post_terminal(lambda: self.__show_tooltip(msg))
             except Exception as exc:
                 self.__log_exception("manual status query failed", exc)
-                self.__ui_post(
+                post_terminal(
                     lambda: self.__show_tooltip(
                         "사용량 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
                     )
@@ -1422,20 +1504,26 @@ class CodexUsageMonitor:
                             snapshot = retry_snapshot
                         elif retry_error:
                             error = str(retry_error)
-                    if error is None and snapshot is not None:
-                        self.__failure_count = 0
-                        changes = self.handle_snapshot(snapshot)
-                        latest_snapshot = self.get_last_snapshot()
-                        if changes:
-                            self.__ui_post(lambda: self.__show_change_tooltip(changes, latest_snapshot))
-                        self.__ui_post(
-                            lambda snap=latest_snapshot: self.__show_pending_manual_result_if_needed(
-                                snap,
-                                error=None,
+                        if error is None and snapshot is not None:
+                            self.__failure_count = 0
+                            changes = self.handle_snapshot(snapshot)
+                            latest_snapshot = self.get_last_snapshot()
+                            self.__ui_post_coalesced(
+                                (
+                                    lambda: self.__show_change_tooltip(
+                                        changes,
+                                        latest_snapshot,
+                                    )
+                                )
+                                if changes
+                                else None,
+                                lambda snap=latest_snapshot: self.__show_pending_manual_result_if_needed(
+                                    snap,
+                                    error=None,
+                                ),
                             )
-                        )
-                        self.__log("startup warmup end ok (pending retry)")
-                        return
+                            self.__log("startup warmup end ok (pending retry)")
+                            return
                     self.__ui_post(
                         lambda err=error: self.__show_pending_manual_result_if_needed(None, error=err)
                     )
@@ -1448,13 +1536,19 @@ class CodexUsageMonitor:
                 if snapshot is not None:
                     changes = self.handle_snapshot(snapshot)
                     latest_snapshot = self.get_last_snapshot()
-                    if changes:
-                        self.__ui_post(lambda: self.__show_change_tooltip(changes, latest_snapshot))
-                    self.__ui_post(
+                    self.__ui_post_coalesced(
+                        (
+                            lambda: self.__show_change_tooltip(
+                                changes,
+                                latest_snapshot,
+                            )
+                        )
+                        if changes
+                        else None,
                         lambda snap=latest_snapshot: self.__show_pending_manual_result_if_needed(
                             snap,
                             error=None,
-                        )
+                        ),
                     )
                 self.__log("startup warmup end ok")
             except Exception as exc:
@@ -1563,13 +1657,19 @@ class CodexUsageMonitor:
                         self.__failure_count = 0
                         changes = self.handle_snapshot(snapshot)
                         latest_snapshot = self.get_last_snapshot()
-                        if changes:
-                            self.__ui_post(lambda: self.__show_change_tooltip(changes, latest_snapshot))
-                        self.__ui_post(
+                        self.__ui_post_coalesced(
+                            (
+                                lambda: self.__show_change_tooltip(
+                                    changes,
+                                    latest_snapshot,
+                                )
+                            )
+                            if changes
+                            else None,
                             lambda snap=latest_snapshot: self.__show_pending_manual_result_if_needed(
                                 snap,
                                 error=None,
-                            )
+                            ),
                         )
                         return
                     self.__ui_post(
@@ -1584,13 +1684,19 @@ class CodexUsageMonitor:
                     return
                 changes = self.handle_snapshot(snapshot)
                 latest_snapshot = self.get_last_snapshot()
-                if changes:
-                    self.__ui_post(lambda: self.__show_change_tooltip(changes, latest_snapshot))
-                self.__ui_post(
+                self.__ui_post_coalesced(
+                    (
+                        lambda: self.__show_change_tooltip(
+                            changes,
+                            latest_snapshot,
+                        )
+                    )
+                    if changes
+                    else None,
                     lambda snap=latest_snapshot: self.__show_pending_manual_result_if_needed(
                         snap,
                         error=None,
-                    )
+                    ),
                 )
             except Exception as exc:
                 if not self.__is_worker_epoch_current(worker_epoch):
@@ -1660,13 +1766,16 @@ class CodexUsageMonitor:
             self.__collect_inflight_source = str(source or "")
             self.__set_monitor_state("running")
             if source_key == "manual_query":
-                self.__ui_post(self.__pause_monitor_countdown_for_manual_query)
+                self.__ui_post_coalesced(
+                    self.__pause_monitor_countdown_for_manual_query,
+                    on_acquired if callable(on_acquired) else None,
+                )
             try:
                 self.__collect_started_ts = float(self.__lib.time.monotonic())
             except Exception:
                 self.__collect_started_ts = 0.0
             self.__log(f"collect start source={source}")
-            if callable(on_acquired):
+            if source_key != "manual_query" and callable(on_acquired):
                 try:
                     on_acquired()
                 except Exception:
@@ -1682,7 +1791,7 @@ class CodexUsageMonitor:
             self.__collect_started_ts = 0.0
             if not bool(self.__logout_in_progress):
                 self.__set_monitor_state("idle")
-            if source_key == "manual_query":
+            if source_key == "manual_query" and not callable(on_acquired):
                 self.__ui_post(self.__reset_monitor_countdown_after_manual_query)
             if bool(self.__pending_hidden_cdp_clear):
                 self.__pending_hidden_cdp_clear = False
@@ -1691,6 +1800,28 @@ class CodexUsageMonitor:
                 self.__collect_lock.release()
             except Exception:
                 pass
+
+    def __compose_ui_callbacks(self, *callbacks):
+        items = [callback for callback in callbacks if callable(callback)]
+        if not items:
+            return None
+        if len(items) == 1:
+            return items[0]
+
+        def runner(items=tuple(items)) -> None:
+            for callback in items:
+                try:
+                    callback()
+                except Exception as exc:
+                    self.__log_exception("ui callback failed", exc)
+
+        return runner
+
+    def __ui_post_coalesced(self, *callbacks) -> None:
+        fn = self.__compose_ui_callbacks(*callbacks)
+        if callable(fn):
+            self.__ui_post(fn)
+        return
 
     def __ui_post(self, fn) -> None:
         queue_obj = self.__event_queue
@@ -1883,7 +2014,7 @@ class CodexUsageMonitor:
                 left = float(ratio.group(1))
             except Exception:
                 return None
-            if key in {"five_hour_limit", "weekly_limit", "code_review"}:
+            if key in USAGE_LIMIT_METRIC_KEYS:
                 # Usage ratios are treated as "used/limit", so lower is better.
                 return -left
             return left
@@ -4026,7 +4157,7 @@ class CodexUsageMonitor:
                 parsed = parse_usage_metrics_from_text(body_text)
                 has_usage_limit_metric = any(
                     normalize_usage_value(parsed.get(k, ""))
-                    for k in ("five_hour_limit", "weekly_limit", "code_review")
+                    for k in USAGE_LIMIT_METRIC_KEYS
                 )
             except Exception:
                 has_usage_limit_metric = False
@@ -4096,13 +4227,14 @@ class CodexUsageMonitor:
         if isinstance(probe.get("metricBlocks"), list) and probe.get("metricBlocks"):
             return True
         readiness_markers = (
+            "analytics",
             "usage",
             "limit",
-            "review",
+            "spark",
             "credit",
             "사용",
             "한도",
-            "검토",
+            "스파크",
             "크레딧",
         )
         return any(marker in lowered for marker in readiness_markers)
@@ -4143,7 +4275,7 @@ class CodexUsageMonitor:
         )
         if not metrics:
             return None
-        limit_keys = ("five_hour_limit", "weekly_limit", "code_review")
+        limit_keys = USAGE_LIMIT_METRIC_KEYS
         has_limit_metric = any(normalize_usage_value(metrics.get(k, "")) for k in limit_keys)
         if not has_limit_metric:
             return None
