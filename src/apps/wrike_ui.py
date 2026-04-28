@@ -5,9 +5,10 @@ import threading
 
 
 class WrikeSettingsView:
-    def __init__(self, root: Any, wrike: Any) -> None:
+    def __init__(self, root: Any, wrike: Any, ui_post=None) -> None:
         self._root = root
         self._wrike = wrike
+        self._ui_post = ui_post if callable(ui_post) else None
 
         self._tk = None
         self._ttk = None
@@ -334,7 +335,7 @@ class WrikeSettingsView:
         except Exception:
             settings = {}
         try:
-            self._token_var.set(str(settings.get("api_token", "") or ""))
+            self._token_var.set("")
         except Exception:
             pass
         try:
@@ -369,7 +370,11 @@ class WrikeSettingsView:
             self._token_var.set("")
         except Exception:
             pass
-        self._on_save()
+        ok, err = self._wrike.update_settings({"api_token": "", "clear_api_token": True})
+        if ok:
+            self._set_status("토큰 삭제 완료", level="ok")
+        else:
+            self._set_status(f"토큰 삭제 실패: {err}", level="error")
         return
 
     def _on_reload(self) -> None:
@@ -440,15 +445,24 @@ class WrikeSettingsView:
 
         def worker() -> None:
             result = fn()
-            try:
-                win.after(0, lambda: on_done(result))
-            except Exception:
-                return
+            self._post_ui(lambda: on_done(result))
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
             return
+
+    def _post_ui(self, fn) -> bool:
+        if not callable(fn):
+            return False
+        ui_post = self._ui_post
+        if callable(ui_post):
+            try:
+                ui_post(fn)
+                return True
+            except Exception:
+                return False
+        return False
 
     def _on_save(self) -> None:
         token = str(self._token_var.get() or "").strip()

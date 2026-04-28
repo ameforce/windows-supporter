@@ -1,5 +1,7 @@
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from src.apps.codex_usage_monitor import CodexUsageMonitor, UsageChange, UsageSnapshot
@@ -981,7 +983,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             bool(launch_cdp.call_args.kwargs.get("start_hidden", True))
         )
 
-    def test_collect_snapshot_once_interactive_recovery_promotes_hidden_reuse_after_success(self) -> None:
+    def test_collect_snapshot_once_interactive_recovery_terminates_app_cdp_after_success(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -995,7 +997,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         class _DummyProc:
             pid = 55555
-            _ws_cdp_port = 9333
+            _ws_cdp_port = 48123
 
             def poll(self):
                 return None
@@ -1070,13 +1072,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 9333)
-        self.assertTrue(set_visibility.called)
-        self.assertFalse(terminate_proc.called)
-        self.assertFalse(context.closed)
+        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
+        self.assertFalse(set_visibility.called)
+        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
+        self.assertTrue(context.closed)
 
-    def test_collect_snapshot_once_interactive_recovery_promotes_hidden_reuse_after_wait(self) -> None:
+    def test_collect_snapshot_once_interactive_recovery_terminates_app_cdp_after_wait(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -1090,7 +1092,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         class _DummyProc:
             pid = 55556
-            _ws_cdp_port = 9333
+            _ws_cdp_port = 48124
 
             def poll(self):
                 return None
@@ -1164,11 +1166,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 9333)
-        self.assertTrue(set_visibility.called)
-        self.assertFalse(terminate_proc.called)
-        self.assertFalse(context.closed)
+        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
+        self.assertFalse(set_visibility.called)
+        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
+        self.assertTrue(context.closed)
 
     def test_collect_snapshot_once_hides_cdp_window_when_force_hidden(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
@@ -1643,6 +1645,85 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
         )
 
+    def test_launch_interactive_context_via_cdp_uses_ephemeral_loopback_debug_port(
+        self,
+    ) -> None:
+        class _DummyProc:
+            pid = 43211
+
+            def poll(self):
+                return None
+
+        class _DummyContext:
+            pass
+
+        class _DummyBrowser:
+            def __init__(self):
+                self.contexts = [_DummyContext()]
+
+            def close(self):
+                return None
+
+        class _DummyChromium:
+            def __init__(self):
+                self.endpoints: list[str] = []
+
+            def connect_over_cdp(self, endpoint, **_kwargs):
+                self.endpoints.append(str(endpoint))
+                return _DummyBrowser()
+
+        class _DummyPlaywright:
+            def __init__(self):
+                self.chromium = _DummyChromium()
+
+        popen_calls: list[list[str]] = []
+
+        def fake_popen(cmd, **_kwargs):
+            popen_calls.append(list(cmd))
+            return _DummyProc()
+
+        playwright_obj = _DummyPlaywright()
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__resolve_chrome_executable_path",
+            return_value="C:/Program Files/Google/Chrome/Application/chrome.exe",
+        ):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib.os,
+                "makedirs",
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib.subprocess,
+                    "Popen",
+                    side_effect=fake_popen,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__find_profile_remote_debugging_pid",
+                        side_effect=[0, 43211],
+                    ):
+                        context, browser, proc = (
+                            self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
+                                playwright_obj,
+                                start_hidden=True,
+                            )
+                        )
+
+        self.assertIsNotNone(context)
+        self.assertIsNotNone(browser)
+        self.assertIsNotNone(proc)
+        self.assertTrue(popen_calls)
+        cmd = popen_calls[0]
+        debug_port_flags = [
+            item for item in cmd if str(item).startswith("--remote-debugging-port=")
+        ]
+        self.assertEqual(len(debug_port_flags), 1)
+        debug_port = int(debug_port_flags[0].split("=", 1)[1])
+        self.assertNotIn(debug_port, range(9333, 9345))
+        self.assertGreater(debug_port, 0)
+        self.assertIn("--remote-debugging-address=127.0.0.1", cmd)
+        self.assertEqual(playwright_obj.chromium.endpoints, [f"http://127.0.0.1:{debug_port}"])
+
     def test_launch_interactive_context_via_cdp_accepts_listener_pid_remap(self) -> None:
         class _DummyProc:
             def __init__(self, pid):
@@ -1717,7 +1798,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(int(getattr(proc, "pid", 0)), 11111)
         self.assertEqual(len(popen_calls), 1)
         self.assertFalse(terminate_proc.called)
-        self.assertIn("--remote-debugging-port=9333", popen_calls[0])
+        debug_port_flags = [
+            item for item in popen_calls[0] if str(item).startswith("--remote-debugging-port=")
+        ]
+        self.assertEqual(len(debug_port_flags), 1)
+        debug_port = int(debug_port_flags[0].split("=", 1)[1])
+        self.assertNotIn(debug_port, range(9333, 9345))
+        self.assertIn("--remote-debugging-address=127.0.0.1", popen_calls[0])
         self.assertIn("--disable-session-crashed-bubble", popen_calls[0])
         self.assertIn("--hide-crash-restore-bubble", popen_calls[0])
         self.assertIn("--no-first-run", popen_calls[0])
@@ -1726,7 +1813,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
         )
 
-    def test_collect_snapshot_once_reuses_hidden_cdp_process_between_calls(self) -> None:
+    def test_collect_snapshot_once_does_not_reuse_hidden_cdp_process_between_calls(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -1740,7 +1827,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         class _DummyProc:
             pid = 54321
-            _ws_cdp_port = 9333
+            _ws_cdp_port = 48125
 
             def poll(self):
                 return None
@@ -1836,11 +1923,9 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNone(err2)
         self.assertIsNotNone(got1)
         self.assertIsNotNone(got2)
-        self.assertEqual(launch_cdp.call_count, 1)
-        self.assertEqual(
-            pw.chromium.timeouts,
-            [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
-        )
+        self.assertEqual(launch_cdp.call_count, 2)
+        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
 
     def test_select_collect_page_prefers_non_blank_and_closes_extra_blank_tabs(self) -> None:
         class _DummyPage:
@@ -3539,6 +3624,51 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(save_state.called)
         self.assertFalse(restart_monitor.called)
 
+    def test_clear_profile_directory_deletes_only_managed_default_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            appdata = root / "Roaming"
+            localappdata = root / "Local"
+            appdata.mkdir()
+            localappdata.mkdir()
+            with patch.dict(
+                "os.environ",
+                {"APPDATA": str(appdata), "LOCALAPPDATA": str(localappdata)},
+            ):
+                monitor = CodexUsageMonitor()
+
+            profile = localappdata / "windows-supporter" / "chatgpt-profile"
+            profile.mkdir(parents=True)
+            (profile / "session.txt").write_text("login", encoding="utf-8")
+
+            ok, msg = monitor._CodexUsageMonitor__clear_profile_directory()
+
+            self.assertTrue(ok)
+            self.assertIn("로그아웃", msg)
+            self.assertFalse(profile.exists())
+
+    def test_clear_profile_directory_rejects_custom_profile_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            appdata = root / "Roaming"
+            localappdata = root / "Local"
+            appdata.mkdir()
+            localappdata.mkdir()
+            custom_profile = root / "important-profile"
+            custom_profile.mkdir()
+            (custom_profile / "keep.txt").write_text("do not delete", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {"APPDATA": str(appdata), "LOCALAPPDATA": str(localappdata)},
+            ):
+                monitor = CodexUsageMonitor(profile_dir=str(custom_profile))
+
+            ok, msg = monitor._CodexUsageMonitor__clear_profile_directory()
+
+            self.assertFalse(ok)
+            self.assertIn("관리하는", msg)
+            self.assertTrue((custom_profile / "keep.txt").exists())
+
     def test_release_profile_session_rejects_while_collect_busy(self) -> None:
         class _BusyLock:
             def acquire(self, *args, **kwargs):
@@ -3554,6 +3684,20 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ok, msg = self.monitor.release_profile_session()
         self.assertFalse(ok)
         self.assertIn("중단하지 못했습니다", msg)
+
+    def test_ui_post_does_not_schedule_tk_directly_when_queue_fails(self) -> None:
+        class _FailingQueue:
+            def put(self, _fn):
+                raise RuntimeError("queue unavailable")
+
+        class _Root:
+            def after(self, *_args, **_kwargs):
+                raise AssertionError("worker must not call root.after directly")
+
+        self.monitor._CodexUsageMonitor__event_queue = _FailingQueue()
+        self.monitor._CodexUsageMonitor__root = _Root()
+
+        self.monitor._CodexUsageMonitor__ui_post(lambda: None)
 
     def test_restart_monitor_skips_warmup_when_logged_out(self) -> None:
         self.monitor._CodexUsageMonitor__root = object()

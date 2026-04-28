@@ -10,10 +10,17 @@ class WindowsSupporterMainUI:
     _TAB_CODEX = "codex_usage"
     _KAKAO_RETRY_DELAY_MS = 500
 
-    def __init__(self, root: Any, startup_manager: Any, monitor: Any) -> None:
+    def __init__(
+        self,
+        root: Any,
+        startup_manager: Any,
+        monitor: Any,
+        event_queue: Any = None,
+    ) -> None:
         self._root = root
         self._startup_manager = startup_manager
         self._monitor = monitor
+        self._event_queue = event_queue
 
         self._tk = None
         self._ttk = None
@@ -49,6 +56,18 @@ class WindowsSupporterMainUI:
         self._lazy_import_tk()
         self._build_shell()
         return
+
+    def _ui_post(self, fn) -> bool:
+        if not callable(fn):
+            return False
+        queue_obj = self._event_queue
+        if queue_obj is None:
+            return False
+        try:
+            queue_obj.put(fn)
+            return True
+        except Exception:
+            return False
 
     def show(self, tab: str | None = None) -> None:
         root = self._root
@@ -387,7 +406,11 @@ class WindowsSupporterMainUI:
             return
 
         try:
-            self._wrike_view = WrikeSettingsView(self._root, wrike)
+            self._wrike_view = WrikeSettingsView(
+                self._root,
+                wrike,
+                ui_post=self._ui_post,
+            )
             self._wrike_view.mount(self._tab_wrike)
             self._wrike_built = True
         except Exception:
@@ -434,7 +457,11 @@ class WindowsSupporterMainUI:
             return
 
         try:
-            self._codex_view = CodexUsageSettingsView(self._root, codex)
+            self._codex_view = CodexUsageSettingsView(
+                self._root,
+                codex,
+                ui_post=self._ui_post,
+            )
             self._codex_view.mount(self._tab_codex)
             self._codex_built = True
         except Exception:

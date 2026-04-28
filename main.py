@@ -43,7 +43,7 @@ def main() -> None:
     monitor = Monitor()
     event_queue: queue.SimpleQueue = queue.SimpleQueue()
     startup_manager = StartupAppManager()
-    main_ui = WindowsSupporterMainUI(root, startup_manager, monitor)
+    main_ui = WindowsSupporterMainUI(root, startup_manager, monitor, event_queue=event_queue)
     try:
         setattr(root, "_ws_main_ui", main_ui)
     except Exception:
@@ -83,6 +83,12 @@ def main() -> None:
         except Exception:
             pass
 
+    def _on_display_topology_change(reason: str) -> None:
+        try:
+            event_queue.put(lambda: monitor.on_display_topology_changed(reason))
+        except Exception:
+            pass
+
     try:
         root.after(120, lambda: event_queue.put(_start_startup_apps_bg))
     except Exception:
@@ -101,6 +107,7 @@ def main() -> None:
         on_open_log=lambda: event_queue.put(startup_manager.open_log_file),
         on_exit=lambda: event_queue.put(root.quit),
         on_session_unlock=_on_session_unlock,
+        on_display_topology_change=_on_display_topology_change,
     )
     try:
         tray.start()

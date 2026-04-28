@@ -10,10 +10,17 @@ class _FakeKeyboard:
     def __init__(self) -> None:
         self.hotkeys: list[str] = []
         self.press_keys: list[str] = []
+        self.removed: list[str] = []
+        self._next_handle = 0
 
     def add_hotkey(self, combo, _callback, suppress=False):
         _ = suppress
         self.hotkeys.append(str(combo))
+        self._next_handle += 1
+        return f"handle#{self._next_handle}:{combo}"
+
+    def remove_hotkey(self, handle):
+        self.removed.append(str(handle))
         return None
 
     def on_press_key(self, key, _callback, suppress=False):
@@ -43,9 +50,9 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         self.assertIn("ctrl+alt+c", fake_kb.hotkeys)
         self.assertIn("ctrl+alt+k", fake_kb.hotkeys)
         self.assertIn("ctrl+alt+w", fake_kb.hotkeys)
-        self.assertIn("alt+q", fake_kb.hotkeys)
-        self.assertIn("ctrl+q", fake_kb.hotkeys)
-        self.assertIn("ctrl+s", fake_kb.hotkeys)
+        self.assertNotIn("alt+q", fake_kb.hotkeys)
+        self.assertNotIn("ctrl+q", fake_kb.hotkeys)
+        self.assertNotIn("ctrl+s", fake_kb.hotkeys)
         self.assertNotIn("ctrl+c", fake_kb.hotkeys)
         self.assertNotIn("enter", fake_kb.hotkeys)
         self.assertEqual([], fake_kb.press_keys)
@@ -78,7 +85,8 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         fn = monitor._Monitor__event_queue.get_nowait()
         fn()
 
-        wrike.action.assert_called_once_with(root)
+        wrike.run_action_async.assert_called_once_with(root)
+        wrike.action.assert_not_called()
 
     def test_ctrl_q_dispatches_wrike_open_when_wrike_is_active(self) -> None:
         monitor = Monitor()
@@ -94,7 +102,8 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         fn = monitor._Monitor__event_queue.get_nowait()
         fn()
 
-        wrike.open_in_separate_tab.assert_called_once_with(root)
+        wrike.open_in_separate_tab_async.assert_called_once_with(root)
+        wrike.open_in_separate_tab.assert_not_called()
 
     def test_ctrl_s_dispatches_notion_action_when_notion_is_active(self) -> None:
         monitor = Monitor()
@@ -109,7 +118,8 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         fn = monitor._Monitor__event_queue.get_nowait()
         fn()
 
-        notion.action.assert_called_once_with(root)
+        notion.run_action_async.assert_called_once_with(root)
+        notion.action.assert_not_called()
 
     def test_ctrl_s_ignores_when_notion_is_not_active(self) -> None:
         monitor = Monitor()
@@ -139,6 +149,35 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
             monitor.attach(root, event_queue)
 
         self.assertTrue(warmup.called)
+
+    def test_session_unlock_invalidates_kakao_display_topology(self) -> None:
+        monitor = Monitor()
+        monitor._Monitor__lib.keyboard = _FakeKeyboard()
+        root = object()
+        kakao = MagicMock()
+        monitor._Monitor__root = root
+        monitor._Monitor__kakao = kakao
+
+        monitor.on_session_unlock()
+
+        kakao.invalidate_display_topology.assert_called_once_with(
+            root=root,
+            reason="session_unlock",
+        )
+
+    def test_explicit_display_topology_change_invalidates_kakao(self) -> None:
+        monitor = Monitor()
+        root = object()
+        kakao = MagicMock()
+        monitor._Monitor__root = root
+        monitor._Monitor__kakao = kakao
+
+        monitor.on_display_topology_changed("display_change")
+
+        kakao.invalidate_display_topology.assert_called_once_with(
+            root=root,
+            reason="display_change",
+        )
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from src.apps.Notion import DEFAULT_WRIKE_CLIPBOARD_VARIANT, Notion, WRIKE_CLIPBOARD_VARIANTS
 
@@ -14,6 +15,27 @@ HIERARCHY_SOURCE = """- [[CAS] - Parent Task](https://www.wrike.com/open.htm?id=
 """
 
 
+class _FakeThread:
+    created = []
+
+    def __init__(self, target=None, daemon=None):
+        self.target = target
+        self.daemon = daemon
+        _FakeThread.created.append(self)
+
+    def start(self):
+        return None
+
+
+class _RecordingRoot:
+    def __init__(self):
+        self.after_calls = []
+
+    def after(self, delay_ms, callback):
+        self.after_calls.append((delay_ms, callback))
+        return f"after#{len(self.after_calls)}"
+
+
 def load_fixture_text() -> str:
     return FIXTURE_PATH.read_text(encoding="utf-8")
 
@@ -22,6 +44,44 @@ class NotionWrikeTransformUnitTest(unittest.TestCase):
     def setUp(self) -> None:
         self.notion = Notion()
         self.raw_text = load_fixture_text()
+
+    def test_action_dispatches_background_worker_without_inline_pyautogui(self) -> None:
+        _FakeThread.created = []
+
+        with patch("src.apps.Notion.threading.Thread", _FakeThread):
+            with patch.object(
+                self.notion._Notion__lib.pyautogui,
+                "hotkey",
+                side_effect=AssertionError("pyautogui must not run on caller thread"),
+            ):
+                self.notion.action(object())
+
+        self.assertEqual(len(_FakeThread.created), 1)
+        self.assertTrue(self.notion._Notion__is_running)
+
+    def test_action_worker_posts_sanitized_tooltip_to_ui_queue(self) -> None:
+        _FakeThread.created = []
+        posted = []
+        root = _RecordingRoot()
+        tooltip = Mock()
+        self.notion.set_ui_post(lambda fn: posted.append(fn))
+
+        with patch("src.apps.Notion.threading.Thread", _FakeThread):
+            with patch.object(self.notion._Notion__lib.pyperclip, "paste", return_value="secret clipboard value"):
+                with patch.object(self.notion._Notion__lib.pyperclip, "copy", return_value=None):
+                    with patch.object(self.notion._Notion__lib.pyautogui, "keyUp", return_value=None):
+                        with patch.object(self.notion._Notion__lib.pyautogui, "hotkey", return_value=None):
+                            with patch("src.apps.Notion.ToolTip", return_value=tooltip) as tooltip_cls:
+                                self.notion.action(root)
+                                _FakeThread.created[0].target()
+                                self.assertEqual(len(posted), 1)
+                                posted[0]()
+
+        tooltip_text = tooltip_cls.call_args.args[1]
+        self.assertIn("클립보드 복구 완료", tooltip_text)
+        self.assertNotIn("secret clipboard value", tooltip_text)
+        tooltip.show_tooltip.assert_called_once()
+        self.assertEqual(root.after_calls[0][0], 1500)
 
     def test_variant_catalog_is_stable(self) -> None:
         self.assertEqual(

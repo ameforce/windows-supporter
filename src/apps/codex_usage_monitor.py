@@ -919,15 +919,16 @@ class CodexUsageMonitor:
             "codex_usage_state.json",
         )
         self.__log_path = self.__lib.os.path.join(self.__config_dir, "codex_usage.log")
+        self.__default_profile_dir = self.__lib.os.path.join(
+            local_base,
+            "windows-supporter",
+            "chatgpt-profile",
+        )
         normalized_profile_dir = str(profile_dir or "").strip()
         if normalized_profile_dir:
             self.__profile_dir = normalized_profile_dir
         else:
-            self.__profile_dir = self.__lib.os.path.join(
-                local_base,
-                "windows-supporter",
-                "chatgpt-profile",
-            )
+            self.__profile_dir = self.__default_profile_dir
 
         self.__load_settings()
         self.__load_state()
@@ -1070,6 +1071,9 @@ class CodexUsageMonitor:
         profile_dir = str(self.__profile_dir or "").strip()
         if not profile_dir:
             return False, "로그인 세션 경로를 확인하지 못했습니다."
+        if not self.__is_managed_profile_directory(profile_dir):
+            self.__log(f"profile directory delete rejected path={profile_dir!r}")
+            return False, "앱이 관리하는 로그인 세션 경로만 삭제할 수 있습니다."
         try:
             if not self.__lib.os.path.isdir(profile_dir):
                 return True, "이미 로그아웃된 상태입니다."
@@ -1105,6 +1109,40 @@ class CodexUsageMonitor:
                 False,
                 "로그인 세션 폴더가 사용 중입니다. 관련 창을 닫고 다시 시도해 주세요.",
             )
+
+    def __is_managed_profile_directory(self, profile_dir: str) -> bool:
+        target = self.__normalize_local_path(profile_dir)
+        default = self.__normalize_local_path(getattr(self, "_CodexUsageMonitor__default_profile_dir", ""))
+        if not target or not default or target != default:
+            return False
+        try:
+            leaf = self.__lib.os.path.basename(target)
+            parent = self.__lib.os.path.basename(self.__lib.os.path.dirname(target))
+            if leaf.lower() != "chatgpt-profile":
+                return False
+            if parent.lower() != "windows-supporter":
+                return False
+        except Exception:
+            return False
+        return True
+
+    def __normalize_local_path(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            raw = self.__lib.os.path.abspath(raw)
+        except Exception:
+            pass
+        try:
+            raw = self.__lib.os.path.normpath(raw)
+        except Exception:
+            pass
+        try:
+            raw = self.__lib.os.path.normcase(raw)
+        except Exception:
+            raw = raw.lower()
+        return raw.rstrip("\\/")
 
     def __force_playwright_mode(self) -> None:
         self.__collection_mode = "playwright"
@@ -1830,14 +1868,7 @@ class CodexUsageMonitor:
                 queue_obj.put(fn)
                 return
             except Exception:
-                pass
-        root = self.__root
-        if root is None:
-            return
-        try:
-            root.after(0, fn)
-        except Exception:
-            return
+                self.__log("ui callback post failed")
         return
 
     def __show_change_tooltip(
@@ -2316,7 +2347,7 @@ class CodexUsageMonitor:
         context = None
         cdp_browser = None
         cdp_proc = None
-        keep_hidden_cdp_process = False
+        keep_cdp_process = False
         page = None
         close_collect_page = False
         usage_url = str(self.__usage_url)
@@ -2332,7 +2363,7 @@ class CodexUsageMonitor:
                         context,
                         cdp_browser,
                         cdp_proc,
-                        keep_hidden_cdp_process,
+                        keep_cdp_process,
                     ) = self.__connect_hidden_cdp_context(
                         playwright_obj,
                         launch_url=start_url,
@@ -2454,18 +2485,6 @@ class CodexUsageMonitor:
             snapshot = self.__build_snapshot_from_page(page)
             if snapshot is not None:
                 self.__set_session_state("logged_in")
-                if (
-                    not bool(effective_headless)
-                    and bool(allow_interactive_recovery)
-                    and cdp_proc is not None
-                ):
-                    if self.__promote_cdp_process_for_hidden_reuse(cdp_proc):
-                        keep_hidden_cdp_process = True
-                        self.__set_cdp_window_visibility(
-                            cdp_proc,
-                            visible=False,
-                            bring_to_front=False,
-                        )
                 return snapshot, None
             if bool(effective_headless):
                 return self.__wait_for_snapshot_ready(
@@ -2477,14 +2496,6 @@ class CodexUsageMonitor:
                     page,
                     timeout_sec=self.__login_timeout_sec,
                 )
-                if waited_error is None and waited_snapshot is not None and cdp_proc is not None:
-                    if self.__promote_cdp_process_for_hidden_reuse(cdp_proc):
-                        keep_hidden_cdp_process = True
-                        self.__set_cdp_window_visibility(
-                            cdp_proc,
-                            visible=False,
-                            bring_to_front=False,
-                        )
                 return waited_snapshot, waited_error
             if not bool(effective_headless):
                 return self.__wait_for_snapshot_ready(
@@ -2503,8 +2514,6 @@ class CodexUsageMonitor:
         except Exception as exc:
             if self.__is_collect_cancel_requested():
                 return None, "collect_cancelled"
-            if bool(keep_hidden_cdp_process):
-                self.__clear_hidden_cdp_process(terminate=True)
             self.__log_exception("collect snapshot once failed", exc)
             return None, "collect_failed"
         finally:
@@ -2513,7 +2522,7 @@ class CodexUsageMonitor:
                     page.close()
                 except Exception:
                     pass
-            if context is not None and not bool(keep_hidden_cdp_process):
+            if context is not None and not bool(keep_cdp_process):
                 try:
                     context.close()
                 except Exception:
@@ -2523,7 +2532,7 @@ class CodexUsageMonitor:
                     cdp_browser.close()
                 except Exception:
                     pass
-            if cdp_proc is not None and not bool(keep_hidden_cdp_process):
+            if cdp_proc is not None and not bool(keep_cdp_process):
                 self.__terminate_spawned_process(cdp_proc, cleanup_orphans=False)
 
     def __build_snapshot_from_page(self, page) -> UsageSnapshot | None:
@@ -2714,6 +2723,7 @@ class CodexUsageMonitor:
                 cmd = [
                     str(chrome_path),
                     f"--remote-debugging-port={int(port)}",
+                    "--remote-debugging-address=127.0.0.1",
                     f"--user-data-dir={self.__profile_dir}",
                     "--disable-session-crashed-bubble",
                     "--hide-crash-restore-bubble",
@@ -2844,21 +2854,34 @@ class CodexUsageMonitor:
         return None, None, None
 
     def __iter_cdp_ports(self) -> list[int]:
-        ports = list(range(9333, 9345))
+        ports: list[int] = []
         try:
-            preferred = int(self.__last_successful_cdp_port or 0)
+            limit = int(self.__cdp_port_attempt_limit or 1)
         except Exception:
-            preferred = 0
-        if preferred in ports:
-            ports.remove(preferred)
-            ports.insert(0, preferred)
-        try:
-            limit = int(self.__cdp_port_attempt_limit or len(ports))
-        except Exception:
-            limit = len(ports)
+            limit = 1
         if limit < 1:
-            limit = len(ports)
-        return ports[: min(limit, len(ports))]
+            limit = 1
+        for _idx in range(limit):
+            port = self.__allocate_ephemeral_cdp_port()
+            if port > 0 and port not in ports:
+                ports.append(int(port))
+        return ports
+
+    def __allocate_ephemeral_cdp_port(self) -> int:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+        except Exception as exc:
+            self.__log_exception("ephemeral cdp port allocation failed", exc)
+            return 0
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def __prepare_profile_for_chrome_launch(self) -> None:
         profile_dir = str(self.__profile_dir or "").strip()
@@ -3112,7 +3135,7 @@ class CodexUsageMonitor:
                     int(port),
                     monitor_managed=bool(monitor_managed),
                 )
-                return contexts[0], browser, handle, True
+                return contexts[0], browser, handle, not bool(monitor_managed)
             except Exception as exc:
                 last_error = exc
                 if browser is not None:
@@ -3308,31 +3331,7 @@ class CodexUsageMonitor:
         except Exception:
             port = 0
 
-        if proc is not None:
-            if (not self.__is_subprocess_running(proc)) or (port <= 0):
-                self.__clear_hidden_cdp_process(terminate=True)
-                proc = None
-                port = 0
-
-        if proc is not None and port > 0:
-            endpoint = f"http://127.0.0.1:{int(port)}"
-            reconnect_browser = None
-            try:
-                reconnect_browser = self.__connect_browser_over_cdp(playwright_obj, endpoint)
-                contexts = []
-                try:
-                    contexts = list(reconnect_browser.contexts or [])
-                except Exception:
-                    contexts = []
-                if contexts:
-                    return contexts[0], reconnect_browser, proc, True
-            except Exception as exc:
-                self.__log_exception("hidden cdp reconnect failed", exc)
-            if reconnect_browser is not None:
-                try:
-                    reconnect_browser.close()
-                except Exception:
-                    pass
+        if proc is not None or port > 0:
             self.__clear_hidden_cdp_process(terminate=True)
 
         ext_context, ext_browser, ext_proc, ext_keep = (
@@ -3357,31 +3356,8 @@ class CodexUsageMonitor:
         except Exception:
             port = 0
         if port > 0:
-            self.__hidden_cdp_proc = proc
-            self.__hidden_cdp_port = int(port)
-            return context, browser, proc, True
+            return context, browser, proc, False
         return context, browser, proc, False
-
-    def __promote_cdp_process_for_hidden_reuse(self, proc) -> bool:
-        if proc is None:
-            return False
-        if self.__is_external_cdp_handle(proc):
-            return False
-        try:
-            port = int(getattr(proc, "_ws_cdp_port", 0) or 0)
-        except Exception:
-            port = 0
-        if port <= 0:
-            return False
-        prev = self.__hidden_cdp_proc
-        try:
-            self.__hidden_cdp_proc = proc
-            self.__hidden_cdp_port = int(port)
-        except Exception:
-            return False
-        if prev is not None and prev is not proc:
-            self.__terminate_spawned_process(prev, cleanup_orphans=True)
-        return True
 
     def __set_cdp_window_visibility(
         self,

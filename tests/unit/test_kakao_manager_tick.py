@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,6 +12,27 @@ from src.apps.KakaoManager import (
     WindowMove,
     WindowMovePlan,
 )
+
+
+def _monitor_snapshot(
+    handle: int,
+    device: str,
+    display_num: int | None,
+    *,
+    primary: bool = False,
+    work: tuple[int, int, int, int] | None = None,
+    monitor: tuple[int, int, int, int] | None = None,
+) -> MonitorSnapshot:
+    rect = work if work is not None else (0, 0, 1920, 1080)
+    monitor_rect = monitor if monitor is not None else rect
+    return MonitorSnapshot(
+        handle=handle,
+        device=device,
+        display_num=display_num,
+        is_primary=primary,
+        work=rect,
+        monitor=monitor_rect,
+    )
 
 
 class _FakeThread:
@@ -118,6 +141,27 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
         self.assertTrue(self.manager._KakaoManager__pending_rerun)
         self.assertEqual(self.manager._KakaoManager__latest_request_generation, 2)
 
+    def test_request_refresh_captures_target_monitor_descriptor(self) -> None:
+        _FakeThread.created = []
+        self.manager._KakaoManager__target_monitor = {
+            "display_num": 2,
+            "device": r"\\.\DISPLAY2",
+            "work": (1920, 0, 3840, 1040),
+            "monitor": (1920, 0, 3840, 1080),
+            "selected_at_topology_signature": "sig",
+        }
+
+        with patch("src.apps.KakaoManager.threading.Thread", _FakeThread):
+            self.manager.request_refresh(root=None)
+
+        captured_requests = []
+        self.manager._KakaoManager__compute_work_result = (
+            lambda request: captured_requests.append(request) or (_ for _ in ()).throw(RuntimeError())
+        )
+        _FakeThread.created[0].target()
+        self.assertEqual(captured_requests[0].requested_display_num, 2)
+        self.assertEqual(captured_requests[0].requested_target_monitor["device"], r"\\.\DISPLAY2")
+
     def test_post_ui_reports_contract_success_and_failure(self) -> None:
         calls = []
         self.manager.set_ui_post(lambda fn: calls.append(fn))
@@ -128,20 +172,16 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
         self.manager.set_ui_post(None)
         root = _FakeAfterRoot(after_result="after#1")
 
-        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=root), True)
+        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=root), False)
+        self.assertEqual(root.after_calls, [])
         self.assertIs(self.manager._KakaoManager__post_ui(None, root=root), False)
 
-        falsey_root = _FakeAfterRoot(after_result=None)
-        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=falsey_root), False)
-
-    def test_post_ui_falls_back_after_ui_post_exception_and_reports_failure(self) -> None:
+    def test_post_ui_does_not_fall_back_to_tk_after_ui_post_exception(self) -> None:
         self.manager.set_ui_post(Mock(side_effect=RuntimeError("post failed")))
 
         root = _FakeAfterRoot(after_result="after#1")
-        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=root), True)
-
-        failing_root = _FakeAfterRoot(after_side_effect=RuntimeError("after failed"))
-        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=failing_root), False)
+        self.assertIs(self.manager._KakaoManager__post_ui(lambda: None, root=root), False)
+        self.assertEqual(root.after_calls, [])
 
     def test_worker_compute_exception_cleans_active_latch(self) -> None:
         _FakeThread.created = []
@@ -253,8 +293,8 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
                 requested_display_num=7,
                 resolved_display_num=1,
                 resolved_monitor_handle=11,
-                config_missing=True,
-                fallback_reason="requested_display_unavailable",
+                config_missing=False,
+                fallback_reason="target_unavailable",
             ),
             move_plan=WindowMovePlan(
                 moves=(
@@ -274,8 +314,297 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
         self.assertEqual(self.manager._KakaoManager__kakao_pids, {101, 202})
         self.assertEqual(self.manager._KakaoManager__resolved_target_display_num, 1)
         self.assertEqual(self.manager._KakaoManager__resolved_target_monitor_handle, 11)
-        self.assertTrue(self.manager._KakaoManager__config_missing)
+        self.assertFalse(self.manager._KakaoManager__config_missing)
         self.assertEqual(apply_move.call_count, 2)
+
+    def test_resolve_target_monitor_prefers_saved_device_over_display_number(self) -> None:
+        monitors = [
+            _monitor_snapshot(
+                11,
+                r"\\.\DISPLAY2",
+                2,
+                primary=True,
+                work=(0, 0, 1920, 1040),
+                monitor=(0, 0, 1920, 1080),
+            ),
+            _monitor_snapshot(
+                22,
+                r"\\.\DISPLAY1",
+                1,
+                work=(1920, 0, 3840, 1040),
+                monitor=(1920, 0, 3840, 1080),
+            ),
+        ]
+
+        resolution, monitor = self.manager._KakaoManager__resolve_target_monitor(
+            monitors,
+            requested_display_num=2,
+            requested_target_monitor={"display_num": 2, "device": r"\\.\DISPLAY1"},
+            config_missing=False,
+        )
+
+        self.assertIsNotNone(monitor)
+        self.assertEqual(monitor.handle, 22)
+        self.assertEqual(resolution.resolved_monitor_handle, 22)
+        self.assertEqual(resolution.fallback_reason, "device")
+
+    def test_resolve_target_monitor_does_not_mark_missing_when_target_unavailable(self) -> None:
+        monitors = [
+            _monitor_snapshot(
+                11,
+                r"\\.\DISPLAY1",
+                1,
+                primary=True,
+                work=(0, 0, 1920, 1040),
+                monitor=(0, 0, 1920, 1080),
+            ),
+        ]
+
+        resolution, monitor = self.manager._KakaoManager__resolve_target_monitor(
+            monitors,
+            requested_display_num=2,
+            requested_target_monitor={"display_num": 2, "device": r"\\.\DISPLAY2"},
+            config_missing=False,
+        )
+
+        self.assertIsNotNone(monitor)
+        self.assertEqual(monitor.handle, 11)
+        self.assertFalse(resolution.config_missing)
+        self.assertEqual(resolution.fallback_reason, "target_unavailable")
+
+    def test_resolve_target_monitor_prefers_descriptor_rect_before_stale_display_number(self) -> None:
+        target_work = (1920, 0, 3840, 1040)
+        target_monitor = (1920, 0, 3840, 1080)
+        monitors = [
+            _monitor_snapshot(
+                11,
+                r"\\.\DISPLAY9",
+                2,
+                primary=True,
+                work=(0, 0, 1920, 1040),
+                monitor=(0, 0, 1920, 1080),
+            ),
+            _monitor_snapshot(
+                22,
+                r"\\.\DISPLAY3",
+                3,
+                work=target_work,
+                monitor=target_monitor,
+            ),
+        ]
+
+        resolution, monitor = self.manager._KakaoManager__resolve_target_monitor(
+            monitors,
+            requested_display_num=2,
+            requested_target_monitor={
+                "display_num": 2,
+                "device": r"\\.\DISPLAY2",
+                "work": target_work,
+                "monitor": target_monitor,
+            },
+            config_missing=False,
+        )
+
+        self.assertIsNotNone(monitor)
+        self.assertEqual(monitor.handle, 22)
+        self.assertEqual(resolution.resolved_monitor_handle, 22)
+        self.assertEqual(resolution.fallback_reason, "descriptor_rect")
+
+    def test_selector_selected_display_uses_target_monitor_descriptor(self) -> None:
+        self.assertEqual(
+            self.manager._KakaoManager__display_num_from_target_monitor(
+                {"display_num": 3, "device": r"\\.\DISPLAY3"},
+                fallback_display_num=1,
+            ),
+            3,
+        )
+        self.assertEqual(
+            self.manager._KakaoManager__display_num_from_target_monitor(
+                {"device": r"\\.\DISPLAY3"},
+                fallback_display_num=2,
+            ),
+            2,
+        )
+
+    def test_selector_initial_overlay_uses_default_index_descriptor(self) -> None:
+        self.assertEqual(
+            self.manager._KakaoManager__display_num_from_selector_index(
+                [
+                    {"display_num": 1, "device": r"\\.\DISPLAY1"},
+                    {"display_num": 3, "device": r"\\.\DISPLAY2"},
+                ],
+                selected_index=1,
+                fallback_display_num=1,
+            ),
+            3,
+        )
+        self.assertEqual(
+            self.manager._KakaoManager__display_num_from_selector_index(
+                [{"display_num": 1, "device": r"\\.\DISPLAY1"}],
+                selected_index=99,
+                fallback_display_num=2,
+            ),
+            2,
+        )
+
+    def test_selector_default_index_prefers_descriptor_device_over_stale_display_number(self) -> None:
+        items = [
+            {
+                "display_num": 1,
+                "target_monitor": {"display_num": 1, "device": r"\\.\DISPLAY1"},
+            },
+            {
+                "display_num": 3,
+                "target_monitor": {"display_num": 3, "device": r"\\.\DISPLAY2"},
+            },
+            {
+                "display_num": 2,
+                "target_monitor": {"display_num": 2, "device": r"\\.\DISPLAY9"},
+            },
+        ]
+
+        index = self.manager._KakaoManager__select_monitor_item_index(
+            items,
+            requested_target_monitor={"display_num": 2, "device": r"\\.\DISPLAY2"},
+            requested_display_num=2,
+        )
+
+        self.assertEqual(index, 1)
+
+    def test_selector_default_index_prefers_descriptor_rect_over_stale_display_number(self) -> None:
+        target_work = (1920, 0, 3840, 1040)
+        target_monitor = (1920, 0, 3840, 1080)
+        items = [
+            {
+                "display_num": 2,
+                "target_monitor": {
+                    "display_num": 2,
+                    "device": r"\\.\DISPLAY9",
+                    "work": (0, 0, 1920, 1040),
+                    "monitor": (0, 0, 1920, 1080),
+                },
+            },
+            {
+                "display_num": 3,
+                "target_monitor": {
+                    "display_num": 3,
+                    "device": r"\\.\DISPLAY3",
+                    "work": target_work,
+                    "monitor": target_monitor,
+                },
+            },
+        ]
+
+        index = self.manager._KakaoManager__select_monitor_item_index(
+            items,
+            requested_target_monitor={
+                "display_num": 2,
+                "device": r"\\.\DISPLAY2",
+                "work": target_work,
+                "monitor": target_monitor,
+            },
+            requested_display_num=2,
+        )
+
+        self.assertEqual(index, 1)
+
+    def test_selector_overlay_display_uses_selector_state_before_display_number(self) -> None:
+        self.manager._KakaoManager__select_index_to_target = [
+            {"display_num": 1, "device": r"\\.\DISPLAY1"},
+            {"display_num": 3, "device": r"\\.\DISPLAY2"},
+        ]
+        self.manager._KakaoManager__select_current_index = 1
+        self.manager._KakaoManager__target_display_num = 1
+        self.manager._KakaoManager__target_monitor = {"display_num": 1}
+
+        self.assertEqual(
+            self.manager._KakaoManager__selector_overlay_display_num(),
+            3,
+        )
+
+    def test_invalidate_display_topology_clears_runtime_target_state(self) -> None:
+        request_refresh = Mock()
+        root = object()
+        self.manager.request_refresh = request_refresh
+        self.manager._KakaoManager__monitors = [{"handle": 11, "display_num": 1}]
+        self.manager._KakaoManager__resolved_target_display_num = 1
+        self.manager._KakaoManager__resolved_target_monitor_handle = 11
+        self.manager._KakaoManager__next_monitor_scan_time = 123.0
+        self.manager._KakaoManager__is_selecting = True
+        self.manager._KakaoManager__select_window = _RaisingWindow()
+        self.manager._KakaoManager__overlay_windows = [_RaisingWindow()]
+        before_epoch = self.manager._KakaoManager__state_epoch
+
+        self.manager.invalidate_display_topology(root=root, reason="display_change")
+
+        self.assertEqual(self.manager._KakaoManager__monitors, [])
+        self.assertIsNone(self.manager._KakaoManager__resolved_target_display_num)
+        self.assertIsNone(self.manager._KakaoManager__resolved_target_monitor_handle)
+        self.assertEqual(self.manager._KakaoManager__next_monitor_scan_time, 0.0)
+        self.assertFalse(self.manager._KakaoManager__is_selecting)
+        self.assertIsNone(self.manager._KakaoManager__select_window)
+        self.assertGreater(self.manager._KakaoManager__state_epoch, before_epoch)
+        request_refresh.assert_called_once_with(root)
+
+    def test_config_loads_legacy_target_display_and_saves_target_monitor_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = f"{tmp}\\kakao_manager.json"
+            with open(config_path, "w", encoding="utf-8") as fp:
+                json.dump({"target_display": 2}, fp)
+
+            manager = KakaoManager()
+            manager._KakaoManager__config_dir = tmp
+            manager._KakaoManager__config_path = config_path
+            manager._KakaoManager__load_config()
+
+            self.assertFalse(manager._KakaoManager__config_missing)
+            self.assertEqual(manager._KakaoManager__target_display_num, 2)
+            self.assertEqual(
+                manager._KakaoManager__target_monitor,
+                {"display_num": 2},
+            )
+
+            manager._KakaoManager__set_requested_target_monitor(
+                {
+                    "display_num": 3,
+                    "device": r"\\.\DISPLAY3",
+                    "work": (0, 0, 1280, 720),
+                    "monitor": (0, 0, 1280, 768),
+                    "selected_at_topology_signature": "abc",
+                }
+            )
+            manager._KakaoManager__save_config()
+
+            with open(config_path, "r", encoding="utf-8") as fp:
+                saved = json.load(fp)
+
+        self.assertNotIn("target_display", saved)
+        self.assertEqual(saved["target_monitor"]["display_num"], 3)
+        self.assertEqual(saved["target_monitor"]["device"], r"\\.\DISPLAY3")
+
+    def test_apply_move_plan_skips_when_target_monitor_signature_is_stale(self) -> None:
+        plan = WindowMovePlan(
+            target_monitor_signature=(
+                11,
+                r"\\.\DISPLAY1",
+                (0, 0, 1920, 1040),
+                (0, 0, 1920, 1080),
+            ),
+            moves=(WindowMove(hwnd=300, x=10, y=20, width=400, height=500, resize=False),),
+        )
+
+        with patch(
+            "src.apps.KakaoManager.win32api.GetMonitorInfo",
+            return_value={
+                "Device": r"\\.\DISPLAY1",
+                "Work": (0, 0, 1600, 900),
+                "Monitor": (0, 0, 1600, 900),
+            },
+        ):
+            with patch("src.apps.KakaoManager.apply_precomputed_window_position") as apply_move:
+                self.manager._KakaoManager__apply_move_plan(plan)
+
+        apply_move.assert_not_called()
 
     def test_accept_work_result_drops_stale_generation_without_mutating_state(self) -> None:
         self.manager._KakaoManager__latest_request_generation = 5
