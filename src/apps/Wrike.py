@@ -1,5 +1,6 @@
 from datetime import timedelta
 import json
+import queue
 import shutil
 import threading
 import traceback
@@ -8,6 +9,7 @@ import urllib.parse
 import urllib.request
 
 from src.utils.LibConnector import LibConnector
+from src.utils.secret_store import SecretStore
 from src.utils.ToolTip import ToolTip
 
 
@@ -23,6 +25,7 @@ class Wrike:
         self.__page_ready_poll_sec = 0.05
         self.__page_ready_stable_sec = 0.4
         self.__is_running = False
+        self.__open_tab_running = False
         self.__time_log_running = False
         self.__time_log_root_url = (
             'https://www.wrike.com/workspace.htm?acc=469516'
@@ -69,8 +72,10 @@ class Wrike:
         self.__monitor_folder_path: list[dict] = []
         self.__folder_cache: dict[str, list[dict]] = {}
         self.__root = None
+        self.__ui_queue = queue.SimpleQueue()
+        self.__ui_pump_started = False
         self.__active_tooltip = None
-        self.__settings_version = 3
+        self.__settings_version = 4
         self.__playwright_checked = False
         self.__playwright_ready = False
         self.__time_log_weekday_labels = ['월', '화', '수', '목', '금', '토', '일']
@@ -83,6 +88,7 @@ class Wrike:
         self.__time_log_log_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike.log")
         self.__time_log_token_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_token.txt")
         self.__settings_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_settings.json")
+        self.__secret_store = SecretStore("windows-supporter:wrike-api-token")
 
         self.__re_brackets = self.__lib.re.compile(r'\[([^\]]*)\]')
         self.__re_internal = self.__lib.re.compile(r'^없음\s*\((.+?)\)\s*$')
@@ -262,6 +268,16 @@ class Wrike:
 
         self.__is_running = True
         try:
+            threading.Thread(target=lambda: self.__action_worker(root), daemon=True).start()
+        except Exception:
+            self.__is_running = False
+        return
+
+    def __action_worker(self, root) -> None:
+        def show_message(message: str) -> None:
+            self.__ui_safe(root, lambda: self.__show_tooltip(root, message))
+
+        try:
             self.__lib.pyautogui.click()
             self.__lib.time.sleep(0.02)
             self.__lib.pyautogui.hotkey('ctrl', 'a')
@@ -274,14 +290,14 @@ class Wrike:
                 copied_text = self.__safe_clipboard_paste()
 
             if not copied_text:
-                self.__show_tooltip(root, "클립보드 복사 실패: 텍스트를 선택한 뒤 다시 시도하세요")
+                show_message("클립보드 복사 실패: 텍스트를 선택한 뒤 다시 시도하세요")
                 return
 
             self.__lib.pyautogui.hotkey('ctrl', 't')
             self.__lib.time.sleep(0.05)
             self.__lib.pyautogui.hotkey('ctrl', 'l')
             if not self.__safe_clipboard_copy(self.__form_url):
-                self.__show_tooltip(root, "URL 클립보드 복사 실패: 잠시 후 다시 시도하세요")
+                show_message("URL 클립보드 복사 실패: 잠시 후 다시 시도하세요")
                 return
             self.__lib.time.sleep(0.02)
             self.__lib.pyautogui.hotkey('ctrl', 'v')
@@ -290,7 +306,7 @@ class Wrike:
             self.__lib.time.sleep(0.02)
             self.__safe_clipboard_copy(copied_text)
             if not self.__wait_for_wrike_form_ready():
-                self.__show_tooltip(root, "Wrike Form 로딩 대기 시간 초과: 잠시 후 다시 시도하세요")
+                show_message("Wrike Form 로딩 대기 시간 초과: 잠시 후 다시 시도하세요")
                 return
             self.__lib.pyautogui.press('tab', presses=self.__form_tab_presses, interval=self.__tab_interval_sec)
 
@@ -300,7 +316,7 @@ class Wrike:
 
             transformed_text = self.transform_text(copied_text)
             if not transformed_text:
-                self.__show_tooltip(root, "치환 실패: 텍스트 형식을 확인하세요")
+                show_message("치환 실패: 텍스트 형식을 확인하세요")
                 return
 
             self.__safe_clipboard_copy(transformed_text)
@@ -308,20 +324,45 @@ class Wrike:
             self.__lib.pyautogui.hotkey('ctrl', 'v')
             self.__lib.time.sleep(0.02)
             self.__lib.pyautogui.press('left', presses=4, interval=0.02)
-            self.__show_tooltip(root, "Wrike Form 입력 완료")
+            show_message("Wrike Form 입력 완료")
             return
         finally:
             self.__is_running = False
 
-    def open_in_separate_tab(self, root) -> None:
-        self.__lib.pyautogui.rightClick()
-        self.__lib.pyautogui.moveRel(-20, 0, duration=0.1)
-        self.__lib.pyautogui.hotkey('o')
-        self.__lib.pyautogui.hotkey('enter')
+    def run_action_async(self, root) -> None:
+        self.action(root)
+        return
 
-        tooltip = ToolTip(root, f"새로운 탭에서 열림", bind_events=False)
-        tooltip.show_tooltip()
-        root.after(1500, tooltip.hide_tooltip)
+    def open_in_separate_tab(self, root) -> None:
+        if self.__open_tab_running:
+            return
+        self.__open_tab_running = True
+        try:
+            threading.Thread(target=lambda: self.__open_in_separate_tab_worker(root), daemon=True).start()
+        except Exception:
+            self.__open_tab_running = False
+            return
+        return
+
+    def open_in_separate_tab_async(self, root) -> None:
+        self.open_in_separate_tab(root)
+        return
+
+    def __open_in_separate_tab_worker(self, root) -> None:
+        try:
+            self.__lib.pyautogui.rightClick()
+            self.__lib.pyautogui.moveRel(-20, 0, duration=0.1)
+            self.__lib.pyautogui.hotkey('o')
+            self.__lib.pyautogui.hotkey('enter')
+        finally:
+            self.__open_tab_running = False
+
+        def show_done() -> None:
+            tooltip = ToolTip(root, f"새로운 탭에서 열림", bind_events=False)
+            tooltip.show_tooltip()
+            root.after(1500, tooltip.hide_tooltip)
+
+        self.__ui_safe(root, show_done)
         return
 
     def show_weekly_timelog_summary(self, root) -> None:
@@ -368,13 +409,48 @@ class Wrike:
         threading.Thread(target=task, daemon=True).start()
         return
 
-    def __ui_safe(self, root, fn) -> None:
+    def __ui_safe(self, root, fn) -> bool:
+        _ = root
+        if fn is None:
+            return False
+        try:
+            self.__ui_queue.put(fn)
+            return True
+        except Exception:
+            return False
+
+    def __start_ui_pump(self, root) -> None:
+        if root is None or self.__ui_pump_started:
+            return
+        self.__ui_pump_started = True
+        try:
+            root.after(30, self.__drain_ui_queue)
+        except Exception:
+            self.__ui_pump_started = False
+        return
+
+    def __drain_ui_queue(self) -> None:
+        root = self.__root
+        processed = 0
+        while processed < 16:
+            try:
+                fn = self.__ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
+            processed += 1
         if root is None:
+            self.__ui_pump_started = False
             return
         try:
-            root.after(0, fn)
+            root.after(1 if processed >= 16 else 30, self.__drain_ui_queue)
         except Exception:
-            return
+            self.__ui_pump_started = False
         return
 
     def __open_settings_tab(self) -> None:
@@ -395,6 +471,7 @@ class Wrike:
 
     def attach(self, root) -> None:
         self.__root = root
+        self.__start_ui_pump(root)
         self.__restart_monitor()
         return
 
@@ -444,6 +521,8 @@ class Wrike:
         self.__monitor_running = True
 
         def worker() -> None:
+            next_total_minutes = None
+            tooltip_lines = None
             try:
                 contact_id, display_name, contact_error = self.__resolve_contact_identity(token)
                 if contact_error or not contact_id:
@@ -458,26 +537,45 @@ class Wrike:
                 total_minutes = sum(int(d.get("minutes", 0)) for d in days)
                 last_total = self.__monitor_last_total_minutes
                 if last_total is None:
-                    self.__monitor_last_total_minutes = total_minutes
+                    next_total_minutes = total_minutes
                     return
                 if total_minutes <= int(last_total):
                     return
 
-                self.__monitor_last_total_minutes = total_minutes
+                next_total_minutes = total_minutes
                 daily_target_minutes = int(self.__daily_target_minutes)
-                lines = self.__build_timelog_summary_lines(
+                tooltip_lines = self.__build_timelog_summary_lines(
                     display_name, daily_target_minutes, days
                 )
-                self.__ui_safe(root, lambda: self.__show_tooltip(root, "", lines=lines))
             finally:
-                self.__monitor_running = False
-                self.__schedule_monitor_tick(root)
+                self.__ui_safe(
+                    root,
+                    lambda: self.__finish_monitor_worker(
+                        root,
+                        next_total_minutes,
+                        tooltip_lines,
+                    ),
+                )
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
             self.__monitor_running = False
             self.__schedule_monitor_tick(root)
+        return
+
+    def __finish_monitor_worker(
+        self,
+        root,
+        next_total_minutes: int | None,
+        tooltip_lines: list[tuple[str, str | None]] | None,
+    ) -> None:
+        if next_total_minutes is not None:
+            self.__monitor_last_total_minutes = int(next_total_minutes)
+        if tooltip_lines:
+            self.__show_tooltip(root, "", lines=tooltip_lines)
+        self.__monitor_running = False
+        self.__schedule_monitor_tick(root)
         return
 
     def __count_target_days(self, week_dates: list) -> int:
@@ -1104,20 +1202,19 @@ class Wrike:
 
     def __get_wrike_api_token(self, root, prompt_if_missing: bool = False) -> str:
         token = str(self.__wrike_api_token_session or "").strip()
+        token_from_legacy_file = False
         if not token:
             token = self.__lib.os.getenv(self.__wrike_api_token_env) or ""
         if not token:
             token = self.__lib.os.getenv("WRIKE_API_TOKEN") or ""
         if not token:
-            try:
-                if self.__lib.os.path.isfile(self.__time_log_token_path):
-                    with open(self.__time_log_token_path, "r", encoding="utf-8") as fp:
-                        token = (fp.readline() or "").strip()
-            except Exception:
-                token = ""
+            token = self.__read_legacy_api_token_file()
+            token_from_legacy_file = bool(str(token or "").strip())
         token = str(token).strip()
         if token:
             self.__set_wrike_api_token_session(token)
+            if token_from_legacy_file and self.__save_settings():
+                self.__remove_legacy_api_token_file()
             self.__log(f"api token cached length={len(token)}")
             return token
 
@@ -1140,6 +1237,33 @@ class Wrike:
             self.__log("api token empty after prompt")
         return str(token).strip()
 
+    def __read_legacy_api_token_file(self) -> str:
+        try:
+            if self.__lib.os.path.isfile(self.__time_log_token_path):
+                with open(self.__time_log_token_path, "r", encoding="utf-8") as fp:
+                    return (fp.readline() or "").strip()
+        except Exception as exc:
+            self.__log_exception("legacy token read failed", exc)
+        return ""
+
+    def __remove_legacy_api_token_file(self) -> bool:
+        try:
+            if not self.__lib.os.path.exists(self.__time_log_token_path):
+                return True
+            self.__lib.os.remove(self.__time_log_token_path)
+        except Exception as exc:
+            self.__log_exception("legacy token remove failed", exc)
+            try:
+                with open(self.__time_log_token_path, "w", encoding="utf-8") as fp:
+                    fp.write("")
+                self.__lib.os.remove(self.__time_log_token_path)
+            except Exception as cleanup_exc:
+                self.__log_exception("legacy token cleanup failed", cleanup_exc)
+        try:
+            return not self.__lib.os.path.exists(self.__time_log_token_path)
+        except Exception:
+            return False
+
     def __prompt_api_token(self, root) -> str | None:
         try:
             from tkinter import simpledialog
@@ -1154,6 +1278,7 @@ class Wrike:
                 "Wrike API",
                 message,
                 parent=root,
+                show="*",
             )
         except Exception:
             return None
@@ -1169,8 +1294,10 @@ class Wrike:
         return True
 
     def get_settings_snapshot(self) -> dict:
+        token = str(self.__wrike_api_token_session or "").strip()
         return {
-            "api_token": str(self.__wrike_api_token_session or ""),
+            "api_token_configured": bool(token),
+            "api_token_masked": self.__mask_api_token(token),
             "daily_target_minutes": int(self.__daily_target_minutes),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "monitor_enabled": bool(self.__monitor_enabled),
@@ -1179,10 +1306,20 @@ class Wrike:
             "settings_path": str(self.__settings_path or ""),
         }
 
+    def __mask_api_token(self, token: str) -> str:
+        raw = str(token or "").strip()
+        if not raw:
+            return ""
+        if len(raw) <= 6:
+            return "*" * len(raw)
+        return raw[:3] + ("*" * max(3, len(raw) - 6)) + raw[-3:]
+
     def update_settings(self, data: dict) -> tuple[bool, str | None]:
         if not isinstance(data, dict):
             return False, "invalid settings"
 
+        token_supplied = "api_token" in data
+        clear_token = bool(data.get("clear_api_token", False))
         token = str(data.get("api_token", "") or "").strip()
         daily_minutes = data.get("daily_target_minutes", self.__daily_target_minutes)
         tooltip_ms = data.get("tooltip_duration_ms", self.__tooltip_duration_ms)
@@ -1210,13 +1347,17 @@ class Wrike:
         if monitor_interval < 5:
             monitor_interval = 5.0
 
-        self.__set_wrike_api_token_session(token)
+        if clear_token:
+            self.__set_wrike_api_token_session("")
+        elif token_supplied and token:
+            self.__set_wrike_api_token_session(token)
         self.__daily_target_minutes = int(daily_minutes)
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__monitor_enabled = bool(monitor_enabled)
         self.__monitor_interval_sec = float(monitor_interval)
         self.__monitor_last_total_minutes = None
-        self.__save_settings()
+        if not self.__save_settings():
+            return False, "api token protection"
         self.__restart_monitor()
         return True, None
 
@@ -1439,7 +1580,6 @@ class Wrike:
         had_data = bool(data) if isinstance(data, dict) else False
         defaults = {
             "settings_version": int(self.__settings_version),
-            "api_token": "",
             "daily_target_minutes": int(self.__daily_target_minutes),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "monitor_enabled": True,
@@ -1477,9 +1617,22 @@ class Wrike:
             data["settings_version"] = int(self.__settings_version)
             needs_save = True
 
-        try:
-            self.__set_wrike_api_token_session(str(data.get("api_token", "") or "").strip())
-        except Exception:
+        token = ""
+        protected_token = str(data.get("api_token_protected", "") or "").strip()
+        if protected_token:
+            try:
+                token = self.__secret_store.unprotect(protected_token)
+            except Exception:
+                token = ""
+        if not token and "api_token" in data:
+            try:
+                token = str(data.get("api_token", "") or "").strip()
+            except Exception:
+                token = ""
+            needs_save = True
+        if token:
+            self.__set_wrike_api_token_session(token)
+        elif not protected_token:
             self.__set_wrike_api_token_session("")
         try:
             self.__daily_target_minutes = int(data.get("daily_target_minutes", self.__daily_target_minutes))
@@ -1538,23 +1691,30 @@ class Wrike:
         self.__apply_settings_data(data, reason, allow_save=True)
         return
 
-    def __save_settings(self) -> None:
+    def __save_settings(self) -> bool:
+        token = str(self.__wrike_api_token_session or "").strip()
         payload = {
             "settings_version": int(self.__settings_version),
-            "api_token": str(self.__wrike_api_token_session or ""),
             "daily_target_minutes": int(self.__daily_target_minutes),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "monitor_enabled": bool(self.__monitor_enabled),
             "monitor_interval_sec": float(self.__monitor_interval_sec),
             "monitor_folder_path": list(self.__monitor_folder_path),
         }
+        if token:
+            protected_token = self.__secret_store.protect(token)
+            if not protected_token:
+                self.__log("settings save skipped: api token protection failed")
+                return False
+            payload["api_token_protected"] = protected_token
         try:
             self.__lib.os.makedirs(self.__time_log_config_dir, exist_ok=True)
             with open(self.__settings_path, "w", encoding="utf-8") as fp:
                 json.dump(payload, fp, ensure_ascii=False, indent=2)
+            return True
         except Exception as exc:
             self.__log_exception("settings save failed", exc)
-        return
+        return False
 
     def __query_timelogs_week(self, token: str, contact_id: str, week_dates: list) -> list[dict] | None:
         if not token or not contact_id or not week_dates:
