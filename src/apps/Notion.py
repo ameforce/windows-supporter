@@ -3,6 +3,7 @@ from src.utils.ToolTip import ToolTip
 import win32clipboard
 import win32con
 import math
+import threading
 
 WRIKE_CLIPBOARD_VARIANTS = (
     "plain_only_url",
@@ -74,6 +75,12 @@ class Notion:
         self.__lib = LibConnector()
         self.__last_wrike_payload_key = None
         self.__last_wrike_payload_bundle = None
+        self.__ui_post = None
+        self.__is_running = False
+        return
+
+    def set_ui_post(self, ui_post) -> None:
+        self.__ui_post = ui_post if callable(ui_post) else None
         return
 
     def is_notion_running(self):
@@ -108,19 +115,59 @@ class Notion:
         return formatted_date
 
     def action(self, root) -> None:
+        self.run_action_async(root)
+        return
+
+    def run_action_async(self, root) -> None:
+        if self.__is_running:
+            return
+        self.__is_running = True
+        try:
+            threading.Thread(target=lambda: self.__action_worker(root), daemon=True).start()
+        except Exception:
+            self.__is_running = False
+        return
+
+    def __action_worker(self, root) -> None:
         transformed_text = self.get_date()
-        backup_data = self.__lib.pyperclip.paste()
-        self.__lib.pyperclip.copy(transformed_text)
-        self.__lib.pyautogui.keyUp('ctrl')
-        self.__lib.pyautogui.hotkey('ctrl', 'v')
-        self.__lib.pyperclip.copy(backup_data)
+        restored = False
+        try:
+            backup_data = self.__lib.pyperclip.paste()
+            self.__lib.pyperclip.copy(transformed_text)
+            self.__lib.pyautogui.keyUp('ctrl')
+            self.__lib.pyautogui.hotkey('ctrl', 'v')
+            self.__lib.pyperclip.copy(backup_data)
+            restored = True
+        except Exception:
+            restored = False
+        finally:
+            self.__is_running = False
+        self.__ui_safe(
+            root,
+            lambda: self.__show_action_tooltip(root, transformed_text, restored),
+        )
+        return
+
+    def __show_action_tooltip(self, root, transformed_text: str, restored: bool) -> None:
+        restored_text = "클립보드 복구 완료" if restored else "클립보드 복구 실패"
         tooltip = ToolTip(root,
                           f"성공적으로 삽입됨: {transformed_text}\n"
-                          f"성공적으로 복구됨: {backup_data}",
+                          f"{restored_text}",
                           bind_events=False)
         tooltip.show_tooltip()
         root.after(1500, tooltip.hide_tooltip)
         return
+
+    def __ui_safe(self, root, fn) -> bool:
+        _ = root
+        ui_post = self.__ui_post
+        if callable(ui_post):
+            try:
+                ui_post(fn)
+                return True
+            except Exception:
+                return False
+        return False
 
     def rewrite_clipboard_for_slack(self, root) -> None:
         self.rewrite_clipboard_for_wrike(root)

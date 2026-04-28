@@ -5,9 +5,10 @@ from typing import Any
 
 
 class CodexUsageSettingsView:
-    def __init__(self, root: Any, codex_monitor: Any) -> None:
+    def __init__(self, root: Any, codex_monitor: Any, ui_post=None) -> None:
         self._root = root
         self._codex = codex_monitor
+        self._ui_post = ui_post if callable(ui_post) else None
 
         self._tk = None
         self._ttk = None
@@ -438,14 +439,7 @@ class CodexUsageSettingsView:
                 self._set_status(message, level="error")
                 return
 
-            win = self._win
-            if win is not None:
-                try:
-                    win.after(0, done)
-                    return
-                except Exception:
-                    pass
-            done()
+            self._post_ui(done)
             return
 
         try:
@@ -453,6 +447,18 @@ class CodexUsageSettingsView:
         except Exception:
             self._set_status("로그아웃 작업을 시작하지 못했습니다.", level="error")
         return
+
+    def _post_ui(self, fn) -> bool:
+        if not callable(fn):
+            return False
+        ui_post = self._ui_post
+        if callable(ui_post):
+            try:
+                ui_post(fn)
+                return True
+            except Exception:
+                return False
+        return False
 
     def _parse_seconds(self, text: str, default: float) -> float:
         raw = str(text or "").strip()

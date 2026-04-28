@@ -17,13 +17,28 @@ except Exception:
     win32ts = None
 
 _WM_WTSSESSION_CHANGE = getattr(win32con, "WM_WTSSESSION_CHANGE", 0x02B1)
+_WM_DISPLAYCHANGE = getattr(win32con, "WM_DISPLAYCHANGE", 0x007E)
 _WTS_SESSION_UNLOCK = 0x7
+_WTS_CONSOLE_CONNECT = 0x1
+_WTS_CONSOLE_DISCONNECT = 0x2
+_WTS_REMOTE_CONNECT = 0x3
+_WTS_REMOTE_DISCONNECT = 0x4
 _WTS_NOTIFY_THIS_SESSION = 0
 if win32ts is not None:
     try:
         _WTS_SESSION_UNLOCK = int(win32ts.WTS_SESSION_UNLOCK)
     except Exception:
         pass
+    for _name in (
+        "WTS_CONSOLE_CONNECT",
+        "WTS_CONSOLE_DISCONNECT",
+        "WTS_REMOTE_CONNECT",
+        "WTS_REMOTE_DISCONNECT",
+    ):
+        try:
+            globals()[f"_{_name}"] = int(getattr(win32ts, _name))
+        except Exception:
+            pass
     try:
         _WTS_NOTIFY_THIS_SESSION = int(win32ts.NOTIFY_FOR_THIS_SESSION)
     except Exception:
@@ -75,6 +90,7 @@ class SystemTrayIcon:
         on_open_kakao_monitor: Callable[[], None] | None = None,
         icon_path: str | None = None,
         on_session_unlock: Callable[[], None] | None = None,
+        on_display_topology_change: Callable[[str], None] | None = None,
     ) -> None:
         self._tooltip = str(tooltip) if tooltip else "Windows Supporter"
         self._on_open_settings = on_open_settings
@@ -89,6 +105,7 @@ class SystemTrayIcon:
         self._on_open_kakao_monitor = on_open_kakao_monitor
         self._icon_path = str(icon_path).strip() if icon_path else None
         self._on_session_unlock = on_session_unlock
+        self._on_display_topology_change = on_display_topology_change
 
         self._hwnd: int | None = None
         self._thread: threading.Thread | None = None
@@ -143,6 +160,7 @@ class SystemTrayIcon:
             win32con.WM_COMMAND: self._on_command,
             win32con.WM_CLOSE: self._on_close,
             win32con.WM_DESTROY: self._on_destroy,
+            _WM_DISPLAYCHANGE: self._on_display_change,
         }
         try:
             message_map[_WM_WTSSESSION_CHANGE] = self._on_session_change
@@ -322,15 +340,44 @@ class SystemTrayIcon:
         return
 
     def _on_session_change(self, hwnd: int, msg: int, wparam: int, lparam: int):
-        cb = self._on_session_unlock
-        if cb is None:
-            return 0
         try:
-            if int(wparam) == int(_WTS_SESSION_UNLOCK):
-                cb()
+            event = int(wparam)
         except Exception:
-            pass
+            return 0
+        if event == int(_WTS_SESSION_UNLOCK):
+            cb = self._on_session_unlock
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+            self._notify_display_topology_change("session_unlock")
+            return 0
+
+        reason_map = {
+            int(_WTS_CONSOLE_CONNECT): "console_connect",
+            int(_WTS_CONSOLE_DISCONNECT): "console_disconnect",
+            int(_WTS_REMOTE_CONNECT): "remote_connect",
+            int(_WTS_REMOTE_DISCONNECT): "remote_disconnect",
+        }
+        reason = reason_map.get(event)
+        if reason:
+            self._notify_display_topology_change(reason)
         return 0
+
+    def _on_display_change(self, hwnd: int, msg: int, wparam: int, lparam: int):
+        self._notify_display_topology_change("display_change")
+        return 0
+
+    def _notify_display_topology_change(self, reason: str) -> None:
+        cb = self._on_display_topology_change
+        if cb is None:
+            return
+        try:
+            cb(str(reason or "display_change"))
+        except Exception:
+            return
+        return
 
     def _on_notify(self, hwnd: int, msg: int, wparam: int, lparam: int):
         if self._stop_event.is_set():

@@ -29,6 +29,10 @@ class Monitor:
 
         self.__kakao_after_id = None
         self.__kakao_tick_ms = 200
+        self.__foreground_hotkey_after_id = None
+        self.__foreground_hotkey_tick_ms = 200
+        self.__foreground_hotkey_profile = None
+        self.__foreground_hotkey_handles = []
 
         return
 
@@ -41,11 +45,24 @@ class Monitor:
                 self.__hotkeys_registered = True
             except Exception:
                 self.__hotkeys_registered = False
+        self.__start_foreground_hotkey_poll()
         self.__start_feature_warmup_async()
         return
 
     def on_session_unlock(self) -> None:
         self.__reset_hotkeys()
+        self.on_display_topology_changed("session_unlock")
+        return
+
+    def on_display_topology_changed(self, reason: str = "display_change") -> None:
+        root = self.__root
+        try:
+            self.__ensure_kakao().invalidate_display_topology(
+                root=root,
+                reason=str(reason or "display_change"),
+            )
+        except Exception:
+            return
         return
 
     def __ui_post(self, fn) -> None:
@@ -60,10 +77,18 @@ class Monitor:
 
     def __ensure_notion(self):
         if self.__notion is not None:
+            try:
+                self.__notion.set_ui_post(self.__ui_post)
+            except Exception:
+                pass
             return self.__notion
         with self.__component_lock:
             if self.__notion is None:
                 self.__notion = Notion()
+            try:
+                self.__notion.set_ui_post(self.__ui_post)
+            except Exception:
+                pass
         return self.__notion
 
     def __ensure_wrike(self):
@@ -180,9 +205,6 @@ class Monitor:
         kb.add_hotkey("ctrl+alt+c", safe(self.__on_ctrl_alt_c), suppress=False)
         kb.add_hotkey("ctrl+alt+k", safe(self.__on_ctrl_alt_k), suppress=False)
         kb.add_hotkey("ctrl+alt+w", safe(self.__on_ctrl_alt_w), suppress=False)
-        kb.add_hotkey("alt+q", safe(self.__on_alt_q), suppress=False)
-        kb.add_hotkey("ctrl+q", safe(self.__on_ctrl_q), suppress=False)
-        kb.add_hotkey("ctrl+s", safe(self.__on_ctrl_s), suppress=False)
         return
 
     def __reset_hotkeys(self) -> None:
@@ -192,13 +214,102 @@ class Monitor:
         except Exception:
             pass
         self.__clear_keyboard_state(kb)
+        self.__foreground_hotkey_handles = []
+        self.__foreground_hotkey_profile = None
         self.__hotkeys_registered = False
         try:
             self.__register_hotkeys()
             self.__hotkeys_registered = True
         except Exception:
             self.__hotkeys_registered = False
+        try:
+            self.__sync_foreground_hotkeys()
+        except Exception:
+            pass
         return
+
+    def __start_foreground_hotkey_poll(self) -> None:
+        root = self.__root
+        if root is None:
+            return
+        if self.__foreground_hotkey_after_id is not None:
+            return
+        try:
+            self.__foreground_hotkey_after_id = root.after(
+                self.__foreground_hotkey_tick_ms,
+                self.__poll_foreground_hotkeys,
+            )
+        except Exception:
+            self.__foreground_hotkey_after_id = None
+        return
+
+    def __poll_foreground_hotkeys(self) -> None:
+        self.__foreground_hotkey_after_id = None
+        try:
+            self.__sync_foreground_hotkeys()
+        except Exception:
+            pass
+        self.__start_foreground_hotkey_poll()
+        return
+
+    def __detect_foreground_hotkey_profile(self) -> str | None:
+        try:
+            wrike = self.__ensure_wrike()
+            if wrike is not None and wrike.is_wrike_active():
+                return "wrike"
+        except Exception:
+            pass
+        try:
+            notion = self.__ensure_notion()
+            if notion is not None and notion.is_notion_active():
+                return "notion"
+        except Exception:
+            pass
+        return None
+
+    def __sync_foreground_hotkeys(self, profile="__detect__") -> None:
+        if profile == "__detect__":
+            profile = self.__detect_foreground_hotkey_profile()
+        if profile not in ("wrike", "notion", None):
+            profile = None
+        if profile == self.__foreground_hotkey_profile:
+            return
+
+        kb = self.__lib.keyboard
+        for _combo, handle in list(self.__foreground_hotkey_handles):
+            try:
+                kb.remove_hotkey(handle)
+            except Exception:
+                try:
+                    kb.remove_hotkey(_combo)
+                except Exception:
+                    pass
+        self.__foreground_hotkey_handles = []
+        self.__foreground_hotkey_profile = profile
+
+        def add(combo, cb) -> None:
+            try:
+                handle = kb.add_hotkey(combo, self.__safe_hotkey(cb), suppress=False)
+            except Exception:
+                return
+            self.__foreground_hotkey_handles.append((str(combo), handle))
+            return
+
+        if profile == "wrike":
+            add("alt+q", self.__on_alt_q)
+            add("ctrl+q", self.__on_ctrl_q)
+        elif profile == "notion":
+            add("ctrl+s", self.__on_ctrl_s)
+        return
+
+    def __safe_hotkey(self, cb):
+        def _inner(*_args, **_kwargs):
+            try:
+                cb()
+            except Exception:
+                return
+
+        return _inner
 
     def __clear_keyboard_state(self, kb) -> None:
         try:
@@ -302,7 +413,7 @@ class Monitor:
                     wrike.attach(root)
                     self.__wrike_attached = True
                 if wrike.is_wrike_active():
-                    wrike.action(root)
+                    wrike.run_action_async(root)
             except Exception:
                 return
             return
@@ -322,7 +433,7 @@ class Monitor:
                     wrike.attach(root)
                     self.__wrike_attached = True
                 if wrike.is_wrike_active():
-                    wrike.open_in_separate_tab(root)
+                    wrike.open_in_separate_tab_async(root)
             except Exception:
                 return
             return
@@ -339,7 +450,7 @@ class Monitor:
                 return
             try:
                 if notion.is_notion_active():
-                    notion.action(root)
+                    notion.run_action_async(root)
             except Exception:
                 return
             return

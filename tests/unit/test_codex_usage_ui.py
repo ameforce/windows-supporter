@@ -69,7 +69,11 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                 return None
 
         monitor = _FakeMonitor()
-        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: fn(),
+        )
         view._tk = object()
         view._win = _FakeWin()
 
