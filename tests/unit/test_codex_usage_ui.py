@@ -229,6 +229,121 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(view._collect_state_var.value, "조회 중 (manual_query)")
         self.assertEqual(view._next_collect_var.value, "-")
 
+    def test_refresh_runtime_status_preserves_last_values_while_collecting(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after-token"
+
+        class _FakeSnapshot:
+            def to_dict(self):
+                return {
+                    "five_hour_limit": "24%",
+                    "weekly_limit": "27%",
+                    "gpt_5_3_codex_spark_five_hour_limit": "98%",
+                    "gpt_5_3_codex_spark_weekly_limit": "99%",
+                    "remaining_credit": "958",
+                    "captured_at": "2026-03-30T12:58:00",
+                }
+
+        class _FakeMonitor:
+            def get_last_snapshot(self):
+                return _FakeSnapshot()
+
+            def format_captured_at_for_display(self, value: str) -> str:
+                self.captured_at = value
+                return "2026-03-30 12:58:00"
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_in",
+            "monitor_state": "running",
+            "profile_in_use": False,
+            "collect_inflight": True,
+            "collect_source": "monitor_tick",
+            "next_collect_in_sec": 44,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "조회 중 (monitor_tick)")
+        self.assertEqual(view._next_collect_var.value, "-")
+        self.assertEqual(view._live_time_var.value, "2026-03-30 12:58:00")
+        self.assertEqual(view._live_five_hour_var.value, "24%")
+        self.assertEqual(view._live_weekly_var.value, "27%")
+        self.assertEqual(view._live_spark_five_hour_var.value, "98%")
+        self.assertEqual(view._live_spark_weekly_var.value, "99%")
+        self.assertEqual(view._live_credit_var.value, "958")
+        self.assertEqual(monitor.captured_at, "2026-03-30T12:58:00")
+
+    def test_refresh_runtime_status_shows_dash_while_collecting_without_snapshot(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after-token"
+
+        class _FakeMonitor:
+            def get_last_snapshot(self):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_in",
+            "monitor_state": "running",
+            "profile_in_use": False,
+            "collect_inflight": True,
+            "collect_source": "manual_query",
+            "next_collect_in_sec": 44,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "조회 중 (manual_query)")
+        self.assertEqual(view._next_collect_var.value, "-")
+        self.assertEqual(view._live_time_var.value, "-")
+        self.assertEqual(view._live_five_hour_var.value, "-")
+        self.assertEqual(view._live_weekly_var.value, "-")
+        self.assertEqual(view._live_spark_five_hour_var.value, "-")
+        self.assertEqual(view._live_spark_weekly_var.value, "-")
+        self.assertEqual(view._live_credit_var.value, "-")
+
 
 if __name__ == "__main__":
     unittest.main()
