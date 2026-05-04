@@ -3576,6 +3576,230 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(line_map.get("5시간 사용 한도: 19 / 40"), "#16A34A")
         self.assertEqual(line_map.get("남은 크레딧: 259"), "#DC2626")
 
+    def test_monitor_tick_defers_change_tooltip_until_input_changes(self) -> None:
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        class _FakeRoot:
+            def __init__(self):
+                self.after_calls = []
+
+            def after(self, delay, fn):
+                self.after_calls.append((delay, fn))
+                return f"after-{len(self.after_calls)}"
+
+            def after_cancel(self, _after_id):
+                return None
+
+        root = _FakeRoot()
+        self.monitor._CodexUsageMonitor__root = root
+        self.monitor._CodexUsageMonitor__enabled = True
+        self.monitor._CodexUsageMonitor__session_state = "logged_in"
+        self.monitor._CodexUsageMonitor__monitor_running = False
+        self.monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "20 / 40",
+                "weekly_limit": "120 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
+                "remaining_credit": "260",
+            },
+            captured_at="2026-03-30T10:00:00",
+        )
+        changed = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "19 / 40",
+                "weekly_limit": "120 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
+                "remaining_credit": "260",
+            },
+            captured_at="2026-03-30T10:20:00",
+        )
+        shown = []
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+                return_value=(changed, None),
+            ):
+                with patch.object(self.monitor, "_CodexUsageMonitor__save_state"):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__get_last_input_tick",
+                        return_value=100,
+                        create=True,
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__show_tooltip",
+                            side_effect=lambda text, lines=None, duration_ms=None: shown.append(
+                                (text, lines, duration_ms)
+                            ),
+                        ):
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__ui_post",
+                                side_effect=lambda fn: fn(),
+                            ):
+                                with patch.object(
+                                    self.monitor,
+                                    "_CodexUsageMonitor__schedule_monitor_tick",
+                                ):
+                                    self.monitor._CodexUsageMonitor__monitor_tick()
+
+        self.assertEqual(shown, [])
+        self.assertTrue(root.after_calls)
+
+    def test_pending_change_tooltip_flushes_after_input_tick_changes(self) -> None:
+        class _FakeRoot:
+            def __init__(self):
+                self.after_calls = []
+
+            def after(self, delay, fn):
+                self.after_calls.append((delay, fn))
+                return f"after-{len(self.after_calls)}"
+
+            def after_cancel(self, _after_id):
+                return None
+
+        root = _FakeRoot()
+        self.monitor._CodexUsageMonitor__root = root
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "19 / 40",
+                "weekly_limit": "120 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
+                "remaining_credit": "259",
+            },
+            captured_at="2026-03-30T10:20:00",
+        )
+        changes = [
+            UsageChange("five_hour_limit", "5시간 사용 한도", "20 / 40", "19 / 40"),
+            UsageChange("remaining_credit", "남은 크레딧", "260", "259"),
+        ]
+        shown = []
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__get_last_input_tick",
+            side_effect=[100, 100, 101],
+            create=True,
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__show_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(
+                    (text, lines, duration_ms)
+                ),
+            ):
+                self.monitor._CodexUsageMonitor__queue_change_tooltip_until_input(
+                    changes,
+                    snapshot,
+                )
+                self.assertEqual(shown, [])
+                self.assertEqual(len(root.after_calls), 1)
+
+                root.after_calls[-1][1]()
+                self.assertEqual(shown, [])
+                self.assertEqual(len(root.after_calls), 2)
+
+                root.after_calls[-1][1]()
+
+        self.assertEqual(len(shown), 1)
+        lines = shown[0][1] or []
+        joined = " | ".join(str(line[0]) for line in lines)
+        self.assertIn("Codex 현재 사용량", joined)
+        self.assertIn("- 5시간 사용 한도: 20 / 40 -> 19 / 40", joined)
+        self.assertIn("- 남은 크레딧: 260 -> 259", joined)
+
+    def test_pending_change_tooltip_merges_changes_until_user_input(self) -> None:
+        class _FakeRoot:
+            def __init__(self):
+                self.after_calls = []
+
+            def after(self, delay, fn):
+                self.after_calls.append((delay, fn))
+                return f"after-{len(self.after_calls)}"
+
+            def after_cancel(self, _after_id):
+                return None
+
+        root = _FakeRoot()
+        self.monitor._CodexUsageMonitor__root = root
+        first = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "19 / 40",
+                "weekly_limit": "120 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
+                "remaining_credit": "259",
+            },
+            captured_at="2026-03-30T10:20:00",
+        )
+        second = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "18 / 40",
+                "weekly_limit": "119 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "10 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "10 / 50",
+                "remaining_credit": "259",
+            },
+            captured_at="2026-03-30T10:30:00",
+        )
+        first_changes = [
+            UsageChange("five_hour_limit", "5시간 사용 한도", "20 / 40", "19 / 40"),
+            UsageChange("remaining_credit", "남은 크레딧", "260", "259"),
+        ]
+        second_changes = [
+            UsageChange("five_hour_limit", "5시간 사용 한도", "19 / 40", "18 / 40"),
+            UsageChange("weekly_limit", "주간 사용 한도", "120 / 300", "119 / 300"),
+        ]
+        shown = []
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__get_last_input_tick",
+            side_effect=[100, 100, 101],
+            create=True,
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__show_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(
+                    (text, lines, duration_ms)
+                ),
+            ):
+                self.monitor._CodexUsageMonitor__queue_change_tooltip_until_input(
+                    first_changes,
+                    first,
+                )
+                self.monitor._CodexUsageMonitor__queue_change_tooltip_until_input(
+                    second_changes,
+                    second,
+                )
+                self.assertEqual(len(root.after_calls), 1)
+                root.after_calls[-1][1]()
+
+        self.assertEqual(len(shown), 1)
+        lines = shown[0][1] or []
+        joined = " | ".join(str(line[0]) for line in lines)
+        self.assertIn("5시간 사용 한도: 18 / 40", joined)
+        self.assertIn("주간 사용 한도: 119 / 300", joined)
+        self.assertIn("남은 크레딧: 259", joined)
+        self.assertIn("- 5시간 사용 한도: 20 / 40 -> 18 / 40", joined)
+        self.assertIn("- 주간 사용 한도: 120 / 300 -> 119 / 300", joined)
+        self.assertIn("- 남은 크레딧: 260 -> 259", joined)
+
     def test_release_profile_session_success_resets_runtime_state(self) -> None:
         self.monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot.from_metrics(
             {

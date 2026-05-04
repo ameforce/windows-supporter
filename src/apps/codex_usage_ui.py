@@ -619,27 +619,19 @@ class CodexUsageSettingsView:
                 pass
             return raw
 
-        def _metric_text(key: str) -> str:
-            if inflight:
-                return "조회 중..."
-            return _val(key)
-
         try:
             self._collect_state_var.set(state)
             self._next_collect_var.set(remain_text)
-            if inflight:
-                self._live_time_var.set("조회 중...")
-            else:
-                self._live_time_var.set(_fmt_time(_val("captured_at")))
-            self._live_five_hour_var.set(_metric_text("five_hour_limit"))
-            self._live_weekly_var.set(_metric_text("weekly_limit"))
+            self._live_time_var.set(_fmt_time(_val("captured_at")))
+            self._live_five_hour_var.set(_val("five_hour_limit"))
+            self._live_weekly_var.set(_val("weekly_limit"))
             self._live_spark_five_hour_var.set(
-                _metric_text("gpt_5_3_codex_spark_five_hour_limit")
+                _val("gpt_5_3_codex_spark_five_hour_limit")
             )
             self._live_spark_weekly_var.set(
-                _metric_text("gpt_5_3_codex_spark_weekly_limit")
+                _val("gpt_5_3_codex_spark_weekly_limit")
             )
-            self._live_credit_var.set(_metric_text("remaining_credit"))
+            self._live_credit_var.set(_val("remaining_credit"))
         except Exception:
             pass
 
