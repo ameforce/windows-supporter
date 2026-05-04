@@ -844,6 +844,11 @@ class CodexUsageMonitor:
         self.__startup_warmup_running = False
         self.__worker_epoch = 0
         self.__active_tooltip = None
+        self.__pending_change_tooltip_changes: dict[str, UsageChange] = {}
+        self.__pending_change_tooltip_snapshot: UsageSnapshot | None = None
+        self.__pending_change_tooltip_input_tick: int | None = None
+        self.__pending_change_tooltip_after_id = None
+        self.__pending_change_tooltip_poll_ms = 500
         self.__failure_count = 0
         self.__collect_inflight = False
         self.__collect_inflight_source = ""
@@ -1576,7 +1581,7 @@ class CodexUsageMonitor:
                     latest_snapshot = self.get_last_snapshot()
                     self.__ui_post_coalesced(
                         (
-                            lambda: self.__show_change_tooltip(
+                            lambda: self.__queue_change_tooltip_until_input(
                                 changes,
                                 latest_snapshot,
                             )
@@ -1697,7 +1702,7 @@ class CodexUsageMonitor:
                         latest_snapshot = self.get_last_snapshot()
                         self.__ui_post_coalesced(
                             (
-                                lambda: self.__show_change_tooltip(
+                                lambda: self.__queue_change_tooltip_until_input(
                                     changes,
                                     latest_snapshot,
                                 )
@@ -1724,7 +1729,7 @@ class CodexUsageMonitor:
                 latest_snapshot = self.get_last_snapshot()
                 self.__ui_post_coalesced(
                     (
-                        lambda: self.__show_change_tooltip(
+                        lambda: self.__queue_change_tooltip_until_input(
                             changes,
                             latest_snapshot,
                         )
@@ -1869,6 +1874,130 @@ class CodexUsageMonitor:
                 return
             except Exception:
                 self.__log("ui callback post failed")
+        return
+
+    def __queue_change_tooltip_until_input(
+        self,
+        changes: list[UsageChange],
+        snapshot: UsageSnapshot | None = None,
+    ) -> None:
+        root = self.__root
+        if root is None or not changes:
+            return
+        current_input_tick = self.__get_last_input_tick()
+        was_empty = not bool(self.__pending_change_tooltip_changes)
+        for item in changes:
+            key = str(item.key or "").strip()
+            if not key:
+                continue
+            previous = self.__pending_change_tooltip_changes.get(key)
+            before = item.before
+            if previous is not None and normalize_usage_value(previous.before):
+                before = previous.before
+            self.__pending_change_tooltip_changes[key] = UsageChange(
+                key=key,
+                label=str(item.label or USAGE_METRIC_LABELS.get(key, key)),
+                before=str(before or ""),
+                after=str(item.after or ""),
+            )
+        if not self.__pending_change_tooltip_changes:
+            return
+        if isinstance(snapshot, UsageSnapshot):
+            self.__pending_change_tooltip_snapshot = UsageSnapshot.from_dict(
+                snapshot.to_dict()
+            )
+        if current_input_tick is None:
+            self.__show_pending_change_tooltip_now()
+            return
+        if was_empty:
+            self.__pending_change_tooltip_input_tick = int(current_input_tick)
+        elif self.__pending_change_tooltip_input_tick is not None:
+            try:
+                if int(current_input_tick) != int(self.__pending_change_tooltip_input_tick):
+                    self.__show_pending_change_tooltip_now()
+                    return
+            except Exception:
+                pass
+        self.__schedule_pending_change_tooltip_poll()
+        return
+
+    def __get_last_input_tick(self) -> int | None:
+        try:
+            ctypes = self.__lib.ctypes
+
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint),
+                    ("dwTime", ctypes.c_uint),
+                ]
+
+            info = LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            ok = ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info))
+            if not ok:
+                return None
+            return int(info.dwTime)
+        except Exception:
+            return None
+
+    def __schedule_pending_change_tooltip_poll(self) -> None:
+        root = self.__root
+        if root is None:
+            return
+        if self.__pending_change_tooltip_after_id is not None:
+            return
+        try:
+            self.__pending_change_tooltip_after_id = root.after(
+                int(self.__pending_change_tooltip_poll_ms),
+                self.__flush_pending_change_tooltip_if_input_seen,
+            )
+        except Exception:
+            self.__pending_change_tooltip_after_id = None
+            self.__show_pending_change_tooltip_now()
+        return
+
+    def __flush_pending_change_tooltip_if_input_seen(self) -> None:
+        self.__pending_change_tooltip_after_id = None
+        if not self.__pending_change_tooltip_changes:
+            return
+        baseline_tick = self.__pending_change_tooltip_input_tick
+        current_tick = self.__get_last_input_tick()
+        if current_tick is None:
+            self.__show_pending_change_tooltip_now()
+            return
+        try:
+            if baseline_tick is None or int(current_tick) != int(baseline_tick):
+                self.__show_pending_change_tooltip_now()
+                return
+        except Exception:
+            self.__show_pending_change_tooltip_now()
+            return
+        self.__schedule_pending_change_tooltip_poll()
+        return
+
+    def __show_pending_change_tooltip_now(self) -> None:
+        changes_by_key = dict(self.__pending_change_tooltip_changes)
+        snapshot = self.__pending_change_tooltip_snapshot
+        self.__pending_change_tooltip_changes = {}
+        self.__pending_change_tooltip_snapshot = None
+        self.__pending_change_tooltip_input_tick = None
+        after_id = self.__pending_change_tooltip_after_id
+        self.__pending_change_tooltip_after_id = None
+        root = self.__root
+        if root is not None and after_id is not None:
+            try:
+                root.after_cancel(after_id)
+            except Exception:
+                pass
+        if not changes_by_key:
+            return
+        ordered: list[UsageChange] = []
+        for key in USAGE_METRIC_KEYS:
+            item = changes_by_key.pop(key, None)
+            if item is not None:
+                ordered.append(item)
+        ordered.extend(changes_by_key.values())
+        self.__show_change_tooltip(ordered, snapshot)
         return
 
     def __show_change_tooltip(
