@@ -1,10 +1,15 @@
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from src.apps.codex_usage_monitor import CodexUsageMonitor, UsageChange, UsageSnapshot
+from src.apps.codex_usage_monitor import (
+    CodexUsageMonitor,
+    UsageChange,
+    UsageSnapshot,
+    merge_snapshot_with_previous,
+)
 
 
 class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
@@ -733,14 +738,30 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     {
                         "metric_key": "five_hour_limit",
                         "label_text": "5-hour usage limit",
-                        "block_text": "5-hour usage limit 25%",
+                        "block_text": "5-hour usage limit 25% Resets at 2026-03-30T15:00:00+09:00",
                         "value_candidates": ["25%"],
+                        "reset_at_candidates": ["2026-03-30T15:00:00+09:00"],
                     },
                     {
                         "metric_key": "weekly_limit",
                         "label_text": "weekly usage limit",
-                        "block_text": "weekly usage limit 28%",
+                        "block_text": "weekly usage limit 28% Resets at 2026-04-02T12:00:00+09:00",
                         "value_candidates": ["28%"],
+                        "reset_at_candidates": ["2026-04-02T12:00:00+09:00"],
+                    },
+                    {
+                        "metric_key": "gpt_5_3_codex_spark_five_hour_limit",
+                        "label_text": "gpt-5.3-codex-spark 5-hour usage limit",
+                        "block_text": "gpt-5.3-codex-spark 5-hour usage limit 79% 오후 12:08 초기화",
+                        "value_candidates": ["79%"],
+                        "reset_candidates": ["gpt-5.3-codex-spark 5-hour usage limit 79% 오후 12:08 초기화"],
+                    },
+                    {
+                        "metric_key": "gpt_5_3_codex_spark_weekly_limit",
+                        "label_text": "gpt-5.3-codex-spark weekly usage limit",
+                        "block_text": "gpt-5.3-codex-spark weekly usage limit 74% 2026. 4. 1. 오후 12:14 초기화",
+                        "value_candidates": ["74%"],
+                        "reset_candidates": ["2026. 4. 1. 오후 12:14 초기화"],
                     },
                 ],
             },
@@ -755,6 +776,16 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNotNone(snap)
         self.assertEqual(snap.five_hour_limit, "25%")
         self.assertEqual(snap.weekly_limit, "28%")
+        self.assertEqual(snap.five_hour_limit_reset_at, "2026-03-30T15:00:00+09:00")
+        self.assertEqual(snap.weekly_limit_reset_at, "2026-04-02T12:00:00+09:00")
+        self.assertEqual(
+            snap.gpt_5_3_codex_spark_five_hour_limit_reset_at,
+            "2026-03-30T12:08:00+09:00",
+        )
+        self.assertEqual(
+            snap.gpt_5_3_codex_spark_weekly_limit_reset_at,
+            "2026-04-01T12:14:00+09:00",
+        )
 
     def test_build_snapshot_accepts_fragmentless_analytics_probe_origin_when_metrics_exist(self) -> None:
         class _DummyPage:
@@ -2343,8 +2374,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(lines)
         self.assertEqual(lines[0][0], "Codex 현재 사용량")
         self.assertIn("--------------------------------", line_texts)
-        self.assertLess(line_texts.index("--------------------------------"), line_texts.index("변경 항목"))
-        self.assertIn("변경 항목", joined)
+        self.assertLess(line_texts.index("--------------------------------"), line_texts.index("변경"))
+        self.assertIn("변경", joined)
         self.assertIn("남은 크레딧: 959", joined)
 
     def test_show_change_tooltip_uses_red_and_green_colors(self) -> None:
@@ -2385,11 +2416,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         color_map = {str(line[0]): line[1] for line in captured.get("lines", [])}
         self.assertEqual(
-            color_map.get("- 5시간 사용 한도: 26% -> 25%"),
+            color_map.get("5시간 사용 한도: 26% -> 25%"),
             "#DC2626",
         )
         self.assertEqual(
-            color_map.get("- 남은 크레딧: 959 -> 960"),
+            color_map.get("남은 크레딧: 959 -> 960"),
             "#16A34A",
         )
 
@@ -2406,7 +2437,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         )
         lines = self.monitor._CodexUsageMonitor__build_snapshot_lines(snapshot)
         joined = " | ".join(str(line[0]) for line in lines)
-        self.assertIn("확인 시각: 2026-03-30 12:45:00", joined)
+        self.assertIn("확인: 2026-03-30 12:45:00", joined)
 
     def test_build_snapshot_lines_converts_utc_timestamp_to_kst(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
@@ -2421,7 +2452,155 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         )
         lines = self.monitor._CodexUsageMonitor__build_snapshot_lines(snapshot)
         joined = " | ".join(str(line[0]) for line in lines)
-        self.assertIn("확인 시각: 2026-03-30 09:00:00", joined)
+        self.assertIn("확인: 2026-03-30 09:00:00", joined)
+
+    def test_build_snapshot_lines_shows_reset_countdowns(self) -> None:
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "25%",
+                "weekly_limit": "28%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "remaining_credit": "960",
+            },
+            captured_at="2026-03-30T12:45:00",
+            reset_info={
+                "five_hour_limit_reset_at": "2026-03-30T15:01:02+09:00",
+                "weekly_limit_reset_at": "2026-04-02T12:00:04+09:00",
+                "gpt_5_3_codex_spark_five_hour_limit_reset_at": "2026-03-30T12:08:03+09:00",
+                "gpt_5_3_codex_spark_weekly_limit_reset_at": "2026-04-01T12:14:05+09:00",
+            },
+        )
+        now = datetime(2026, 3, 30, 12, 0, 0, tzinfo=timezone(timedelta(hours=9)))
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__now_local_datetime",
+            return_value=now,
+        ):
+            lines = self.monitor._CodexUsageMonitor__build_snapshot_lines(snapshot)
+
+        line_texts = [str(line[0]) for line in lines]
+        expected = [
+            "5시간 사용 한도: 25%",
+            "      초기화: 15:01:02 (03h 01m 02s)",
+            "주간 사용 한도: 28%",
+            "      초기화: 04/02 12:00:04 (3d 00h 00m 04s)",
+            "gpt-5.3-codex-spark 5시간 사용 한도: 100%",
+            "      초기화: 12:08:03 (00h 08m 03s)",
+            "gpt-5.3-codex-spark 주간 사용 한도: 100%",
+            "      초기화: 04/01 12:14:05 (2d 00h 14m 05s)",
+        ]
+        self.assertEqual(line_texts[: len(expected)], expected)
+
+    def test_snapshot_tooltip_lines_refresh_reset_countdown(self) -> None:
+        self.monitor._CodexUsageMonitor__root = object()
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "25%",
+                "weekly_limit": "28%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "remaining_credit": "960",
+            },
+            captured_at="2026-03-30T12:45:00",
+            reset_info={"five_hour_limit_reset_at": "2026-03-30T15:00:00+09:00"},
+        )
+        now = datetime(2026, 3, 30, 12, 0, 0, tzinfo=timezone(timedelta(hours=9)))
+        later = datetime(2026, 3, 30, 12, 0, 10, tzinfo=timezone(timedelta(hours=9)))
+        captured = {}
+
+        def fake_show(_text, lines=None, duration_ms=None):
+            captured["lines"] = lines
+            captured["duration_ms"] = duration_ms
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__now_local_datetime",
+            side_effect=[now, now, later, later],
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__show_tooltip",
+                side_effect=fake_show,
+            ):
+                self.monitor._CodexUsageMonitor__show_snapshot_tooltip(
+                    snapshot,
+                    title="Codex 현재 사용량",
+                )
+            lines = captured["lines"]
+            refreshed = lines.refresh()
+
+        initial_text = " | ".join(str(line[0]) for line in captured["lines"])
+        refreshed_text = " | ".join(str(line[0]) for line in refreshed)
+        self.assertIn("      초기화: 15:00:00 (03h 00m 00s)", initial_text)
+        self.assertIn("      초기화: 15:00:00 (02h 59m 50s)", refreshed_text)
+
+    def test_reset_display_omits_days_only_for_five_hour_limits(self) -> None:
+        now = datetime(2026, 3, 30, 12, 0, 0, tzinfo=timezone(timedelta(hours=9)))
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__now_local_datetime",
+            return_value=now,
+        ):
+            five_hour = self.monitor.format_reset_at_for_display(
+                "2026-03-30T15:00:00+09:00",
+                "five_hour_limit_reset_at",
+            )
+            spark_five_hour = self.monitor.format_reset_at_for_display(
+                "2026-03-30T12:08:03+09:00",
+                "gpt_5_3_codex_spark_five_hour_limit_reset_at",
+            )
+            weekly = self.monitor.format_reset_at_for_display(
+                "2026-04-02T12:00:04+09:00",
+                "weekly_limit_reset_at",
+            )
+
+        self.assertEqual(five_hour, "2026-03-30 15:00:00 (03h 00m 00s)")
+        self.assertEqual(spark_five_hour, "2026-03-30 12:08:03 (00h 08m 03s)")
+        self.assertEqual(weekly, "2026-04-02 12:00:04 (3d 00h 00m 04s)")
+
+    def test_merge_snapshot_preserves_previous_reset_times_when_missing(self) -> None:
+        previous = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "25%",
+                "weekly_limit": "28%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "remaining_credit": "960",
+            },
+            captured_at="2026-03-30T12:45:00",
+            reset_info={
+                "five_hour_limit_reset_at": "2026-03-30T15:00:00+09:00",
+                "weekly_limit_reset_at": "2026-04-02T12:00:00+09:00",
+                "gpt_5_3_codex_spark_five_hour_limit_reset_at": "2026-03-30T12:08:00+09:00",
+                "gpt_5_3_codex_spark_weekly_limit_reset_at": "2026-04-01T12:14:00+09:00",
+            },
+        )
+        current = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "24%",
+                "weekly_limit": "28%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "remaining_credit": "959",
+            },
+            captured_at="2026-03-30T13:00:00",
+        )
+
+        merged = merge_snapshot_with_previous(current, previous)
+
+        self.assertEqual(merged.five_hour_limit_reset_at, "2026-03-30T15:00:00+09:00")
+        self.assertEqual(merged.weekly_limit_reset_at, "2026-04-02T12:00:00+09:00")
+        self.assertEqual(
+            merged.gpt_5_3_codex_spark_five_hour_limit_reset_at,
+            "2026-03-30T12:08:00+09:00",
+        )
+        self.assertEqual(
+            merged.gpt_5_3_codex_spark_weekly_limit_reset_at,
+            "2026-04-01T12:14:00+09:00",
+        )
 
     def test_show_current_status_shows_loading_tooltip_for_manual_query(self) -> None:
         self.monitor._CodexUsageMonitor__root = object()
@@ -2480,6 +2659,74 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         titles = [entry[1][0][0] for entry in shown if entry[1]]
         self.assertIn("Codex 현재 사용량", titles)
 
+    def test_show_current_status_shows_cached_snapshot_while_manual_query_runs(self) -> None:
+        self.monitor._CodexUsageMonitor__root = object()
+        self.monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "24%",
+                "weekly_limit": "27%",
+                "gpt_5_3_codex_spark_five_hour_limit": "98%",
+                "gpt_5_3_codex_spark_weekly_limit": "99%",
+                "remaining_credit": "958",
+            },
+            captured_at="2026-03-30T12:45:00",
+        )
+        refreshed = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "25%",
+                "weekly_limit": "28%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "remaining_credit": "960",
+            },
+            captured_at="2026-03-30T12:50:00",
+        )
+        shown: list[tuple[str, list[tuple[str, str | None]] | None, int | None]] = []
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        def fake_show(text, lines=None, duration_ms=None):
+            shown.append((str(text or ""), lines, duration_ms))
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__ui_post",
+                side_effect=lambda fn: fn(),
+            ):
+                def fake_collect_guarded(source, on_acquired=None):
+                    _ = source
+                    if callable(on_acquired):
+                        on_acquired()
+                    return refreshed, None
+
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__collect_snapshot_guarded",
+                    side_effect=fake_collect_guarded,
+                ):
+                    with patch.object(self.monitor, "_CodexUsageMonitor__save_state"):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__show_tooltip",
+                            side_effect=fake_show,
+                        ):
+                            self.monitor.show_current_status(force_refresh=True)
+
+        first_lines = shown[0][1] or []
+        first_joined = " | ".join(str(line[0]) for line in first_lines)
+        self.assertEqual(first_lines[0][0], "Codex 최근 사용량 (조회 중...)")
+        self.assertIn("5시간 사용 한도: 24%", first_joined)
+        self.assertEqual(shown[0][2], 0)
+
     def test_show_current_status_ignores_when_collect_already_busy(self) -> None:
         self.monitor._CodexUsageMonitor__root = object()
         shown: list[tuple[str, list[tuple[str, str | None]] | None, int | None]] = []
@@ -2520,7 +2767,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("완료되면 결과를 자동으로 표시합니다.", shown[0][0])
         self.assertEqual(shown[0][2], 0)
 
-    def test_show_current_status_busy_does_not_show_old_snapshot_lines(self) -> None:
+    def test_show_current_status_busy_shows_cached_snapshot_lines(self) -> None:
         self.monitor._CodexUsageMonitor__root = object()
         self.monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot.from_metrics(
             {
@@ -2566,9 +2813,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         self.monitor.show_current_status(force_refresh=True)
 
         self.assertEqual(len(shown), 1)
-        text, lines, _duration = shown[0]
-        self.assertIn("이미 Codex 사용량 조회가 진행 중입니다.", text)
-        self.assertIsNone(lines)
+        text, lines, duration = shown[0]
+        self.assertEqual(text, "")
+        self.assertEqual(duration, 0)
+        line_text = " | ".join(str(line[0]) for line in (lines or []))
+        self.assertIn("Codex 최근 사용량 (이미 조회 중)", line_text)
+        self.assertIn("5시간 사용 한도: 24%", line_text)
+        self.assertIn("완료되면 결과를 자동으로 표시합니다.", line_text)
 
     def test_monitor_tick_shows_pending_manual_snapshot_after_busy(self) -> None:
         self.monitor._CodexUsageMonitor__enabled = True
@@ -3719,8 +3970,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         lines = shown[0][1] or []
         joined = " | ".join(str(line[0]) for line in lines)
         self.assertIn("Codex 현재 사용량", joined)
-        self.assertIn("- 5시간 사용 한도: 20 / 40 -> 19 / 40", joined)
-        self.assertIn("- 남은 크레딧: 260 -> 259", joined)
+        self.assertIn("5시간 사용 한도: 20 / 40 -> 19 / 40", joined)
+        self.assertIn("남은 크레딧: 260 -> 259", joined)
 
     def test_pending_change_tooltip_merges_changes_until_user_input(self) -> None:
         class _FakeRoot:
@@ -3796,9 +4047,9 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("5시간 사용 한도: 18 / 40", joined)
         self.assertIn("주간 사용 한도: 119 / 300", joined)
         self.assertIn("남은 크레딧: 259", joined)
-        self.assertIn("- 5시간 사용 한도: 20 / 40 -> 18 / 40", joined)
-        self.assertIn("- 주간 사용 한도: 120 / 300 -> 119 / 300", joined)
-        self.assertIn("- 남은 크레딧: 260 -> 259", joined)
+        self.assertIn("5시간 사용 한도: 20 / 40 -> 18 / 40", joined)
+        self.assertIn("주간 사용 한도: 120 / 300 -> 119 / 300", joined)
+        self.assertIn("남은 크레딧: 260 -> 259", joined)
 
     def test_release_profile_session_success_resets_runtime_state(self) -> None:
         self.monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot.from_metrics(
