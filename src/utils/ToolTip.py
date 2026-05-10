@@ -36,6 +36,9 @@ class ToolTip(object):
         self.__container = None
         self.__countdown_label = None
         self.__countdown_after_id = None
+        self.__line_labels = []
+        self.__line_refresh_after_id = None
+        self.__line_refresh_provider = getattr(lines, "refresh", None)
         self.__deadline_ts = None
         self.__expired_while_hovering = False
         return
@@ -80,6 +83,7 @@ class ToolTip(object):
         except Exception:
             pass
         bg = "#ffffff"
+        self.__line_labels = []
         container = self.__lib.tk.Frame(
             self.__tw,
             background=bg,
@@ -94,7 +98,7 @@ class ToolTip(object):
         if self.__lines:
             for line, color in self.__lines:
                 fg = color if color else "#111111"
-                self.__lib.tk.Label(
+                label = self.__lib.tk.Label(
                     container,
                     text=str(line),
                     justify='left',
@@ -102,7 +106,9 @@ class ToolTip(object):
                     foreground=fg,
                     wraplength=self.__wrap_length,
                     anchor="w",
-                ).pack(fill="x", padx=4, pady=1)
+                )
+                label.pack(fill="x", padx=4, pady=1)
+                self.__line_labels.append(label)
         else:
             self.__lib.tk.Label(
                 container,
@@ -135,12 +141,14 @@ class ToolTip(object):
                 pass
 
         self.__start_countdown()
+        self.__start_line_refresh()
         return
 
     def hide_tooltip(self) -> None:
         tw = self.__tw
-        self.__tw = None
         self.__cancel_auto_hide()
+        self.__cancel_line_refresh()
+        self.__tw = None
         if tw:
             tw.destroy()
         return
@@ -165,6 +173,73 @@ class ToolTip(object):
         except Exception:
             pass
         self.__hide_after_id = None
+        return
+
+    def __start_line_refresh(self) -> None:
+        if self.__tw is None:
+            return
+        if not callable(self.__line_refresh_provider):
+            return
+        self.__schedule_line_refresh()
+        return
+
+    def __schedule_line_refresh(self) -> None:
+        if self.__tw is None:
+            return
+        if not callable(self.__line_refresh_provider):
+            return
+        self.__cancel_line_refresh()
+        try:
+            self.__line_refresh_after_id = self.__tw.after(1000, self.__line_refresh_tick)
+        except Exception:
+            self.__line_refresh_after_id = None
+        return
+
+    def __cancel_line_refresh(self) -> None:
+        if self.__tw is None or self.__line_refresh_after_id is None:
+            return
+        try:
+            self.__tw.after_cancel(self.__line_refresh_after_id)
+        except Exception:
+            pass
+        self.__line_refresh_after_id = None
+        return
+
+    def __line_refresh_tick(self) -> None:
+        if self.__tw is None:
+            return
+        provider = self.__line_refresh_provider
+        if not callable(provider):
+            return
+        try:
+            refreshed = provider()
+        except Exception:
+            self.__schedule_line_refresh()
+            return
+        self.__update_line_labels(refreshed)
+        self.__schedule_line_refresh()
+        return
+
+    def __update_line_labels(self, lines) -> None:
+        labels = list(self.__line_labels or [])
+        if not labels:
+            return
+        try:
+            normalized = list(lines or [])
+        except Exception:
+            return
+        if len(normalized) != len(labels):
+            return
+        for label, item in zip(labels, normalized):
+            try:
+                text, color = item
+            except Exception:
+                continue
+            fg = color if color else "#111111"
+            try:
+                label.configure(text=str(text), foreground=fg)
+            except Exception:
+                continue
         return
 
     def __on_tooltip_enter(self, _event=None) -> None:
