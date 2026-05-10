@@ -27,9 +27,13 @@ class CodexUsageSettingsView:
         self._next_collect_var = None
         self._live_time_var = None
         self._live_five_hour_var = None
+        self._live_five_hour_reset_var = None
         self._live_weekly_var = None
+        self._live_weekly_reset_var = None
         self._live_spark_five_hour_var = None
+        self._live_spark_five_hour_reset_var = None
         self._live_spark_weekly_var = None
+        self._live_spark_weekly_reset_var = None
         self._live_credit_var = None
         self._status_colors = {
             "info": "#6B7280",
@@ -144,9 +148,13 @@ class CodexUsageSettingsView:
         self._next_collect_var = tk.StringVar(value="-")
         self._live_time_var = tk.StringVar(value="-")
         self._live_five_hour_var = tk.StringVar(value="-")
+        self._live_five_hour_reset_var = tk.StringVar(value="-")
         self._live_weekly_var = tk.StringVar(value="-")
+        self._live_weekly_reset_var = tk.StringVar(value="-")
         self._live_spark_five_hour_var = tk.StringVar(value="-")
+        self._live_spark_five_hour_reset_var = tk.StringVar(value="-")
         self._live_spark_weekly_var = tk.StringVar(value="-")
+        self._live_spark_weekly_reset_var = tk.StringVar(value="-")
         self._live_credit_var = tk.StringVar(value="-")
 
         row = 0
@@ -263,7 +271,11 @@ class CodexUsageSettingsView:
         row += 1
         self._add_value_row(body, row, "5시간 사용 한도", self._live_five_hour_var, card_bg)
         row += 1
+        self._add_value_row(body, row, "5시간 한도 초기화", self._live_five_hour_reset_var, card_bg)
+        row += 1
         self._add_value_row(body, row, "주간 사용 한도", self._live_weekly_var, card_bg)
+        row += 1
+        self._add_value_row(body, row, "주간 한도 초기화", self._live_weekly_reset_var, card_bg)
         row += 1
         self._add_value_row(
             body,
@@ -276,8 +288,24 @@ class CodexUsageSettingsView:
         self._add_value_row(
             body,
             row,
+            "gpt-5.3-codex-spark 5시간 초기화",
+            self._live_spark_five_hour_reset_var,
+            card_bg,
+        )
+        row += 1
+        self._add_value_row(
+            body,
+            row,
             "gpt-5.3-codex-spark 주간 사용 한도",
             self._live_spark_weekly_var,
+            card_bg,
+        )
+        row += 1
+        self._add_value_row(
+            body,
+            row,
+            "gpt-5.3-codex-spark 주간 초기화",
+            self._live_spark_weekly_reset_var,
             card_bg,
         )
         row += 1
@@ -619,18 +647,46 @@ class CodexUsageSettingsView:
                 pass
             return raw
 
+        def _fmt_reset(key: str) -> str:
+            raw = str(payload.get(key, "") or "").strip()
+            if not raw:
+                return "-"
+            try:
+                formatter = getattr(self._codex, "format_reset_at_for_display", None)
+                if callable(formatter):
+                    try:
+                        rendered = str(formatter(raw, key) or "").strip()
+                    except TypeError:
+                        rendered = str(formatter(raw) or "").strip()
+                    return rendered if rendered else "-"
+            except Exception:
+                pass
+            return raw
+
         try:
             self._collect_state_var.set(state)
             self._next_collect_var.set(remain_text)
             self._live_time_var.set(_fmt_time(_val("captured_at")))
             self._live_five_hour_var.set(_val("five_hour_limit"))
+            if self._live_five_hour_reset_var is not None:
+                self._live_five_hour_reset_var.set(_fmt_reset("five_hour_limit_reset_at"))
             self._live_weekly_var.set(_val("weekly_limit"))
+            if self._live_weekly_reset_var is not None:
+                self._live_weekly_reset_var.set(_fmt_reset("weekly_limit_reset_at"))
             self._live_spark_five_hour_var.set(
                 _val("gpt_5_3_codex_spark_five_hour_limit")
             )
+            if self._live_spark_five_hour_reset_var is not None:
+                self._live_spark_five_hour_reset_var.set(
+                    _fmt_reset("gpt_5_3_codex_spark_five_hour_limit_reset_at")
+                )
             self._live_spark_weekly_var.set(
                 _val("gpt_5_3_codex_spark_weekly_limit")
             )
+            if self._live_spark_weekly_reset_var is not None:
+                self._live_spark_weekly_reset_var.set(
+                    _fmt_reset("gpt_5_3_codex_spark_weekly_limit_reset_at")
+                )
             self._live_credit_var.set(_val("remaining_credit"))
         except Exception:
             pass

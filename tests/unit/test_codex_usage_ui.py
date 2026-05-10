@@ -251,15 +251,38 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                     "gpt_5_3_codex_spark_weekly_limit": "99%",
                     "remaining_credit": "958",
                     "captured_at": "2026-03-30T12:58:00",
+                    "five_hour_limit_reset_at": "2026-03-30T15:00:00+09:00",
+                    "weekly_limit_reset_at": "2026-04-02T12:00:00+09:00",
+                    "gpt_5_3_codex_spark_five_hour_limit_reset_at": (
+                        "2026-03-30T13:08:00+09:00"
+                    ),
+                    "gpt_5_3_codex_spark_weekly_limit_reset_at": (
+                        "2026-04-01T12:14:00+09:00"
+                    ),
                 }
 
         class _FakeMonitor:
+            reset_keys: list[str]
+
+            def __init__(self):
+                self.reset_keys = []
+
             def get_last_snapshot(self):
                 return _FakeSnapshot()
 
             def format_captured_at_for_display(self, value: str) -> str:
                 self.captured_at = value
                 return "2026-03-30 12:58:00"
+
+            def format_reset_at_for_display(self, value: str, key: str = "") -> str:
+                self.reset_keys.append(key)
+                if "15:00:00" in value:
+                    return "2026-03-30 15:00:00 (02h 02m 00s)"
+                if "13:08:00" in value:
+                    return "2026-03-30 13:08:00 (00h 10m 00s)"
+                if "12:14:00" in value:
+                    return "2026-04-01 12:14:00 (1d 23h 16m 00s)"
+                return "2026-04-02 12:00:00 (2d 23h 02m 00s)"
 
         monitor = _FakeMonitor()
         view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
@@ -268,9 +291,13 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._next_collect_var = _Var()
         view._live_time_var = _Var()
         view._live_five_hour_var = _Var()
+        view._live_five_hour_reset_var = _Var()
         view._live_weekly_var = _Var()
+        view._live_weekly_reset_var = _Var()
         view._live_spark_five_hour_var = _Var()
+        view._live_spark_five_hour_reset_var = _Var()
         view._live_spark_weekly_var = _Var()
+        view._live_spark_weekly_reset_var = _Var()
         view._live_credit_var = _Var()
         view._refresh_action_buttons = lambda runtime: runtime
         view._safe_get_runtime = lambda: {
@@ -289,11 +316,36 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(view._next_collect_var.value, "-")
         self.assertEqual(view._live_time_var.value, "2026-03-30 12:58:00")
         self.assertEqual(view._live_five_hour_var.value, "24%")
+        self.assertEqual(
+            view._live_five_hour_reset_var.value,
+            "2026-03-30 15:00:00 (02h 02m 00s)",
+        )
         self.assertEqual(view._live_weekly_var.value, "27%")
+        self.assertEqual(
+            view._live_weekly_reset_var.value,
+            "2026-04-02 12:00:00 (2d 23h 02m 00s)",
+        )
         self.assertEqual(view._live_spark_five_hour_var.value, "98%")
+        self.assertEqual(
+            view._live_spark_five_hour_reset_var.value,
+            "2026-03-30 13:08:00 (00h 10m 00s)",
+        )
         self.assertEqual(view._live_spark_weekly_var.value, "99%")
+        self.assertEqual(
+            view._live_spark_weekly_reset_var.value,
+            "2026-04-01 12:14:00 (1d 23h 16m 00s)",
+        )
         self.assertEqual(view._live_credit_var.value, "958")
         self.assertEqual(monitor.captured_at, "2026-03-30T12:58:00")
+        self.assertEqual(
+            monitor.reset_keys,
+            [
+                "five_hour_limit_reset_at",
+                "weekly_limit_reset_at",
+                "gpt_5_3_codex_spark_five_hour_limit_reset_at",
+                "gpt_5_3_codex_spark_weekly_limit_reset_at",
+            ],
+        )
 
     def test_refresh_runtime_status_shows_dash_while_collecting_without_snapshot(self) -> None:
         class _Var:
