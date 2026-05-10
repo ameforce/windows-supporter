@@ -11,7 +11,7 @@ import socket
 import threading
 import traceback
 import urllib.request
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -34,12 +34,65 @@ USAGE_METRIC_KEYS = (
 
 USAGE_LIMIT_METRIC_KEYS = USAGE_METRIC_KEYS[:-1]
 
+USAGE_RESET_AT_KEYS = (
+    "five_hour_limit_reset_at",
+    "weekly_limit_reset_at",
+    "gpt_5_3_codex_spark_five_hour_limit_reset_at",
+    "gpt_5_3_codex_spark_weekly_limit_reset_at",
+)
+
+USAGE_SNAPSHOT_META_KEYS = (
+    "captured_at",
+    "five_hour_limit_reset_at",
+    "weekly_limit_reset_at",
+    "gpt_5_3_codex_spark_five_hour_limit_reset_at",
+    "gpt_5_3_codex_spark_weekly_limit_reset_at",
+)
+
+USAGE_LIMIT_RESET_AT_KEY_BY_METRIC: dict[str, str] = {
+    "five_hour_limit": "five_hour_limit_reset_at",
+    "weekly_limit": "weekly_limit_reset_at",
+    "gpt_5_3_codex_spark_five_hour_limit": (
+        "gpt_5_3_codex_spark_five_hour_limit_reset_at"
+    ),
+    "gpt_5_3_codex_spark_weekly_limit": (
+        "gpt_5_3_codex_spark_weekly_limit_reset_at"
+    ),
+}
+
+USAGE_FIVE_HOUR_METRIC_KEYS = (
+    "five_hour_limit",
+    "gpt_5_3_codex_spark_five_hour_limit",
+)
+
+USAGE_FIVE_HOUR_RESET_AT_KEYS = (
+    "five_hour_limit_reset_at",
+    "gpt_5_3_codex_spark_five_hour_limit_reset_at",
+)
+
 USAGE_METRIC_LABELS: dict[str, str] = {
     "five_hour_limit": "5시간 사용 한도",
     "weekly_limit": "주간 사용 한도",
     "gpt_5_3_codex_spark_five_hour_limit": "gpt-5.3-codex-spark 5시간 사용 한도",
     "gpt_5_3_codex_spark_weekly_limit": "gpt-5.3-codex-spark 주간 사용 한도",
     "remaining_credit": "남은 크레딧",
+}
+
+USAGE_METRIC_SHORT_LABELS: dict[str, str] = {
+    "five_hour_limit": "5시간 사용 한도",
+    "weekly_limit": "주간 사용 한도",
+    "gpt_5_3_codex_spark_five_hour_limit": "gpt-5.3-codex-spark 5시간 사용 한도",
+    "gpt_5_3_codex_spark_weekly_limit": "gpt-5.3-codex-spark 주간 사용 한도",
+    "remaining_credit": "남은 크레딧",
+}
+
+USAGE_RESET_TOOLTIP_INDENT = "      "
+
+USAGE_RESET_LABELS: dict[str, str] = {
+    "five_hour_limit_reset_at": "5시간 한도",
+    "weekly_limit_reset_at": "주간 한도",
+    "gpt_5_3_codex_spark_five_hour_limit_reset_at": "gpt-5.3-codex-spark 5시간 한도",
+    "gpt_5_3_codex_spark_weekly_limit_reset_at": "gpt-5.3-codex-spark 주간 한도",
 }
 
 CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
@@ -52,6 +105,13 @@ CODEX_USAGE_PAGE_PATHS = (
     "/codex/cloud/settings/analytics",
 )
 RAW_CDP_COMMAND_TIMEOUT_SEC = 8.0
+
+
+class _RefreshableTooltipLines(list):
+    def __init__(self, rows, refresh):
+        super().__init__(rows)
+        self.refresh = refresh
+        return
 
 
 class _FallbackWebSocketClient:
@@ -325,6 +385,145 @@ USAGE_PAGE_PROBE_SCRIPT = r"""
     }
     return values;
   };
+  const resetMarkerPattern = /(reset|resets|resetting|refresh|renews|renewal|초기화|재설정|갱신)/i;
+  const toIsoFromLocalParts = (year, month, day, ampm, hour, minute, second = 0) => {
+    let h = Number(hour);
+    if (!Number.isFinite(h)) return '';
+    const marker = String(ampm || '').trim();
+    if (marker === '오후' && h < 12) h += 12;
+    if (marker === '오전' && h === 12) h = 0;
+    const date = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      h,
+      Number(minute),
+      Number(second) || 0,
+      0
+    );
+    return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+  };
+  const parseKoreanResetIso = (value) => {
+    const raw = normalize(value);
+    if (!raw) return '';
+    let match = raw.match(/(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(오전|오후)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (match) {
+      return toIsoFromLocalParts(match[1], match[2], match[3], match[4], match[5], match[6], match[7] || 0);
+    }
+    match = raw.match(/(오전|오후)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:초기화|재설정|갱신)?/);
+    if (!match) return '';
+    const now = new Date();
+    let h = Number(match[2]);
+    if (match[1] === '오후' && h < 12) h += 12;
+    if (match[1] === '오전' && h === 12) h = 0;
+    const date = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+      h,
+      Number(match[3]),
+      Number(match[4] || 0),
+      0
+    );
+    if (date.getTime() < now.getTime() - 60000) {
+      date.setDate(date.getDate() + 1);
+    }
+    return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+  };
+  const parseResetIso = (value) => {
+    const raw = normalize(value);
+    if (!raw) return '';
+    const isoMatch = raw.match(/\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/);
+    const candidates = [];
+    if (isoMatch) candidates.push(isoMatch[0].replace(' ', 'T'));
+    const koreanIso = parseKoreanResetIso(raw);
+    if (koreanIso) return koreanIso;
+    candidates.push(raw.replace(/^(resets?|resetting|renews|refreshes)\s*(at|on)?\s*/i, '').trim());
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      const parsed = Date.parse(candidate);
+      if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+    }
+    return '';
+  };
+  const countMetricLabels = (node) => {
+    if (!node) return 0;
+    let count = getMetricKey(node.innerText || node.textContent || '') ? 1 : 0;
+    if (!node.querySelectorAll) return count;
+    for (const child of Array.from(node.querySelectorAll('*'))) {
+      if (getMetricKey(child.innerText || child.textContent || '')) {
+        count += 1;
+      }
+    }
+    return count;
+  };
+  const collectResetCandidates = (boundary, labelEl) => {
+    const resetCandidates = [];
+    const resetAtCandidates = [];
+    const seen = new Set();
+    const seenIso = new Set();
+    const add = (value, allowWithoutMarker = false) => {
+      const text = normalize(value);
+      if (!text || text.length > 180 || !/[0-9]/.test(text)) return;
+      if (!allowWithoutMarker && !resetMarkerPattern.test(text)) return;
+      if (!seen.has(text)) {
+        seen.add(text);
+        resetCandidates.push(text);
+      }
+      const iso = parseResetIso(text);
+      if (iso && !seenIso.has(iso)) {
+        seenIso.add(iso);
+        resetAtCandidates.push(iso);
+      }
+    };
+    const addNodeTree = (node, allowWithoutMarker = false) => {
+      if (!node) return;
+      add(node.innerText || node.textContent || '', allowWithoutMarker);
+      if (node.getAttribute) {
+        add(node.getAttribute('datetime') || '', allowWithoutMarker);
+        add(node.getAttribute('title') || '', allowWithoutMarker);
+        add(node.getAttribute('aria-label') || '', allowWithoutMarker);
+      }
+      if (!node.querySelectorAll) return;
+      for (const child of Array.from(node.querySelectorAll('*'))) {
+        add(child.innerText || child.textContent || '', allowWithoutMarker);
+        if (!child.getAttribute) continue;
+        add(child.getAttribute('datetime') || '', allowWithoutMarker);
+        add(child.getAttribute('title') || '', allowWithoutMarker);
+        add(child.getAttribute('aria-label') || '', allowWithoutMarker);
+      }
+    };
+    const timeNodes = Array.from(boundary.querySelectorAll('time'));
+    for (const node of timeNodes) {
+      addNodeTree(node, true);
+    }
+    addNodeTree(boundary, false);
+    let current = labelEl;
+    for (let depth = 0; current && current !== scope && depth < 5; depth += 1) {
+      const parent = current.parentElement;
+      if (!parent) break;
+      const parentText = normalize(parent.innerText || parent.textContent || '');
+      if (parentText && parentText.length <= 360 && countMetricLabels(parent) <= 3) {
+        addNodeTree(parent, false);
+      }
+      const siblings = Array.from(parent.children || []);
+      const index = siblings.indexOf(current);
+      const start = Math.max(0, index - 2);
+      const end = Math.min(siblings.length - 1, index + 2);
+      for (let i = start; i <= end; i += 1) {
+        const sibling = siblings[i];
+        const text = normalize(sibling.innerText || sibling.textContent || '');
+        if (text && text.length <= 260 && countMetricLabels(sibling) <= 1) {
+          addNodeTree(sibling, false);
+        }
+      }
+      current = parent;
+    }
+    return {
+      reset_candidates: resetCandidates,
+      reset_at_candidates: resetAtCandidates,
+    };
+  };
   const findBoundary = (labelEl) => {
     let boundary = labelEl;
     let current = labelEl;
@@ -366,12 +565,15 @@ USAGE_PAGE_PROBE_SCRIPT = r"""
     const dedupeKey = `${metricKey}::${blockText}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
+    const resetInfo = collectResetCandidates(boundary, element);
     metricBlocks.push({
       metric_key: metricKey,
       label_text: text,
       block_text: blockText,
       heading_text: findHeading(boundary),
       value_candidates: collectValueCandidates(boundary, text),
+      reset_candidates: resetInfo.reset_candidates,
+      reset_at_candidates: resetInfo.reset_at_candidates,
       boundary_tag: boundary.tagName || '',
       boundary_role: boundary.getAttribute ? (boundary.getAttribute('role') || '') : '',
     });
@@ -436,6 +638,63 @@ def _normalize_match_token(text: str) -> str:
     for token in (" ", ":", "：", "-", "_", "|", "\t"):
         raw = raw.replace(token, "")
     return raw
+
+
+_RESET_AT_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}"
+    r"(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
+)
+
+_KOREAN_DOTTED_DATETIME_PATTERN = re.compile(
+    r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*"
+    r"(오전|오후)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?"
+)
+
+_KOREAN_TIME_PATTERN = re.compile(
+    r"(오전|오후)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:초기화|재설정|갱신)?"
+)
+
+_ENGLISH_MONTH_DATETIME_PATTERN = re.compile(
+    r"(?:resets?|resetting|renews|refreshes)?\s*"
+    r"([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})\s+"
+    r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)",
+    re.IGNORECASE,
+)
+
+_ENGLISH_TIME_PATTERN = re.compile(
+    r"(?:resets?|resetting|renews|refreshes)?\s*"
+    r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)",
+    re.IGNORECASE,
+)
+
+_ENGLISH_MONTHS: dict[str, int] = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+_KOREA_TZ = timezone(timedelta(hours=9), name="KST")
 
 
 def _find_alias_in_line(line: str, aliases: tuple[str, ...]) -> tuple[str | None, int]:
@@ -707,6 +966,219 @@ def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str
     return parsed
 
 
+def _normalize_reset_at_candidate(value: str) -> str:
+    text = normalize_usage_value(value)
+    if not text:
+        return ""
+    if _RESET_AT_PATTERN.fullmatch(text):
+        return text
+    match = _RESET_AT_PATTERN.search(text)
+    if match is None:
+        return ""
+    return normalize_usage_value(match.group(0))
+
+
+def _coerce_korean_ampm_hour(marker: str, hour: int) -> int:
+    if marker == "오후" and hour < 12:
+        return hour + 12
+    if marker == "오전" and hour == 12:
+        return 0
+    return hour
+
+
+def _coerce_english_ampm_hour(marker: str, hour: int) -> int:
+    normalized = str(marker or "").strip().upper()
+    if normalized == "PM" and hour < 12:
+        return hour + 12
+    if normalized == "AM" and hour == 12:
+        return 0
+    return hour
+
+
+def _format_reset_datetime_for_storage(value: datetime) -> str:
+    return value.astimezone(_KOREA_TZ).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+
+
+def _parse_base_reset_datetime(value: str) -> datetime | None:
+    normalized = _normalize_reset_at_candidate(value)
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=_KOREA_TZ)
+        return parsed.astimezone(_KOREA_TZ)
+    except Exception:
+        return None
+
+
+def _build_korean_datetime(
+    year: int,
+    month: int,
+    day: int,
+    marker: str,
+    hour: int,
+    minute: int,
+    second: int,
+) -> datetime | None:
+    try:
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            _coerce_korean_ampm_hour(str(marker), int(hour)),
+            int(minute),
+            int(second),
+            tzinfo=_KOREA_TZ,
+        )
+    except Exception:
+        return None
+
+
+def _build_english_datetime(
+    year: int,
+    month: int,
+    day: int,
+    marker: str,
+    hour: int,
+    minute: int,
+    second: int,
+) -> datetime | None:
+    try:
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            _coerce_english_ampm_hour(str(marker), int(hour)),
+            int(minute),
+            int(second),
+            tzinfo=_KOREA_TZ,
+        )
+    except Exception:
+        return None
+
+
+def _normalize_korean_reset_candidate(value: str, base_at: str = "") -> str:
+    text = normalize_usage_value(value)
+    if not text:
+        return ""
+    match = _KOREAN_DOTTED_DATETIME_PATTERN.search(text)
+    if match is not None:
+        parsed = _build_korean_datetime(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            str(match.group(4)),
+            int(match.group(5)),
+            int(match.group(6)),
+            int(match.group(7) or 0),
+        )
+        return _format_reset_datetime_for_storage(parsed) if parsed is not None else ""
+
+    base = _parse_base_reset_datetime(base_at)
+    if base is None:
+        return ""
+    match = _KOREAN_TIME_PATTERN.search(text)
+    if match is None:
+        return ""
+    parsed = _build_korean_datetime(
+        base.year,
+        base.month,
+        base.day,
+        str(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+        int(match.group(4) or 0),
+    )
+    if parsed is None:
+        return ""
+    if parsed < base - timedelta(minutes=1):
+        parsed = parsed + timedelta(days=1)
+    return _format_reset_datetime_for_storage(parsed)
+
+
+def _normalize_english_reset_candidate(value: str, base_at: str = "") -> str:
+    text = normalize_usage_value(value)
+    if not text:
+        return ""
+    match = _ENGLISH_MONTH_DATETIME_PATTERN.search(text)
+    if match is not None:
+        month = _ENGLISH_MONTHS.get(str(match.group(1) or "").lower(), 0)
+        if not month:
+            return ""
+        parsed = _build_english_datetime(
+            int(match.group(3)),
+            month,
+            int(match.group(2)),
+            str(match.group(7)),
+            int(match.group(4)),
+            int(match.group(5)),
+            int(match.group(6) or 0),
+        )
+        return _format_reset_datetime_for_storage(parsed) if parsed is not None else ""
+
+    base = _parse_base_reset_datetime(base_at)
+    if base is None:
+        return ""
+    match = _ENGLISH_TIME_PATTERN.search(text)
+    if match is None:
+        return ""
+    parsed = _build_english_datetime(
+        base.year,
+        base.month,
+        base.day,
+        str(match.group(4)),
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3) or 0),
+    )
+    if parsed is None:
+        return ""
+    if parsed < base - timedelta(minutes=1):
+        parsed = parsed + timedelta(days=1)
+    return _format_reset_datetime_for_storage(parsed)
+
+
+def extract_usage_reset_info_from_semantic_blocks(
+    raw_blocks: Any,
+    captured_at: str = "",
+) -> dict[str, str]:
+    if not isinstance(raw_blocks, list):
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_block in raw_blocks:
+        if not isinstance(raw_block, dict):
+            continue
+        metric_key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
+        if not metric_key:
+            metric_key = str(_find_metric_key_for_label(raw_block.get("block_text", "")) or "")
+        if not metric_key:
+            metric_key = normalize_usage_value(raw_block.get("metric_key", ""))
+        reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
+        if not reset_key or reset_key in parsed:
+            continue
+        candidates = _normalize_value_candidates(raw_block.get("reset_at_candidates", []))
+        candidates.extend(_normalize_value_candidates(raw_block.get("reset_candidates", [])))
+        candidates.extend(
+            _normalize_value_candidates(
+                [
+                    raw_block.get("block_text", ""),
+                    raw_block.get("heading_text", ""),
+                ]
+            )
+        )
+        for candidate in candidates:
+            value = _normalize_reset_at_candidate(candidate)
+            if not value:
+                value = _normalize_korean_reset_candidate(candidate, captured_at)
+            if not value:
+                value = _normalize_english_reset_candidate(candidate, captured_at)
+            if value:
+                parsed[reset_key] = value
+                break
+    return parsed
+
+
 @dataclass
 class UsageSnapshot:
     five_hour_limit: str = ""
@@ -715,14 +1187,20 @@ class UsageSnapshot:
     gpt_5_3_codex_spark_weekly_limit: str = ""
     remaining_credit: str = ""
     captured_at: str = ""
+    five_hour_limit_reset_at: str = ""
+    weekly_limit_reset_at: str = ""
+    gpt_5_3_codex_spark_five_hour_limit_reset_at: str = ""
+    gpt_5_3_codex_spark_weekly_limit_reset_at: str = ""
 
     @classmethod
     def from_metrics(
         cls,
         metrics: dict[str, str] | None,
         captured_at: str = "",
+        reset_info: dict[str, str] | None = None,
     ) -> "UsageSnapshot":
         data = metrics or {}
+        reset_data = reset_info or {}
         return cls(
             five_hour_limit=normalize_usage_value(data.get("five_hour_limit", "")),
             weekly_limit=normalize_usage_value(data.get("weekly_limit", "")),
@@ -734,6 +1212,18 @@ class UsageSnapshot:
             ),
             remaining_credit=normalize_usage_value(data.get("remaining_credit", "")),
             captured_at=normalize_usage_value(captured_at),
+            five_hour_limit_reset_at=normalize_usage_value(
+                reset_data.get("five_hour_limit_reset_at", "")
+            ),
+            weekly_limit_reset_at=normalize_usage_value(
+                reset_data.get("weekly_limit_reset_at", "")
+            ),
+            gpt_5_3_codex_spark_five_hour_limit_reset_at=normalize_usage_value(
+                reset_data.get("gpt_5_3_codex_spark_five_hour_limit_reset_at", "")
+            ),
+            gpt_5_3_codex_spark_weekly_limit_reset_at=normalize_usage_value(
+                reset_data.get("gpt_5_3_codex_spark_weekly_limit_reset_at", "")
+            ),
         )
 
     @classmethod
@@ -751,6 +1241,18 @@ class UsageSnapshot:
             ),
             remaining_credit=normalize_usage_value(data.get("remaining_credit", "")),
             captured_at=normalize_usage_value(data.get("captured_at", "")),
+            five_hour_limit_reset_at=normalize_usage_value(
+                data.get("five_hour_limit_reset_at", "")
+            ),
+            weekly_limit_reset_at=normalize_usage_value(
+                data.get("weekly_limit_reset_at", "")
+            ),
+            gpt_5_3_codex_spark_five_hour_limit_reset_at=normalize_usage_value(
+                data.get("gpt_5_3_codex_spark_five_hour_limit_reset_at", "")
+            ),
+            gpt_5_3_codex_spark_weekly_limit_reset_at=normalize_usage_value(
+                data.get("gpt_5_3_codex_spark_weekly_limit_reset_at", "")
+            ),
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -765,11 +1267,22 @@ class UsageSnapshot:
             ),
             "remaining_credit": normalize_usage_value(self.remaining_credit),
             "captured_at": normalize_usage_value(self.captured_at),
+            "five_hour_limit_reset_at": normalize_usage_value(
+                self.five_hour_limit_reset_at
+            ),
+            "weekly_limit_reset_at": normalize_usage_value(self.weekly_limit_reset_at),
+            "gpt_5_3_codex_spark_five_hour_limit_reset_at": normalize_usage_value(
+                self.gpt_5_3_codex_spark_five_hour_limit_reset_at
+            ),
+            "gpt_5_3_codex_spark_weekly_limit_reset_at": normalize_usage_value(
+                self.gpt_5_3_codex_spark_weekly_limit_reset_at
+            ),
         }
 
     def metrics(self) -> dict[str, str]:
         payload = self.to_dict()
-        payload.pop("captured_at", None)
+        for key in USAGE_SNAPSHOT_META_KEYS:
+            payload.pop(key, None)
         return payload
 
     def has_any_metric(self) -> bool:
@@ -794,6 +1307,11 @@ def merge_snapshot_with_previous(
     merged = current.to_dict()
     prev_payload = prev.to_dict()
     for key in USAGE_METRIC_KEYS:
+        if not merged.get(key):
+            merged[key] = prev_payload.get(key, "")
+    for key in USAGE_SNAPSHOT_META_KEYS:
+        if key == "captured_at":
+            continue
         if not merged.get(key):
             merged[key] = prev_payload.get(key, "")
     if not merged.get("captured_at"):
@@ -1342,6 +1860,9 @@ class CodexUsageMonitor:
     def format_captured_at_for_display(self, value: str) -> str:
         return self.__format_timestamp_display(str(value or ""))
 
+    def format_reset_at_for_display(self, value: str, key: str = "") -> str:
+        return self.__format_reset_at_display(str(value or ""), key=key)
+
     def show_current_status(self, force_refresh: bool = True) -> None:
         root = self.__root
         if root is None:
@@ -1372,10 +1893,7 @@ class CodexUsageMonitor:
                 if bool(force_refresh):
                     refreshed, error = self.__collect_snapshot_guarded(
                         source="manual_query",
-                        on_acquired=lambda: self.__show_tooltip(
-                            "Codex 사용량 조회 중...",
-                            duration_ms=0,
-                        ),
+                        on_acquired=self.__show_manual_collect_started_tooltip,
                     )
                     if error == "collect_busy":
                         if bool(self.__profile_in_use_detected):
@@ -2014,29 +2532,91 @@ class CodexUsageMonitor:
             color = self.__resolve_change_color(item)
             if color:
                 metric_colors[str(item.key)] = color
+        lines = self.__build_change_tooltip_lines(changes, current, metric_colors)
+        if self.__snapshot_has_reset_info(current):
+            lines = _RefreshableTooltipLines(
+                lines,
+                lambda: self.__build_change_tooltip_lines(
+                    changes,
+                    current,
+                    metric_colors,
+                ),
+            )
+        self.__show_tooltip("", lines=lines)
+        return
+
+    def __build_change_tooltip_lines(
+        self,
+        changes: list[UsageChange],
+        snapshot: UsageSnapshot | None,
+        metric_colors: dict[str, str],
+    ) -> list[tuple[str, str | None]]:
         lines: list[tuple[str, str | None]] = [("Codex 현재 사용량", None)]
-        lines.extend(self.__build_snapshot_lines(current, metric_colors=metric_colors))
+        lines.extend(self.__build_snapshot_lines(snapshot, metric_colors=metric_colors))
         lines.append(("--------------------------------", None))
-        lines.append(("변경 항목", None))
+        lines.append(("변경", None))
         for item in changes:
             before = item.before if item.before else "-"
             after = item.after if item.after else "-"
             lines.append(
                 (
-                    f"- {item.label}: {before} -> {after}",
+                    f"{self.__metric_short_label(item.key)}: {before} -> {after}",
                     self.__resolve_change_color(item),
                 )
             )
-        self.__show_tooltip("", lines=lines)
+        return lines
+
+    def __show_snapshot_tooltip(
+        self,
+        snapshot: UsageSnapshot,
+        title: str,
+        duration_ms: int | None = None,
+        footer: str | None = None,
+    ) -> None:
+        lines = self.__build_snapshot_tooltip_lines(snapshot, title, footer)
+        if self.__snapshot_has_reset_info(snapshot):
+            lines = _RefreshableTooltipLines(
+                lines,
+                lambda: self.__build_snapshot_tooltip_lines(snapshot, title, footer),
+            )
+        self.__show_tooltip("", lines=lines, duration_ms=duration_ms)
         return
 
-    def __show_snapshot_tooltip(self, snapshot: UsageSnapshot, title: str) -> None:
+    def __build_snapshot_tooltip_lines(
+        self,
+        snapshot: UsageSnapshot,
+        title: str,
+        footer: str | None = None,
+    ) -> list[tuple[str, str | None]]:
         lines: list[tuple[str, str | None]] = [(str(title or "Codex 현재 사용량"), None)]
         lines.extend(self.__build_snapshot_lines(snapshot))
-        self.__show_tooltip("", lines=lines)
+        footer_text = normalize_usage_value(str(footer or ""))
+        if footer_text:
+            lines.append((footer_text, None))
+        return lines
+
+    def __show_manual_collect_started_tooltip(self) -> None:
+        latest = self.get_last_snapshot()
+        if latest is not None and latest.has_any_metric():
+            self.__show_snapshot_tooltip(
+                latest,
+                title="Codex 최근 사용량 (조회 중...)",
+                duration_ms=0,
+            )
+            return
+        self.__show_tooltip("Codex 사용량 조회 중...", duration_ms=0)
         return
 
     def __show_busy_collect_tooltip(self) -> None:
+        latest = self.get_last_snapshot()
+        if latest is not None and latest.has_any_metric():
+            self.__show_snapshot_tooltip(
+                latest,
+                title="Codex 최근 사용량 (이미 조회 중)",
+                duration_ms=0,
+                footer="완료되면 결과를 자동으로 표시합니다.",
+            )
+            return
         self.__show_tooltip(
             "이미 Codex 사용량 조회가 진행 중입니다. 완료되면 결과를 자동으로 표시합니다.",
             duration_ms=0,
@@ -2123,34 +2703,146 @@ class CodexUsageMonitor:
         if section_title:
             lines.append((str(section_title), None))
         for key in USAGE_METRIC_KEYS:
-            label = USAGE_METRIC_LABELS.get(key, key)
+            label = self.__metric_short_label(key)
             value = normalize_usage_value(payload.get(key, ""))
             if not value:
                 value = "-"
             line_color: str | None = None
             if isinstance(metric_colors, dict):
                 line_color = metric_colors.get(str(key))
+            reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(str(key), "")
+            reset_at = normalize_usage_value(payload.get(reset_key, ""))
+            reset_display = self.__format_reset_at_inline_display(reset_at, key=key)
             lines.append((f"{label}: {value}", line_color))
+            if reset_display:
+                lines.append((f"{USAGE_RESET_TOOLTIP_INDENT}{reset_display}", None))
         captured_at = normalize_usage_value(payload.get("captured_at", ""))
         if captured_at:
-            lines.append((f"확인 시각: {self.__format_timestamp_display(captured_at)}", None))
+            lines.append((f"확인: {self.__format_timestamp_display(captured_at)}", None))
         return lines
+
+    def __metric_short_label(self, key: str) -> str:
+        return USAGE_METRIC_LABELS.get(str(key), str(key))
+
+    def __snapshot_has_reset_info(self, snapshot: UsageSnapshot | None) -> bool:
+        if not isinstance(snapshot, UsageSnapshot):
+            return False
+        payload = snapshot.to_dict()
+        return any(normalize_usage_value(payload.get(key, "")) for key in USAGE_RESET_AT_KEYS)
+
+    def __build_reset_lines(self, payload: dict[str, str]) -> list[tuple[str, str | None]]:
+        lines: list[tuple[str, str | None]] = []
+        for key in USAGE_RESET_AT_KEYS:
+            value = normalize_usage_value(payload.get(key, ""))
+            if not value:
+                continue
+            rendered = self.__format_reset_at_display(value)
+            if not rendered:
+                continue
+            label = USAGE_RESET_LABELS.get(key, key)
+            lines.append((f"{label}: {rendered}", None))
+        return lines
+
+    def __parse_display_datetime(self, value: str):
+        candidate = normalize_usage_value(value)
+        if not candidate:
+            return None
+        try:
+            normalized = candidate.replace("Z", "+00:00")
+            parsed = self.__lib.datetime.fromisoformat(normalized)
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(self.__korea_tz)
+            return parsed.replace(tzinfo=self.__korea_tz)
+        except Exception:
+            return None
 
     def __format_timestamp_display(self, value: str) -> str:
         text = normalize_usage_value(value)
         if not text:
             return ""
-        candidate = text
+        parsed = self.__parse_display_datetime(text)
+        if parsed is not None:
+            return str(parsed.strftime("%Y-%m-%d %H:%M:%S"))
+        return text.replace("T", " ")
+
+    def __format_reset_at_display(self, value: str, key: str = "") -> str:
+        text = normalize_usage_value(value)
+        if not text:
+            return ""
+        parsed = self.__parse_display_datetime(text)
+        if parsed is None:
+            return self.__format_timestamp_display(text)
+        reset_at = str(parsed.strftime("%Y-%m-%d %H:%M:%S"))
+        remaining = self.__format_remaining_until(
+            parsed,
+            include_days=not self.__is_five_hour_reset_key(key),
+        )
+        if remaining:
+            return f"{reset_at} ({remaining})"
+        return f"{reset_at} (elapsed)"
+
+    def __format_reset_at_inline_display(self, value: str, key: str = "") -> str:
+        text = normalize_usage_value(value)
+        if not text:
+            return ""
+        parsed = self.__parse_display_datetime(text)
+        if parsed is None:
+            rendered = self.__format_reset_at_display(text, key=key)
+            return f"초기화: {rendered}" if rendered else ""
+        remaining = self.__format_remaining_until(
+            parsed,
+            include_days=not self.__is_five_hour_reset_key(key),
+        )
+        if remaining:
+            return f"초기화: {self.__format_reset_at_compact(parsed)} ({remaining})"
+        return f"초기화: {self.__format_reset_at_compact(parsed)} (elapsed)"
+
+    def __format_reset_at_compact(self, value) -> str:
         try:
-            normalized = candidate.replace("Z", "+00:00")
-            parsed = self.__lib.datetime.fromisoformat(normalized)
-            if parsed.tzinfo is not None:
-                localized = parsed.astimezone(self.__korea_tz)
-            else:
-                localized = parsed
-            return str(localized.strftime("%Y-%m-%d %H:%M:%S"))
+            now = self.__now_local_datetime()
+            if value.date() == now.date():
+                return str(value.strftime("%H:%M:%S"))
+            return str(value.strftime("%m/%d %H:%M:%S"))
         except Exception:
-            return candidate.replace("T", " ")
+            try:
+                return str(value.strftime("%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                return ""
+
+    def __now_local_datetime(self):
+        utc_now = self.__lib.datetime.now(timezone.utc)
+        return utc_now.astimezone(self.__korea_tz)
+
+    def __format_remaining_until(self, reset_at, include_days: bool = True) -> str:
+        try:
+            now = self.__now_local_datetime()
+            remain_seconds = int(max(0, (reset_at - now).total_seconds()))
+        except Exception:
+            return ""
+        if remain_seconds <= 0:
+            return ""
+        return self.__format_duration_seconds(
+            remain_seconds,
+            include_days=include_days,
+        )
+
+    def __format_duration_seconds(self, seconds: int, include_days: bool = True) -> str:
+        try:
+            total = int(max(0, seconds))
+        except Exception:
+            total = 0
+        if not include_days:
+            hours, rem = divmod(total, 3600)
+            minutes, seconds = divmod(rem, 60)
+            return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
+        days, rem = divmod(total, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+        return f"{days}d {hours:02d}h {minutes:02d}m {seconds:02d}s"
+
+    def __is_five_hour_reset_key(self, key: str) -> bool:
+        normalized = str(key or "")
+        return normalized in USAGE_FIVE_HOUR_METRIC_KEYS or normalized in USAGE_FIVE_HOUR_RESET_AT_KEYS
 
     def __resolve_change_color(self, item: UsageChange) -> str | None:
         before_score = self.__metric_score_for_compare(item.key, item.before)
@@ -4384,7 +5076,15 @@ class CodexUsageMonitor:
         has_limit_metric = any(normalize_usage_value(metrics.get(k, "")) for k in limit_keys)
         if not has_limit_metric:
             return None
-        snapshot = UsageSnapshot.from_metrics(metrics, captured_at=captured_at)
+        reset_info = extract_usage_reset_info_from_semantic_blocks(
+            normalized_probe.get("metricBlocks", []),
+            captured_at=captured_at,
+        )
+        snapshot = UsageSnapshot.from_metrics(
+            metrics,
+            captured_at=captured_at,
+            reset_info=reset_info,
+        )
         if not snapshot.has_any_metric():
             return None
         return snapshot
