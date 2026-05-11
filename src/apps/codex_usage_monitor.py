@@ -4144,14 +4144,68 @@ class CodexUsageMonitor:
                 raise RuntimeError(str(message.get("error")))
             return message
 
-    def __connect_hidden_cdp_context(self, playwright_obj, launch_url: str | None = None):
+    def __connect_managed_hidden_cdp_context(self, playwright_obj):
         proc = self.__hidden_cdp_proc
         port = 0
         try:
             port = int(self.__hidden_cdp_port or 0)
         except Exception:
             port = 0
+        if proc is None or port <= 0:
+            return None, None, None, False
 
+        try:
+            listener_pid = int(self.__find_profile_remote_debugging_pid(int(port)) or 0)
+        except Exception:
+            listener_pid = 0
+        if listener_pid > 0:
+            try:
+                setattr(proc, "_ws_listener_pid", int(listener_pid))
+            except Exception:
+                pass
+        elif not self.__is_subprocess_running(proc):
+            self.__clear_hidden_cdp_process(terminate=False)
+            return None, None, None, False
+
+        endpoint = f"http://127.0.0.1:{int(port)}"
+        browser = None
+        try:
+            browser = self.__connect_browser_over_cdp(playwright_obj, endpoint)
+            contexts = []
+            try:
+                contexts = list(browser.contexts or [])
+            except Exception:
+                contexts = []
+            if not contexts:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                self.__clear_hidden_cdp_process(terminate=True)
+                return None, None, None, False
+            self.__log(f"hidden cdp reused managed process port={int(port)}")
+            return contexts[0], browser, proc, True
+        except Exception as exc:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            self.__log_exception("hidden cdp reuse failed", exc)
+            self.__clear_hidden_cdp_process(terminate=True)
+            return None, None, None, False
+
+    def __connect_hidden_cdp_context(self, playwright_obj, launch_url: str | None = None):
+        context, browser, proc, keep = self.__connect_managed_hidden_cdp_context(playwright_obj)
+        if context is not None:
+            return context, browser, proc, keep
+
+        proc = self.__hidden_cdp_proc
+        port = 0
+        try:
+            port = int(self.__hidden_cdp_port or 0)
+        except Exception:
+            port = 0
         if proc is not None or port > 0:
             self.__clear_hidden_cdp_process(terminate=True)
 
@@ -4177,7 +4231,13 @@ class CodexUsageMonitor:
         except Exception:
             port = 0
         if port > 0:
-            return context, browser, proc, False
+            try:
+                setattr(proc, "_ws_monitor_managed", True)
+            except Exception:
+                pass
+            self.__hidden_cdp_proc = proc
+            self.__hidden_cdp_port = int(port)
+            return context, browser, proc, True
         return context, browser, proc, False
 
     def __set_cdp_window_visibility(

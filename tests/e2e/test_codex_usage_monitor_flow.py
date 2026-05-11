@@ -1844,7 +1844,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
         )
 
-    def test_collect_snapshot_once_does_not_reuse_hidden_cdp_process_between_calls(self) -> None:
+    def test_collect_snapshot_once_reuses_hidden_cdp_process_between_calls(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -1954,9 +1954,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNone(err2)
         self.assertIsNotNone(got1)
         self.assertIsNotNone(got2)
-        self.assertEqual(launch_cdp.call_count, 2)
-        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
+        self.assertEqual(launch_cdp.call_count, 1)
+        self.assertEqual(pw.chromium.connect_calls, 1)
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, launch_cdp.return_value[2])
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48125)
 
     def test_select_collect_page_prefers_non_blank_and_closes_extra_blank_tabs(self) -> None:
         class _DummyPage:
