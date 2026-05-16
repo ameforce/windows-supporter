@@ -9,24 +9,160 @@ class _FakeLabel:
         _ = args
         self._owner = owner
         self.kwargs = dict(kwargs)
+        self.pack_kwargs = {}
         self.grid_kwargs = {}
+        self.bind_calls = []
         owner.labels.append(self)
+
+    def pack(self, **kwargs):
+        self.pack_kwargs = dict(kwargs)
+        return None
 
     def grid(self, **kwargs):
         self.grid_kwargs = dict(kwargs)
         return None
 
+    def bind(self, event, callback):
+        self.bind_calls.append((event, callback))
+        return None
+
+
+class _FakeWidget:
+    def __init__(self, owner=None, *args, **kwargs):
+        _ = args
+        self._owner = owner
+        self.kwargs = dict(kwargs)
+        self.pack_kwargs = {}
+        self.grid_kwargs = {}
+        self.bind_calls = []
+        self.configure_calls = []
+        self.children = []
+
+    def pack(self, **kwargs):
+        self.pack_kwargs = dict(kwargs)
+        return None
+
+    def grid(self, **kwargs):
+        self.grid_kwargs = dict(kwargs)
+        return None
+
+    def bind(self, event, callback):
+        self.bind_calls.append((event, callback))
+        return None
+
+    def configure(self, **kwargs):
+        self.configure_calls.append(dict(kwargs))
+        return None
+
+    def columnconfigure(self, *_args, **_kwargs):
+        return None
+
+    def rowconfigure(self, *_args, **_kwargs):
+        return None
+
+    def winfo_children(self):
+        return list(self.children)
+
+    def destroy(self):
+        return None
+
+
+class _FakeCanvas(_FakeWidget):
+    def __init__(self, owner=None, *args, **kwargs):
+        super().__init__(owner, *args, **kwargs)
+        self.windows = []
+        self.itemconfigure_calls = []
+        if owner is not None:
+            owner.canvases.append(self)
+
+    def yview(self, *_args, **_kwargs):
+        return None
+
+    def create_window(self, *args, **kwargs):
+        self.windows.append((args, kwargs))
+        return len(self.windows)
+
+    def itemconfigure(self, item, **kwargs):
+        self.itemconfigure_calls.append((item, dict(kwargs)))
+        return None
+
+    def bbox(self, *_args):
+        return (0, 0, 100, 100)
+
+
+class _FakeVar:
+    def __init__(self, value=None):
+        self.value = value
+
+    def set(self, value):
+        self.value = value
+        return None
+
+    def get(self):
+        return self.value
+
 
 class _FakeTk:
     def __init__(self):
         self.labels = []
+        self.canvases = []
 
     def Label(self, *args, **kwargs):
         return _FakeLabel(self, *args, **kwargs)
 
+    def Frame(self, *args, **kwargs):
+        return _FakeWidget(self, *args, **kwargs)
+
+    def Canvas(self, *args, **kwargs):
+        return _FakeCanvas(self, *args, **kwargs)
+
+    def StringVar(self, value=""):
+        return _FakeVar(value=value)
+
+    def BooleanVar(self, value=False):
+        return _FakeVar(value=value)
+
+    def Checkbutton(self, *args, **kwargs):
+        return _FakeWidget(self, *args, **kwargs)
+
+
+class _FakeButton(_FakeWidget):
+    def __init__(self, owner=None, *args, **kwargs):
+        super().__init__(owner, *args, **kwargs)
+        if owner is not None:
+            owner.buttons.append(self)
+
+    def state(self, _tokens):
+        return None
+
+
+class _FakeScrollbar(_FakeWidget):
+    def __init__(self, owner=None, *args, **kwargs):
+        super().__init__(owner, *args, **kwargs)
+        if owner is not None:
+            owner.scrollbars.append(self)
+
+    def set(self, *_args):
+        return None
+
+
+class _FakeTtk:
+    def __init__(self):
+        self.buttons = []
+        self.scrollbars = []
+
+    def Entry(self, *args, **kwargs):
+        return _FakeWidget(self, *args, **kwargs)
+
+    def Button(self, *args, **kwargs):
+        return _FakeButton(self, *args, **kwargs)
+
+    def Scrollbar(self, *args, **kwargs):
+        return _FakeScrollbar(self, *args, **kwargs)
+
 
 class CodexUsageUiUnitTest(unittest.TestCase):
-    def test_add_value_row_uses_wrapping_and_fill_for_runtime_values(self) -> None:
+    def test_add_value_row_uses_wrapping_without_forcing_wide_columns(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         fake_tk = _FakeTk()
         view._tk = fake_tk
@@ -41,7 +177,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(len(fake_tk.labels), 2)
         value_label = fake_tk.labels[1]
-        self.assertEqual(value_label.grid_kwargs.get("sticky"), "we")
+        self.assertEqual(value_label.grid_kwargs.get("sticky"), "w")
         self.assertGreater(int(value_label.kwargs.get("wraplength", 0)), 0)
 
     def test_on_release_profile_calls_monitor_and_sets_ok_status(self) -> None:
@@ -94,13 +230,70 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertTrue(status_calls)
         self.assertEqual(status_calls[-1][1], "ok")
 
+    def test_mount_keeps_codex_content_unscrolled(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        self.assertEqual(len(fake_tk.canvases), 0)
+        self.assertEqual(len(fake_ttk.scrollbars), 0)
+
+    def test_mount_lays_runtime_values_out_in_two_columns(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        runtime_labels = {
+            label.kwargs.get("text"): label.grid_kwargs
+            for label in fake_tk.labels
+            if label.kwargs.get("text")
+            in {
+                "조회 상태",
+                "다음 모니터링까지",
+                "남은 크레딧",
+                "5시간 사용 한도",
+                "5시간 한도 초기화",
+            }
+        }
+        self.assertEqual(runtime_labels["조회 상태"].get("column"), 0)
+        self.assertEqual(runtime_labels["다음 모니터링까지"].get("column"), 2)
+        self.assertEqual(runtime_labels["남은 크레딧"].get("column"), 2)
+        self.assertEqual(runtime_labels["5시간 사용 한도"].get("column"), 0)
+        self.assertEqual(runtime_labels["5시간 한도 초기화"].get("column"), 2)
+
     def test_on_login_triggers_show_current_status(self) -> None:
         class _FakeMonitor:
             def __init__(self):
                 self.args = []
 
-            def show_current_status(self, force_refresh: bool = True):
-                self.args.append(bool(force_refresh))
+            def show_current_status(self, force_refresh: bool = True, source: str = ""):
+                self.args.append((bool(force_refresh), str(source)))
                 return None
 
         monitor = _FakeMonitor()
@@ -112,8 +305,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._on_login()
 
-        self.assertEqual(monitor.args, [True])
+        self.assertEqual(monitor.args, [(True, "manual_login")])
         self.assertTrue(statuses)
+        self.assertEqual(statuses[-1][0], "로그인 창을 여는 중입니다...")
         self.assertEqual(statuses[-1][1], "info")
 
     def test_refresh_action_buttons_applies_runtime_permissions(self) -> None:
@@ -186,6 +380,234 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(view._collect_state_var.value, "프로필 사용 중 (자동 일시중지)")
         self.assertEqual(view._next_collect_var.value, "-")
 
+    def test_refresh_runtime_status_shows_pending_login_poll_state(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after-token"
+
+        class _FakeMonitor:
+            def get_last_snapshot(self):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_out",
+            "monitor_state": "idle",
+            "profile_in_use": False,
+            "pending_login_poll_active": True,
+            "pending_login_poll_remaining_sec": 482.7,
+            "collect_inflight": False,
+            "next_collect_in_sec": None,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "로그인 완료 대기 중")
+        self.assertEqual(view._next_collect_var.value, "최대 482초")
+
+    def test_refresh_runtime_status_shows_pending_login_cdp_wait_state(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after-token"
+
+        class _FakeMonitor:
+            def get_last_snapshot(self):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_out",
+            "monitor_state": "idle",
+            "profile_in_use": False,
+            "pending_login_poll_active": True,
+            "pending_login_poll_remaining_sec": 321.2,
+            "pending_login_no_cdp_miss_count": 2,
+            "pending_login_no_cdp_max_misses": 6,
+            "collect_inflight": False,
+            "next_collect_in_sec": None,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "로그인 창 감지 대기 중 (2/6)")
+        self.assertEqual(view._next_collect_var.value, "최대 321초")
+
+    def test_refresh_runtime_status_shows_existing_chrome_cdp_state(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after-token"
+
+        class _FakeMonitor:
+            def get_last_snapshot(self):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_out",
+            "monitor_state": "idle",
+            "profile_in_use": False,
+            "system_chrome_cdp_available": True,
+            "pending_login_poll_active": False,
+            "collect_inflight": False,
+            "next_collect_in_sec": None,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "기존 Chrome 세션 감지됨")
+        self.assertEqual(view._next_collect_var.value, "-")
+
+    def test_refresh_runtime_status_shows_auth_attention_state(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after-token"
+
+        class _FakeMonitor:
+            def get_last_snapshot(self):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_in",
+            "monitor_state": "paused_auth_required",
+            "auth_attention_required": True,
+            "auth_attention_reason": "cloudflare_challenge",
+            "profile_in_use": False,
+            "pending_login_poll_active": False,
+            "collect_inflight": False,
+            "next_collect_in_sec": None,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "브라우저 인증 필요")
+        self.assertEqual(view._next_collect_var.value, "-")
+
+    def test_refresh_runtime_status_shows_cloudflare_pending_auth_state(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after-token"
+
+        class _FakeMonitor:
+            def get_last_snapshot(self):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_in",
+            "monitor_state": "paused_auth_required",
+            "auth_attention_required": True,
+            "auth_attention_reason": "cloudflare_challenge",
+            "profile_in_use": False,
+            "pending_login_poll_active": True,
+            "pending_login_poll_reason": "cloudflare_challenge",
+            "pending_login_poll_remaining_sec": 88.8,
+            "pending_login_no_cdp_miss_count": 0,
+            "pending_login_no_cdp_max_misses": 6,
+            "collect_inflight": False,
+            "next_collect_in_sec": None,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "인증 완료 대기 중")
+        self.assertEqual(view._next_collect_var.value, "최대 88초")
+
     def test_refresh_runtime_status_hides_countdown_while_collecting(self) -> None:
         class _Var:
             def __init__(self):
@@ -227,6 +649,45 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._refresh_runtime_status()
 
         self.assertEqual(view._collect_state_var.value, "조회 중 (manual_query)")
+        self.assertEqual(view._next_collect_var.value, "-")
+
+    def test_refresh_runtime_status_shows_manual_login_window_opening_state(self) -> None:
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+                return None
+
+        class _FakeWin:
+            def after(self, _delay, _fn):
+                return "after"
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._win = _FakeWin()
+        view._collect_state_var = _Var()
+        view._next_collect_var = _Var()
+        view._live_time_var = _Var()
+        view._live_five_hour_var = _Var()
+        view._live_weekly_var = _Var()
+        view._live_spark_five_hour_var = _Var()
+        view._live_spark_weekly_var = _Var()
+        view._live_credit_var = _Var()
+        view._refresh_action_buttons = lambda runtime: runtime
+        view._safe_get_runtime = lambda: {
+            "session_state": "logged_out",
+            "monitor_state": "running",
+            "profile_in_use": False,
+            "collect_inflight": True,
+            "collect_source": "manual_login",
+            "next_collect_in_sec": None,
+            "next_collect_estimated": False,
+        }
+
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._collect_state_var.value, "로그인 창 여는 중")
         self.assertEqual(view._next_collect_var.value, "-")
 
     def test_refresh_runtime_status_preserves_last_values_while_collecting(self) -> None:

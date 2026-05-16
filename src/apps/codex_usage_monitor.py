@@ -1374,8 +1374,26 @@ class CodexUsageMonitor:
         self.__next_collect_due_ts = 0.0
         self.__manual_query_waiting_result = False
         self.__manual_query_state_lock = threading.Lock()
+        self.__pending_login_after_id = None
+        self.__pending_login_poll_until_ts = 0.0
+        self.__pending_login_poll_interval_sec = 8.0
+        self.__pending_login_poll_window_sec = 900.0
+        self.__pending_login_poll_reason = ""
+        self.__pending_login_no_cdp_miss_count = 0
+        self.__pending_login_no_cdp_max_misses = 6
+        self.__cdp_status_cache_ttl_sec = 5.0
+        self.__cdp_status_cache: dict[str, int] = {"profile": 0, "system": 0}
+        self.__cdp_status_cache_lock = threading.Lock()
+        self.__cdp_status_refresh_inflight = False
+        try:
+            self.__cdp_status_cache_ts = float(self.__lib.time.monotonic())
+        except Exception:
+            self.__cdp_status_cache_ts = 0.0
         self.__monitor_state = "idle"
-        self.__session_state = "logged_in"
+        self.__session_state = "logged_out"
+        self.__auth_attention_required = False
+        self.__auth_attention_reason = ""
+        self.__auth_attention_source = ""
         self.__logout_in_progress = False
         self.__collect_cancel_event = threading.Event()
         self.__release_wait_timeout_sec = 8.0
@@ -1519,6 +1537,7 @@ class CodexUsageMonitor:
         self.__set_monitor_state("cancelling")
         self.__request_collect_cancel()
         self.__pause_background_monitor()
+        self.__cancel_pending_login_poll()
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
@@ -1566,12 +1585,13 @@ class CodexUsageMonitor:
             if not ok:
                 return False, message
             self.__last_snapshot = UsageSnapshot()
+            self.__set_session_state("logged_out")
+            self.__clear_auth_attention()
             self.__save_state()
             self.__playwright_checked = False
             self.__playwright_available = False
             self.__failure_count = 0
             self.__manual_query_waiting_result = False
-            self.__set_session_state("logged_out")
             self.__pause_background_monitor()
             return (
                 True,
@@ -1667,6 +1687,44 @@ class CodexUsageMonitor:
             raw = raw.lower()
         return raw.rstrip("\\/")
 
+    def __get_chrome_arg_value(self, cmdline: Any, name: str) -> str:
+        option = str(name or "").strip().lower()
+        if not option:
+            return ""
+        try:
+            tokens = list(cmdline or [])
+        except Exception:
+            tokens = []
+        for index, token in enumerate(tokens):
+            text = str(token or "").strip().strip("\"'")
+            lowered = text.lower()
+            if lowered == option:
+                try:
+                    return str(tokens[index + 1] or "").strip().strip("\"'")
+                except Exception:
+                    return ""
+            prefix = f"{option}="
+            if lowered.startswith(prefix):
+                return text[len(prefix) :].strip().strip("\"'")
+        return ""
+
+    def __get_chrome_remote_debugging_port(self, cmdline: Any) -> int:
+        raw = self.__get_chrome_arg_value(cmdline, "--remote-debugging-port")
+        try:
+            port = int(str(raw or "").strip())
+        except Exception:
+            port = 0
+        return int(port) if port > 0 else 0
+
+    def __is_chrome_cmdline_for_profile(self, cmdline: Any, profile_dir: str) -> bool:
+        target = self.__normalize_local_path(profile_dir)
+        if not target:
+            return False
+        user_data_dir = self.__normalize_local_path(
+            self.__get_chrome_arg_value(cmdline, "--user-data-dir")
+        )
+        return bool(user_data_dir and user_data_dir == target)
+
     def __force_playwright_mode(self) -> None:
         self.__collection_mode = "playwright"
         return
@@ -1683,6 +1741,18 @@ class CodexUsageMonitor:
         if normalized not in {"logged_in", "logged_out"}:
             normalized = "logged_out"
         self.__session_state = normalized
+        return
+
+    def __set_auth_attention(self, reason: str, source: str = "") -> None:
+        self.__auth_attention_required = True
+        self.__auth_attention_reason = normalize_usage_value(reason).lower() or "unknown"
+        self.__auth_attention_source = normalize_usage_value(source).lower()
+        return
+
+    def __clear_auth_attention(self) -> None:
+        self.__auth_attention_required = False
+        self.__auth_attention_reason = ""
+        self.__auth_attention_source = ""
         return
 
     def __is_logged_in_session(self) -> bool:
@@ -1703,9 +1773,7 @@ class CodexUsageMonitor:
             return False
 
     def __refresh_session_state_from_profile(self) -> None:
-        if self.__has_profile_session():
-            self.__set_session_state("logged_in")
-        else:
+        if not self.__has_profile_session():
             self.__set_session_state("logged_out")
         return
 
@@ -1713,6 +1781,7 @@ class CodexUsageMonitor:
         return bool(
             self.__enabled
             and self.__is_logged_in_session()
+            and not bool(self.__auth_attention_required)
             and not bool(self.__logout_in_progress)
         )
 
@@ -1802,6 +1871,105 @@ class CodexUsageMonitor:
     def get_last_snapshot(self) -> UsageSnapshot:
         return UsageSnapshot.from_dict(self.__last_snapshot.to_dict())
 
+    def __get_cdp_status_counts(
+        self,
+        now: float | None = None,
+    ) -> tuple[int, int]:
+        current = 0.0
+        try:
+            current = float(now if now is not None else self.__lib.time.monotonic())
+        except Exception:
+            current = 0.0
+        ttl = 5.0
+        try:
+            ttl = float(self.__cdp_status_cache_ttl_sec)
+        except Exception:
+            ttl = 5.0
+        if ttl < 0.0:
+            ttl = 0.0
+        try:
+            with self.__cdp_status_cache_lock:
+                cache_ts = float(self.__cdp_status_cache_ts or 0.0)
+                cache = (
+                    dict(self.__cdp_status_cache)
+                    if isinstance(self.__cdp_status_cache, dict)
+                    else {}
+                )
+            age = current - cache_ts
+        except Exception:
+            age = ttl + 1.0
+            cache = {}
+        if not cache:
+            cache = {"profile": 0, "system": 0}
+        if age >= ttl:
+            self.__request_cdp_status_counts_refresh()
+        try:
+            return max(0, int(cache.get("profile", 0))), max(0, int(cache.get("system", 0)))
+        except Exception:
+            return 0, 0
+
+    def __request_cdp_status_counts_refresh(self) -> None:
+        try:
+            with self.__cdp_status_cache_lock:
+                if bool(self.__cdp_status_refresh_inflight):
+                    return
+                self.__cdp_status_refresh_inflight = True
+        except Exception:
+            return
+
+        def worker() -> None:
+            try:
+                self.__refresh_cdp_status_counts_sync()
+            finally:
+                try:
+                    with self.__cdp_status_cache_lock:
+                        self.__cdp_status_refresh_inflight = False
+                except Exception:
+                    pass
+            return
+
+        try:
+            threading.Thread(
+                target=worker,
+                daemon=True,
+                name="codex-cdp-status-refresh",
+            ).start()
+        except Exception:
+            try:
+                with self.__cdp_status_cache_lock:
+                    self.__cdp_status_refresh_inflight = False
+            except Exception:
+                pass
+        return
+
+    def __refresh_cdp_status_counts_sync(
+        self,
+        now: float | None = None,
+    ) -> tuple[int, int]:
+        try:
+            profile_count = len(self.__iter_external_profile_remote_debugging_endpoints(include_owned=True))
+        except Exception:
+            profile_count = 0
+        try:
+            system_count = len(self.__iter_system_chrome_remote_debugging_endpoints())
+        except Exception:
+            system_count = 0
+        current = 0.0
+        try:
+            current = float(now if now is not None else self.__lib.time.monotonic())
+        except Exception:
+            current = 0.0
+        try:
+            with self.__cdp_status_cache_lock:
+                self.__cdp_status_cache = {
+                    "profile": max(0, int(profile_count)),
+                    "system": max(0, int(system_count)),
+                }
+                self.__cdp_status_cache_ts = current
+        except Exception:
+            pass
+        return max(0, int(profile_count)), max(0, int(system_count))
+
     def get_runtime_status(self) -> dict[str, Any]:
         self.__force_playwright_mode()
         now = 0.0
@@ -1809,6 +1977,36 @@ class CodexUsageMonitor:
             now = float(self.__lib.time.monotonic())
         except Exception:
             now = 0.0
+        pending_login_active = False
+        try:
+            pending_login_active = bool(
+                self.__pending_login_after_id is not None
+                or (
+                    float(self.__pending_login_poll_until_ts or 0.0) > 0.0
+                    and float(self.__pending_login_poll_until_ts or 0.0) > float(now)
+                )
+            )
+        except Exception:
+            pending_login_active = False
+        pending_login_remaining: float | None = None
+        if bool(pending_login_active):
+            try:
+                until_ts = float(self.__pending_login_poll_until_ts or 0.0)
+                if until_ts > 0.0:
+                    pending_login_remaining = until_ts - float(now)
+                    if pending_login_remaining < 0.0:
+                        pending_login_remaining = 0.0
+            except Exception:
+                pending_login_remaining = None
+        try:
+            pending_login_no_cdp_miss_count = int(self.__pending_login_no_cdp_miss_count)
+        except Exception:
+            pending_login_no_cdp_miss_count = 0
+        try:
+            pending_login_no_cdp_max_misses = int(self.__pending_login_no_cdp_max_misses)
+        except Exception:
+            pending_login_no_cdp_max_misses = 0
+        profile_cdp_count, system_chrome_cdp_count = self.__get_cdp_status_counts(now=now)
         remain: float | None = None
         estimated = False
         if (
@@ -1828,10 +2026,16 @@ class CodexUsageMonitor:
             monitor_state = "running"
         elif bool(self.__profile_in_use_detected):
             monitor_state = "paused_profile_in_use"
+        elif bool(self.__auth_attention_required):
+            monitor_state = "paused_auth_required"
         can_login = bool(
-            str(self.__session_state) == "logged_out"
+            (
+                str(self.__session_state) == "logged_out"
+                or bool(self.__auth_attention_required)
+            )
             and not bool(self.__logout_in_progress)
             and not bool(self.__collect_inflight)
+            and not bool(pending_login_active)
         )
         can_logout = bool(
             (str(self.__session_state) == "logged_in" or bool(self.__collect_inflight))
@@ -1850,8 +2054,20 @@ class CodexUsageMonitor:
             "api_failure_count": int(self.__api_failure_count),
             "session_state": str(self.__session_state or "logged_out"),
             "monitor_state": monitor_state,
+            "auth_attention_required": bool(self.__auth_attention_required),
+            "auth_attention_reason": str(self.__auth_attention_reason or ""),
+            "auth_attention_source": str(self.__auth_attention_source or ""),
             "logout_in_progress": bool(self.__logout_in_progress),
+            "pending_login_poll_active": bool(pending_login_active),
+            "pending_login_poll_reason": str(self.__pending_login_poll_reason or ""),
+            "pending_login_poll_remaining_sec": pending_login_remaining,
+            "pending_login_no_cdp_miss_count": max(0, pending_login_no_cdp_miss_count),
+            "pending_login_no_cdp_max_misses": max(0, pending_login_no_cdp_max_misses),
             "profile_in_use": bool(self.__profile_in_use_detected),
+            "profile_cdp_available": bool(profile_cdp_count > 0),
+            "profile_cdp_count": max(0, int(profile_cdp_count)),
+            "system_chrome_cdp_available": bool(system_chrome_cdp_count > 0),
+            "system_chrome_cdp_count": max(0, int(system_chrome_cdp_count)),
             "auto_monitoring_active": bool(self.__should_run_background_collection()),
             "can_login": can_login,
             "can_logout": can_logout,
@@ -1863,11 +2079,14 @@ class CodexUsageMonitor:
     def format_reset_at_for_display(self, value: str, key: str = "") -> str:
         return self.__format_reset_at_display(str(value or ""), key=key)
 
-    def show_current_status(self, force_refresh: bool = True) -> None:
+    def show_current_status(self, force_refresh: bool = True, source: str = "manual_query") -> None:
         root = self.__root
         if root is None:
             return
         worker_epoch = int(self.__worker_epoch)
+        source_key = normalize_usage_value(source).lower()
+        if source_key not in {"manual_query", "manual_login"}:
+            source_key = "manual_query"
 
         def worker() -> None:
             snapshot = None if bool(force_refresh) else self.get_last_snapshot()
@@ -1891,9 +2110,14 @@ class CodexUsageMonitor:
                     )
                     return
                 if bool(force_refresh):
+                    on_acquired = (
+                        self.__show_manual_login_started_tooltip
+                        if source_key == "manual_login"
+                        else self.__show_manual_collect_started_tooltip
+                    )
                     refreshed, error = self.__collect_snapshot_guarded(
-                        source="manual_query",
-                        on_acquired=self.__show_manual_collect_started_tooltip,
+                        source=source_key,
+                        on_acquired=on_acquired,
                     )
                     if error == "collect_busy":
                         if bool(self.__profile_in_use_detected):
@@ -1912,19 +2136,23 @@ class CodexUsageMonitor:
                                     )
                                 )
                             return
-                        self.__set_manual_query_pending_result()
-                        post_terminal(self.__show_busy_collect_tooltip)
+                        if source_key == "manual_login":
+                            post_terminal(self.__show_busy_login_tooltip)
+                        else:
+                            self.__set_manual_query_pending_result()
+                            post_terminal(self.__show_busy_collect_tooltip)
                         return
                     if error == "collect_cancelled":
                         post_terminal(lambda: self.__show_tooltip("조회가 취소되었습니다."))
                         return
                     self.__consume_manual_query_pending_result()
                     if error is not None and error != "profile_in_use":
-                        self.__handle_collect_error(error, source="manual_query")
+                        self.__handle_collect_error(error, source=source_key)
                     if refreshed is not None:
                         if not self.__is_worker_epoch_current(worker_epoch):
                             return
                         self.__set_session_state("logged_in")
+                        self.__clear_auth_attention()
                         merged = merge_snapshot_with_previous(
                             refreshed,
                             self.__last_snapshot if self.__last_snapshot.has_any_metric() else None,
@@ -1989,7 +2217,10 @@ class CodexUsageMonitor:
         merged = merge_snapshot_with_previous(snapshot, prev)
         if not merged.has_any_metric():
             return []
+        self.__cancel_pending_login_poll()
         self.__profile_in_use_detected = False
+        self.__set_session_state("logged_in")
+        self.__clear_auth_attention()
         changes = compute_usage_changes(prev, merged)
         self.__last_snapshot = merged
         self.__save_state()
@@ -1997,6 +2228,7 @@ class CodexUsageMonitor:
 
     def __restart_monitor(self) -> None:
         self.__pause_background_monitor()
+        self.__cancel_pending_login_poll()
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
@@ -2007,6 +2239,17 @@ class CodexUsageMonitor:
         else:
             self.__clear_hidden_cdp_process(terminate=True)
         if not self.__should_run_background_collection():
+            if not bool(self.__enabled):
+                reason = "disabled"
+            elif bool(self.__logout_in_progress):
+                reason = "logout_in_progress"
+            elif bool(self.__auth_attention_required):
+                reason = "auth_attention_required"
+            elif not self.__is_logged_in_session():
+                reason = "logged_out"
+            else:
+                reason = "not_ready"
+            self.__log(f"monitor restart skipped reason={reason}")
             return
         self.__start_startup_warmup()
         return
@@ -2028,7 +2271,7 @@ class CodexUsageMonitor:
         def worker() -> None:
             next_delay = float(self.__interval_sec)
             try:
-                self.__log("startup warmup begin mode=headful-hidden-first")
+                self.__log("startup warmup begin mode=no-focus-first")
                 self.__profile_in_use_detected = False
                 snapshot, error = self.__collect_snapshot_guarded(source="startup_warmup")
                 if not self.__is_worker_epoch_current(worker_epoch):
@@ -2160,6 +2403,178 @@ class CodexUsageMonitor:
         except Exception:
             self.__monitor_after_id = None
             self.__next_collect_due_ts = 0.0
+        return
+
+    def __cancel_pending_login_poll(self) -> None:
+        root = self.__root
+        after_id = self.__pending_login_after_id
+        self.__pending_login_after_id = None
+        self.__pending_login_poll_until_ts = 0.0
+        self.__pending_login_poll_reason = ""
+        self.__pending_login_no_cdp_miss_count = 0
+        if root is not None and after_id is not None:
+            try:
+                root.after_cancel(after_id)
+            except Exception:
+                pass
+        return
+
+    def __schedule_pending_login_poll(
+        self,
+        reason: str = "",
+        initial_delay_sec: float | None = None,
+        require_profile_cdp: bool = True,
+    ) -> None:
+        if bool(self.__logout_in_progress) or self.__is_collect_cancel_requested():
+            return
+        root = self.__root
+        if root is None:
+            return
+        profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
+        if bool(require_profile_cdp) and not bool(profile_cdp_available):
+            return
+        if bool(profile_cdp_available):
+            self.__pending_login_no_cdp_miss_count = 0
+        self.__pending_login_poll_reason = normalize_usage_value(reason) or "unknown"
+        now = 0.0
+        try:
+            now = float(self.__lib.time.monotonic())
+        except Exception:
+            now = 0.0
+        try:
+            until_ts = float(self.__pending_login_poll_until_ts or 0.0)
+        except Exception:
+            until_ts = 0.0
+        if until_ts <= now:
+            self.__pending_login_poll_until_ts = now + float(self.__pending_login_poll_window_sec)
+        if self.__pending_login_after_id is not None:
+            return
+        delay_sec = (
+            float(self.__pending_login_poll_interval_sec)
+            if initial_delay_sec is None
+            else float(initial_delay_sec)
+        )
+        if delay_sec < 1.0:
+            delay_sec = 1.0
+        delay_ms = int(delay_sec * 1000)
+        try:
+            self.__pending_login_after_id = root.after(delay_ms, self.__pending_login_poll_tick)
+            self.__log(
+                "pending login poll scheduled "
+                f"reason={normalize_usage_value(reason) or 'unknown'} delay={delay_sec:.1f}s"
+            )
+        except Exception:
+            self.__pending_login_after_id = None
+        return
+
+    def __pending_login_poll_tick(self) -> None:
+        self.__pending_login_after_id = None
+        if bool(self.__logout_in_progress) or self.__is_collect_cancel_requested():
+            self.__pending_login_poll_until_ts = 0.0
+            return
+        now = 0.0
+        try:
+            now = float(self.__lib.time.monotonic())
+        except Exception:
+            now = 0.0
+        try:
+            until_ts = float(self.__pending_login_poll_until_ts or 0.0)
+        except Exception:
+            until_ts = 0.0
+        if until_ts > 0.0 and now >= until_ts:
+            self.__pending_login_poll_until_ts = 0.0
+            self.__log("pending login poll stopped reason=timeout")
+            return
+        if not self.__has_profile_remote_debugging_endpoint():
+            try:
+                self.__pending_login_no_cdp_miss_count = int(
+                    self.__pending_login_no_cdp_miss_count
+                ) + 1
+            except Exception:
+                self.__pending_login_no_cdp_miss_count = 1
+            max_misses = int(self.__pending_login_no_cdp_max_misses)
+            if max_misses < 1:
+                max_misses = 1
+            if int(self.__pending_login_no_cdp_miss_count) <= max_misses:
+                self.__log(
+                    "pending login poll retry reason=no_profile_cdp "
+                    f"miss={int(self.__pending_login_no_cdp_miss_count)}"
+                )
+                self.__schedule_pending_login_poll(
+                    reason="no_profile_cdp",
+                    initial_delay_sec=min(float(self.__pending_login_poll_interval_sec), 5.0),
+                    require_profile_cdp=False,
+                )
+                return
+            self.__pending_login_poll_until_ts = 0.0
+            self.__pending_login_no_cdp_miss_count = 0
+            self.__log("pending login poll stopped reason=no_profile_cdp")
+            return
+        self.__pending_login_no_cdp_miss_count = 0
+        if bool(self.__collect_inflight):
+            self.__schedule_pending_login_poll(
+                reason="collect_busy",
+                initial_delay_sec=min(float(self.__pending_login_poll_interval_sec), 5.0),
+            )
+            return
+        worker_epoch = int(self.__worker_epoch)
+
+        def worker() -> None:
+            try:
+                snapshot, error = self.__collect_snapshot_guarded(source="pending_login_poll")
+                if not self.__is_worker_epoch_current(worker_epoch):
+                    self.__log("pending login poll stale result ignored")
+                    return
+                if error is None and snapshot is not None:
+                    self.__set_session_state("logged_in")
+                    self.__failure_count = 0
+                    changes = self.handle_snapshot(snapshot)
+                    latest_snapshot = self.get_last_snapshot()
+
+                    def on_success() -> None:
+                        self.__cancel_pending_login_poll()
+                        self.__resume_background_monitor_if_needed()
+                        if changes:
+                            self.__queue_change_tooltip_until_input(changes, latest_snapshot)
+                        else:
+                            self.__show_snapshot_tooltip(
+                                latest_snapshot,
+                                title="Codex 사용량 (로그인 완료)",
+                            )
+
+                    self.__ui_post(on_success)
+                    self.__log("pending login poll end ok")
+                    return
+                if error == "collect_cancelled":
+                    self.__log("pending login poll cancelled")
+                    return
+                self.__log(f"pending login poll retry error={error or 'empty_snapshot'}")
+                self.__ui_post(
+                    lambda err=error: self.__schedule_pending_login_poll(
+                        reason=str(err or "empty_snapshot"),
+                        initial_delay_sec=float(self.__pending_login_poll_interval_sec),
+                    )
+                )
+            except Exception as exc:
+                if not self.__is_worker_epoch_current(worker_epoch):
+                    return
+                self.__log_exception("pending login poll failed", exc)
+                self.__ui_post(
+                    lambda: self.__schedule_pending_login_poll(
+                        reason="poll_failed",
+                        initial_delay_sec=float(self.__pending_login_poll_interval_sec),
+                    )
+                )
+            return
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as exc:
+            self.__log_exception("pending login poll thread start failed", exc)
+            self.__schedule_pending_login_poll(
+                reason="thread_start_failed",
+                initial_delay_sec=float(self.__pending_login_poll_interval_sec),
+            )
         return
 
     def __monitor_tick(self) -> None:
@@ -2310,6 +2725,9 @@ class CodexUsageMonitor:
         except Exception:
             return False
 
+    def __is_manual_collect_source(self, source: str) -> bool:
+        return normalize_usage_value(source).lower() in {"manual_query", "manual_login"}
+
     def __collect_snapshot_guarded(
         self,
         source: str,
@@ -2326,7 +2744,7 @@ class CodexUsageMonitor:
             self.__collect_inflight = True
             self.__collect_inflight_source = str(source or "")
             self.__set_monitor_state("running")
-            if source_key == "manual_query":
+            if self.__is_manual_collect_source(source_key):
                 self.__ui_post_coalesced(
                     self.__pause_monitor_countdown_for_manual_query,
                     on_acquired if callable(on_acquired) else None,
@@ -2336,7 +2754,7 @@ class CodexUsageMonitor:
             except Exception:
                 self.__collect_started_ts = 0.0
             self.__log(f"collect start source={source}")
-            if source_key != "manual_query" and callable(on_acquired):
+            if not self.__is_manual_collect_source(source_key) and callable(on_acquired):
                 try:
                     on_acquired()
                 except Exception:
@@ -2352,7 +2770,7 @@ class CodexUsageMonitor:
             self.__collect_started_ts = 0.0
             if not bool(self.__logout_in_progress):
                 self.__set_monitor_state("idle")
-            if source_key == "manual_query" and not callable(on_acquired):
+            if self.__is_manual_collect_source(source_key) and not callable(on_acquired):
                 self.__ui_post(self.__reset_monitor_countdown_after_manual_query)
             if bool(self.__pending_hidden_cdp_clear):
                 self.__pending_hidden_cdp_clear = False
@@ -2607,6 +3025,22 @@ class CodexUsageMonitor:
         self.__show_tooltip("Codex 사용량 조회 중...", duration_ms=0)
         return
 
+    def __show_manual_login_started_tooltip(self) -> None:
+        latest = self.get_last_snapshot()
+        if latest is not None and latest.has_any_metric():
+            self.__show_snapshot_tooltip(
+                latest,
+                title="Codex 최근 사용량 (로그인 창 여는 중...)",
+                duration_ms=0,
+                footer="로그인 완료 후 자동으로 수집합니다.",
+            )
+            return
+        self.__show_tooltip(
+            "Codex 로그인 창을 여는 중... 로그인 완료 후 자동으로 수집합니다.",
+            duration_ms=0,
+        )
+        return
+
     def __show_busy_collect_tooltip(self) -> None:
         latest = self.get_last_snapshot()
         if latest is not None and latest.has_any_metric():
@@ -2619,6 +3053,22 @@ class CodexUsageMonitor:
             return
         self.__show_tooltip(
             "이미 Codex 사용량 조회가 진행 중입니다. 완료되면 결과를 자동으로 표시합니다.",
+            duration_ms=0,
+        )
+        return
+
+    def __show_busy_login_tooltip(self) -> None:
+        latest = self.get_last_snapshot()
+        if latest is not None and latest.has_any_metric():
+            self.__show_snapshot_tooltip(
+                latest,
+                title="Codex 최근 사용량 (로그인 요청 대기 중)",
+                duration_ms=0,
+                footer="현재 작업이 끝나면 로그인 창을 다시 열 수 있습니다.",
+            )
+            return
+        self.__show_tooltip(
+            "현재 Codex 작업이 진행 중입니다. 완료 후 로그인 창을 다시 열어 주세요.",
             duration_ms=0,
         )
         return
@@ -2940,12 +3390,20 @@ class CodexUsageMonitor:
             return
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
-        is_manual_query = normalized_source == "manual_query"
+        is_manual_query = self.__is_manual_collect_source(normalized_source)
 
-        if msg in {"login_required", "cloudflare_challenge"}:
-            if msg == "login_required":
-                self.__set_session_state("logged_out")
-                self.__pause_background_monitor()
+        if msg == "login_required":
+            self.__set_session_state("logged_out")
+            self.__clear_auth_attention()
+            self.__pause_background_monitor()
+            self.__save_state()
+            profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
+            if bool(profile_cdp_available) or bool(is_manual_query):
+                self.__schedule_pending_login_poll(
+                    reason=msg,
+                    initial_delay_sec=5.0 if bool(is_manual_query) else 10.0,
+                    require_profile_cdp=not bool(is_manual_query),
+                )
             now = 0.0
             try:
                 now = float(self.__lib.time.monotonic())
@@ -2953,28 +3411,49 @@ class CodexUsageMonitor:
                 now = 0.0
             if (now - float(self.__last_login_notice_ts)) >= float(self.__login_notice_cooldown_sec):
                 self.__last_login_notice_ts = now
-                if msg == "cloudflare_challenge":
-                    if is_manual_query:
-                        message = (
-                            "Cloudflare 인증이 필요합니다. 인증 창이 자동으로 열리지 않으면 "
-                            "잠시 후 Ctrl+Alt+C로 다시 조회해 주세요."
-                        )
-                    else:
-                        message = (
-                            "Cloudflare 인증이 필요합니다. Ctrl+Alt+C로 수동 조회를 실행하면 "
-                            "인증 창을 열어 확인할 수 있습니다."
-                        )
+                if is_manual_query:
+                    message = (
+                        "Codex 로그인이 필요합니다. 로그인 창이 자동으로 열리지 않으면 "
+                        "잠시 후 Ctrl+Alt+C로 다시 조회해 주세요."
+                    )
                 else:
-                    if is_manual_query:
-                        message = (
-                            "Codex 로그인이 필요합니다. 로그인 창이 자동으로 열리지 않으면 "
-                            "잠시 후 Ctrl+Alt+C로 다시 조회해 주세요."
-                        )
-                    else:
-                        message = (
-                            "Codex 로그인이 필요합니다. Ctrl+Alt+C로 수동 조회를 실행하면 "
-                            "로그인 창을 열 수 있습니다."
-                        )
+                    message = (
+                        "Codex 로그인이 필요합니다. Ctrl+Alt+C로 수동 조회를 실행하면 "
+                        "로그인 창을 열 수 있습니다."
+                    )
+                self.__ui_post(
+                    lambda: self.__show_tooltip(
+                        message,
+                    )
+                )
+        elif msg == "cloudflare_challenge":
+            self.__set_auth_attention(msg, source=normalized_source)
+            self.__pause_background_monitor()
+            self.__save_state()
+            profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
+            if bool(profile_cdp_available) or bool(is_manual_query):
+                self.__schedule_pending_login_poll(
+                    reason=msg,
+                    initial_delay_sec=5.0 if bool(is_manual_query) else 10.0,
+                    require_profile_cdp=not bool(is_manual_query),
+                )
+            now = 0.0
+            try:
+                now = float(self.__lib.time.monotonic())
+            except Exception:
+                now = 0.0
+            if (now - float(self.__last_login_notice_ts)) >= float(self.__login_notice_cooldown_sec):
+                self.__last_login_notice_ts = now
+                if is_manual_query:
+                    message = (
+                        "Cloudflare 인증이 필요합니다. 인증 창이 자동으로 열리지 않으면 "
+                        "잠시 후 Ctrl+Alt+C로 다시 조회해 주세요."
+                    )
+                else:
+                    message = (
+                        "Cloudflare 인증이 필요합니다. Ctrl+Alt+C로 수동 조회를 실행하면 "
+                        "인증 창을 열어 확인할 수 있습니다."
+                    )
                 self.__ui_post(
                     lambda: self.__show_tooltip(
                         message,
@@ -3018,6 +3497,14 @@ class CodexUsageMonitor:
     def __collect_snapshot(self, source: str = "") -> tuple[UsageSnapshot | None, str | None]:
         if self.__is_collect_cancel_requested():
             return None, "collect_cancelled"
+        source_key = normalize_usage_value(source).lower()
+        if source_key != "manual_login":
+            raw_wait_timeout_sec = 4.0 if source_key == "pending_login_poll" else None
+            raw_snapshot, raw_error, raw_handled = self.__try_no_focus_raw_preflight(
+                wait_timeout_sec=raw_wait_timeout_sec,
+            )
+            if bool(raw_handled):
+                return raw_snapshot, raw_error
         self.__force_playwright_mode()
         self.__configure_playwright_env()
         if not self.__ensure_playwright_available():
@@ -3055,7 +3542,33 @@ class CodexUsageMonitor:
     ) -> tuple[UsageSnapshot | None, str | None]:
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = normalized_source == "manual_query"
-        self.__log("collect strategy=headful-hidden-first step=hidden")
+        is_manual_login = normalized_source == "manual_login"
+        if is_manual_login:
+            if self.__is_collect_cancel_requested():
+                return None, "collect_cancelled"
+            if not self.__should_open_interactive_recovery(source=source):
+                self.__log(
+                    "collect strategy=interactive-login-first "
+                    f"interactive=skip source={normalized_source}"
+                )
+                return None, "login_required"
+            self.__log("collect strategy=interactive-login-first interactive=open")
+            self.__prepare_interactive_recovery_launch(
+                source=normalized_source,
+                reason="login_required",
+            )
+            return self.__collect_snapshot_once(
+                playwright_obj,
+                headless=False,
+                allow_interactive_recovery=True,
+                force_hidden=False,
+                prefer_system_channel=True,
+                initial_url=str(self.__login_entry_url),
+            )
+        raw_snapshot, raw_error, raw_handled = self.__try_no_focus_raw_preflight()
+        if bool(raw_handled):
+            return raw_snapshot, raw_error
+        self.__log("collect strategy=no-focus-first step=hidden_cdp")
         snapshot, error = self.__collect_snapshot_once(
             playwright_obj,
             headless=False,
@@ -3066,41 +3579,31 @@ class CodexUsageMonitor:
         if error in {"profile_in_use", "collect_failed", "parse_failed", "cloudflare_challenge"}:
             raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp()
             if raw_snapshot is not None:
-                self.__log("collect strategy=headful-hidden-first recovered=raw_cdp_external")
+                self.__log("collect strategy=no-focus-first recovered=raw_cdp_profile_after_hidden_cdp")
                 return raw_snapshot, None
+            raw_system_snapshot = self.__try_collect_snapshot_via_raw_system_chrome_cdp()
+            if raw_system_snapshot is not None:
+                self.__log("collect strategy=no-focus-first recovered=raw_cdp_system_after_hidden_cdp")
+                return raw_system_snapshot, None
         if error == "collect_cancelled":
             return None, "collect_cancelled"
-        if is_manual_query and error in {"login_required", "cloudflare_challenge"}:
+        if is_manual_query and error == "cloudflare_challenge":
             self.__log(
-                f"collect strategy=headful-hidden-first pre-interactive-retry reason={error} "
+                f"collect strategy=no-focus-first interactive-needed reason={error} "
                 f"source={normalized_source}"
             )
-            retry_snapshot, retry_error = self.__collect_snapshot_once(
-                playwright_obj,
-                headless=False,
-                allow_interactive_recovery=False,
-                force_hidden=True,
-                prefer_system_channel=True,
-            )
-            if retry_error is None and retry_snapshot is not None:
-                return retry_snapshot, None
-            if retry_error is not None:
-                if str(retry_error) == "collect_cancelled":
-                    return None, "collect_cancelled"
-                error = str(retry_error)
-                snapshot = retry_snapshot
         if error not in {"login_required", "cloudflare_challenge"}:
             return snapshot, error
         if self.__is_collect_cancel_requested():
             return None, "collect_cancelled"
         if not self.__should_open_interactive_recovery(source=source):
             self.__log(
-                f"collect strategy=headful-hidden-first interactive=skip reason={error} "
+                f"collect strategy=no-focus-first interactive=skip reason={error} "
                 f"source={normalize_usage_value(source)}"
             )
             return None, error
         self.__log(
-            f"collect strategy=headful-hidden-first interactive=open reason={error} "
+            f"collect strategy=no-focus-first interactive=open reason={error} "
             f"source={normalize_usage_value(source)}"
         )
         self.__prepare_interactive_recovery_launch(
@@ -3124,10 +3627,16 @@ class CodexUsageMonitor:
     def __should_open_interactive_recovery(self, source: str = "") -> bool:
         normalized_source = normalize_usage_value(source).lower()
         # Background collectors should never open visible auth windows.
-        if normalized_source != "manual_query":
+        if normalized_source not in {"manual_query", "manual_login"}:
             return False
         if bool(self.__logout_in_progress) or self.__is_collect_cancel_requested():
             return False
+        if normalized_source == "manual_login":
+            try:
+                self.__last_interactive_login_ts = float(self.__lib.time.monotonic())
+            except Exception:
+                pass
+            return True
         now = 0.0
         try:
             now = float(self.__lib.time.monotonic())
@@ -3278,6 +3787,10 @@ class CodexUsageMonitor:
                     if not ok_cf:
                         if self.__is_collect_cancel_requested():
                             return None, "collect_cancelled"
+                        keep_cdp_process = self.__keep_interactive_cdp_process_open(
+                            cdp_proc,
+                            reason="cloudflare_challenge",
+                        )
                         return None, "cloudflare_challenge"
 
             if self.__is_login_required(page):
@@ -3289,6 +3802,10 @@ class CodexUsageMonitor:
                     if self.__is_collect_cancel_requested():
                         return None, "collect_cancelled"
                     self.__set_session_state("logged_out")
+                    keep_cdp_process = self.__keep_interactive_cdp_process_open(
+                        cdp_proc,
+                        reason="login_required",
+                    )
                     return None, "login_required"
             if needs_usage_navigation:
                 try:
@@ -3306,6 +3823,8 @@ class CodexUsageMonitor:
             snapshot = self.__build_snapshot_from_page(page)
             if snapshot is not None:
                 self.__set_session_state("logged_in")
+                if bool(allow_interactive_recovery) and cdp_proc is not None:
+                    self.__log_interactive_cdp_close_after_success(cdp_proc)
                 return snapshot, None
             if bool(effective_headless):
                 return self.__wait_for_snapshot_ready(
@@ -3317,6 +3836,13 @@ class CodexUsageMonitor:
                     page,
                     timeout_sec=self.__login_timeout_sec,
                 )
+                if waited_error is None and waited_snapshot is not None and cdp_proc is not None:
+                    self.__log_interactive_cdp_close_after_success(cdp_proc)
+                elif waited_error in {"login_required", "parse_failed", "cloudflare_challenge"}:
+                    keep_cdp_process = self.__keep_interactive_cdp_process_open(
+                        cdp_proc,
+                        reason=str(waited_error or "pending"),
+                    )
                 return waited_snapshot, waited_error
             if not bool(effective_headless):
                 return self.__wait_for_snapshot_ready(
@@ -3348,7 +3874,7 @@ class CodexUsageMonitor:
                     context.close()
                 except Exception:
                     pass
-            if cdp_browser is not None:
+            if cdp_browser is not None and not bool(keep_cdp_process):
                 try:
                     cdp_browser.close()
                 except Exception:
@@ -3554,6 +4080,7 @@ class CodexUsageMonitor:
                 if bool(start_hidden):
                     cmd.extend(
                         [
+                            "--start-minimized",
                             "--window-size=1280,720",
                             "--disable-extensions",
                             "--disable-notifications",
@@ -3787,6 +4314,43 @@ class CodexUsageMonitor:
             self.__terminate_spawned_process(proc, cleanup_orphans=True)
         return
 
+    def __log_interactive_cdp_close_after_success(self, proc) -> None:
+        if proc is None:
+            return
+        port = 0
+        try:
+            port = int(getattr(proc, "_ws_cdp_port", 0) or 0)
+        except Exception:
+            port = 0
+        if port > 0:
+            self.__log(f"interactive cdp closing after successful snapshot port={int(port)}")
+            return
+        self.__log("interactive cdp closing after successful snapshot")
+        return
+
+    def __keep_interactive_cdp_process_open(self, proc, reason: str = "") -> bool:
+        if proc is None or self.__is_external_cdp_handle(proc):
+            return False
+        port = 0
+        try:
+            port = int(getattr(proc, "_ws_cdp_port", 0) or 0)
+        except Exception:
+            port = 0
+        if port <= 0:
+            return False
+        try:
+            setattr(proc, "_ws_monitor_managed", True)
+        except Exception:
+            pass
+        self.__pending_hidden_cdp_clear = False
+        self.__last_successful_cdp_port = int(port)
+        normalized_reason = normalize_usage_value(reason) or "pending"
+        self.__log(
+            "interactive cdp kept open for login completion "
+            f"reason={normalized_reason} port={int(port)}"
+        )
+        return True
+
     def __is_external_cdp_handle(self, proc) -> bool:
         if proc is None:
             return False
@@ -3817,8 +4381,11 @@ class CodexUsageMonitor:
         setattr(handle, "_ws_monitor_managed", bool(monitor_managed))
         return handle
 
-    def __iter_external_profile_remote_debugging_endpoints(self) -> list[tuple[int, int, bool]]:
-        target_profile = str(self.__profile_dir or "").strip().lower()
+    def __iter_external_profile_remote_debugging_endpoints(
+        self,
+        include_owned: bool = False,
+    ) -> list[tuple[int, int, bool]]:
+        target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
         if not target_profile:
             return []
         owned_pids: set[int] = set()
@@ -3850,7 +4417,7 @@ class CodexUsageMonitor:
             try:
                 info = item.info if hasattr(item, "info") else {}
                 pid = int((info or {}).get("pid") or 0)
-                if pid > 0 and pid in owned_pids:
+                if (not bool(include_owned)) and pid > 0 and pid in owned_pids:
                     continue
                 name = str((info or {}).get("name") or "").lower()
                 if "chrome" not in name:
@@ -3859,24 +4426,11 @@ class CodexUsageMonitor:
                 cmd_text = " ".join(str(x) for x in cmdline).lower()
                 if not cmd_text:
                     continue
-                if f"--user-data-dir={target_profile}" not in cmd_text:
+                if not self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
                     continue
                 if "--type=" in cmd_text:
                     continue
-                port = 0
-                for token in cmdline:
-                    text = str(token or "").strip().lower()
-                    prefix = "--remote-debugging-port="
-                    if not text.startswith(prefix):
-                        continue
-                    raw_port = str(text[len(prefix) :]).strip()
-                    try:
-                        parsed = int(raw_port)
-                    except Exception:
-                        parsed = 0
-                    if parsed > 0:
-                        port = int(parsed)
-                        break
+                port = self.__get_chrome_remote_debugging_port(cmdline)
                 if port <= 0:
                     continue
                 managed_tokens = (
@@ -3969,14 +4523,112 @@ class CodexUsageMonitor:
             self.__log_exception("hidden cdp attach existing failed", last_error)
         return None, None, None, False
 
-    def __try_collect_snapshot_via_raw_external_cdp(self) -> UsageSnapshot | None:
-        for port, _pid, _managed in self.__iter_external_profile_remote_debugging_endpoints():
-            snapshot = self.__collect_snapshot_via_raw_cdp_port(int(port))
+    def __try_collect_snapshot_via_raw_external_cdp(
+        self,
+        wait_timeout_sec: float | None = None,
+    ) -> UsageSnapshot | None:
+        for port, _pid, _managed in self.__iter_external_profile_remote_debugging_endpoints(
+            include_owned=True,
+        ):
+            snapshot = self.__collect_snapshot_via_raw_cdp_port(
+                int(port),
+                wait_timeout_sec=wait_timeout_sec,
+            )
             if snapshot is not None:
                 return snapshot
         return None
 
-    def __collect_snapshot_via_raw_cdp_port(self, port: int) -> UsageSnapshot | None:
+    def __try_no_focus_raw_preflight(
+        self,
+        wait_timeout_sec: float | None = None,
+    ) -> tuple[UsageSnapshot | None, str | None, bool]:
+        profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
+        raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp(
+            wait_timeout_sec=wait_timeout_sec,
+        )
+        if raw_snapshot is not None:
+            self.__log("collect strategy=no-focus-first recovered=raw_cdp_profile")
+            return raw_snapshot, None, True
+        raw_system_snapshot = self.__try_collect_snapshot_via_raw_system_chrome_cdp(
+            wait_timeout_sec=wait_timeout_sec,
+        )
+        if raw_system_snapshot is not None:
+            self.__log("collect strategy=no-focus-first recovered=raw_cdp_system_chrome")
+            return raw_system_snapshot, None, True
+        if bool(profile_cdp_available):
+            self.__log("collect strategy=no-focus-first skip=headless reason=profile_cdp_active")
+            return None, "login_required", True
+        return None, None, False
+
+    def __has_profile_remote_debugging_endpoint(self) -> bool:
+        try:
+            return bool(
+                self.__iter_external_profile_remote_debugging_endpoints(
+                    include_owned=True,
+                )
+            )
+        except Exception:
+            return False
+
+    def __try_collect_snapshot_via_raw_system_chrome_cdp(
+        self,
+        wait_timeout_sec: float | None = None,
+    ) -> UsageSnapshot | None:
+        for port, _pid in self.__iter_system_chrome_remote_debugging_endpoints():
+            snapshot = self.__collect_snapshot_via_raw_cdp_port(
+                int(port),
+                wait_timeout_sec=wait_timeout_sec,
+            )
+            if snapshot is not None:
+                return snapshot
+        return None
+
+    def __iter_system_chrome_remote_debugging_endpoints(self) -> list[tuple[int, int]]:
+        target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
+        try:
+            proc_iter = self.__lib.psutil.process_iter(attrs=["pid", "name", "cmdline"])
+        except Exception:
+            return []
+
+        items: list[tuple[int, int]] = []
+        for item in proc_iter:
+            try:
+                info = item.info if hasattr(item, "info") else {}
+                name = str((info or {}).get("name") or "").lower()
+                if "chrome" not in name:
+                    continue
+                cmdline = (info or {}).get("cmdline") or []
+                cmd_text = " ".join(str(x) for x in cmdline).lower()
+                if not cmd_text:
+                    continue
+                if "--type=" in cmd_text:
+                    continue
+                if "--remote-debugging-pipe" in cmd_text:
+                    continue
+                if self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
+                    continue
+                port = self.__get_chrome_remote_debugging_port(cmdline)
+                if port <= 0:
+                    continue
+                pid = int((info or {}).get("pid") or 0)
+                items.append((int(port), int(pid if pid > 0 else 0)))
+            except Exception:
+                continue
+
+        dedup: list[tuple[int, int]] = []
+        seen_ports: set[int] = set()
+        for port, pid in items:
+            if port in seen_ports:
+                continue
+            seen_ports.add(port)
+            dedup.append((int(port), int(pid)))
+        return dedup
+
+    def __collect_snapshot_via_raw_cdp_port(
+        self,
+        port: int,
+        wait_timeout_sec: float | None = None,
+    ) -> UsageSnapshot | None:
         try:
             target_port = int(port)
         except Exception:
@@ -4018,9 +4670,13 @@ class CodexUsageMonitor:
             )
             deadline = 0.0
             try:
-                deadline = float(self.__lib.time.monotonic()) + float(
-                    self.__headless_wait_timeout_sec
-                )
+                if wait_timeout_sec is None:
+                    wait_timeout = float(self.__headless_wait_timeout_sec)
+                else:
+                    wait_timeout = float(wait_timeout_sec)
+                if wait_timeout < 1.0:
+                    wait_timeout = 1.0
+                deadline = float(self.__lib.time.monotonic()) + wait_timeout
             except Exception:
                 deadline = 0.0
             while True:
@@ -4340,7 +4996,10 @@ class CodexUsageMonitor:
                 for hwnd in handles:
                     try:
                         if bool(visible):
-                            self.__lib.win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+                            if bool(bring_to_front):
+                                self.__lib.win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+                            else:
+                                self.__lib.win32gui.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
                             if bool(bring_to_front):
                                 try:
                                     self.__lib.win32gui.SetForegroundWindow(hwnd)
@@ -4399,7 +5058,7 @@ class CodexUsageMonitor:
         return handles
 
     def __list_profile_chrome_pids(self) -> list[int]:
-        target_profile = str(self.__profile_dir or "").strip().lower()
+        target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
         if not target_profile:
             return []
         pids: list[int] = []
@@ -4417,7 +5076,7 @@ class CodexUsageMonitor:
                 cmd_text = " ".join(str(x) for x in cmdline).lower()
                 if not cmd_text:
                     continue
-                if f"--user-data-dir={target_profile}" not in cmd_text:
+                if not self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
                     continue
                 pid = int((info or {}).get("pid") or 0)
                 if pid > 0:
@@ -4436,7 +5095,7 @@ class CodexUsageMonitor:
     def __is_profile_locked_without_remote_debugging(self) -> bool:
         if self.__root is None:
             return False
-        target_profile = str(self.__profile_dir or "").strip().lower()
+        target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
         if not target_profile:
             return False
         owned_pids: set[int] = set()
@@ -4474,7 +5133,7 @@ class CodexUsageMonitor:
                 cmd_text = " ".join(str(x) for x in cmdline).lower()
                 if not cmd_text:
                     continue
-                if f"--user-data-dir={target_profile}" not in cmd_text:
+                if not self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
                     continue
                 if "--type=" in cmd_text:
                     # Renderer/GPU helper processes inherit user-data-dir
@@ -4488,7 +5147,7 @@ class CodexUsageMonitor:
         return False
 
     def __find_profile_remote_debugging_pid(self, port: int) -> int:
-        target_profile = str(self.__profile_dir or "").strip().lower()
+        target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
         if not target_profile:
             return 0
         try:
@@ -4498,8 +5157,6 @@ class CodexUsageMonitor:
         if target_port <= 0:
             return 0
 
-        port_token = f"--remote-debugging-port={target_port}"
-        profile_token = f"--user-data-dir={target_profile}"
         try:
             proc_iter = self.__lib.psutil.process_iter(attrs=["pid", "name", "cmdline"])
         except Exception:
@@ -4514,9 +5171,9 @@ class CodexUsageMonitor:
                 cmd_text = " ".join(str(x) for x in cmdline).lower()
                 if not cmd_text:
                     continue
-                if port_token not in cmd_text:
+                if self.__get_chrome_remote_debugging_port(cmdline) != int(target_port):
                     continue
-                if profile_token not in cmd_text:
+                if not self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
                     continue
                 pid = int((info or {}).get("pid") or 0)
                 if pid > 0:
@@ -4635,7 +5292,7 @@ class CodexUsageMonitor:
         return
 
     def __terminate_profile_remote_debugging_processes(self) -> None:
-        target_profile = str(self.__profile_dir or "").strip().lower()
+        target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
         if not target_profile:
             return
 
@@ -4655,9 +5312,9 @@ class CodexUsageMonitor:
                 cmd_text = " ".join(str(x) for x in cmdline).lower()
                 if not cmd_text:
                     continue
-                if f"--user-data-dir={target_profile}" not in cmd_text:
+                if not self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
                     continue
-                if "--remote-debugging-port=" not in cmd_text:
+                if self.__get_chrome_remote_debugging_port(cmdline) <= 0:
                     continue
                 to_kill.append(item)
             except Exception:
@@ -4816,8 +5473,7 @@ class CodexUsageMonitor:
         except Exception:
             deadline = 0.0
         attempted_open = False
-        stagnant_count = 0
-        last_url = ""
+        next_login_entry_attempt_ts = 0.0
         while True:
             if self.__is_collect_cancel_requested():
                 return False
@@ -4835,24 +5491,6 @@ class CodexUsageMonitor:
                 self.__set_session_state("logged_in")
                 return True
 
-            did_open = self.__try_open_login_entry(
-                page,
-                force=(not attempted_open or stagnant_count >= 2),
-            )
-            if did_open:
-                attempted_open = True
-
-            current_url = ""
-            try:
-                current_url = str(page.url or "")
-            except Exception:
-                current_url = ""
-            if current_url and current_url == last_url:
-                stagnant_count += 1
-            else:
-                stagnant_count = 0
-                last_url = current_url
-
             now = 0.0
             try:
                 now = float(self.__lib.time.monotonic())
@@ -4861,6 +5499,16 @@ class CodexUsageMonitor:
             if now > deadline:
                 self.__set_session_state("logged_out")
                 return False
+            if now >= float(next_login_entry_attempt_ts):
+                did_open = self.__try_open_login_entry(
+                    page,
+                    force=(not bool(attempted_open)),
+                )
+                if did_open:
+                    attempted_open = True
+                    next_login_entry_attempt_ts = now + 45.0
+                else:
+                    next_login_entry_attempt_ts = now + 15.0
             try:
                 page.wait_for_timeout(1000)
             except Exception:
@@ -5272,13 +5920,24 @@ class CodexUsageMonitor:
         data = self.__read_json_file(self.__state_path)
         if not isinstance(data, dict):
             self.__last_snapshot = UsageSnapshot()
+            self.__set_session_state("logged_out")
             return
         snap = UsageSnapshot.from_dict(data.get("last_snapshot"))
         self.__last_snapshot = snap
+        raw_state = data.get("session_state", "")
+        state = normalize_usage_value(raw_state)
+        dirty = False
+        if state not in {"logged_in", "logged_out"}:
+            state = "logged_out"
+            dirty = True
+        self.__set_session_state(state)
+        if bool(dirty):
+            self.__save_state()
         return
 
     def __save_state(self) -> None:
         payload = {
+            "session_state": str(self.__session_state or "logged_out"),
             "last_snapshot": self.__last_snapshot.to_dict(),
         }
         self.__write_json_file(self.__state_path, payload)

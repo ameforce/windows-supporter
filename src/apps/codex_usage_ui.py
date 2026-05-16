@@ -80,10 +80,10 @@ class CodexUsageSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
-        header_card.pack(fill="x", padx=12, pady=(12, 8))
+        header_card.pack(fill="x", padx=8, pady=(8, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
-        header_inner.pack(fill="x", padx=14, pady=12)
+        header_inner.pack(fill="x", padx=12, pady=8)
 
         title_row = tk.Frame(header_inner, bg=card_bg)
         title_row.pack(fill="x")
@@ -93,7 +93,7 @@ class CodexUsageSettingsView:
             text="Codex Usage Monitoring 설정",
             bg=card_bg,
             fg="#111827",
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 13, "bold"),
         ).pack(side="left")
 
         btn_row = tk.Frame(title_row, bg=card_bg)
@@ -117,7 +117,7 @@ class CodexUsageSettingsView:
             bg=card_bg,
             fg=text_muted,
             font=("Segoe UI", 9),
-        ).pack(anchor="w", pady=(6, 0))
+        ).pack(anchor="w", pady=(4, 0))
 
         self._status_label = tk.Label(
             header_inner,
@@ -126,7 +126,7 @@ class CodexUsageSettingsView:
             fg=text_muted,
             font=("Segoe UI", 9),
         )
-        self._status_label.pack(anchor="w", pady=(6, 0))
+        self._status_label.pack(anchor="w", pady=(3, 0))
 
         content_card = tk.Frame(
             container,
@@ -134,11 +134,12 @@ class CodexUsageSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
-        content_card.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        content_card.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         body = tk.Frame(content_card, bg=card_bg)
-        body.pack(fill="both", expand=True, padx=14, pady=12)
+        body.pack(fill="both", expand=True, padx=12, pady=8)
         body.columnconfigure(1, weight=1)
+        body.columnconfigure(3, weight=1)
 
         self._enabled_var = tk.BooleanVar(value=False)
         self._interval_var = tk.StringVar(value="")
@@ -167,12 +168,12 @@ class CodexUsageSettingsView:
                 bg=card_bg,
                 fg="#111827",
                 font=("Segoe UI", 9),
-            ).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=6)
+            ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
 
         def add_entry(var, width: int = 50):
             nonlocal row
             entry = ttk.Entry(body, textvariable=var, width=width)
-            entry.grid(row=row, column=1, sticky="we", pady=6)
+            entry.grid(row=row, column=1, columnspan=3, sticky="we", pady=3)
             return entry
 
         add_label("모니터링 활성화")
@@ -185,7 +186,7 @@ class CodexUsageSettingsView:
             fg="#111827",
             activeforeground="#111827",
             font=("Segoe UI", 9),
-        ).grid(row=row, column=1, sticky="w", pady=6)
+        ).grid(row=row, column=1, columnspan=3, sticky="w", pady=3)
         row += 1
 
         add_label("모니터링 주기(초)")
@@ -213,7 +214,7 @@ class CodexUsageSettingsView:
             font=("Segoe UI", 9),
             cursor="hand2" if settings_path else "",
         )
-        settings_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        settings_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(5, 0))
         if settings_path:
             try:
                 settings_label.bind("<Button-1>", lambda _e: self._open_path(settings_path))
@@ -230,7 +231,7 @@ class CodexUsageSettingsView:
             anchor="w",
             justify="left",
             wraplength=860,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 0))
         row += 1
 
         tk.Label(
@@ -242,15 +243,15 @@ class CodexUsageSettingsView:
             anchor="w",
             justify="left",
             wraplength=860,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 0))
         row += 1
 
         tk.Frame(body, bg=border, height=1).grid(
             row=row,
             column=0,
-            columnspan=2,
+            columnspan=4,
             sticky="we",
-            pady=(10, 8),
+            pady=(6, 5),
         )
         row += 1
 
@@ -260,72 +261,112 @@ class CodexUsageSettingsView:
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 10, "bold"),
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 2))
         row += 1
 
-        self._add_value_row(body, row, "조회 상태", self._collect_state_var, card_bg)
-        row += 1
-        self._add_value_row(body, row, "다음 모니터링까지", self._next_collect_var, card_bg)
-        row += 1
-        self._add_value_row(body, row, "최근 확인 시각", self._live_time_var, card_bg)
-        row += 1
-        self._add_value_row(body, row, "5시간 사용 한도", self._live_five_hour_var, card_bg)
-        row += 1
-        self._add_value_row(body, row, "5시간 한도 초기화", self._live_five_hour_reset_var, card_bg)
-        row += 1
-        self._add_value_row(body, row, "주간 사용 한도", self._live_weekly_var, card_bg)
-        row += 1
-        self._add_value_row(body, row, "주간 한도 초기화", self._live_weekly_reset_var, card_bg)
-        row += 1
+        runtime_grid = tk.Frame(body, bg=card_bg)
+        runtime_grid.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 0))
+        runtime_grid.columnconfigure(1, minsize=210)
+        runtime_grid.columnconfigure(3, minsize=250)
+
+        runtime_row = 0
+        self._add_value_row(runtime_grid, runtime_row, "조회 상태", self._collect_state_var, card_bg)
         self._add_value_row(
-            body,
-            row,
-            "gpt-5.3-codex-spark 5시간 사용 한도",
+            runtime_grid,
+            runtime_row,
+            "다음 모니터링까지",
+            self._next_collect_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(runtime_grid, runtime_row, "최근 확인 시각", self._live_time_var, card_bg)
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "남은 크레딧",
+            self._live_credit_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(runtime_grid, runtime_row, "5시간 사용 한도", self._live_five_hour_var, card_bg)
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "5시간 한도 초기화",
+            self._live_five_hour_reset_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(runtime_grid, runtime_row, "주간 사용 한도", self._live_weekly_var, card_bg)
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "주간 한도 초기화",
+            self._live_weekly_reset_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "Spark 5시간 한도",
             self._live_spark_five_hour_var,
             card_bg,
         )
-        row += 1
         self._add_value_row(
-            body,
-            row,
-            "gpt-5.3-codex-spark 5시간 초기화",
+            runtime_grid,
+            runtime_row,
+            "Spark 5시간 초기화",
             self._live_spark_five_hour_reset_var,
             card_bg,
+            column=2,
         )
-        row += 1
+        runtime_row += 1
         self._add_value_row(
-            body,
-            row,
-            "gpt-5.3-codex-spark 주간 사용 한도",
+            runtime_grid,
+            runtime_row,
+            "Spark 주간 한도",
             self._live_spark_weekly_var,
             card_bg,
         )
-        row += 1
         self._add_value_row(
-            body,
-            row,
-            "gpt-5.3-codex-spark 주간 초기화",
+            runtime_grid,
+            runtime_row,
+            "Spark 주간 초기화",
             self._live_spark_weekly_reset_var,
             card_bg,
+            column=2,
         )
-        row += 1
-        self._add_value_row(body, row, "남은 크레딧", self._live_credit_var, card_bg)
 
         self._load_settings()
         self._start_runtime_refresh()
         return
 
-    def _add_value_row(self, parent: Any, row: int, label: str, value_var, bg: str) -> None:
+    def _add_value_row(
+        self,
+        parent: Any,
+        row: int,
+        label: str,
+        value_var,
+        bg: str,
+        column: int = 0,
+    ) -> None:
         tk = self._tk
         if tk is None:
             return
+        label_pad = (0, 6) if column == 0 else (18, 6)
+        value_pad = (0, 8)
         tk.Label(
             parent,
             text=label,
             bg=bg,
             fg="#111827",
             font=("Segoe UI", 9),
-        ).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=2)
+        ).grid(row=row, column=column, sticky="w", padx=label_pad, pady=1)
         tk.Label(
             parent,
             textvariable=value_var,
@@ -334,8 +375,8 @@ class CodexUsageSettingsView:
             font=("Segoe UI", 9),
             anchor="w",
             justify="left",
-            wraplength=520,
-        ).grid(row=row, column=1, sticky="we", pady=2)
+            wraplength=250 if column else 220,
+        ).grid(row=row, column=column + 1, sticky="w", padx=value_pad, pady=1)
         return
 
     def _lazy_import_tk(self) -> None:
@@ -413,9 +454,9 @@ class CodexUsageSettingsView:
                 return
         except Exception:
             pass
-        self._set_status("로그인/조회 요청을 시작합니다...", level="info")
+        self._set_status("로그인 창을 여는 중입니다...", level="info")
         try:
-            self._codex.show_current_status(force_refresh=True)
+            self._codex.show_current_status(force_refresh=True, source="manual_login")
         except Exception:
             self._set_status("로그인 요청 중 오류가 발생했습니다.", level="error")
             return
@@ -581,6 +622,19 @@ class CodexUsageSettingsView:
         monitor_state = str(runtime.get("monitor_state", "idle") or "idle")
         logout_in_progress = bool(runtime.get("logout_in_progress", False))
         profile_in_use = bool(runtime.get("profile_in_use", False))
+        pending_login_poll = bool(runtime.get("pending_login_poll_active", False))
+        auth_attention_required = bool(runtime.get("auth_attention_required", False))
+        auth_attention_reason = str(runtime.get("auth_attention_reason", "") or "")
+        pending_login_reason = str(runtime.get("pending_login_poll_reason", "") or "")
+        system_chrome_cdp_available = bool(runtime.get("system_chrome_cdp_available", False))
+        try:
+            pending_cdp_misses = int(runtime.get("pending_login_no_cdp_miss_count", 0) or 0)
+        except Exception:
+            pending_cdp_misses = 0
+        try:
+            pending_cdp_max_misses = int(runtime.get("pending_login_no_cdp_max_misses", 0) or 0)
+        except Exception:
+            pending_cdp_max_misses = 0
         try:
             inflight = bool(runtime.get("collect_inflight", False))
         except Exception:
@@ -589,11 +643,29 @@ class CodexUsageSettingsView:
         if logout_in_progress or monitor_state == "cancelling":
             state = "로그아웃 중"
         elif inflight:
-            state = "조회 중"
-            if source:
-                state = f"조회 중 ({source})"
+            state = "로그인 창 여는 중" if source == "manual_login" else "조회 중"
+            if source and source != "manual_login":
+                state = f"{state} ({source})"
         elif profile_in_use or monitor_state == "paused_profile_in_use":
             state = "프로필 사용 중 (자동 일시중지)"
+        elif pending_login_poll:
+            is_cloudflare_auth = (
+                auth_attention_reason == "cloudflare_challenge"
+                or pending_login_reason == "cloudflare_challenge"
+            )
+            if pending_cdp_misses > 0:
+                if pending_cdp_max_misses > 0:
+                    label = "인증 창" if is_cloudflare_auth else "로그인 창"
+                    state = f"{label} 감지 대기 중 ({pending_cdp_misses}/{pending_cdp_max_misses})"
+                else:
+                    label = "인증 창" if is_cloudflare_auth else "로그인 창"
+                    state = f"{label} 감지 대기 중 ({pending_cdp_misses})"
+            else:
+                state = "인증 완료 대기 중" if is_cloudflare_auth else "로그인 완료 대기 중"
+        elif auth_attention_required or monitor_state == "paused_auth_required":
+            state = "브라우저 인증 필요"
+        elif session_state == "logged_out" and system_chrome_cdp_available:
+            state = "기존 Chrome 세션 감지됨"
         elif session_state == "logged_out":
             state = "로그인 필요"
         else:
@@ -603,7 +675,14 @@ class CodexUsageSettingsView:
         remain = runtime.get("next_collect_in_sec", None)
         is_estimated = bool(runtime.get("next_collect_estimated", False))
         try:
-            if (
+            if pending_login_poll:
+                pending_remaining = runtime.get("pending_login_poll_remaining_sec", None)
+                if pending_remaining is not None:
+                    seconds = float(pending_remaining)
+                    if seconds < 0:
+                        seconds = 0.0
+                    remain_text = f"최대 {int(seconds)}초"
+            elif (
                 remain is not None
                 and session_state != "logged_out"
                 and not profile_in_use

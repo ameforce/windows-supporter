@@ -44,13 +44,13 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP: (1000, 560),
             self._TAB_KAKAO: (700, 340),
             self._TAB_WRIKE: (840, 580),
-            self._TAB_CODEX: (840, 630),
+            self._TAB_CODEX: (820, 520),
         }
         self._tab_minsizes = {
             self._TAB_STARTUP: (940, 520),
             self._TAB_KAKAO: (620, 300),
             self._TAB_WRIKE: (800, 520),
-            self._TAB_CODEX: (800, 590),
+            self._TAB_CODEX: (760, 500),
         }
 
         self._lazy_import_tk()
