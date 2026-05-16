@@ -61,8 +61,8 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
                 ui = WindowsSupporterMainUI(root=object(), startup_manager=object(), monitor=object())
 
-        self.assertEqual(ui._tab_sizes.get(ui._TAB_CODEX), (840, 630))
-        self.assertEqual(ui._tab_minsizes.get(ui._TAB_CODEX), (800, 590))
+        self.assertEqual(ui._tab_sizes.get(ui._TAB_CODEX), (820, 520))
+        self.assertEqual(ui._tab_minsizes.get(ui._TAB_CODEX), (760, 500))
 
     def test_kakao_build_false_keeps_tab_unbuilt_and_schedules_single_retry(self) -> None:
         ui, root, kakao = self._build_ui(kakao=_FakeKakao([False, False]))
