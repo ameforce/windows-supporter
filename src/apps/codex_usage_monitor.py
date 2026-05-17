@@ -1725,6 +1725,24 @@ class CodexUsageMonitor:
         )
         return bool(user_data_dir and user_data_dir == target)
 
+    def __is_monitor_managed_chrome_cmdline(self, cmdline: Any) -> bool:
+        cmd_text = " ".join(str(x) for x in (cmdline or [])).lower()
+        if not cmd_text:
+            return False
+        managed_tokens = (
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-notifications",
+        )
+        managed_hit = 0
+        for token in managed_tokens:
+            if token in cmd_text:
+                managed_hit += 1
+        return managed_hit >= 4
+
     def __force_playwright_mode(self) -> None:
         self.__collection_mode = "playwright"
         return
@@ -3413,13 +3431,13 @@ class CodexUsageMonitor:
                 self.__last_login_notice_ts = now
                 if is_manual_query:
                     message = (
-                        "Codex 로그인이 필요합니다. 로그인 창이 자동으로 열리지 않으면 "
-                        "잠시 후 Ctrl+Alt+C로 다시 조회해 주세요."
+                        "Codex 로그인이 필요합니다. Codex Usage 설정의 로그인 버튼으로 "
+                        "로그인한 뒤 Ctrl+Alt+C로 다시 조회해 주세요."
                     )
                 else:
                     message = (
-                        "Codex 로그인이 필요합니다. Ctrl+Alt+C로 수동 조회를 실행하면 "
-                        "로그인 창을 열 수 있습니다."
+                        "Codex 로그인이 필요합니다. Codex Usage 설정의 로그인 버튼으로 "
+                        "로그인한 뒤 다시 조회해 주세요."
                     )
                 self.__ui_post(
                     lambda: self.__show_tooltip(
@@ -3446,13 +3464,13 @@ class CodexUsageMonitor:
                 self.__last_login_notice_ts = now
                 if is_manual_query:
                     message = (
-                        "Cloudflare 인증이 필요합니다. 인증 창이 자동으로 열리지 않으면 "
-                        "잠시 후 Ctrl+Alt+C로 다시 조회해 주세요."
+                        "Cloudflare 인증이 필요합니다. Codex Usage 설정의 로그인 버튼으로 "
+                        "인증을 완료한 뒤 Ctrl+Alt+C로 다시 조회해 주세요."
                     )
                 else:
                     message = (
-                        "Cloudflare 인증이 필요합니다. Ctrl+Alt+C로 수동 조회를 실행하면 "
-                        "인증 창을 열어 확인할 수 있습니다."
+                        "Cloudflare 인증이 필요합니다. Codex Usage 설정의 로그인 버튼으로 "
+                        "인증을 완료한 뒤 다시 조회해 주세요."
                     )
                 self.__ui_post(
                     lambda: self.__show_tooltip(
@@ -3589,7 +3607,7 @@ class CodexUsageMonitor:
             return None, "collect_cancelled"
         if is_manual_query and error == "cloudflare_challenge":
             self.__log(
-                f"collect strategy=no-focus-first interactive-needed reason={error} "
+                f"collect strategy=no-focus-first auth-required-hidden-only reason={error} "
                 f"source={normalized_source}"
             )
         if error not in {"login_required", "cloudflare_challenge"}:
@@ -3626,28 +3644,16 @@ class CodexUsageMonitor:
 
     def __should_open_interactive_recovery(self, source: str = "") -> bool:
         normalized_source = normalize_usage_value(source).lower()
-        # Background collectors should never open visible auth windows.
-        if normalized_source not in {"manual_query", "manual_login"}:
+        # Usage queries must stay no-focus/no-taskbar; only the explicit login
+        # action may open an interactive browser for auth recovery.
+        if normalized_source != "manual_login":
             return False
         if bool(self.__logout_in_progress) or self.__is_collect_cancel_requested():
             return False
-        if normalized_source == "manual_login":
-            try:
-                self.__last_interactive_login_ts = float(self.__lib.time.monotonic())
-            except Exception:
-                pass
-            return True
-        now = 0.0
         try:
-            now = float(self.__lib.time.monotonic())
+            self.__last_interactive_login_ts = float(self.__lib.time.monotonic())
         except Exception:
-            now = 0.0
-        cooldown_sec = float(self.__manual_interactive_reopen_cooldown_sec)
-        if cooldown_sec < 0.0:
-            cooldown_sec = 0.0
-        if (now - float(self.__last_interactive_login_ts)) < cooldown_sec:
-            return False
-        self.__last_interactive_login_ts = now
+            pass
         return True
 
     def __prepare_interactive_recovery_launch(self, source: str = "", reason: str = "") -> None:
@@ -3746,11 +3752,7 @@ class CodexUsageMonitor:
                 )
             if self.__is_collect_cancel_requested():
                 return None, "collect_cancelled"
-            page.goto(
-                str(start_url),
-                wait_until="domcontentloaded",
-                timeout=int(self.__navigation_timeout_ms),
-            )
+            self.__refresh_collect_page(page, str(start_url))
             if (
                 cdp_proc is not None
                 and bool(force_hidden)
@@ -3886,6 +3888,27 @@ class CodexUsageMonitor:
         probe = self.__probe_usage_page(page)
         return self.__build_snapshot_from_probe(probe)
 
+    def __refresh_collect_page(self, page, target_url: str) -> None:
+        current_url = self.__get_page_url(page)
+        if are_equivalent_codex_usage_urls(current_url, target_url):
+            reload_page = getattr(page, "reload", None)
+            if callable(reload_page):
+                try:
+                    reload_page(
+                        wait_until="domcontentloaded",
+                        timeout=int(self.__navigation_timeout_ms),
+                    )
+                    self.__log("usage page refreshed via reload")
+                    return
+                except Exception as exc:
+                    self.__log_exception("usage page reload failed", exc)
+        page.goto(
+            str(target_url),
+            wait_until="domcontentloaded",
+            timeout=int(self.__navigation_timeout_ms),
+        )
+        return
+
     def __wait_for_snapshot_ready(self, page, timeout_sec: float) -> tuple[UsageSnapshot | None, str | None]:
         deadline = 0.0
         try:
@@ -4015,7 +4038,11 @@ class CodexUsageMonitor:
             for candidate in pages:
                 if candidate is selected:
                     continue
-                if not self.__is_blank_page_url(self.__get_page_url(candidate)):
+                candidate_url = self.__get_page_url(candidate)
+                is_duplicate_usage = bool(
+                    preferred and are_equivalent_codex_usage_urls(candidate_url, preferred)
+                )
+                if not (self.__is_blank_page_url(candidate_url) or is_duplicate_usage):
                     continue
                 try:
                     candidate.close()
@@ -4082,6 +4109,7 @@ class CodexUsageMonitor:
                         [
                             "--start-minimized",
                             "--window-size=1280,720",
+                            "--window-position=-32000,-32000",
                             "--disable-extensions",
                             "--disable-notifications",
                         ]
@@ -4100,7 +4128,24 @@ class CodexUsageMonitor:
                         popen_kwargs["startupinfo"] = startupinfo
                     except Exception:
                         pass
+                    try:
+                        create_no_window = int(
+                            getattr(self.__lib.subprocess, "CREATE_NO_WINDOW", 0)
+                        )
+                        if create_no_window:
+                            popen_kwargs["creationflags"] = int(
+                                popen_kwargs.get("creationflags", 0)
+                            ) | create_no_window
+                    except Exception:
+                        pass
                 proc = self.__lib.subprocess.Popen(cmd, **popen_kwargs)
+                if bool(start_hidden):
+                    self.__set_cdp_window_visibility(
+                        proc,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.2,
+                    )
                 endpoint = f"http://127.0.0.1:{int(port)}"
                 connect_deadline = 0.0
                 try:
@@ -4118,6 +4163,13 @@ class CodexUsageMonitor:
                         break
                     except Exception as exc:
                         last_error = exc
+                        if bool(start_hidden):
+                            self.__set_cdp_window_visibility(
+                                proc,
+                                visible=False,
+                                bring_to_front=False,
+                                timeout_sec=0.1,
+                            )
                         now = 0.0
                         try:
                             now = float(self.__lib.time.monotonic())
@@ -4433,19 +4485,7 @@ class CodexUsageMonitor:
                 port = self.__get_chrome_remote_debugging_port(cmdline)
                 if port <= 0:
                     continue
-                managed_tokens = (
-                    "--disable-session-crashed-bubble",
-                    "--hide-crash-restore-bubble",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-extensions",
-                    "--disable-notifications",
-                )
-                managed_hit = 0
-                for token in managed_tokens:
-                    if token in cmd_text:
-                        managed_hit += 1
-                monitor_managed = managed_hit >= 4
+                monitor_managed = self.__is_monitor_managed_chrome_cmdline(cmdline)
                 items.append((int(port), int(pid if pid > 0 else 0), bool(monitor_managed)))
             except Exception:
                 continue
@@ -4913,7 +4953,7 @@ class CodexUsageMonitor:
                 candidate = 0
             if candidate > 0:
                 pid_candidates.append(candidate)
-        for alt_pid in self.__list_profile_chrome_pids():
+        for alt_pid in self.__list_profile_chrome_pids(managed_only=not bool(visible)):
             try:
                 candidate = int(alt_pid)
             except Exception:
@@ -5006,6 +5046,7 @@ class CodexUsageMonitor:
                                 except Exception:
                                     pass
                         else:
+                            self.__hide_window_from_taskbar(hwnd)
                             self.__lib.win32gui.ShowWindow(hwnd, 0)  # SW_HIDE
                         changed = True
                     except Exception:
@@ -5025,6 +5066,33 @@ class CodexUsageMonitor:
             except Exception:
                 break
         return False
+
+    def __hide_window_from_taskbar(self, hwnd: int) -> None:
+        try:
+            handle = int(hwnd)
+        except Exception:
+            return
+        if handle <= 0:
+            return
+        # Stable Win32 constants: GWL_EXSTYLE=-20, WS_EX_APPWINDOW=0x40000,
+        # WS_EX_TOOLWINDOW=0x80. Tool windows do not leave taskbar buttons.
+        try:
+            current_style = int(self.__lib.win32gui.GetWindowLong(handle, -20))
+            hidden_style = (current_style & ~0x00040000) | 0x00000080
+            if hidden_style != current_style:
+                self.__lib.win32gui.SetWindowLong(handle, -20, hidden_style)
+            self.__lib.win32gui.SetWindowPos(
+                handle,
+                0,
+                -32000,
+                -32000,
+                0,
+                0,
+                0x0001 | 0x0004 | 0x0010 | 0x0020,
+            )
+        except Exception:
+            return
+        return
 
     def __list_top_windows_for_pid(self, pid: int) -> list[int]:
         handles: list[int] = []
@@ -5057,7 +5125,7 @@ class CodexUsageMonitor:
             return handles
         return handles
 
-    def __list_profile_chrome_pids(self) -> list[int]:
+    def __list_profile_chrome_pids(self, managed_only: bool = False) -> list[int]:
         target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
         if not target_profile:
             return []
@@ -5077,6 +5145,8 @@ class CodexUsageMonitor:
                 if not cmd_text:
                     continue
                 if not self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
+                    continue
+                if bool(managed_only) and not self.__is_monitor_managed_chrome_cmdline(cmdline):
                     continue
                 pid = int((info or {}).get("pid") or 0)
                 if pid > 0:
