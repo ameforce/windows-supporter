@@ -710,139 +710,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIs(snap, recovered)
         self.assertEqual(collect_once.call_count, 1)
 
-    def test_collect_with_playwright_obj_login_required_opens_interactive_after_hidden_probe(self) -> None:
-        recovered = UsageSnapshot.from_metrics(
-            {
-                "five_hour_limit": "17 / 40",
-                "weekly_limit": "109 / 300",
-                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
-                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
-                "remaining_credit": "245",
-            },
-            captured_at="2026-03-30T11:05:00",
-        )
-
+    def test_collect_with_playwright_obj_manual_query_does_not_open_interactive_for_login_required(self) -> None:
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__collect_snapshot_once",
-            side_effect=[
-                (None, "login_required"),
-                (recovered, None),
-            ],
-        ) as collect_once:
-            with patch.object(
-                self.monitor,
-                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
-                return_value=None,
-            ):
-                with patch.object(
-                    self.monitor,
-                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp",
-                    return_value=None,
-                ):
-                    with patch.object(
-                        self.monitor,
-                        "_CodexUsageMonitor__ui_post",
-                        side_effect=lambda fn: fn(),
-                    ):
-                        with patch.object(
-                            self.monitor,
-                            "_CodexUsageMonitor__prepare_interactive_recovery_launch",
-                        ):
-                            with patch.object(
-                                self.monitor._CodexUsageMonitor__lib.time,
-                                "monotonic",
-                                return_value=2000.0,
-                            ):
-                                snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                                    object(),
-                                    source="manual_query",
-                                )
-
-        self.assertIsNone(err)
-        self.assertIs(snap, recovered)
-        self.assertEqual(collect_once.call_count, 2)
-        first_call = collect_once.call_args_list[0]
-        self.assertFalse(first_call.kwargs.get("allow_interactive_recovery"))
-        self.assertFalse(first_call.kwargs.get("headless"))
-        self.assertTrue(first_call.kwargs.get("force_hidden"))
-        second_call = collect_once.call_args_list[1]
-        self.assertTrue(second_call.kwargs.get("allow_interactive_recovery"))
-        self.assertFalse(second_call.kwargs.get("force_hidden"))
-
-    def test_collect_with_playwright_obj_opens_interactive_after_cloudflare_hidden_probe(self) -> None:
-        recovered = UsageSnapshot.from_metrics(
-            {
-                "five_hour_limit": "17 / 40",
-                "weekly_limit": "109 / 300",
-                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
-                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
-                "remaining_credit": "245",
-            },
-            captured_at="2026-03-30T11:05:00",
-        )
-
-        with patch.object(
-            self.monitor,
-            "_CodexUsageMonitor__collect_snapshot_once",
-            side_effect=[
-                (None, "cloudflare_challenge"),
-                (recovered, None),
-            ],
-        ) as collect_once:
-            with patch.object(
-                self.monitor,
-                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
-                return_value=None,
-            ):
-                with patch.object(
-                    self.monitor,
-                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp",
-                    return_value=None,
-                ):
-                    with patch.object(
-                        self.monitor,
-                        "_CodexUsageMonitor__ui_post",
-                        side_effect=lambda fn: fn(),
-                    ):
-                        with patch.object(self.monitor._CodexUsageMonitor__lib.time, "monotonic", return_value=2000.0):
-                            snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                                object(),
-                                source="manual_query",
-                            )
-
-        self.assertIsNone(err)
-        self.assertIsNotNone(snap)
-        self.assertEqual(collect_once.call_count, 2)
-        first_call = collect_once.call_args_list[0]
-        self.assertFalse(first_call.kwargs.get("headless"))
-        self.assertFalse(first_call.kwargs.get("allow_interactive_recovery"))
-        self.assertTrue(first_call.kwargs.get("force_hidden"))
-        second_call = collect_once.call_args_list[1]
-        self.assertFalse(second_call.kwargs.get("headless"))
-        self.assertTrue(second_call.kwargs.get("allow_interactive_recovery"))
-        self.assertTrue(second_call.kwargs.get("prefer_system_channel"))
-        self.assertFalse(second_call.kwargs.get("force_hidden"))
-
-    def test_collect_with_playwright_obj_opens_interactive_when_hidden_retry_still_fails(self) -> None:
-        recovered = UsageSnapshot.from_metrics(
-            {
-                "five_hour_limit": "17 / 40",
-                "weekly_limit": "109 / 300",
-                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
-                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
-                "remaining_credit": "245",
-            },
-            captured_at="2026-03-30T11:05:00",
-        )
-
-        with patch.object(
-            self.monitor,
-            "_CodexUsageMonitor__collect_snapshot_once",
-            side_effect=[
-                (None, "cloudflare_challenge"),
-                (recovered, None),
-            ],
+            return_value=(None, "login_required"),
         ) as collect_once:
             with patch.object(
                 self.monitor,
@@ -873,29 +745,102 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                     source="manual_query",
                                 )
 
-        self.assertTrue(prepare_interactive.called)
-        self.assertEqual(
-            prepare_interactive.call_args.kwargs.get("source"),
-            "manual_query",
-        )
-        self.assertEqual(
-            prepare_interactive.call_args.kwargs.get("reason"),
-            "cloudflare_challenge",
-        )
-        self.assertIsNone(err)
-        self.assertIsNotNone(snap)
-        self.assertEqual(collect_once.call_count, 2)
+        self.assertEqual(err, "login_required")
+        self.assertIsNone(snap)
+        self.assertEqual(collect_once.call_count, 1)
+        prepare_interactive.assert_not_called()
         first_call = collect_once.call_args_list[0]
         self.assertFalse(first_call.kwargs.get("allow_interactive_recovery"))
         self.assertFalse(first_call.kwargs.get("headless"))
         self.assertTrue(first_call.kwargs.get("force_hidden"))
-        second_call = collect_once.call_args_list[1]
-        self.assertTrue(second_call.kwargs.get("allow_interactive_recovery"))
-        self.assertFalse(second_call.kwargs.get("force_hidden"))
-        self.assertEqual(
-            second_call.kwargs.get("initial_url"),
-            "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
-        )
+
+    def test_collect_with_playwright_obj_manual_query_does_not_open_interactive_for_cloudflare(self) -> None:
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            return_value=(None, "cloudflare_challenge"),
+        ) as collect_once:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=None,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp",
+                    return_value=None,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__ui_post",
+                        side_effect=lambda fn: fn(),
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__prepare_interactive_recovery_launch",
+                        ) as prepare_interactive:
+                            with patch.object(
+                                self.monitor._CodexUsageMonitor__lib.time,
+                                "monotonic",
+                                return_value=2000.0,
+                            ):
+                                snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                                    object(),
+                                    source="manual_query",
+                                )
+
+        self.assertEqual(err, "cloudflare_challenge")
+        self.assertIsNone(snap)
+        self.assertEqual(collect_once.call_count, 1)
+        prepare_interactive.assert_not_called()
+        first_call = collect_once.call_args_list[0]
+        self.assertFalse(first_call.kwargs.get("headless"))
+        self.assertFalse(first_call.kwargs.get("allow_interactive_recovery"))
+        self.assertTrue(first_call.kwargs.get("force_hidden"))
+
+    def test_collect_with_playwright_obj_manual_query_reports_hidden_retry_failure_without_visible_window(self) -> None:
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            return_value=(None, "cloudflare_challenge"),
+        ) as collect_once:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                return_value=None,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp",
+                    return_value=None,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__ui_post",
+                        side_effect=lambda fn: fn(),
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__prepare_interactive_recovery_launch",
+                        ) as prepare_interactive:
+                            with patch.object(
+                                self.monitor._CodexUsageMonitor__lib.time,
+                                "monotonic",
+                                return_value=2000.0,
+                            ):
+                                snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                                    object(),
+                                    source="manual_query",
+                                )
+
+        prepare_interactive.assert_not_called()
+        self.assertEqual(err, "cloudflare_challenge")
+        self.assertIsNone(snap)
+        self.assertEqual(collect_once.call_count, 1)
+        first_call = collect_once.call_args_list[0]
+        self.assertFalse(first_call.kwargs.get("allow_interactive_recovery"))
+        self.assertFalse(first_call.kwargs.get("headless"))
+        self.assertTrue(first_call.kwargs.get("force_hidden"))
 
     def test_collect_with_playwright_obj_skips_interactive_for_background_source(self) -> None:
         with patch.object(
@@ -933,34 +878,17 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(first_call.kwargs.get("force_hidden"))
         self.assertFalse(show_tip.called)
 
-    def test_should_open_interactive_recovery_manual_not_blocked_by_background_source(self) -> None:
+    def test_should_open_interactive_recovery_only_allows_manual_login(self) -> None:
         with patch.object(
             self.monitor._CodexUsageMonitor__lib.time,
             "monotonic",
-            side_effect=[100.0, 100.0],
+            return_value=100.0,
         ):
             self.assertFalse(
                 self.monitor._CodexUsageMonitor__should_open_interactive_recovery(
                     source="startup_warmup"
                 )
             )
-            self.assertTrue(
-                self.monitor._CodexUsageMonitor__should_open_interactive_recovery(
-                    source="manual_query"
-                )
-            )
-
-    def test_should_open_interactive_recovery_manual_uses_short_cooldown(self) -> None:
-        with patch.object(
-            self.monitor._CodexUsageMonitor__lib.time,
-            "monotonic",
-            side_effect=[100.0, 101.0, 104.2],
-        ):
-            self.assertTrue(
-                self.monitor._CodexUsageMonitor__should_open_interactive_recovery(
-                    source="manual_query"
-                )
-            )
             self.assertFalse(
                 self.monitor._CodexUsageMonitor__should_open_interactive_recovery(
                     source="manual_query"
@@ -968,7 +896,21 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             )
             self.assertTrue(
                 self.monitor._CodexUsageMonitor__should_open_interactive_recovery(
-                    source="manual_query"
+                    source="manual_login"
+                )
+            )
+
+    def test_should_open_interactive_recovery_manual_login_bypasses_short_cooldown(self) -> None:
+        self.monitor._CodexUsageMonitor__last_interactive_login_ts = 99.0
+        self.monitor._CodexUsageMonitor__manual_interactive_reopen_cooldown_sec = 120.0
+        with patch.object(
+            self.monitor._CodexUsageMonitor__lib.time,
+            "monotonic",
+            return_value=100.0,
+        ):
+            self.assertTrue(
+                self.monitor._CodexUsageMonitor__should_open_interactive_recovery(
+                    source="manual_login"
                 )
             )
 
@@ -2572,10 +2514,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--start-minimized", cmd)
         self.assertIn("--disable-session-crashed-bubble", cmd)
         self.assertIn("--hide-crash-restore-bubble", cmd)
-        self.assertNotIn("--window-position=-32000,-32000", cmd)
+        self.assertIn("--window-position=-32000,-32000", cmd)
         self.assertNotIn("about:blank", cmd)
         self.assertIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", cmd)
         self.assertIn("startupinfo", kwargs)
+        self.assertIn("creationflags", kwargs)
         self.assertEqual(
             playwright_obj.chromium.timeouts,
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
@@ -2864,6 +2807,32 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, launch_cdp.return_value[2])
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48125)
 
+    def test_refresh_collect_page_reloads_existing_usage_page(self) -> None:
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
+
+            def __init__(self):
+                self.reload_calls: list[dict] = []
+                self.goto_calls: list[str] = []
+
+            def reload(self, **kwargs):
+                self.reload_calls.append(dict(kwargs))
+                return None
+
+            def goto(self, url, **_kwargs):
+                self.goto_calls.append(str(url))
+                return None
+
+        page = _DummyPage()
+
+        self.monitor._CodexUsageMonitor__refresh_collect_page(
+            page,
+            "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+        )
+
+        self.assertEqual(len(page.reload_calls), 1)
+        self.assertEqual(page.goto_calls, [])
+
     def test_select_collect_page_prefers_non_blank_and_closes_extra_blank_tabs(self) -> None:
         class _DummyPage:
             def __init__(self, url):
@@ -2897,6 +2866,40 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIs(selected, usage)
         self.assertTrue(blank1.closed)
         self.assertTrue(blank2.closed)
+
+    def test_select_collect_page_closes_duplicate_usage_tabs_for_managed_hidden_context(self) -> None:
+        class _DummyPage:
+            def __init__(self, url):
+                self.url = url
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return None
+
+        class _DummyContext:
+            def __init__(self, pages):
+                self.pages = pages
+
+            def new_page(self):
+                p = _DummyPage("about:blank")
+                self.pages.append(p)
+                return p
+
+        selected_usage = _DummyPage("https://chatgpt.com/codex/cloud/settings/analytics#usage")
+        duplicate_usage = _DummyPage("https://chatgpt.com/codex/cloud/settings/analytics")
+        login = _DummyPage("https://chatgpt.com/auth/login")
+        ctx = _DummyContext([selected_usage, duplicate_usage, login])
+
+        selected = self.monitor._CodexUsageMonitor__select_collect_page(
+            ctx,
+            preferred_url="https://chatgpt.com/codex/cloud/settings/analytics#usage",
+            close_extra_blank_tabs=True,
+        )
+
+        self.assertIs(selected, selected_usage)
+        self.assertTrue(duplicate_usage.closed)
+        self.assertFalse(login.closed)
 
     def test_collect_snapshot_once_background_waits_briefly_for_cloudflare_clear(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
@@ -3130,6 +3133,133 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 called_pids.append(int(call.kwargs.get("pid")))
         self.assertIn(111, called_pids)
         self.assertIn(222, called_pids)
+
+    def test_set_cdp_window_visibility_only_uses_managed_profile_pids_when_hiding(self) -> None:
+        class _DummyProc:
+            pid = 111
+
+        class _DummyProcInfo:
+            def __init__(self, pid: int, name: str, cmdline: list[str]):
+                self.info = {"pid": int(pid), "name": str(name), "cmdline": list(cmdline)}
+
+        profile = "c:/tmp/chatgpt-profile"
+        self.monitor._CodexUsageMonitor__profile_dir = profile
+        process_items = [
+            _DummyProcInfo(
+                222,
+                "chrome.exe",
+                [
+                    "chrome.exe",
+                    "--remote-debugging-port=9333",
+                    f"--user-data-dir={profile}",
+                    "--disable-session-crashed-bubble",
+                    "--hide-crash-restore-bubble",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                    "--disable-notifications",
+                ],
+            ),
+            _DummyProcInfo(
+                333,
+                "chrome.exe",
+                [
+                    "chrome.exe",
+                    "--remote-debugging-port=9444",
+                    f"--user-data-dir={profile}",
+                ],
+            ),
+        ]
+
+        with patch.object(
+            self.monitor._CodexUsageMonitor__lib.psutil,
+            "process_iter",
+            return_value=process_items,
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__set_windows_visibility_for_pid",
+                return_value=False,
+            ) as set_by_pid:
+                self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
+                    _DummyProc(),
+                    visible=False,
+                    bring_to_front=False,
+                    timeout_sec=1.0,
+                )
+
+        called_pids: list[int] = []
+        for call in set_by_pid.call_args_list:
+            if call.args:
+                called_pids.append(int(call.args[0]))
+            else:
+                called_pids.append(int(call.kwargs.get("pid")))
+        self.assertIn(111, called_pids)
+        self.assertIn(222, called_pids)
+        self.assertNotIn(333, called_pids)
+
+    def test_set_windows_visibility_for_pid_hides_window_from_taskbar(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.style = 0x00040000
+                self.set_styles: list[tuple[int, int, int]] = []
+                self.position_calls: list[tuple[int, int, int, int, int, int, int]] = []
+                self.show_calls: list[tuple[int, int]] = []
+
+            def GetWindowLong(self, hwnd, index):
+                self.set_styles.append((int(hwnd), int(index), self.style))
+                return self.style
+
+            def SetWindowLong(self, hwnd, index, value):
+                self.style = int(value)
+                self.set_styles.append((int(hwnd), int(index), int(value)))
+                return int(value)
+
+            def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+                self.position_calls.append(
+                    (
+                        int(hwnd),
+                        int(insert_after),
+                        int(x),
+                        int(y),
+                        int(cx),
+                        int(cy),
+                        int(flags),
+                    )
+                )
+                return True
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    return_value=[789],
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.2,
+                    )
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_win32gui.style & 0x00040000, 0)
+        self.assertTrue(fake_win32gui.style & 0x00000080)
+        self.assertTrue(fake_win32gui.position_calls)
+        self.assertEqual(fake_win32gui.position_calls[-1][2:4], (-32000, -32000))
+        self.assertEqual(fake_win32gui.show_calls, [(789, 0)])
 
     def test_set_windows_visibility_for_pid_restores_without_activating_by_default(self) -> None:
         class _DummyWin32Gui:
@@ -4368,7 +4498,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     )
 
         self.assertTrue(captured)
-        self.assertIn("Ctrl+Alt+C", captured[-1])
+        self.assertIn("로그인 버튼", captured[-1])
         self.assertNotIn("열린 브라우저 창", captured[-1])
 
     def test_handle_collect_error_cloudflare_manual_avoids_open_window_assumption(self) -> None:
@@ -4402,7 +4532,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     )
 
         self.assertTrue(captured)
-        self.assertIn("열리지 않으면", captured[-1])
+        self.assertIn("로그인 버튼", captured[-1])
         self.assertNotIn("열린 브라우저 창", captured[-1])
 
     def test_now_iso_is_korea_time(self) -> None:
