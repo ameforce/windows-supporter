@@ -17,16 +17,22 @@ class Wrike:
     def __init__(self) -> None:
         self.__lib = LibConnector()
         self.__form_url = 'https://www.wrike.com/workspace.htm?acc=469516#/forms?formid=2239448'
-        self.__form_tab_presses = 5
-        self.__tab_interval_sec = 0.1
         self.__clipboard_timeout_sec = 0.7
         self.__clipboard_copy_retry = 6
-        self.__page_ready_timeout_sec = 8.0
-        self.__page_ready_poll_sec = 0.05
-        self.__page_ready_stable_sec = 0.4
+        self.__form_nav_timeout_ms = 20000
+        self.__form_title_timeout_ms = 7000
+        self.__form_settle_timeout_ms = 1200
+        self.__form_title_locator_wait_ms = 800
         self.__is_running = False
         self.__open_tab_running = False
         self.__time_log_running = False
+        self.__form_playwright = None
+        self.__form_context = None
+        self.__form_page = None
+        self.__form_browser_queue = queue.Queue()
+        self.__form_browser_worker_thread = None
+        self.__form_browser_worker_lock = threading.Lock()
+        self.__form_browser_prewarm_requested = False
         self.__time_log_root_url = (
             'https://www.wrike.com/workspace.htm?acc=469516'
             '#/folder/1593118419/tableV2?showInfo=0&spaceId=1590111212&viewId=336617617'
@@ -92,14 +98,6 @@ class Wrike:
 
         self.__re_brackets = self.__lib.re.compile(r'\[([^\]]*)\]')
         self.__re_internal = self.__lib.re.compile(r'^없음\s*\((.+?)\)\s*$')
-        self.__re_wrike_request_chrome_title = self.__lib.re.compile(
-            r'Request\s*-\s*Wrike\s*-\s*(Google\s*)?Chrome',
-            self.__lib.re.IGNORECASE,
-        )
-        self.__re_wrike_chrome_title = self.__lib.re.compile(
-            r'Wrike.*(Google\s*)?Chrome',
-            self.__lib.re.IGNORECASE,
-        )
         self.__re_time_h = self.__lib.re.compile(r'(\d+(?:\.\d+)?)\s*h')
         self.__re_time_m = self.__lib.re.compile(r'(\d+(?:\.\d+)?)\s*m')
         self.__re_time_hhmm = self.__lib.re.compile(r'^\s*(\d+)\s*:\s*(\d{1,2})\s*$')
@@ -165,41 +163,6 @@ class Wrike:
                 self.__lib.time.sleep(0.02)
         return False
 
-    def __safe_get_active_window_title(self) -> str:
-        try:
-            win = self.__lib.gw.getActiveWindow()
-        except Exception:
-            return ''
-        if win is None:
-            return ''
-        try:
-            title = win.title
-        except Exception:
-            return ''
-        if not title:
-            return ''
-        return str(title)
-
-    def __wait_for_wrike_form_ready(self) -> bool:
-        deadline = self.__lib.time.monotonic() + self.__page_ready_timeout_sec
-        last_title = self.__safe_get_active_window_title()
-        last_change = self.__lib.time.monotonic()
-        saw_title_change = False
-        while self.__lib.time.monotonic() < deadline:
-            title = self.__safe_get_active_window_title()
-            now = self.__lib.time.monotonic()
-            if title:
-                if self.__re_wrike_request_chrome_title.search(title):
-                    return True
-                if title != last_title:
-                    saw_title_change = True
-                    last_title = title
-                    last_change = now
-                elif saw_title_change and (now - last_change) >= self.__page_ready_stable_sec and self.__re_wrike_chrome_title.search(title):
-                    return True
-            self.__lib.time.sleep(self.__page_ready_poll_sec)
-        return False
-
     def __wait_for_clipboard_update(self, before: str) -> str:
         deadline = self.__lib.time.monotonic() + self.__clipboard_timeout_sec
         while self.__lib.time.monotonic() < deadline:
@@ -215,6 +178,12 @@ class Wrike:
             return formatted + ' - '
         return formatted
 
+    def __strip_leading_title_separator(self, text: str) -> str:
+        value = str(text or '').strip()
+        while value.startswith('-'):
+            value = value[1:].strip()
+        return value
+
     def transform_text(self, clipboard_content: str) -> str | None:
         if clipboard_content is None:
             return None
@@ -229,6 +198,8 @@ class Wrike:
         if bracket_matches:
             tokens = [m.group(1).strip() for m in bracket_matches]
             remainder = text[bracket_matches[-1].end():].strip()
+            if remainder:
+                remainder = self.__strip_leading_title_separator(remainder)
             if remainder:
                 tokens.append(remainder)
             while tokens and tokens[-1] == '':
@@ -293,37 +264,15 @@ class Wrike:
                 show_message("클립보드 복사 실패: 텍스트를 선택한 뒤 다시 시도하세요")
                 return
 
-            self.__lib.pyautogui.hotkey('ctrl', 't')
-            self.__lib.time.sleep(0.05)
-            self.__lib.pyautogui.hotkey('ctrl', 'l')
-            if not self.__safe_clipboard_copy(self.__form_url):
-                show_message("URL 클립보드 복사 실패: 잠시 후 다시 시도하세요")
-                return
-            self.__lib.time.sleep(0.02)
-            self.__lib.pyautogui.hotkey('ctrl', 'v')
-            self.__lib.time.sleep(0.02)
-            self.__lib.pyautogui.press('enter')
-            self.__lib.time.sleep(0.02)
-            self.__safe_clipboard_copy(copied_text)
-            if not self.__wait_for_wrike_form_ready():
-                show_message("Wrike Form 로딩 대기 시간 초과: 잠시 후 다시 시도하세요")
-                return
-            self.__lib.pyautogui.press('tab', presses=self.__form_tab_presses, interval=self.__tab_interval_sec)
-
-            if self.__safe_clipboard_paste() != copied_text:
-                self.__safe_clipboard_copy(copied_text)
-                self.__lib.time.sleep(0.02)
-
             transformed_text = self.transform_text(copied_text)
             if not transformed_text:
                 show_message("치환 실패: 텍스트 형식을 확인하세요")
                 return
 
-            self.__safe_clipboard_copy(transformed_text)
-            self.__lib.time.sleep(0.02)
-            self.__lib.pyautogui.hotkey('ctrl', 'v')
-            self.__lib.time.sleep(0.02)
-            self.__lib.pyautogui.press('left', presses=4, interval=0.02)
+            error = self.__fill_wrike_form_on_browser_worker(root, transformed_text)
+            if error:
+                show_message(error)
+                return
             show_message("Wrike Form 입력 완료")
             return
         finally:
@@ -473,6 +422,7 @@ class Wrike:
         self.__root = root
         self.__start_ui_pump(root)
         self.__restart_monitor()
+        self.__prewarm_wrike_form_browser_async()
         return
 
     def __restart_monitor(self) -> None:
@@ -815,7 +765,104 @@ class Wrike:
             pass
         return profile_dir
 
-    def __ensure_wrike_logged_in(self, page, root) -> str | None:
+    def __prewarm_wrike_form_browser_async(self) -> None:
+        if self.__form_browser_prewarm_requested:
+            return
+        if not self.__ensure_wrike_form_browser_worker_started():
+            return
+        self.__form_browser_prewarm_requested = True
+        try:
+            self.__form_browser_queue.put(("prewarm", None, None, None))
+        except Exception:
+            self.__form_browser_prewarm_requested = False
+        return
+
+    def __fill_wrike_form_on_browser_worker(self, root, title: str) -> str | None:
+        if not self.__ensure_wrike_form_browser_worker_started():
+            return "Wrike Form 자동화 시작 실패"
+
+        response_queue = queue.Queue(maxsize=1)
+        try:
+            self.__form_browser_queue.put(("fill", root, title, response_queue))
+        except Exception:
+            return "Wrike Form 자동화 시작 실패"
+
+        timeout_sec = float(self.__time_log_login_timeout_sec) + 45.0
+        try:
+            ok, result = response_queue.get(timeout=timeout_sec)
+        except queue.Empty:
+            return "Wrike Form 자동화 시간 초과: 열린 브라우저 상태를 확인하세요"
+        except Exception:
+            return "Wrike Form 자동화 실패: 잠시 후 다시 시도하세요"
+
+        if ok:
+            return result
+        self.__log_exception("wrike form browser worker failed", result)
+        return "Wrike Form 자동화 실패: 잠시 후 다시 시도하세요"
+
+    def __ensure_wrike_form_browser_worker_started(self) -> bool:
+        with self.__form_browser_worker_lock:
+            thread = self.__form_browser_worker_thread
+            if self.__is_thread_alive(thread):
+                return True
+            self.__form_browser_queue = queue.Queue()
+            self.__form_browser_prewarm_requested = False
+            try:
+                thread = threading.Thread(target=self.__wrike_form_browser_worker_loop, daemon=True)
+                self.__form_browser_worker_thread = thread
+                thread.start()
+                return True
+            except Exception as exc:
+                self.__log_exception("wrike form browser worker start failed", exc)
+                self.__form_browser_worker_thread = None
+                return False
+
+    def __is_thread_alive(self, thread) -> bool:
+        if thread is None:
+            return False
+        try:
+            return bool(thread.is_alive())
+        except Exception:
+            return True
+
+    def __wrike_form_browser_worker_loop(self) -> None:
+        while True:
+            try:
+                kind, root, title, response_queue = self.__form_browser_queue.get()
+            except Exception:
+                return
+
+            if kind == "prewarm":
+                self.__prewarm_wrike_form_browser()
+                continue
+
+            if kind != "fill":
+                continue
+
+            try:
+                result = self.__fill_wrike_form_with_playwright(root, title)
+            except Exception as exc:
+                self.__log_exception("wrike form fill worker exception", exc)
+                try:
+                    response_queue.put((False, exc))
+                except Exception:
+                    pass
+                continue
+
+            try:
+                response_queue.put((True, result))
+            except Exception:
+                pass
+        return
+
+    def __prewarm_wrike_form_browser(self) -> None:
+        if not self.__ensure_playwright_ready():
+            self.__playwright_checked = False
+            return
+        self.__ensure_wrike_form_playwright_started()
+        return
+
+    def __ensure_wrike_logged_in(self, page, root, return_url: str | None = None) -> str | None:
         current_url = str(page.url or "")
         if self.__requires_login(page):
             self.__log(f"login required url={current_url}")
@@ -834,8 +881,339 @@ class Wrike:
                 page.wait_for_url("**/workspace.htm*", timeout=int(self.__time_log_login_timeout_sec * 1000))
             except Exception:
                 return self.__error_with_log("Wrike 로그인 시간 초과")
-            page.goto(self.__time_log_root_url, wait_until="domcontentloaded")
+            page.goto(return_url or self.__time_log_root_url, wait_until="domcontentloaded")
         return None
+
+    def __fill_wrike_form_with_playwright(self, root, title: str) -> str | None:
+        if not self.__ensure_playwright_ready():
+            return "Wrike Form 자동화 준비 실패: Playwright를 사용할 수 없습니다"
+
+        page, error = self.__get_wrike_form_page()
+        if error:
+            return error
+        if page is None:
+            return "Wrike Form 브라우저를 열지 못했습니다"
+
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+
+        navigation_error = None
+        if not self.__is_current_wrike_form_page(page):
+            navigation_error = self.__goto_wrike_form(page)
+        if navigation_error:
+            if not self.__is_stale_playwright_error(navigation_error):
+                self.__log_exception("wrike form navigation failed", navigation_error)
+                return "Wrike Form 이동 실패: 잠시 후 다시 시도하세요"
+            self.__log_exception("wrike form stale browser handle", navigation_error)
+            self.__reset_wrike_form_browser_handles()
+            page, error = self.__get_wrike_form_page()
+            if error:
+                return error
+            if page is None:
+                return "Wrike Form 브라우저를 열지 못했습니다"
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+            navigation_error = self.__goto_wrike_form(page)
+            if navigation_error:
+                self.__log_exception("wrike form navigation retry failed", navigation_error)
+                return "Wrike Form 이동 실패: 잠시 후 다시 시도하세요"
+
+        login_error = self.__ensure_wrike_logged_in(page, root, return_url=self.__form_url)
+        if login_error:
+            return login_error
+
+        try:
+            if not self.__is_current_wrike_form_page(page):
+                page.goto(
+                    self.__form_url,
+                    wait_until="domcontentloaded",
+                    timeout=self.__form_nav_timeout_ms,
+                )
+        except Exception as exc:
+            self.__log_exception("wrike form post-login navigation failed", exc)
+            return "Wrike Form 이동 실패: 잠시 후 다시 시도하세요"
+
+        login_error = self.__ensure_wrike_logged_in(page, root, return_url=self.__form_url)
+        if login_error:
+            return login_error
+
+        if not self.__fill_wrike_form_title(page, title):
+            return "Wrike Form 제목 입력칸을 찾지 못했습니다"
+        return None
+
+    def __goto_wrike_form(self, page) -> Exception | None:
+        try:
+            page.goto(
+                self.__form_url,
+                wait_until="domcontentloaded",
+                timeout=self.__form_nav_timeout_ms,
+            )
+            return None
+        except Exception as exc:
+            return exc
+
+    def __is_current_wrike_form_page(self, page) -> bool:
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            return False
+        return (
+            current_url.startswith("https://www.wrike.com/workspace.htm")
+            and "#/forms?formid=2239448" in current_url
+        )
+
+    def __is_stale_playwright_error(self, exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        stale_markers = (
+            "different thread",
+            "thread",
+            "target closed",
+            "page closed",
+            "browser has been closed",
+            "context closed",
+            "connection closed",
+        )
+        return any(marker in msg for marker in stale_markers)
+
+    def __reset_wrike_form_browser_handles(self) -> None:
+        context = self.__form_context
+        playwright_obj = self.__form_playwright
+        self.__form_page = None
+        self.__form_context = None
+        self.__form_playwright = None
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if playwright_obj is not None:
+                playwright_obj.stop()
+        except Exception:
+            pass
+
+    def __get_wrike_form_page(self):
+        last_error = None
+        for attempt in range(2):
+            try:
+                if self.__is_playwright_page_open(self.__form_page):
+                    return self.__form_page, None
+            except Exception:
+                self.__form_page = None
+
+            if self.__form_playwright is None:
+                if not self.__ensure_wrike_form_playwright_started():
+                    return None, "Wrike Form 자동화 시작 실패"
+
+            if self.__form_context is None:
+                profile_dir = self.__ensure_wrike_profile_dir()
+                self.__form_context = self.__launch_playwright_context(self.__form_playwright, profile_dir)
+                if self.__form_context is None:
+                    return None, "Wrike Form 브라우저 실행 실패"
+
+            try:
+                pages = list(getattr(self.__form_context, "pages", []) or [])
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and self.__is_stale_playwright_error(exc):
+                    self.__log_exception("wrike form cached context closed", exc)
+                    self.__reset_wrike_form_browser_handles()
+                    continue
+                pages = []
+
+            for page in pages:
+                if self.__is_playwright_page_open(page):
+                    self.__form_page = page
+                    return page, None
+
+            try:
+                self.__form_page = self.__form_context.new_page()
+                return self.__form_page, None
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and self.__is_stale_playwright_error(exc):
+                    self.__log_exception("wrike form cached context new_page failed", exc)
+                    self.__reset_wrike_form_browser_handles()
+                    continue
+                self.__log_exception("wrike form page create failed", exc)
+                return None, "Wrike Form 브라우저 탭 생성 실패"
+
+        if last_error is not None:
+            self.__log_exception("wrike form page recover failed", last_error)
+        return None, "Wrike Form 브라우저 탭 생성 실패"
+
+    def __ensure_wrike_form_playwright_started(self) -> bool:
+        if self.__form_playwright is not None:
+            return True
+        try:
+            from playwright.sync_api import sync_playwright
+
+            self.__form_playwright = sync_playwright().start()
+            return True
+        except Exception as exc:
+            self.__log_exception("playwright start failed", exc)
+            self.__form_playwright = None
+            return False
+
+    def __is_playwright_page_open(self, page) -> bool:
+        if page is None:
+            return False
+        try:
+            return not bool(page.is_closed())
+        except Exception:
+            return True
+
+    def __fill_wrike_form_title(self, page, title: str) -> bool:
+        self.__dismiss_wrike_form_draft_prompt(page, wait_ms=0)
+        if self.__try_fill_wrike_form_title_field(page, title, wait_ms=0):
+            return True
+
+        dismissed = self.__dismiss_wrike_form_draft_prompt(page, wait_ms=500)
+        if dismissed and self.__try_fill_wrike_form_title_field(
+            page,
+            title,
+            wait_ms=self.__form_title_locator_wait_ms,
+        ):
+            return True
+
+        return self.__try_fill_wrike_form_title_field(
+            page,
+            title,
+            wait_ms=self.__form_title_locator_wait_ms,
+        )
+
+    def __try_fill_wrike_form_title_field(self, page, title: str, wait_ms: int = 0) -> bool:
+        field = self.__find_wrike_form_title_field(page, wait_ms=wait_ms)
+        if field is None:
+            return False
+        try:
+            field.fill(title, timeout=self.__form_title_timeout_ms)
+        except Exception as exc:
+            self.__log_exception("wrike form title fill failed", exc)
+            return False
+
+        try:
+            for _ in range(4):
+                field.press("ArrowLeft", timeout=500)
+        except Exception:
+            pass
+        return True
+
+    def __dismiss_wrike_form_draft_prompt(self, page, wait_ms: int = 0) -> bool:
+        locators = self.__wrike_form_draft_prompt_locators(page)
+        for locator in locators:
+            target = self.__first_available_locator(locator)
+            if target is not None and self.__click_wrike_draft_prompt(target, page):
+                return True
+
+        if int(wait_ms) > 0 and locators:
+            target = self.__first_available_locator(locators[0], wait_ms=wait_ms)
+            if target is not None and self.__click_wrike_draft_prompt(target, page):
+                return True
+        return False
+
+    def __wrike_form_draft_prompt_locators(self, page) -> list:
+        locators = []
+        labels = ("Start new", "새로 시작", "새로 만들기")
+        for label in labels:
+            try:
+                locators.append(page.get_by_role("button", name=label, exact=True))
+            except Exception:
+                pass
+        try:
+            label_pattern = self.__lib.re.compile(
+                r"^\s*(Start\s+new|새로\s*시작|새로\s*만들기)\s*$",
+                self.__lib.re.IGNORECASE,
+            )
+            locators.append(page.get_by_role("button", name=label_pattern))
+        except Exception:
+            pass
+        for label in labels:
+            try:
+                locators.append(page.get_by_text(label, exact=True))
+            except Exception:
+                pass
+        for label in labels:
+            escaped = label.replace('"', '\\"')
+            for selector in (
+                f'button:has-text("{escaped}")',
+                f'[role="button"]:has-text("{escaped}")',
+            ):
+                try:
+                    locators.append(page.locator(selector))
+                except Exception:
+                    pass
+        return locators
+
+    def __click_wrike_draft_prompt(self, target, page) -> bool:
+        try:
+            target.click(timeout=1500)
+            try:
+                page.wait_for_load_state(state="domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            self.__log_exception("wrike form draft prompt click failed", exc)
+            return False
+
+    def __find_wrike_form_title_field(self, page, wait_ms: int = 0):
+        candidates = []
+        for label in ("제목", "Title"):
+            candidates.append(lambda label=label: page.get_by_label(label, exact=False))
+            candidates.append(lambda label=label: page.get_by_placeholder(label, exact=False))
+        for selector in (
+            "textarea[aria-label*='제목'], input[aria-label*='제목']",
+            "textarea[placeholder*='제목'], input[placeholder*='제목']",
+            "textarea[aria-label*='Title'], input[aria-label*='Title']",
+            "textarea[placeholder*='Title'], input[placeholder*='Title']",
+            "textarea[name*='title' i], input[name*='title' i]",
+        ):
+            candidates.append(lambda selector=selector: page.locator(selector))
+
+        for candidate in candidates:
+            try:
+                locator = candidate()
+            except Exception:
+                continue
+            target = self.__first_available_locator(locator)
+            if target is not None:
+                return target
+        if int(wait_ms) <= 0:
+            return None
+        for candidate in candidates:
+            try:
+                locator = candidate()
+            except Exception:
+                continue
+            target = self.__first_available_locator(locator, wait_ms=wait_ms)
+            if target is not None:
+                return target
+        return None
+
+    def __first_available_locator(self, locator, wait_ms: int = 0):
+        try:
+            count = int(locator.count())
+        except Exception:
+            return None
+        if count <= 0 and int(wait_ms) > 0:
+            try:
+                locator.wait_for(state="visible", timeout=int(wait_ms))
+                count = int(locator.count())
+            except Exception:
+                return None
+        if count <= 0:
+            return None
+        if count == 1:
+            return locator
+        try:
+            return locator.first
+        except Exception:
+            return locator
 
     def __is_login_url(self, url: str) -> bool:
         lowered = str(url or "").lower()
@@ -846,11 +1224,25 @@ class Wrike:
         if self.__is_login_url(url):
             return True
         try:
+            title = str(page.title() or "").strip().lower()
+            if "wrike" in title and ("sign in" in title or "log in" in title or "login" in title):
+                return True
+        except Exception:
+            pass
+        try:
             if page.locator("input[type='password']").count() > 0:
                 return True
         except Exception:
             pass
-        for label in ("Log in", "Sign in", "로그인", "SSO"):
+        for label in (
+            "Log in",
+            "Sign in",
+            "Sign in to your Wrike account",
+            "Forgot password?",
+            "Log in with One-Time Password",
+            "로그인",
+            "SSO",
+        ):
             try:
                 if page.get_by_text(label, exact=False).count() > 0:
                     return True
