@@ -3520,6 +3520,7 @@ class CodexUsageMonitor:
             raw_wait_timeout_sec = 4.0 if source_key == "pending_login_poll" else None
             raw_snapshot, raw_error, raw_handled = self.__try_no_focus_raw_preflight(
                 wait_timeout_sec=raw_wait_timeout_sec,
+                source=source_key,
             )
             if bool(raw_handled):
                 return raw_snapshot, raw_error
@@ -3583,7 +3584,9 @@ class CodexUsageMonitor:
                 prefer_system_channel=True,
                 initial_url=str(self.__login_entry_url),
             )
-        raw_snapshot, raw_error, raw_handled = self.__try_no_focus_raw_preflight()
+        raw_snapshot, raw_error, raw_handled = self.__try_no_focus_raw_preflight(
+            source=normalized_source,
+        )
         if bool(raw_handled):
             return raw_snapshot, raw_error
         self.__log("collect strategy=no-focus-first step=hidden_cdp")
@@ -4578,27 +4581,93 @@ class CodexUsageMonitor:
                 return snapshot
         return None
 
+    def __try_collect_snapshot_via_raw_external_cdp_result(
+        self,
+        wait_timeout_sec: float | None = None,
+    ) -> tuple[UsageSnapshot | None, str | None]:
+        last_error: str | None = None
+        for port, _pid, _managed in self.__iter_external_profile_remote_debugging_endpoints(
+            include_owned=True,
+        ):
+            snapshot, error = self.__collect_snapshot_via_raw_cdp_port_result(
+                int(port),
+                wait_timeout_sec=wait_timeout_sec,
+            )
+            if snapshot is not None:
+                return snapshot, None
+            if error:
+                last_error = str(error)
+        return None, last_error
+
     def __try_no_focus_raw_preflight(
         self,
         wait_timeout_sec: float | None = None,
+        source: str = "",
     ) -> tuple[UsageSnapshot | None, str | None, bool]:
+        source_key = normalize_usage_value(source).lower()
+        is_background_monitor = self.__is_background_monitor_collect_source(source_key)
         profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
-        raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp(
-            wait_timeout_sec=wait_timeout_sec,
-        )
+        raw_error: str | None = None
+        if is_background_monitor:
+            raw_snapshot, raw_error = self.__try_collect_snapshot_via_raw_external_cdp_result(
+                wait_timeout_sec=wait_timeout_sec,
+            )
+        else:
+            raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp(
+                wait_timeout_sec=wait_timeout_sec,
+            )
         if raw_snapshot is not None:
             self.__log("collect strategy=no-focus-first recovered=raw_cdp_profile")
             return raw_snapshot, None, True
-        raw_system_snapshot = self.__try_collect_snapshot_via_raw_system_chrome_cdp(
-            wait_timeout_sec=wait_timeout_sec,
-        )
+        if is_background_monitor and raw_error == "collect_cancelled":
+            return None, "collect_cancelled", True
+        if is_background_monitor and raw_error in {"login_required", "cloudflare_challenge"}:
+            self.__log(
+                "collect strategy=no-focus-first auth-evidence=raw_cdp_profile "
+                f"reason={raw_error}"
+            )
+            return None, raw_error, True
+        raw_system_error: str | None = None
+        if is_background_monitor:
+            raw_system_snapshot, raw_system_error = (
+                self.__try_collect_snapshot_via_raw_system_chrome_cdp_result(
+                    wait_timeout_sec=wait_timeout_sec,
+                )
+            )
+        else:
+            raw_system_snapshot = self.__try_collect_snapshot_via_raw_system_chrome_cdp(
+                wait_timeout_sec=wait_timeout_sec,
+            )
         if raw_system_snapshot is not None:
             self.__log("collect strategy=no-focus-first recovered=raw_cdp_system_chrome")
             return raw_system_snapshot, None, True
+        if is_background_monitor and raw_system_error == "collect_cancelled":
+            return None, "collect_cancelled", True
+        if is_background_monitor and raw_system_error in {"login_required", "cloudflare_challenge"}:
+            self.__log(
+                "collect strategy=no-focus-first auth-evidence=raw_cdp_system_chrome "
+                f"reason={raw_system_error}"
+            )
+            return None, raw_system_error, True
         if bool(profile_cdp_available):
+            if is_background_monitor:
+                error = raw_error or raw_system_error or "parse_failed"
+                if error not in {"login_required", "cloudflare_challenge"}:
+                    error = "parse_failed"
+                self.__log(
+                    "collect strategy=no-focus-first skip=headless "
+                    f"reason=profile_cdp_active raw_error={error}"
+                )
+                return None, error, True
             self.__log("collect strategy=no-focus-first skip=headless reason=profile_cdp_active")
             return None, "login_required", True
         return None, None, False
+
+    def __is_background_monitor_collect_source(self, source: str) -> bool:
+        return normalize_usage_value(source).lower() in {
+            "monitor_tick",
+            "monitor_tick_pending_retry",
+        }
 
     def __has_profile_remote_debugging_endpoint(self) -> bool:
         try:
@@ -4622,6 +4691,22 @@ class CodexUsageMonitor:
             if snapshot is not None:
                 return snapshot
         return None
+
+    def __try_collect_snapshot_via_raw_system_chrome_cdp_result(
+        self,
+        wait_timeout_sec: float | None = None,
+    ) -> tuple[UsageSnapshot | None, str | None]:
+        last_error: str | None = None
+        for port, _pid in self.__iter_system_chrome_remote_debugging_endpoints():
+            snapshot, error = self.__collect_snapshot_via_raw_cdp_port_result(
+                int(port),
+                wait_timeout_sec=wait_timeout_sec,
+            )
+            if snapshot is not None:
+                return snapshot, None
+            if error:
+                last_error = str(error)
+        return None, last_error
 
     def __iter_system_chrome_remote_debugging_endpoints(self) -> list[tuple[int, int]]:
         target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
@@ -4669,23 +4754,35 @@ class CodexUsageMonitor:
         port: int,
         wait_timeout_sec: float | None = None,
     ) -> UsageSnapshot | None:
+        snapshot, _error = self.__collect_snapshot_via_raw_cdp_port_result(
+            port,
+            wait_timeout_sec=wait_timeout_sec,
+        )
+        return snapshot
+
+    def __collect_snapshot_via_raw_cdp_port_result(
+        self,
+        port: int,
+        wait_timeout_sec: float | None = None,
+    ) -> tuple[UsageSnapshot | None, str | None]:
         try:
             target_port = int(port)
         except Exception:
-            return None
+            return None, "parse_failed"
         if target_port <= 0:
-            return None
+            return None, "parse_failed"
         browser_ws = self.__fetch_raw_cdp_browser_websocket_url(target_port)
         if not browser_ws:
-            return None
+            return None, "parse_failed"
         socket_timeout_sec = float(RAW_CDP_COMMAND_TIMEOUT_SEC)
         ws = None
         target_id = ""
+        last_probe: dict[str, Any] | None = None
         try:
             ws = _create_raw_websocket_connection(browser_ws, socket_timeout_sec)
             target_id = self.__raw_cdp_create_target(ws)
             if not target_id:
-                return None
+                return None, "parse_failed"
             attach = self.__raw_cdp_send(
                 ws,
                 "Target.attachToTarget",
@@ -4699,7 +4796,7 @@ class CodexUsageMonitor:
                     {"targetId": str(target_id)},
                 )
                 target_id = ""
-                return None
+                return None, "parse_failed"
             self.__raw_cdp_send(ws, "Runtime.enable", session_id=session_id)
             self.__raw_cdp_send(ws, "Page.enable", session_id=session_id)
             self.__raw_cdp_send(
@@ -4721,14 +4818,15 @@ class CodexUsageMonitor:
                 deadline = 0.0
             while True:
                 if self.__is_collect_cancel_requested():
-                    return None
+                    return None, "collect_cancelled"
                 probe = self.__raw_cdp_probe_target(ws, session_id=session_id)
+                last_probe = probe
                 snapshot = self.__build_snapshot_from_probe(probe)
                 if snapshot is not None:
                     self.__set_session_state("logged_in")
                     self.__last_successful_cdp_port = int(target_port)
                     self.__log(f"raw cdp snapshot collected port={int(target_port)}")
-                    return snapshot
+                    return snapshot, None
                 now = 0.0
                 try:
                     now = float(self.__lib.time.monotonic())
@@ -4757,7 +4855,7 @@ class CodexUsageMonitor:
                     ws.close()
                 except Exception:
                     pass
-        return None
+        return None, self.__classify_raw_usage_probe_error(last_probe)
 
     def __fetch_raw_cdp_browser_websocket_url(self, port: int) -> str:
         try:
@@ -5866,6 +5964,58 @@ class CodexUsageMonitor:
         if not snapshot.has_any_metric():
             return None
         return snapshot
+
+    def __classify_raw_usage_probe_error(self, probe: dict[str, Any] | None) -> str:
+        normalized_probe = self.__normalize_probe_payload(
+            probe,
+            fallback_url=str(self.__usage_url),
+        )
+        page_url = normalize_usage_value(normalized_probe.get("url", ""))
+        lowered_url = page_url.lower()
+        if any(token in lowered_url for token in ("login", "log-in", "signin", "sign-in", "auth")):
+            return "login_required"
+
+        title = normalize_usage_value(normalized_probe.get("title", ""))
+        main_text = normalize_usage_value(normalized_probe.get("mainText", ""))
+        combined_text = f"{title} {main_text}".strip().lower()
+        if not combined_text:
+            return "parse_failed"
+
+        cloudflare_markers = (
+            "cloudflare",
+            "verify you are human",
+            "checking your browser",
+            "사람인지 확인",
+        )
+        if any(marker in combined_text for marker in cloudflare_markers):
+            return "cloudflare_challenge"
+
+        explicit_login_markers = (
+            "login required",
+            "log in required",
+            "sign in required",
+            "please log in",
+            "please sign in",
+            "log in to",
+            "sign in to",
+            "로그인이 필요",
+            "로그인 필요",
+            "로그인해 주세요",
+            "로그인하세요",
+            "로그인 후",
+        )
+        if any(marker in combined_text for marker in explicit_login_markers):
+            return "login_required"
+
+        login_button_markers = (
+            "log in",
+            "sign in",
+            "로그인",
+        )
+        if any(marker in combined_text for marker in login_button_markers):
+            return "login_required"
+
+        return "parse_failed"
 
     def __is_login_required(self, page) -> bool:
         url = ""

@@ -432,7 +432,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIs(snap, recovered)
-        raw_preflight.assert_called_once_with(wait_timeout_sec=4.0)
+        raw_preflight.assert_called_once_with(wait_timeout_sec=4.0, source="pending_login_poll")
 
     def test_collect_with_playwright_obj_prefers_profile_raw_cdp_before_cloudflare_probe(self) -> None:
         recovered = UsageSnapshot.from_metrics(
@@ -532,6 +532,160 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNone(snap)
         self.assertEqual(err, "login_required")
         self.assertEqual(collect_once.call_count, 0)
+
+    def test_collect_with_playwright_obj_background_raw_miss_with_profile_cdp_is_parse_failed(
+        self,
+    ) -> None:
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            side_effect=AssertionError("headless browser launch should not run"),
+        ) as collect_once:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
+                return_value=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp_result",
+                    return_value=(None, "parse_failed"),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp_result",
+                        return_value=(None, "parse_failed"),
+                    ):
+                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="monitor_tick",
+                        )
+
+        self.assertIsNone(snap)
+        self.assertEqual(err, "parse_failed")
+        self.assertEqual(collect_once.call_count, 0)
+
+    def test_background_raw_miss_parse_failed_does_not_mark_logged_out_or_show_login_tooltip(
+        self,
+    ) -> None:
+        class _InlineQueue:
+            def put(self, fn):
+                fn()
+
+        self.monitor._CodexUsageMonitor__event_queue = _InlineQueue()
+        self.monitor._CodexUsageMonitor__set_session_state("logged_in")
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            side_effect=AssertionError("headless browser launch should not run"),
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
+                return_value=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp_result",
+                    return_value=(None, "parse_failed"),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp_result",
+                        return_value=(None, "parse_failed"),
+                    ):
+                        _snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="monitor_tick",
+                        )
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__show_tooltip",
+        ) as show_tip:
+            self.monitor._CodexUsageMonitor__handle_collect_error(
+                str(err or ""),
+                source="monitor_tick",
+            )
+
+        self.assertEqual(err, "parse_failed")
+        self.assertEqual(self.monitor.get_runtime_status().get("session_state"), "logged_in")
+        shown_texts = [str(call.args[0]) for call in show_tip.call_args_list if call.args]
+        self.assertFalse(any("Codex 로그인이 필요합니다" in text for text in shown_texts))
+
+    def test_collect_with_playwright_obj_background_raw_cancel_propagates_cancelled(
+        self,
+    ) -> None:
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__collect_snapshot_once",
+            side_effect=AssertionError("headless browser launch should not run"),
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
+                return_value=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp_result",
+                    return_value=(None, "collect_cancelled"),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp_result",
+                        return_value=(None, "parse_failed"),
+                    ):
+                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="monitor_tick",
+                        )
+
+        self.assertIsNone(snap)
+        self.assertEqual(err, "collect_cancelled")
+
+    def test_classify_raw_usage_probe_error_detects_login_url(self) -> None:
+        err = self.monitor._CodexUsageMonitor__classify_raw_usage_probe_error(
+            {"url": "https://auth.openai.com/log-in", "mainText": ""}
+        )
+
+        self.assertEqual(err, "login_required")
+
+    def test_classify_raw_usage_probe_error_detects_explicit_login_text(self) -> None:
+        err = self.monitor._CodexUsageMonitor__classify_raw_usage_probe_error(
+            {
+                "url": "https://chatgpt.com/codex/settings/usage",
+                "mainText": "Codex 사용량을 보려면 로그인이 필요합니다.",
+            }
+        )
+
+        self.assertEqual(err, "login_required")
+
+    def test_classify_raw_usage_probe_error_rejects_broad_account_markers(self) -> None:
+        for text in ("Sign up", "Continue with Google"):
+            with self.subTest(text=text):
+                err = self.monitor._CodexUsageMonitor__classify_raw_usage_probe_error(
+                    {
+                        "url": "https://chatgpt.com/codex/settings/usage",
+                        "mainText": text,
+                    }
+                )
+
+                self.assertEqual(err, "parse_failed")
+
+    def test_classify_raw_usage_probe_error_keeps_usage_page_without_metrics_parse_failed(
+        self,
+    ) -> None:
+        err = self.monitor._CodexUsageMonitor__classify_raw_usage_probe_error(
+            {
+                "url": "https://chatgpt.com/codex/settings/usage",
+                "mainText": "5-hour usage limit",
+                "metricBlocks": [],
+            }
+        )
+
+        self.assertEqual(err, "parse_failed")
 
     def test_collect_with_playwright_obj_uses_hidden_no_focus_probe_for_background_login_required(
         self,
