@@ -3044,17 +3044,8 @@ class CodexUsageMonitor:
         return
 
     def __show_manual_login_started_tooltip(self) -> None:
-        latest = self.get_last_snapshot()
-        if latest is not None and latest.has_any_metric():
-            self.__show_snapshot_tooltip(
-                latest,
-                title="Codex 최근 사용량 (로그인 창 여는 중...)",
-                duration_ms=0,
-                footer="로그인 완료 후 자동으로 수집합니다.",
-            )
-            return
         self.__show_tooltip(
-            "Codex 로그인 창을 여는 중... 로그인 완료 후 자동으로 수집합니다.",
+            "Codex 로그인 창을 여는 중...",
             duration_ms=0,
         )
         return
@@ -3381,12 +3372,7 @@ class CodexUsageMonitor:
                 if duration < 1200:
                     duration = 1200
                 auto_hide_ms = duration
-        current = self.__active_tooltip
-        if current is not None:
-            try:
-                current.hide_tooltip()
-            except Exception:
-                pass
+        self.__hide_active_tooltip()
         tooltip = ToolTip(
             root,
             str(text or ""),
@@ -3400,6 +3386,16 @@ class CodexUsageMonitor:
             tooltip.show_tooltip()
         except Exception:
             return
+        return
+
+    def __hide_active_tooltip(self) -> None:
+        current = self.__active_tooltip
+        self.__active_tooltip = None
+        if current is not None:
+            try:
+                current.hide_tooltip()
+            except Exception:
+                pass
         return
 
     def __handle_collect_error(self, error: str, source: str = "") -> None:
@@ -3632,9 +3628,9 @@ class CodexUsageMonitor:
             reason=str(error or ""),
         )
         if error == "login_required":
-            notice = "Codex 로그인 창을 여는 중... 로그인 완료 후 자동으로 수집합니다."
+            notice = "Codex 로그인 창을 여는 중..."
         else:
-            notice = "Cloudflare 인증 창을 여는 중... 인증 완료 후 자동으로 수집합니다."
+            notice = "Cloudflare 인증 창을 여는 중..."
         self.__ui_post(lambda: self.__show_tooltip(notice))
         return self.__collect_snapshot_once(
             playwright_obj,
@@ -3710,11 +3706,39 @@ class CodexUsageMonitor:
                     if context is None and self.__is_profile_locked_without_remote_debugging():
                         return None, "profile_in_use"
                 else:
-                    context, cdp_browser, cdp_proc = self.__launch_interactive_context_via_cdp(
-                        playwright_obj,
-                        start_hidden=False,
-                        initial_url=start_url,
-                    )
+                    if bool(allow_interactive_recovery):
+                        existing_profile_endpoints = (
+                            self.__iter_external_profile_remote_debugging_endpoints(
+                                include_owned=True,
+                            )
+                        )
+                        has_managed_existing = any(
+                            bool(item[2]) for item in existing_profile_endpoints
+                        )
+                        if bool(has_managed_existing):
+                            self.__log(
+                                "interactive cdp closing managed existing profile process "
+                                "before visible login"
+                            )
+                            self.__terminate_profile_remote_debugging_processes(
+                                managed_only=True
+                            )
+                            try:
+                                self.__lib.time.sleep(0.5)
+                            except Exception:
+                                pass
+                        else:
+                            context, cdp_browser, cdp_proc, keep_cdp_process = (
+                                self.__connect_existing_profile_remote_debug_context(playwright_obj)
+                            )
+                            if context is not None:
+                                self.__log("interactive cdp reused existing profile process")
+                    if context is None:
+                        context, cdp_browser, cdp_proc = self.__launch_interactive_context_via_cdp(
+                            playwright_obj,
+                            start_hidden=False,
+                            initial_url=start_url,
+                        )
             if context is None:
                 launch_headless = bool(effective_headless)
                 if (not launch_headless) and bool(force_hidden):
@@ -3737,6 +3761,12 @@ class CodexUsageMonitor:
             if cdp_proc is not None:
                 if bool(force_hidden) and bool(should_hide_cdp_window):
                     self.__set_cdp_window_visibility(cdp_proc, visible=False, bring_to_front=False)
+                elif bool(allow_interactive_recovery) and bool(is_external_cdp):
+                    self.__set_cdp_window_visibility(
+                        cdp_proc,
+                        visible=True,
+                        bring_to_front=True,
+                    )
             if bool(is_external_cdp) and not bool(is_monitor_managed_cdp):
                 try:
                     page = context.new_page()
@@ -3756,6 +3786,8 @@ class CodexUsageMonitor:
             if self.__is_collect_cancel_requested():
                 return None, "collect_cancelled"
             self.__refresh_collect_page(page, str(start_url))
+            if bool(allow_interactive_recovery) and not bool(force_hidden):
+                self.__ui_post(self.__hide_active_tooltip)
             if (
                 cdp_proc is not None
                 and bool(force_hidden)
@@ -3829,7 +3861,19 @@ class CodexUsageMonitor:
             if snapshot is not None:
                 self.__set_session_state("logged_in")
                 if bool(allow_interactive_recovery) and cdp_proc is not None:
-                    self.__log_interactive_cdp_close_after_success(cdp_proc)
+                    keep_after_success = self.__keep_interactive_cdp_process_open(
+                        cdp_proc,
+                        reason="logged_in",
+                    )
+                    if bool(keep_after_success):
+                        keep_cdp_process = True
+                        self.__set_cdp_window_visibility(
+                            cdp_proc,
+                            visible=False,
+                            bring_to_front=False,
+                        )
+                    elif not bool(keep_cdp_process):
+                        self.__log_interactive_cdp_close_after_success(cdp_proc)
                 return snapshot, None
             if bool(effective_headless):
                 return self.__wait_for_snapshot_ready(
@@ -3842,7 +3886,19 @@ class CodexUsageMonitor:
                     timeout_sec=self.__login_timeout_sec,
                 )
                 if waited_error is None and waited_snapshot is not None and cdp_proc is not None:
-                    self.__log_interactive_cdp_close_after_success(cdp_proc)
+                    keep_after_success = self.__keep_interactive_cdp_process_open(
+                        cdp_proc,
+                        reason="logged_in",
+                    )
+                    if bool(keep_after_success):
+                        keep_cdp_process = True
+                        self.__set_cdp_window_visibility(
+                            cdp_proc,
+                            visible=False,
+                            bring_to_front=False,
+                        )
+                    elif not bool(keep_cdp_process):
+                        self.__log_interactive_cdp_close_after_success(cdp_proc)
                 elif waited_error in {"login_required", "parse_failed", "cloudflare_challenge"}:
                     keep_cdp_process = self.__keep_interactive_cdp_process_open(
                         cdp_proc,
@@ -4398,6 +4454,8 @@ class CodexUsageMonitor:
         except Exception:
             pass
         self.__pending_hidden_cdp_clear = False
+        self.__hidden_cdp_proc = proc
+        self.__hidden_cdp_port = int(port)
         self.__last_successful_cdp_port = int(port)
         normalized_reason = normalize_usage_value(reason) or "pending"
         self.__log(
@@ -5138,6 +5196,10 @@ class CodexUsageMonitor:
                                 self.__lib.win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
                             else:
                                 self.__lib.win32gui.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+                            self.__restore_window_to_visible_area(
+                                hwnd,
+                                activate=bool(bring_to_front),
+                            )
                             if bool(bring_to_front):
                                 try:
                                     self.__lib.win32gui.SetForegroundWindow(hwnd)
@@ -5164,6 +5226,89 @@ class CodexUsageMonitor:
             except Exception:
                 break
         return False
+
+    def __restore_window_to_visible_area(self, hwnd: int, activate: bool = False) -> None:
+        try:
+            handle = int(hwnd)
+        except Exception:
+            return
+        if handle <= 0:
+            return
+        try:
+            left, top, right, bottom = self.__lib.win32gui.GetWindowRect(handle)
+            left = int(left)
+            top = int(top)
+            right = int(right)
+            bottom = int(bottom)
+        except Exception:
+            return
+        width = int(right - left)
+        height = int(bottom - top)
+        if width <= 0 or height <= 0:
+            width = 1280
+            height = 900
+        try:
+            user32 = self.__lib.ctypes.windll.user32
+            screen_x = int(user32.GetSystemMetrics(76) or 0)
+            screen_y = int(user32.GetSystemMetrics(77) or 0)
+            screen_w = int(user32.GetSystemMetrics(78) or 0)
+            screen_h = int(user32.GetSystemMetrics(79) or 0)
+            if screen_w <= 0 or screen_h <= 0:
+                screen_x = 0
+                screen_y = 0
+                screen_w = int(user32.GetSystemMetrics(0) or 0)
+                screen_h = int(user32.GetSystemMetrics(1) or 0)
+        except Exception:
+            screen_x = 0
+            screen_y = 0
+            screen_w = 0
+            screen_h = 0
+        if screen_w <= 0 or screen_h <= 0:
+            screen_x = 0
+            screen_y = 0
+            screen_w = 1280
+            screen_h = 900
+        screen_right = int(screen_x + screen_w)
+        screen_bottom = int(screen_y + screen_h)
+        is_offscreen = (
+            right <= screen_x
+            or bottom <= screen_y
+            or left >= screen_right
+            or top >= screen_bottom
+            or left <= -10000
+            or top <= -10000
+        )
+        if not bool(is_offscreen):
+            return
+        target_w = min(max(width, 900), max(screen_w - 80, 640))
+        target_h = min(max(height, 700), max(screen_h - 80, 480))
+        target_x = max(
+            screen_x + 20,
+            min(screen_x + 80, screen_right - int(target_w) - 20),
+        )
+        target_y = max(
+            screen_y + 20,
+            min(screen_y + 80, screen_bottom - int(target_h) - 20),
+        )
+        # Stable Win32 constants: SWP_NOZORDER=0x0004,
+        # SWP_NOOWNERZORDER=0x0200, SWP_SHOWWINDOW=0x0040,
+        # SWP_NOACTIVATE=0x0010.
+        flags = 0x0004 | 0x0200 | 0x0040
+        if not bool(activate):
+            flags |= 0x0010
+        try:
+            self.__lib.win32gui.SetWindowPos(
+                handle,
+                0,
+                int(target_x),
+                int(target_y),
+                int(target_w),
+                int(target_h),
+                int(flags),
+            )
+        except Exception:
+            return
+        return
 
     def __hide_window_from_taskbar(self, hwnd: int) -> None:
         try:
@@ -5459,7 +5604,7 @@ class CodexUsageMonitor:
                 pass
         return
 
-    def __terminate_profile_remote_debugging_processes(self) -> None:
+    def __terminate_profile_remote_debugging_processes(self, managed_only: bool = False) -> None:
         target_profile = self.__normalize_local_path(str(self.__profile_dir or ""))
         if not target_profile:
             return
@@ -5483,6 +5628,10 @@ class CodexUsageMonitor:
                 if not self.__is_chrome_cmdline_for_profile(cmdline, target_profile):
                     continue
                 if self.__get_chrome_remote_debugging_port(cmdline) <= 0:
+                    continue
+                if bool(managed_only) and not self.__is_monitor_managed_chrome_cmdline(
+                    cmdline
+                ):
                     continue
                 to_kill.append(item)
             except Exception:
