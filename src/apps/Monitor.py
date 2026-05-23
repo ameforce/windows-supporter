@@ -1,3 +1,5 @@
+import json
+
 from src.utils.LibConnector import LibConnector
 import threading
 
@@ -19,6 +21,8 @@ class Monitor:
 
         self.__root = None
         self.__event_queue = None
+        self.__background_settings_path = self.__get_background_settings_path()
+        self.__background_enabled = self.__load_background_enabled()
         self.__hotkeys_registered = False
         self.__features_warmup_started = False
         self.__features_warmup_done = False
@@ -39,6 +43,8 @@ class Monitor:
     def attach(self, root, event_queue) -> None:
         self.__root = root
         self.__event_queue = event_queue
+        if not self.__background_enabled:
+            return
         if not self.__hotkeys_registered:
             try:
                 self.__register_hotkeys()
@@ -50,11 +56,15 @@ class Monitor:
         return
 
     def on_session_unlock(self) -> None:
+        if not self.__background_enabled:
+            return
         self.__reset_hotkeys()
         self.on_display_topology_changed("session_unlock")
         return
 
     def on_display_topology_changed(self, reason: str = "display_change") -> None:
+        if not self.__background_enabled:
+            return
         root = self.__root
         try:
             self.__ensure_kakao().invalidate_display_topology(
@@ -132,6 +142,8 @@ class Monitor:
         return self.__codex_usage
 
     def __attach_features_on_ui_thread(self) -> None:
+        if not self.__background_enabled:
+            return
         root = self.__root
         if root is None:
             return
@@ -164,6 +176,8 @@ class Monitor:
         return
 
     def __start_feature_warmup_async(self) -> None:
+        if not self.__background_enabled:
+            return
         if self.__features_warmup_started:
             self.__ui_post(self.__attach_features_on_ui_thread)
             return
@@ -191,6 +205,8 @@ class Monitor:
         return
 
     def __register_hotkeys(self) -> None:
+        if not self.__background_enabled:
+            return
         kb = self.__lib.keyboard
 
         def safe(cb):
@@ -217,6 +233,8 @@ class Monitor:
         self.__foreground_hotkey_handles = []
         self.__foreground_hotkey_profile = None
         self.__hotkeys_registered = False
+        if not self.__background_enabled:
+            return
         try:
             self.__register_hotkeys()
             self.__hotkeys_registered = True
@@ -229,6 +247,8 @@ class Monitor:
         return
 
     def __start_foreground_hotkey_poll(self) -> None:
+        if not self.__background_enabled:
+            return
         root = self.__root
         if root is None:
             return
@@ -245,6 +265,8 @@ class Monitor:
 
     def __poll_foreground_hotkeys(self) -> None:
         self.__foreground_hotkey_after_id = None
+        if not self.__background_enabled:
+            return
         try:
             self.__sync_foreground_hotkeys()
         except Exception:
@@ -300,6 +322,110 @@ class Monitor:
             add("ctrl+q", self.__on_ctrl_q)
         elif profile == "notion":
             add("ctrl+s", self.__on_ctrl_s)
+        return
+
+    def get_dashboard_status_snapshot(self) -> dict:
+        return {
+            "enabled": bool(self.__background_enabled),
+            "root_attached": self.__root is not None,
+            "event_queue_attached": self.__event_queue is not None,
+            "hotkeys_registered": bool(self.__hotkeys_registered),
+            "features_warmup_started": bool(self.__features_warmup_started),
+            "features_warmup_done": bool(self.__features_warmup_done),
+            "wrike_attached": bool(self.__wrike_attached),
+            "lijamong_attached": bool(self.__lijamong_attached),
+            "codex_attached": bool(self.__codex_attached),
+            "foreground_hotkey_profile": str(self.__foreground_hotkey_profile or ""),
+            "foreground_hotkey_count": len(list(self.__foreground_hotkey_handles)),
+            "foreground_hotkey_poll_active": self.__foreground_hotkey_after_id is not None,
+            "kakao_tick_active": self.__kakao_after_id is not None,
+        }
+
+    def set_background_enabled(self, enabled: bool) -> bool:
+        next_enabled = bool(enabled)
+        changed = next_enabled != bool(self.__background_enabled)
+        self.__background_enabled = next_enabled
+        self.__save_background_enabled()
+        if not changed:
+            return bool(self.__background_enabled)
+        if self.__background_enabled:
+            self.__start_background_tasks()
+        else:
+            self.__stop_background_tasks()
+        return bool(self.__background_enabled)
+
+    def __get_background_settings_path(self) -> str:
+        try:
+            appdata = self.__lib.os.environ.get("APPDATA")
+            base_dir = appdata if appdata else self.__lib.os.path.expanduser("~")
+            return self.__lib.os.path.join(
+                base_dir,
+                "windows-supporter",
+                "background_settings.json",
+            )
+        except Exception:
+            return "background_settings.json"
+
+    def __load_background_enabled(self) -> bool:
+        try:
+            path = str(self.__background_settings_path or "")
+            if not path or not self.__lib.os.path.exists(path):
+                return True
+            with open(path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            return bool(data.get("enabled", True)) if isinstance(data, dict) else True
+        except Exception:
+            return True
+
+    def __save_background_enabled(self) -> None:
+        try:
+            path = str(self.__background_settings_path or "")
+            if not path:
+                return
+            self.__lib.os.makedirs(self.__lib.os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump({"enabled": bool(self.__background_enabled)}, fp, ensure_ascii=False, indent=2)
+                fp.write("\n")
+        except Exception:
+            return
+        return
+
+    def __start_background_tasks(self) -> None:
+        if self.__root is None:
+            return
+        if not self.__hotkeys_registered:
+            try:
+                self.__register_hotkeys()
+                self.__hotkeys_registered = True
+            except Exception:
+                self.__hotkeys_registered = False
+        self.__start_foreground_hotkey_poll()
+        self.__start_feature_warmup_async()
+        self.__ui_post(self.__attach_features_on_ui_thread)
+        return
+
+    def __stop_background_tasks(self) -> None:
+        root = self.__root
+        if root is not None and self.__foreground_hotkey_after_id is not None:
+            try:
+                root.after_cancel(self.__foreground_hotkey_after_id)
+            except Exception:
+                pass
+        if root is not None and self.__kakao_after_id is not None:
+            try:
+                root.after_cancel(self.__kakao_after_id)
+            except Exception:
+                pass
+        self.__foreground_hotkey_after_id = None
+        self.__kakao_after_id = None
+        try:
+            self.__lib.keyboard.unhook_all()
+        except Exception:
+            pass
+        self.__clear_keyboard_state(self.__lib.keyboard)
+        self.__foreground_hotkey_handles = []
+        self.__foreground_hotkey_profile = None
+        self.__hotkeys_registered = False
         return
 
     def __safe_hotkey(self, cb):
@@ -372,7 +498,7 @@ class Monitor:
                 ui = None
             try:
                 if ui is not None:
-                    ui.show_kakao_monitor()
+                    ui.show()
                 else:
                     kakao.open_monitor_selector(root)
             except Exception:
@@ -459,6 +585,8 @@ class Monitor:
         return
 
     def __start_kakao_tick(self) -> None:
+        if not self.__background_enabled:
+            return
         root = self.__root
         if root is None:
             return
@@ -475,6 +603,8 @@ class Monitor:
         if root is None:
             return
         self.__kakao_after_id = None
+        if not self.__background_enabled:
+            return
         try:
             self.__ensure_kakao().tick(root)
         except Exception:
@@ -490,7 +620,7 @@ class Monitor:
         try:
             ui = getattr(root, "_ws_main_ui", None)
             if ui is not None:
-                ui.show_kakao_monitor()
+                ui.show()
                 return
             kakao.open_monitor_selector(root)
         except Exception:

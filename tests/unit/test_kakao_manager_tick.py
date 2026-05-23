@@ -88,6 +88,20 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
 
         request_background.assert_called_once()
 
+    def test_update_settings_disables_background_tick(self) -> None:
+        request_background = Mock()
+        self.manager._KakaoManager__request_background_tick = request_background
+
+        with patch.object(self.manager, "_KakaoManager__save_config") as save_config:
+            ok, err = self.manager.update_settings({"enabled": False})
+            self.manager.tick(root=object())
+
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertFalse(self.manager.get_settings_snapshot()["enabled"])
+        request_background.assert_not_called()
+        save_config.assert_called_once()
+
     def test_open_monitor_selector_requests_refresh_when_no_snapshot_exists(self) -> None:
         request_refresh = Mock()
         self.manager.request_refresh = request_refresh

@@ -51,6 +51,7 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
                     with patch("src.apps.Monitor.KakaoManager", return_value=object()):
                         with patch("src.apps.Monitor.LiJaMong", return_value=object()):
                             monitor = Monitor()
+                            monitor._Monitor__background_enabled = True
                             monitor._Monitor__register_hotkeys()
 
         press_keys = [key for key, _suppress in lib.keyboard.on_press_key_calls]
@@ -80,6 +81,7 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
                             return_value=lib,
                         ):
                             monitor = Monitor()
+                            monitor._Monitor__background_enabled = True
                             monitor._Monitor__register_hotkeys()
 
         press_keys = [key for key, _suppress in lib.keyboard.on_press_key_calls]
@@ -102,6 +104,7 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
 
         with patch("src.apps.Monitor.LibConnector", return_value=lib):
             monitor = Monitor()
+            monitor._Monitor__background_enabled = True
             monitor._Monitor__register_hotkeys()
             monitor._Monitor__sync_foreground_hotkeys("wrike")
 
