@@ -20,6 +20,51 @@ class _FakeRoot:
         return f"{self.after_result_prefix}-{len(self.after_calls)}"
 
 
+class _FakeWidget:
+    def __init__(self, master=None, **kwargs):
+        self.master = master
+        self.kwargs = dict(kwargs)
+        self.pack_calls = []
+
+    def pack(self, **kwargs):
+        self.pack_calls.append(dict(kwargs))
+
+
+class _FakeNotebook(_FakeWidget):
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.tabs = []
+        self.bind_calls = []
+
+    def add(self, child, text=""):
+        self.tabs.append((child, text))
+
+    def bind(self, event, callback):
+        self.bind_calls.append((event, callback))
+
+
+class _FakeTtk:
+    def __init__(self):
+        self.frames = []
+        self.labels = []
+        self.notebooks = []
+
+    def Frame(self, master=None, **kwargs):
+        frame = _FakeWidget(master, **kwargs)
+        self.frames.append(frame)
+        return frame
+
+    def Label(self, master=None, **kwargs):
+        label = _FakeWidget(master, **kwargs)
+        self.labels.append(label)
+        return label
+
+    def Notebook(self, master=None, **kwargs):
+        notebook = _FakeNotebook(master, **kwargs)
+        self.notebooks.append(notebook)
+        return notebook
+
+
 class _FakeKakao:
     def __init__(self, results):
         self.results = list(results)
@@ -63,6 +108,28 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
 
         self.assertEqual(ui._tab_sizes.get(ui._TAB_CODEX), (820, 520))
         self.assertEqual(ui._tab_minsizes.get(ui._TAB_CODEX), (760, 500))
+
+    def test_main_shell_places_version_label_at_bottom_right(self) -> None:
+        fake_ttk = _FakeTtk()
+
+        def install_fake_tk(ui):
+            ui._tk = object()
+            ui._ttk = fake_ttk
+
+        with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", install_fake_tk):
+            with patch("src.apps.main_ui.get_app_version_label", return_value="Version v0.3.5 (64d97c3)"):
+                ui = WindowsSupporterMainUI(
+                    root=_FakeRoot(),
+                    startup_manager=object(),
+                    monitor=object(),
+                )
+
+        self.assertIsNotNone(ui._footer_frame)
+        self.assertIsNotNone(ui._version_label)
+        self.assertEqual(ui._version_label.kwargs.get("text"), "Version v0.3.5 (64d97c3)")
+        self.assertEqual(ui._version_label.kwargs.get("anchor"), "e")
+        self.assertEqual(ui._footer_frame.pack_calls[-1].get("side"), "bottom")
+        self.assertEqual(ui._version_label.pack_calls[-1].get("side"), "right")
 
     def test_kakao_build_false_keeps_tab_unbuilt_and_schedules_single_retry(self) -> None:
         ui, root, kakao = self._build_ui(kakao=_FakeKakao([False, False]))
