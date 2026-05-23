@@ -7,6 +7,9 @@ set "EXE_NAME=%EXE_BASE%.exe"
 set "MAIN_SOURCE=main.py"
 set "CURRENT_DIR=%~dp0"
 set "ROOT_EXE=%CURRENT_DIR%%EXE_NAME%"
+set "BUILD_GENERATED_DIR=build\generated"
+set "BUILD_INFO_MODULE=%BUILD_GENERATED_DIR%\windows_supporter_build_info.py"
+set "VERSION_FILE=%BUILD_GENERATED_DIR%\%EXE_BASE%-version-info.txt"
 set "STEP_LOG=%TEMP%\%EXE_BASE%-build-%RANDOM%%RANDOM%.log"
 
 REM Switch to repo root
@@ -89,10 +92,22 @@ call :remove_pyinstaller_byproducts " before build"
 if errorlevel 1 exit /b 1
 echo [ Success !! ]
 
+REM Generate build-time version metadata from Git tags and current commit
+echo | set /p="Generating version metadata..."
+call :clear_log
+uv run python "tools\generate_build_metadata.py" --repo-root "%CURRENT_DIR:~0,-1%" --module-output "%BUILD_INFO_MODULE%" --version-file "%VERSION_FILE%" --exe-name "%EXE_NAME%" > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo Version metadata generation failed.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+
 REM Build the executable
 echo | set /p="Building %MAIN_SOURCE% to %EXE_NAME%..."
 call :clear_log
-uv run python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
+uv run python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller build failed.

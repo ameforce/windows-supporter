@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
+
+from src.apps.main_ui_state import load_last_tab, save_last_tab
+from src.utils.app_version import get_app_version_label
 
 
 class WindowsSupporterMainUI:
+    _TAB_DASHBOARD = "dashboard"
     _TAB_STARTUP = "startup_apps"
     _TAB_KAKAO = "kakao_monitor"
     _TAB_WRIKE = "wrike"
@@ -16,21 +21,29 @@ class WindowsSupporterMainUI:
         startup_manager: Any,
         monitor: Any,
         event_queue: Any = None,
+        state_path: str | None = None,
     ) -> None:
         self._root = root
         self._startup_manager = startup_manager
         self._monitor = monitor
         self._event_queue = event_queue
+        self._state_path = state_path
 
         self._tk = None
         self._ttk = None
 
         self._notebook = None
+        self._shell_frame = None
+        self._footer_frame = None
+        self._version_label = None
+        self._tab_dashboard = None
         self._tab_startup = None
         self._tab_kakao = None
         self._tab_wrike = None
         self._tab_codex = None
 
+        self._dashboard_view = None
+        self._dashboard_built = False
         self._startup_view = None
         self._startup_built = False
         self._kakao_built = False
@@ -41,12 +54,14 @@ class WindowsSupporterMainUI:
         self._codex_built = False
         self._current_tab = None
         self._tab_sizes = {
+            self._TAB_DASHBOARD: (1000, 480),
             self._TAB_STARTUP: (1000, 560),
             self._TAB_KAKAO: (700, 340),
             self._TAB_WRIKE: (840, 580),
             self._TAB_CODEX: (820, 520),
         }
         self._tab_minsizes = {
+            self._TAB_DASHBOARD: (940, 480),
             self._TAB_STARTUP: (940, 520),
             self._TAB_KAKAO: (620, 300),
             self._TAB_WRIKE: (800, 520),
@@ -83,6 +98,8 @@ class WindowsSupporterMainUI:
 
         if tab:
             self._select_tab(str(tab))
+        else:
+            self._select_tab(self._load_last_tab())
         self._ensure_selected_tab_built()
         return
 
@@ -108,8 +125,16 @@ class WindowsSupporterMainUI:
         self.show(self._TAB_STARTUP)
         return
 
+    def show_dashboard(self) -> None:
+        self.show(self._TAB_DASHBOARD)
+        return
+
     def show_kakao_monitor(self) -> None:
         self.show(self._TAB_KAKAO)
+        return
+
+    def show_wrike(self) -> None:
+        self.show(self._TAB_WRIKE)
         return
 
     def show_codex_usage(self) -> None:
@@ -142,12 +167,12 @@ class WindowsSupporterMainUI:
         except Exception:
             pass
         try:
-            w, h = self._tab_sizes.get(self._TAB_STARTUP, (1000, 560))
+            w, h = self._tab_sizes.get(self._TAB_DASHBOARD, (1000, 480))
             root.geometry(f"{int(w)}x{int(h)}")
         except Exception:
             pass
         try:
-            mw, mh = self._tab_minsizes.get(self._TAB_STARTUP, (940, 520))
+            mw, mh = self._tab_minsizes.get(self._TAB_DASHBOARD, (940, 480))
             root.minsize(int(mw), int(mh))
         except Exception:
             pass
@@ -161,22 +186,48 @@ class WindowsSupporterMainUI:
         except Exception:
             pass
 
-        notebook = ttk.Notebook(root)
-        self._notebook = notebook
+        shell = ttk.Frame(root)
+        self._shell_frame = shell
         try:
-            notebook.pack(fill="both", expand=True)
+            shell.pack(fill="both", expand=True)
         except Exception:
             pass
 
+        footer = ttk.Frame(shell)
+        self._footer_frame = footer
+        try:
+            footer.pack(side="bottom", fill="x")
+        except Exception:
+            pass
+        try:
+            self._version_label = ttk.Label(
+                footer,
+                text=get_app_version_label(),
+                anchor="e",
+            )
+            self._version_label.pack(side="right", padx=(8, 10), pady=(2, 4))
+        except Exception:
+            self._version_label = None
+
+        notebook = ttk.Notebook(shell)
+        self._notebook = notebook
+        try:
+            notebook.pack(side="top", fill="both", expand=True)
+        except Exception:
+            pass
+
+        tab_dashboard = ttk.Frame(notebook)
         tab_startup = ttk.Frame(notebook)
         tab_kakao = ttk.Frame(notebook)
         tab_wrike = ttk.Frame(notebook)
         tab_codex = ttk.Frame(notebook)
+        self._tab_dashboard = tab_dashboard
         self._tab_startup = tab_startup
         self._tab_kakao = tab_kakao
         self._tab_wrike = tab_wrike
         self._tab_codex = tab_codex
 
+        notebook.add(tab_dashboard, text="Dashboard")
         notebook.add(tab_startup, text="Startup Apps")
         notebook.add(tab_kakao, text="KakaoTalk")
         notebook.add(tab_wrike, text="Wrike")
@@ -188,6 +239,7 @@ class WindowsSupporterMainUI:
             pass
 
         try:
+            ttk.Label(tab_dashboard, text="Dashboard를 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_startup, text="Startup Apps 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_kakao, text="KakaoTalk 모니터 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_wrike, text="Wrike 설정을 여는 중...").pack(padx=12, pady=12)
@@ -201,6 +253,12 @@ class WindowsSupporterMainUI:
         if nb is None:
             return
         t = str(tab).strip().lower()
+        if t in {"dashboard", "home", "main"}:
+            try:
+                nb.select(self._tab_dashboard)
+            except Exception:
+                pass
+            return
         if t in {"startup", "startup_apps", "startupapps"}:
             try:
                 nb.select(self._tab_startup)
@@ -225,6 +283,30 @@ class WindowsSupporterMainUI:
             except Exception:
                 pass
             return
+        return
+
+    def _valid_tab_keys(self) -> tuple[str, ...]:
+        return (
+            self._TAB_DASHBOARD,
+            self._TAB_STARTUP,
+            self._TAB_KAKAO,
+            self._TAB_WRIKE,
+            self._TAB_CODEX,
+        )
+
+    def _load_last_tab(self) -> str:
+        return load_last_tab(
+            valid_tabs=self._valid_tab_keys(),
+            default=self._TAB_DASHBOARD,
+            path=self._state_path,
+        )
+
+    def _save_last_tab(self, tab_key: str) -> None:
+        save_last_tab(
+            str(tab_key or ""),
+            valid_tabs=self._valid_tab_keys(),
+            path=self._state_path,
+        )
         return
 
     def _remember_tab_size(self, tab_key: str | None) -> None:
@@ -282,7 +364,9 @@ class WindowsSupporterMainUI:
 
         try:
             new_tab = None
-            if self._tab_startup is not None and cur == str(self._tab_startup):
+            if self._tab_dashboard is not None and cur == str(self._tab_dashboard):
+                new_tab = self._TAB_DASHBOARD
+            elif self._tab_startup is not None and cur == str(self._tab_startup):
                 new_tab = self._TAB_STARTUP
             elif self._tab_kakao is not None and cur == str(self._tab_kakao):
                 new_tab = self._TAB_KAKAO
@@ -309,7 +393,9 @@ class WindowsSupporterMainUI:
                         except Exception:
                             pass
 
-            if new_tab == self._TAB_STARTUP:
+            if new_tab == self._TAB_DASHBOARD:
+                self._ensure_dashboard_built()
+            elif new_tab == self._TAB_STARTUP:
                 self._ensure_startup_built()
             elif new_tab == self._TAB_KAKAO:
                 self._ensure_kakao_built()
@@ -320,10 +406,275 @@ class WindowsSupporterMainUI:
 
             self._apply_tab_geometry(new_tab)
             self._current_tab = new_tab
+            self._save_last_tab(new_tab)
             return
         except Exception:
             return
         return
+
+    def _ensure_dashboard_built(self) -> None:
+        if self._dashboard_built or self._tab_dashboard is None:
+            return
+        try:
+            from src.apps.dashboard_ui import DashboardView
+        except Exception:
+            return
+        try:
+            self._dashboard_view = DashboardView(
+                self._root,
+                status_provider=self._get_dashboard_status_snapshot,
+                callbacks=self._get_dashboard_callbacks(),
+            )
+            self._dashboard_view.mount(self._tab_dashboard)
+            self._dashboard_built = True
+        except Exception:
+            self._dashboard_built = False
+        return
+
+    def _get_dashboard_callbacks(self) -> dict[str, Any]:
+        return {
+            "startup.toggle": self._dashboard_startup_toggle,
+            "startup.settings": self.show_startup_apps,
+            "codex.toggle": self._dashboard_codex_toggle_enabled,
+            "codex.settings": self.show_codex_usage,
+            "kakao.toggle": self._dashboard_kakao_toggle_enabled,
+            "kakao.settings": self.show_kakao_monitor,
+            "wrike.toggle": self._dashboard_wrike_toggle_enabled,
+            "wrike.settings": self.show_wrike,
+            "background.toggle": self._dashboard_background_toggle_enabled,
+        }
+
+    def _run_bg(self, fn) -> None:
+        if not callable(fn):
+            return
+        try:
+            threading.Thread(target=fn, daemon=True).start()
+        except Exception:
+            pass
+        return
+
+    def _dashboard_startup_toggle(self) -> None:
+        def task() -> None:
+            try:
+                self._startup_manager.toggle_enabled()
+                self._startup_manager.start(self._root)
+            except Exception:
+                pass
+            return
+
+        self._run_bg(task)
+        return
+
+    def _dashboard_startup_apply(self) -> None:
+        self._run_bg(lambda: self._startup_manager.start(self._root))
+        return
+
+    def _dashboard_startup_rescan_apply(self) -> None:
+        def task() -> None:
+            try:
+                self._startup_manager.rescan_defaults_merge()
+                self._startup_manager.start(self._root)
+            except Exception:
+                pass
+            return
+
+        self._run_bg(task)
+        return
+
+    def _get_codex_usage_monitor(self):
+        try:
+            return self._monitor.get_codex_usage_monitor()
+        except Exception:
+            return None
+
+    def _dashboard_codex_toggle_enabled(self) -> None:
+        codex = self._get_codex_usage_monitor()
+        if codex is None:
+            return
+        try:
+            settings = codex.get_settings_snapshot()
+            if not isinstance(settings, dict):
+                settings = {}
+            settings["enabled"] = not bool(settings.get("enabled", True))
+            codex.update_settings(settings)
+        except Exception:
+            pass
+        return
+
+    def _dashboard_codex_current_usage(self) -> None:
+        codex = self._get_codex_usage_monitor()
+        if codex is None:
+            return
+        try:
+            codex.show_current_status(force_refresh=True)
+        except Exception:
+            pass
+        return
+
+    def _dashboard_codex_login(self) -> None:
+        codex = self._get_codex_usage_monitor()
+        if codex is None:
+            return
+        try:
+            codex.show_current_status(force_refresh=True, source="manual_login")
+        except Exception:
+            pass
+        return
+
+    def _dashboard_kakao_show_numbers(self) -> None:
+        try:
+            kakao = self._monitor.get_kakao_manager()
+        except Exception:
+            kakao = None
+        if kakao is None:
+            return
+        try:
+            kakao.show_monitor_overlays(self._root, duration_ms=1500)
+        except Exception:
+            pass
+        return
+
+    def _dashboard_kakao_toggle_enabled(self) -> None:
+        try:
+            kakao = self._monitor.get_kakao_manager()
+        except Exception:
+            kakao = None
+        if kakao is None:
+            return
+        try:
+            settings = kakao.get_settings_snapshot()
+            if not isinstance(settings, dict):
+                settings = {}
+            settings["enabled"] = not bool(settings.get("enabled", True))
+            kakao.update_settings(settings)
+        except Exception:
+            pass
+        return
+
+    def _dashboard_wrike_weekly_timelog(self) -> None:
+        try:
+            wrike = self._monitor.get_wrike()
+        except Exception:
+            wrike = None
+        if wrike is None:
+            return
+        try:
+            wrike.show_weekly_timelog_summary(self._root)
+        except Exception:
+            pass
+        return
+
+    def _dashboard_wrike_toggle_enabled(self) -> None:
+        try:
+            wrike = self._monitor.get_wrike()
+        except Exception:
+            wrike = None
+        if wrike is None:
+            return
+        try:
+            settings = wrike.get_settings_snapshot()
+            if not isinstance(settings, dict):
+                settings = {}
+            settings["monitor_enabled"] = not bool(settings.get("monitor_enabled", False))
+            wrike.update_settings(settings)
+        except Exception:
+            pass
+        return
+
+    def _dashboard_background_toggle_enabled(self) -> None:
+        try:
+            status = self._monitor.get_dashboard_status_snapshot()
+            current = bool(status.get("enabled", True)) if isinstance(status, dict) else True
+            self._monitor.set_background_enabled(not current)
+        except Exception:
+            pass
+        return
+
+    def _get_dashboard_status_snapshot(self) -> dict[str, Any]:
+        return {
+            "startup": self._get_startup_dashboard_status(),
+            "codex": self._get_codex_dashboard_status(),
+            "kakao": self._get_kakao_dashboard_status(),
+            "wrike": self._get_wrike_dashboard_status(),
+            "background": self._get_background_dashboard_status(),
+        }
+
+    def _get_startup_dashboard_status(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"enabled": True}
+        try:
+            out["enabled"] = bool(self._startup_manager.get_enabled_state())
+        except Exception:
+            pass
+        try:
+            cfg = self._startup_manager.load_config()
+            instances = cfg.get("instances", []) if isinstance(cfg, dict) else []
+            if isinstance(instances, list):
+                runtime = self._startup_manager.get_instances_runtime(instances)
+                out["total_count"] = len(instances)
+                out["running_count"] = sum(1 for value in runtime.values() if bool(value[0]))
+        except Exception:
+            pass
+        return out
+
+    def _get_codex_dashboard_status(self) -> dict[str, Any]:
+        codex = self._get_codex_usage_monitor()
+        if codex is None:
+            return {}
+        out: dict[str, Any] = {}
+        try:
+            settings = codex.get_settings_snapshot()
+            if isinstance(settings, dict):
+                out.update(settings)
+        except Exception:
+            pass
+        try:
+            runtime = codex.get_runtime_status()
+            if isinstance(runtime, dict):
+                out.update(runtime)
+        except Exception:
+            pass
+        return out
+
+    def _get_kakao_dashboard_status(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        try:
+            kakao = self._monitor.get_kakao_manager()
+        except Exception:
+            kakao = None
+        if kakao is not None:
+            try:
+                settings = kakao.get_settings_snapshot()
+                if isinstance(settings, dict):
+                    out.update(settings)
+            except Exception:
+                pass
+        status = self._get_background_dashboard_status()
+        out["tick_active"] = bool(status.get("kakao_tick_active", False))
+        return out
+
+    def _get_wrike_dashboard_status(self) -> dict[str, Any]:
+        try:
+            wrike = self._monitor.get_wrike()
+        except Exception:
+            wrike = None
+        if wrike is None:
+            return {}
+        try:
+            data = wrike.get_settings_snapshot()
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception:
+            pass
+        return {}
+
+    def _get_background_dashboard_status(self) -> dict[str, Any]:
+        try:
+            data = self._monitor.get_dashboard_status_snapshot()
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception:
+            pass
+        return {}
 
     def _ensure_startup_built(self) -> None:
         if self._startup_built or self._tab_startup is None:

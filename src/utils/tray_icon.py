@@ -73,6 +73,7 @@ class SystemTrayIcon:
     _MENU_OPEN_CONFIG_DIR = 1006
     _MENU_TOGGLE_ENABLED = 1007
     _MENU_KAKAO_MONITOR = 1010
+    _MENU_RESTART = 1098
     _MENU_EXIT = 1099
 
     def __init__(
@@ -88,6 +89,7 @@ class SystemTrayIcon:
         on_toggle_enabled: Callable[[], None] | None = None,
         is_enabled: Callable[[], bool] | None = None,
         on_open_kakao_monitor: Callable[[], None] | None = None,
+        on_restart: Callable[[], None] | None = None,
         icon_path: str | None = None,
         on_session_unlock: Callable[[], None] | None = None,
         on_display_topology_change: Callable[[str], None] | None = None,
@@ -103,6 +105,7 @@ class SystemTrayIcon:
         self._on_toggle_enabled = on_toggle_enabled
         self._is_enabled = is_enabled
         self._on_open_kakao_monitor = on_open_kakao_monitor
+        self._on_restart = on_restart
         self._icon_path = str(icon_path).strip() if icon_path else None
         self._on_session_unlock = on_session_unlock
         self._on_display_topology_change = on_display_topology_change
@@ -500,6 +503,8 @@ class SystemTrayIcon:
             )
 
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+        if self._on_restart is not None:
+            win32gui.AppendMenu(menu, win32con.MF_STRING, self._MENU_RESTART, "재시작")
         win32gui.AppendMenu(menu, win32con.MF_STRING, self._MENU_EXIT, "종료")
 
         try:
@@ -581,6 +586,17 @@ class SystemTrayIcon:
         if cmd_id == self._MENU_KAKAO_MONITOR and self._on_open_kakao_monitor is not None:
             try:
                 self._on_open_kakao_monitor()
+            except Exception:
+                pass
+            return 0
+
+        if cmd_id == self._MENU_RESTART and self._on_restart is not None:
+            try:
+                self._on_restart()
+            except Exception:
+                pass
+            try:
+                win32gui.DestroyWindow(hwnd)
             except Exception:
                 pass
             return 0
