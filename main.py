@@ -179,14 +179,14 @@ def main() -> None:
 
     tray = SystemTrayIcon(
         tooltip="Windows Supporter",
-        on_open_settings=lambda: event_queue.put(main_ui.show_startup_apps),
+        on_open_settings=lambda: event_queue.put(main_ui.show),
         on_apply=lambda: event_queue.put(_start_startup_apps_bg),
         on_rescan=lambda: event_queue.put(_rescan_and_start_bg),
         on_open_config=lambda: event_queue.put(startup_manager.open_config_file),
         on_open_config_dir=lambda: event_queue.put(startup_manager.open_config_dir),
         on_toggle_enabled=lambda: event_queue.put(_toggle_and_start_bg),
         is_enabled=startup_manager.get_enabled_state,
-        on_open_kakao_monitor=lambda: event_queue.put(main_ui.show_kakao_monitor),
+        on_open_kakao_monitor=lambda: event_queue.put(main_ui.show),
         on_open_log=lambda: event_queue.put(startup_manager.open_log_file),
         on_restart=lambda: event_queue.put(_request_restart),
         on_exit=lambda: event_queue.put(root.quit),

@@ -100,6 +100,7 @@ class KakaoManager:
         self.__config_path = self.__lib.os.path.join(self.__config_dir, "kakao_manager.json")
         self.__config_loaded = False
         self.__config_missing = True
+        self.__enabled = True
         self.__target_display_num = None
         self.__target_monitor = None
 
@@ -161,6 +162,8 @@ class KakaoManager:
     def tick(self, root=None) -> None:
         now = self.__lib.time.monotonic()
         self.__ensure_config_state_bootstrapped()
+        if not self.__enabled:
+            return
 
         if root is not None and self.__config_missing and (not self.__is_selecting):
             try:
@@ -180,6 +183,32 @@ class KakaoManager:
         self.__next_poll_time = now + self.__poll_interval_sec
         self.__request_background_tick(root, now)
         return
+
+    def get_settings_snapshot(self) -> dict:
+        self.__ensure_config_state_bootstrapped()
+        return {
+            "enabled": bool(self.__enabled),
+            "target_display_num": self.__normalize_display_num(self.__target_display_num),
+            "resolved_target_display_num": self.__normalize_display_num(
+                self.__resolved_target_display_num
+            ),
+            "config_missing": bool(self.__config_missing),
+            "settings_path": str(self.__config_path or ""),
+        }
+
+    def update_settings(self, data: dict) -> tuple[bool, str | None]:
+        if not isinstance(data, dict):
+            return False, "invalid settings"
+        self.__ensure_config_state_bootstrapped()
+        if "enabled" in data:
+            self.__enabled = bool(data.get("enabled", self.__enabled))
+        self.__save_config()
+        if not self.__enabled:
+            try:
+                self.__destroy_overlays()
+            except Exception:
+                pass
+        return True, None
 
     def __ensure_config_state_bootstrapped(self) -> None:
         if not self.__config_loaded:
@@ -1435,6 +1464,7 @@ class KakaoManager:
                 return
             with open(self.__config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            self.__enabled = bool(data.get("enabled", self.__enabled))
             target_monitor = self.__normalize_target_monitor(data.get("target_monitor"))
             if target_monitor:
                 self.__target_monitor = target_monitor
@@ -1461,7 +1491,10 @@ class KakaoManager:
                 if display_num is None:
                     display_num = 1
                 target_monitor = {"display_num": int(display_num)}
-            data = {"target_monitor": target_monitor}
+            data = {
+                "enabled": bool(self.__enabled),
+                "target_monitor": target_monitor,
+            }
             with open(self.__config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
