@@ -826,6 +826,242 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
         )
 
+    def test_collect_snapshot_once_manual_login_reuses_existing_profile_cdp(self) -> None:
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T11:05:00",
+        )
+
+        class _DummyProc:
+            pid = 23004
+            _ws_listener_pid = 23004
+            _ws_cdp_port = 12236
+            _ws_external_cdp = True
+            _ws_monitor_managed = False
+
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
+
+            def goto(self, url, **_kwargs):
+                self.url = str(url)
+                return None
+
+            def wait_for_timeout(self, _ms):
+                return None
+
+        class _DummyContext:
+            def __init__(self):
+                self.pages = [_DummyPage()]
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return None
+
+        class _DummyBrowser:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return None
+
+        context = _DummyContext()
+        browser = _DummyBrowser()
+        proc = _DummyProc()
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+            return_value=[(12236, 23004, False)],
+        ) as iter_endpoints:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__connect_existing_profile_remote_debug_context",
+                return_value=(context, browser, proc, True),
+            ) as connect_existing:
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__launch_interactive_context_via_cdp",
+                    side_effect=AssertionError("new Chrome should not be launched"),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__set_cdp_window_visibility",
+                        return_value=True,
+                    ) as set_visibility:
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__terminate_spawned_process",
+                        ):
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__is_cloudflare_challenge",
+                                return_value=False,
+                            ):
+                                with patch.object(
+                                    self.monitor,
+                                    "_CodexUsageMonitor__is_login_required",
+                                    return_value=False,
+                                ):
+                                    with patch.object(
+                                        self.monitor,
+                                        "_CodexUsageMonitor__build_snapshot_from_page",
+                                        return_value=snapshot,
+                                    ):
+                                        got, err = self.monitor._CodexUsageMonitor__collect_snapshot_once(
+                                            object(),
+                                            headless=False,
+                                            allow_interactive_recovery=True,
+                                            force_hidden=False,
+                                            prefer_system_channel=True,
+                                            initial_url=(
+                                                "https://chatgpt.com/auth/login?"
+                                                "next=/codex/cloud/settings/analytics%23usage"
+                                            ),
+                                        )
+
+        self.assertIsNone(err)
+        self.assertIs(got, snapshot)
+        iter_endpoints.assert_called_once_with(include_owned=True)
+        connect_existing.assert_called_once()
+        set_visibility.assert_called_once_with(
+            proc,
+            visible=True,
+            bring_to_front=True,
+        )
+        self.assertFalse(context.closed)
+        self.assertFalse(browser.closed)
+
+    def test_collect_snapshot_once_manual_login_relaunches_when_existing_profile_cdp_is_managed(
+        self,
+    ) -> None:
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T11:05:00",
+        )
+
+        class _DummyProc:
+            pid = 24000
+            _ws_cdp_port = 24001
+
+            def poll(self):
+                return None
+
+        class _DummyPage:
+            url = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage"
+
+            def goto(self, url, **_kwargs):
+                self.url = str(url)
+                return None
+
+            def wait_for_timeout(self, _ms):
+                return None
+
+        class _DummyContext:
+            def __init__(self):
+                self.pages = [_DummyPage()]
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return None
+
+        class _DummyBrowser:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return None
+
+        context = _DummyContext()
+        browser = _DummyBrowser()
+        proc = _DummyProc()
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+            return_value=[(12236, 23004, True)],
+        ) as iter_endpoints:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__terminate_profile_remote_debugging_processes",
+            ) as terminate_managed:
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib.time,
+                    "sleep",
+                ) as sleep:
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__connect_existing_profile_remote_debug_context",
+                        side_effect=AssertionError("managed hidden CDP should not be reused"),
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__launch_interactive_context_via_cdp",
+                            return_value=(context, browser, proc),
+                        ) as launch_interactive:
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__set_cdp_window_visibility",
+                                return_value=True,
+                            ) as set_visibility:
+                                with patch.object(
+                                    self.monitor,
+                                    "_CodexUsageMonitor__terminate_spawned_process",
+                                ):
+                                    with patch.object(
+                                        self.monitor,
+                                        "_CodexUsageMonitor__is_cloudflare_challenge",
+                                        return_value=False,
+                                    ):
+                                        with patch.object(
+                                            self.monitor,
+                                            "_CodexUsageMonitor__is_login_required",
+                                            return_value=False,
+                                        ):
+                                            with patch.object(
+                                                self.monitor,
+                                                "_CodexUsageMonitor__build_snapshot_from_page",
+                                                return_value=snapshot,
+                                            ):
+                                                got, err = self.monitor._CodexUsageMonitor__collect_snapshot_once(
+                                                    object(),
+                                                    headless=False,
+                                                    allow_interactive_recovery=True,
+                                                    force_hidden=False,
+                                                    prefer_system_channel=True,
+                                                    initial_url=(
+                                                        "https://chatgpt.com/auth/login?"
+                                                        "next=/codex/cloud/settings/analytics%23usage"
+                                                    ),
+                                                )
+
+        self.assertIsNone(err)
+        self.assertIs(got, snapshot)
+        iter_endpoints.assert_called_once_with(include_owned=True)
+        terminate_managed.assert_called_once_with(managed_only=True)
+        sleep.assert_called_once()
+        launch_interactive.assert_called_once()
+        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 24001)
+        self.assertFalse(context.closed)
+        self.assertFalse(browser.closed)
+
     def test_manual_login_button_bypasses_interactive_reopen_cooldown(self) -> None:
         recovered = UsageSnapshot.from_metrics(
             {
@@ -1701,7 +1937,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             bool(launch_cdp.call_args.kwargs.get("start_hidden", True))
         )
 
-    def test_collect_snapshot_once_interactive_recovery_closes_app_cdp_after_success(self) -> None:
+    def test_collect_snapshot_once_interactive_recovery_keeps_app_cdp_after_success(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -1779,25 +2015,35 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 "_CodexUsageMonitor__build_snapshot_from_page",
                                 return_value=snapshot,
                             ):
-                                got, err = self.monitor._CodexUsageMonitor__collect_snapshot_once(
-                                    object(),
-                                    headless=False,
-                                    allow_interactive_recovery=True,
-                                    force_hidden=False,
-                                    prefer_system_channel=True,
-                                    initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
-                                )
+                                with patch.object(
+                                    self.monitor,
+                                    "_CodexUsageMonitor__ui_post",
+                                    side_effect=lambda fn: fn(),
+                                ):
+                                    with patch.object(
+                                        self.monitor,
+                                        "_CodexUsageMonitor__hide_active_tooltip",
+                                    ) as hide_tooltip:
+                                        got, err = self.monitor._CodexUsageMonitor__collect_snapshot_once(
+                                            object(),
+                                            headless=False,
+                                            allow_interactive_recovery=True,
+                                            force_hidden=False,
+                                            prefer_system_channel=True,
+                                            initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+                                        )
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
-        set_visibility.assert_not_called()
-        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
-        self.assertTrue(context.closed)
-        self.assertTrue(browser.closed)
+        hide_tooltip.assert_called_once()
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48123)
+        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        terminate_proc.assert_not_called()
+        self.assertFalse(context.closed)
+        self.assertFalse(browser.closed)
 
-    def test_collect_snapshot_once_releases_interactive_cdp_when_hide_fails_after_snapshot(self) -> None:
+    def test_collect_snapshot_once_keeps_interactive_cdp_when_hide_fails_after_snapshot(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -1887,14 +2133,14 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
-        set_visibility.assert_not_called()
-        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
-        self.assertTrue(context.closed)
-        self.assertTrue(browser.closed)
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48126)
+        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        terminate_proc.assert_not_called()
+        self.assertFalse(context.closed)
+        self.assertFalse(browser.closed)
 
-    def test_collect_snapshot_once_interactive_recovery_closes_app_cdp_after_wait(self) -> None:
+    def test_collect_snapshot_once_interactive_recovery_keeps_app_cdp_after_wait(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -1987,12 +2233,12 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
-        set_visibility.assert_not_called()
-        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
-        self.assertTrue(context.closed)
-        self.assertTrue(browser.closed)
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48124)
+        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        terminate_proc.assert_not_called()
+        self.assertFalse(context.closed)
+        self.assertFalse(browser.closed)
 
     def test_collect_snapshot_once_keeps_interactive_cdp_open_when_login_still_pending(self) -> None:
         class _DummyProc:
@@ -2074,7 +2320,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(err, "login_required")
         self.assertEqual(int(self.monitor._CodexUsageMonitor__last_successful_cdp_port), 48125)
         self.assertTrue(bool(getattr(proc, "_ws_monitor_managed", False)))
-        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48125)
         set_visibility.assert_not_called()
         terminate_proc.assert_not_called()
         self.assertFalse(context.closed)
@@ -3454,6 +3701,89 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(fake_win32gui.show_calls, [(789, 4)])
         self.assertEqual(fake_win32gui.foreground_calls, [])
 
+    def test_set_windows_visibility_for_pid_moves_offscreen_window_on_manual_restore(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.show_calls: list[tuple[int, int]] = []
+                self.foreground_calls: list[int] = []
+                self.position_calls: list[tuple[int, int, int, int, int, int, int]] = []
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+            def SetForegroundWindow(self, hwnd):
+                self.foreground_calls.append(int(hwnd))
+                return True
+
+            def GetWindowRect(self, _hwnd):
+                return (-32000, -32000, -30720, -31100)
+
+            def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+                self.position_calls.append(
+                    (
+                        int(hwnd),
+                        int(insert_after),
+                        int(x),
+                        int(y),
+                        int(cx),
+                        int(cy),
+                        int(flags),
+                    )
+                )
+                return True
+
+        class _DummyUser32:
+            def GetSystemMetrics(self, index):
+                values = {
+                    0: 1920,
+                    1: 1080,
+                    76: 0,
+                    77: 0,
+                    78: 1920,
+                    79: 1080,
+                }
+                return values.get(int(index), 0)
+
+        class _DummyCtypes:
+            class _Windll:
+                user32 = _DummyUser32()
+
+            windll = _Windll()
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib,
+                    "ctypes",
+                    _DummyCtypes(),
+                    create=True,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__list_top_windows_for_pid",
+                        return_value=[789],
+                    ):
+                        ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                            pid=123,
+                            visible=True,
+                            bring_to_front=True,
+                            timeout_sec=0.2,
+                        )
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_win32gui.show_calls, [(789, 9)])
+        self.assertEqual(fake_win32gui.foreground_calls, [789])
+        self.assertTrue(fake_win32gui.position_calls)
+        self.assertEqual(fake_win32gui.position_calls[-1][2:4], (80, 80))
+
     def test_configure_playwright_env_adds_no_deprecation_node_option_once(self) -> None:
         with patch.dict(self.monitor._CodexUsageMonitor__lib.os.environ, {}, clear=True):
             self.monitor._CodexUsageMonitor__configure_playwright_env()
@@ -3900,6 +4230,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             },
             captured_at="2026-03-30T12:50:00",
         )
+        self.monitor._CodexUsageMonitor__last_snapshot = snapshot
         shown: list[tuple[str, list[tuple[str, str | None]] | None, int | None]] = []
         seen_sources: list[str] = []
 
@@ -3949,7 +4280,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(
             shown[0],
             (
-                "Codex 로그인 창을 여는 중... 로그인 완료 후 자동으로 수집합니다.",
+                "Codex 로그인 창을 여는 중...",
                 None,
                 0,
             ),
