@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.utils.app_version import get_app_version_label
+
 
 class WindowsSupporterMainUI:
     _TAB_STARTUP = "startup_apps"
@@ -26,6 +28,9 @@ class WindowsSupporterMainUI:
         self._ttk = None
 
         self._notebook = None
+        self._shell_frame = None
+        self._footer_frame = None
+        self._version_label = None
         self._tab_startup = None
         self._tab_kakao = None
         self._tab_wrike = None
@@ -161,10 +166,33 @@ class WindowsSupporterMainUI:
         except Exception:
             pass
 
-        notebook = ttk.Notebook(root)
+        shell = ttk.Frame(root)
+        self._shell_frame = shell
+        try:
+            shell.pack(fill="both", expand=True)
+        except Exception:
+            pass
+
+        footer = ttk.Frame(shell)
+        self._footer_frame = footer
+        try:
+            footer.pack(side="bottom", fill="x")
+        except Exception:
+            pass
+        try:
+            self._version_label = ttk.Label(
+                footer,
+                text=get_app_version_label(),
+                anchor="e",
+            )
+            self._version_label.pack(side="right", padx=(8, 10), pady=(2, 4))
+        except Exception:
+            self._version_label = None
+
+        notebook = ttk.Notebook(shell)
         self._notebook = notebook
         try:
-            notebook.pack(fill="both", expand=True)
+            notebook.pack(side="top", fill="both", expand=True)
         except Exception:
             pass
 
