@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.apps.Monitor import Monitor
+from src.apps.codex_usage_multi_monitor import CodexUsageMultiMonitor
 
 
 class _FakeKeyboard:
@@ -72,6 +73,45 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
         fn()
 
         codex.show_current_status.assert_called_once_with(force_refresh=True)
+
+    def test_get_codex_usage_monitor_returns_two_account_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            appdata = os.path.join(tmp, "Roaming")
+            localappdata = os.path.join(tmp, "Local")
+            os.makedirs(appdata)
+            os.makedirs(localappdata)
+            monitor = Monitor()
+
+            with patch.dict(
+                os.environ,
+                {"APPDATA": appdata, "LOCALAPPDATA": localappdata},
+                clear=True,
+            ):
+                codex = monitor.get_codex_usage_monitor()
+
+        self.assertIsInstance(codex, CodexUsageMultiMonitor)
+        self.assertEqual(
+            [account["id"] for account in codex.get_settings_snapshot()["accounts"]],
+            ["account_1", "account_2"],
+        )
+
+    def test_display_topology_change_repositions_existing_codex_overlay(self) -> None:
+        monitor = Monitor()
+        root = object()
+        codex = MagicMock()
+        kakao = MagicMock()
+        monitor._Monitor__background_enabled = True
+        monitor._Monitor__root = root
+        monitor._Monitor__codex_usage = codex
+        monitor._Monitor__kakao = kakao
+
+        monitor.on_display_topology_changed("display_change")
+
+        codex.on_display_topology_changed.assert_called_once_with("display_change")
+        kakao.invalidate_display_topology.assert_called_once_with(
+            root=root,
+            reason="display_change",
+        )
 
     def test_ctrl_alt_k_opens_main_ui_without_forcing_kakao_tab(self) -> None:
         monitor = Monitor()

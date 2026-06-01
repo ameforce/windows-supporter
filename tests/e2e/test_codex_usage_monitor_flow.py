@@ -5818,6 +5818,32 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             self.assertIn("로그아웃", msg)
             self.assertFalse(profile.exists())
 
+    def test_clear_profile_directory_accepts_account_specific_managed_profile_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            appdata = root / "Roaming"
+            localappdata = root / "Local"
+            appdata.mkdir()
+            localappdata.mkdir()
+            account_1_profile = localappdata / "windows-supporter" / "chatgpt-profile-account-1"
+            account_2_profile = localappdata / "windows-supporter" / "chatgpt-profile-account-2"
+            account_1_profile.mkdir(parents=True)
+            account_2_profile.mkdir(parents=True)
+            (account_1_profile / "session.txt").write_text("login-1", encoding="utf-8")
+            (account_2_profile / "session.txt").write_text("login-2", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {"APPDATA": str(appdata), "LOCALAPPDATA": str(localappdata)},
+            ):
+                monitor = CodexUsageMonitor(profile_dir=str(account_1_profile))
+
+            ok, msg = monitor._CodexUsageMonitor__clear_profile_directory()
+
+            self.assertTrue(ok)
+            self.assertIn("로그아웃", msg)
+            self.assertFalse(account_1_profile.exists())
+            self.assertTrue((account_2_profile / "session.txt").exists())
+
     def test_clear_profile_directory_rejects_custom_profile_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5839,6 +5865,29 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("관리하는", msg)
             self.assertTrue((custom_profile / "keep.txt").exists())
+
+    def test_notification_sink_suppresses_direct_tooltip_for_managed_normal_events(self) -> None:
+        events = []
+        monitor = CodexUsageMonitor(
+            config_dir=str(self._config_dir),
+            profile_dir=str(self._profile_dir),
+            notification_sink=events.append,
+            suppress_normal_tooltips=True,
+        )
+
+        monitor._CodexUsageMonitor__show_tooltip("Codex 사용량 조회 중...", duration_ms=0)
+
+        self.assertEqual(
+            events,
+            [
+                {
+                    "text": "Codex 사용량 조회 중...",
+                    "lines": None,
+                    "duration_ms": 0,
+                }
+            ],
+        )
+        self.assertIsNone(monitor._CodexUsageMonitor__active_tooltip)
 
     def test_release_profile_session_rejects_while_collect_busy(self) -> None:
         class _BusyLock:
