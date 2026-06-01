@@ -72,6 +72,28 @@ class StartupAppsShowOnceUnitTest(unittest.TestCase):
         self.assertEqual(mock_apply.call_count, 2)
         self.assertEqual(show_once_hwnds, {1001, 2002})
 
+    def test_launch_instances_skips_kakaotalk_even_when_configured(self) -> None:
+        manager = StartupAppManager()
+        instances = [
+            {
+                "id": "kakao",
+                "type": "exe",
+                "app": "KakaoTalk",
+                "enabled": True,
+                "exe": r"C:\Program Files (x86)\Kakao\KakaoTalk\KakaoTalk.exe",
+                "raw_args": "-bystartup",
+            }
+        ]
+
+        with patch(
+            "src.apps.startup_apps.snapshot_running_processes",
+            return_value=(set(), set()),
+        ):
+            with patch("src.apps.startup_apps.popen_no_window") as popen:
+                manager._launch_instances(instances)
+
+        popen.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

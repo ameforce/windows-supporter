@@ -15,9 +15,17 @@ class _FakeRoot:
         self.minsize_calls = []
         self.after_calls = []
         self.after_cancel_calls = []
+        self.iconify_calls = 0
+        self.withdraw_calls = 0
 
     def deiconify(self):
         return None
+
+    def iconify(self):
+        self.iconify_calls += 1
+
+    def withdraw(self):
+        self.withdraw_calls += 1
 
     def lift(self):
         return None
@@ -264,6 +272,17 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertEqual(ui._current_tab, ui._TAB_CODEX)
             ensure_codex.assert_called_once()
 
+    def test_hide_withdraws_main_window_without_taskbar_thumbnail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, root, _, monitor = self._build_ui(path)
+
+            ui.hide()
+
+            self.assertEqual(root.iconify_calls, 0)
+            self.assertEqual(root.withdraw_calls, 1)
+            self.assertEqual(monitor.kakao.overlay_calls, [])
+
     def test_dashboard_controls_delegate_to_existing_managers(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
@@ -366,6 +385,33 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertEqual(view._format_minutes(480), "8시간")
         self.assertEqual(view._format_minutes(490), "8시간 10분")
         self.assertEqual(view._format_minutes(30), "30분")
+
+    def test_codex_formatter_summarizes_two_accounts(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        _, parts = view._format_codex(
+            {
+                "enabled": True,
+                "monitor_state": "mixed",
+                "session_state": "mixed",
+                "accounts": [
+                    {
+                        "label": "Codex 1",
+                        "enabled": True,
+                        "runtime": {"monitor_state": "idle", "session_state": "logged_in"},
+                    },
+                    {
+                        "label": "Codex 2",
+                        "enabled": False,
+                        "runtime": {"monitor_state": "idle", "session_state": "logged_out"},
+                    },
+                ],
+            }
+        )
+
+        labels = [text for text, _style in parts]
+        self.assertIn("Codex 1: logged_in / idle", labels)
+        self.assertIn("Codex 2: 비활성 / logged_out", labels)
 
 
 if __name__ == "__main__":

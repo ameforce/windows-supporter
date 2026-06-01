@@ -67,6 +67,26 @@ class CodexUsageMonitorUiCoalescingTest(unittest.TestCase):
 
         self.assertEqual(calls, ["pause", "progress"])
 
+    def test_external_scheduler_attach_prevents_child_timer_resume(self) -> None:
+        class _Root:
+            def __init__(self):
+                self.after_calls = []
+
+            def after(self, delay_ms, callback):
+                self.after_calls.append((delay_ms, callback))
+                return f"after-{len(self.after_calls)}"
+
+        monitor = self._make_monitor()
+        root = _Root()
+        monitor.attach(root=root, event_queue=None, start_monitor=False)
+        monitor._CodexUsageMonitor__enabled = True  # noqa: SLF001
+        monitor._CodexUsageMonitor__session_state = "logged_in"  # noqa: SLF001
+
+        monitor._CodexUsageMonitor__resume_background_monitor_if_needed()  # noqa: SLF001
+        monitor._CodexUsageMonitor__reset_monitor_countdown_after_manual_query()  # noqa: SLF001
+
+        self.assertEqual(root.after_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
