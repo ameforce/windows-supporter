@@ -33,6 +33,8 @@ from src.utils.windows_window import (
 )
 
 _SCHEMA_VERSION = 2
+_BLOCKED_STARTUP_PROCESS_NAMES = {"kakaotalk.exe"}
+_BLOCKED_STARTUP_NAME_TOKENS = {"kakao", "kakaotalk", "카카오", "카카오톡"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1183,6 +1185,9 @@ class StartupAppManager:
             if not exe:
                 self._log(f"missing exe for instance: {inst.get('id')!r}")
                 continue
+            if self._is_blocked_startup_launch(inst, exe):
+                self._log(f"launch skipped blocked instance: {inst.get('id')!r}")
+                continue
 
             if inst_type == "chrome_pwa":
                 inst_id_cf = str(inst.get("id", "")).strip().casefold()
@@ -1257,6 +1262,18 @@ class StartupAppManager:
             except Exception:
                 pass
         return
+
+    def _is_blocked_startup_launch(self, inst: dict[str, Any], exe: str) -> bool:
+        proc_name = os.path.basename(str(exe or "")).strip().casefold()
+        if proc_name in _BLOCKED_STARTUP_PROCESS_NAMES:
+            return True
+        fields = (
+            str(inst.get("id", "")),
+            str(inst.get("app", "")),
+            str(inst.get("name", "")),
+        )
+        normalized = " ".join(fields).strip().casefold()
+        return any(token in normalized for token in _BLOCKED_STARTUP_NAME_TOKENS)
 
     def _hide_worker(
         self,

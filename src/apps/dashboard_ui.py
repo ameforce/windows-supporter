@@ -390,11 +390,28 @@ class DashboardView:
         is_enabled = bool(data.get("enabled", True))
         runtime = str(data.get("monitor_state", "unknown") or "unknown")
         session = str(data.get("session_state", "unknown") or "unknown")
-        return is_enabled, [
+        parts = [
             self._enabled_part(is_enabled),
             (f"상태: {runtime}", "normal"),
             (f"세션: {session}", "normal"),
         ]
+        accounts = data.get("accounts")
+        if isinstance(accounts, list):
+            for raw in accounts[:2]:
+                if not isinstance(raw, dict):
+                    continue
+                label = str(raw.get("label") or raw.get("id") or "Codex").strip()
+                account_enabled = bool(raw.get("enabled", True))
+                account_runtime = raw.get("runtime", {})
+                if not isinstance(account_runtime, dict):
+                    account_runtime = {}
+                account_session = str(account_runtime.get("session_state", "unknown") or "unknown")
+                account_state = str(account_runtime.get("monitor_state", "unknown") or "unknown")
+                if account_enabled:
+                    parts.append((f"{label}: {account_session} / {account_state}", "normal"))
+                else:
+                    parts.append((f"{label}: 비활성 / {account_session}", "disabled"))
+        return is_enabled, parts
 
     def _format_kakao(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
         if not isinstance(data, dict):

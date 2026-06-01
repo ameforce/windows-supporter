@@ -1,0 +1,464 @@
+import json
+import os
+import tempfile
+import unittest
+
+from src.apps.codex_usage_multi_monitor import CodexUsageMultiMonitor
+
+
+class _FakeChildMonitor:
+    def __init__(self, config_dir: str, profile_dir: str) -> None:
+        self.config_dir = config_dir
+        self.profile_dir = profile_dir
+        self.update_calls: list[dict] = []
+        self.show_calls: list[dict] = []
+        self.release_calls = 0
+        self.attach_calls = []
+        self.tooltip_duration_ms = 7000
+        self.runtime = {
+            "enabled": True,
+            "monitor_state": "idle",
+            "session_state": "logged_out",
+            "collect_inflight": False,
+            "auto_monitoring_active": True,
+            "can_login": True,
+            "can_logout": False,
+        }
+        self.last_snapshot = {
+            "five_hour_limit": "",
+            "weekly_limit": "",
+            "gpt_5_3_codex_spark_five_hour_limit": "",
+            "gpt_5_3_codex_spark_weekly_limit": "",
+            "remaining_credit": "",
+            "captured_at": "",
+        }
+
+    def get_settings_snapshot(self):
+        return {
+            "enabled": bool(self.runtime.get("enabled", True)),
+            "interval_sec": 90.0,
+            "tooltip_duration_ms": int(self.tooltip_duration_ms),
+            "usage_url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+            "collection_mode": "playwright",
+            "settings_path": os.path.join(self.config_dir, "codex_usage_settings.json"),
+            "state_path": os.path.join(self.config_dir, "codex_usage_state.json"),
+            "profile_dir": self.profile_dir,
+        }
+
+    def update_settings(self, data):
+        self.update_calls.append(dict(data))
+        self.runtime["enabled"] = bool(data.get("enabled", self.runtime["enabled"]))
+        if "tooltip_duration_ms" in data:
+            self.tooltip_duration_ms = int(data["tooltip_duration_ms"])
+        return True, None
+
+    def get_runtime_status(self):
+        return dict(self.runtime)
+
+    def get_last_snapshot(self):
+        return dict(self.last_snapshot)
+
+    def show_current_status(self, force_refresh=True, source="manual_query"):
+        self.show_calls.append({"force_refresh": bool(force_refresh), "source": str(source)})
+        return None
+
+    def release_profile_session(self):
+        self.release_calls += 1
+        return True, "released"
+
+    def attach(self, root, event_queue=None, start_monitor=True):
+        self.attach_calls.append(
+            {
+                "root": root,
+                "event_queue": event_queue,
+                "start_monitor": bool(start_monitor),
+            }
+        )
+        return None
+
+
+class _FakeRoot:
+    def __init__(self) -> None:
+        self.after_calls = []
+        self.after_cancel_calls = []
+
+    def after(self, delay_ms, callback):
+        after_id = f"after-{len(self.after_calls) + 1}"
+        self.after_calls.append(
+            {
+                "id": after_id,
+                "delay_ms": int(delay_ms),
+                "callback": callback,
+            }
+        )
+        return after_id
+
+    def after_cancel(self, after_id):
+        self.after_cancel_calls.append(after_id)
+
+
+class _FakeTaskbarOverlay:
+    instances = []
+
+    def __init__(self, root, runtime_getter):
+        self.root = root
+        self.runtime_getter = runtime_getter
+        self.refresh_calls = 0
+        self.hide_calls = 0
+        self.invalidate_geometry_calls = 0
+        self.runtime_snapshots = []
+        self.instances.append(self)
+
+    def refresh(self):
+        self.refresh_calls += 1
+        self.runtime_snapshots.append(self.runtime_getter())
+        return True
+
+    def hide(self):
+        self.hide_calls += 1
+        return None
+
+    def invalidate_geometry(self):
+        self.invalidate_geometry_calls += 1
+        return None
+
+
+class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
+    def _build_manager(self, tmp: str, taskbar_progress_factory=None):
+        children: list[_FakeChildMonitor] = []
+
+        def factory(config_dir: str, profile_dir: str):
+            child = _FakeChildMonitor(config_dir=config_dir, profile_dir=profile_dir)
+            children.append(child)
+            return child
+
+        manager = CodexUsageMultiMonitor(
+            config_dir=os.path.join(tmp, "config"),
+            local_base_dir=os.path.join(tmp, "local"),
+            monitor_factory=factory,
+            taskbar_progress_factory=taskbar_progress_factory,
+        )
+        return manager, children
+
+    def test_settings_snapshot_creates_two_isolated_accounts_and_migrates_legacy_files_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            legacy_settings = os.path.join(config_dir, "codex_usage_settings.json")
+            legacy_state = os.path.join(config_dir, "codex_usage_state.json")
+            with open(legacy_settings, "w", encoding="utf-8") as fp:
+                json.dump({"enabled": False, "interval_sec": 33.0}, fp)
+            with open(legacy_state, "w", encoding="utf-8") as fp:
+                json.dump({"session_state": "logged_in"}, fp)
+
+            manager, children = self._build_manager(tmp)
+            snapshot = manager.get_settings_snapshot()
+
+            self.assertEqual(snapshot["settings_version"], 2)
+            self.assertEqual(snapshot["default_account_id"], "account_1")
+            self.assertEqual([a["id"] for a in snapshot["accounts"]], ["account_1", "account_2"])
+            self.assertEqual([a["label"] for a in snapshot["accounts"]], ["Codex 1", "Codex 2"])
+            self.assertNotEqual(
+                snapshot["accounts"][0]["profile_dir"],
+                snapshot["accounts"][1]["profile_dir"],
+            )
+            self.assertEqual(len(children), 2)
+
+            account_1_settings = snapshot["accounts"][0]["settings_path"]
+            account_1_state = snapshot["accounts"][0]["state_path"]
+            account_2_settings = snapshot["accounts"][1]["settings_path"]
+            self.assertTrue(os.path.isfile(account_1_settings))
+            self.assertTrue(os.path.isfile(account_1_state))
+            self.assertFalse(os.path.exists(account_2_settings))
+            self.assertTrue(os.path.isfile(legacy_settings))
+            self.assertTrue(os.path.isfile(legacy_state))
+
+            with open(legacy_settings, "w", encoding="utf-8") as fp:
+                json.dump({"enabled": True, "interval_sec": 999.0}, fp)
+            manager_again, _ = self._build_manager(tmp)
+            again = manager_again.get_settings_snapshot()
+
+            with open(again["accounts"][0]["settings_path"], encoding="utf-8") as fp:
+                copied = json.load(fp)
+            self.assertEqual(copied["interval_sec"], 33.0)
+
+    def test_runtime_snapshot_aggregates_enabled_accounts_and_routes_account_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime.update(
+                {"session_state": "logged_out", "can_login": True, "can_logout": False}
+            )
+            children[1].runtime.update(
+                {"session_state": "logged_in", "can_login": False, "can_logout": True}
+            )
+
+            runtime = manager.get_runtime_status()
+
+            self.assertEqual(runtime["session_state"], "mixed")
+            self.assertTrue(runtime["can_login"])
+            self.assertTrue(runtime["can_logout"])
+
+            ok, error = manager.update_settings(
+                {
+                    "accounts": [
+                        {"id": "account_1", "enabled": False},
+                        {"id": "account_2", "enabled": True},
+                    ]
+                }
+            )
+            self.assertTrue(ok, error)
+            runtime = manager.get_runtime_status()
+
+            self.assertEqual(runtime["accounts"][0]["enabled"], False)
+            self.assertEqual(runtime["session_state"], "logged_in")
+            self.assertFalse(runtime["can_login"])
+            self.assertTrue(runtime["can_logout"])
+
+            manager.login_account("account_1")
+            ok, message = manager.release_account_profile_session("account_2")
+
+            self.assertEqual(children[0].show_calls, [{"force_refresh": True, "source": "manual_login"}])
+            self.assertTrue(ok, message)
+            self.assertEqual(children[1].release_calls, 1)
+            self.assertFalse(hasattr(manager, "release_profile_session"))
+
+    def test_tooltip_duration_round_trips_and_propagates_to_child_monitors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+
+            ok, error = manager.update_settings({"tooltip_duration_ms": 4321})
+            snapshot = manager.get_settings_snapshot()
+            manager_again, _ = self._build_manager(tmp)
+
+            self.assertTrue(ok, error)
+            self.assertEqual(snapshot["tooltip_duration_ms"], 4321)
+            self.assertEqual(manager_again.get_settings_snapshot()["tooltip_duration_ms"], 4321)
+            self.assertEqual(
+                [child.update_calls[-1]["tooltip_duration_ms"] for child in children],
+                [4321, 4321],
+            )
+
+    def test_taskbar_overlay_enabled_round_trips_and_controls_overlay_visibility(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _FakeTaskbarOverlay.instances = []
+            manager, _children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(object(), event_queue=None)
+
+            self.assertTrue(manager.get_settings_snapshot()["taskbar_overlay_enabled"])
+            self.assertTrue(manager.get_runtime_status()["taskbar_overlay_enabled"])
+
+            ok, error = manager.update_settings({"taskbar_overlay_enabled": False})
+            self.assertTrue(ok, error)
+            self.assertFalse(manager.get_settings_snapshot()["taskbar_overlay_enabled"])
+            self.assertEqual(len(_FakeTaskbarOverlay.instances), 1)
+            self.assertEqual(_FakeTaskbarOverlay.instances[0].hide_calls, 1)
+
+            manager_again, _children_again = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            self.assertFalse(manager_again.get_settings_snapshot()["taskbar_overlay_enabled"])
+
+            ok, error = manager_again.update_settings({"taskbar_overlay_enabled": True})
+            self.assertTrue(ok, error)
+            manager_again.attach(object(), event_queue=None)
+            self.assertEqual(len(_FakeTaskbarOverlay.instances), 2)
+            self.assertEqual(_FakeTaskbarOverlay.instances[-1].refresh_calls, 1)
+
+    def test_show_current_status_refreshes_enabled_accounts_in_fixed_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            manager.update_settings(
+                {
+                    "accounts": [
+                        {"id": "account_1", "enabled": True},
+                        {"id": "account_2", "enabled": False},
+                    ]
+                }
+            )
+
+            manager.show_current_status(force_refresh=True)
+
+            self.assertEqual(children[0].show_calls, [{"force_refresh": True, "source": "manual_query"}])
+            self.assertEqual(children[1].show_calls, [])
+
+            manager.update_settings({"enabled": False})
+            manager.show_current_status(force_refresh=True)
+
+            self.assertEqual(len(children[0].show_calls), 1)
+            self.assertEqual(children[1].show_calls, [])
+
+    def test_attach_gives_children_ui_context_without_starting_independent_monitoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            root = object()
+            event_queue = object()
+
+            manager.attach(root, event_queue)
+
+            self.assertEqual(
+                [child.attach_calls for child in children],
+                [
+                    [{"root": root, "event_queue": event_queue, "start_monitor": False}],
+                    [{"root": root, "event_queue": event_queue, "start_monitor": False}],
+                ],
+            )
+
+    def test_attach_starts_manager_level_periodic_monitoring_for_logged_in_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime["session_state"] = "logged_in"
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            manager.attach(root, event_queue=None)
+
+            self.assertEqual(len(root.after_calls), 1)
+            self.assertLessEqual(root.after_calls[0]["delay_ms"], 1000)
+
+            root.after_calls[0]["callback"]()
+
+            self.assertEqual(
+                children[0].show_calls,
+                [{"force_refresh": True, "source": "auto_monitor"}],
+            )
+            self.assertEqual(children[1].show_calls, [])
+            self.assertGreaterEqual(len(root.after_calls), 2)
+
+    def test_attach_does_not_mask_child_attach_type_errors(self):
+        class BuggyAttachChild(_FakeChildMonitor):
+            def attach(self, root, event_queue=None, **kwargs):
+                if "start_monitor" in kwargs:
+                    raise TypeError("internal attach failure")
+                return super().attach(root, event_queue)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            children = []
+
+            def factory(config_dir: str, profile_dir: str):
+                child = BuggyAttachChild(config_dir=config_dir, profile_dir=profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+
+            with self.assertRaisesRegex(TypeError, "internal attach failure"):
+                manager.attach(object(), event_queue=None)
+
+    def test_partial_v2_state_still_migrates_legacy_account_1_files_and_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            with open(os.path.join(config_dir, "codex_usage_multi_state.json"), "w", encoding="utf-8") as fp:
+                json.dump({"account_expanded": {"account_2": True}}, fp)
+            with open(os.path.join(config_dir, "codex_usage_settings.json"), "w", encoding="utf-8") as fp:
+                json.dump({"enabled": False, "interval_sec": 33.0}, fp)
+            with open(os.path.join(config_dir, "codex_usage_state.json"), "w", encoding="utf-8") as fp:
+                json.dump({"session_state": "logged_in"}, fp)
+
+            manager, _ = self._build_manager(tmp)
+            snapshot = manager.get_settings_snapshot()
+
+            self.assertFalse(snapshot["enabled"])
+            self.assertEqual(snapshot["interval_sec"], 33.0)
+            self.assertTrue(os.path.isfile(snapshot["accounts"][0]["settings_path"]))
+            self.assertTrue(os.path.isfile(snapshot["accounts"][0]["state_path"]))
+            self.assertFalse(os.path.exists(snapshot["accounts"][1]["settings_path"]))
+
+    def test_attach_updates_taskbar_progress_without_querying_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _FakeTaskbarOverlay.instances = []
+            root = object()
+            manager, children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+
+            manager.attach(root, event_queue=None)
+
+            self.assertEqual(len(_FakeTaskbarOverlay.instances), 1)
+            self.assertIs(_FakeTaskbarOverlay.instances[0].root, root)
+            self.assertEqual(_FakeTaskbarOverlay.instances[0].refresh_calls, 1)
+            self.assertEqual([child.show_calls for child in children], [[], []])
+
+    def test_display_topology_change_refreshes_taskbar_overlay_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _FakeTaskbarOverlay.instances = []
+            manager, _children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(object(), event_queue=None)
+
+            manager.on_display_topology_changed("display_change")
+
+            self.assertEqual(len(_FakeTaskbarOverlay.instances), 1)
+            self.assertEqual(_FakeTaskbarOverlay.instances[0].invalidate_geometry_calls, 1)
+            self.assertEqual(_FakeTaskbarOverlay.instances[0].refresh_calls, 2)
+
+    def test_update_settings_refreshes_taskbar_overlay_after_disabling_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _FakeTaskbarOverlay.instances = []
+            manager, _children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(object(), event_queue=None)
+
+            ok, error = manager.update_settings({"enabled": False})
+
+            self.assertTrue(ok, error)
+            self.assertEqual(len(_FakeTaskbarOverlay.instances), 1)
+            self.assertEqual(_FakeTaskbarOverlay.instances[0].refresh_calls, 2)
+            self.assertFalse(
+                _FakeTaskbarOverlay.instances[0].runtime_snapshots[-1]["enabled"]
+            )
+
+    def test_show_current_status_updates_taskbar_progress_after_refreshing_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _FakeTaskbarOverlay.instances = []
+            root = object()
+            manager, children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(root, event_queue=None)
+
+            manager.show_current_status(force_refresh=True)
+
+            self.assertEqual(len(_FakeTaskbarOverlay.instances), 1)
+            self.assertGreaterEqual(_FakeTaskbarOverlay.instances[0].refresh_calls, 2)
+            self.assertEqual(
+                [child.show_calls for child in children],
+                [
+                    [{"force_refresh": True, "source": "manual_query"}],
+                    [{"force_refresh": True, "source": "manual_query"}],
+                ],
+            )
+
+    def test_manual_login_status_updates_taskbar_progress_and_routes_default_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _FakeTaskbarOverlay.instances = []
+            manager, children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(object(), event_queue=None)
+
+            manager.show_current_status(force_refresh=True, source="manual_login")
+
+            self.assertEqual(len(_FakeTaskbarOverlay.instances), 1)
+            self.assertGreaterEqual(_FakeTaskbarOverlay.instances[0].refresh_calls, 2)
+            self.assertEqual(children[0].show_calls, [{"force_refresh": True, "source": "manual_login"}])
+            self.assertEqual(children[1].show_calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

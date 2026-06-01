@@ -106,6 +106,7 @@ class _FakeTk:
     def __init__(self):
         self.labels = []
         self.canvases = []
+        self.checkbuttons = []
 
     def Label(self, *args, **kwargs):
         return _FakeLabel(self, *args, **kwargs)
@@ -123,7 +124,9 @@ class _FakeTk:
         return _FakeVar(value=value)
 
     def Checkbutton(self, *args, **kwargs):
-        return _FakeWidget(self, *args, **kwargs)
+        widget = _FakeWidget(self, *args, **kwargs)
+        self.checkbuttons.append(widget)
+        return widget
 
 
 class _FakeButton(_FakeWidget):
@@ -251,6 +254,34 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(len(fake_tk.canvases), 0)
         self.assertEqual(len(fake_ttk.scrollbars), 0)
 
+    def test_mount_keeps_two_account_settings_visible_without_scroll_canvas(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+            "accounts": [
+                {"id": "account_1", "label": "Codex 1", "enabled": True},
+                {"id": "account_2", "label": "Codex 2", "enabled": True},
+            ],
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        self.assertEqual(len(fake_tk.canvases), 0)
+        self.assertEqual(len(fake_ttk.scrollbars), 0)
+        texts = [label.kwargs.get("text") for label in fake_tk.labels]
+        self.assertIn("작업표시줄 표시", texts)
+        self.assertIn("계정", texts)
+
     def test_mount_lays_runtime_values_out_in_two_columns(self) -> None:
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
@@ -286,6 +317,180 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(runtime_labels["남은 크레딧"].get("column"), 2)
         self.assertEqual(runtime_labels["5시간 사용 한도"].get("column"), 0)
         self.assertEqual(runtime_labels["5시간 한도 초기화"].get("column"), 2)
+
+    def test_mount_renders_two_account_sections(self) -> None:
+        class _FakeMonitor:
+            def get_settings_snapshot(self):
+                return {
+                    "enabled": True,
+                    "taskbar_overlay_enabled": True,
+                    "interval_sec": 90,
+                    "tooltip_duration_ms": 7000,
+                    "usage_url": "https://example.test",
+                    "settings_path": "",
+                    "state_path": "",
+                    "profile_dir": "",
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "label": "Codex 1",
+                            "enabled": True,
+                            "settings_path": "s1.json",
+                            "state_path": "st1.json",
+                            "profile_dir": "profile-1",
+                        },
+                        {
+                            "id": "account_2",
+                            "label": "Codex 2",
+                            "enabled": False,
+                            "settings_path": "s2.json",
+                            "state_path": "st2.json",
+                            "profile_dir": "profile-2",
+                        },
+                    ],
+                }
+
+            def get_runtime_status(self):
+                return {"accounts": []}
+
+            def get_last_snapshot(self):
+                return None
+
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        texts = [label.kwargs.get("text") for label in fake_tk.labels]
+        self.assertIn("Codex 1", texts)
+        self.assertIn("Codex 2", texts)
+        self.assertIn("프로필 경로: profile-1", texts)
+        self.assertIn("프로필 경로: profile-2", texts)
+
+    def test_save_includes_taskbar_overlay_toggle(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.update_payloads = []
+
+            def get_settings_snapshot(self):
+                return {
+                    "accounts": [],
+                    "taskbar_overlay_enabled": True,
+                }
+
+            def update_settings(self, payload):
+                self.update_payloads.append(dict(payload))
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=False)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._set_status = lambda *_args, **_kwargs: None
+        view._hide_main_ui = lambda: None
+
+        view._on_save()
+
+        self.assertEqual(monitor.update_payloads[-1]["taskbar_overlay_enabled"], False)
+
+    def test_mount_hides_legacy_global_login_logout_buttons_for_multi_account_settings(self) -> None:
+        class _FakeMonitor:
+            def get_settings_snapshot(self):
+                return {
+                    "enabled": True,
+                    "interval_sec": 90,
+                    "tooltip_duration_ms": 7000,
+                    "usage_url": "https://example.test",
+                    "accounts": [
+                        {"id": "account_1", "label": "Codex 1", "enabled": True},
+                        {"id": "account_2", "label": "Codex 2", "enabled": True},
+                    ],
+                }
+
+            def get_runtime_status(self):
+                return {
+                    "can_login": False,
+                    "can_logout": True,
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "runtime": {"can_logout": False, "session_state": "logged_out"},
+                        },
+                        {
+                            "id": "account_2",
+                            "runtime": {"can_logout": True, "session_state": "logged_in"},
+                        },
+                    ],
+                }
+
+            def get_last_snapshot(self):
+                return None
+
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        self.assertIsNone(view._login_button)
+        self.assertIsNone(view._logout_button)
+        self.assertEqual(
+            [button.kwargs.get("text") for button in fake_ttk.buttons],
+            ["저장", "로드하기", "로그인", "로그아웃", "로그인", "로그아웃"],
+        )
+
+    def test_account_login_and_release_call_account_specific_manager_methods(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.login_calls = []
+                self.release_calls = []
+
+            def login_account(self, account_id):
+                self.login_calls.append(account_id)
+
+            def release_account_profile_session(self, account_id):
+                self.release_calls.append(account_id)
+                return True, "released"
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor, ui_post=lambda fn: fn())
+        view._tk = object()
+        view._win = object()
+        view._set_status = lambda *_args, **_kwargs: None
+        view._load_settings = lambda: None
+        view._refresh_runtime_status = lambda: None
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _InlineThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_account_login("account_2")
+                view._on_account_release_profile("account_1")
+
+        self.assertEqual(monitor.login_calls, ["account_2"])
+        self.assertEqual(monitor.release_calls, ["account_1"])
 
     def test_on_login_triggers_show_current_status(self) -> None:
         class _FakeMonitor:
@@ -327,16 +532,135 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         login_btn = _FakeButton()
         logout_btn = _FakeButton()
+        account_1_login = _FakeButton()
+        account_1_logout = _FakeButton()
+        account_2_login = _FakeButton()
+        account_2_logout = _FakeButton()
         view._login_button = login_btn
         view._logout_button = logout_btn
+        view._account_login_buttons = {
+            "account_1": account_1_login,
+            "account_2": account_2_login,
+        }
+        view._account_logout_buttons = {
+            "account_1": account_1_logout,
+            "account_2": account_2_logout,
+        }
 
-        view._refresh_action_buttons({"can_login": True, "can_logout": False})
+        view._refresh_action_buttons(
+            {
+                "can_login": True,
+                "can_logout": False,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "enabled": True,
+                        "runtime": {"can_login": True, "can_logout": False},
+                    },
+                    {
+                        "id": "account_2",
+                        "enabled": True,
+                        "runtime": {"can_login": False, "can_logout": True},
+                    },
+                ],
+            }
+        )
         self.assertFalse(login_btn.disabled)
         self.assertTrue(logout_btn.disabled)
+        self.assertFalse(account_1_login.disabled)
+        self.assertTrue(account_1_logout.disabled)
+        self.assertTrue(account_2_login.disabled)
+        self.assertFalse(account_2_logout.disabled)
 
-        view._refresh_action_buttons({"can_login": False, "can_logout": True})
+        view._refresh_action_buttons(
+            {
+                "can_login": False,
+                "can_logout": True,
+                "enabled": False,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "enabled": True,
+                        "runtime": {"can_login": True, "can_logout": True},
+                    },
+                    {
+                        "id": "account_2",
+                        "enabled": True,
+                        "runtime": {"can_login": True, "can_logout": True},
+                    },
+                ],
+            }
+        )
         self.assertTrue(login_btn.disabled)
         self.assertFalse(logout_btn.disabled)
+        self.assertTrue(account_1_login.disabled)
+        self.assertTrue(account_1_logout.disabled)
+        self.assertTrue(account_2_login.disabled)
+        self.assertTrue(account_2_logout.disabled)
+
+    def test_account_login_guard_uses_account_runtime_permissions(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.login_calls = []
+
+            def get_runtime_status(self):
+                return {
+                    "enabled": False,
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "enabled": True,
+                            "runtime": {"can_login": True, "can_logout": True},
+                        }
+                    ]
+                }
+
+            def login_account(self, account_id):
+                self.login_calls.append(account_id)
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        statuses: list[tuple[str, str]] = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        view._on_account_login("account_1")
+
+        self.assertEqual(monitor.login_calls, [])
+        self.assertTrue(statuses)
+        self.assertEqual(statuses[-1][1], "info")
+
+    def test_account_logout_guard_uses_account_runtime_permissions(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.release_calls = []
+
+            def get_runtime_status(self):
+                return {
+                    "enabled": False,
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "enabled": True,
+                            "runtime": {"can_login": True, "can_logout": True},
+                        }
+                    ]
+                }
+
+            def release_account_profile_session(self, account_id):
+                self.release_calls.append(account_id)
+                return True, "released"
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._tk = object()
+        statuses: list[tuple[str, str]] = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        view._on_account_release_profile("account_1")
+
+        self.assertEqual(monitor.release_calls, [])
+        self.assertTrue(statuses)
+        self.assertEqual(statuses[-1][1], "info")
 
     def test_refresh_runtime_status_shows_profile_in_use_pause_state(self) -> None:
         class _Var:

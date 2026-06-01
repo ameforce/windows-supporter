@@ -111,7 +111,10 @@ def main() -> None:
                 break
     except Exception:
         pass
-    root.withdraw()
+    try:
+        root.withdraw()
+    except Exception:
+        pass
     monitor = Monitor()
     event_queue: queue.SimpleQueue = queue.SimpleQueue()
     startup_manager = StartupAppManager()
@@ -171,11 +174,6 @@ def main() -> None:
         except Exception:
             pass
         return
-
-    try:
-        root.after(120, lambda: event_queue.put(_start_startup_apps_bg))
-    except Exception:
-        pass
 
     tray = SystemTrayIcon(
         tooltip="Windows Supporter",

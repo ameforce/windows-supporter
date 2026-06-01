@@ -202,9 +202,9 @@ class SystemTrayIcon:
         hwnd = self._hwnd
         if not hwnd:
             return
-        hicon = self._get_hicon()
+        hicon, tooltip = self._get_hicon(), self._tooltip
         flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
-        nid = (hwnd, 0, flags, self._wm_notify, hicon, self._tooltip)
+        nid = (hwnd, 0, flags, self._wm_notify, hicon, tooltip)
         try:
             win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
         except Exception:
@@ -265,12 +265,17 @@ class SystemTrayIcon:
 
     def _destroy_hicon(self) -> None:
         if self._hicon_owned and self._hicon:
-            try:
-                win32gui.DestroyIcon(int(self._hicon))
-            except Exception:
-                pass
+            self._destroy_hicon_value(int(self._hicon))
         self._hicon = None
         self._hicon_owned = False
+        return
+
+    def _destroy_hicon_value(self, hicon: int) -> None:
+        if hicon:
+            try:
+                win32gui.DestroyIcon(int(hicon))
+            except Exception:
+                pass
         return
 
     def _on_taskbar_restart(self, hwnd: int, msg: int, wparam: int, lparam: int):

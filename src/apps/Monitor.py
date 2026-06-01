@@ -7,7 +7,7 @@ from src.apps.Notion import Notion
 from src.apps.Wrike import Wrike
 from src.apps.KakaoManager import KakaoManager
 from src.apps.LiJaMong import LiJaMong
-from src.apps.codex_usage_monitor import CodexUsageMonitor
+from src.apps.codex_usage_multi_monitor import CodexUsageMultiMonitor
 
 
 class Monitor:
@@ -66,13 +66,21 @@ class Monitor:
         if not self.__background_enabled:
             return
         root = self.__root
+        normalized_reason = str(reason or "display_change")
+        try:
+            codex = self.__codex_usage
+            handler = getattr(codex, "on_display_topology_changed", None)
+            if callable(handler):
+                handler(normalized_reason)
+        except Exception:
+            pass
         try:
             self.__ensure_kakao().invalidate_display_topology(
                 root=root,
-                reason=str(reason or "display_change"),
+                reason=normalized_reason,
             )
         except Exception:
-            return
+            pass
         return
 
     def __ui_post(self, fn) -> None:
@@ -138,7 +146,7 @@ class Monitor:
             return self.__codex_usage
         with self.__component_lock:
             if self.__codex_usage is None:
-                self.__codex_usage = CodexUsageMonitor()
+                self.__codex_usage = CodexUsageMultiMonitor()
         return self.__codex_usage
 
     def __attach_features_on_ui_thread(self) -> None:

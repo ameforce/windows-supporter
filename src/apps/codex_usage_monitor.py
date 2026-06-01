@@ -1352,10 +1352,15 @@ class CodexUsageMonitor:
         self,
         config_dir: str | None = None,
         profile_dir: str | None = None,
+        notification_sink=None,
+        suppress_normal_tooltips: bool = False,
     ) -> None:
         self.__lib = LibConnector()
         self.__root = None
         self.__event_queue = None
+        self.__notification_sink = notification_sink if callable(notification_sink) else None
+        self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
+        self.__external_scheduler = False
 
         self.__monitor_after_id = None
         self.__monitor_running = False
@@ -1476,11 +1481,20 @@ class CodexUsageMonitor:
         self.__refresh_session_state_from_profile()
         return
 
-    def attach(self, root, event_queue=None) -> None:
+    def attach(self, root, event_queue=None, start_monitor: bool = True) -> None:
         self.__root = root
         self.__event_queue = event_queue
+        self.__external_scheduler = not bool(start_monitor)
         self.__refresh_session_state_from_profile()
-        self.__restart_monitor()
+        if bool(start_monitor):
+            self.__restart_monitor()
+            return
+        self.__clear_monitor_schedule()
+        return
+
+    def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:
+        self.__notification_sink = notification_sink if callable(notification_sink) else None
+        self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         return
 
     def __set_usage_url(self, value: str) -> None:
@@ -1528,7 +1542,10 @@ class CodexUsageMonitor:
         self.__force_playwright_mode()
         self.__refresh_session_state_from_profile()
         self.__save_settings()
-        self.__restart_monitor()
+        if bool(self.__external_scheduler):
+            self.__clear_monitor_schedule()
+        else:
+            self.__restart_monitor()
         return True, None
 
     def release_profile_session(self) -> tuple[bool, str]:
@@ -1656,12 +1673,23 @@ class CodexUsageMonitor:
     def __is_managed_profile_directory(self, profile_dir: str) -> bool:
         target = self.__normalize_local_path(profile_dir)
         default = self.__normalize_local_path(getattr(self, "_CodexUsageMonitor__default_profile_dir", ""))
-        if not target or not default or target != default:
+        if not target or not default:
             return False
         try:
             leaf = self.__lib.os.path.basename(target)
-            parent = self.__lib.os.path.basename(self.__lib.os.path.dirname(target))
-            if leaf.lower() != "chatgpt-profile":
+            parent_dir = self.__lib.os.path.dirname(target)
+            default_parent = self.__normalize_local_path(
+                self.__lib.os.path.dirname(default)
+            )
+            parent = self.__lib.os.path.basename(parent_dir)
+            allowed_leafs = {
+                "chatgpt-profile",
+                "chatgpt-profile-account-1",
+                "chatgpt-profile-account-2",
+            }
+            if leaf.lower() not in allowed_leafs:
+                return False
+            if self.__normalize_local_path(parent_dir) != default_parent:
                 return False
             if parent.lower() != "windows-supporter":
                 return False
@@ -1869,6 +1897,8 @@ class CodexUsageMonitor:
 
     def __reset_monitor_countdown_after_manual_query(self) -> None:
         self.__clear_monitor_schedule()
+        if bool(self.__external_scheduler):
+            return
         if not self.__should_run_background_collection():
             return
         if bool(self.__monitor_running or self.__startup_warmup_running):
@@ -1877,6 +1907,8 @@ class CodexUsageMonitor:
         return
 
     def __resume_background_monitor_if_needed(self) -> None:
+        if bool(self.__external_scheduler):
+            return
         if not self.__should_run_background_collection():
             return
         if self.__monitor_after_id is not None:
@@ -3352,6 +3384,8 @@ class CodexUsageMonitor:
         lines: list[tuple[str, str | None]] | None = None,
         duration_ms: int | None = None,
     ) -> None:
+        if self.__emit_managed_notification(text, lines=lines, duration_ms=duration_ms):
+            return
         root = self.__root
         if root is None:
             return
@@ -3387,6 +3421,28 @@ class CodexUsageMonitor:
         except Exception:
             return
         return
+
+    def __emit_managed_notification(
+        self,
+        text: str,
+        lines: list[tuple[str, str | None]] | None = None,
+        duration_ms: int | None = None,
+    ) -> bool:
+        sink = self.__notification_sink
+        if sink is None or not bool(self.__suppress_normal_tooltips):
+            return False
+        try:
+            sink(
+                {
+                    "text": str(text or ""),
+                    "lines": lines,
+                    "duration_ms": duration_ms,
+                }
+            )
+            return True
+        except Exception as exc:
+            self.__log_exception("managed notification sink failed", exc)
+            return False
 
     def __hide_active_tooltip(self) -> None:
         current = self.__active_tooltip
