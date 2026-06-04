@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -66,6 +67,7 @@ class CodexUsageMultiMonitor:
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__collection_mode = "playwright"
         self.__refresh_inflight = False
+        self.__refresh_lock = threading.Lock()
         self.__root = None
         self.__event_queue = None
         self.__taskbar_progress = None
@@ -211,6 +213,11 @@ class CodexUsageMultiMonitor:
             self.login_account(self.__default_account_id)
             return
         if bool(force_refresh):
+            if self.__dispatch_refresh_worker(
+                lambda: self.__refresh_accounts(source=source_key, manage_inflight=False),
+                refresh_taskbar=True,
+            ):
+                return
             self.__refresh_accounts(source=source_key)
         self.__refresh_taskbar_progress()
         return
@@ -325,6 +332,36 @@ class CodexUsageMultiMonitor:
         except Exception:
             return False
 
+    def __dispatch_refresh_worker(self, fn, *, refresh_taskbar: bool) -> bool:
+        if self.__event_queue is None or not callable(fn):
+            return False
+        with self.__refresh_lock:
+            if bool(self.__refresh_inflight):
+                if bool(refresh_taskbar):
+                    self.__refresh_taskbar_progress()
+                return True
+            self.__refresh_inflight = True
+
+        def worker() -> None:
+            try:
+                fn()
+            finally:
+                with self.__refresh_lock:
+                    self.__refresh_inflight = False
+                if bool(refresh_taskbar):
+                    self.__refresh_taskbar_progress()
+            return
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            with self.__refresh_lock:
+                self.__refresh_inflight = False
+            return False
+        if bool(refresh_taskbar):
+            self.__refresh_taskbar_progress()
+        return True
+
     def __restart_monitor_scheduler(self, initial_delay_sec: float | None = None) -> None:
         self.__clear_monitor_schedule()
         if not self.__should_run_background_collection():
@@ -374,15 +411,24 @@ class CodexUsageMultiMonitor:
         self.__next_collect_due_ts = 0.0
         if not self.__should_run_background_collection():
             return
-        self.__refresh_background_accounts(source="auto_monitor")
-        self.__refresh_taskbar_progress()
+        if not self.__dispatch_refresh_worker(
+            lambda: self.__refresh_background_accounts(
+                source="auto_monitor",
+                manage_inflight=False,
+            ),
+            refresh_taskbar=True,
+        ):
+            self.__refresh_background_accounts(source="auto_monitor")
+            self.__refresh_taskbar_progress()
         self.__schedule_monitor_tick(initial_delay_sec=self.__interval_sec)
         return
 
-    def __refresh_background_accounts(self, source: str) -> None:
+    def __refresh_background_accounts(self, source: str, *, manage_inflight: bool = True) -> None:
         if not bool(self.__enabled):
             return
-        self.__refresh_inflight = True
+        if bool(manage_inflight):
+            with self.__refresh_lock:
+                self.__refresh_inflight = True
         try:
             for account_id in self.__background_account_ids():
                 self.__show_account_status(
@@ -390,9 +436,12 @@ class CodexUsageMultiMonitor:
                     force_refresh=True,
                     source=source,
                     refresh_taskbar=False,
+                    allow_async_dispatch=False,
                 )
         finally:
-            self.__refresh_inflight = False
+            if bool(manage_inflight):
+                with self.__refresh_lock:
+                    self.__refresh_inflight = False
         return
 
     def __should_run_background_collection(self) -> bool:
@@ -405,7 +454,12 @@ class CodexUsageMultiMonitor:
                 continue
             runtime = self.__safe_child_runtime(account_id)
             session_state = str(runtime.get("session_state") or "logged_out")
-            if session_state == "logged_in" or bool(runtime.get("collect_inflight")):
+            if (
+                session_state == "logged_in"
+                or bool(runtime.get("collect_inflight"))
+                or bool(runtime.get("profile_session_present"))
+                or bool(runtime.get("profile_cdp_available"))
+            ):
                 account_ids.append(account_id)
         return account_ids
 
@@ -423,10 +477,12 @@ class CodexUsageMultiMonitor:
             remaining = 0.0
         return remaining
 
-    def __refresh_accounts(self, source: str) -> None:
+    def __refresh_accounts(self, source: str, *, manage_inflight: bool = True) -> None:
         if not bool(self.__enabled):
             return
-        self.__refresh_inflight = True
+        if bool(manage_inflight):
+            with self.__refresh_lock:
+                self.__refresh_inflight = True
         try:
             for account_id in ACCOUNT_IDS:
                 if not bool(self.__account_settings[account_id].enabled):
@@ -436,9 +492,12 @@ class CodexUsageMultiMonitor:
                     force_refresh=True,
                     source=source,
                     refresh_taskbar=False,
+                    allow_async_dispatch=False,
                 )
         finally:
-            self.__refresh_inflight = False
+            if bool(manage_inflight):
+                with self.__refresh_lock:
+                    self.__refresh_inflight = False
         return
 
     def __show_account_status(
@@ -448,8 +507,17 @@ class CodexUsageMultiMonitor:
         force_refresh: bool,
         source: str,
         refresh_taskbar: bool,
+        allow_async_dispatch: bool = True,
     ) -> None:
         child = self.__child(account_id)
+        if bool(allow_async_dispatch) and bool(force_refresh) and self.__dispatch_refresh_worker(
+            lambda: child.show_current_status(
+                force_refresh=True,
+                source=str(source or "manual_query"),
+            ),
+            refresh_taskbar=bool(refresh_taskbar),
+        ):
+            return
         child.show_current_status(force_refresh=bool(force_refresh), source=str(source or "manual_query"))
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
@@ -470,14 +538,24 @@ class CodexUsageMultiMonitor:
 
     def __build_account_runtime_entry(self, account_id: str) -> dict[str, Any]:
         account = self.__account_settings[account_id]
+        runtime = self.__safe_child_runtime(account_id)
         return {
             "id": account.account_id,
-            "label": account.label,
+            "label": self.__display_account_label(account, runtime),
+            "configured_label": account.label,
             "enabled": bool(account.enabled),
-            "runtime": self.__safe_child_runtime(account_id),
+            "runtime": runtime,
             "last_snapshot": self.__snapshot_to_dict(self.__child(account_id).get_last_snapshot()),
             "settings": self.__safe_child_settings(account_id),
         }
+
+    def __display_account_label(self, account: _AccountSettings, runtime: dict[str, Any]) -> str:
+        profile_name = ""
+        if isinstance(runtime, dict):
+            profile_name = str(runtime.get("profile_name") or "").strip()
+        if profile_name:
+            return profile_name
+        return str(account.label or DEFAULT_LABELS.get(account.account_id, account.account_id))
 
     def __safe_child_settings(self, account_id: str) -> dict[str, Any]:
         try:

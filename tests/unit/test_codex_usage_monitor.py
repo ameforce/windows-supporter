@@ -10,6 +10,7 @@ from src.apps.codex_usage_monitor import (
     merge_snapshot_with_previous,
     normalize_usage_value,
     parse_usage_metrics_from_text,
+    sanitize_profile_name,
 )
 
 
@@ -49,6 +50,26 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
   left """),
             "12 / 40 left",
         )
+
+    def test_sanitize_profile_name_rejects_menu_button_labels(self) -> None:
+        for value in (
+            "메뉴 열기",
+            "프로필 메뉴 열기",
+            "Open menu",
+            "profile",
+            "설정",
+            "사용자 지정",
+            "그룹화 기준: 일별",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(sanitize_profile_name(value), "")
+
+    def test_sanitize_profile_name_keeps_real_profile_name(self) -> None:
+        self.assertEqual(sanitize_profile_name("Profile: Daeng"), "Daeng")
+        self.assertEqual(sanitize_profile_name("이니미니"), "이니미니")
+
+    def test_sanitize_profile_name_strips_plan_badge_suffix(self) -> None:
+        self.assertEqual(sanitize_profile_name("이 PRO"), "이")
 
     def test_parse_usage_metrics_from_inline_lines(self) -> None:
         raw = """
@@ -245,6 +266,91 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         self.assertEqual(merged.gpt_5_3_codex_spark_five_hour_limit, "83%")
         self.assertEqual(merged.gpt_5_3_codex_spark_weekly_limit, "95%")
         self.assertEqual(merged.remaining_credit, "959")
+
+    def test_snapshot_from_dict_drops_implausible_day_scale_five_hour_reset(self) -> None:
+        snapshot = UsageSnapshot.from_dict(
+            {
+                "five_hour_limit": "100%",
+                "weekly_limit": "0%",
+                "captured_at": "2026-06-03T20:48:37+09:00",
+                "five_hour_limit_reset_at": "2026-06-07T15:39:00+09:00",
+                "weekly_limit_reset_at": "2026-06-07T15:39:00+09:00",
+            }
+        )
+
+        self.assertEqual(snapshot.five_hour_limit_reset_at, "")
+        self.assertEqual(snapshot.weekly_limit_reset_at, "2026-06-07T15:39:00+09:00")
+
+    def test_merge_snapshot_does_not_restore_previous_implausible_five_hour_reset(self) -> None:
+        previous = UsageSnapshot.from_dict(
+            {
+                "five_hour_limit": "100%",
+                "weekly_limit": "0%",
+                "captured_at": "2026-06-03T20:48:37+09:00",
+                "five_hour_limit_reset_at": "2026-06-07T15:39:00+09:00",
+                "weekly_limit_reset_at": "2026-06-07T15:39:00+09:00",
+            }
+        )
+        current = UsageSnapshot.from_metrics(
+            {"five_hour_limit": "100%", "weekly_limit": "0%"},
+            captured_at="2026-06-03T21:48:37+09:00",
+        )
+
+        merged = merge_snapshot_with_previous(current, previous)
+
+        self.assertEqual(merged.five_hour_limit_reset_at, "")
+        self.assertEqual(merged.weekly_limit_reset_at, "2026-06-07T15:39:00+09:00")
+
+    def test_snapshot_from_dict_drops_cross_metric_cloned_five_hour_resets(self) -> None:
+        snapshot = UsageSnapshot.from_dict(
+            {
+                "five_hour_limit": "89%",
+                "weekly_limit": "35%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "captured_at": "2026-06-03T22:13:42+09:00",
+                "five_hour_limit_reset_at": "2026-06-03T22:24:00+09:00",
+                "weekly_limit_reset_at": "2026-06-08T00:38:00+09:00",
+                "gpt_5_3_codex_spark_five_hour_limit_reset_at": "2026-06-03T22:24:00+09:00",
+                "gpt_5_3_codex_spark_weekly_limit_reset_at": "2026-06-03T22:24:00+09:00",
+            }
+        )
+
+        self.assertEqual(snapshot.five_hour_limit_reset_at, "2026-06-03T22:24:00+09:00")
+        self.assertEqual(snapshot.weekly_limit_reset_at, "2026-06-08T00:38:00+09:00")
+        self.assertEqual(snapshot.gpt_5_3_codex_spark_five_hour_limit_reset_at, "")
+        self.assertEqual(snapshot.gpt_5_3_codex_spark_weekly_limit_reset_at, "")
+
+    def test_merge_snapshot_does_not_restore_cross_metric_cloned_reset_values(self) -> None:
+        previous = UsageSnapshot.from_dict(
+            {
+                "five_hour_limit": "89%",
+                "weekly_limit": "35%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "captured_at": "2026-06-03T22:13:42+09:00",
+                "five_hour_limit_reset_at": "2026-06-03T22:24:00+09:00",
+                "weekly_limit_reset_at": "2026-06-08T00:38:00+09:00",
+                "gpt_5_3_codex_spark_five_hour_limit_reset_at": "2026-06-03T22:24:00+09:00",
+                "gpt_5_3_codex_spark_weekly_limit_reset_at": "2026-06-03T22:24:00+09:00",
+            }
+        )
+        current = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "88%",
+                "weekly_limit": "35%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+            },
+            captured_at="2026-06-03T22:14:42+09:00",
+        )
+
+        merged = merge_snapshot_with_previous(current, previous)
+
+        self.assertEqual(merged.five_hour_limit_reset_at, "2026-06-03T22:24:00+09:00")
+        self.assertEqual(merged.weekly_limit_reset_at, "2026-06-08T00:38:00+09:00")
+        self.assertEqual(merged.gpt_5_3_codex_spark_five_hour_limit_reset_at, "")
+        self.assertEqual(merged.gpt_5_3_codex_spark_weekly_limit_reset_at, "")
 
     def test_compute_usage_changes_detects_only_changed_fields(self) -> None:
         prev = UsageSnapshot.from_metrics(

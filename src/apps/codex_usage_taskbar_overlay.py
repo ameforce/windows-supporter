@@ -17,9 +17,11 @@ except Exception:  # pragma: no cover - exercised on GUI-less imports only.
     tk = None
 
 try:
+    import win32api
     import win32con
     import win32gui
 except Exception:  # pragma: no cover - non-Windows fallback.
+    win32api = None
     win32con = None
     win32gui = None
 
@@ -34,17 +36,41 @@ _DEFAULT_GEOMETRY = {
 }
 
 _EMPTY_SLOT_PADDING_PX = 8
-_MIN_EMPTY_SLOT_WIDTH_PX = 220
+_MIN_EMPTY_SLOT_WIDTH_PX = 300
+_PREFERRED_EMPTY_SLOT_WIDTH_PX = 420
 _TASKBAR_SAMPLE_STEP_PX = 4
 _OCCUPIED_DILATION_PX = 24
-_FLASH_DURATION_SEC = 2.8
-_FLASH_TICK_MS = 320
+_FLASH_DURATION_SEC = 1.0
+_FLASH_TICK_MS = 1000
 _KEEPALIVE_TICK_MS = 250
+_GEOMETRY_MONITOR_TICK_MS = 400
+_GEOMETRY_MONITOR_HARD_RESAMPLE_SEC = 3.0
+_GEOMETRY_CHANGE_TOLERANCE_PX = 2
+_FULLSCREEN_POLL_MS = 500
 _GWLP_HWNDPARENT = -8
 _TASKBAR_METRICS = (
     ("five_hour_limit", "5h"),
     ("weekly_limit", "7d"),
 )
+_TASKBAR_OCCUPIED_CHILD_CLASSES = {
+    "Button",
+    "MSTaskListWClass",
+    "MSTaskSwWClass",
+    "ReBarWindow32",
+    "Start",
+    "TrayNotifyWnd",
+}
+_FULLSCREEN_EXCLUDED_WINDOW_CLASSES = {
+    "Dwm",
+    "Progman",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "WorkerW",
+}
+_FULLSCREEN_EXCLUDED_WINDOW_TITLES = {
+    "Windows Input Experience",
+    "Windows 입력 환경",
+}
 _RESET_KEY_BY_METRIC = {
     "five_hour_limit": "five_hour_limit_reset_at",
     "weekly_limit": "weekly_limit_reset_at",
@@ -63,8 +89,26 @@ _RESET_WINDOW_BY_METRIC = {
         "very_far_seconds": 5 * 24 * 60 * 60,
     },
 }
-_RESET_DETAIL_COLUMN_WIDTH_PX = 42
-_RESET_SHORT_COLUMN_WIDTH_PX = 24
+_RESET_DETAIL_COLUMN_WIDTH_PX = 48
+_RESET_WEEKLY_COLUMN_WIDTH_PX = 52
+_RESET_FIVE_HOUR_COLUMN_WIDTH_PX = 40
+_RESET_SHORT_COLUMN_WIDTH_PX = 28
+_RESET_PLACEHOLDER_TEXT = "--"
+_VALUE_COLUMN_MIN_WIDTH_PX = 22
+_VALUE_COLUMN_MAX_WIDTH_PX = 28
+_SEGMENT_RIGHT_PADDING_PX = 2
+_METRIC_PROGRESS_MIN_WIDTH_PX = 28
+_METRIC_PROGRESS_PREFERRED_WIDTH_PX = 36
+_METRIC_PROGRESS_MAX_WIDTH_PX = 48
+_METRIC_SEGMENT_GAP_COMPACT_PX = 6
+_METRIC_SEGMENT_GAP_WIDE_PX = 12
+_PROFILE_LABEL_COLUMN_MIN_WIDTH_PX = 64
+_PROFILE_LABEL_COLUMN_MAX_WIDTH_PX = 76
+_PROFILE_LABEL_COLUMN_WIDTH_RATIO = 0.17
+_STATUS_DOT_ONLY_WIDTH_PX = 14
+_STATUS_WITH_TEXT_WIDTH_PX = 24
+_STATUS_TO_METRICS_GAP_PX = 6
+_FIVE_HOUR_RESET_MAX_SECONDS = 36 * 60 * 60
 
 
 def build_codex_usage_taskbar_overlay_model(
@@ -243,6 +287,7 @@ class CodexUsageTaskbarOverlay:
             list[tuple[int, int]] | None,
         ]
         | None = None,
+        fullscreen_detector: Callable[[Any | None], bool] | None = None,
     ) -> None:
         self._root = root
         self._runtime_getter = runtime_getter
@@ -251,6 +296,7 @@ class CodexUsageTaskbarOverlay:
         self._occupied_span_getter = (
             occupied_span_getter or _detect_horizontal_taskbar_occupied_spans
         )
+        self._fullscreen_detector = fullscreen_detector
         self._window = None
         self._canvas = None
         self._last_metric_values: dict[str, str] = {}
@@ -258,9 +304,12 @@ class CodexUsageTaskbarOverlay:
         self._last_model: dict[str, Any] | None = None
         self._flash_after_id = None
         self._keepalive_after_id = None
+        self._geometry_after_id = None
+        self._last_geometry_hard_resample_at = 0.0
         self._geometry_invalidated = True
         self._cached_geometry_context = None
         self._cached_geometry: dict[str, int | str] | None = None
+        self._fullscreen_suppressed = False
         return
 
     def refresh(self) -> bool:
@@ -271,8 +320,16 @@ class CodexUsageTaskbarOverlay:
         geometry = self._calculate_geometry()
         model = build_codex_usage_taskbar_overlay_model(runtime, geometry=geometry)
         if not bool(model.get("visible")):
+            if not bool(geometry.get("visible", True)):
+                self._withdraw_for_geometry_gap(model)
+                return True
             self.hide()
             return True
+        if self._is_fullscreen_active(self._window, geometry):
+            self._last_model = model
+            self._suppress_for_fullscreen()
+            return True
+        self._fullscreen_suppressed = False
         window = self._ensure_window()
         if window is None:
             return False
@@ -280,7 +337,14 @@ class CodexUsageTaskbarOverlay:
         self._update_metric_change_flash(model)
         self._draw(model)
         self._last_model = model
+        if self._last_geometry_hard_resample_at <= 0.0:
+            try:
+                self._last_geometry_hard_resample_at = time.monotonic()
+            except Exception:
+                self._last_geometry_hard_resample_at = 0.0
         self._schedule_keepalive_tick()
+        self._schedule_geometry_monitor_tick()
+        self._schedule_flash_tick_if_needed()
         try:
             window.deiconify()
         except Exception:
@@ -302,6 +366,20 @@ class CodexUsageTaskbarOverlay:
             pass
         self._cancel_flash_tick()
         self._cancel_keepalive_tick()
+        self._cancel_geometry_monitor_tick()
+        self._fullscreen_suppressed = False
+        return
+
+    def _withdraw_for_geometry_gap(self, model: dict[str, Any]) -> None:
+        self._last_model = model
+        window = self._window
+        if window is not None:
+            try:
+                window.withdraw()
+            except Exception:
+                pass
+        self._cancel_flash_tick()
+        self._schedule_geometry_monitor_tick()
         return
 
     def invalidate_geometry(self) -> None:
@@ -323,13 +401,18 @@ class CodexUsageTaskbarOverlay:
                 identity = f"{account_id}:{metric_key}"
                 value = str(metric.get("value_text") or "")
                 active_keys.add(identity)
+                previous = self._last_metric_values.get(identity)
+                if previous is not None and previous != value:
+                    try:
+                        self._flash_until[identity] = time.monotonic() + _FLASH_DURATION_SEC
+                    except Exception:
+                        self._flash_until[identity] = 0.0
                 self._last_metric_values[identity] = value
-                metric["flash"] = False
-                metric["flash_phase"] = False
         for identity in list(self._last_metric_values):
             if identity not in active_keys:
                 self._last_metric_values.pop(identity, None)
-        self._flash_until.clear()
+                self._flash_until.pop(identity, None)
+        self._decorate_model_flash(model)
         return
 
     def _decorate_model_flash(self, model: dict[str, Any], *, now: float | None = None) -> bool:
@@ -359,7 +442,7 @@ class CodexUsageTaskbarOverlay:
             return
         if self._flash_after_id is not None:
             return
-        delay_ms = self._next_flash_expiry_delay_ms()
+        delay_ms = _FLASH_TICK_MS
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
             return
@@ -401,7 +484,7 @@ class CodexUsageTaskbarOverlay:
                 pass
         return
 
-    def _schedule_keepalive_tick(self) -> None:
+    def _schedule_keepalive_tick(self, delay_ms: int | None = None) -> None:
         if self._keepalive_after_id is not None:
             return
         scheduler = getattr(self._root, "after", None)
@@ -409,7 +492,7 @@ class CodexUsageTaskbarOverlay:
             return
         try:
             self._keepalive_after_id = scheduler(
-                _KEEPALIVE_TICK_MS,
+                _KEEPALIVE_TICK_MS if delay_ms is None else int(delay_ms),
                 self._keepalive_tick,
             )
         except Exception:
@@ -420,9 +503,18 @@ class CodexUsageTaskbarOverlay:
         self._keepalive_after_id = None
         window = self._window
         model = self._last_model
-        if window is None or not isinstance(model, dict):
+        if not isinstance(model, dict):
             return
         if not bool(model.get("visible", True)):
+            return
+        if self._is_fullscreen_active(window, model.get("geometry")):
+            self._suppress_for_fullscreen()
+            return
+        if bool(self._fullscreen_suppressed):
+            self._fullscreen_suppressed = False
+            self.refresh()
+            return
+        if window is None:
             return
         native_visible = self._is_native_z_order_visible(window)
         self._reassert_native_z_order(window)
@@ -444,7 +536,107 @@ class CodexUsageTaskbarOverlay:
                 pass
         return
 
-    def _calculate_geometry(self) -> dict[str, int | str]:
+    def _schedule_geometry_monitor_tick(self, delay_ms: int | None = None) -> None:
+        if self._geometry_after_id is not None:
+            return
+        scheduler = getattr(self._root, "after", None)
+        if not callable(scheduler):
+            return
+        try:
+            self._geometry_after_id = scheduler(
+                _GEOMETRY_MONITOR_TICK_MS if delay_ms is None else int(delay_ms),
+                self._geometry_monitor_tick,
+            )
+        except Exception:
+            self._geometry_after_id = None
+        return
+
+    def _geometry_monitor_tick(self) -> None:
+        self._geometry_after_id = None
+        model = self._last_model
+        if not isinstance(model, dict):
+            return
+        window = self._window
+        if bool(model.get("visible", True)) and self._is_fullscreen_active(
+            window,
+            model.get("geometry"),
+        ):
+            self._suppress_for_fullscreen()
+            return
+        now = time.monotonic()
+        hard_resample = (
+            now - float(self._last_geometry_hard_resample_at)
+            >= _GEOMETRY_MONITOR_HARD_RESAMPLE_SEC
+        )
+        if hard_resample:
+            self._last_geometry_hard_resample_at = now
+        geometry = self._calculate_geometry(
+            force_resample=True,
+            withdraw_for_sampling=False,
+        )
+        previous_geometry = model.get("geometry", {})
+        if not isinstance(previous_geometry, dict):
+            previous_geometry = {}
+        if _geometry_changed(previous_geometry, geometry):
+            try:
+                runtime = self._runtime_getter()
+            except Exception:
+                runtime = {}
+            updated_model = build_codex_usage_taskbar_overlay_model(runtime, geometry=geometry)
+            if bool(updated_model.get("visible")):
+                if window is None:
+                    window = self._ensure_window()
+                if window is None:
+                    self._last_model = updated_model
+                    self._schedule_geometry_monitor_tick()
+                    return
+                self._apply_geometry(window, geometry)
+                self._decorate_model_flash(updated_model)
+                self._draw(updated_model)
+                self._last_model = updated_model
+                try:
+                    window.deiconify()
+                except Exception:
+                    pass
+                self._force_native_repaint(window)
+            else:
+                if not bool(geometry.get("visible", True)):
+                    self._withdraw_for_geometry_gap(updated_model)
+                else:
+                    self.hide()
+                return
+        elif hard_resample and bool(model.get("visible", True)) and window is not None:
+            try:
+                window.deiconify()
+            except Exception:
+                pass
+            try:
+                window.lift()
+            except Exception:
+                pass
+            self._force_native_repaint(window)
+        self._schedule_geometry_monitor_tick()
+        return
+
+    def _cancel_geometry_monitor_tick(self) -> None:
+        after_id = self._geometry_after_id
+        self._geometry_after_id = None
+        if after_id is None:
+            return
+        canceller = getattr(self._root, "after_cancel", None)
+        if callable(canceller):
+            try:
+                canceller(after_id)
+            except Exception:
+                pass
+        return
+
+    def _calculate_geometry(
+        self,
+        *,
+        force_resample: bool = False,
+        withdraw_for_sampling: bool = True,
+    ) -> dict[str, int | str]:
         width = _root_int(self._root, "winfo_screenwidth", 1920)
         height = _root_int(self._root, "winfo_screenheight", 1080)
         try:
@@ -457,12 +649,19 @@ class CodexUsageTaskbarOverlay:
             return geometry
         context = self._geometry_context(width, height, work_area, geometry)
         if (
-            not bool(self._geometry_invalidated)
+            not bool(force_resample)
+            and not bool(self._geometry_invalidated)
             and self._cached_geometry_context == context
             and isinstance(self._cached_geometry, dict)
         ):
             return dict(self._cached_geometry)
-        occupied_spans = self._calculate_occupied_spans(width, height, work_area, geometry)
+        occupied_spans = self._calculate_occupied_spans(
+            width,
+            height,
+            work_area,
+            geometry,
+            withdraw_window=withdraw_for_sampling,
+        )
         if occupied_spans is None:
             self._cached_geometry_context = context
             self._cached_geometry = dict(geometry)
@@ -516,9 +715,12 @@ class CodexUsageTaskbarOverlay:
         height: int,
         work_area: tuple[int, int, int, int] | dict[str, int] | None,
         geometry: dict[str, int | str],
+        *,
+        withdraw_window: bool = True,
     ) -> list[tuple[int, int]] | None:
         window = self._window
-        if window is not None:
+        sampling_geometry = dict(geometry)
+        if window is not None and bool(withdraw_window):
             try:
                 window.withdraw()
                 updater = getattr(self._root, "update_idletasks", None)
@@ -527,8 +729,12 @@ class CodexUsageTaskbarOverlay:
                 time.sleep(0.035)
             except Exception:
                 pass
+        elif window is not None:
+            exclude_span = _current_horizontal_window_span(window)
+            if exclude_span is not None:
+                sampling_geometry["_exclude_spans"] = [exclude_span]
         try:
-            return self._occupied_span_getter(width, height, work_area, geometry)
+            return self._occupied_span_getter(width, height, work_area, sampling_geometry)
         except Exception:
             return None
 
@@ -610,10 +816,18 @@ class CodexUsageTaskbarOverlay:
             return
         row_count = min(2, len(bars))
         row_height = max(14, (height - 8) // max(1, row_count))
-        label_width = min(46, max(40, int(width * 0.13)))
-        status_width = 28 if width >= 300 else 10
-        metrics_x = 8 + label_width + status_width + 18
-        metrics_width = max(110, width - metrics_x - 8)
+        label_width = min(
+            _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX,
+            max(
+                _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
+                int(width * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
+            ),
+        )
+        status_width = (
+            _STATUS_WITH_TEXT_WIDTH_PX if width >= 420 else _STATUS_DOT_ONLY_WIDTH_PX
+        )
+        metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
+        metrics_width = max(110, width - metrics_x - 4)
         for index, bar in enumerate(bars[:2]):
             y = 4 + index * row_height
             center_y = y + row_height // 2
@@ -621,14 +835,14 @@ class CodexUsageTaskbarOverlay:
             status_text = str(bar.get("status_text") or "")
             status_color = str(bar.get("status_color") or "#6b7280")
             canvas.create_text(
-                8,
+                6,
                 center_y,
                 anchor="w",
                 fill="#e5e7eb",
                 font=("Segoe UI", 8, "bold"),
-                text=label[:10],
+                text=label[:8],
             )
-            dot_x = 8 + label_width + 2
+            dot_x = 6 + label_width + 1
             canvas.create_oval(
                 dot_x,
                 center_y - 4,
@@ -637,7 +851,7 @@ class CodexUsageTaskbarOverlay:
                 fill=status_color,
                 outline=status_color,
             )
-            if status_width > 10:
+            if status_width > 20:
                 canvas.create_text(
                     dot_x + 10,
                     center_y,
@@ -656,14 +870,27 @@ class CodexUsageTaskbarOverlay:
                         "color": str(bar.get("color") or "#6b7280"),
                     }
                 ]
-            segment_gap = 20
+            segment_gap = (
+                _METRIC_SEGMENT_GAP_COMPACT_PX
+                if width < 640
+                else _METRIC_SEGMENT_GAP_WIDE_PX
+            )
             segment_width = max(
                 48,
                 (metrics_width - segment_gap * max(0, len(metrics) - 1)) // max(1, len(metrics)),
             )
+            progress_width = _metric_progress_width_for_segment(segment_width)
             for metric_index, metric in enumerate(metrics[:2]):
                 segment_x = metrics_x + metric_index * (segment_width + segment_gap)
-                self._draw_metric_segment(canvas, metric, segment_x, y, segment_width, row_height)
+                self._draw_metric_segment(
+                    canvas,
+                    metric,
+                    segment_x,
+                    y,
+                    segment_width,
+                    row_height,
+                    progress_width=progress_width,
+                )
         return
 
     def _draw_metric_segment(
@@ -674,6 +901,7 @@ class CodexUsageTaskbarOverlay:
         y: int,
         width: int,
         row_height: int,
+        progress_width: int | None = None,
     ) -> None:
         center_y = y + row_height // 2
         label = str(metric.get("key") or "")
@@ -681,37 +909,53 @@ class CodexUsageTaskbarOverlay:
         reset_text = str(metric.get("reset_text") or "")
         reset_short_text = str(metric.get("reset_short_text") or reset_text)
         reset_color = str(metric.get("reset_color") or "#94a3b8")
+        metric_key = str(metric.get("metric_key") or "")
         percent = int(metric.get("percent") or 0)
         color = str(metric.get("color") or "#6b7280")
         flash = bool(metric.get("flash"))
         flash_phase = bool(metric.get("flash_phase"))
         label_width = 14
-        value_width = 24
+        value_width = _VALUE_COLUMN_MAX_WIDTH_PX
         label_to_bar_gap = 3
         bar_to_value_gap = 3
         reset_gap = 4
-        display_reset_text = _display_reset_text_for_width(
+        bar_x = x + label_width + label_to_bar_gap
+        reset_right_x = x + width - _SEGMENT_RIGHT_PADDING_PX
+        max_progress_width = max(6, reset_right_x - reset_gap - value_width - bar_to_value_gap - bar_x)
+        if progress_width is None:
+            progress_width = _metric_progress_width_for_segment(width)
+        bar_width = max(
+            6,
+            min(int(progress_width), int(max_progress_width)),
+        )
+        value_x = bar_x + bar_width + bar_to_value_gap + value_width
+        reset_text_x = value_x + reset_gap
+        display_reset_text = _display_reset_text_for_space(
             reset_text,
             reset_short_text,
-            width,
+            metric_key=metric_key,
+            available_px=max(0, reset_right_x - reset_text_x),
         )
-        reset_width = _reset_column_width_for_width(width)
+        if not display_reset_text and not reset_text:
+            display_reset_text = _display_reset_text_for_space(
+                _RESET_PLACEHOLDER_TEXT,
+                _RESET_PLACEHOLDER_TEXT,
+                metric_key=metric_key,
+                available_px=max(0, reset_right_x - reset_text_x),
+            )
+            if display_reset_text:
+                reset_color = "#4b5563"
         show_reset = bool(display_reset_text)
-        bar_x = x + label_width + label_to_bar_gap
-        reset_x = x + width
-        value_x = reset_x - reset_width - reset_gap if reset_width > 0 else x + width
-        reset_text_x = value_x + reset_gap
-        bar_width = max(16, value_x - value_width - bar_to_value_gap - bar_x)
         bar_y = y + max(4, (row_height - 7) // 2)
         if flash:
-            outline = "#fde68a" if flash_phase else "#f59e0b"
+            _ = flash_phase
             canvas.create_rectangle(
                 x - 2,
                 y + 1,
                 x + width + 1,
                 y + row_height - 1,
-                fill="#2c2414" if flash_phase else "#16181d",
-                outline=outline,
+                fill="#16181d",
+                outline="#f59e0b",
             )
         canvas.create_text(
             x,
@@ -797,6 +1041,36 @@ class CodexUsageTaskbarOverlay:
             setter(int(hwnd), int(_GWLP_HWNDPARENT), int(taskbar_hwnd))
         except Exception:
             pass
+        return
+
+    def _is_fullscreen_active(
+        self,
+        window: Any | None,
+        geometry: dict[str, Any] | None = None,
+    ) -> bool:
+        detector = self._fullscreen_detector
+        if callable(detector):
+            try:
+                return bool(detector(window))
+            except Exception:
+                return False
+        if window is None and _get_window_handle(self._root) <= 0:
+            return False
+        overlay_hwnd = _get_window_handle(window) if window is not None else 0
+        if window is not None and int(overlay_hwnd) <= 0:
+            return False
+        return _is_foreground_fullscreen(int(overlay_hwnd), self._root, geometry)
+
+    def _suppress_for_fullscreen(self) -> None:
+        self._fullscreen_suppressed = True
+        window = self._window
+        if window is not None:
+            try:
+                window.withdraw()
+            except Exception:
+                pass
+        self._cancel_flash_tick()
+        self._schedule_keepalive_tick(delay_ms=_FULLSCREEN_POLL_MS)
         return
 
     def _set_native_position(
@@ -938,25 +1212,118 @@ def _fit_horizontal_geometry_to_empty_slot(
         occupied_spans,
         padding_px=_EMPTY_SLOT_PADDING_PX,
     )
-    candidates = []
-    for start, end in free_spans:
-        available = max(0, int(end) - int(start))
-        width = min(desired_width, available)
-        if width < _MIN_EMPTY_SLOT_WIDTH_PX:
-            continue
-        candidates.append((end, width, available, start))
-
-    if not candidates:
+    if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
         return fitted
 
-    end, width, _available, start = max(candidates)
+    start, end = max(free_spans, key=lambda span: (int(span[1]), int(span[0])))
+    available = max(0, int(end) - int(start))
+    if available < _MIN_EMPTY_SLOT_WIDTH_PX:
+        fitted["visible"] = False
+        fitted["width"] = 0
+        fitted["height"] = 0
+        return fitted
+
+    target_width = min(desired_width, _PREFERRED_EMPTY_SLOT_WIDTH_PX)
+    width = min(target_width, available)
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
     fitted["visible"] = True
     return fitted
+
+
+def _geometry_changed(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    tolerance_px: int = _GEOMETRY_CHANGE_TOLERANCE_PX,
+) -> bool:
+    if bool(previous.get("visible", True)) != bool(current.get("visible", True)):
+        return True
+    if str(previous.get("orientation") or "") != str(current.get("orientation") or ""):
+        return True
+    for key in ("x", "y", "width", "height"):
+        try:
+            before = int(previous.get(key, 0))
+            after = int(current.get(key, 0))
+        except Exception:
+            return True
+        if abs(after - before) > int(tolerance_px):
+            return True
+    return False
+
+
+def _current_horizontal_window_span(window: Any) -> tuple[int, int] | None:
+    hwnd = _get_window_handle(window)
+    if hwnd <= 0 or win32gui is None:
+        return None
+    try:
+        left, _top, right, _bottom = [int(v) for v in win32gui.GetWindowRect(hwnd)]
+    except Exception:
+        return None
+    if right <= left:
+        return None
+    return (int(left), int(right))
+
+
+def _geometry_exclude_spans(
+    geometry: dict[str, Any],
+    screen_width: int,
+) -> list[tuple[int, int]]:
+    raw = geometry.get("_exclude_spans") if isinstance(geometry, dict) else None
+    if not isinstance(raw, list):
+        return []
+    spans = []
+    for item in raw:
+        try:
+            start, end = item
+        except Exception:
+            continue
+        start_i = max(0, min(int(screen_width), int(start)))
+        end_i = max(0, min(int(screen_width), int(end)))
+        if end_i > start_i:
+            spans.append((start_i, end_i))
+    return _merge_spans(spans)
+
+
+def _span_overlaps_any(
+    start: int,
+    end: int,
+    spans: list[tuple[int, int]],
+) -> bool:
+    return any(int(start) < span_end and int(end) > span_start for span_start, span_end in spans)
+
+
+def _subtract_spans(
+    spans: list[tuple[int, int]],
+    excluded: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    if not spans or not excluded:
+        return list(spans)
+    output: list[tuple[int, int]] = []
+    for start, end in spans:
+        fragments = [(int(start), int(end))]
+        for ex_start, ex_end in excluded:
+            next_fragments: list[tuple[int, int]] = []
+            for frag_start, frag_end in fragments:
+                if ex_end <= frag_start or ex_start >= frag_end:
+                    next_fragments.append((frag_start, frag_end))
+                    continue
+                if ex_start > frag_start:
+                    next_fragments.append((frag_start, ex_start))
+                if ex_end < frag_end:
+                    next_fragments.append((ex_end, frag_end))
+            fragments = next_fragments
+            if not fragments:
+                break
+        output.extend(
+            (frag_start, frag_end)
+            for frag_start, frag_end in fragments
+            if frag_end > frag_start
+        )
+    return output
 
 
 def _free_spans_from_occupied_spans(
@@ -1006,7 +1373,7 @@ def _detect_horizontal_taskbar_occupied_spans(
     screen_width: int,
     screen_height: int,
     work_area: tuple[int, int, int, int] | dict[str, int] | None,
-    geometry: dict[str, int | str],
+    geometry: dict[str, Any],
 ) -> list[tuple[int, int]] | None:
     if not hasattr(ctypes, "windll"):
         return None
@@ -1023,26 +1390,90 @@ def _detect_horizontal_taskbar_occupied_spans(
     if band_bottom - band_top < 8:
         return None
 
+    excluded_spans = _geometry_exclude_spans(geometry, int(screen_width))
+    occupied = _taskbar_child_occupied_spans(
+        int(screen_width),
+        int(band_top),
+        int(band_bottom),
+    )
+    if excluded_spans:
+        occupied = _subtract_spans(occupied, excluded_spans)
     sample_rows = _taskbar_sample_rows(band_top, band_bottom)
     columns = _sample_taskbar_columns(int(screen_width), sample_rows)
-    if not columns:
+    if not columns and not occupied:
         return None
-    background = _median_background_color(columns)
-    occupied = []
-    for x, colors in columns:
-        if _column_looks_occupied(colors, background):
-            occupied.append(
-                (
-                    max(0, x - _OCCUPIED_DILATION_PX),
-                    min(int(screen_width), x + _TASKBAR_SAMPLE_STEP_PX + _OCCUPIED_DILATION_PX),
+    if columns:
+        background = _median_background_color(columns)
+        for x, colors in columns:
+            if excluded_spans and _span_overlaps_any(
+                int(x),
+                int(x) + _TASKBAR_SAMPLE_STEP_PX,
+                excluded_spans,
+            ):
+                continue
+            if _column_looks_occupied(colors, background):
+                occupied.append(
+                    (
+                        max(0, x - _OCCUPIED_DILATION_PX),
+                        min(int(screen_width), x + _TASKBAR_SAMPLE_STEP_PX + _OCCUPIED_DILATION_PX),
+                    )
                 )
-            )
 
     # Keep the reserved taskbar edge controls out of the overlay even when the
     # sampled pixels happen to be close to the background color.
     edge_guard = max(72, min(180, int(screen_width * 0.04)))
     occupied.extend([(0, edge_guard), (int(screen_width) - edge_guard, int(screen_width))])
     return _merge_spans(occupied)
+
+
+def _taskbar_child_occupied_spans(
+    screen_width: int,
+    band_top: int,
+    band_bottom: int,
+) -> list[tuple[int, int]]:
+    if win32gui is None:
+        return []
+    try:
+        taskbar_hwnd = int(win32gui.FindWindow("Shell_TrayWnd", None) or 0)
+    except Exception:
+        return []
+    if taskbar_hwnd <= 0:
+        return []
+
+    spans: list[tuple[int, int]] = []
+
+    def visit(hwnd, _extra) -> bool:
+        try:
+            class_name = str(win32gui.GetClassName(hwnd) or "")
+        except Exception:
+            return True
+        if class_name not in _TASKBAR_OCCUPIED_CHILD_CLASSES:
+            return True
+        try:
+            if not bool(win32gui.IsWindowVisible(hwnd)):
+                return True
+        except Exception:
+            return True
+        try:
+            left, top, right, bottom = [int(v) for v in win32gui.GetWindowRect(hwnd)]
+        except Exception:
+            return True
+        if right <= left or bottom <= top:
+            return True
+        vertical_overlap = min(int(bottom), int(band_bottom)) - max(int(top), int(band_top))
+        if vertical_overlap < 8:
+            return True
+        start = max(0, min(int(screen_width), int(left)))
+        end = max(0, min(int(screen_width), int(right)))
+        if end - start >= 8:
+            spans.append((start, end))
+        return True
+
+    try:
+        win32gui.EnumChildWindows(taskbar_hwnd, visit, None)
+    except Exception:
+        return spans
+    return spans
 
 
 def _taskbar_sample_rows(band_top: int, band_bottom: int) -> list[int]:
@@ -1192,7 +1623,7 @@ def _median_background_color(
 
 def _column_looks_occupied(
     colors: list[tuple[int, int, int]],
-    _background: tuple[int, int, int],
+    background: tuple[int, int, int],
 ) -> bool:
     if not colors:
         return False
@@ -1200,7 +1631,267 @@ def _column_looks_occupied(
     for left_color in colors:
         for right_color in colors:
             vertical_spread = max(vertical_spread, _rgb_distance(left_color, right_color))
-    return vertical_spread >= 38
+    if vertical_spread >= 38:
+        return True
+    average = tuple(
+        int(round(sum(color[index] for color in colors) / len(colors)))
+        for index in range(3)
+    )
+    return _rgb_distance(average, background) >= 52
+
+
+def _is_foreground_fullscreen(
+    overlay_hwnd: int,
+    root: Any | None = None,
+    target_geometry: dict[str, Any] | None = None,
+) -> bool:
+    if win32gui is None or win32con is None:
+        return False
+    target_monitor_rect = _target_monitor_rect(int(overlay_hwnd), target_geometry, root)
+    try:
+        hwnd = int(win32gui.GetForegroundWindow() or 0)
+    except Exception:
+        hwnd = 0
+    if _window_covers_target_monitor(
+        hwnd,
+        int(overlay_hwnd),
+        root,
+        target_monitor_rect,
+    ):
+        return True
+    return _visible_fullscreen_window_exists(
+        int(overlay_hwnd),
+        root,
+        target_monitor_rect,
+    )
+
+
+def _target_monitor_rect(
+    overlay_hwnd: int,
+    target_geometry: dict[str, Any] | None,
+    root: Any | None,
+) -> tuple[int, int, int, int] | None:
+    geometry_rect = _geometry_screen_rect(target_geometry)
+    if geometry_rect is not None:
+        rect_monitor = _monitor_rect_from_rect(geometry_rect)
+        if rect_monitor is not None:
+            return rect_monitor
+    if int(overlay_hwnd) > 0:
+        hwnd_monitor = _foreground_monitor_rect(int(overlay_hwnd), root)
+        if hwnd_monitor is not None:
+            return hwnd_monitor
+    if geometry_rect is not None:
+        return geometry_rect
+    return None
+
+
+def _visible_fullscreen_window_exists(
+    overlay_hwnd: int,
+    root: Any | None,
+    target_monitor_rect: tuple[int, int, int, int] | None,
+) -> bool:
+    enum_windows = getattr(win32gui, "EnumWindows", None)
+    if not callable(enum_windows):
+        return False
+    found = False
+
+    def visit(hwnd: int, _extra: Any) -> bool:
+        nonlocal found
+        if _window_covers_target_monitor(
+            int(hwnd),
+            int(overlay_hwnd),
+            root,
+            target_monitor_rect,
+        ):
+            found = True
+        return True
+
+    try:
+        enum_windows(visit, None)
+    except Exception:
+        return False
+    return bool(found)
+
+
+def _window_covers_target_monitor(
+    hwnd: int,
+    overlay_hwnd: int,
+    root: Any | None,
+    target_monitor_rect: tuple[int, int, int, int] | None,
+) -> bool:
+    hwnd = int(hwnd or 0)
+    if hwnd <= 0 or hwnd == int(overlay_hwnd):
+        return False
+    try:
+        root_hwnd = int(win32gui.GetAncestor(hwnd, 2) or hwnd)
+    except Exception:
+        root_hwnd = hwnd
+    if root_hwnd == int(overlay_hwnd):
+        return False
+    try:
+        class_name = str(win32gui.GetClassName(hwnd) or "")
+    except Exception:
+        class_name = ""
+    if class_name in _FULLSCREEN_EXCLUDED_WINDOW_CLASSES:
+        return False
+    try:
+        title = str(win32gui.GetWindowText(hwnd) or "")
+    except Exception:
+        title = ""
+    if title in _FULLSCREEN_EXCLUDED_WINDOW_TITLES:
+        return False
+    try:
+        if not bool(win32gui.IsWindowVisible(hwnd)):
+            return False
+        if bool(win32gui.IsIconic(hwnd)):
+            return False
+    except Exception:
+        pass
+    try:
+        left, top, right, bottom = [int(v) for v in win32gui.GetWindowRect(hwnd)]
+    except Exception:
+        return False
+    if right <= left or bottom <= top:
+        return False
+
+    monitor_rect = _foreground_monitor_rect(hwnd, root)
+    if monitor_rect is None:
+        return False
+    if target_monitor_rect is not None and not _rects_close(
+        monitor_rect,
+        target_monitor_rect,
+    ):
+        return False
+    tolerance = 2
+    candidate_rects = [monitor_rect]
+    root_screen_rect = _root_screen_rect(root)
+    if root_screen_rect is not None and not _rects_close(
+        root_screen_rect,
+        monitor_rect,
+        tolerance=tolerance,
+    ):
+        candidate_rects.append(root_screen_rect)
+    for m_left, m_top, m_right, m_bottom in candidate_rects:
+        if (
+            left <= m_left + tolerance
+            and top <= m_top + tolerance
+            and right >= m_right - tolerance
+            and bottom >= m_bottom - tolerance
+        ):
+            return _window_is_top_at_probe_points(
+                root_hwnd,
+                (m_left, m_top, m_right, m_bottom),
+            )
+    return False
+
+
+def _root_screen_rect(root: Any | None) -> tuple[int, int, int, int] | None:
+    if root is None:
+        return None
+    width = _root_int(root, "winfo_screenwidth", 0)
+    height = _root_int(root, "winfo_screenheight", 0)
+    if width <= 0 or height <= 0:
+        return None
+    return 0, 0, int(width), int(height)
+
+
+def _window_is_top_at_probe_points(
+    root_hwnd: int,
+    rect: tuple[int, int, int, int],
+) -> bool:
+    window_from_point = getattr(win32gui, "WindowFromPoint", None)
+    if not callable(window_from_point):
+        return True
+    left, top, right, bottom = [int(v) for v in rect]
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    probe_points = [
+        (left + width // 2, top + height // 2),
+        (left + width // 4, top + height // 3),
+        (right - width // 4, top + height // 3),
+    ]
+    for x, y in probe_points:
+        try:
+            hit = int(window_from_point((int(x), int(y))) or 0)
+        except Exception:
+            continue
+        if hit <= 0:
+            continue
+        try:
+            hit_root = int(win32gui.GetAncestor(hit, 2) or hit)
+        except Exception:
+            hit_root = hit
+        if hit_root == int(root_hwnd):
+            return True
+    return False
+
+
+def _geometry_screen_rect(
+    geometry: dict[str, Any] | None,
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(geometry, dict):
+        return None
+    try:
+        x = int(geometry.get("x", 0))
+        y = int(geometry.get("y", 0))
+        width = int(geometry.get("width", 0))
+        height = int(geometry.get("height", 0))
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (x, y, x + width, y + height)
+
+
+def _monitor_rect_from_rect(
+    rect: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    if win32api is None or win32con is None:
+        return None
+    monitor_from_rect = getattr(win32api, "MonitorFromRect", None)
+    if not callable(monitor_from_rect):
+        return None
+    try:
+        monitor = monitor_from_rect(
+            tuple(int(v) for v in rect),
+            int(getattr(win32con, "MONITOR_DEFAULTTONEAREST", 2)),
+        )
+        info = win32api.GetMonitorInfo(monitor)
+        monitor_rect = info.get("Monitor")
+        if monitor_rect is not None and len(monitor_rect) == 4:
+            return tuple(int(v) for v in monitor_rect)
+    except Exception:
+        return None
+    return None
+
+
+def _rects_close(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+    *,
+    tolerance: int = 2,
+) -> bool:
+    return all(abs(int(a) - int(b)) <= int(tolerance) for a, b in zip(left, right))
+
+
+def _foreground_monitor_rect(hwnd: int, root: Any | None) -> tuple[int, int, int, int] | None:
+    if win32api is not None and win32con is not None:
+        try:
+            monitor = win32api.MonitorFromWindow(
+                int(hwnd),
+                int(getattr(win32con, "MONITOR_DEFAULTTONEAREST", 2)),
+            )
+            info = win32api.GetMonitorInfo(monitor)
+            rect = info.get("Monitor")
+            if rect is not None and len(rect) == 4:
+                return tuple(int(v) for v in rect)
+        except Exception:
+            pass
+    width = _root_int(root, "winfo_screenwidth", 0) if root is not None else 0
+    height = _root_int(root, "winfo_screenheight", 0) if root is not None else 0
+    if width > 0 and height > 0:
+        return 0, 0, int(width), int(height)
+    return None
 
 
 def _rgb_distance(
@@ -1285,11 +1976,19 @@ def _build_reset_info(
     current = _reset_now(parsed, now)
     seconds = int((parsed - current).total_seconds())
     if seconds <= 0:
-        return {"text": "now", "short_text": "now", "state": "overdue", "color": "#ef4444"}
+        text = _format_reset_remaining_detail(0, metric_key=metric_key)
+        return {
+            "text": text,
+            "short_text": text,
+            "state": "overdue",
+            "color": "#ef4444",
+        }
+    if not _reset_remaining_is_plausible(metric_key, seconds):
+        return {"text": "", "short_text": "", "state": "unknown", "color": "#6b7280"}
     state = _reset_action_state(metric_key, percent, seconds)
     return {
-        "text": _format_reset_remaining_detail(seconds),
-        "short_text": _format_reset_remaining_compact(seconds),
+        "text": _format_reset_remaining_detail(seconds, metric_key=metric_key),
+        "short_text": _format_reset_remaining_compact(seconds, metric_key=metric_key),
         "state": state,
         "color": _reset_color(state),
     }
@@ -1305,6 +2004,12 @@ def _parse_reset_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _reset_remaining_is_plausible(metric_key: str, seconds: int) -> bool:
+    if str(metric_key or "").endswith("five_hour_limit"):
+        return int(seconds) <= _FIVE_HOUR_RESET_MAX_SECONDS
+    return True
+
+
 def _reset_now(reset_at: datetime, now: datetime | None) -> datetime:
     current = datetime.now(reset_at.tzinfo) if now is None else now
     if reset_at.tzinfo is None:
@@ -1314,32 +2019,20 @@ def _reset_now(reset_at: datetime, now: datetime | None) -> datetime:
     return current.astimezone(reset_at.tzinfo)
 
 
-def _format_reset_remaining_detail(seconds: int) -> str:
-    seconds = max(1, int(seconds))
-    if seconds < 3600:
-        return f"{max(1, seconds // 60)}m"
-    if seconds < 86400:
-        hours = max(1, seconds // 3600)
-        minutes = (seconds % 3600) // 60
-        return f"{hours}h {minutes}m" if minutes > 0 else f"{hours}h"
-    days = max(1, seconds // 86400)
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    parts = [f"{days}d"]
-    if hours > 0:
-        parts.append(f"{hours}h")
-    if minutes > 0:
-        parts.append(f"{minutes}m")
-    return " ".join(parts)
+def _format_reset_remaining_detail(seconds: int, *, metric_key: str = "") -> str:
+    seconds = max(0, int(seconds))
+    total_minutes = max(0, (seconds + 59) // 60)
+    days = int(total_minutes // 1440)
+    hours = int((total_minutes % 1440) // 60)
+    minutes = int(total_minutes % 60)
+    if str(metric_key or "") == "five_hour_limit":
+        total_hours = int(total_minutes // 60)
+        return f"{total_hours:02d}h {minutes:02d}m"
+    return f"{days}d {hours:02d}h {minutes:02d}m"
 
 
-def _format_reset_remaining_compact(seconds: int) -> str:
-    seconds = max(1, int(seconds))
-    if seconds < 3600:
-        return f"{max(1, seconds // 60)}m"
-    if seconds < 86400:
-        return f"{max(1, seconds // 3600)}h"
-    return f"{max(1, seconds // 86400)}d"
+def _format_reset_remaining_compact(seconds: int, *, metric_key: str = "") -> str:
+    return _format_reset_remaining_detail(seconds, metric_key=metric_key)
 
 
 def _display_reset_text_for_width(
@@ -1347,19 +2040,68 @@ def _display_reset_text_for_width(
     short_text: str,
     width: int,
 ) -> str:
-    if detail_text and width >= 118:
-        return detail_text
-    if short_text and width >= 108:
-        return short_text
+    return _display_reset_text_for_space(
+        detail_text,
+        short_text,
+        available_px=max(0, int(width) // 2),
+    )
+
+
+def _display_reset_text_for_space(
+    detail_text: str,
+    short_text: str,
+    *,
+    metric_key: str = "",
+    available_px: int,
+) -> str:
+    candidates = []
+    detail = str(detail_text or "")
+    short = str(short_text or "")
+    if detail:
+        candidates.append(detail)
+    if short and short != detail:
+        candidates.append(short)
+    for text in candidates:
+        if _reset_column_width_for_text(text, metric_key=metric_key) <= int(available_px):
+            return text
     return ""
 
 
-def _reset_column_width_for_width(width: int) -> int:
-    if width >= 118:
-        return _RESET_DETAIL_COLUMN_WIDTH_PX
-    if width >= 108:
-        return _RESET_SHORT_COLUMN_WIDTH_PX
-    return 0
+def _metric_progress_width_for_segment(width: int) -> int:
+    width = max(0, int(width))
+    fixed_columns = 14 + 3 + 3 + _VALUE_COLUMN_MAX_WIDTH_PX + 4 + _RESET_WEEKLY_COLUMN_WIDTH_PX + _SEGMENT_RIGHT_PADDING_PX
+    available = max(6, width - fixed_columns)
+    return max(
+        _METRIC_PROGRESS_MIN_WIDTH_PX,
+        min(
+            _METRIC_PROGRESS_MAX_WIDTH_PX,
+            _METRIC_PROGRESS_PREFERRED_WIDTH_PX,
+            int(available),
+        ),
+    )
+
+
+def _reset_column_width_for_text(text: str, *, metric_key: str = "") -> int:
+    value = str(text or "")
+    if not value:
+        return 0
+    if value == _RESET_PLACEHOLDER_TEXT:
+        return max(12, len(value) * 5 + 2)
+    minimum = _RESET_DETAIL_COLUMN_WIDTH_PX
+    if str(metric_key or "") == "five_hour_limit":
+        minimum = _RESET_FIVE_HOUR_COLUMN_WIDTH_PX
+    elif str(metric_key or "") == "weekly_limit":
+        minimum = _RESET_WEEKLY_COLUMN_WIDTH_PX
+    return max(minimum, len(value) * 5 + 2)
+
+
+def _value_column_width_for_text(value_text: str) -> int:
+    text = str(value_text or "")
+    estimated_width = len(text) * 7 + 2
+    return min(
+        _VALUE_COLUMN_MAX_WIDTH_PX,
+        max(_VALUE_COLUMN_MIN_WIDTH_PX, int(estimated_width)),
+    )
 
 
 def _reset_action_state(metric_key: str, percent: int | None, seconds: int) -> str:
@@ -1422,16 +2164,16 @@ def _account_status(
         "running",
         "cancelling",
     }
-    if collect_inflight:
+    has_metric = any(
+        _parse_percent(snapshot.get(metric_key)) is not None
+        for metric_key, _label in _TASKBAR_METRICS
+    )
+    if collect_inflight and not has_metric:
         return {"state": "sync", "text": "SYNC", "color": "#38bdf8"}
     if monitor_state == "paused_profile_in_use":
         return {"state": "profile_busy", "text": "WAIT", "color": "#f59e0b"}
     if monitor_state == "paused_auth_required" or session_state == "logged_out":
         return {"state": "login", "text": "OUT", "color": "#f59e0b"}
-    has_metric = any(
-        _parse_percent(snapshot.get(metric_key)) is not None
-        for metric_key, _label in _TASKBAR_METRICS
-    )
     if not has_metric:
         return {"state": "nodata", "text": "DATA", "color": "#94a3b8"}
     return {"state": "ready", "text": "OK", "color": "#22c55e"}

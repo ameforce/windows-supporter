@@ -60,6 +60,8 @@ USAGE_LIMIT_RESET_AT_KEY_BY_METRIC: dict[str, str] = {
     ),
 }
 
+FIVE_HOUR_RESET_MAX_OFFSET_SECONDS = 36 * 60 * 60
+
 USAGE_FIVE_HOUR_METRIC_KEYS = (
     "five_hour_limit",
     "gpt_5_3_codex_spark_five_hour_limit",
@@ -303,7 +305,7 @@ def _create_raw_websocket_connection(url: str, timeout: float) -> Any:
     )
 
 USAGE_PAGE_PROBE_SCRIPT = r"""
-() => {
+async () => {
   const normalize = (value) =>
     String(value || '')
       .replace(/\r/g, '\n')
@@ -457,6 +459,164 @@ USAGE_PAGE_PROBE_SCRIPT = r"""
     }
     return count;
   };
+  const cleanProfileName = (value) => {
+    let text = normalize(value);
+    if (!text || text.length > 96) return '';
+    text = text
+      .replace(/^(profile|account|user|menu|open|프로필|계정|사용자|메뉴)\s*[:：-]?\s*/i, '')
+      .replace(/\s*(profile|account|menu|프로필|계정|메뉴)\s*$/i, '')
+      .replace(/\s+(pro|plus|team|enterprise|free)$/i, '')
+      .trim();
+    if (!text || text.length > 40) return '';
+    const lowered = text.toLowerCase();
+    if (/@/.test(text) || /^\+?\d[\d\s().-]{5,}$/.test(text)) return '';
+    if (/^(open|close|menu|settings?|profile|account|user|button|toggle|pro|plus|team|enterprise|free)$/i.test(lowered)) return '';
+    if (/^(열기|닫기|메뉴|설정|프로필|계정|사용자|버튼|지정)$/.test(text)) return '';
+    if (/(메뉴\s*열기|프로필\s*메뉴|알림\s*열기|사용자\s*지정|그룹화\s*기준)/.test(text)) return '';
+    if (/(log in|sign in|logout|log out|로그인|로그아웃|설정|settings)/i.test(lowered)) return '';
+    return text;
+  };
+  const safeQueryAll = (selector) => {
+    try {
+      return Array.from(document.querySelectorAll(selector));
+    } catch (_) {
+      return [];
+    }
+  };
+  const collectStoredProfileName = () => {
+    const userIds = new Set();
+    try {
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = String(localStorage.key(index) || '');
+        const match = key.match(/(?:^|\/)(user-[A-Za-z0-9_-]+)/);
+        if (match && match[1]) userIds.add(match[1]);
+      }
+    } catch (_) {}
+    if (!userIds.size) return '';
+    const parseMaybeJson = (value) => {
+      if (typeof value !== 'string') return value;
+      const text = value.trim();
+      if (!text || !/^[\[{"]/.test(text)) return value;
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        return value;
+      }
+    };
+    const candidateFromObject = (obj) => {
+      if (!obj || typeof obj !== 'object') return '';
+      const rawUserId = String(obj.user_id || obj.userId || '');
+      if (rawUserId && userIds.has(rawUserId)) {
+        for (const key of ['display_name', 'displayName', 'name', 'full_name', 'fullName']) {
+          const candidate = cleanProfileName(obj[key]);
+          if (candidate) return candidate;
+        }
+      }
+      const author = obj.author;
+      if (author && typeof author === 'object') {
+        const authorUserId = String(author.user_id || author.userId || '');
+        if (authorUserId && userIds.has(authorUserId)) {
+          for (const key of ['display_name', 'displayName', 'name', 'full_name', 'fullName']) {
+            const candidate = cleanProfileName(author[key]);
+            if (candidate) return candidate;
+          }
+        }
+      }
+      return '';
+    };
+    const walk = (value, depth = 0, seen = new Set()) => {
+      if (depth > 6 || value == null) return '';
+      value = parseMaybeJson(value);
+      if (value == null || typeof value !== 'object') return '';
+      if (seen.has(value)) return '';
+      seen.add(value);
+      const direct = candidateFromObject(value);
+      if (direct) return direct;
+      if (Array.isArray(value)) {
+        for (const item of value.slice(0, 80)) {
+          const candidate = walk(item, depth + 1, seen);
+          if (candidate) return candidate;
+        }
+        return '';
+      }
+      for (const item of Object.values(value).slice(0, 120)) {
+        const candidate = walk(item, depth + 1, seen);
+        if (candidate) return candidate;
+      }
+      return '';
+    };
+    try {
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = String(localStorage.key(index) || '');
+        if (!/(cache\/user-|oai\/apps|account|profile|session)/i.test(key)) continue;
+        const raw = localStorage.getItem(key) || '';
+        if (!raw || raw.length > 1000000) continue;
+        const candidate = walk(raw);
+        if (candidate) return candidate;
+      }
+    } catch (_) {}
+    return '';
+  };
+  const collectSessionProfileName = async () => {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2500);
+      const response = await fetch('/api/auth/session', {
+        credentials: 'include',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (!response.ok) return '';
+      const session = await response.json();
+      return cleanProfileName(
+        session && session.user
+          ? (session.user.name || session.user.displayName || '')
+          : ''
+      );
+    } catch (_) {
+      return '';
+    }
+  };
+  const collectProfileName = async () => {
+    const session = await collectSessionProfileName();
+    if (session) return session;
+    const stored = collectStoredProfileName();
+    if (stored) return stored;
+    const selectors = [
+      '[data-testid*="profile" i]',
+      '[data-testid*="account" i]',
+      '[aria-label*="profile" i]',
+      '[aria-label*="account" i]',
+      '[aria-label*="프로필" i]',
+      '[aria-label*="계정" i]',
+      'button[aria-haspopup="menu"]',
+      'button[aria-expanded]',
+    ];
+    const seen = new Set();
+    for (const selector of selectors) {
+      for (const node of safeQueryAll(selector)) {
+        const nodeIdentity = normalize([
+          node.getAttribute ? node.getAttribute('data-testid') : '',
+          node.getAttribute ? node.getAttribute('aria-label') : '',
+          node.getAttribute ? node.getAttribute('title') : '',
+        ].join(' ')).toLowerCase();
+        if (!/(profile|account|프로필|계정)/i.test(nodeIdentity)) continue;
+        for (const raw of [
+          node.getAttribute ? node.getAttribute('aria-label') : '',
+          node.getAttribute ? node.getAttribute('title') : '',
+          node.innerText || node.textContent || '',
+        ]) {
+          const candidate = cleanProfileName(raw);
+          if (candidate && !seen.has(candidate)) {
+            seen.add(candidate);
+            return candidate;
+          }
+        }
+      }
+    }
+    return '';
+  };
   const collectResetCandidates = (boundary, labelEl) => {
     const resetCandidates = [];
     const resetAtCandidates = [];
@@ -582,6 +742,7 @@ USAGE_PAGE_PROBE_SCRIPT = r"""
     url: location.href,
     title: document.title,
     mainText: normalize(scope.innerText || scope.textContent || ''),
+    profileName: await collectProfileName(),
     metricBlocks,
   };
 }
@@ -631,6 +792,60 @@ def normalize_usage_value(value: str) -> str:
         if cleaned:
             parts.append(cleaned)
     return " ".join(parts).strip()
+
+
+_PROFILE_NAME_REJECT_EXACT_PATTERN = re.compile(
+    r"^(?:"
+    r"open|close|menu|settings?|profile|account|user|button|toggle|"
+    r"pro|plus|team|enterprise|free|"
+    r"열기|닫기|메뉴|설정|프로필|계정|사용자|버튼|지정"
+    r")$",
+    re.IGNORECASE,
+)
+
+_PROFILE_NAME_REJECT_FRAGMENT_PATTERN = re.compile(
+    r"(?:"
+    r"log in|sign in|logout|log out|settings|"
+    r"로그인|로그아웃|설정|메뉴\s*열기|프로필\s*메뉴|알림\s*열기|"
+    r"사용자\s*지정|그룹화\s*기준"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def sanitize_profile_name(value: Any) -> str:
+    text = normalize_usage_value(str(value or ""))
+    if not text or len(text) > 96:
+        return ""
+    text = re.sub(
+        r"^(profile|account|user|menu|open|프로필|계정|사용자|메뉴)\s*[:：-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s*(profile|account|menu|프로필|계정|메뉴)\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    text = re.sub(
+        r"\s+(pro|plus|team|enterprise|free)$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not text or len(text) > 40:
+        return ""
+    if "@" in text:
+        return ""
+    if re.fullmatch(r"\+?\d[\d\s().-]{5,}", text):
+        return ""
+    if _PROFILE_NAME_REJECT_EXACT_PATTERN.search(text):
+        return ""
+    if _PROFILE_NAME_REJECT_FRAGMENT_PATTERN.search(text):
+        return ""
+    return text
 
 
 def _normalize_match_token(text: str) -> str:
@@ -935,6 +1150,189 @@ def _normalize_value_candidates(raw_value: Any) -> list[str]:
     return normalized
 
 
+def _usage_metric_alias_occurrences(value: str) -> list[tuple[int, int, str]]:
+    text = normalize_usage_value(value)
+    if not text:
+        return []
+    lowered = text.lower()
+    raw_matches: list[tuple[int, int, str]] = []
+    for key in USAGE_METRIC_KEYS:
+        for alias in sorted(USAGE_METRIC_ALIASES.get(key, ()), key=len, reverse=True):
+            needle = normalize_usage_value(alias).lower()
+            if not needle:
+                continue
+            start = 0
+            while True:
+                idx = lowered.find(needle, start)
+                if idx < 0:
+                    break
+                raw_matches.append((idx, idx + len(needle), key))
+                start = idx + 1
+
+    raw_matches.sort(key=lambda item: (-(item[1] - item[0]), item[0], item[2]))
+    selected: list[tuple[int, int, str]] = []
+    for start, end, key in raw_matches:
+        if any(not (end <= used_start or start >= used_end) for used_start, used_end, _ in selected):
+            continue
+        selected.append((start, end, key))
+    selected.sort(key=lambda item: (item[0], item[1], item[2]))
+    return selected
+
+
+def _text_has_other_usage_metric(value: str, metric_key: str) -> bool:
+    return any(
+        key != metric_key
+        for _, _, key in _usage_metric_alias_occurrences(value)
+    )
+
+
+def _scoped_reset_candidate_fragments(value: str, metric_key: str) -> list[str]:
+    text = normalize_usage_value(value)
+    if not text:
+        return []
+    occurrences = _usage_metric_alias_occurrences(text)
+    if not occurrences:
+        return [text]
+
+    fragments: list[str] = []
+    for index, (start, _end, key) in enumerate(occurrences):
+        if key != metric_key:
+            continue
+        next_start = len(text)
+        for following_start, _following_end, _following_key in occurrences[index + 1:]:
+            if following_start > start:
+                next_start = following_start
+                break
+        fragment = text[start:next_start].strip(" \t:-|")
+        if fragment:
+            fragments.append(fragment)
+    return fragments
+
+
+def _append_reset_candidates_for_metric(
+    output: list[str],
+    raw_value: Any,
+    metric_key: str,
+    *,
+    block_has_other_metric: bool,
+    allow_unscoped: bool,
+) -> None:
+    seen = set(output)
+    for candidate in _normalize_value_candidates(raw_value):
+        occurrences = _usage_metric_alias_occurrences(candidate)
+        if occurrences:
+            fragments = _scoped_reset_candidate_fragments(candidate, metric_key)
+        elif bool(allow_unscoped) and not bool(block_has_other_metric):
+            fragments = [candidate]
+        else:
+            fragments = []
+        for fragment in fragments:
+            if fragment and fragment not in seen:
+                seen.add(fragment)
+                output.append(fragment)
+    return
+
+
+def _reset_candidate_fragments_for_metric(raw_block: dict[str, Any], metric_key: str) -> list[str]:
+    block_text = normalize_usage_value(raw_block.get("block_text", ""))
+    block_has_other_metric = _text_has_other_usage_metric(block_text, metric_key)
+    candidates: list[str] = []
+    _append_reset_candidates_for_metric(
+        candidates,
+        raw_block.get("reset_at_candidates", []),
+        metric_key,
+        block_has_other_metric=block_has_other_metric,
+        allow_unscoped=True,
+    )
+    _append_reset_candidates_for_metric(
+        candidates,
+        raw_block.get("reset_candidates", []),
+        metric_key,
+        block_has_other_metric=block_has_other_metric,
+        allow_unscoped=True,
+    )
+    _append_reset_candidates_for_metric(
+        candidates,
+        [
+            raw_block.get("block_text", ""),
+            raw_block.get("heading_text", ""),
+        ],
+        metric_key,
+        block_has_other_metric=block_has_other_metric,
+        allow_unscoped=True,
+    )
+    return candidates
+
+
+def _reset_value_matches_metric_window(
+    metric_key: str,
+    reset_at: str,
+    captured_at: str,
+) -> bool:
+    if not str(metric_key or "").endswith("five_hour_limit"):
+        return True
+    base = _parse_base_reset_datetime(captured_at)
+    parsed = _parse_base_reset_datetime(reset_at)
+    if base is None or parsed is None:
+        return True
+    seconds = int((parsed - base).total_seconds())
+    return (
+        -FIVE_HOUR_RESET_MAX_OFFSET_SECONDS
+        <= seconds
+        <= FIVE_HOUR_RESET_MAX_OFFSET_SECONDS
+    )
+
+
+def _sanitize_snapshot_reset_payload(data: dict[str, Any] | None) -> dict[str, str]:
+    payload = data if isinstance(data, dict) else {}
+    cleaned = {key: normalize_usage_value(payload.get(key, "")) for key in USAGE_METRIC_KEYS}
+    cleaned["captured_at"] = normalize_usage_value(payload.get("captured_at", ""))
+    for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items():
+        reset_at = normalize_usage_value(payload.get(reset_key, ""))
+        if reset_at and not _reset_value_matches_metric_window(
+            metric_key,
+            reset_at,
+            cleaned["captured_at"],
+        ):
+            reset_at = ""
+        cleaned[reset_key] = reset_at
+    captured_at = cleaned["captured_at"]
+    main_five_hour_reset = cleaned.get("five_hour_limit_reset_at", "")
+    if (
+        main_five_hour_reset
+        and cleaned.get("gpt_5_3_codex_spark_five_hour_limit_reset_at", "")
+        == main_five_hour_reset
+        and _reset_value_matches_metric_window(
+            "five_hour_limit",
+            main_five_hour_reset,
+            captured_at,
+        )
+    ):
+        cleaned["gpt_5_3_codex_spark_five_hour_limit_reset_at"] = ""
+
+    five_hour_scale_resets = {
+        reset_at
+        for reset_at in (
+            cleaned.get("five_hour_limit_reset_at", ""),
+            cleaned.get("gpt_5_3_codex_spark_five_hour_limit_reset_at", ""),
+        )
+        if reset_at
+        and _reset_value_matches_metric_window(
+            "five_hour_limit",
+            reset_at,
+            captured_at,
+        )
+    }
+    for weekly_reset_key in (
+        "weekly_limit_reset_at",
+        "gpt_5_3_codex_spark_weekly_limit_reset_at",
+    ):
+        reset_at = cleaned.get(weekly_reset_key, "")
+        if reset_at and reset_at in five_hour_scale_resets:
+            cleaned[weekly_reset_key] = ""
+    return cleaned
+
+
 def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str]:
     if not isinstance(raw_blocks, list):
         return {}
@@ -1157,23 +1555,14 @@ def extract_usage_reset_info_from_semantic_blocks(
         reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
         if not reset_key or reset_key in parsed:
             continue
-        candidates = _normalize_value_candidates(raw_block.get("reset_at_candidates", []))
-        candidates.extend(_normalize_value_candidates(raw_block.get("reset_candidates", [])))
-        candidates.extend(
-            _normalize_value_candidates(
-                [
-                    raw_block.get("block_text", ""),
-                    raw_block.get("heading_text", ""),
-                ]
-            )
-        )
+        candidates = _reset_candidate_fragments_for_metric(raw_block, metric_key)
         for candidate in candidates:
             value = _normalize_reset_at_candidate(candidate)
             if not value:
                 value = _normalize_korean_reset_candidate(candidate, captured_at)
             if not value:
                 value = _normalize_english_reset_candidate(candidate, captured_at)
-            if value:
+            if value and _reset_value_matches_metric_window(metric_key, value, captured_at):
                 parsed[reset_key] = value
                 break
     return parsed
@@ -1201,57 +1590,38 @@ class UsageSnapshot:
     ) -> "UsageSnapshot":
         data = metrics or {}
         reset_data = reset_info or {}
-        return cls(
-            five_hour_limit=normalize_usage_value(data.get("five_hour_limit", "")),
-            weekly_limit=normalize_usage_value(data.get("weekly_limit", "")),
-            gpt_5_3_codex_spark_five_hour_limit=normalize_usage_value(
-                data.get("gpt_5_3_codex_spark_five_hour_limit", "")
-            ),
-            gpt_5_3_codex_spark_weekly_limit=normalize_usage_value(
-                data.get("gpt_5_3_codex_spark_weekly_limit", "")
-            ),
-            remaining_credit=normalize_usage_value(data.get("remaining_credit", "")),
-            captured_at=normalize_usage_value(captured_at),
-            five_hour_limit_reset_at=normalize_usage_value(
-                reset_data.get("five_hour_limit_reset_at", "")
-            ),
-            weekly_limit_reset_at=normalize_usage_value(
-                reset_data.get("weekly_limit_reset_at", "")
-            ),
-            gpt_5_3_codex_spark_five_hour_limit_reset_at=normalize_usage_value(
-                reset_data.get("gpt_5_3_codex_spark_five_hour_limit_reset_at", "")
-            ),
-            gpt_5_3_codex_spark_weekly_limit_reset_at=normalize_usage_value(
-                reset_data.get("gpt_5_3_codex_spark_weekly_limit_reset_at", "")
-            ),
-        )
+        payload = {
+            **{key: data.get(key, "") for key in USAGE_METRIC_KEYS},
+            "captured_at": captured_at,
+            **{key: reset_data.get(key, "") for key in USAGE_RESET_AT_KEYS},
+        }
+        return cls.from_dict(payload)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UsageSnapshot":
-        if not isinstance(data, dict):
-            return cls()
+        payload = _sanitize_snapshot_reset_payload(data)
         return cls(
-            five_hour_limit=normalize_usage_value(data.get("five_hour_limit", "")),
-            weekly_limit=normalize_usage_value(data.get("weekly_limit", "")),
+            five_hour_limit=normalize_usage_value(payload.get("five_hour_limit", "")),
+            weekly_limit=normalize_usage_value(payload.get("weekly_limit", "")),
             gpt_5_3_codex_spark_five_hour_limit=normalize_usage_value(
-                data.get("gpt_5_3_codex_spark_five_hour_limit", "")
+                payload.get("gpt_5_3_codex_spark_five_hour_limit", "")
             ),
             gpt_5_3_codex_spark_weekly_limit=normalize_usage_value(
-                data.get("gpt_5_3_codex_spark_weekly_limit", "")
+                payload.get("gpt_5_3_codex_spark_weekly_limit", "")
             ),
-            remaining_credit=normalize_usage_value(data.get("remaining_credit", "")),
-            captured_at=normalize_usage_value(data.get("captured_at", "")),
+            remaining_credit=normalize_usage_value(payload.get("remaining_credit", "")),
+            captured_at=normalize_usage_value(payload.get("captured_at", "")),
             five_hour_limit_reset_at=normalize_usage_value(
-                data.get("five_hour_limit_reset_at", "")
+                payload.get("five_hour_limit_reset_at", "")
             ),
             weekly_limit_reset_at=normalize_usage_value(
-                data.get("weekly_limit_reset_at", "")
+                payload.get("weekly_limit_reset_at", "")
             ),
             gpt_5_3_codex_spark_five_hour_limit_reset_at=normalize_usage_value(
-                data.get("gpt_5_3_codex_spark_five_hour_limit_reset_at", "")
+                payload.get("gpt_5_3_codex_spark_five_hour_limit_reset_at", "")
             ),
             gpt_5_3_codex_spark_weekly_limit_reset_at=normalize_usage_value(
-                data.get("gpt_5_3_codex_spark_weekly_limit_reset_at", "")
+                payload.get("gpt_5_3_codex_spark_weekly_limit_reset_at", "")
             ),
         )
 
@@ -1304,8 +1674,8 @@ def merge_snapshot_with_previous(
     prev = previous if isinstance(previous, UsageSnapshot) else None
     if prev is None:
         return current
-    merged = current.to_dict()
-    prev_payload = prev.to_dict()
+    merged = _sanitize_snapshot_reset_payload(current.to_dict())
+    prev_payload = _sanitize_snapshot_reset_payload(prev.to_dict())
     for key in USAGE_METRIC_KEYS:
         if not merged.get(key):
             merged[key] = prev_payload.get(key, "")
@@ -1396,6 +1766,7 @@ class CodexUsageMonitor:
             self.__cdp_status_cache_ts = 0.0
         self.__monitor_state = "idle"
         self.__session_state = "logged_out"
+        self.__profile_name = ""
         self.__auth_attention_required = False
         self.__auth_attention_reason = ""
         self.__auth_attention_source = ""
@@ -1789,6 +2160,10 @@ class CodexUsageMonitor:
         self.__session_state = normalized
         return
 
+    def __set_profile_name(self, value: Any) -> None:
+        self.__profile_name = sanitize_profile_name(value)
+        return
+
     def __set_auth_attention(self, reason: str, source: str = "") -> None:
         self.__auth_attention_required = True
         self.__auth_attention_reason = normalize_usage_value(reason).lower() or "unknown"
@@ -2103,6 +2478,8 @@ class CodexUsageMonitor:
             "failure_count": int(self.__failure_count),
             "api_failure_count": int(self.__api_failure_count),
             "session_state": str(self.__session_state or "logged_out"),
+            "profile_name": str(self.__profile_name or ""),
+            "profile_session_present": bool(self.__has_profile_session()),
             "monitor_state": monitor_state,
             "auth_attention_required": bool(self.__auth_attention_required),
             "auth_attention_reason": str(self.__auth_attention_reason or ""),
@@ -5003,7 +5380,11 @@ class CodexUsageMonitor:
         response = self.__raw_cdp_send(
             ws,
             "Runtime.evaluate",
-            {"expression": f"({USAGE_PAGE_PROBE_SCRIPT})()", "returnByValue": True},
+            {
+                "expression": f"({USAGE_PAGE_PROBE_SCRIPT})()",
+                "returnByValue": True,
+                "awaitPromise": True,
+            },
             session_id=session_id,
         )
         result = response.get("result") or {}
@@ -6131,6 +6512,9 @@ class CodexUsageMonitor:
         normalized_payload["mainText"] = normalize_usage_value(
             normalized_payload.get("mainText", "")
         )
+        normalized_payload["profileName"] = normalize_usage_value(
+            normalized_payload.get("profileName", "")
+        )
         metric_blocks = normalized_payload.get("metricBlocks", [])
         if not isinstance(metric_blocks, list):
             metric_blocks = []
@@ -6147,6 +6531,7 @@ class CodexUsageMonitor:
             return None
         if not self.__is_usage_dom_ready_from_probe(normalized_probe):
             return None
+        self.__set_profile_name(normalized_probe.get("profileName", ""))
         captured_at = self.__now_iso()
         metrics = extract_usage_metrics_from_semantic_blocks(
             normalized_probe.get("metricBlocks", [])
@@ -6349,6 +6734,7 @@ class CodexUsageMonitor:
             return
         snap = UsageSnapshot.from_dict(data.get("last_snapshot"))
         self.__last_snapshot = snap
+        self.__set_profile_name(data.get("profile_name", ""))
         raw_state = data.get("session_state", "")
         state = normalize_usage_value(raw_state)
         dirty = False
@@ -6363,6 +6749,7 @@ class CodexUsageMonitor:
     def __save_state(self) -> None:
         payload = {
             "session_state": str(self.__session_state or "logged_out"),
+            "profile_name": str(self.__profile_name or ""),
             "last_snapshot": self.__last_snapshot.to_dict(),
         }
         self.__write_json_file(self.__state_path, payload)
