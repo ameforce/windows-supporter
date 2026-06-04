@@ -1,6 +1,9 @@
 import json
 import os
+import queue
 import tempfile
+import threading
+import time
 import unittest
 
 from src.apps.codex_usage_multi_monitor import CodexUsageMultiMonitor
@@ -77,6 +80,18 @@ class _FakeChildMonitor:
         return None
 
 
+class _BlockingChildMonitor(_FakeChildMonitor):
+    def __init__(self, config_dir: str, profile_dir: str) -> None:
+        super().__init__(config_dir, profile_dir)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def show_current_status(self, force_refresh=True, source="manual_query"):
+        self.started.set()
+        self.release.wait(2.0)
+        return super().show_current_status(force_refresh=force_refresh, source=source)
+
+
 class _FakeRoot:
     def __init__(self) -> None:
         self.after_calls = []
@@ -139,6 +154,14 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             taskbar_progress_factory=taskbar_progress_factory,
         )
         return manager, children
+
+    def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return bool(predicate())
 
     def test_settings_snapshot_creates_two_isolated_accounts_and_migrates_legacy_files_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,6 +245,16 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(children[1].release_calls, 1)
             self.assertFalse(hasattr(manager, "release_profile_session"))
 
+    def test_runtime_snapshot_prefers_profile_name_for_account_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime["profile_name"] = "Daeng"
+
+            runtime = manager.get_runtime_status()
+
+            self.assertEqual(runtime["accounts"][0]["label"], "Daeng")
+            self.assertEqual(runtime["accounts"][0]["configured_label"], "Codex 1")
+
     def test_tooltip_duration_round_trips_and_propagates_to_child_monitors(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
@@ -291,6 +324,99 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(len(children[0].show_calls), 1)
             self.assertEqual(children[1].show_calls, [])
 
+    def test_attached_show_current_status_dispatches_refresh_without_blocking_ui_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            children: list[_BlockingChildMonitor] = []
+
+            def factory(config_dir: str, profile_dir: str):
+                child = _BlockingChildMonitor(config_dir=config_dir, profile_dir=profile_dir)
+                child.runtime["session_state"] = "logged_in"
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            event_queue = queue.Queue()
+            manager.attach(object(), event_queue=event_queue)
+
+            call_finished = threading.Event()
+            caller = threading.Thread(
+                target=lambda: (manager.show_current_status(force_refresh=True), call_finished.set()),
+                daemon=True,
+            )
+            caller.start()
+
+            try:
+                self.assertTrue(call_finished.wait(0.25))
+                manager.show_current_status(force_refresh=True)
+                self.assertTrue(children[0].started.wait(1.0))
+                self.assertTrue(manager.get_runtime_status()["collect_inflight"])
+                self.assertEqual([child.show_calls for child in children], [[], []])
+            finally:
+                for child in children:
+                    child.release.set()
+                caller.join(1.0)
+
+            self.assertTrue(
+                self._wait_until(lambda: all(len(child.show_calls) == 1 for child in children))
+            )
+            self.assertEqual(
+                [child.show_calls for child in children],
+                [
+                    [{"force_refresh": True, "source": "manual_query"}],
+                    [{"force_refresh": True, "source": "manual_query"}],
+                ],
+            )
+            self.assertTrue(self._wait_until(lambda: not manager.get_runtime_status()["collect_inflight"]))
+
+    def test_attached_show_account_status_dispatches_single_account_without_blocking_ui_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            children: list[_BlockingChildMonitor] = []
+
+            def factory(config_dir: str, profile_dir: str):
+                child = _BlockingChildMonitor(config_dir=config_dir, profile_dir=profile_dir)
+                child.runtime["session_state"] = "logged_in"
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(object(), event_queue=queue.Queue())
+            call_finished = threading.Event()
+            caller = threading.Thread(
+                target=lambda: (
+                    manager.show_account_status("account_1", force_refresh=True),
+                    call_finished.set(),
+                ),
+                daemon=True,
+            )
+            caller.start()
+
+            try:
+                self.assertTrue(call_finished.wait(0.25))
+                self.assertTrue(children[0].started.wait(1.0))
+                self.assertFalse(children[1].started.is_set())
+                self.assertEqual([child.show_calls for child in children], [[], []])
+            finally:
+                for child in children:
+                    child.release.set()
+                caller.join(1.0)
+
+            self.assertTrue(self._wait_until(lambda: len(children[0].show_calls) == 1))
+            self.assertEqual(
+                [child.show_calls for child in children],
+                [[{"force_refresh": True, "source": "manual_query"}], []],
+            )
+            self.assertTrue(self._wait_until(lambda: not manager.get_runtime_status()["collect_inflight"]))
+
     def test_attach_gives_children_ui_context_without_starting_independent_monitoring(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
@@ -327,6 +453,25 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
             self.assertEqual(children[1].show_calls, [])
             self.assertGreaterEqual(len(root.after_calls), 2)
+
+    def test_attach_revalidates_logged_out_account_when_profile_session_is_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime["session_state"] = "logged_out"
+            children[0].runtime["profile_session_present"] = True
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            manager.attach(root, event_queue=None)
+
+            self.assertEqual(len(root.after_calls), 1)
+            root.after_calls[0]["callback"]()
+
+            self.assertEqual(
+                children[0].show_calls,
+                [{"force_refresh": True, "source": "auto_monitor"}],
+            )
+            self.assertEqual(children[1].show_calls, [])
 
     def test_attach_does_not_mask_child_attach_type_errors(self):
         class BuggyAttachChild(_FakeChildMonitor):
