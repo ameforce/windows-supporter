@@ -172,6 +172,52 @@ class CodexUsageMonitorDomContractTest(unittest.TestCase):
 
         self.assertEqual(parsed.get("five_hour_limit_reset_at"), "2026-05-06T12:05:00+09:00")
 
+    def test_semantic_dom_contract_does_not_copy_weekly_reset_from_broad_block_to_five_hour(
+        self,
+    ) -> None:
+        broad_block = (
+            "5 hour usage limit 100% remaining "
+            "weekly usage limit 0% remaining Resets Jun 7, 2026 11:39 PM"
+        )
+        parsed = extract_usage_reset_info_from_semantic_blocks(
+            [
+                {
+                    "label_text": "5 hour usage limit",
+                    "block_text": broad_block,
+                    "reset_candidates": ["Resets Jun 7, 2026 11:39 PM"],
+                },
+                {
+                    "label_text": "weekly usage limit",
+                    "block_text": broad_block,
+                    "reset_candidates": ["Resets Jun 7, 2026 11:39 PM"],
+                },
+            ],
+            captured_at="2026-06-03T20:48:37+09:00",
+        )
+
+        self.assertNotIn("five_hour_limit_reset_at", parsed)
+        self.assertEqual(parsed.get("weekly_limit_reset_at"), "2026-06-07T23:39:00+09:00")
+
+    def test_semantic_dom_contract_rejects_day_scale_five_hour_reset_candidate(self) -> None:
+        parsed = extract_usage_reset_info_from_semantic_blocks(
+            [
+                {
+                    "label_text": "5 hour usage limit",
+                    "block_text": "5 hour usage limit 100% remaining Resets Jun 7, 2026 11:39 PM",
+                    "reset_candidates": ["Resets Jun 7, 2026 11:39 PM"],
+                },
+                {
+                    "label_text": "weekly usage limit",
+                    "block_text": "weekly usage limit 0% remaining Resets Jun 7, 2026 11:39 PM",
+                    "reset_candidates": ["Resets Jun 7, 2026 11:39 PM"],
+                },
+            ],
+            captured_at="2026-06-03T20:48:37+09:00",
+        )
+
+        self.assertNotIn("five_hour_limit_reset_at", parsed)
+        self.assertEqual(parsed.get("weekly_limit_reset_at"), "2026-06-07T23:39:00+09:00")
+
     def test_semantic_dom_contract_uses_nearby_reset_candidate_when_boundary_has_no_reset(self) -> None:
         parsed = extract_usage_reset_info_from_semantic_blocks(
             [
