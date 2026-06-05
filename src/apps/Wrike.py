@@ -10,6 +10,7 @@ import urllib.request
 
 from src.utils.LibConnector import LibConnector
 from src.utils.secret_store import SecretStore
+from src.utils.subprocess_utils import build_python_module_command, is_frozen_runtime
 from src.utils.ToolTip import ToolTip
 
 
@@ -2334,6 +2335,7 @@ class Wrike:
             return None
 
     def __ensure_playwright_ready(self) -> bool:
+        self.__configure_playwright_env()
         if self.__playwright_checked:
             return bool(self.__playwright_ready)
         self.__playwright_checked = True
@@ -2369,6 +2371,9 @@ class Wrike:
             )
         except Exception as exc:
             if self.__is_playwright_missing_browser_error(exc):
+                if self.__is_frozen_runtime():
+                    self.__log("playwright bundled browser missing in frozen runtime")
+                    return None
                 self.__log("playwright browser missing, installing chromium")
                 if self.__install_playwright_browsers():
                     try:
@@ -2391,18 +2396,25 @@ class Wrike:
         return False
 
     def __ensure_playwright_browsers_installed(self) -> bool:
+        self.__configure_playwright_env()
         if self.__has_playwright_chromium():
+            return True
+        if self.__is_frozen_runtime():
+            self.__log("playwright browser install skipped in frozen runtime; using bundled assets")
             return True
         return self.__install_playwright_browsers()
 
     def __install_playwright_browsers(self) -> bool:
-        return self.__run_install_cmd(
-            [self.__lib.sys.executable, "-m", "playwright", "install", "chromium"]
-        )
+        cmd = self.__build_python_module_command("playwright", ["install", "chromium"])
+        if cmd is None:
+            return False
+        return self.__run_install_cmd(cmd)
 
     def __has_playwright_chromium(self) -> bool:
         base = self.__lib.os.getenv("PLAYWRIGHT_BROWSERS_PATH")
-        if not base or base in {"0", "1"}:
+        if base == "0":
+            base = self.__playwright_package_local_browsers_path()
+        elif not base or base == "1":
             base = self.__lib.os.getenv("LOCALAPPDATA") or self.__lib.os.getenv("APPDATA")
             if base:
                 base = self.__lib.os.path.join(base, "ms-playwright")
@@ -2422,7 +2434,34 @@ class Wrike:
                 return True
         return False
 
+    def __playwright_package_local_browsers_path(self) -> str | None:
+        try:
+            import playwright
+
+            package_dir = self.__lib.os.path.dirname(
+                self.__lib.os.path.abspath(str(playwright.__file__))
+            )
+        except Exception:
+            package_dir = ""
+
+        if not package_dir:
+            meipass = str(getattr(self.__lib.sys, "_MEIPASS", "") or "").strip()
+            if not meipass:
+                return None
+            package_dir = self.__lib.os.path.join(meipass, "playwright")
+
+        return self.__lib.os.path.join(
+            package_dir,
+            "driver",
+            "package",
+            ".local-browsers",
+        )
+
     def __try_install_playwright(self) -> bool:
+        if self.__is_frozen_runtime():
+            self.__log("playwright package install skipped in frozen runtime")
+            return False
+
         uv_path = shutil.which("uv")
         if not uv_path:
             self.__log("uv not found for playwright install")
@@ -2430,9 +2469,32 @@ class Wrike:
 
         if not self.__run_install_cmd([uv_path, "pip", "install", "playwright"]):
             return False
-        if not self.__run_install_cmd([self.__lib.sys.executable, "-m", "playwright", "install", "chromium"]):
+        cmd = self.__build_python_module_command("playwright", ["install", "chromium"])
+        if cmd is None:
+            return False
+        if not self.__run_install_cmd(cmd):
             return False
         return True
+
+    def __is_frozen_runtime(self) -> bool:
+        return is_frozen_runtime(self.__lib.sys)
+
+    def __build_python_module_command(self, module: str, args: list[str]) -> list[str] | None:
+        return build_python_module_command(
+            module,
+            args,
+            sys_module=self.__lib.sys,
+            log=self.__log,
+        )
+
+    def __configure_playwright_env(self) -> None:
+        try:
+            if self.__is_frozen_runtime():
+                self.__lib.os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+            else:
+                self.__lib.os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+        except Exception:
+            return
 
     def __run_install_cmd(self, argv: list[str]) -> bool:
         try:
