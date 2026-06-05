@@ -1,5 +1,7 @@
 import json
+import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -433,6 +435,98 @@ class WrikeResponsivenessAndTokenUnitTest(unittest.TestCase):
             wrike._Wrike__prewarm_wrike_form_browser()
 
         self.assertFalse(wrike._Wrike__playwright_checked)
+
+    def test_playwright_browser_install_does_not_relaunch_frozen_exe(self) -> None:
+        wrike = self._new_wrike()
+
+        with patch.object(wrike._Wrike__lib.sys, "frozen", True, create=True):
+            with patch.object(
+                wrike,
+                "_Wrike__run_install_cmd",
+                side_effect=AssertionError("frozen exe must not run python -m"),
+            ):
+                installed = wrike._Wrike__install_playwright_browsers()
+
+        self.assertFalse(installed)
+
+    def test_playwright_browser_check_uses_bundled_assets_when_frozen(self) -> None:
+        wrike = self._new_wrike()
+
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(wrike._Wrike__lib.sys, "frozen", True, create=True):
+                with patch.object(wrike, "_Wrike__has_playwright_chromium", return_value=False):
+                    with patch.object(
+                        wrike,
+                        "_Wrike__install_playwright_browsers",
+                        side_effect=AssertionError("frozen runtime must not install browsers"),
+                    ):
+                        ready = wrike._Wrike__ensure_playwright_browsers_installed()
+
+            self.assertEqual("0", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
+
+        self.assertTrue(ready)
+
+    def test_playwright_browser_check_resolves_zero_env_to_package_local_browsers(self) -> None:
+        wrike = self._new_wrike()
+        package_dir = self.appdata / "pkg" / "playwright"
+        chromium_dir = (
+            package_dir
+            / "driver"
+            / "package"
+            / ".local-browsers"
+            / "chromium-123"
+            / "chrome-win64"
+        )
+        chromium_dir.mkdir(parents=True)
+        (chromium_dir / "chrome.exe").write_bytes(b"stub")
+        fake_playwright = types.SimpleNamespace(__file__=str(package_dir / "__init__.py"))
+
+        with patch.dict("sys.modules", {"playwright": fake_playwright}):
+            with patch.dict("os.environ", {"PLAYWRIGHT_BROWSERS_PATH": "0"}, clear=True):
+                self.assertTrue(wrike._Wrike__has_playwright_chromium())
+
+    def test_playwright_browser_check_zero_env_does_not_fallback_to_appdata(self) -> None:
+        wrike = self._new_wrike()
+        package_dir = self.appdata / "pkg" / "playwright"
+        package_dir.mkdir(parents=True)
+        appdata_chromium_dir = (
+            self.appdata
+            / "ms-playwright"
+            / "chromium-123"
+            / "chrome-win64"
+        )
+        appdata_chromium_dir.mkdir(parents=True)
+        (appdata_chromium_dir / "chrome.exe").write_bytes(b"stub")
+        fake_playwright = types.SimpleNamespace(__file__=str(package_dir / "__init__.py"))
+
+        with patch.dict("sys.modules", {"playwright": fake_playwright}):
+            with patch.dict(
+                "os.environ",
+                {"PLAYWRIGHT_BROWSERS_PATH": "0", "APPDATA": str(self.appdata)},
+                clear=True,
+            ):
+                self.assertFalse(wrike._Wrike__has_playwright_chromium())
+
+    def test_missing_playwright_browser_does_not_install_when_frozen(self) -> None:
+        class _DummyChromium:
+            def launch_persistent_context(self, *_args, **_kwargs):
+                raise RuntimeError("Executable doesn't exist at bundled chromium")
+
+        wrike = self._new_wrike()
+        playwright_obj = Mock(chromium=_DummyChromium())
+
+        with patch.object(wrike._Wrike__lib.sys, "frozen", True, create=True):
+            with patch.object(
+                wrike,
+                "_Wrike__install_playwright_browsers",
+                side_effect=AssertionError("frozen runtime must not install browsers"),
+            ):
+                context = wrike._Wrike__launch_playwright_context(
+                    playwright_obj,
+                    str(self.appdata / "profile"),
+                )
+
+        self.assertIsNone(context)
 
     def test_action_worker_dispatches_form_fill_to_browser_worker(self) -> None:
         wrike = self._new_wrike()
