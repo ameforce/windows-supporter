@@ -546,6 +546,7 @@ class CodexUsageMultiMonitor:
             "enabled": bool(account.enabled),
             "runtime": runtime,
             "last_snapshot": self.__snapshot_to_dict(self.__child(account_id).get_last_snapshot()),
+            "usage_history": self.__usage_history_to_dicts(runtime.get("usage_history")),
             "settings": self.__safe_child_settings(account_id),
         }
 
@@ -778,6 +779,11 @@ class CodexUsageMultiMonitor:
             if isinstance(data, dict):
                 return dict(data)
         return UsageSnapshot().to_dict()
+
+    def __usage_history_to_dicts(self, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        return [dict(item) for item in value if isinstance(item, dict)]
 
     def __create_child_monitor(self, config_dir: str, profile_dir: str) -> CodexUsageMonitor:
         return CodexUsageMonitor(

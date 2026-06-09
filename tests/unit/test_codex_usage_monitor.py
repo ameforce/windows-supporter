@@ -1,6 +1,10 @@
+import json
+import os
+import tempfile
 import unittest
 
 from src.apps.codex_usage_monitor import (
+    CodexUsageMonitor,
     UsageSnapshot,
     are_equivalent_codex_usage_urls,
     build_codex_login_entry_url,
@@ -383,6 +387,71 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         self.assertNotIn("주간 사용 한도", labels)
         self.assertNotIn("gpt-5.3-codex-spark 주간 사용 한도", labels)
         self.assertNotIn("남은 크레딧", labels)
+
+    def test_handle_snapshot_persists_compact_usage_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            reset_info = {"five_hour_limit_reset_at": "2026-06-01T11:00:00+09:00"}
+
+            monitor.handle_snapshot(
+                UsageSnapshot.from_metrics(
+                    {"five_hour_limit": "80%", "weekly_limit": "70%"},
+                    captured_at="2026-06-01T10:00:00+09:00",
+                    reset_info=reset_info,
+                )
+            )
+            monitor.handle_snapshot(
+                UsageSnapshot.from_metrics(
+                    {"five_hour_limit": "78%", "weekly_limit": "69%"},
+                    captured_at="2026-06-01T10:02:00+09:00",
+                    reset_info=reset_info,
+                )
+            )
+
+            state_path = os.path.join(tmp, "codex_usage_state.json")
+            with open(state_path, encoding="utf-8") as fp:
+                state = json.load(fp)
+            history = state.get("usage_history")
+
+            self.assertEqual(len(history), 2)
+            self.assertEqual(history[0]["captured_at"], "2026-06-01T10:00:00+09:00")
+            self.assertEqual(history[1]["five_hour_limit"], "78%")
+            self.assertEqual(
+                history[1]["five_hour_limit_reset_at"],
+                "2026-06-01T11:00:00+09:00",
+            )
+            self.assertEqual(monitor.get_runtime_status()["usage_history"], history)
+
+    def test_load_state_normalizes_old_or_oversized_usage_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, "codex_usage_state.json")
+            raw_history = [
+                {"captured_at": "bad", "five_hour_limit": "99%"},
+                {"captured_at": "2026-06-01T09:00:00+09:00", "five_hour_limit": "90%"},
+                {"captured_at": "2026-06-01T10:00:00+09:00", "five_hour_limit": "80%"},
+                {"captured_at": "2026-06-01T10:02:00+09:00", "five_hour_limit": "79%"},
+                {"captured_at": "2026-06-01T10:04:00+09:00", "five_hour_limit": "78%"},
+                {"captured_at": "2026-06-01T10:06:00+09:00", "five_hour_limit": "77%"},
+                {"captured_at": "2026-06-01T10:08:00+09:00", "five_hour_limit": "76%"},
+                {"captured_at": "2026-06-01T10:10:00+09:00", "five_hour_limit": "75%"},
+            ]
+            with open(state_path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "session_state": "logged_in",
+                        "last_snapshot": {"five_hour_limit": "75%"},
+                        "usage_history": raw_history,
+                    },
+                    fp,
+                )
+
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            history = monitor.get_runtime_status()["usage_history"]
+
+            self.assertEqual(len(history), 5)
+            self.assertEqual(history[0]["captured_at"], "2026-06-01T10:02:00+09:00")
+            self.assertEqual(history[-1]["captured_at"], "2026-06-01T10:10:00+09:00")
+            self.assertNotIn("bad", [item["captured_at"] for item in history])
 
 
 if __name__ == "__main__":

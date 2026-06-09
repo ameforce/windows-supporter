@@ -34,11 +34,20 @@ USAGE_METRIC_KEYS = (
 
 USAGE_LIMIT_METRIC_KEYS = USAGE_METRIC_KEYS[:-1]
 
+USAGE_HISTORY_MAX_SAMPLES = 5
+USAGE_HISTORY_WINDOW_SECONDS = 15 * 60
+
 USAGE_RESET_AT_KEYS = (
     "five_hour_limit_reset_at",
     "weekly_limit_reset_at",
     "gpt_5_3_codex_spark_five_hour_limit_reset_at",
     "gpt_5_3_codex_spark_weekly_limit_reset_at",
+)
+
+USAGE_HISTORY_KEYS = (
+    "captured_at",
+    *USAGE_LIMIT_METRIC_KEYS,
+    *USAGE_RESET_AT_KEYS,
 )
 
 USAGE_SNAPSHOT_META_KEYS = (
@@ -1814,6 +1823,7 @@ class CodexUsageMonitor:
         self.__korea_tz = timezone(timedelta(hours=9), name="KST")
 
         self.__last_snapshot = UsageSnapshot()
+        self.__usage_history: list[dict[str, str]] = []
 
         base_dir = self.__lib.os.getenv("APPDATA")
         if not base_dir:
@@ -1973,6 +1983,7 @@ class CodexUsageMonitor:
             if not ok:
                 return False, message
             self.__last_snapshot = UsageSnapshot()
+            self.__usage_history = []
             self.__set_session_state("logged_out")
             self.__clear_auth_attention()
             self.__save_state()
@@ -2498,6 +2509,7 @@ class CodexUsageMonitor:
             "auto_monitoring_active": bool(self.__should_run_background_collection()),
             "can_login": can_login,
             "can_logout": can_logout,
+            "usage_history": self.__get_usage_history_snapshot(),
         }
 
     def format_captured_at_for_display(self, value: str) -> str:
@@ -2584,8 +2596,7 @@ class CodexUsageMonitor:
                             refreshed,
                             self.__last_snapshot if self.__last_snapshot.has_any_metric() else None,
                         )
-                        self.__last_snapshot = merged
-                        self.__save_state()
+                        self.__commit_merged_snapshot(merged)
                         snapshot = merged
                         self.__profile_in_use_detected = False
                         self.__resume_background_monitor_if_needed()
@@ -2649,9 +2660,83 @@ class CodexUsageMonitor:
         self.__set_session_state("logged_in")
         self.__clear_auth_attention()
         changes = compute_usage_changes(prev, merged)
-        self.__last_snapshot = merged
-        self.__save_state()
+        self.__commit_merged_snapshot(merged)
         return changes
+
+    def __commit_merged_snapshot(self, snapshot: UsageSnapshot) -> None:
+        self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
+        self.__append_usage_history_sample(self.__last_snapshot)
+        self.__save_state()
+        return
+
+    def __append_usage_history_sample(self, snapshot: UsageSnapshot) -> None:
+        sample = self.__build_usage_history_sample(snapshot)
+        if sample is None:
+            self.__usage_history = self.__normalize_usage_history(self.__usage_history)
+            return
+        self.__usage_history = self.__normalize_usage_history(
+            [*self.__usage_history, sample]
+        )
+        return
+
+    def __build_usage_history_sample(
+        self,
+        snapshot: UsageSnapshot,
+    ) -> dict[str, str] | None:
+        payload = snapshot.to_dict()
+        captured_at = normalize_usage_value(payload.get("captured_at", ""))
+        if not captured_at:
+            return None
+        has_metric = any(
+            normalize_usage_value(payload.get(key, "")) for key in USAGE_LIMIT_METRIC_KEYS
+        )
+        if not has_metric:
+            return None
+        return {
+            key: normalize_usage_value(payload.get(key, ""))
+            for key in USAGE_HISTORY_KEYS
+        }
+
+    def __get_usage_history_snapshot(self) -> list[dict[str, str]]:
+        return [dict(item) for item in self.__normalize_usage_history(self.__usage_history)]
+
+    def __normalize_usage_history(self, value: Any) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[tuple[float, int, dict[str, str]]] = []
+        for index, raw in enumerate(value):
+            if not isinstance(raw, dict):
+                continue
+            sample = {
+                key: normalize_usage_value(raw.get(key, ""))
+                for key in USAGE_HISTORY_KEYS
+            }
+            captured_at = sample.get("captured_at", "")
+            captured_ts = self.__parse_usage_history_timestamp(captured_at)
+            if captured_ts is None:
+                continue
+            has_metric = any(sample.get(key, "") for key in USAGE_LIMIT_METRIC_KEYS)
+            if not has_metric:
+                continue
+            normalized.append((captured_ts, index, sample))
+        normalized.sort(key=lambda item: (item[0], item[1]))
+        if not normalized:
+            return []
+        latest_ts = normalized[-1][0]
+        window_start = latest_ts - float(USAGE_HISTORY_WINDOW_SECONDS)
+        trimmed = [item for item in normalized if item[0] >= window_start]
+        trimmed = trimmed[-USAGE_HISTORY_MAX_SAMPLES:]
+        return [dict(item[2]) for item in trimmed]
+
+    def __parse_usage_history_timestamp(self, value: str) -> float | None:
+        text = normalize_usage_value(value)
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return float(parsed.timestamp())
+        except Exception:
+            return None
 
     def __restart_monitor(self) -> None:
         self.__pause_background_monitor()
@@ -6730,10 +6815,12 @@ class CodexUsageMonitor:
         data = self.__read_json_file(self.__state_path)
         if not isinstance(data, dict):
             self.__last_snapshot = UsageSnapshot()
+            self.__usage_history = []
             self.__set_session_state("logged_out")
             return
         snap = UsageSnapshot.from_dict(data.get("last_snapshot"))
         self.__last_snapshot = snap
+        self.__usage_history = self.__normalize_usage_history(data.get("usage_history"))
         self.__set_profile_name(data.get("profile_name", ""))
         raw_state = data.get("session_state", "")
         state = normalize_usage_value(raw_state)
@@ -6751,6 +6838,7 @@ class CodexUsageMonitor:
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
             "last_snapshot": self.__last_snapshot.to_dict(),
+            "usage_history": self.__get_usage_history_snapshot(),
         }
         self.__write_json_file(self.__state_path, payload)
         return
