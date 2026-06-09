@@ -131,6 +131,9 @@ def build_codex_usage_taskbar_overlay_model(
         snapshot = raw.get("last_snapshot", {})
         if not isinstance(snapshot, dict):
             snapshot = {}
+        usage_history = raw.get("usage_history", [])
+        if not isinstance(usage_history, list):
+            usage_history = []
         runtime_info = raw.get("runtime", {})
         if not isinstance(runtime_info, dict):
             runtime_info = {}
@@ -144,6 +147,8 @@ def build_codex_usage_taskbar_overlay_model(
                     short_label=short_label,
                     raw_value=snapshot.get(metric_key),
                     reset_at_value=snapshot.get(reset_key),
+                    captured_at_value=snapshot.get("captured_at"),
+                    usage_history=usage_history,
                     account_state=status["state"],
                     now=now,
                 )
@@ -1936,6 +1941,8 @@ def _build_metric(
     short_label: str,
     raw_value: Any,
     reset_at_value: Any = "",
+    captured_at_value: Any = "",
+    usage_history: list[Any] | None = None,
     account_state: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -1947,20 +1954,171 @@ def _build_metric(
         percent=percent,
         now=now,
     )
+    dynamic_state = _dynamic_usage_state(
+        metric_key=key,
+        current_percent=percent,
+        reset_at_value=reset_at_value,
+        captured_at_value=captured_at_value,
+        usage_history=usage_history,
+        now=now,
+    )
+    state = _bar_state(enabled, percent)
+    color = _bar_color(enabled, percent)
+    reset_state = reset_info["state"]
+    reset_color = reset_info["color"]
+    if enabled and dynamic_state in {"high", "warning", "normal"}:
+        state = dynamic_state
+        color = _bar_color_for_state(True, dynamic_state)
+        reset_state = _dynamic_reset_state(dynamic_state)
+        reset_color = _reset_color(reset_state)
     return {
         "metric_key": str(key),
         "key": str(short_label),
         "percent": 0 if percent is None else int(percent),
         "value_text": "--" if percent is None else f"{int(percent)}%",
-        "state": _bar_state(enabled, percent),
-        "color": _bar_color(enabled, percent),
+        "state": state,
+        "color": color,
         "reset_text": reset_info["text"],
         "reset_short_text": reset_info["short_text"],
-        "reset_state": reset_info["state"],
-        "reset_color": reset_info["color"],
+        "reset_state": reset_state,
+        "reset_color": reset_color,
         "flash": False,
         "flash_phase": False,
     }
+
+
+def _dynamic_usage_state(
+    *,
+    metric_key: str,
+    current_percent: int | None,
+    reset_at_value: Any,
+    captured_at_value: Any,
+    usage_history: list[Any] | None,
+    now: datetime | None = None,
+) -> str | None:
+    if current_percent is None:
+        return None
+    reset_at = _parse_reset_datetime(reset_at_value)
+    if reset_at is None:
+        return None
+    current_reset_now = _reset_now(reset_at, now)
+    seconds_until_reset = int((reset_at - current_reset_now).total_seconds())
+    if seconds_until_reset <= 0:
+        return None
+    if not _reset_remaining_is_plausible(metric_key, seconds_until_reset):
+        return None
+    if int(current_percent) <= 0:
+        return "high"
+
+    current_ts = _history_timestamp_seconds(captured_at_value)
+    if current_ts is None:
+        return None
+    reset_key = _RESET_KEY_BY_METRIC.get(str(metric_key), "")
+    reset_text = str(reset_at_value or "").strip()
+    samples = _history_samples_for_metric(
+        metric_key=str(metric_key),
+        reset_key=reset_key,
+        reset_at_value=reset_text,
+        usage_history=usage_history,
+        current_ts=current_ts,
+    )
+    current_sample = (float(current_ts), int(current_percent))
+    samples = _merge_current_history_sample(samples, current_sample)
+    if len(samples) < 2:
+        return None
+    current_ts, current_remaining = samples[-1]
+    previous_samples = samples[:-1]
+    oldest_valid: tuple[float, int] | None = None
+    for sample_ts, sample_percent in previous_samples:
+        if sample_ts >= current_ts:
+            continue
+        if int(sample_percent) < int(current_remaining):
+            continue
+        oldest_valid = (sample_ts, sample_percent)
+        break
+    if oldest_valid is None:
+        return None
+    elapsed_minutes = (float(current_ts) - float(oldest_valid[0])) / 60.0
+    if elapsed_minutes <= 0.0:
+        return None
+    consumed = float(oldest_valid[1]) - float(current_remaining)
+    rate_per_min = max(0.0, consumed / elapsed_minutes)
+    projected_remaining = float(current_remaining) - (
+        rate_per_min * (float(seconds_until_reset) / 60.0)
+    )
+    if projected_remaining < 0.0:
+        return "high"
+    if projected_remaining <= 20.0:
+        return "normal"
+    if projected_remaining <= 40.0:
+        return "warning"
+    return "high"
+
+
+def _history_samples_for_metric(
+    *,
+    metric_key: str,
+    reset_key: str,
+    reset_at_value: str,
+    usage_history: list[Any] | None,
+    current_ts: float,
+) -> list[tuple[float, int]]:
+    if not isinstance(usage_history, list):
+        return []
+    window_start = float(current_ts) - (15 * 60)
+    samples: list[tuple[float, int]] = []
+    for item in usage_history:
+        if not isinstance(item, dict):
+            continue
+        sample_ts = _history_timestamp_seconds(item.get("captured_at"))
+        if sample_ts is None or sample_ts < window_start or sample_ts > float(current_ts):
+            continue
+        if reset_key and reset_at_value:
+            sample_reset = str(item.get(reset_key) or "").strip()
+            if sample_reset != reset_at_value:
+                continue
+        sample_percent = _parse_percent(item.get(metric_key))
+        if sample_percent is None:
+            continue
+        samples.append((float(sample_ts), int(sample_percent)))
+    samples.sort(key=lambda value: value[0])
+    return samples[-5:]
+
+
+def _merge_current_history_sample(
+    samples: list[tuple[float, int]],
+    current_sample: tuple[float, int],
+) -> list[tuple[float, int]]:
+    current_ts, current_percent = current_sample
+    merged = [
+        (sample_ts, sample_percent)
+        for sample_ts, sample_percent in samples
+        if abs(float(sample_ts) - float(current_ts)) > 0.001
+    ]
+    merged.append((float(current_ts), int(current_percent)))
+    merged.sort(key=lambda value: value[0])
+    return merged[-5:]
+
+
+def _history_timestamp_seconds(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return float(parsed.timestamp())
+    except Exception:
+        return None
+
+
+def _dynamic_reset_state(state: str) -> str:
+    if state == "normal":
+        return "stable"
+    if state == "warning":
+        return "warning"
+    if state == "high":
+        return "urgent"
+    return "unknown"
 
 
 def _build_reset_info(
@@ -2214,6 +2372,12 @@ def _bar_state(enabled: bool, percent: int | None) -> str:
 
 def _bar_color(enabled: bool, percent: int | None) -> str:
     state = _bar_state(enabled, percent)
+    return _bar_color_for_state(enabled, state)
+
+
+def _bar_color_for_state(enabled: bool, state: str) -> str:
+    if not bool(enabled):
+        return "#6b7280"
     if state == "high":
         return "#ef4444"
     if state == "warning":
