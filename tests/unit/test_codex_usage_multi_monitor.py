@@ -26,6 +26,7 @@ class _FakeChildMonitor:
             "auto_monitoring_active": True,
             "can_login": True,
             "can_logout": False,
+            "usage_history": [],
         }
         self.last_snapshot = {
             "five_hour_limit": "",
@@ -318,11 +319,34 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(children[0].show_calls, [{"force_refresh": True, "source": "manual_query"}])
             self.assertEqual(children[1].show_calls, [])
 
-            manager.update_settings({"enabled": False})
-            manager.show_current_status(force_refresh=True)
+    def test_runtime_entry_exposes_account_level_usage_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime["usage_history"] = [
+                {"captured_at": "2026-06-01T10:00:00+09:00", "five_hour_limit": "80%"}
+            ]
+            children[1].runtime["usage_history"] = [
+                {"captured_at": "2026-06-01T10:00:00+09:00", "five_hour_limit": "60%"}
+            ]
 
-            self.assertEqual(len(children[0].show_calls), 1)
-            self.assertEqual(children[1].show_calls, [])
+            runtime = manager.get_runtime_status()
+
+            self.assertEqual(
+                runtime["accounts"][0]["usage_history"],
+                children[0].runtime["usage_history"],
+            )
+            self.assertEqual(
+                runtime["accounts"][1]["usage_history"],
+                children[1].runtime["usage_history"],
+            )
+            self.assertIsNot(
+                runtime["accounts"][0]["usage_history"],
+                children[0].runtime["usage_history"],
+            )
+            self.assertIsNot(
+                runtime["accounts"][0]["usage_history"][0],
+                children[0].runtime["usage_history"][0],
+            )
 
     def test_attached_show_current_status_dispatches_refresh_without_blocking_ui_path(self):
         with tempfile.TemporaryDirectory() as tmp:

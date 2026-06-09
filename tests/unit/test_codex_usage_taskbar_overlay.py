@@ -262,6 +262,158 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(reset_colors, ["#ef4444", "#ef4444", "#f59e0b", "#22c55e"])
         self.assertEqual(reset_states, ["urgent", "urgent", "warning", "stable"])
 
+    def test_model_uses_dynamic_usage_pace_for_taskbar_metric_colors(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "50%",
+                "weekly_limit": "50%",
+                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
+                "weekly_limit_reset_at": "2026-06-01T10:30:00+09:00",
+            }
+        )
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "five_hour_limit": "60%",
+                "weekly_limit": "60%",
+                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
+                "weekly_limit_reset_at": "2026-06-01T10:30:00+09:00",
+            }
+        ]
+        runtime["accounts"][1]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "80%",
+                "five_hour_limit_reset_at": "2026-06-01T10:30:00+09:00",
+            }
+        )
+        runtime["accounts"][1]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "five_hour_limit": "82%",
+                "five_hour_limit_reset_at": "2026-06-01T10:30:00+09:00",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metrics = model["bars"][0]["metrics"]
+        second_metrics = model["bars"][1]["metrics"]
+        self.assertEqual([metric["state"] for metric in first_metrics], ["normal", "warning"])
+        self.assertEqual([metric["color"] for metric in first_metrics], ["#22c55e", "#f59e0b"])
+        self.assertEqual(
+            [metric["reset_state"] for metric in first_metrics],
+            ["stable", "warning"],
+        )
+        self.assertEqual(second_metrics[0]["state"], "high")
+        self.assertEqual(second_metrics[0]["color"], "#ef4444")
+        self.assertEqual(second_metrics[0]["reset_state"], "urgent")
+        self.assertEqual(second_metrics[0]["reset_color"], "#ef4444")
+
+    def test_model_falls_back_to_static_color_without_dynamic_history_inputs(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "50%",
+                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
+            }
+        )
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["state"], "warning")
+        self.assertEqual(first_metric["color"], "#f59e0b")
+
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "five_hour_limit": "40%",
+                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["state"], "warning")
+        self.assertEqual(first_metric["color"], "#f59e0b")
+
+    def test_model_falls_back_to_static_color_without_reset_time(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "80%",
+            }
+        )
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "five_hour_limit": "82%",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        first_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["state"], "normal")
+        self.assertEqual(first_metric["color"], "#22c55e")
+        self.assertEqual(first_metric["reset_state"], "unknown")
+
+    def test_model_ignores_history_without_matching_reset_window(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "50%",
+                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
+            }
+        )
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "five_hour_limit": "60%",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["state"], "warning")
+        self.assertEqual(first_metric["color"], "#f59e0b")
+
+    def test_model_keeps_zero_remaining_urgent_before_reset(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "0%",
+                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
+            }
+        )
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "five_hour_limit": "0%",
+                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["state"], "high")
+        self.assertEqual(first_metric["color"], "#ef4444")
+        self.assertEqual(first_metric["reset_state"], "urgent")
+
     def test_model_uses_separate_reset_windows_for_five_hour_and_weekly_limits(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
