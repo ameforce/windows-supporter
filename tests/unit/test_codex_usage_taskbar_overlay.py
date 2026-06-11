@@ -259,8 +259,64 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ["04h 12m", "0d 05h 59m", "00h 45m", "0d 06h 07m"],
         )
         self.assertEqual(reset_short_texts, reset_texts)
-        self.assertEqual(reset_colors, ["#ef4444", "#ef4444", "#f59e0b", "#22c55e"])
-        self.assertEqual(reset_states, ["urgent", "urgent", "warning", "stable"])
+        self.assertEqual(reset_colors, ["#ef4444", "#f59e0b", "#f59e0b", "#22c55e"])
+        self.assertEqual(reset_states, ["urgent", "warning", "warning", "stable"])
+        self.assertEqual(
+            [
+                metric["reset_direction"]
+                for bar in model["bars"]
+                for metric in bar["metrics"]
+            ],
+            ["shortage", "surplus", "surplus", "on_track"],
+        )
+        self.assertEqual(
+            [
+                metric["reset_marker"]
+                for bar in model["bars"]
+                for metric in bar["metrics"]
+            ],
+            ["↓", "↑", "↑", "="],
+        )
+        self.assertEqual(
+            [
+                metric["reset_badge_label"]
+                for bar in model["bars"]
+                for metric in bar["metrics"]
+            ],
+            ["부족", "남음", "남음", "정상"],
+        )
+        self.assertEqual(
+            [
+                metric["reset_badge_short_label"]
+                for bar in model["bars"]
+                for metric in bar["metrics"]
+            ],
+            ["부", "남", "남", "정"],
+        )
+        self.assertEqual(
+            [
+                metric["reset_badge_fill"]
+                for bar in model["bars"]
+                for metric in bar["metrics"]
+            ],
+            ["#7f1d1d", "#78350f", "#78350f", "#064e3b"],
+        )
+        self.assertEqual(
+            [
+                metric["reset_badge_outline"]
+                for bar in model["bars"]
+                for metric in bar["metrics"]
+            ],
+            ["#ef4444", "#f59e0b", "#f59e0b", "#22c55e"],
+        )
+        self.assertEqual(
+            [
+                metric["reset_badge_text_color"]
+                for bar in model["bars"]
+                for metric in bar["metrics"]
+            ],
+            ["#fee2e2", "#fef3c7", "#fef3c7", "#dcfce7"],
+        )
 
     def test_model_uses_dynamic_usage_pace_only_for_reset_time_colors(self):
         runtime = self._runtime()
@@ -308,37 +364,139 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             [metric["reset_state"] for metric in first_metrics],
             ["stable", "warning"],
         )
+        self.assertEqual(
+            [metric["reset_direction"] for metric in first_metrics],
+            ["on_track", "surplus"],
+        )
+        self.assertEqual([metric["reset_marker"] for metric in first_metrics], ["=", "↑"])
         self.assertEqual(second_metrics[0]["state"], "normal")
         self.assertEqual(second_metrics[0]["color"], "#22c55e")
-        self.assertEqual(second_metrics[0]["reset_state"], "urgent")
-        self.assertEqual(second_metrics[0]["reset_color"], "#ef4444")
+        self.assertEqual(second_metrics[0]["reset_state"], "warning")
+        self.assertEqual(second_metrics[0]["reset_color"], "#f59e0b")
+        self.assertEqual(second_metrics[0]["reset_direction"], "surplus")
+        self.assertEqual(second_metrics[0]["reset_marker"], "↑")
 
-    def test_model_keeps_high_remaining_progress_green_when_dynamic_reset_risk_is_high(self):
+    def test_model_marks_high_remaining_far_weekly_reset_as_surplus_information(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
             {
                 "captured_at": "2026-06-01T10:10:00+09:00",
-                "weekly_limit": "99%",
-                "weekly_limit_reset_at": "2026-06-08T09:10:00+09:00",
+                "weekly_limit": "97%",
+                "weekly_limit_reset_at": "2026-06-08T06:10:00+09:00",
             }
         )
         runtime["accounts"][0]["usage_history"] = [
             {
                 "captured_at": "2026-06-01T10:00:00+09:00",
-                "weekly_limit": "100%",
-                "weekly_limit_reset_at": "2026-06-08T09:10:00+09:00",
+                "weekly_limit": "97%",
+                "weekly_limit_reset_at": "2026-06-08T06:10:00+09:00",
             }
         ]
 
         model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
 
         weekly_metric = model["bars"][0]["metrics"][1]
-        self.assertEqual(weekly_metric["percent"], 99)
+        self.assertEqual(weekly_metric["percent"], 97)
         self.assertEqual(weekly_metric["state"], "normal")
         self.assertEqual(weekly_metric["color"], "#22c55e")
+        self.assertEqual(weekly_metric["reset_text"], "6d 20h 00m")
+        self.assertEqual(weekly_metric["reset_direction"], "surplus")
+        self.assertEqual(weekly_metric["reset_marker"], "↑")
+        self.assertEqual(weekly_metric["reset_state"], "warning")
+        self.assertEqual(weekly_metric["reset_color"], "#f59e0b")
+
+    def test_model_marks_dynamic_projection_below_zero_as_shortage(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "50%",
+                "five_hour_limit_reset_at": "2026-06-01T10:30:00+09:00",
+            }
+        )
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "five_hour_limit": "90%",
+                "five_hour_limit_reset_at": "2026-06-01T10:30:00+09:00",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        five_hour_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(five_hour_metric["reset_direction"], "shortage")
+        self.assertEqual(five_hour_metric["reset_marker"], "↓")
+        self.assertEqual(five_hour_metric["reset_state"], "urgent")
+        self.assertEqual(five_hour_metric["reset_color"], "#ef4444")
+
+    def test_model_prefers_fast_burn_shortage_over_high_current_surplus(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "weekly_limit": "80%",
+                "weekly_limit_reset_at": "2026-06-01T11:10:00+09:00",
+            }
+        )
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "weekly_limit": "100%",
+                "weekly_limit_reset_at": "2026-06-01T11:10:00+09:00",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        weekly_metric = model["bars"][0]["metrics"][1]
+        self.assertEqual(weekly_metric["reset_direction"], "shortage")
+        self.assertEqual(weekly_metric["reset_marker"], "↓")
         self.assertEqual(weekly_metric["reset_state"], "urgent")
         self.assertEqual(weekly_metric["reset_color"], "#ef4444")
+
+    def test_model_marks_static_low_remaining_far_reset_as_shortage(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "weekly_limit": "18%",
+                "weekly_limit_reset_at": "2026-06-07T10:00:00+09:00",
+            }
+        )
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        weekly_metric = model["bars"][0]["metrics"][1]
+        self.assertEqual(weekly_metric["reset_direction"], "shortage")
+        self.assertEqual(weekly_metric["reset_marker"], "↓")
+        self.assertEqual(weekly_metric["reset_state"], "urgent")
+        self.assertEqual(weekly_metric["reset_color"], "#ef4444")
+
+    def test_model_exposes_unknown_direction_without_reset_time(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "five_hour_limit": "80%",
+            }
+        )
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        five_hour_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(five_hour_metric["reset_direction"], "unknown")
+        self.assertEqual(five_hour_metric["reset_marker"], "")
+        self.assertEqual(five_hour_metric["reset_state"], "unknown")
+        self.assertEqual(five_hour_metric["reset_badge_label"], "")
+        self.assertEqual(five_hour_metric["reset_badge_short_label"], "")
+        self.assertEqual(five_hour_metric["reset_badge_fill"], "")
+        self.assertEqual(five_hour_metric["reset_badge_outline"], "")
+        self.assertEqual(five_hour_metric["reset_badge_text_color"], "")
 
     def test_model_falls_back_to_static_color_without_dynamic_history_inputs(self):
         runtime = self._runtime()
@@ -622,7 +780,95 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         track_widths = [int(track[1][2]) - int(track[1][0]) for track in track_rects[:4]]
         self.assertEqual(track_widths, [track_widths[0]] * 4)
 
-    def test_draw_metric_segment_keeps_detail_reset_time_even_when_space_is_tight(self):
+    def test_reset_badge_fit_prefers_reset_time_over_badge(self):
+        badge_width = taskbar_overlay._reset_badge_width_for_label("부족")
+        short_badge_width = taskbar_overlay._reset_badge_width_for_label("부")
+        detail_width = taskbar_overlay._reset_column_width_for_text(
+            "3h 12m detail",
+            metric_key="five_hour_limit",
+        )
+        short_width = taskbar_overlay._reset_column_width_for_text(
+            "3h",
+            metric_key="five_hour_limit",
+        )
+        gap = taskbar_overlay._RESET_BADGE_TIME_GAP_PX
+
+        detail_fit = taskbar_overlay._fit_reset_badge_for_space(
+            "3h 12m detail",
+            "3h",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="five_hour_limit",
+            available_px=badge_width + gap + detail_width,
+        )
+        short_fit = taskbar_overlay._fit_reset_badge_for_space(
+            "3h 12m detail",
+            "3h",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="five_hour_limit",
+            available_px=badge_width + gap + short_width,
+        )
+        time_only_fit = taskbar_overlay._fit_reset_badge_for_space(
+            "3h 12m detail",
+            "3h",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="five_hour_limit",
+            available_px=short_width,
+        )
+        short_badge_fit = taskbar_overlay._fit_reset_badge_for_space(
+            "3h 12m detail",
+            "3h",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="five_hour_limit",
+            available_px=short_badge_width,
+        )
+        hidden_fit = taskbar_overlay._fit_reset_badge_for_space(
+            "3h 12m detail",
+            "3h",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="five_hour_limit",
+            available_px=short_badge_width - 1,
+        )
+
+        self.assertEqual(detail_fit["variant"], "badge_detail")
+        self.assertEqual(detail_fit["badge_label"], "부족")
+        self.assertEqual(detail_fit["time_text"], "3h 12m detail")
+        self.assertEqual(short_fit["variant"], "badge_short")
+        self.assertEqual(short_fit["time_text"], "3h")
+        self.assertEqual(time_only_fit["variant"], "time_short")
+        self.assertFalse(time_only_fit["badge_visible"])
+        self.assertEqual(time_only_fit["time_text"], "3h")
+        self.assertEqual(short_badge_fit["variant"], "badge_short_only")
+        self.assertEqual(short_badge_fit["badge_label"], "부")
+        self.assertEqual(hidden_fit["variant"], "hidden")
+        self.assertFalse(hidden_fit["badge_visible"])
+
+    def test_metric_segment_layout_shrinks_progress_before_dropping_badge_time(self):
+        layout = taskbar_overlay._fit_metric_segment_layout(
+            158,
+            "6d 20h 00m",
+            "6d 20h",
+            badge_label="남음",
+            badge_short_label="남",
+            metric_key="weekly_limit",
+            reset_marker="↑",
+            has_reset_badge=True,
+            progress_width=taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX,
+        )
+
+        self.assertEqual(
+            layout["progress_width"],
+            taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
+        )
+        self.assertTrue(layout["badge_fit"]["badge_visible"])
+        self.assertEqual(layout["badge_fit"]["badge_label"], "남")
+        self.assertIn(layout["badge_fit"]["time_text"], {"6d 20h 00m", "6d 20h"})
+
+    def test_draw_metric_segment_draws_reset_badge_and_time_without_overlap(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
         metric = {
             "key": "5h",
@@ -632,33 +878,311 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "reset_text": "3h 12m",
             "reset_short_text": "3h",
             "reset_color": "#22c55e",
+            "reset_marker": "↓",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "reset_badge_fill": "#7f1d1d",
+            "reset_badge_outline": "#ef4444",
+            "reset_badge_text_color": "#fee2e2",
         }
         wide_canvas = _FakeCanvas()
-        compact_canvas = _FakeCanvas()
-        narrow_canvas = _FakeCanvas()
-
-        overlay._draw_metric_segment(wide_canvas, metric, 10, 2, 174, 15)
-        overlay._draw_metric_segment(compact_canvas, metric, 10, 2, 124, 15)
-        overlay._draw_metric_segment(narrow_canvas, metric, 10, 2, 110, 15)
+        overlay._draw_metric_segment(wide_canvas, metric, 10, 2, 220, 15)
 
         wide_value = [
             op for op in wide_canvas.ops if op[0] == "text" and op[2].get("text") == "73%"
         ][0]
-        wide_reset = [
+        track_rect = [
+            op
+            for op in wide_canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#2a2f38"
+        ][0]
+        badge_rect = [
+            op
+            for op in wide_canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#7f1d1d"
+        ][0]
+        badge_label = [
+            op for op in wide_canvas.ops if op[0] == "text" and op[2].get("text") == "부족"
+        ][0]
+        reset_time = [
             op for op in wide_canvas.ops if op[0] == "text" and op[2].get("text") == "3h 12m"
         ][0]
-        compact_detail_reset = [
-            op for op in compact_canvas.ops if op[0] == "text" and op[2].get("text") == "3h 12m"
+        arrow_only = [
+            op for op in wide_canvas.ops if op[0] == "text" and op[2].get("text") == "↓"
         ]
-        narrow_reset = [
-            op for op in narrow_canvas.ops if op[0] == "text" and op[2].get("text") in {"3h 12m", "3h"}
+
+        self.assertGreater(badge_rect[1][0], wide_value[1][0])
+        self.assertGreater(badge_rect[1][0], track_rect[1][2])
+        self.assertGreater(reset_time[1][0], badge_rect[1][2])
+        self.assertGreaterEqual(badge_label[1][0], badge_rect[1][0])
+        self.assertLessEqual(badge_label[1][0], badge_rect[1][2])
+        self.assertEqual(badge_label[2].get("fill"), "#fee2e2")
+        self.assertEqual(badge_rect[2].get("outline"), "#ef4444")
+        self.assertEqual(arrow_only, [])
+
+    def test_draw_metric_segment_keeps_reset_time_before_badge_when_space_is_narrow(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "7d",
+            "percent": 97,
+            "value_text": "97%",
+            "color": "#22c55e",
+            "reset_text": "6d 20h 00m",
+            "reset_short_text": "6d 20h",
+            "reset_color": "#f59e0b",
+            "reset_marker": "↑",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "reset_badge_fill": "#78350f",
+            "reset_badge_outline": "#f59e0b",
+            "reset_badge_text_color": "#fef3c7",
+        }
+        narrow_canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(narrow_canvas, metric, 10, 2, 134, 15)
+
+        badge_rects = [
+            op
+            for op in narrow_canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#78350f"
         ]
-        self.assertGreater(wide_reset[1][0], wide_value[1][0])
-        self.assertLessEqual(wide_reset[1][0] - wide_value[1][0], 6)
-        self.assertEqual(wide_reset[2].get("anchor"), "w")
-        self.assertEqual(wide_reset[2].get("fill"), "#22c55e")
-        self.assertEqual(compact_detail_reset, [])
-        self.assertEqual(narrow_reset, [])
+        badge_labels = [
+            op
+            for op in narrow_canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"남음", "남"}
+        ]
+        reset_times = [
+            op
+            for op in narrow_canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"6d 20h 00m", "6d 20h"}
+        ]
+        arrow_only = [
+            op for op in narrow_canvas.ops if op[0] == "text" and op[2].get("text") == "↑"
+        ]
+        track_rect = [
+            op
+            for op in narrow_canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#2a2f38"
+        ][0]
+
+        self.assertEqual(badge_rects, [])
+        self.assertEqual(badge_labels, [])
+        self.assertEqual(len(reset_times), 1)
+        self.assertEqual(arrow_only, [])
+        self.assertEqual(
+            int(track_rect[1][2]) - int(track_rect[1][0]),
+            taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
+        )
+
+    def test_draw_metric_segment_shrinks_progress_to_keep_badge_with_reset_time(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "7d",
+            "percent": 97,
+            "value_text": "97%",
+            "color": "#22c55e",
+            "reset_text": "6d 20h 00m",
+            "reset_short_text": "6d 20h",
+            "reset_color": "#f59e0b",
+            "reset_marker": "↑",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "reset_badge_fill": "#78350f",
+            "reset_badge_outline": "#f59e0b",
+            "reset_badge_text_color": "#fef3c7",
+        }
+        canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(canvas, metric, 10, 2, 158, 15)
+
+        track_rect = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#2a2f38"
+        ][0]
+        badge_labels = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "남"
+        ]
+        reset_times = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"6d 20h 00m", "6d 20h"}
+        ]
+        arrow_only = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "↑"
+        ]
+
+        self.assertEqual(len(badge_labels), 1)
+        self.assertEqual(len(reset_times), 1)
+        self.assertEqual(
+            int(track_rect[1][2]) - int(track_rect[1][0]),
+            taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
+        )
+        self.assertGreater(reset_times[0][1][0], badge_labels[0][1][0])
+        self.assertEqual(arrow_only, [])
+
+    def test_draw_metric_segment_hides_known_direction_marker_when_badge_metadata_is_absent(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "7d",
+            "percent": 97,
+            "value_text": "97%",
+            "color": "#22c55e",
+            "reset_text": "6d 20h 00m",
+            "reset_short_text": "6d 20h",
+            "reset_color": "#f59e0b",
+            "reset_marker": "↑",
+        }
+        tiny_canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(tiny_canvas, metric, 10, 2, 91, 15)
+
+        arrow_only = [
+            op for op in tiny_canvas.ops if op[0] == "text" and op[2].get("text") == "↑"
+        ]
+
+        self.assertEqual(arrow_only, [])
+
+    def test_draw_metric_segment_keeps_reset_time_with_short_badge_label_only(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "7d",
+            "percent": 97,
+            "value_text": "97%",
+            "color": "#22c55e",
+            "reset_text": "6d 20h 00m",
+            "reset_short_text": "6d 20h",
+            "reset_color": "#f59e0b",
+            "reset_marker": "↑",
+            "reset_badge_short_label": "남",
+            "reset_badge_fill": "#78350f",
+            "reset_badge_outline": "#f59e0b",
+            "reset_badge_text_color": "#fef3c7",
+        }
+        canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(canvas, metric, 10, 2, 220, 15)
+
+        reset_times = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"6d 20h 00m", "6d 20h"}
+        ]
+        badge_labels = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "남"
+        ]
+        arrow_only = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "↑"
+        ]
+
+        self.assertEqual(len(reset_times), 1)
+        self.assertEqual(len(badge_labels), 1)
+        self.assertEqual(arrow_only, [])
+
+    def test_draw_metric_segment_keeps_reset_time_with_badge_style_only(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "7d",
+            "percent": 97,
+            "value_text": "97%",
+            "color": "#22c55e",
+            "reset_text": "6d 20h 00m",
+            "reset_short_text": "6d 20h",
+            "reset_color": "#f59e0b",
+            "reset_marker": "↑",
+            "reset_badge_fill": "#78350f",
+            "reset_badge_outline": "#f59e0b",
+            "reset_badge_text_color": "#fef3c7",
+        }
+        canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(canvas, metric, 10, 2, 220, 15)
+
+        reset_times = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"6d 20h 00m", "6d 20h"}
+        ]
+        badge_rects = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#78350f"
+        ]
+        arrow_only = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "↑"
+        ]
+
+        self.assertEqual(len(reset_times), 1)
+        self.assertEqual(badge_rects, [])
+        self.assertEqual(arrow_only, [])
+
+    def test_draw_metric_segment_hides_known_direction_instead_of_arrow_only(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "7d",
+            "percent": 97,
+            "value_text": "97%",
+            "color": "#22c55e",
+            "reset_text": "6d 20h 00m",
+            "reset_short_text": "6d 20h",
+            "reset_color": "#f59e0b",
+            "reset_marker": "↑",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "reset_badge_fill": "#78350f",
+            "reset_badge_outline": "#f59e0b",
+            "reset_badge_text_color": "#fef3c7",
+        }
+        tiny_canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(tiny_canvas, metric, 10, 2, 91, 15)
+
+        badge_labels = [
+            op
+            for op in tiny_canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"남음", "남"}
+        ]
+        arrow_only = [
+            op for op in tiny_canvas.ops if op[0] == "text" and op[2].get("text") == "↑"
+        ]
+        reset_times = [
+            op
+            for op in tiny_canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"6d 20h 00m", "6d 20h"}
+        ]
+
+        self.assertEqual(badge_labels, [])
+        self.assertEqual(arrow_only, [])
+        self.assertEqual(reset_times, [])
+
+    def test_draw_metric_segment_uses_default_badge_style_when_label_is_visible(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "7d",
+            "percent": 50,
+            "value_text": "50%",
+            "color": "#f59e0b",
+            "reset_text": "1d 00h 00m",
+            "reset_short_text": "1d",
+            "reset_color": "#f59e0b",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+        }
+        canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(canvas, metric, 10, 2, 220, 15)
+
+        badge_rects = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#374151"
+        ]
+        badge_labels = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "남음"
+        ]
+        self.assertEqual(len(badge_rects), 1)
+        self.assertEqual(badge_rects[0][2].get("outline"), "#f59e0b")
+        self.assertEqual(len(badge_labels), 1)
 
     def test_draw_metric_segment_keeps_percent_and_reset_text_outside_track(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -1524,7 +2048,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(geometry["x"], 1832)
         self.assertEqual(geometry["width"], 380)
 
-    def test_bottom_taskbar_geometry_caps_wide_right_slot_at_preferred_width(self):
+    def test_bottom_taskbar_geometry_can_use_wider_safe_right_slot_than_old_preferred_cap(self):
         geometry = calculate_taskbar_overlay_geometry(
             2560,
             1440,
@@ -1534,8 +2058,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["orientation"], "bottom")
-        self.assertEqual(geometry["width"], 420)
-        self.assertEqual(geometry["x"], 1972)
+        self.assertGreater(geometry["width"], 420)
+        self.assertGreaterEqual(geometry["x"], 1708)
+        self.assertLessEqual(geometry["x"] + geometry["width"], 2392)
 
     def test_bottom_taskbar_geometry_uses_right_slot_as_equal_width_tie_breaker(self):
         geometry = calculate_taskbar_overlay_geometry(
@@ -1792,7 +2317,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 2)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
-        self.assertIn("420x", window.geometry_calls[-1])
+        self.assertIn(
+            f"{taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX}x",
+            window.geometry_calls[-1],
+        )
 
     def test_geometry_monitor_hard_resample_restores_window_when_slot_is_unchanged(self):
         root = _FakeRoot()
@@ -1879,7 +2407,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 2)
-        self.assertIn("420x", window.geometry_calls[-1])
+        self.assertIn(
+            f"{taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX}x",
+            window.geometry_calls[-1],
+        )
 
     def test_geometry_monitor_tick_excludes_current_overlay_span_from_live_sampling(self):
         root = _FakeRoot()
