@@ -140,10 +140,10 @@ _RESET_BADGE_TEXT_COLORS = {
     _RESET_DIRECTION_SURPLUS: "#fef3c7",
     _RESET_DIRECTION_UNKNOWN: "",
 }
-_RESET_BADGE_HORIZONTAL_PADDING_PX = 5
+_RESET_BADGE_HORIZONTAL_PADDING_PX = 2
 _RESET_BADGE_HEIGHT_PX = 11
 _RESET_BADGE_MIN_WIDTH_PX = 14
-_RESET_BADGE_TIME_GAP_PX = 3
+_RESET_BADGE_TIME_GAP_PX = 2
 _RESET_BADGE_OUTLINE_WIDTH_PX = 1
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
@@ -2252,7 +2252,11 @@ def _build_reset_info(
     seconds = int((parsed - current).total_seconds())
     if seconds <= 0:
         text = _format_reset_remaining_detail(0, metric_key=metric_key)
-        profile = _reset_overdue_profile()
+        profile = (
+            _reset_direction_profile(_RESET_DIRECTION_SHORTAGE)
+            if str(metric_key or "") == "five_hour_limit"
+            else _reset_overdue_profile()
+        )
         return {
             "text": text,
             "short_text": text,

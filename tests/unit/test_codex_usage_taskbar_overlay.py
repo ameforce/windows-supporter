@@ -643,6 +643,24 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["reset_text"], "00h 00m")
         self.assertEqual(first_metric["reset_color"], "#ef4444")
+        self.assertEqual(first_metric["reset_direction"], "shortage")
+        self.assertEqual(first_metric["reset_badge_label"], "부족")
+        self.assertEqual(first_metric["reset_badge_short_label"], "부")
+
+    def test_model_keeps_elapsed_weekly_reset_without_zero_time_risk_badge(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"]["weekly_limit_reset_at"] = (
+            "2026-06-01T09:59:00+09:00"
+        )
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        weekly_metric = model["bars"][0]["metrics"][1]
+        self.assertEqual(weekly_metric["reset_text"], "0d 00h 00m")
+        self.assertEqual(weekly_metric["reset_direction"], "unknown")
+        self.assertEqual(weekly_metric["reset_badge_label"], "")
+        self.assertEqual(weekly_metric["reset_badge_short_label"], "")
 
     def test_draw_keeps_status_close_and_metric_groups_separated(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -860,13 +878,46 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             progress_width=taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX,
         )
 
-        self.assertEqual(
+        self.assertLess(
+            layout["progress_width"],
+            taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX,
+        )
+        self.assertGreaterEqual(
             layout["progress_width"],
             taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
         )
         self.assertTrue(layout["badge_fit"]["badge_visible"])
         self.assertEqual(layout["badge_fit"]["badge_label"], "남")
         self.assertIn(layout["badge_fit"]["time_text"], {"6d 20h 00m", "6d 20h"})
+
+    def test_metric_segment_layout_fits_zero_time_risk_badge_in_compact_five_hour_segment(self):
+        layout = taskbar_overlay._fit_metric_segment_layout(
+            140,
+            "00h 00m",
+            "00h 00m",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="five_hour_limit",
+            reset_marker="↓",
+            has_reset_badge=True,
+            progress_width=taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX,
+        )
+
+        self.assertLess(
+            layout["progress_width"],
+            taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX,
+        )
+        self.assertGreaterEqual(
+            layout["progress_width"],
+            taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
+        )
+        self.assertTrue(layout["badge_fit"]["badge_visible"])
+        self.assertEqual(layout["badge_fit"]["badge_label"], "부")
+        self.assertEqual(layout["badge_fit"]["time_text"], "00h 00m")
+        self.assertIn(
+            layout["badge_fit"]["variant"],
+            {"badge_short_detail", "badge_short_time"},
+        )
 
     def test_draw_metric_segment_draws_reset_badge_and_time_without_overlap(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -920,6 +971,51 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(badge_rect[2].get("outline"), "#ef4444")
         self.assertEqual(arrow_only, [])
 
+    def test_draw_metric_segment_draws_zero_time_badge_with_small_gap_in_compact_width(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        metric = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 47,
+            "value_text": "47%",
+            "color": "#22c55e",
+            "reset_text": "00h 00m",
+            "reset_short_text": "00h 00m",
+            "reset_color": "#ef4444",
+            "reset_marker": "↓",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "reset_badge_fill": "#7f1d1d",
+            "reset_badge_outline": "#ef4444",
+            "reset_badge_text_color": "#fee2e2",
+        }
+        canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(canvas, metric, 10, 2, 140, 15)
+
+        badge_rects = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#7f1d1d"
+        ]
+        badge_labels = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "부"
+        ]
+        reset_times = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "00h 00m"
+        ]
+        arrow_only = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "↓"
+        ]
+
+        self.assertEqual(len(badge_rects), 1)
+        self.assertEqual(len(badge_labels), 1)
+        self.assertEqual(len(reset_times), 1)
+        gap = int(reset_times[0][1][0]) - int(badge_rects[0][1][2])
+        self.assertGreater(gap, 0)
+        self.assertLessEqual(gap, 3)
+        self.assertEqual(arrow_only, [])
+
     def test_draw_metric_segment_keeps_reset_time_before_badge_when_space_is_narrow(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
         metric = {
@@ -969,10 +1065,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(badge_labels, [])
         self.assertEqual(len(reset_times), 1)
         self.assertEqual(arrow_only, [])
-        self.assertEqual(
-            int(track_rect[1][2]) - int(track_rect[1][0]),
-            taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
-        )
+        track_width = int(track_rect[1][2]) - int(track_rect[1][0])
+        self.assertLess(track_width, taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX)
+        self.assertGreaterEqual(track_width, taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX)
 
     def test_draw_metric_segment_shrinks_progress_to_keep_badge_with_reset_time(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -1014,10 +1109,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(badge_labels), 1)
         self.assertEqual(len(reset_times), 1)
-        self.assertEqual(
-            int(track_rect[1][2]) - int(track_rect[1][0]),
-            taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
-        )
+        track_width = int(track_rect[1][2]) - int(track_rect[1][0])
+        self.assertLess(track_width, taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX)
+        self.assertGreaterEqual(track_width, taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX)
         self.assertGreater(reset_times[0][1][0], badge_labels[0][1][0])
         self.assertEqual(arrow_only, [])
 
