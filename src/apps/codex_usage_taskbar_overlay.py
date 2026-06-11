@@ -1954,7 +1954,7 @@ def _build_metric(
         percent=percent,
         now=now,
     )
-    dynamic_state = _dynamic_usage_state(
+    dynamic_reset_risk_state = _dynamic_reset_risk_state(
         metric_key=key,
         current_percent=percent,
         reset_at_value=reset_at_value,
@@ -1966,10 +1966,8 @@ def _build_metric(
     color = _bar_color(enabled, percent)
     reset_state = reset_info["state"]
     reset_color = reset_info["color"]
-    if enabled and dynamic_state in {"high", "warning", "normal"}:
-        state = dynamic_state
-        color = _bar_color_for_state(True, dynamic_state)
-        reset_state = _dynamic_reset_state(dynamic_state)
+    if enabled and dynamic_reset_risk_state in {"high", "warning", "normal"}:
+        reset_state = _reset_state_for_dynamic_risk(dynamic_reset_risk_state)
         reset_color = _reset_color(reset_state)
     return {
         "metric_key": str(key),
@@ -1987,7 +1985,7 @@ def _build_metric(
     }
 
 
-def _dynamic_usage_state(
+def _dynamic_reset_risk_state(
     *,
     metric_key: str,
     current_percent: int | None,
@@ -2111,7 +2109,7 @@ def _history_timestamp_seconds(value: Any) -> float | None:
         return None
 
 
-def _dynamic_reset_state(state: str) -> str:
+def _reset_state_for_dynamic_risk(state: str) -> str:
     if state == "normal":
         return "stable"
     if state == "warning":

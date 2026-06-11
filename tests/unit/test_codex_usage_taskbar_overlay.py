@@ -262,7 +262,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(reset_colors, ["#ef4444", "#ef4444", "#f59e0b", "#22c55e"])
         self.assertEqual(reset_states, ["urgent", "urgent", "warning", "stable"])
 
-    def test_model_uses_dynamic_usage_pace_for_taskbar_metric_colors(self):
+    def test_model_uses_dynamic_usage_pace_only_for_reset_time_colors(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -302,16 +302,43 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         first_metrics = model["bars"][0]["metrics"]
         second_metrics = model["bars"][1]["metrics"]
-        self.assertEqual([metric["state"] for metric in first_metrics], ["normal", "warning"])
-        self.assertEqual([metric["color"] for metric in first_metrics], ["#22c55e", "#f59e0b"])
+        self.assertEqual([metric["state"] for metric in first_metrics], ["warning", "warning"])
+        self.assertEqual([metric["color"] for metric in first_metrics], ["#f59e0b", "#f59e0b"])
         self.assertEqual(
             [metric["reset_state"] for metric in first_metrics],
             ["stable", "warning"],
         )
-        self.assertEqual(second_metrics[0]["state"], "high")
-        self.assertEqual(second_metrics[0]["color"], "#ef4444")
+        self.assertEqual(second_metrics[0]["state"], "normal")
+        self.assertEqual(second_metrics[0]["color"], "#22c55e")
         self.assertEqual(second_metrics[0]["reset_state"], "urgent")
         self.assertEqual(second_metrics[0]["reset_color"], "#ef4444")
+
+    def test_model_keeps_high_remaining_progress_green_when_dynamic_reset_risk_is_high(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-01T10:10:00+09:00",
+                "weekly_limit": "99%",
+                "weekly_limit_reset_at": "2026-06-08T09:10:00+09:00",
+            }
+        )
+        runtime["accounts"][0]["usage_history"] = [
+            {
+                "captured_at": "2026-06-01T10:00:00+09:00",
+                "weekly_limit": "100%",
+                "weekly_limit_reset_at": "2026-06-08T09:10:00+09:00",
+            }
+        ]
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        weekly_metric = model["bars"][0]["metrics"][1]
+        self.assertEqual(weekly_metric["percent"], 99)
+        self.assertEqual(weekly_metric["state"], "normal")
+        self.assertEqual(weekly_metric["color"], "#22c55e")
+        self.assertEqual(weekly_metric["reset_state"], "urgent")
+        self.assertEqual(weekly_metric["reset_color"], "#ef4444")
 
     def test_model_falls_back_to_static_color_without_dynamic_history_inputs(self):
         runtime = self._runtime()
