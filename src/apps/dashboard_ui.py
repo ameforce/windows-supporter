@@ -95,6 +95,8 @@ class DashboardView:
         self._add_wrike_section(body, text=text, bg=card_bg, border=border)
         self._add_separator(body, border=border, bg=card_bg)
         self._add_background_section(body, text=text, bg=card_bg, border=border)
+        self._add_separator(body, border=border, bg=card_bg)
+        self._add_update_section(body, text=text, bg=card_bg, border=border)
 
         self.refresh()
         return
@@ -112,6 +114,7 @@ class DashboardView:
         self._set_feature_status("kakao", self._format_kakao(snapshot.get("kakao")))
         self._set_feature_status("wrike", self._format_wrike(snapshot.get("wrike")))
         self._set_feature_status("background", self._format_background(snapshot.get("background")))
+        self._set_feature_status("update", self._format_update(snapshot.get("update")))
         return
 
     def _lazy_import_tk(self) -> bool:
@@ -226,6 +229,42 @@ class DashboardView:
             settings_callback=None,
             toggle_callback="background.toggle",
         )
+        return
+
+    def _add_update_section(
+        self,
+        parent: Any,
+        *,
+        text: str,
+        bg: str,
+        border: str,
+    ) -> None:
+        tk = self._tk
+        ttk = self._ttk
+        frame = tk.Frame(parent, bg=bg)
+        frame.pack(fill="x")
+        tk.Label(
+            frame,
+            text="Update",
+            bg=bg,
+            fg=text,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+        row = tk.Frame(frame, bg=bg)
+        row.pack(fill="x", pady=(3, 0))
+        try:
+            row.columnconfigure(0, weight=1)
+        except Exception:
+            pass
+        status_frame = tk.Frame(row, bg=bg)
+        status_frame.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Button(
+            row,
+            text="업데이트 확인",
+            width=14,
+            command=lambda: self._invoke("update.check"),
+        ).grid(row=0, column=1, sticky="e")
+        self._status_frames["update"] = status_frame
         return
 
     def _add_section(
@@ -463,6 +502,31 @@ class DashboardView:
             (f"전경 프로필: {profile}", "normal"),
             (f"연결된 기능: {attached_text}", "normal"),
         ]
+
+    def _format_update(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
+        if not isinstance(data, dict):
+            return False, [("확인 불가", "disabled")]
+        state = str(data.get("state", "") or "").strip()
+        current = str(data.get("current_tag", "") or "").strip()
+        latest = str(data.get("latest_tag", "") or "").strip()
+        if state == "update_available" and latest:
+            parts = [("업데이트 가능", "enabled")]
+            if current:
+                parts.append((f"{current} -> {latest}", "normal"))
+            else:
+                parts.append((latest, "normal"))
+            return True, parts
+        if state == "checking":
+            return False, [("확인 중", "normal")]
+        if state == "updating":
+            return True, [("업데이트 중", "enabled")]
+        if state == "unavailable":
+            return False, [("지원 안 됨", "disabled"), ("Git checkout 필요", "normal")]
+        if state == "error":
+            return False, [("확인 실패", "disabled")]
+        if current:
+            return False, [("최신", "normal"), (current, "normal")]
+        return False, [("확인 대기", "normal")]
 
     def _enabled_part(self, enabled: bool) -> tuple[str, str]:
         if bool(enabled):

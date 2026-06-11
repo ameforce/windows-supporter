@@ -77,6 +77,24 @@ class MainRestartUnitTest(unittest.TestCase):
 
         self.assertEqual(cwd, r"C:\workspace\epapyrus\git\tools\windows-supporter")
 
+    def test_build_update_repo_root_uses_executable_dir_when_frozen(self) -> None:
+        repo_root = main._build_update_repo_root(
+            executable=r"C:\repo\windows-supporter.exe",
+            main_file=r"C:\Temp\_MEI12345\main.py",
+            frozen=True,
+        )
+
+        self.assertEqual(repo_root, r"C:\repo")
+
+    def test_build_update_repo_root_uses_main_file_dir_when_unfrozen(self) -> None:
+        repo_root = main._build_update_repo_root(
+            executable=r"C:\Python\python.exe",
+            main_file=r"C:\repo\main.py",
+            frozen=False,
+        )
+
+        self.assertEqual(repo_root, r"C:\repo")
+
     def test_restart_current_process_passes_reset_environment_and_safe_cwd(self) -> None:
         with patch.object(main, "_build_restart_command", return_value=["app.exe"]):
             with patch.object(

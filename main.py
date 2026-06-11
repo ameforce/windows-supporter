@@ -13,6 +13,7 @@ from src.utils.StartReg import StartReg
 from src.apps.startup_apps import StartupAppManager
 from src.utils.tray_icon import SystemTrayIcon
 from src.utils.ui_event_pump import SharedUiEventPump
+from src.utils.update_monitor import WindowsSupporterUpdater
 
 
 def _build_restart_command(
@@ -59,6 +60,20 @@ def _build_restart_cwd(
         if exe_dir:
             return exe_dir
     return os.path.abspath(current_cwd or os.getcwd())
+
+
+def _build_update_repo_root(
+    *,
+    executable: str | None = None,
+    main_file: str | None = None,
+    frozen: bool | None = None,
+) -> str:
+    is_frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
+    if is_frozen:
+        exe_dir = os.path.dirname(os.path.abspath(executable or sys.executable))
+        if exe_dir:
+            return exe_dir
+    return os.path.dirname(os.path.abspath(main_file or __file__))
 
 
 def _restart_current_process() -> None:
@@ -118,7 +133,19 @@ def main() -> None:
     monitor = Monitor()
     event_queue: queue.SimpleQueue = queue.SimpleQueue()
     startup_manager = StartupAppManager()
-    main_ui = WindowsSupporterMainUI(root, startup_manager, monitor, event_queue=event_queue)
+    updater = WindowsSupporterUpdater(
+        root=root,
+        event_queue=event_queue,
+        repo_root=_build_update_repo_root(),
+        quit_callback=root.quit,
+    )
+    main_ui = WindowsSupporterMainUI(
+        root,
+        startup_manager,
+        monitor,
+        event_queue=event_queue,
+        updater=updater,
+    )
     try:
         setattr(root, "_ws_main_ui", main_ui)
     except Exception:
@@ -128,6 +155,10 @@ def main() -> None:
     except Exception:
         pass
     SharedUiEventPump(root=root, event_queue=event_queue).start()
+    try:
+        updater.start()
+    except Exception:
+        pass
 
     def _run_bg(fn) -> None:
         try:
