@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from src.utils.LibConnector import LibConnector
 from src.utils.windows_window import apply_precomputed_window_position
 
@@ -71,6 +71,8 @@ class KakaoWorkResult:
     runtime_snapshot: KakaoRuntimeSnapshot
     target_resolution: KakaoTargetResolution
     move_plan: WindowMovePlan
+    requested_at: float = 0.0
+    compute_duration_ms: float = 0.0
 
 
 class KakaoManager:
@@ -117,6 +119,15 @@ class KakaoManager:
         self.__pending_rerun = False
         self.__latest_request_generation = 0
         self.__state_epoch = 0
+        self.__refresh_diagnostics = {
+            "coalesced_requests": 0,
+            "last_compute_ms": None,
+            "last_apply_ms": None,
+            "last_total_ms": None,
+            "last_move_count": 0,
+            "last_accepted": False,
+            "last_rerun_requested": False,
+        }
         return
 
     def set_ui_post(self, ui_post) -> None:
@@ -209,6 +220,9 @@ class KakaoManager:
             except Exception:
                 pass
         return True, None
+
+    def get_refresh_diagnostics_snapshot(self) -> dict:
+        return self.__get_refresh_diagnostics_snapshot()
 
     def __ensure_config_state_bootstrapped(self) -> None:
         if not self.__config_loaded:
@@ -415,11 +429,14 @@ class KakaoManager:
     def __request_background_tick(self, root, now: float) -> None:
         request = None
         with self.__worker_lock:
-            self.__latest_request_generation = int(self.__latest_request_generation) + 1
-            generation = int(self.__latest_request_generation)
             if self.__worker_active:
                 self.__pending_rerun = True
+                self.__refresh_diagnostics["coalesced_requests"] = (
+                    int(self.__refresh_diagnostics.get("coalesced_requests") or 0) + 1
+                )
                 return
+            self.__latest_request_generation = int(self.__latest_request_generation) + 1
+            generation = int(self.__latest_request_generation)
             self.__worker_active = True
             self.__pending_rerun = False
             requested_target = self.__copy_target_monitor_descriptor()
@@ -442,7 +459,14 @@ class KakaoManager:
 
         def worker() -> None:
             try:
+                compute_started = self.__lib.time.monotonic()
                 result = self.__compute_work_result(request)
+                computed_at = self.__lib.time.monotonic()
+                result = replace(
+                    result,
+                    requested_at=float(request.now),
+                    compute_duration_ms=max(0.0, (computed_at - compute_started) * 1000.0),
+                )
             except Exception:
                 self.__finish_failed_worker(root)
                 return
@@ -487,7 +511,20 @@ class KakaoManager:
                 int(result.request_generation) != int(self.__latest_request_generation)
             )
             self.__pending_rerun = False
-        self.__accept_work_result(result)
+        apply_started = self.__lib.time.monotonic()
+        accepted = self.__accept_work_result(result)
+        apply_finished = self.__lib.time.monotonic()
+        self.__record_refresh_diagnostics(
+            last_compute_ms=float(result.compute_duration_ms or 0.0),
+            last_apply_ms=max(0.0, (apply_finished - apply_started) * 1000.0),
+            last_total_ms=max(
+                0.0,
+                (apply_finished - float(result.requested_at or apply_started)) * 1000.0,
+            ),
+            last_move_count=len(tuple(result.move_plan.moves or ())),
+            last_accepted=bool(accepted),
+            last_rerun_requested=bool(rerun),
+        )
         if rerun:
             self.__request_background_tick(root, self.__lib.time.monotonic())
         return
@@ -527,6 +564,32 @@ class KakaoManager:
 
         self.__apply_move_plan(result.move_plan)
         return True
+
+    def __record_refresh_diagnostics(self, **updates) -> None:
+        try:
+            with self.__worker_lock:
+                for key, value in updates.items():
+                    if key.endswith("_ms") and value is not None:
+                        try:
+                            self.__refresh_diagnostics[key] = round(float(value), 3)
+                        except Exception:
+                            self.__refresh_diagnostics[key] = None
+                        continue
+                    self.__refresh_diagnostics[key] = value
+        except Exception:
+            return
+        return
+
+    def __get_refresh_diagnostics_snapshot(self) -> dict:
+        try:
+            with self.__worker_lock:
+                snapshot = dict(self.__refresh_diagnostics)
+                snapshot["worker_active"] = bool(self.__worker_active)
+                snapshot["pending_rerun"] = bool(self.__pending_rerun)
+                snapshot["latest_request_generation"] = int(self.__latest_request_generation)
+            return snapshot
+        except Exception:
+            return {}
 
     def __apply_move_plan(self, move_plan: WindowMovePlan) -> None:
         signature = getattr(move_plan, "target_monitor_signature", None)

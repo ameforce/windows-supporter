@@ -153,7 +153,66 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
         self.assertEqual(len(_FakeThread.created), 1)
         self.assertTrue(self.manager._KakaoManager__worker_active)
         self.assertTrue(self.manager._KakaoManager__pending_rerun)
-        self.assertEqual(self.manager._KakaoManager__latest_request_generation, 2)
+        self.assertEqual(self.manager._KakaoManager__latest_request_generation, 1)
+        diagnostics = self.manager.get_refresh_diagnostics_snapshot()
+        self.assertEqual(diagnostics["coalesced_requests"], 1)
+
+    def test_pending_refresh_does_not_discard_completed_active_result(self) -> None:
+        _FakeThread.created = []
+        with patch("src.apps.KakaoManager.threading.Thread", _FakeThread):
+            self.manager.request_refresh(root=None)
+            self.manager.request_refresh(root=None)
+
+        self.assertEqual(self.manager._KakaoManager__latest_request_generation, 1)
+        self.assertTrue(self.manager._KakaoManager__pending_rerun)
+        result = KakaoWorkResult(
+            request_generation=1,
+            state_epoch=self.manager._KakaoManager__state_epoch,
+            requested_at=10.0,
+            compute_duration_ms=200.0,
+            runtime_snapshot=KakaoRuntimeSnapshot(
+                kakao_pids=(101,),
+                chat_order=(301,),
+                last_main_hwnd=300,
+                monitors=(
+                    MonitorSnapshot(
+                        handle=11,
+                        device="DISPLAY1",
+                        display_num=1,
+                        is_primary=True,
+                        work=(0, 0, 1920, 1080),
+                        monitor=(0, 0, 1920, 1080),
+                    ),
+                ),
+                next_pid_scan_time=12.5,
+                next_monitor_scan_time=34.5,
+            ),
+            target_resolution=KakaoTargetResolution(
+                requested_display_num=1,
+                resolved_display_num=1,
+                resolved_monitor_handle=11,
+                config_missing=False,
+                fallback_reason="",
+            ),
+            move_plan=WindowMovePlan(
+                moves=(
+                    WindowMove(hwnd=301, x=10, y=20, width=400, height=500, resize=True),
+                ),
+            ),
+        )
+
+        with patch("src.apps.KakaoManager.apply_precomputed_window_position") as apply_move:
+            with patch.object(self.manager, "_KakaoManager__request_background_tick") as request_tick:
+                self.manager._KakaoManager__handle_work_result(root="root", result=result)
+
+        apply_move.assert_called_once()
+        request_tick.assert_called_once()
+        self.assertEqual(self.manager._KakaoManager__chat_order, [301])
+        self.assertFalse(self.manager._KakaoManager__pending_rerun)
+        diagnostics = self.manager.get_refresh_diagnostics_snapshot()
+        self.assertTrue(diagnostics["last_accepted"])
+        self.assertTrue(diagnostics["last_rerun_requested"])
+        self.assertEqual(diagnostics["last_move_count"], 1)
 
     def test_request_refresh_captures_target_monitor_descriptor(self) -> None:
         _FakeThread.created = []
