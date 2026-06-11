@@ -24,19 +24,23 @@ class BuildVersion:
     major: int
     minor: int
     patch: int
+    revision: int
 
     @property
     def display_version(self) -> str:
         suffix = "-dirty" if self.dirty else ""
-        return f"v{self.major}.{self.minor}.{self.patch} ({self.commit}{suffix})"
+        core = f"v{self.major}.{self.minor}.{self.patch}"
+        if self.revision > 0:
+            core = f"{core}.{self.revision}"
+        return f"{core} ({self.commit}{suffix})"
 
     @property
     def numeric_version(self) -> str:
-        return f"{self.major}.{self.minor}.{self.patch}.0"
+        return f"{self.major}.{self.minor}.{self.patch}.{self.revision}"
 
     @property
     def numeric_tuple(self) -> tuple[int, int, int, int]:
-        return (self.major, self.minor, self.patch, 0)
+        return (self.major, self.minor, self.patch, self.revision)
 
     @property
     def describe(self) -> str:
@@ -56,6 +60,47 @@ def _run_git(repo_root: Path, args: list[str]) -> str:
         message = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(message or f"git {' '.join(args)} failed")
     return result.stdout.strip()
+
+
+def _find_source_tag_integration_merge(repo_root: Path, source_tag: str) -> str | None:
+    tag_commit = _run_git(repo_root, ["rev-parse", f"{source_tag}^{{}}"])
+    first_parent_lines = _run_git(
+        repo_root,
+        ["rev-list", "--first-parent", "--parents", "HEAD"],
+    ).splitlines()
+
+    for line in first_parent_lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        commit = parts[0]
+        non_first_parents = parts[2:]
+        if tag_commit in non_first_parents:
+            return commit
+    return None
+
+
+def _derive_revision(repo_root: Path, source_tag: str, commits_since_tag: int) -> int:
+    if commits_since_tag == 0:
+        return 0
+
+    integration_merge = _find_source_tag_integration_merge(repo_root, source_tag)
+    if not integration_merge:
+        return commits_since_tag
+
+    raw_count = _run_git(
+        repo_root,
+        ["rev-list", "--first-parent", "--count", f"{integration_merge}..HEAD"],
+    )
+    try:
+        commits_after_integration = int(raw_count)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"invalid first-parent commit count after {integration_merge}: {raw_count!r}"
+        ) from exc
+
+    # Only proven release-tag integration merges reset the post-release revision axis.
+    return 1 + commits_after_integration
 
 
 def derive_build_version(repo_root: Path) -> BuildVersion:
@@ -84,7 +129,8 @@ def derive_build_version(repo_root: Path) -> BuildVersion:
     commits_since_tag = int(match.group("count"))
     major = int(semver.group("major"))
     minor = int(semver.group("minor"))
-    patch = int(semver.group("patch")) + commits_since_tag
+    patch = int(semver.group("patch"))
+    revision = _derive_revision(repo_root, source_tag, commits_since_tag)
     return BuildVersion(
         source_tag=source_tag,
         commits_since_tag=commits_since_tag,
@@ -93,6 +139,7 @@ def derive_build_version(repo_root: Path) -> BuildVersion:
         major=major,
         minor=minor,
         patch=patch,
+        revision=revision,
     )
 
 
@@ -105,6 +152,7 @@ def write_build_info_module(path: Path, version: BuildVersion) -> None:
             "NUMERIC_VERSION = " + repr(version.numeric_version),
             "SOURCE_TAG = " + repr(version.source_tag),
             "COMMITS_SINCE_TAG = " + repr(version.commits_since_tag),
+            "REVISION = " + repr(version.revision),
             "COMMIT = " + repr(version.commit),
             "DIRTY = " + repr(version.dirty),
             "GIT_DESCRIBE = " + repr(version.describe),
