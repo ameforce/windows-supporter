@@ -37,7 +37,7 @@ _DEFAULT_GEOMETRY = {
 
 _EMPTY_SLOT_PADDING_PX = 8
 _MIN_EMPTY_SLOT_WIDTH_PX = 300
-_PREFERRED_EMPTY_SLOT_WIDTH_PX = 420
+_TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX = 560
 _TASKBAR_SAMPLE_STEP_PX = 4
 _OCCUPIED_DILATION_PX = 24
 _FLASH_DURATION_SEC = 1.0
@@ -94,6 +94,57 @@ _RESET_WEEKLY_COLUMN_WIDTH_PX = 52
 _RESET_FIVE_HOUR_COLUMN_WIDTH_PX = 40
 _RESET_SHORT_COLUMN_WIDTH_PX = 28
 _RESET_PLACEHOLDER_TEXT = "--"
+_RESET_DIRECTION_SHORTAGE = "shortage"
+_RESET_DIRECTION_ON_TRACK = "on_track"
+_RESET_DIRECTION_SURPLUS = "surplus"
+_RESET_DIRECTION_UNKNOWN = "unknown"
+_RESET_DIRECTION_MARKERS = {
+    _RESET_DIRECTION_SHORTAGE: "↓",
+    _RESET_DIRECTION_ON_TRACK: "=",
+    _RESET_DIRECTION_SURPLUS: "↑",
+    _RESET_DIRECTION_UNKNOWN: "",
+}
+_RESET_DIRECTION_STATES = {
+    _RESET_DIRECTION_SHORTAGE: "urgent",
+    _RESET_DIRECTION_ON_TRACK: "stable",
+    _RESET_DIRECTION_SURPLUS: "warning",
+    _RESET_DIRECTION_UNKNOWN: "unknown",
+}
+_RESET_BADGE_LABELS = {
+    _RESET_DIRECTION_SHORTAGE: "부족",
+    _RESET_DIRECTION_ON_TRACK: "정상",
+    _RESET_DIRECTION_SURPLUS: "남음",
+    _RESET_DIRECTION_UNKNOWN: "",
+}
+_RESET_BADGE_SHORT_LABELS = {
+    _RESET_DIRECTION_SHORTAGE: "부",
+    _RESET_DIRECTION_ON_TRACK: "정",
+    _RESET_DIRECTION_SURPLUS: "남",
+    _RESET_DIRECTION_UNKNOWN: "",
+}
+_RESET_BADGE_FILLS = {
+    _RESET_DIRECTION_SHORTAGE: "#7f1d1d",
+    _RESET_DIRECTION_ON_TRACK: "#064e3b",
+    _RESET_DIRECTION_SURPLUS: "#78350f",
+    _RESET_DIRECTION_UNKNOWN: "",
+}
+_RESET_BADGE_OUTLINES = {
+    _RESET_DIRECTION_SHORTAGE: "#ef4444",
+    _RESET_DIRECTION_ON_TRACK: "#22c55e",
+    _RESET_DIRECTION_SURPLUS: "#f59e0b",
+    _RESET_DIRECTION_UNKNOWN: "",
+}
+_RESET_BADGE_TEXT_COLORS = {
+    _RESET_DIRECTION_SHORTAGE: "#fee2e2",
+    _RESET_DIRECTION_ON_TRACK: "#dcfce7",
+    _RESET_DIRECTION_SURPLUS: "#fef3c7",
+    _RESET_DIRECTION_UNKNOWN: "",
+}
+_RESET_BADGE_HORIZONTAL_PADDING_PX = 5
+_RESET_BADGE_HEIGHT_PX = 11
+_RESET_BADGE_MIN_WIDTH_PX = 14
+_RESET_BADGE_TIME_GAP_PX = 3
+_RESET_BADGE_OUTLINE_WIDTH_PX = 1
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
 _SEGMENT_RIGHT_PADDING_PX = 2
@@ -914,42 +965,37 @@ class CodexUsageTaskbarOverlay:
         reset_text = str(metric.get("reset_text") or "")
         reset_short_text = str(metric.get("reset_short_text") or reset_text)
         reset_color = str(metric.get("reset_color") or "#94a3b8")
+        reset_marker = str(metric.get("reset_marker") or "")
+        reset_badge_label = str(metric.get("reset_badge_label") or "")
+        reset_badge_short_label = str(metric.get("reset_badge_short_label") or "")
+        reset_badge_fill = str(metric.get("reset_badge_fill") or "")
+        reset_badge_outline = str(metric.get("reset_badge_outline") or reset_badge_fill)
+        reset_badge_text_color = str(metric.get("reset_badge_text_color") or "#f9fafb")
+        has_reset_badge = bool(reset_badge_label or reset_badge_short_label)
         metric_key = str(metric.get("metric_key") or "")
         percent = int(metric.get("percent") or 0)
         color = str(metric.get("color") or "#6b7280")
         flash = bool(metric.get("flash"))
         flash_phase = bool(metric.get("flash_phase"))
-        label_width = 14
-        value_width = _VALUE_COLUMN_MAX_WIDTH_PX
-        label_to_bar_gap = 3
-        bar_to_value_gap = 3
-        reset_gap = 4
-        bar_x = x + label_width + label_to_bar_gap
-        reset_right_x = x + width - _SEGMENT_RIGHT_PADDING_PX
-        max_progress_width = max(6, reset_right_x - reset_gap - value_width - bar_to_value_gap - bar_x)
-        if progress_width is None:
-            progress_width = _metric_progress_width_for_segment(width)
-        bar_width = max(
-            6,
-            min(int(progress_width), int(max_progress_width)),
-        )
-        value_x = bar_x + bar_width + bar_to_value_gap + value_width
-        reset_text_x = value_x + reset_gap
-        display_reset_text = _display_reset_text_for_space(
+        layout = _fit_metric_segment_layout(
+            width,
             reset_text,
             reset_short_text,
+            badge_label=reset_badge_label,
+            badge_short_label=reset_badge_short_label,
             metric_key=metric_key,
-            available_px=max(0, reset_right_x - reset_text_x),
+            reset_marker=reset_marker,
+            has_reset_badge=has_reset_badge,
+            progress_width=progress_width,
         )
-        if not display_reset_text and not reset_text:
-            display_reset_text = _display_reset_text_for_space(
-                _RESET_PLACEHOLDER_TEXT,
-                _RESET_PLACEHOLDER_TEXT,
-                metric_key=metric_key,
-                available_px=max(0, reset_right_x - reset_text_x),
-            )
-            if display_reset_text:
-                reset_color = "#4b5563"
+        bar_x = x + int(layout["bar_x"])
+        bar_width = int(layout["progress_width"])
+        value_x = x + int(layout["value_x"])
+        reset_text_x = x + int(layout["reset_text_x"])
+        badge_fit = dict(layout["badge_fit"])
+        display_reset_text = str(layout["display_reset_text"])
+        if bool(layout["placeholder_visible"]):
+            reset_color = "#4b5563"
         show_reset = bool(display_reset_text)
         bar_y = y + max(4, (row_height - 7) // 2)
         if flash:
@@ -996,7 +1042,42 @@ class CodexUsageTaskbarOverlay:
             font=("Segoe UI", 7, "bold"),
             text=value_text,
         )
-        if show_reset:
+        if badge_fit["badge_visible"] and has_reset_badge:
+            badge_width = int(badge_fit["badge_width"])
+            badge_y = center_y - (_RESET_BADGE_HEIGHT_PX // 2)
+            badge_right_x = reset_text_x + badge_width
+            # A visible badge fit is the drawability contract; default styling keeps
+            # partial badge payloads from falling back to tiny marker-only text.
+            badge_fill = reset_badge_fill or "#374151"
+            badge_outline = reset_badge_outline or reset_color or badge_fill
+            badge_text_color = reset_badge_text_color or "#f9fafb"
+            canvas.create_rectangle(
+                reset_text_x,
+                badge_y,
+                badge_right_x,
+                badge_y + _RESET_BADGE_HEIGHT_PX,
+                fill=badge_fill,
+                outline=badge_outline,
+            )
+            canvas.create_text(
+                reset_text_x + badge_width // 2,
+                center_y,
+                anchor="center",
+                fill=badge_text_color,
+                font=("Segoe UI", 6, "bold"),
+                text=str(badge_fit["badge_label"]),
+            )
+            time_text = str(badge_fit["time_text"] or "")
+            if time_text:
+                canvas.create_text(
+                    badge_right_x + _RESET_BADGE_TIME_GAP_PX,
+                    center_y,
+                    anchor="w",
+                    fill=reset_color,
+                    font=("Segoe UI", 6, "bold"),
+                    text=time_text,
+                )
+        elif show_reset:
             canvas.create_text(
                 reset_text_x,
                 center_y,
@@ -1231,7 +1312,7 @@ def _fit_horizontal_geometry_to_empty_slot(
         fitted["height"] = 0
         return fitted
 
-    target_width = min(desired_width, _PREFERRED_EMPTY_SLOT_WIDTH_PX)
+    target_width = min(desired_width, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
     width = min(target_width, available)
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
@@ -1954,7 +2035,7 @@ def _build_metric(
         percent=percent,
         now=now,
     )
-    dynamic_reset_risk_state = _dynamic_reset_risk_state(
+    dynamic_reset_direction = _dynamic_reset_direction(
         metric_key=key,
         current_percent=percent,
         reset_at_value=reset_at_value,
@@ -1966,9 +2047,19 @@ def _build_metric(
     color = _bar_color(enabled, percent)
     reset_state = reset_info["state"]
     reset_color = reset_info["color"]
-    if enabled and dynamic_reset_risk_state in {"high", "warning", "normal"}:
-        reset_state = _reset_state_for_dynamic_risk(dynamic_reset_risk_state)
-        reset_color = _reset_color(reset_state)
+    reset_direction = str(reset_info.get("direction") or _RESET_DIRECTION_UNKNOWN)
+    if enabled and dynamic_reset_direction in {
+        _RESET_DIRECTION_SHORTAGE,
+        _RESET_DIRECTION_ON_TRACK,
+        _RESET_DIRECTION_SURPLUS,
+    }:
+        reset_direction = dynamic_reset_direction
+    reset_profile = _reset_direction_profile(reset_direction)
+    reset_marker = reset_profile["marker"]
+    if reset_direction != _RESET_DIRECTION_UNKNOWN:
+        reset_state = reset_profile["state"]
+        reset_color = reset_profile["color"]
+    # `reset_direction` is the semantic source; state/color stay for presentation compatibility.
     return {
         "metric_key": str(key),
         "key": str(short_label),
@@ -1980,12 +2071,19 @@ def _build_metric(
         "reset_short_text": reset_info["short_text"],
         "reset_state": reset_state,
         "reset_color": reset_color,
+        "reset_direction": reset_direction,
+        "reset_marker": reset_marker,
+        "reset_badge_label": reset_profile["badge_label"],
+        "reset_badge_short_label": reset_profile["badge_short_label"],
+        "reset_badge_fill": reset_profile["badge_fill"],
+        "reset_badge_outline": reset_profile["badge_outline"],
+        "reset_badge_text_color": reset_profile["badge_text_color"],
         "flash": False,
         "flash_phase": False,
     }
 
 
-def _dynamic_reset_risk_state(
+def _dynamic_reset_direction(
     *,
     metric_key: str,
     current_percent: int | None,
@@ -2006,7 +2104,7 @@ def _dynamic_reset_risk_state(
     if not _reset_remaining_is_plausible(metric_key, seconds_until_reset):
         return None
     if int(current_percent) <= 0:
-        return "high"
+        return _RESET_DIRECTION_SHORTAGE
 
     current_ts = _history_timestamp_seconds(captured_at_value)
     if current_ts is None:
@@ -2045,12 +2143,10 @@ def _dynamic_reset_risk_state(
         rate_per_min * (float(seconds_until_reset) / 60.0)
     )
     if projected_remaining < 0.0:
-        return "high"
+        return _RESET_DIRECTION_SHORTAGE
     if projected_remaining <= 20.0:
-        return "normal"
-    if projected_remaining <= 40.0:
-        return "warning"
-    return "high"
+        return _RESET_DIRECTION_ON_TRACK
+    return _RESET_DIRECTION_SURPLUS
 
 
 def _history_samples_for_metric(
@@ -2109,14 +2205,29 @@ def _history_timestamp_seconds(value: Any) -> float | None:
         return None
 
 
-def _reset_state_for_dynamic_risk(state: str) -> str:
-    if state == "normal":
-        return "stable"
-    if state == "warning":
-        return "warning"
-    if state == "high":
-        return "urgent"
-    return "unknown"
+def _reset_direction_profile(direction: str) -> dict[str, str]:
+    normalized = str(direction or _RESET_DIRECTION_UNKNOWN)
+    if normalized not in _RESET_DIRECTION_MARKERS:
+        normalized = _RESET_DIRECTION_UNKNOWN
+    state = _RESET_DIRECTION_STATES.get(normalized, "unknown")
+    return {
+        "direction": normalized,
+        "marker": _RESET_DIRECTION_MARKERS.get(normalized, ""),
+        "state": state,
+        "color": _reset_color(state),
+        "badge_label": _RESET_BADGE_LABELS.get(normalized, ""),
+        "badge_short_label": _RESET_BADGE_SHORT_LABELS.get(normalized, ""),
+        "badge_fill": _RESET_BADGE_FILLS.get(normalized, ""),
+        "badge_outline": _RESET_BADGE_OUTLINES.get(normalized, ""),
+        "badge_text_color": _RESET_BADGE_TEXT_COLORS.get(normalized, ""),
+    }
+
+
+def _reset_overdue_profile() -> dict[str, str]:
+    profile = dict(_reset_direction_profile(_RESET_DIRECTION_UNKNOWN))
+    profile["state"] = "overdue"
+    profile["color"] = _reset_color("overdue")
+    return profile
 
 
 def _build_reset_info(
@@ -2128,25 +2239,47 @@ def _build_reset_info(
 ) -> dict[str, str]:
     parsed = _parse_reset_datetime(value)
     if parsed is None:
-        return {"text": "", "short_text": "", "state": "unknown", "color": "#6b7280"}
+        profile = _reset_direction_profile(_RESET_DIRECTION_UNKNOWN)
+        return {
+            "text": "",
+            "short_text": "",
+            "state": "unknown",
+            "color": "#6b7280",
+            "direction": profile["direction"],
+            "marker": profile["marker"],
+        }
     current = _reset_now(parsed, now)
     seconds = int((parsed - current).total_seconds())
     if seconds <= 0:
         text = _format_reset_remaining_detail(0, metric_key=metric_key)
+        profile = _reset_overdue_profile()
         return {
             "text": text,
             "short_text": text,
-            "state": "overdue",
-            "color": "#ef4444",
+            "state": profile["state"],
+            "color": profile["color"],
+            "direction": profile["direction"],
+            "marker": profile["marker"],
         }
     if not _reset_remaining_is_plausible(metric_key, seconds):
-        return {"text": "", "short_text": "", "state": "unknown", "color": "#6b7280"}
-    state = _reset_action_state(metric_key, percent, seconds)
+        profile = _reset_direction_profile(_RESET_DIRECTION_UNKNOWN)
+        return {
+            "text": "",
+            "short_text": "",
+            "state": "unknown",
+            "color": "#6b7280",
+            "direction": profile["direction"],
+            "marker": profile["marker"],
+        }
+    direction = _reset_action_direction(metric_key, percent, seconds)
+    profile = _reset_direction_profile(direction)
     return {
         "text": _format_reset_remaining_detail(seconds, metric_key=metric_key),
         "short_text": _format_reset_remaining_compact(seconds, metric_key=metric_key),
-        "state": state,
-        "color": _reset_color(state),
+        "state": profile["state"],
+        "color": profile["color"],
+        "direction": profile["direction"],
+        "marker": profile["marker"],
     }
 
 
@@ -2195,10 +2328,13 @@ def _display_reset_text_for_width(
     detail_text: str,
     short_text: str,
     width: int,
+    *,
+    reset_marker: str = "",
 ) -> str:
     return _display_reset_text_for_space(
         detail_text,
         short_text,
+        reset_marker=reset_marker,
         available_px=max(0, int(width) // 2),
     )
 
@@ -2208,19 +2344,316 @@ def _display_reset_text_for_space(
     short_text: str,
     *,
     metric_key: str = "",
+    reset_marker: str = "",
     available_px: int,
 ) -> str:
     candidates = []
     detail = str(detail_text or "")
     short = str(short_text or "")
-    if detail:
-        candidates.append(detail)
-    if short and short != detail:
-        candidates.append(short)
+    marker = str(reset_marker or "")
+    if marker:
+        if detail:
+            candidates.append(f"{marker} {detail}")
+        if short and short != detail:
+            candidates.append(f"{marker} {short}")
+    else:
+        if detail:
+            candidates.append(detail)
+        if short and short != detail:
+            candidates.append(short)
     for text in candidates:
         if _reset_column_width_for_text(text, metric_key=metric_key) <= int(available_px):
             return text
     return ""
+
+
+def _fit_metric_segment_layout(
+    width: int,
+    detail_text: str,
+    short_text: str,
+    *,
+    badge_label: str,
+    badge_short_label: str,
+    metric_key: str = "",
+    reset_marker: str = "",
+    has_reset_badge: bool = False,
+    progress_width: int | None = None,
+) -> dict[str, Any]:
+    segment_width = max(0, int(width))
+    label_width = 14
+    value_width = _VALUE_COLUMN_MAX_WIDTH_PX
+    label_to_bar_gap = 3
+    bar_to_value_gap = 3
+    reset_gap = 4
+    bar_x = label_width + label_to_bar_gap
+    reset_right_x = segment_width - _SEGMENT_RIGHT_PADDING_PX
+    max_progress_width = max(
+        6,
+        reset_right_x - reset_gap - value_width - bar_to_value_gap - bar_x,
+    )
+    requested_progress_width = (
+        _metric_progress_width_for_segment(segment_width)
+        if progress_width is None
+        else int(progress_width)
+    )
+    target_progress_width = max(
+        6,
+        min(
+            int(requested_progress_width),
+            int(max_progress_width),
+            _METRIC_PROGRESS_MAX_WIDTH_PX,
+        ),
+    )
+    minimum_progress_width = max(
+        6,
+        min(_METRIC_PROGRESS_MIN_WIDTH_PX, int(max_progress_width)),
+    )
+
+    hidden_badge = {
+        "badge_visible": False,
+        "badge_label": "",
+        "badge_width": 0,
+        "time_text": "",
+        "total_width": 0,
+        "variant": "hidden",
+    }
+    best: dict[str, Any] | None = None
+    best_score: tuple[int, int, int, int, int] | None = None
+    detail = str(detail_text or "")
+    short = str(short_text or "")
+    full_badge_label = str(badge_label or "")
+    compact_badge_label = str(badge_short_label or full_badge_label)
+
+    def score_candidate(
+        *,
+        progress: int,
+        badge_fit: dict[str, Any],
+        display_text: str,
+    ) -> tuple[int, int, int, int, int]:
+        time_text = str(badge_fit.get("time_text") or display_text or "")
+        badge_text = str(badge_fit.get("badge_label") or "")
+        time_quality = 0
+        if time_text:
+            time_quality = 2 if time_text == detail else 1
+        badge_quality = 0
+        if bool(badge_fit.get("badge_visible")):
+            badge_quality = 2 if badge_text == full_badge_label else 1
+        return (
+            1 if time_text else 0,
+            1 if time_text and badge_quality else 0,
+            badge_quality,
+            time_quality,
+            int(progress),
+        )
+
+    for candidate_progress in range(
+        int(target_progress_width),
+        int(minimum_progress_width) - 1,
+        -1,
+    ):
+        reset_text_x = (
+            bar_x
+            + int(candidate_progress)
+            + bar_to_value_gap
+            + value_width
+            + reset_gap
+        )
+        value_x = bar_x + int(candidate_progress) + bar_to_value_gap + value_width
+        reset_available_px = max(0, reset_right_x - reset_text_x)
+        badge_fit = _fit_reset_badge_for_space(
+            detail,
+            short,
+            badge_label=full_badge_label,
+            badge_short_label=compact_badge_label,
+            metric_key=metric_key,
+            available_px=reset_available_px,
+        )
+        display_reset_text = ""
+        placeholder_visible = False
+        if not badge_fit["badge_visible"] and badge_fit["time_text"]:
+            display_reset_text = str(badge_fit["time_text"])
+        elif not badge_fit["badge_visible"] and not has_reset_badge:
+            display_reset_text = _display_reset_text_for_space(
+                detail,
+                short,
+                metric_key=metric_key,
+                reset_marker="",
+                available_px=reset_available_px,
+            )
+            if not display_reset_text and not detail:
+                display_reset_text = _display_reset_text_for_space(
+                    _RESET_PLACEHOLDER_TEXT,
+                    _RESET_PLACEHOLDER_TEXT,
+                    metric_key=metric_key,
+                    reset_marker="",
+                    available_px=reset_available_px,
+                )
+                placeholder_visible = bool(display_reset_text)
+
+        score = score_candidate(
+            progress=int(candidate_progress),
+            badge_fit=badge_fit,
+            display_text=display_reset_text,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best = {
+                "progress_width": int(candidate_progress),
+                "bar_x": int(bar_x),
+                "value_x": int(value_x),
+                "reset_text_x": int(reset_text_x),
+                "badge_fit": badge_fit,
+                "display_reset_text": display_reset_text,
+                "placeholder_visible": placeholder_visible,
+                "variant": str(badge_fit.get("variant") or "reset_text"),
+            }
+
+    if best is not None:
+        return best
+    fallback_progress_width = max(
+        6,
+        min(int(target_progress_width), int(max_progress_width)),
+    )
+    return {
+        "progress_width": fallback_progress_width,
+        "bar_x": int(bar_x),
+        "value_x": int(
+            bar_x
+            + fallback_progress_width
+            + bar_to_value_gap
+            + value_width
+        ),
+        "reset_text_x": int(
+            bar_x
+            + fallback_progress_width
+            + bar_to_value_gap
+            + value_width
+            + reset_gap
+        ),
+        "badge_fit": hidden_badge,
+        "display_reset_text": "",
+        "placeholder_visible": False,
+        "variant": "hidden",
+    }
+
+
+def _fit_reset_badge_for_space(
+    detail_text: str,
+    short_text: str,
+    *,
+    badge_label: str,
+    badge_short_label: str,
+    metric_key: str = "",
+    available_px: int,
+) -> dict[str, Any]:
+    available = max(0, int(available_px))
+    full_label = str(badge_label or badge_short_label or "")
+    compact_label = str(badge_short_label or full_label)
+    detail = str(detail_text or "")
+    short = str(short_text or "")
+
+    hidden = {
+        "badge_visible": False,
+        "badge_label": "",
+        "badge_width": 0,
+        "time_text": "",
+        "total_width": 0,
+        "variant": "hidden",
+    }
+    if not full_label:
+        return hidden
+
+    full_badge_width = _reset_badge_width_for_label(full_label)
+    short_badge_width = _reset_badge_width_for_label(compact_label)
+    candidates: list[tuple[str, str, int, str, int]] = []
+
+    def add_candidate(
+        variant: str,
+        label: str,
+        badge_width: int,
+        time_text: str,
+        total_width: int,
+    ) -> None:
+        candidate = (variant, label, badge_width, time_text, total_width)
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    if detail:
+        detail_width = _reset_column_width_for_text(detail, metric_key=metric_key)
+        add_candidate(
+            "badge_detail",
+            full_label,
+            full_badge_width,
+            detail,
+            full_badge_width + _RESET_BADGE_TIME_GAP_PX + detail_width,
+        )
+        if compact_label and compact_label != full_label:
+            add_candidate(
+                "badge_short_detail",
+                compact_label,
+                short_badge_width,
+                detail,
+                short_badge_width + _RESET_BADGE_TIME_GAP_PX + detail_width,
+            )
+    if short and short != detail:
+        short_width = _reset_column_width_for_text(short, metric_key=metric_key)
+        add_candidate(
+            "badge_short",
+            full_label,
+            full_badge_width,
+            short,
+            full_badge_width + _RESET_BADGE_TIME_GAP_PX + short_width,
+        )
+        if compact_label and compact_label != full_label:
+            add_candidate(
+                "badge_short_time",
+                compact_label,
+                short_badge_width,
+                short,
+                short_badge_width + _RESET_BADGE_TIME_GAP_PX + short_width,
+            )
+    if detail:
+        add_candidate("time_detail", "", 0, detail, detail_width)
+    if short and short != detail:
+        add_candidate("time_short", "", 0, short, short_width)
+    add_candidate("badge_only", full_label, full_badge_width, "", full_badge_width)
+    if compact_label and compact_label != full_label:
+        add_candidate(
+            "badge_short_only",
+            compact_label,
+            short_badge_width,
+            "",
+            short_badge_width,
+        )
+
+    for variant, label, badge_width, time_text, total_width in candidates:
+        if total_width <= available:
+            badge_visible = bool(label and badge_width > 0)
+            return {
+                "badge_visible": badge_visible,
+                "badge_label": label,
+                "badge_width": badge_width if badge_visible else 0,
+                "time_text": time_text,
+                "total_width": total_width,
+                "variant": variant,
+            }
+    return hidden
+
+
+def _reset_badge_width_for_label(label: str) -> int:
+    text = str(label or "")
+    if not text:
+        return 0
+    # Keep this helper pure for deterministic unit tests. The estimate is
+    # deliberately conservative so unknown DPI/font details bias toward hiding
+    # reset time instead of overlapping the badge.
+    label_width = sum(9 if ord(ch) > 127 else 6 for ch in text)
+    return max(
+        _RESET_BADGE_MIN_WIDTH_PX,
+        label_width
+        + _RESET_BADGE_HORIZONTAL_PADDING_PX * 2
+        + _RESET_BADGE_OUTLINE_WIDTH_PX * 2,
+    )
 
 
 def _metric_progress_width_for_segment(width: int) -> int:
@@ -2241,6 +2674,8 @@ def _reset_column_width_for_text(text: str, *, metric_key: str = "") -> int:
     value = str(text or "")
     if not value:
         return 0
+    if value in set(_RESET_DIRECTION_MARKERS.values()) - {""}:
+        return max(8, len(value) * 7 + 2)
     if value == _RESET_PLACEHOLDER_TEXT:
         return max(12, len(value) * 5 + 2)
     minimum = _RESET_DETAIL_COLUMN_WIDTH_PX
@@ -2260,9 +2695,9 @@ def _value_column_width_for_text(value_text: str) -> int:
     )
 
 
-def _reset_action_state(metric_key: str, percent: int | None, seconds: int) -> str:
+def _reset_action_direction(metric_key: str, percent: int | None, seconds: int) -> str:
     if percent is None:
-        return "unknown"
+        return _RESET_DIRECTION_UNKNOWN
     window = _RESET_WINDOW_BY_METRIC.get(str(metric_key))
     if not isinstance(window, dict):
         window = _RESET_WINDOW_BY_METRIC["five_hour_limit"]
@@ -2273,28 +2708,26 @@ def _reset_action_state(metric_key: str, percent: int | None, seconds: int) -> s
     very_far_seconds = int(window["very_far_seconds"])
 
     if seconds <= urgent_seconds:
-        if remaining_percent >= 80:
-            return "urgent"
         if remaining_percent >= 60:
-            return "warning"
-        return "stable"
+            return _RESET_DIRECTION_SURPLUS
+        return _RESET_DIRECTION_ON_TRACK
     if seconds <= soon_seconds:
         if remaining_percent >= 60:
-            return "warning"
-        return "stable"
+            return _RESET_DIRECTION_SURPLUS
+        return _RESET_DIRECTION_ON_TRACK
 
     if seconds >= far_seconds:
         if remaining_percent < 25:
-            return "urgent"
-        if remaining_percent < 60:
-            return "warning"
-        if remaining_percent < 75 and seconds >= very_far_seconds:
-            return "warning"
-        return "stable"
+            return _RESET_DIRECTION_SHORTAGE
+        if remaining_percent >= 75:
+            return _RESET_DIRECTION_SURPLUS
+        if remaining_percent < 60 and seconds >= very_far_seconds:
+            return _RESET_DIRECTION_SHORTAGE
+        return _RESET_DIRECTION_ON_TRACK
 
     if remaining_percent < 25:
-        return "warning"
-    return "stable"
+        return _RESET_DIRECTION_SHORTAGE
+    return _RESET_DIRECTION_ON_TRACK
 
 
 def _reset_color(state: str) -> str:
