@@ -87,8 +87,27 @@ class _FakeMonitor:
 
 
 class _FakeUi:
+    instances = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
+        self.kwargs = kwargs
+        _FakeUi.instances.append(self)
+
     def show(self):
         return None
+
+
+class _FakeUpdater:
+    instances = []
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = dict(kwargs)
+        self.start_calls = 0
+        _FakeUpdater.instances.append(self)
+
+    def start(self):
+        self.start_calls += 1
 
 
 class _FakePump:
@@ -122,6 +141,10 @@ class _FakeThread:
 
 
 class MainStartupBehaviourUnitTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _FakeUi.instances = []
+        _FakeUpdater.instances = []
+
     def test_main_does_not_schedule_startup_apps_on_launch(self) -> None:
         root = _FakeRoot()
         lib = _FakeLib(root)
@@ -132,14 +155,41 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
                 with patch("main.threading.Thread", _FakeThread):
                     with patch("main.Monitor", return_value=_FakeMonitor()):
                         with patch("main.StartupAppManager", return_value=startup):
-                            with patch("main.WindowsSupporterMainUI", return_value=_FakeUi()):
-                                with patch("main.SharedUiEventPump", _FakePump):
-                                    with patch("main.SystemTrayIcon", _FakeTray):
-                                        with patch("main.signal.signal"):
-                                            main.main()
+                            with patch("main.WindowsSupporterMainUI", _FakeUi):
+                                with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
+                                    with patch("main.SharedUiEventPump", _FakePump):
+                                        with patch("main.SystemTrayIcon", _FakeTray):
+                                            with patch("main.signal.signal"):
+                                                main.main()
 
         self.assertNotIn(120, [delay for delay, _callback in root.after_calls])
         self.assertEqual(startup.start_calls, [])
+
+    def test_main_starts_update_monitor_and_passes_it_to_ui(self) -> None:
+        root = _FakeRoot()
+        lib = _FakeLib(root)
+
+        with patch.object(main.sys, "frozen", True, create=True):
+            with patch.object(main.sys, "executable", r"C:\repo\windows-supporter.exe"):
+                with patch("main.LibConnector", return_value=lib):
+                    with patch("main.StartReg"):
+                        with patch("main.threading.Thread", _FakeThread):
+                            with patch("main.Monitor", return_value=_FakeMonitor()):
+                                with patch("main.StartupAppManager", return_value=_FakeStartupManager()):
+                                    with patch("main.WindowsSupporterMainUI", _FakeUi):
+                                        with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
+                                            with patch("main.SharedUiEventPump", _FakePump):
+                                                with patch("main.SystemTrayIcon", _FakeTray):
+                                                    with patch("main.signal.signal"):
+                                                        main.main()
+
+        self.assertEqual(len(_FakeUpdater.instances), 1)
+        updater = _FakeUpdater.instances[0]
+        self.assertIs(updater.kwargs["root"], root)
+        self.assertEqual(updater.kwargs["repo_root"], r"C:\repo")
+        self.assertEqual(updater.start_calls, 1)
+        self.assertEqual(len(_FakeUi.instances), 1)
+        self.assertIs(_FakeUi.instances[0].kwargs["updater"], updater)
 
 
 if __name__ == "__main__":

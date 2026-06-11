@@ -21,12 +21,14 @@ class WindowsSupporterMainUI:
         startup_manager: Any,
         monitor: Any,
         event_queue: Any = None,
+        updater: Any = None,
         state_path: str | None = None,
     ) -> None:
         self._root = root
         self._startup_manager = startup_manager
         self._monitor = monitor
         self._event_queue = event_queue
+        self._updater = updater
         self._state_path = state_path
 
         self._tk = None
@@ -70,6 +72,7 @@ class WindowsSupporterMainUI:
 
         self._lazy_import_tk()
         self._build_shell()
+        self._attach_updater_status_callback()
         return
 
     def _ui_post(self, fn) -> bool:
@@ -431,6 +434,29 @@ class WindowsSupporterMainUI:
             self._dashboard_built = False
         return
 
+    def _attach_updater_status_callback(self) -> None:
+        updater = self._updater
+        if updater is None:
+            return
+        setter = getattr(updater, "set_status_changed_callback", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self._refresh_dashboard_status)
+        except Exception:
+            pass
+        return
+
+    def _refresh_dashboard_status(self) -> None:
+        dashboard = self._dashboard_view
+        if dashboard is None:
+            return
+        try:
+            dashboard.refresh()
+        except Exception:
+            pass
+        return
+
     def _get_dashboard_callbacks(self) -> dict[str, Any]:
         return {
             "startup.toggle": self._dashboard_startup_toggle,
@@ -442,6 +468,7 @@ class WindowsSupporterMainUI:
             "wrike.toggle": self._dashboard_wrike_toggle_enabled,
             "wrike.settings": self.show_wrike,
             "background.toggle": self._dashboard_background_toggle_enabled,
+            "update.check": self._dashboard_update_check,
         }
 
     def _run_bg(self, fn) -> None:
@@ -590,6 +617,16 @@ class WindowsSupporterMainUI:
             pass
         return
 
+    def _dashboard_update_check(self) -> None:
+        updater = self._updater
+        if updater is None:
+            return
+        try:
+            updater.check_now(manual=True)
+        except Exception:
+            pass
+        return
+
     def _get_dashboard_status_snapshot(self) -> dict[str, Any]:
         return {
             "startup": self._get_startup_dashboard_status(),
@@ -597,7 +634,18 @@ class WindowsSupporterMainUI:
             "kakao": self._get_kakao_dashboard_status(),
             "wrike": self._get_wrike_dashboard_status(),
             "background": self._get_background_dashboard_status(),
+            "update": self._get_update_dashboard_status(),
         }
+
+    def _get_update_dashboard_status(self) -> dict[str, Any]:
+        updater = self._updater
+        if updater is None:
+            return {"state": "unavailable"}
+        try:
+            snapshot = updater.get_status_snapshot()
+            return dict(snapshot) if isinstance(snapshot, dict) else {"state": "unknown"}
+        except Exception:
+            return {"state": "unknown"}
 
     def _get_startup_dashboard_status(self) -> dict[str, Any]:
         out: dict[str, Any] = {"enabled": True}

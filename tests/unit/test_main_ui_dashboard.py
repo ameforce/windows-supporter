@@ -192,7 +192,26 @@ class _FakeMonitor:
 
     def set_background_enabled(self, enabled):
         self.background_enabled = bool(enabled)
-        return self.background_enabled
+
+
+class _FakeUpdater:
+    def __init__(self):
+        self.check_calls = []
+        self.status_callback = None
+        self.status = {
+            "state": "update_available",
+            "current_tag": "v0.5.6",
+            "latest_tag": "v0.5.7",
+        }
+
+    def set_status_changed_callback(self, callback):
+        self.status_callback = callback
+
+    def get_status_snapshot(self):
+        return dict(self.status)
+
+    def check_now(self, *, manual=False):
+        self.check_calls.append(bool(manual))
 
 
 class MainUiDashboardUnitTest(unittest.TestCase):
@@ -200,12 +219,14 @@ class MainUiDashboardUnitTest(unittest.TestCase):
         root = _FakeRoot()
         startup = _FakeStartupManager()
         monitor = _FakeMonitor()
+        updater = _FakeUpdater()
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
                 ui = WindowsSupporterMainUI(
                     root=root,
                     startup_manager=startup,
                     monitor=monitor,
+                    updater=updater,
                     state_path=state_path,
                 )
         ui._notebook = _FakeNotebook()
@@ -214,7 +235,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
         ui._tab_kakao = "tab-kakao"
         ui._tab_wrike = "tab-wrike"
         ui._tab_codex = "tab-codex"
-        return ui, root, startup, monitor
+        return ui, root, startup, monitor, updater
 
     def test_state_load_save_validates_tab_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -237,7 +258,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
     def test_first_show_defaults_to_dashboard_and_persists_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
-            ui, _, _, _ = self._build_ui(path)
+            ui, _, _, _, _ = self._build_ui(path)
 
             with patch.object(ui, "_ensure_dashboard_built") as ensure_dashboard:
                 ui.show()
@@ -250,7 +271,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
     def test_dashboard_uses_compact_default_geometry(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
-            ui, _, _, _ = self._build_ui(path)
+            ui, _, _, _, _ = self._build_ui(path)
 
             self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (1000, 480))
             self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (940, 480))
@@ -263,7 +284,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
                 valid_tabs=("dashboard", "startup_apps", "kakao_monitor", "wrike", "codex_usage"),
                 path=path,
             )
-            ui, _, _, _ = self._build_ui(path)
+            ui, _, _, _, _ = self._build_ui(path)
 
             with patch.object(ui, "_ensure_codex_built") as ensure_codex:
                 ui.show()
@@ -275,7 +296,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
     def test_hide_withdraws_main_window_without_taskbar_thumbnail(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
-            ui, root, _, monitor = self._build_ui(path)
+            ui, root, _, monitor, _ = self._build_ui(path)
 
             ui.hide()
 
@@ -286,7 +307,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
     def test_dashboard_controls_delegate_to_existing_managers(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
-            ui, root, startup, monitor = self._build_ui(path)
+            ui, root, startup, monitor, updater = self._build_ui(path)
             ui._run_bg = lambda fn: fn()
 
             ui._dashboard_startup_toggle()
@@ -294,6 +315,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             ui._dashboard_kakao_toggle_enabled()
             ui._dashboard_wrike_toggle_enabled()
             ui._dashboard_background_toggle_enabled()
+            ui._dashboard_update_check()
 
             self.assertEqual(startup.toggle_calls, 1)
             self.assertEqual(startup.rescan_calls, 0)
@@ -305,11 +327,32 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertEqual(monitor.wrike.update_calls[-1]["monitor_enabled"], False)
             self.assertEqual(monitor.wrike.weekly_calls, [])
             self.assertFalse(monitor.background_enabled)
+            self.assertEqual(updater.check_calls, [True])
+
+    def test_update_status_callback_refreshes_existing_dashboard(self):
+        class FakeDashboard:
+            def __init__(self):
+                self.refresh_calls = 0
+
+            def refresh(self):
+                self.refresh_calls += 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, _, updater = self._build_ui(path)
+            dashboard = FakeDashboard()
+            ui._dashboard_view = dashboard
+
+            self.assertIsNotNone(updater.status_callback)
+
+            updater.status_callback()
+
+            self.assertEqual(dashboard.refresh_calls, 1)
 
     def test_dashboard_callbacks_expose_only_navigation_and_toggles(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
-            ui, _, _, _ = self._build_ui(path)
+            ui, _, _, _, _ = self._build_ui(path)
 
             callbacks = ui._get_dashboard_callbacks()
 
@@ -325,13 +368,14 @@ class MainUiDashboardUnitTest(unittest.TestCase):
                     "wrike.toggle",
                     "wrike.settings",
                     "background.toggle",
+                    "update.check",
                 },
             )
 
     def test_dashboard_status_snapshot_combines_safe_feature_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
-            ui, _, _, _ = self._build_ui(path)
+            ui, _, _, _, _ = self._build_ui(path)
 
             snapshot = ui._get_dashboard_status_snapshot()
 
@@ -343,6 +387,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertTrue(snapshot["wrike"]["api_token_configured"])
             self.assertTrue(snapshot["background"]["enabled"])
             self.assertTrue(snapshot["background"]["hotkeys_registered"])
+            self.assertEqual(snapshot["update"]["latest_tag"], "v0.5.7")
 
 
 class DashboardViewFormattingUnitTest(unittest.TestCase):
@@ -412,6 +457,26 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         labels = [text for text, _style in parts]
         self.assertIn("Codex 1: logged_in / idle", labels)
         self.assertIn("Codex 2: 비활성 / logged_out", labels)
+
+    def test_update_formatter_shows_available_version(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        enabled, parts = view._format_update(
+            {"state": "update_available", "current_tag": "v0.5.6", "latest_tag": "v0.5.7"}
+        )
+
+        self.assertTrue(enabled)
+        self.assertEqual(parts[0], ("업데이트 가능", "enabled"))
+        self.assertIn(("v0.5.6 -> v0.5.7", "normal"), parts)
+
+    def test_update_formatter_shows_git_checkout_requirement(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        enabled, parts = view._format_update({"state": "unavailable"})
+
+        self.assertFalse(enabled)
+        self.assertEqual(parts[0], ("지원 안 됨", "disabled"))
+        self.assertIn(("Git checkout 필요", "normal"), parts)
 
 
 if __name__ == "__main__":
