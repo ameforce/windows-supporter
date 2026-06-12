@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import os
 import subprocess
 import tempfile
@@ -216,6 +217,15 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             with open(result_path, "r", encoding="utf-8") as fp:
                 self.assertEqual(fp.read().strip(), repo_dir)
 
+    def test_write_detached_helper_script_uses_utf8_bom_for_windows_powershell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            helper_path = write_detached_helper_script(os.path.join(tmp, "helper.ps1"))
+
+            with open(helper_path, "rb") as fp:
+                contents = fp.read()
+
+            self.assertTrue(contents.startswith(codecs.BOM_UTF8))
+
     def test_rendered_update_helper_accepts_repo_root_and_runs_safe_flow(self) -> None:
         script = render_update_helper_script()
 
@@ -226,6 +236,56 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("git fetch --tags origin", script)
         self.assertIn("git merge --ff-only origin/main", script)
         self.assertIn("cmd /c build.bat", script)
+        self.assertIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1", script)
+
+    def test_build_bat_supports_updater_owned_relaunch(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        self.assertIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN", script)
+        self.assertIn("SKIP_POST_BUILD_RUN", script)
+        self.assertIn("Skipping post-build launch", script)
+
+    def test_rendered_update_helper_exposes_visible_progress_window_contract(self) -> None:
+        script = render_update_helper_script()
+
+        self.assertIn("Add-Type -AssemblyName System.Windows.Forms", script)
+        self.assertIn("Add-Type -AssemblyName System.Drawing", script)
+        self.assertIn("System.Windows.Forms.Form", script)
+        self.assertIn("Windows Supporter 업데이트", script)
+        self.assertIn("취소는 지원하지 않습니다", script)
+        self.assertIn("Open-UpdateLog", script)
+        self.assertIn("Update-ProgressStage", script)
+        self.assertIn("Checking Git checkout", script)
+        self.assertIn("Running build.bat", script)
+        self.assertIn("Start-Process", script)
+        self.assertIn("-PassThru", script)
+        self.assertIn("WaitForExit(250)", script)
+        self.assertIn("[System.Windows.Forms.Application]::DoEvents()", script)
+
+    def test_rendered_update_helper_exposes_failure_actions_and_retry_contract(self) -> None:
+        script = render_update_helper_script()
+
+        self.assertIn("Show-UpdateFailure", script)
+        self.assertIn("업데이트 실패", script)
+        self.assertIn("로그 열기", script)
+        self.assertIn("재시도", script)
+        self.assertIn("닫기", script)
+        self.assertIn("Restart-UpdateHelper", script)
+        self.assertIn("-ExecutionPolicy", script)
+        self.assertIn("-RepoRoot", script)
+
+    def test_rendered_update_helper_relaunches_built_executable_from_repo_root(self) -> None:
+        script = render_update_helper_script()
+
+        self.assertIn("Start-UpdatedWindowsSupporter", script)
+        self.assertIn('Join-Path -Path $RepoRoot -ChildPath "windows-supporter.exe"', script)
+        self.assertIn("Test-Path -LiteralPath $exePath", script)
+        self.assertIn("Start-Process", script)
+        self.assertIn("-WorkingDirectory $RepoRoot", script)
+        self.assertIn("Relaunched Windows Supporter exited immediately", script)
+        self.assertIn("$process.WaitForExit(250)", script)
+        self.assertIn("Update completed", script)
 
     def test_git_checkout_root_requires_git_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
