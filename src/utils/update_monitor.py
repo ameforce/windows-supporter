@@ -11,6 +11,7 @@ from typing import Any
 
 from src.utils.app_version import get_app_version
 from src.utils.subprocess_utils import popen_no_window
+from src.utils.worktree_runtime import is_primary_worktree
 
 
 SEMVER_TAG_RE = re.compile(r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
@@ -21,6 +22,11 @@ DESCRIBE_TAG_RE = re.compile(
 DEFAULT_CLEAN_ALLOWLIST = ("build/", "dist/", "*.spec", "*.egg-info/")
 GIT_COMMAND_TIMEOUT_SECONDS = 20
 DETACHED_HELPER_FILENAME = "update_windows_supporter.ps1"
+GIT_CHECKOUT_UNAVAILABLE_MESSAGE = "Git checkout 안에서 실행되는 windows-supporter.exe만 업데이트를 지원합니다."
+NON_PRIMARY_WORKTREE_UNAVAILABLE_MESSAGE = (
+    "main worktree가 아닌 worktree에서 실행 중입니다. 업데이트와 시작프로그램 등록은 "
+    "main worktree의 windows-supporter.exe에서만 수행합니다."
+)
 UPDATE_HELPER_SCRIPT = """param(
     [Parameter(Mandatory=$true)]
     [string]$RepoRoot
@@ -149,6 +155,7 @@ class WindowsSupporterUpdater:
         quit_callback=None,
         status_changed_callback=None,
         helper_writer=write_detached_helper_script,
+        worktree_runner=subprocess.run,
     ) -> None:
         self._root = root
         self._event_queue = event_queue
@@ -160,6 +167,7 @@ class WindowsSupporterUpdater:
         self._quit_callback = quit_callback
         self._status_changed_callback = status_changed_callback
         self._helper_writer = helper_writer
+        self._worktree_runner = worktree_runner
         self._session = UpdatePromptSession()
         self._worker_active = False
         self._state = "idle"
@@ -169,10 +177,7 @@ class WindowsSupporterUpdater:
         return
 
     def start(self) -> None:
-        if not is_git_checkout_root(self._repo_root):
-            self._state = "unavailable"
-            self._last_error = "Git checkout 안에서 실행되는 windows-supporter.exe만 업데이트를 지원합니다."
-            self._notify_status_changed()
+        if self._mark_unavailable_if_needed():
             return
         self._schedule_check(self.INITIAL_CHECK_DELAY_MS)
         return
@@ -180,10 +185,7 @@ class WindowsSupporterUpdater:
     def check_now(self, *, manual: bool = False) -> None:
         if self._worker_active:
             return
-        if not is_git_checkout_root(self._repo_root):
-            self._state = "unavailable"
-            self._last_error = "Git checkout 안에서 실행되는 windows-supporter.exe만 업데이트를 지원합니다."
-            self._notify_status_changed()
+        if self._mark_unavailable_if_needed():
             if manual:
                 self._show_info("Windows Supporter 업데이트", self._manual_no_update_message())
             return
@@ -222,6 +224,20 @@ class WindowsSupporterUpdater:
     def set_status_changed_callback(self, callback) -> None:
         self._status_changed_callback = callback
         return
+
+    def _mark_unavailable_if_needed(self) -> bool:
+        message = ""
+        if not is_git_checkout_root(self._repo_root):
+            message = GIT_CHECKOUT_UNAVAILABLE_MESSAGE
+        elif not is_primary_worktree(self._repo_root, runner=self._worktree_runner):
+            message = NON_PRIMARY_WORKTREE_UNAVAILABLE_MESSAGE
+
+        if not message:
+            return False
+        self._state = "unavailable"
+        self._last_error = message
+        self._notify_status_changed()
+        return True
 
     def _schedule_check(self, delay_ms: int) -> None:
         try:
@@ -380,6 +396,8 @@ class WindowsSupporterUpdater:
         return
 
     def launch_update(self) -> bool:
+        if self._mark_unavailable_if_needed():
+            return False
         try:
             helper_path = Path(self._helper_writer())
         except Exception as exc:
