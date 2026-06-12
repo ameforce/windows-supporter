@@ -33,58 +33,289 @@ $logDir = Join-Path -Path $baseLogDir -ChildPath "windows-supporter"
 $logFile = Join-Path -Path $logDir -ChildPath "update.log"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$script:progressForm = $null
+$script:stageLabel = $null
+$script:detailLabel = $null
+$script:currentStage = "Starting Windows Supporter update"
+
 function Write-UpdateLog {
     param([string]$Message)
     Add-Content -LiteralPath $logFile -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
 }
 
+function Open-UpdateLog {
+    try {
+        if (-not (Test-Path -LiteralPath $logFile)) {
+            New-Item -ItemType File -Force -Path $logFile | Out-Null
+        }
+        Start-Process -FilePath $logFile | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            ("로그 파일을 열 수 없습니다.`n{0}" -f $_.Exception.Message),
+            "Windows Supporter 업데이트",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+    }
+}
+
+function Update-ProgressStage {
+    param([string]$Stage)
+    $script:currentStage = [string]$Stage
+    Write-UpdateLog $script:currentStage
+    if ($script:stageLabel -ne $null) {
+        $script:stageLabel.Text = $script:currentStage
+    }
+    if ($script:detailLabel -ne $null) {
+        $script:detailLabel.Text = "취소는 지원하지 않습니다. 업데이트가 끝날 때까지 기다려 주세요."
+    }
+    if ($script:progressForm -ne $null) {
+        $script:progressForm.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+}
+
+function Initialize-ProgressWindow {
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Windows Supporter 업데이트"
+    $form.Size = New-Object System.Drawing.Size(440, 190)
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $true
+    $form.TopMost = $true
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "Windows Supporter 업데이트 중"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $title.AutoSize = $true
+    $title.Location = New-Object System.Drawing.Point(16, 16)
+    $form.Controls.Add($title)
+
+    $stage = New-Object System.Windows.Forms.Label
+    $stage.Text = $script:currentStage
+    $stage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $stage.AutoSize = $false
+    $stage.Size = New-Object System.Drawing.Size(390, 24)
+    $stage.Location = New-Object System.Drawing.Point(16, 52)
+    $form.Controls.Add($stage)
+
+    $detail = New-Object System.Windows.Forms.Label
+    $detail.Text = "취소는 지원하지 않습니다. 업데이트가 끝날 때까지 기다려 주세요."
+    $detail.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $detail.AutoSize = $false
+    $detail.Size = New-Object System.Drawing.Size(390, 36)
+    $detail.Location = New-Object System.Drawing.Point(16, 82)
+    $form.Controls.Add($detail)
+
+    $logButton = New-Object System.Windows.Forms.Button
+    $logButton.Text = "로그 열기"
+    $logButton.Size = New-Object System.Drawing.Size(92, 28)
+    $logButton.Location = New-Object System.Drawing.Point(314, 118)
+    $logButton.Add_Click({ Open-UpdateLog })
+    $form.Controls.Add($logButton)
+
+    $script:progressForm = $form
+    $script:stageLabel = $stage
+    $script:detailLabel = $detail
+    $form.Show()
+    $form.Activate()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
 function Invoke-NativeStep {
     param(
         [string]$Label,
-        [scriptblock]$Step
+        [string]$CommandLine
     )
-    Write-UpdateLog $Label
-    & $Step *>> $logFile
+    Update-ProgressStage $Label
+    $redirectedCommand = "{0} >> {1} 2>&1" -f $CommandLine, (ConvertTo-CommandLineArgument $logFile)
+    $process = Start-Process `
+        -FilePath "cmd.exe" `
+        -ArgumentList @("/d", "/c", $redirectedCommand) `
+        -WorkingDirectory (Get-Location).Path `
+        -WindowStyle Hidden `
+        -PassThru
+    while (-not $process.WaitForExit(250)) {
+        if ($script:progressForm -ne $null) {
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "$Label failed with exit code $($process.ExitCode)"
+    }
+}
+
+function ConvertTo-CommandLineArgument {
+    param([string]$Value)
+    return ('"{0}"' -f ($Value -replace '"', '\\"'))
+}
+
+function Restart-UpdateHelper {
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) {
+        $scriptPath = $MyInvocation.MyCommand.Path
+    }
+    if (-not $scriptPath) {
+        throw "Update helper script path could not be resolved"
+    }
+    $args = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        (ConvertTo-CommandLineArgument $scriptPath),
+        "-RepoRoot",
+        (ConvertTo-CommandLineArgument $RepoRoot)
+    ) -join " "
+    Start-Process -FilePath "powershell" -ArgumentList $args | Out-Null
+}
+
+function Show-UpdateFailure {
+    param(
+        [string]$Stage,
+        [string]$Message
+    )
+    Write-UpdateLog ("FAILED: {0} - {1}" -f $Stage, $Message)
+    if ($script:progressForm -ne $null -and -not $script:progressForm.IsDisposed) {
+        $script:progressForm.Hide()
+    }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Windows Supporter 업데이트 실패"
+    $form.Size = New-Object System.Drawing.Size(520, 250)
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "업데이트 실패"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $title.AutoSize = $true
+    $title.Location = New-Object System.Drawing.Point(16, 16)
+    $form.Controls.Add($title)
+
+    $stageLabel = New-Object System.Windows.Forms.Label
+    $stageLabel.Text = ("실패 단계: {0}" -f $Stage)
+    $stageLabel.AutoSize = $false
+    $stageLabel.Size = New-Object System.Drawing.Size(470, 24)
+    $stageLabel.Location = New-Object System.Drawing.Point(16, 52)
+    $form.Controls.Add($stageLabel)
+
+    $messageLabel = New-Object System.Windows.Forms.Label
+    $messageLabel.Text = $Message
+    $messageLabel.AutoSize = $false
+    $messageLabel.Size = New-Object System.Drawing.Size(470, 70)
+    $messageLabel.Location = New-Object System.Drawing.Point(16, 80)
+    $form.Controls.Add($messageLabel)
+
+    $logButton = New-Object System.Windows.Forms.Button
+    $logButton.Text = "로그 열기"
+    $logButton.Size = New-Object System.Drawing.Size(92, 30)
+    $logButton.Location = New-Object System.Drawing.Point(194, 160)
+    $logButton.Add_Click({ Open-UpdateLog })
+    $form.Controls.Add($logButton)
+
+    $retryButton = New-Object System.Windows.Forms.Button
+    $retryButton.Text = "재시도"
+    $retryButton.Size = New-Object System.Drawing.Size(92, 30)
+    $retryButton.Location = New-Object System.Drawing.Point(294, 160)
+    $retryButton.Add_Click({
+        try {
+            Restart-UpdateHelper
+            $form.Close()
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                ("재시도를 시작할 수 없습니다.`n{0}" -f $_.Exception.Message),
+                "Windows Supporter 업데이트",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
+    })
+    $form.Controls.Add($retryButton)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "닫기"
+    $closeButton.Size = New-Object System.Drawing.Size(92, 30)
+    $closeButton.Location = New-Object System.Drawing.Point(394, 160)
+    $closeButton.Add_Click({ $form.Close() })
+    $form.Controls.Add($closeButton)
+
+    $form.ShowDialog() | Out-Null
+}
+
+function Start-UpdatedWindowsSupporter {
+    Update-ProgressStage "Relaunching Windows Supporter"
+    $exePath = Join-Path -Path $RepoRoot -ChildPath "windows-supporter.exe"
+    if (-not (Test-Path -LiteralPath $exePath)) {
+        throw "Built executable not found: $exePath"
+    }
+    try {
+        $process = Start-Process -FilePath $exePath -WorkingDirectory $RepoRoot -PassThru
+    } catch {
+        throw ("Failed to relaunch Windows Supporter: {0}" -f $_.Exception.Message)
+    }
+    for ($i = 0; $i -lt 8; $i++) {
+        if ($process.WaitForExit(250)) {
+            throw "Relaunched Windows Supporter exited immediately with code $($process.ExitCode)"
+        }
+        if ($script:progressForm -ne $null) {
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    }
+}
+
+function Run-Update {
+    Initialize-ProgressWindow
+    Update-ProgressStage "Starting Windows Supporter update"
+    Set-Location -LiteralPath $RepoRoot
+
+    Invoke-NativeStep "Checking Git checkout" "git rev-parse --show-toplevel"
+
+    Update-ProgressStage "Inspecting Git status"
+    $status = & git status --porcelain --untracked-files=all 2>> $logFile
     if ($LASTEXITCODE -ne 0) {
-        throw "$Label failed with exit code $LASTEXITCODE"
+        throw "Failed to inspect Git status"
+    }
+    if (($status | Out-String).Trim().Length -gt 0) {
+        Invoke-NativeStep "Stashing tracked and untracked changes" 'git stash push --include-untracked -m "windows-supporter auto update"'
+    }
+
+    Invoke-NativeStep "Cleaning allowlisted build byproducts" 'git clean -fdX -- build/ dist/ "*.spec" "*.egg-info/"'
+    Invoke-NativeStep "Fetching origin" "git fetch --tags origin"
+
+    Update-ProgressStage "Inspecting local main branch"
+    & git show-ref --verify --quiet refs/heads/main *>> $logFile
+    if ($LASTEXITCODE -ne 0) {
+        Invoke-NativeStep "Creating local main from origin/main" "git switch -c main --track origin/main"
+    } else {
+        Invoke-NativeStep "Switching to main" "git switch main"
+    }
+
+    Invoke-NativeStep "Fast-forwarding main from origin/main" "git merge --ff-only origin/main"
+    Invoke-NativeStep "Running build.bat" 'set "WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1" && cmd /c build.bat'
+    Start-UpdatedWindowsSupporter
+
+    Write-UpdateLog "Update completed"
+    if ($script:progressForm -ne $null) {
+        $script:progressForm.Close()
     }
 }
 
-Write-UpdateLog "Starting Windows Supporter update"
-Set-Location -LiteralPath $RepoRoot
-
-Invoke-NativeStep "Checking Git checkout" { git rev-parse --show-toplevel }
-
-$status = & git status --porcelain --untracked-files=all 2>> $logFile
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to inspect Git status"
+try {
+    Run-Update
+} catch {
+    Show-UpdateFailure -Stage $script:currentStage -Message $_.Exception.Message
+    exit 1
 }
-if (($status | Out-String).Trim().Length -gt 0) {
-    Invoke-NativeStep "Stashing tracked and untracked changes" {
-        git stash push --include-untracked -m "windows-supporter auto update"
-    }
-}
-
-Invoke-NativeStep "Cleaning allowlisted build byproducts" {
-    git clean -fdX -- build/ dist/ "*.spec" "*.egg-info/"
-}
-Invoke-NativeStep "Fetching origin" { git fetch --tags origin }
-
-& git show-ref --verify --quiet refs/heads/main *>> $logFile
-if ($LASTEXITCODE -ne 0) {
-    Invoke-NativeStep "Creating local main from origin/main" {
-        git switch -c main --track origin/main
-    }
-} else {
-    Invoke-NativeStep "Switching to main" { git switch main }
-}
-
-Invoke-NativeStep "Fast-forwarding main from origin/main" {
-    git merge --ff-only origin/main
-}
-Invoke-NativeStep "Running build.bat" { cmd /c build.bat }
-
-Write-UpdateLog "Update completed"
 """
 
 
@@ -114,7 +345,7 @@ def write_detached_helper_script(
 ) -> Path:
     resolved_path = Path(helper_path) if helper_path is not None else get_detached_helper_path()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_path.write_text(render_update_helper_script(), encoding="utf-8", newline="\r\n")
+    resolved_path.write_text(render_update_helper_script(), encoding="utf-8-sig", newline="\r\n")
     return resolved_path
 
 
