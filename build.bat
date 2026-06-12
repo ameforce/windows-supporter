@@ -11,6 +11,8 @@ set "BUILD_GENERATED_DIR=build\generated"
 set "BUILD_INFO_MODULE=%BUILD_GENERATED_DIR%\windows_supporter_build_info.py"
 set "VERSION_FILE=%BUILD_GENERATED_DIR%\%EXE_BASE%-version-info.txt"
 set "STEP_LOG=%TEMP%\%EXE_BASE%-build-%RANDOM%%RANDOM%.log"
+set "SKIP_POST_BUILD_RUN=0"
+if /I "%WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN%"=="1" set "SKIP_POST_BUILD_RUN=1"
 
 REM Switch to repo root
 cd /d "%CURRENT_DIR%"
@@ -143,6 +145,13 @@ if errorlevel 1 exit /b 1
 echo [ Success !! ]
 
 REM Launch the built executable
+if "%SKIP_POST_BUILD_RUN%"=="1" (
+  echo Skipping post-build launch because WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1.
+  call :clear_log
+  endlocal
+  exit /b 0
+)
+
 echo | set /p="Running %EXE_NAME%..."
 if not exist "%ROOT_EXE%" (
   echo Failure
