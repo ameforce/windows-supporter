@@ -686,7 +686,7 @@ class CodexUsageTaskbarOverlay:
             runtime = self._runtime_getter()
         except Exception:
             runtime = {}
-        now = datetime.now()
+        now = _current_overlay_datetime()
         pre_model = build_codex_usage_taskbar_overlay_model(
             runtime,
             geometry=_DEFAULT_GEOMETRY,
@@ -954,7 +954,7 @@ class CodexUsageTaskbarOverlay:
             runtime = self._runtime_getter()
         except Exception:
             runtime = {}
-        model_now = datetime.now()
+        model_now = _current_overlay_datetime()
         pre_model = build_codex_usage_taskbar_overlay_model(
             runtime,
             geometry=_DEFAULT_GEOMETRY,
@@ -2459,6 +2459,9 @@ def _dynamic_reset_direction(
         return None
     if int(current_percent) <= 0:
         return _RESET_DIRECTION_SHORTAGE
+    base_direction = _reset_action_direction(metric_key, current_percent, seconds_until_reset)
+    if base_direction == _RESET_DIRECTION_SURPLUS:
+        return _RESET_DIRECTION_SURPLUS
 
     current_ts = _history_timestamp_seconds(captured_at_value)
     if current_ts is None:
@@ -2606,11 +2609,15 @@ def _build_reset_info(
     seconds = int((parsed - current).total_seconds())
     if seconds <= 0:
         text = _format_reset_remaining_detail(0, metric_key=metric_key)
-        profile = (
-            _reset_direction_profile(_RESET_DIRECTION_SHORTAGE)
-            if str(metric_key or "") == "five_hour_limit"
-            else _reset_overdue_profile()
-        )
+        if str(metric_key or "") == "five_hour_limit":
+            direction = (
+                _RESET_DIRECTION_SURPLUS
+                if percent is not None and int(percent) >= 60
+                else _RESET_DIRECTION_SHORTAGE
+            )
+            profile = _reset_direction_profile(direction)
+        else:
+            profile = _reset_overdue_profile()
         return {
             "text": text,
             "short_text": text,
@@ -2662,8 +2669,12 @@ def _reset_now(reset_at: datetime, now: datetime | None) -> datetime:
     if reset_at.tzinfo is None:
         return current.replace(tzinfo=None)
     if current.tzinfo is None:
-        return current.replace(tzinfo=reset_at.tzinfo)
+        return current.astimezone(reset_at.tzinfo)
     return current.astimezone(reset_at.tzinfo)
+
+
+def _current_overlay_datetime() -> datetime:
+    return datetime.now().astimezone()
 
 
 def _format_reset_remaining_detail(seconds: int, *, metric_key: str = "") -> str:

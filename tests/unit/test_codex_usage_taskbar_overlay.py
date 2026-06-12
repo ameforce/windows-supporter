@@ -432,7 +432,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(five_hour_metric["reset_state"], "urgent")
         self.assertEqual(five_hour_metric["reset_color"], "#ef4444")
 
-    def test_model_prefers_fast_burn_shortage_over_high_current_surplus(self):
+    def test_model_keeps_high_current_surplus_over_noisy_fast_burn(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -453,10 +453,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
 
         weekly_metric = model["bars"][0]["metrics"][1]
-        self.assertEqual(weekly_metric["reset_direction"], "shortage")
-        self.assertEqual(weekly_metric["reset_marker"], "↓")
-        self.assertEqual(weekly_metric["reset_state"], "urgent")
-        self.assertEqual(weekly_metric["reset_color"], "#ef4444")
+        self.assertEqual(weekly_metric["reset_direction"], "surplus")
+        self.assertEqual(weekly_metric["reset_marker"], "↑")
+        self.assertEqual(weekly_metric["reset_state"], "warning")
+        self.assertEqual(weekly_metric["reset_color"], "#f59e0b")
 
     def test_model_marks_static_low_remaining_far_reset_as_shortage(self):
         runtime = self._runtime()
@@ -646,6 +646,74 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(first_metric["reset_direction"], "shortage")
         self.assertEqual(first_metric["reset_badge_label"], "부족")
         self.assertEqual(first_metric["reset_badge_short_label"], "부")
+
+    def test_model_marks_elapsed_high_remaining_five_hour_reset_as_surplus(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "five_hour_limit": "99%",
+                "five_hour_limit_reset_at": "2026-06-01T09:59:00+09:00",
+            }
+        )
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["reset_text"], "00h 00m")
+        self.assertEqual(first_metric["reset_direction"], "surplus")
+        self.assertEqual(first_metric["reset_badge_label"], "남음")
+        self.assertEqual(first_metric["reset_badge_short_label"], "남")
+
+    def test_model_keeps_utc_reset_remaining_time_aligned_with_dashboard(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 12, 14, 10, 50, tzinfo=timezone(timedelta(hours=9)))
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-12 14:10:03",
+                "five_hour_limit": "99%",
+                "weekly_limit": "95%",
+                "five_hour_limit_reset_at": "2026-06-12T09:49:00.000Z",
+                "weekly_limit_reset_at": "2026-06-18T14:46:00.000Z",
+            }
+        )
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metrics = model["bars"][0]["metrics"]
+        self.assertEqual(
+            [metric["reset_text"] for metric in first_metrics],
+            ["04h 39m", "6d 09h 36m"],
+        )
+        self.assertEqual(
+            [metric["reset_direction"] for metric in first_metrics],
+            ["surplus", "surplus"],
+        )
+
+    def test_model_treats_naive_overlay_now_as_local_for_utc_reset_time(self):
+        runtime = self._runtime()
+        now = datetime(2026, 6, 12, 14, 10, 50)
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "captured_at": "2026-06-12 14:10:03",
+                "five_hour_limit": "99%",
+                "weekly_limit": "95%",
+                "five_hour_limit_reset_at": "2026-06-12T09:49:00.000Z",
+                "weekly_limit_reset_at": "2026-06-18T14:46:00.000Z",
+            }
+        )
+
+        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        first_metrics = model["bars"][0]["metrics"]
+        self.assertEqual(
+            [metric["reset_text"] for metric in first_metrics],
+            ["04h 39m", "6d 09h 36m"],
+        )
+        self.assertEqual(
+            [metric["reset_direction"] for metric in first_metrics],
+            ["surplus", "surplus"],
+        )
 
     def test_model_keeps_elapsed_weekly_reset_without_zero_time_risk_badge(self):
         runtime = self._runtime()
