@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import os
 import subprocess
 import tempfile
@@ -26,6 +27,23 @@ from src.utils.update_monitor import (
     select_update_candidate,
     write_detached_helper_script,
 )
+
+
+def _primary_worktree_runner(repo_root: str | os.PathLike[str] = "."):
+    resolved = os.path.abspath(os.fspath(repo_root)).replace(os.sep, "/")
+    output = "\n".join(
+        [
+            f"worktree {resolved}",
+            "HEAD 9cc7cc8",
+            "branch refs/heads/main",
+            "",
+        ]
+    )
+    return lambda _argv, **_kwargs: types.SimpleNamespace(
+        returncode=0,
+        stdout=output,
+        stderr="",
+    )
 
 
 class UpdateMonitorCoreUnitTest(unittest.TestCase):
@@ -199,6 +217,15 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             with open(result_path, "r", encoding="utf-8") as fp:
                 self.assertEqual(fp.read().strip(), repo_dir)
 
+    def test_write_detached_helper_script_uses_utf8_bom_for_windows_powershell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            helper_path = write_detached_helper_script(os.path.join(tmp, "helper.ps1"))
+
+            with open(helper_path, "rb") as fp:
+                contents = fp.read()
+
+            self.assertTrue(contents.startswith(codecs.BOM_UTF8))
+
     def test_rendered_update_helper_accepts_repo_root_and_runs_safe_flow(self) -> None:
         script = render_update_helper_script()
 
@@ -209,6 +236,56 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("git fetch --tags origin", script)
         self.assertIn("git merge --ff-only origin/main", script)
         self.assertIn("cmd /c build.bat", script)
+        self.assertIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1", script)
+
+    def test_build_bat_supports_updater_owned_relaunch(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        self.assertIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN", script)
+        self.assertIn("SKIP_POST_BUILD_RUN", script)
+        self.assertIn("Skipping post-build launch", script)
+
+    def test_rendered_update_helper_exposes_visible_progress_window_contract(self) -> None:
+        script = render_update_helper_script()
+
+        self.assertIn("Add-Type -AssemblyName System.Windows.Forms", script)
+        self.assertIn("Add-Type -AssemblyName System.Drawing", script)
+        self.assertIn("System.Windows.Forms.Form", script)
+        self.assertIn("Windows Supporter 업데이트", script)
+        self.assertIn("취소는 지원하지 않습니다", script)
+        self.assertIn("Open-UpdateLog", script)
+        self.assertIn("Update-ProgressStage", script)
+        self.assertIn("Checking Git checkout", script)
+        self.assertIn("Running build.bat", script)
+        self.assertIn("Start-Process", script)
+        self.assertIn("-PassThru", script)
+        self.assertIn("WaitForExit(250)", script)
+        self.assertIn("[System.Windows.Forms.Application]::DoEvents()", script)
+
+    def test_rendered_update_helper_exposes_failure_actions_and_retry_contract(self) -> None:
+        script = render_update_helper_script()
+
+        self.assertIn("Show-UpdateFailure", script)
+        self.assertIn("업데이트 실패", script)
+        self.assertIn("로그 열기", script)
+        self.assertIn("재시도", script)
+        self.assertIn("닫기", script)
+        self.assertIn("Restart-UpdateHelper", script)
+        self.assertIn("-ExecutionPolicy", script)
+        self.assertIn("-RepoRoot", script)
+
+    def test_rendered_update_helper_relaunches_built_executable_from_repo_root(self) -> None:
+        script = render_update_helper_script()
+
+        self.assertIn("Start-UpdatedWindowsSupporter", script)
+        self.assertIn('Join-Path -Path $RepoRoot -ChildPath "windows-supporter.exe"', script)
+        self.assertIn("Test-Path -LiteralPath $exePath", script)
+        self.assertIn("Start-Process", script)
+        self.assertIn("-WorkingDirectory $RepoRoot", script)
+        self.assertIn("Relaunched Windows Supporter exited immediately", script)
+        self.assertIn("$process.WaitForExit(250)", script)
+        self.assertIn("Update completed", script)
 
     def test_git_checkout_root_requires_git_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,6 +332,101 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "unavailable")
         self.assertIn("Git checkout", snapshot["last_error"])
+        self.assertEqual(len(messages), 1)
+
+    def test_start_marks_update_unavailable_in_codex_temporary_worktree(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.after_calls = []
+
+            def after(self, delay_ms, callback):
+                self.after_calls.append((delay_ms, callback))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = os.path.join(tmp, ".codex", "worktrees", "9f9a", "windows-supporter")
+            os.makedirs(repo_root)
+            with open(os.path.join(repo_root, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: ../../../main/.git/worktrees/9f9a\n")
+            root = FakeRoot()
+            snapshots = []
+            updater = WindowsSupporterUpdater(
+                root=root,
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=repo_root,
+                status_changed_callback=lambda: snapshots.append(updater.get_status_snapshot()),
+            )
+
+            updater.start()
+
+        self.assertEqual(root.after_calls, [])
+        self.assertEqual(snapshots[-1]["state"], "unavailable")
+        self.assertIn("main worktree", snapshots[-1]["last_error"])
+
+    def test_start_marks_update_unavailable_in_non_primary_linked_worktree(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.after_calls = []
+
+            def after(self, delay_ms, callback):
+                self.after_calls.append((delay_ms, callback))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            primary = os.path.join(tmp, "main", "windows-supporter")
+            linked = os.path.join(tmp, "linked", "windows-supporter")
+            os.makedirs(primary)
+            os.makedirs(linked)
+            with open(os.path.join(linked, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: ../.git/worktrees/feature\n")
+            porcelain = "\n".join(
+                [
+                    f"worktree {primary.replace(os.sep, '/')}",
+                    "HEAD 9cc7cc8",
+                    "branch refs/heads/main",
+                    "",
+                    f"worktree {linked.replace(os.sep, '/')}",
+                    "HEAD 9cc7cc8",
+                    "branch refs/heads/codex/feature",
+                    "",
+                ]
+            )
+
+            def worktree_runner(_argv, **_kwargs):
+                return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
+
+            root = FakeRoot()
+            updater = WindowsSupporterUpdater(
+                root=root,
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=linked,
+                worktree_runner=worktree_runner,
+            )
+
+            updater.start()
+
+        snapshot = updater.get_status_snapshot()
+        self.assertEqual(root.after_calls, [])
+        self.assertEqual(snapshot["state"], "unavailable")
+        self.assertIn("main worktree", snapshot["last_error"])
+
+    def test_manual_check_reports_unavailable_in_codex_temporary_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = os.path.join(tmp, ".codex", "worktrees", "9f9a", "windows-supporter")
+            os.makedirs(repo_root)
+            with open(os.path.join(repo_root, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: ../../../main/.git/worktrees/9f9a\n")
+            messages = []
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=repo_root,
+            )
+            updater._show_info = lambda title, message: messages.append((title, message))
+
+            updater.check_now(manual=True)
+
+        snapshot = updater.get_status_snapshot()
+        self.assertEqual(snapshot["state"], "unavailable")
+        self.assertIn("main worktree", snapshot["last_error"])
         self.assertEqual(len(messages), 1)
 
     def test_update_launch_rechecks_dirty_state_before_helper_stash(self) -> None:
@@ -308,16 +480,20 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             def start(self) -> None:
                 return None
 
-        snapshots = []
-        updater = WindowsSupporterUpdater(
-            root=object(),
-            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
-            repo_root=".",
-            thread_factory=DeferredThread,
-            status_changed_callback=lambda: snapshots.append(updater.get_status_snapshot()),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            snapshots = []
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                thread_factory=DeferredThread,
+                status_changed_callback=lambda: snapshots.append(updater.get_status_snapshot()),
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
 
-        updater.check_now(manual=True)
+            updater.check_now(manual=True)
 
         self.assertEqual(snapshots[0]["state"], "checking")
 
@@ -362,28 +538,42 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 self.calls += 1
                 raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
 
-        fake_subprocess = TimeoutSubprocess()
-        updater = WindowsSupporterUpdater(
-            root=object(),
-            event_queue=ImmediateQueue(),
-            repo_root=".",
-            subprocess_module=fake_subprocess,
-            thread_factory=InlineThread,
-        )
-        updater._show_info = lambda _title, _message: None
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            fake_subprocess = TimeoutSubprocess()
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=ImmediateQueue(),
+                repo_root=tmp,
+                subprocess_module=fake_subprocess,
+                thread_factory=InlineThread,
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+            updater._show_info = lambda _title, _message: None
 
-        updater.check_now(manual=True)
-        self.assertEqual(updater.get_status_snapshot()["state"], "error")
-        self.assertIn("timed out", updater.get_status_snapshot()["last_error"])
-        first_call_count = fake_subprocess.calls
+            updater.check_now(manual=True)
+            self.assertEqual(updater.get_status_snapshot()["state"], "error")
+            self.assertIn("timed out", updater.get_status_snapshot()["last_error"])
+            first_call_count = fake_subprocess.calls
 
-        updater.check_now(manual=True)
+            updater.check_now(manual=True)
 
         self.assertGreater(fake_subprocess.calls, first_call_count)
 
     def test_launch_update_writes_detached_helper_and_passes_repo_root(self) -> None:
         launches = []
         with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            porcelain = "\n".join(
+                [
+                    f"worktree {tmp.replace(os.sep, '/')}",
+                    "HEAD 9cc7cc8",
+                    "branch refs/heads/main",
+                    "",
+                ]
+            )
             helper_path = write_detached_helper_script(os.path.join(tmp, "helper.ps1"))
             updater = WindowsSupporterUpdater(
                 root=object(),
@@ -391,6 +581,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 repo_root=tmp,
                 popen=lambda command: launches.append(command) or object(),
                 helper_writer=lambda: helper_path,
+                worktree_runner=lambda _argv, **_kwargs: types.SimpleNamespace(
+                    returncode=0,
+                    stdout=porcelain,
+                    stderr="",
+                ),
             )
 
             self.assertTrue(updater.launch_update())
@@ -413,19 +608,90 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             ],
         )
 
-    def test_launch_update_reports_helper_prepare_failure(self) -> None:
+    def test_launch_update_fails_closed_in_codex_temporary_worktree(self) -> None:
         launches = []
-        updater = WindowsSupporterUpdater(
-            root=object(),
-            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
-            repo_root=".",
-            popen=lambda command: launches.append(command) or object(),
-            helper_writer=lambda: (_ for _ in ()).throw(RuntimeError("denied")),
-        )
+        helper_writes = []
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = os.path.join(tmp, ".codex", "worktrees", "9f9a", "windows-supporter")
+            os.makedirs(repo_root)
+            with open(os.path.join(repo_root, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: ../../../main/.git/worktrees/9f9a\n")
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=repo_root,
+                popen=lambda command: launches.append(command) or object(),
+                helper_writer=lambda: helper_writes.append(True) or os.path.join(tmp, "helper.ps1"),
+            )
 
-        self.assertFalse(updater.launch_update())
+            self.assertFalse(updater.launch_update())
 
         snapshot = updater.get_status_snapshot()
+        self.assertEqual(snapshot["state"], "unavailable")
+        self.assertIn("main worktree", snapshot["last_error"])
+        self.assertEqual(helper_writes, [])
+        self.assertEqual(launches, [])
+
+    def test_launch_update_fails_closed_in_non_primary_linked_worktree(self) -> None:
+        launches = []
+        helper_writes = []
+        with tempfile.TemporaryDirectory() as tmp:
+            primary = os.path.join(tmp, "main", "windows-supporter")
+            linked = os.path.join(tmp, "linked", "windows-supporter")
+            os.makedirs(primary)
+            os.makedirs(linked)
+            with open(os.path.join(linked, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: ../.git/worktrees/feature\n")
+            porcelain = "\n".join(
+                [
+                    f"worktree {primary.replace(os.sep, '/')}",
+                    "HEAD 9cc7cc8",
+                    "branch refs/heads/main",
+                    "",
+                    f"worktree {linked.replace(os.sep, '/')}",
+                    "HEAD 9cc7cc8",
+                    "branch refs/heads/codex/feature",
+                    "",
+                ]
+            )
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=linked,
+                popen=lambda command: launches.append(command) or object(),
+                helper_writer=lambda: helper_writes.append(True) or os.path.join(tmp, "helper.ps1"),
+                worktree_runner=lambda _argv, **_kwargs: types.SimpleNamespace(
+                    returncode=0,
+                    stdout=porcelain,
+                    stderr="",
+                ),
+            )
+
+            self.assertFalse(updater.launch_update())
+
+        snapshot = updater.get_status_snapshot()
+        self.assertEqual(snapshot["state"], "unavailable")
+        self.assertIn("main worktree", snapshot["last_error"])
+        self.assertEqual(helper_writes, [])
+        self.assertEqual(launches, [])
+
+    def test_launch_update_reports_helper_prepare_failure(self) -> None:
+        launches = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                popen=lambda command: launches.append(command) or object(),
+                helper_writer=lambda: (_ for _ in ()).throw(RuntimeError("denied")),
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+
+            self.assertFalse(updater.launch_update())
+
+            snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "error")
         self.assertIn("failed to prepare update helper", snapshot["last_error"])
         self.assertEqual(launches, [])

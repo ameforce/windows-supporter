@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
@@ -143,7 +144,7 @@ _RESET_BADGE_TEXT_COLORS = {
 _RESET_BADGE_HORIZONTAL_PADDING_PX = 2
 _RESET_BADGE_HEIGHT_PX = 11
 _RESET_BADGE_MIN_WIDTH_PX = 14
-_RESET_BADGE_TIME_GAP_PX = 2
+_RESET_BADGE_TIME_GAP_PX = 5
 _RESET_BADGE_OUTLINE_WIDTH_PX = 1
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
@@ -158,8 +159,22 @@ _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX = 76
 _PROFILE_LABEL_COLUMN_WIDTH_RATIO = 0.17
 _STATUS_DOT_ONLY_WIDTH_PX = 14
 _STATUS_WITH_TEXT_WIDTH_PX = 24
+_STATUS_TEXT_MIN_OVERLAY_WIDTH_PX = 420
 _STATUS_TO_METRICS_GAP_PX = 6
 _FIVE_HOUR_RESET_MAX_SECONDS = 36 * 60 * 60
+
+
+@dataclass(frozen=True)
+class _MetricRowLayout:
+    label_width: int
+    status_width: int
+    metrics_x: int
+    metrics_width: int
+    segment_gap: int
+    segment_width: int
+    progress_width: int
+    badge_mode: str
+    visible_metrics: tuple[dict[str, Any], ...]
 
 
 def build_codex_usage_taskbar_overlay_model(
@@ -247,6 +262,7 @@ def calculate_taskbar_overlay_geometry(
     work_area: tuple[int, int, int, int] | dict[str, int] | None,
     *,
     occupied_spans: list[tuple[int, int]] | None = None,
+    preferred_width: int | None = None,
 ) -> dict[str, int | str]:
     screen_width = max(320, int(screen_width or 0))
     screen_height = max(240, int(screen_height or 0))
@@ -271,6 +287,7 @@ def calculate_taskbar_overlay_geometry(
             geometry,
             int(screen_width),
             occupied_spans,
+            preferred_width=preferred_width,
         )
     if top > 0:
         band_height = max(1, top)
@@ -289,6 +306,7 @@ def calculate_taskbar_overlay_geometry(
             geometry,
             int(screen_width),
             occupied_spans,
+            preferred_width=preferred_width,
         )
     if left > 0:
         width = max(1, min(320, left - 2))
@@ -327,7 +345,302 @@ def calculate_taskbar_overlay_geometry(
         geometry,
         int(screen_width),
         occupied_spans,
+        preferred_width=preferred_width,
     )
+
+
+def _label_width_for_overlay_width(width: int) -> int:
+    return min(
+        _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX,
+        max(
+            _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
+            int(max(0, int(width)) * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
+        ),
+    )
+
+
+def _status_width_for_overlay_width(width: int) -> int:
+    if int(width) >= _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX:
+        return _STATUS_WITH_TEXT_WIDTH_PX
+    return _STATUS_DOT_ONLY_WIDTH_PX
+
+
+def _metric_segment_gap_for_overlay_width(width: int) -> int:
+    if int(width) < 640:
+        return _METRIC_SEGMENT_GAP_COMPACT_PX
+    return _METRIC_SEGMENT_GAP_WIDE_PX
+
+
+def _metric_segment_width_for_metrics_width(
+    metrics_width: int,
+    metric_count: int,
+    segment_gap: int,
+) -> int:
+    count = max(1, int(metric_count))
+    return max(
+        48,
+        (int(metrics_width) - int(segment_gap) * max(0, count - 1)) // count,
+    )
+
+
+def _normalized_badge_mode(badge_mode: str | None) -> str:
+    mode = str(badge_mode or "any").strip().lower()
+    if mode in {"full", "short"}:
+        return mode
+    return "any"
+
+
+def _expected_badge_label_for_mode(
+    badge_label: str,
+    badge_short_label: str,
+    badge_mode: str,
+) -> str:
+    if _normalized_badge_mode(badge_mode) == "full":
+        return str(badge_label or badge_short_label or "")
+    return str(badge_short_label or badge_label or "")
+
+
+def _visible_metrics_for_taskbar_bar(bar: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    bar_dict = bar if isinstance(bar, dict) else {}
+    metrics = [
+        metric
+        for metric in bar_dict.get("metrics", [])
+        if isinstance(metric, dict)
+    ]
+    if not metrics:
+        metrics = [
+            {
+                "key": "5h",
+                "percent": int(bar_dict.get("percent") or 0),
+                "value_text": str(bar_dict.get("value_text") or "--"),
+                "color": str(bar_dict.get("color") or "#6b7280"),
+            }
+        ]
+    return tuple(metrics[:2])
+
+
+def _metric_fits_badge_mode(
+    metric: dict[str, Any],
+    segment_width: int,
+    progress_width: int,
+    badge_mode: str,
+) -> bool:
+    metric_dict = metric if isinstance(metric, dict) else {}
+    mode = _normalized_badge_mode(badge_mode)
+    detail_text = str(metric_dict.get("reset_text") or "")
+    short_text = str(metric_dict.get("reset_short_text") or detail_text)
+    badge_label = str(metric_dict.get("reset_badge_label") or "")
+    badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
+    has_reset_badge = bool(badge_label or badge_short_label)
+    has_reset_time = bool(detail_text or short_text)
+    metric_key = str(metric_dict.get("metric_key") or "")
+    reset_marker = str(metric_dict.get("reset_marker") or "")
+    layout = _fit_metric_segment_layout(
+        segment_width,
+        detail_text,
+        short_text,
+        badge_label=badge_label,
+        badge_short_label=badge_short_label,
+        metric_key=metric_key,
+        reset_marker=reset_marker,
+        has_reset_badge=has_reset_badge,
+        progress_width=progress_width,
+        badge_mode=mode,
+    )
+    if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_MIN_WIDTH_PX:
+        return False
+    badge_fit = layout.get("badge_fit")
+    if not isinstance(badge_fit, dict):
+        badge_fit = {}
+    if has_reset_badge:
+        if not bool(badge_fit.get("badge_visible")):
+            return False
+        expected_label = _expected_badge_label_for_mode(
+            badge_label,
+            badge_short_label,
+            mode,
+        )
+        if expected_label and str(badge_fit.get("badge_label") or "") != expected_label:
+            return False
+        if has_reset_time and not str(badge_fit.get("time_text") or ""):
+            return False
+    elif has_reset_time and not (
+        str(badge_fit.get("time_text") or "")
+        or str(layout.get("display_reset_text") or "")
+    ):
+        return False
+    return True
+
+
+def _row_fits_badge_mode(
+    metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    segment_width: int,
+    progress_width: int,
+    badge_mode: str,
+) -> bool:
+    visible_metrics = tuple(metric for metric in metrics[:2] if isinstance(metric, dict))
+    if not visible_metrics:
+        return True
+    return all(
+        _metric_fits_badge_mode(
+            metric,
+            int(segment_width),
+            int(progress_width),
+            badge_mode,
+        )
+        for metric in visible_metrics
+    )
+
+
+def _resolve_row_badge_mode(
+    metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    segment_width: int,
+    progress_width: int,
+) -> str:
+    if _row_fits_badge_mode(metrics, segment_width, progress_width, "full"):
+        return "full"
+    return "short"
+
+
+def _row_fits_badge_mode_for_overlay_width(
+    width: int,
+    metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    badge_mode: str,
+) -> bool:
+    row_layout = _metric_row_layout_for_overlay_width(width, metrics)
+    return _row_fits_badge_mode(
+        row_layout.visible_metrics,
+        row_layout.segment_width,
+        row_layout.progress_width,
+        badge_mode,
+    )
+
+
+def _metric_row_layout_for_overlay_width(
+    width: int,
+    metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> _MetricRowLayout:
+    overlay_width = int(width)
+    visible_metrics = tuple(metric for metric in metrics[:2] if isinstance(metric, dict))
+    label_width = _label_width_for_overlay_width(overlay_width)
+    status_width = _status_width_for_overlay_width(overlay_width)
+    metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
+    metrics_width = max(110, overlay_width - metrics_x - 4)
+    segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
+    segment_width = _metric_segment_width_for_metrics_width(
+        metrics_width,
+        len(visible_metrics),
+        segment_gap,
+    )
+    progress_width = _metric_progress_width_for_segment(segment_width)
+    badge_mode = _resolve_row_badge_mode(
+        visible_metrics,
+        segment_width,
+        progress_width,
+    )
+    return _MetricRowLayout(
+        label_width=label_width,
+        status_width=status_width,
+        metrics_x=metrics_x,
+        metrics_width=metrics_width,
+        segment_gap=segment_gap,
+        segment_width=segment_width,
+        progress_width=progress_width,
+        badge_mode=badge_mode,
+        visible_metrics=visible_metrics,
+    )
+
+
+def _required_metric_segment_width(
+    metric: dict[str, Any],
+    *,
+    badge_mode: str = "any",
+) -> int:
+    metric_dict = metric if isinstance(metric, dict) else {}
+    detail_text = str(metric_dict.get("reset_text") or "")
+    short_text = str(metric_dict.get("reset_short_text") or detail_text)
+    badge_label = str(metric_dict.get("reset_badge_label") or "")
+    badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
+    has_reset_badge = bool(badge_label or badge_short_label)
+    has_reset_time = bool(detail_text or short_text)
+    metric_key = str(metric_dict.get("metric_key") or "")
+    reset_marker = str(metric_dict.get("reset_marker") or "")
+    mode = _normalized_badge_mode(badge_mode)
+
+    for candidate_width in range(48, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX + 1):
+        layout = _fit_metric_segment_layout(
+            candidate_width,
+            detail_text,
+            short_text,
+            badge_label=badge_label,
+            badge_short_label=badge_short_label,
+            metric_key=metric_key,
+            reset_marker=reset_marker,
+            has_reset_badge=has_reset_badge,
+            progress_width=_metric_progress_width_for_segment(candidate_width),
+            badge_mode=mode,
+        )
+        if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_MIN_WIDTH_PX:
+            continue
+        badge_fit = layout.get("badge_fit")
+        if not isinstance(badge_fit, dict):
+            badge_fit = {}
+        if has_reset_badge:
+            if not bool(badge_fit.get("badge_visible")):
+                continue
+            expected_label = _expected_badge_label_for_mode(
+                badge_label,
+                badge_short_label,
+                mode,
+            )
+            if mode in {"full", "short"} and str(
+                badge_fit.get("badge_label") or ""
+            ) != expected_label:
+                continue
+            if has_reset_time and not str(badge_fit.get("time_text") or ""):
+                continue
+        elif has_reset_time:
+            if not (
+                str(badge_fit.get("time_text") or "")
+                or str(layout.get("display_reset_text") or "")
+            ):
+                continue
+        return int(candidate_width)
+    return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
+
+
+def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | None:
+    if not isinstance(model, dict) or not bool(model.get("visible")):
+        return None
+
+    rows: list[tuple[dict[str, Any], ...]] = []
+    bars = model.get("bars")
+    if not isinstance(bars, list):
+        return None
+    for bar in bars[:2]:
+        if not isinstance(bar, dict) or not bool(bar.get("enabled", True)):
+            continue
+        visible_metrics = _visible_metrics_for_taskbar_bar(bar)
+        rows.append(visible_metrics)
+
+    if not rows:
+        return None
+
+    for badge_mode in ("full", "short"):
+        for candidate_width in range(
+            _MIN_EMPTY_SLOT_WIDTH_PX,
+            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX + 1,
+        ):
+            if all(
+                _row_fits_badge_mode_for_overlay_width(
+                    candidate_width,
+                    visible_metrics,
+                    badge_mode,
+                )
+                for visible_metrics in rows
+            ):
+                return int(candidate_width)
+    return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
 
 
 class CodexUsageTaskbarOverlay:
@@ -373,8 +686,19 @@ class CodexUsageTaskbarOverlay:
             runtime = self._runtime_getter()
         except Exception:
             runtime = {}
-        geometry = self._calculate_geometry()
-        model = build_codex_usage_taskbar_overlay_model(runtime, geometry=geometry)
+        now = datetime.now()
+        pre_model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            geometry=_DEFAULT_GEOMETRY,
+            now=now,
+        )
+        preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
+        geometry = self._calculate_geometry(preferred_width=preferred_width)
+        model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            geometry=geometry,
+            now=now,
+        )
         if not bool(model.get("visible")):
             if not bool(geometry.get("visible", True)):
                 self._withdraw_for_geometry_gap(model)
@@ -626,19 +950,31 @@ class CodexUsageTaskbarOverlay:
         )
         if hard_resample:
             self._last_geometry_hard_resample_at = now
+        try:
+            runtime = self._runtime_getter()
+        except Exception:
+            runtime = {}
+        model_now = datetime.now()
+        pre_model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            geometry=_DEFAULT_GEOMETRY,
+            now=model_now,
+        )
+        preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
         geometry = self._calculate_geometry(
             force_resample=True,
             withdraw_for_sampling=False,
+            preferred_width=preferred_width,
         )
         previous_geometry = model.get("geometry", {})
         if not isinstance(previous_geometry, dict):
             previous_geometry = {}
         if _geometry_changed(previous_geometry, geometry):
-            try:
-                runtime = self._runtime_getter()
-            except Exception:
-                runtime = {}
-            updated_model = build_codex_usage_taskbar_overlay_model(runtime, geometry=geometry)
+            updated_model = build_codex_usage_taskbar_overlay_model(
+                runtime,
+                geometry=geometry,
+                now=model_now,
+            )
             if bool(updated_model.get("visible")):
                 if window is None:
                     window = self._ensure_window()
@@ -692,6 +1028,7 @@ class CodexUsageTaskbarOverlay:
         *,
         force_resample: bool = False,
         withdraw_for_sampling: bool = True,
+        preferred_width: int | None = None,
     ) -> dict[str, int | str]:
         width = _root_int(self._root, "winfo_screenwidth", 1920)
         height = _root_int(self._root, "winfo_screenheight", 1080)
@@ -699,11 +1036,28 @@ class CodexUsageTaskbarOverlay:
             work_area = self._work_area_getter()
         except Exception:
             work_area = None
-        geometry = calculate_taskbar_overlay_geometry(width, height, work_area)
+        geometry = calculate_taskbar_overlay_geometry(
+            width,
+            height,
+            work_area,
+            preferred_width=preferred_width,
+        )
         if str(geometry.get("orientation") or "") not in {"bottom", "top"}:
-            self._cache_geometry(width, height, work_area, geometry)
+            self._cache_geometry(
+                width,
+                height,
+                work_area,
+                geometry,
+                preferred_width=preferred_width,
+            )
             return geometry
-        context = self._geometry_context(width, height, work_area, geometry)
+        context = self._geometry_context(
+            width,
+            height,
+            work_area,
+            geometry,
+            preferred_width=preferred_width,
+        )
         if (
             not bool(force_resample)
             and not bool(self._geometry_invalidated)
@@ -728,6 +1082,7 @@ class CodexUsageTaskbarOverlay:
             height,
             work_area,
             occupied_spans=occupied_spans,
+            preferred_width=preferred_width,
         )
         self._cached_geometry_context = context
         self._cached_geometry = dict(fitted)
@@ -740,12 +1095,15 @@ class CodexUsageTaskbarOverlay:
         height: int,
         work_area: tuple[int, int, int, int] | dict[str, int] | None,
         geometry: dict[str, int | str],
-    ) -> tuple[int, int, tuple[int, int, int, int], str]:
+        *,
+        preferred_width: int | None = None,
+    ) -> tuple[int, int, tuple[int, int, int, int], str, int]:
         return (
             int(width),
             int(height),
             _normalize_work_area(work_area, int(width), int(height)),
             str(geometry.get("orientation") or ""),
+            int(preferred_width or 0),
         )
 
     def _cache_geometry(
@@ -754,12 +1112,15 @@ class CodexUsageTaskbarOverlay:
         height: int,
         work_area: tuple[int, int, int, int] | dict[str, int] | None,
         geometry: dict[str, int | str],
+        *,
+        preferred_width: int | None = None,
     ) -> None:
         self._cached_geometry_context = self._geometry_context(
             width,
             height,
             work_area,
             geometry,
+            preferred_width=preferred_width,
         )
         self._cached_geometry = dict(geometry)
         self._geometry_invalidated = False
@@ -872,19 +1233,11 @@ class CodexUsageTaskbarOverlay:
             return
         row_count = min(2, len(bars))
         row_height = max(14, (height - 8) // max(1, row_count))
-        label_width = min(
-            _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX,
-            max(
-                _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
-                int(width * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
-            ),
-        )
-        status_width = (
-            _STATUS_WITH_TEXT_WIDTH_PX if width >= 420 else _STATUS_DOT_ONLY_WIDTH_PX
-        )
-        metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
-        metrics_width = max(110, width - metrics_x - 4)
         for index, bar in enumerate(bars[:2]):
+            row_layout = _metric_row_layout_for_overlay_width(
+                width,
+                _visible_metrics_for_taskbar_bar(bar),
+            )
             y = 4 + index * row_height
             center_y = y + row_height // 2
             label = str(bar.get("label") or "")
@@ -898,7 +1251,7 @@ class CodexUsageTaskbarOverlay:
                 font=("Segoe UI", 8, "bold"),
                 text=label[:8],
             )
-            dot_x = 6 + label_width + 1
+            dot_x = 6 + row_layout.label_width + 1
             canvas.create_oval(
                 dot_x,
                 center_y - 4,
@@ -907,7 +1260,7 @@ class CodexUsageTaskbarOverlay:
                 fill=status_color,
                 outline=status_color,
             )
-            if status_width > 20:
+            if row_layout.status_width > 20:
                 canvas.create_text(
                     dot_x + 10,
                     center_y,
@@ -916,36 +1269,19 @@ class CodexUsageTaskbarOverlay:
                     font=("Segoe UI", 6, "bold"),
                     text=status_text[:5],
                 )
-            metrics = [metric for metric in bar.get("metrics", []) if isinstance(metric, dict)]
-            if not metrics:
-                metrics = [
-                    {
-                        "key": "5h",
-                        "percent": int(bar.get("percent") or 0),
-                        "value_text": str(bar.get("value_text") or "--"),
-                        "color": str(bar.get("color") or "#6b7280"),
-                    }
-                ]
-            segment_gap = (
-                _METRIC_SEGMENT_GAP_COMPACT_PX
-                if width < 640
-                else _METRIC_SEGMENT_GAP_WIDE_PX
-            )
-            segment_width = max(
-                48,
-                (metrics_width - segment_gap * max(0, len(metrics) - 1)) // max(1, len(metrics)),
-            )
-            progress_width = _metric_progress_width_for_segment(segment_width)
-            for metric_index, metric in enumerate(metrics[:2]):
-                segment_x = metrics_x + metric_index * (segment_width + segment_gap)
+            for metric_index, metric in enumerate(row_layout.visible_metrics):
+                segment_x = row_layout.metrics_x + metric_index * (
+                    row_layout.segment_width + row_layout.segment_gap
+                )
                 self._draw_metric_segment(
                     canvas,
                     metric,
                     segment_x,
                     y,
-                    segment_width,
+                    row_layout.segment_width,
                     row_height,
-                    progress_width=progress_width,
+                    progress_width=row_layout.progress_width,
+                    badge_mode=row_layout.badge_mode,
                 )
         return
 
@@ -958,6 +1294,7 @@ class CodexUsageTaskbarOverlay:
         width: int,
         row_height: int,
         progress_width: int | None = None,
+        badge_mode: str = "any",
     ) -> None:
         center_y = y + row_height // 2
         label = str(metric.get("key") or "")
@@ -987,6 +1324,7 @@ class CodexUsageTaskbarOverlay:
             reset_marker=reset_marker,
             has_reset_badge=has_reset_badge,
             progress_width=progress_width,
+            badge_mode=badge_mode,
         )
         bar_x = x + int(layout["bar_x"])
         bar_width = int(layout["progress_width"])
@@ -1287,6 +1625,8 @@ def _fit_horizontal_geometry_to_empty_slot(
     geometry: dict[str, int | str],
     screen_width: int,
     occupied_spans: list[tuple[int, int]] | None,
+    *,
+    preferred_width: int | None = None,
 ) -> dict[str, int | str]:
     fitted = dict(geometry)
     if occupied_spans is None:
@@ -1312,7 +1652,14 @@ def _fit_horizontal_geometry_to_empty_slot(
         fitted["height"] = 0
         return fitted
 
-    target_width = min(desired_width, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+    if preferred_width is None:
+        target_width = min(desired_width, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+    else:
+        target_width = min(
+            max(_MIN_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
+            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+            desired_width,
+        )
     width = min(target_width, available)
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
@@ -1330,7 +1677,14 @@ def _geometry_changed(
         return True
     if str(previous.get("orientation") or "") != str(current.get("orientation") or ""):
         return True
-    for key in ("x", "y", "width", "height"):
+    try:
+        previous_width = int(previous.get("width", 0))
+        current_width = int(current.get("width", 0))
+    except Exception:
+        return True
+    if previous_width != current_width:
+        return True
+    for key in ("x", "y", "height"):
         try:
             before = int(previous.get(key, 0))
             after = int(current.get(key, 0))
@@ -2382,6 +2736,7 @@ def _fit_metric_segment_layout(
     reset_marker: str = "",
     has_reset_badge: bool = False,
     progress_width: int | None = None,
+    badge_mode: str = "any",
 ) -> dict[str, Any]:
     segment_width = max(0, int(width))
     label_width = 14
@@ -2427,6 +2782,7 @@ def _fit_metric_segment_layout(
     short = str(short_text or "")
     full_badge_label = str(badge_label or "")
     compact_badge_label = str(badge_short_label or full_badge_label)
+    normalized_badge_mode = _normalized_badge_mode(badge_mode)
 
     def score_candidate(
         *,
@@ -2471,6 +2827,7 @@ def _fit_metric_segment_layout(
             badge_short_label=compact_badge_label,
             metric_key=metric_key,
             available_px=reset_available_px,
+            badge_mode=normalized_badge_mode,
         )
         display_reset_text = ""
         placeholder_visible = False
@@ -2549,12 +2906,14 @@ def _fit_reset_badge_for_space(
     badge_short_label: str,
     metric_key: str = "",
     available_px: int,
+    badge_mode: str = "any",
 ) -> dict[str, Any]:
     available = max(0, int(available_px))
     full_label = str(badge_label or badge_short_label or "")
     compact_label = str(badge_short_label or full_label)
     detail = str(detail_text or "")
     short = str(short_text or "")
+    normalized_badge_mode = _normalized_badge_mode(badge_mode)
 
     hidden = {
         "badge_visible": False,
@@ -2570,6 +2929,8 @@ def _fit_reset_badge_for_space(
     full_badge_width = _reset_badge_width_for_label(full_label)
     short_badge_width = _reset_badge_width_for_label(compact_label)
     candidates: list[tuple[str, str, int, str, int]] = []
+    allow_full_badge = normalized_badge_mode in {"any", "full"}
+    allow_short_badge = normalized_badge_mode in {"any", "short"}
 
     def add_candidate(
         variant: str,
@@ -2584,14 +2945,15 @@ def _fit_reset_badge_for_space(
 
     if detail:
         detail_width = _reset_column_width_for_text(detail, metric_key=metric_key)
-        add_candidate(
-            "badge_detail",
-            full_label,
-            full_badge_width,
-            detail,
-            full_badge_width + _RESET_BADGE_TIME_GAP_PX + detail_width,
-        )
-        if compact_label and compact_label != full_label:
+        if allow_full_badge:
+            add_candidate(
+                "badge_detail",
+                full_label,
+                full_badge_width,
+                detail,
+                full_badge_width + _RESET_BADGE_TIME_GAP_PX + detail_width,
+            )
+        if allow_short_badge and compact_label:
             add_candidate(
                 "badge_short_detail",
                 compact_label,
@@ -2601,14 +2963,15 @@ def _fit_reset_badge_for_space(
             )
     if short and short != detail:
         short_width = _reset_column_width_for_text(short, metric_key=metric_key)
-        add_candidate(
-            "badge_short",
-            full_label,
-            full_badge_width,
-            short,
-            full_badge_width + _RESET_BADGE_TIME_GAP_PX + short_width,
-        )
-        if compact_label and compact_label != full_label:
+        if allow_full_badge:
+            add_candidate(
+                "badge_short",
+                full_label,
+                full_badge_width,
+                short,
+                full_badge_width + _RESET_BADGE_TIME_GAP_PX + short_width,
+            )
+        if allow_short_badge and compact_label:
             add_candidate(
                 "badge_short_time",
                 compact_label,
@@ -2620,8 +2983,9 @@ def _fit_reset_badge_for_space(
         add_candidate("time_detail", "", 0, detail, detail_width)
     if short and short != detail:
         add_candidate("time_short", "", 0, short, short_width)
-    add_candidate("badge_only", full_label, full_badge_width, "", full_badge_width)
-    if compact_label and compact_label != full_label:
+    if allow_full_badge:
+        add_candidate("badge_only", full_label, full_badge_width, "", full_badge_width)
+    if allow_short_badge and compact_label:
         add_candidate(
             "badge_short_only",
             compact_label,

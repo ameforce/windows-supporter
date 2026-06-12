@@ -892,7 +892,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
     def test_metric_segment_layout_fits_zero_time_risk_badge_in_compact_five_hour_segment(self):
         layout = taskbar_overlay._fit_metric_segment_layout(
-            140,
+            145,
             "00h 00m",
             "00h 00m",
             badge_label="부족",
@@ -991,7 +991,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         }
         canvas = _FakeCanvas()
 
-        overlay._draw_metric_segment(canvas, metric, 10, 2, 140, 15)
+        overlay._draw_metric_segment(canvas, metric, 10, 2, 145, 15)
 
         badge_rects = [
             op
@@ -1012,9 +1012,30 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(len(badge_labels), 1)
         self.assertEqual(len(reset_times), 1)
         gap = int(reset_times[0][1][0]) - int(badge_rects[0][1][2])
-        self.assertGreater(gap, 0)
-        self.assertLessEqual(gap, 3)
+        self.assertEqual(gap, 5)
         self.assertEqual(arrow_only, [])
+
+    def test_fit_reset_badge_uses_five_pixel_gap_in_total_width(self):
+        fit = taskbar_overlay._fit_reset_badge_for_space(
+            "00h 00m",
+            "00h 00m",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="five_hour_limit",
+            available_px=200,
+        )
+        expected_total_width = (
+            taskbar_overlay._reset_badge_width_for_label("부족")
+            + 5
+            + taskbar_overlay._reset_column_width_for_text(
+                "00h 00m",
+                metric_key="five_hour_limit",
+            )
+        )
+
+        self.assertEqual(taskbar_overlay._RESET_BADGE_TIME_GAP_PX, 5)
+        self.assertEqual(fit["variant"], "badge_detail")
+        self.assertEqual(fit["total_width"], expected_total_width)
 
     def test_draw_metric_segment_keeps_reset_time_before_badge_when_space_is_narrow(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -2156,6 +2177,403 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(geometry["x"], 1708)
         self.assertLessEqual(geometry["x"] + geometry["width"], 2392)
 
+    def test_bottom_taskbar_geometry_uses_preferred_width_when_slot_is_wide(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            occupied_spans=[(0, 900), (1500, 1920)],
+            preferred_width=420,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["orientation"], "bottom")
+        self.assertEqual(geometry["width"], 420)
+        self.assertEqual(geometry["x"], 1072)
+
+    def test_bottom_taskbar_geometry_caps_large_preferred_width(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            occupied_spans=[(0, 900), (1600, 1920)],
+            preferred_width=720,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["width"], taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+
+    def test_bottom_taskbar_geometry_uses_available_slot_below_preferred_width(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1000,
+            600,
+            (0, 0, 1000, 560),
+            occupied_spans=[(0, 100), (460, 1000)],
+            preferred_width=420,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["width"], 344)
+
+    def test_bottom_taskbar_geometry_ignores_preferred_width_without_occupied_spans(self):
+        baseline = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+        )
+        preferred = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            preferred_width=420,
+        )
+
+        self.assertEqual(preferred, baseline)
+
+    def test_preferred_taskbar_overlay_width_returns_none_without_visible_rows(self):
+        self.assertIsNone(
+            taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+                {"visible": False, "bars": []}
+            )
+        )
+        self.assertIsNone(
+            taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+                {"visible": True, "bars": []}
+            )
+        )
+
+    def test_preferred_taskbar_overlay_width_below_status_text_switch_uses_dot_only(self):
+        model = {
+            "visible": True,
+            "bars": [
+                {
+                    "enabled": True,
+                    "metrics": [
+                        {
+                            "key": "5h",
+                            "metric_key": "five_hour_limit",
+                            "percent": 47,
+                            "value_text": "47%",
+                            "color": "#22c55e",
+                            "reset_text": "00h 00m",
+                            "reset_short_text": "00h 00m",
+                            "reset_badge_label": "부",
+                            "reset_badge_short_label": "부",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+
+        self.assertIsNotNone(width)
+        self.assertLess(width, 420)
+        self.assertEqual(
+            taskbar_overlay._status_width_for_overlay_width(width),
+            taskbar_overlay._STATUS_DOT_ONLY_WIDTH_PX,
+        )
+
+    def _row_badge_metrics(self):
+        return (
+            {
+                "key": "5h",
+                "metric_key": "five_hour_limit",
+                "percent": 47,
+                "value_text": "47%",
+                "color": "#22c55e",
+                "reset_text": "00h 00m",
+                "reset_short_text": "00h 00m",
+                "reset_color": "#ef4444",
+                "reset_marker": "↓",
+                "reset_badge_label": "부족",
+                "reset_badge_short_label": "부",
+                "reset_badge_fill": "#7f1d1d",
+                "reset_badge_outline": "#ef4444",
+                "reset_badge_text_color": "#fee2e2",
+            },
+            {
+                "key": "7d",
+                "metric_key": "weekly_limit",
+                "percent": 52,
+                "value_text": "52%",
+                "color": "#22c55e",
+                "reset_text": "6d 20h 00m",
+                "reset_short_text": "6d 20h",
+                "reset_color": "#f59e0b",
+                "reset_marker": "↑",
+                "reset_badge_label": "남음",
+                "reset_badge_short_label": "남",
+                "reset_badge_fill": "#78350f",
+                "reset_badge_outline": "#f59e0b",
+                "reset_badge_text_color": "#fef3c7",
+            },
+        )
+
+    def _row_badge_model(self, width, metrics=None):
+        visible_metrics = tuple(metrics or self._row_badge_metrics())
+        return {
+            "visible": True,
+            "state": "ready",
+            "geometry": {
+                "x": 0,
+                "y": 0,
+                "width": int(width),
+                "height": 38,
+                "orientation": "bottom",
+                "visible": True,
+            },
+            "bars": [
+                {
+                    "enabled": True,
+                    "label": "Codex 1",
+                    "status_text": "정상",
+                    "status_color": "#22c55e",
+                    "metrics": [dict(metric) for metric in visible_metrics],
+                }
+            ],
+        }
+
+    def _draw_row_badge_texts(self, width, metrics=None):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        overlay._draw(self._row_badge_model(width, metrics=metrics))
+        return [
+            op[2].get("text")
+            for op in canvas.ops
+            if op[0] == "text"
+        ]
+
+    def test_preferred_taskbar_overlay_width_accounts_for_status_text_switch(self):
+        metric = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 47,
+            "value_text": "47%",
+            "color": "#22c55e",
+            "reset_text": "00h 00m",
+            "reset_short_text": "00h 00m",
+            "reset_badge_label": "부족한도",
+            "reset_badge_short_label": "부족한도",
+        }
+        model = {
+            "visible": True,
+            "bars": [
+                {
+                    "enabled": True,
+                    "metrics": [dict(metric), dict(metric, key="7d", metric_key="weekly_limit")],
+                }
+            ],
+        }
+
+        width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+
+        self.assertIsNotNone(width)
+        self.assertGreaterEqual(width, 420)
+        self.assertEqual(
+            taskbar_overlay._status_width_for_overlay_width(width),
+            taskbar_overlay._STATUS_WITH_TEXT_WIDTH_PX,
+        )
+
+    def test_preferred_taskbar_overlay_width_fits_widest_equal_segment(self):
+        narrow_metric = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 47,
+            "value_text": "47%",
+            "color": "#22c55e",
+            "reset_text": "00h 00m",
+            "reset_short_text": "00h 00m",
+            "reset_badge_label": "부",
+            "reset_badge_short_label": "부",
+        }
+        wide_metric = dict(
+            narrow_metric,
+            key="7d",
+            metric_key="weekly_limit",
+            reset_badge_label="부족한도",
+            reset_badge_short_label="부족한도",
+        )
+        model = {
+            "visible": True,
+            "bars": [
+                {
+                    "enabled": True,
+                    "metrics": [narrow_metric, wide_metric],
+                }
+            ],
+        }
+
+        width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+
+        self.assertIsNotNone(width)
+        self.assertEqual(width, 484)
+        row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
+            width,
+            (narrow_metric, wide_metric),
+        )
+        narrower_row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
+            width - 1,
+            (narrow_metric, wide_metric),
+        )
+        required_wide_segment = taskbar_overlay._required_metric_segment_width(wide_metric)
+        self.assertGreaterEqual(row_layout.segment_width, required_wide_segment)
+        self.assertLess(narrower_row_layout.segment_width, required_wide_segment)
+        layout = taskbar_overlay._fit_metric_segment_layout(
+            row_layout.segment_width,
+            wide_metric["reset_text"],
+            wide_metric["reset_short_text"],
+            badge_label=wide_metric["reset_badge_label"],
+            badge_short_label=wide_metric["reset_badge_short_label"],
+            metric_key=wide_metric["metric_key"],
+            reset_marker="",
+            has_reset_badge=True,
+            progress_width=row_layout.progress_width,
+        )
+        badge_fit = dict(layout["badge_fit"])
+
+        self.assertTrue(badge_fit["badge_visible"])
+        self.assertEqual(badge_fit["time_text"], "00h 00m")
+        self.assertGreaterEqual(
+            int(layout["progress_width"]),
+            taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
+        )
+
+    def test_metric_row_layout_exposes_full_or_short_badge_mode(self):
+        metrics = self._row_badge_metrics()
+
+        full_layout = taskbar_overlay._metric_row_layout_for_overlay_width(460, metrics)
+        short_layout = taskbar_overlay._metric_row_layout_for_overlay_width(414, metrics)
+
+        self.assertEqual(full_layout.badge_mode, "full")
+        self.assertEqual(short_layout.badge_mode, "short")
+        self.assertIn(full_layout.badge_mode, {"full", "short"})
+        self.assertIn(short_layout.badge_mode, {"full", "short"})
+
+    def test_preferred_width_uses_full_badges_before_compacting_row(self):
+        metrics = self._row_badge_metrics()
+        model = {
+            "visible": True,
+            "bars": [
+                {
+                    "enabled": True,
+                    "metrics": [dict(metric) for metric in metrics],
+                }
+            ],
+        }
+
+        width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+        row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width, metrics)
+        narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 1, metrics)
+
+        self.assertGreater(width, 414)
+        self.assertEqual(row_layout.badge_mode, "full")
+        self.assertNotEqual(narrower_layout.badge_mode, "full")
+
+    def test_draw_compacts_all_row_badges_when_full_mode_does_not_fit(self):
+        texts = self._draw_row_badge_texts(414)
+
+        self.assertIn("부", texts)
+        self.assertIn("남", texts)
+        self.assertNotIn("부족", texts)
+        self.assertNotIn("남음", texts)
+
+    def test_draw_uses_full_row_badges_when_full_mode_fits(self):
+        texts = self._draw_row_badge_texts(460)
+
+        self.assertIn("부족", texts)
+        self.assertIn("남음", texts)
+        self.assertNotIn("부", texts)
+        self.assertNotIn("남", texts)
+
+    def test_fit_reset_badge_can_be_forced_to_short_or_full_mode(self):
+        short_available = (
+            taskbar_overlay._reset_badge_width_for_label("남")
+            + taskbar_overlay._RESET_BADGE_TIME_GAP_PX
+            + taskbar_overlay._reset_column_width_for_text(
+                "6d 20h 00m",
+                metric_key="weekly_limit",
+            )
+        )
+
+        full_fit = taskbar_overlay._fit_reset_badge_for_space(
+            "6d 20h 00m",
+            "6d 20h",
+            badge_label="남음",
+            badge_short_label="남",
+            metric_key="weekly_limit",
+            available_px=short_available,
+            badge_mode="full",
+        )
+        short_fit = taskbar_overlay._fit_reset_badge_for_space(
+            "6d 20h 00m",
+            "6d 20h",
+            badge_label="남음",
+            badge_short_label="남",
+            metric_key="weekly_limit",
+            available_px=short_available,
+            badge_mode="short",
+        )
+
+        self.assertNotEqual(full_fit["badge_label"], "남")
+        self.assertEqual(short_fit["badge_label"], "남")
+        self.assertEqual(short_fit["time_text"], "6d 20h 00m")
+
+    def test_refresh_clamp_path_compacts_all_row_badges_from_final_geometry(self):
+        metrics = self._row_badge_metrics()
+        window = _FakeWindow()
+        canvas = _FakeCanvas()
+        preferred_widths = []
+        original_preferred_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model
+
+        def build_model(runtime_status, geometry=None, *, now=None):
+            return self._row_badge_model(
+                int(dict(geometry or taskbar_overlay._DEFAULT_GEOMETRY)["width"]),
+                metrics=metrics,
+            )
+
+        def preferred_width(model):
+            width = original_preferred_width(model)
+            preferred_widths.append(width)
+            return width
+
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: [
+                (0, 900),
+                (1330, 1920),
+            ],
+        )
+        overlay._canvas = canvas
+
+        with patch.object(
+            taskbar_overlay,
+            "build_codex_usage_taskbar_overlay_model",
+            side_effect=build_model,
+        ), patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            side_effect=preferred_width,
+        ):
+            overlay.refresh()
+
+        texts = [
+            op[2].get("text")
+            for op in canvas.ops
+            if op[0] == "text"
+        ]
+
+        self.assertGreater(preferred_widths[0], 414)
+        self.assertIn("414x", window.geometry_calls[-1])
+        self.assertIn("부", texts)
+        self.assertIn("남", texts)
+        self.assertNotIn("부족", texts)
+        self.assertNotIn("남음", texts)
+
     def test_bottom_taskbar_geometry_uses_right_slot_as_equal_width_tie_breaker(self):
         geometry = calculate_taskbar_overlay_geometry(
             1400,
@@ -2356,6 +2774,105 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(window.withdraw_calls, 0)
         self.assertEqual(len(occupied_calls), 1)
 
+    def test_refresh_builds_preferred_and_final_model_from_one_runtime_snapshot_and_now(self):
+        window = _FakeWindow()
+        runtime_calls = []
+        build_calls = []
+
+        def runtime_getter():
+            runtime_calls.append("runtime")
+            return self._runtime()
+
+        def build_model(runtime_status, geometry=None, *, now=None):
+            build_calls.append((runtime_status, dict(geometry or {}), now))
+            return {
+                "visible": True,
+                "state": "ready",
+                "geometry": dict(geometry or taskbar_overlay._DEFAULT_GEOMETRY),
+                "bars": [
+                    {
+                        "enabled": True,
+                        "label": "Codex 1",
+                        "status_text": "정상",
+                        "status_color": "#22c55e",
+                        "metrics": [],
+                    }
+                ],
+            }
+
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            runtime_getter,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: [
+                (0, 900),
+                (1500, 1920),
+            ],
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "build_codex_usage_taskbar_overlay_model",
+            side_effect=build_model,
+        ), patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=420,
+            create=True,
+        ):
+            overlay.refresh()
+
+        self.assertEqual(len(runtime_calls), 1)
+        self.assertEqual(len(build_calls), 2)
+        self.assertIs(build_calls[0][0], build_calls[1][0])
+        self.assertIsNotNone(build_calls[0][2])
+        self.assertIs(build_calls[0][2], build_calls[1][2])
+        self.assertEqual(build_calls[0][1]["width"], taskbar_overlay._DEFAULT_GEOMETRY["width"])
+        self.assertEqual(build_calls[1][1]["width"], 420)
+
+    def test_refresh_resamples_geometry_when_preferred_width_changes(self):
+        window = _FakeWindow()
+        occupied_calls = []
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return [(0, 900), (1500, 1920)]
+
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            side_effect=[420, 360],
+            create=True,
+        ):
+            overlay.refresh()
+            overlay.refresh()
+
+        self.assertEqual(len(occupied_calls), 2)
+        self.assertIn("420x", window.geometry_calls[0])
+        self.assertIn("360x", window.geometry_calls[1])
+
+    def test_geometry_changed_detects_status_text_threshold_crossing(self):
+        previous = {
+            "visible": True,
+            "orientation": "bottom",
+            "x": 100,
+            "y": 200,
+            "width": 419,
+            "height": 38,
+        }
+        current = dict(previous, width=420)
+
+        self.assertTrue(taskbar_overlay._geometry_changed(previous, current))
+
     def test_geometry_invalidation_allows_explicit_resample(self):
         window = _FakeWindow()
         occupied_calls = []
@@ -2412,9 +2929,80 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(len(occupied_calls), 2)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
         self.assertIn(
-            f"{taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX}x",
+            f"{taskbar_overlay._MIN_EMPTY_SLOT_WIDTH_PX}x",
             window.geometry_calls[-1],
         )
+
+    def test_geometry_monitor_tick_reuses_runtime_snapshot_and_now_for_width_change(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        runtime_calls = []
+        build_calls = []
+
+        def runtime_getter():
+            runtime_calls.append("runtime")
+            return self._runtime()
+
+        def build_model(runtime_status, geometry=None, *, now=None):
+            build_calls.append((runtime_status, dict(geometry or {}), now))
+            return {
+                "visible": True,
+                "state": "ready",
+                "geometry": dict(geometry or taskbar_overlay._DEFAULT_GEOMETRY),
+                "bars": [
+                    {
+                        "enabled": True,
+                        "label": "Codex 1",
+                        "status_text": "정상",
+                        "status_color": "#22c55e",
+                        "metrics": [],
+                    }
+                ],
+            }
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            runtime_getter,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: [
+                (0, 900),
+                (1500, 1920),
+            ],
+        )
+        overlay._window = window
+        overlay._last_model = {
+            "visible": True,
+            "geometry": {
+                "x": 908,
+                "y": 1041,
+                "width": 300,
+                "height": 38,
+                "orientation": "bottom",
+                "visible": True,
+            },
+            "bars": [],
+        }
+
+        with patch.object(
+            taskbar_overlay,
+            "build_codex_usage_taskbar_overlay_model",
+            side_effect=build_model,
+        ), patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=420,
+            create=True,
+        ):
+            overlay._geometry_monitor_tick()
+
+        self.assertEqual(len(runtime_calls), 1)
+        self.assertEqual(len(build_calls), 2)
+        self.assertIs(build_calls[0][0], build_calls[1][0])
+        self.assertIsNotNone(build_calls[0][2])
+        self.assertIs(build_calls[0][2], build_calls[1][2])
+        self.assertEqual(build_calls[0][1]["width"], taskbar_overlay._DEFAULT_GEOMETRY["width"])
+        self.assertEqual(build_calls[1][1]["width"], 420)
 
     def test_geometry_monitor_hard_resample_restores_window_when_slot_is_unchanged(self):
         root = _FakeRoot()
@@ -2502,7 +3090,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 2)
         self.assertIn(
-            f"{taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX}x",
+            f"{taskbar_overlay._MIN_EMPTY_SLOT_WIDTH_PX}x",
             window.geometry_calls[-1],
         )
 
