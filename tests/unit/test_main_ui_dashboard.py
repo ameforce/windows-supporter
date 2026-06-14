@@ -469,6 +469,58 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertEqual(parts[0], ("업데이트 가능", "enabled"))
         self.assertIn(("v0.5.6 -> v0.5.7", "normal"), parts)
 
+    def test_update_formatter_shows_progress_label_and_percent(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        enabled, parts = view._format_update(
+            {
+                "state": "updating",
+                "progress": {
+                    "label": "빌드 실행 중",
+                    "detail": "build.bat를 실행합니다.",
+                    "percent": 85,
+                },
+            }
+        )
+
+        self.assertTrue(enabled)
+        self.assertEqual(parts[0], ("업데이트 중", "enabled"))
+        self.assertIn(("빌드 실행 중", "normal"), parts)
+        self.assertIn(("85%", "normal"), parts)
+
+    def test_update_formatter_shows_failure_step_and_detail(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        enabled, parts = view._format_update(
+            {
+                "state": "error",
+                "progress": {
+                    "label": "업데이트 실패",
+                    "detail": "로그를 확인해 주세요.",
+                    "failed_step": "build.bat 실행",
+                },
+            }
+        )
+
+        self.assertFalse(enabled)
+        self.assertEqual(parts[0], ("확인 실패", "disabled"))
+        self.assertIn(("실패 단계: build.bat 실행", "normal"), parts)
+        self.assertIn(("로그를 확인해 주세요.", "normal"), parts)
+
+    def test_update_formatter_shows_cancelled_force_clean(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        enabled, parts = view._format_update(
+            {
+                "state": "cancelled",
+                "last_error": "강제정리가 취소되어 업데이트를 중단했습니다.",
+            }
+        )
+
+        self.assertFalse(enabled)
+        self.assertEqual(parts[0], ("취소됨", "disabled"))
+        self.assertIn(("강제정리가 취소되어 업데이트를 중단했습니다.", "normal"), parts)
+
     def test_update_formatter_shows_git_checkout_requirement(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 

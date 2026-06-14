@@ -13,7 +13,11 @@ from src.utils.StartReg import StartReg
 from src.apps.startup_apps import StartupAppManager
 from src.utils.tray_icon import SystemTrayIcon
 from src.utils.ui_event_pump import SharedUiEventPump
-from src.utils.update_monitor import WindowsSupporterUpdater
+from src.utils.update_monitor import (
+    WindowsSupporterUpdater,
+    run_update_handoff_from_argv,
+    start_update_handoff_cleanup_thread,
+)
 
 
 def _build_restart_command(
@@ -101,6 +105,13 @@ def _restart_current_process() -> None:
 
 
 def main() -> None:
+    if run_update_handoff_from_argv(sys.argv):
+        return
+    try:
+        start_update_handoff_cleanup_thread(current_executable=sys.executable)
+    except Exception:
+        pass
+
     lib = LibConnector()
     try:
         threading.Thread(target=StartReg().add_to_startup, daemon=True).start()
