@@ -62,16 +62,34 @@ class GenerateBuildMetadataUnitTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "invalid first-parent commit count"):
                 derive_build_version(Path("."))
 
-    def test_marks_dirty_builds_in_display_only(self) -> None:
+    def test_dirty_builds_bump_numeric_revision(self) -> None:
         with patch(
             "tools.generate_build_metadata._run_git",
             return_value="v1.2.3-0-gabcdef1-dirty",
         ):
             version = derive_build_version(Path("."))
 
-        self.assertEqual(version.display_version, "v1.2.3 (abcdef1-dirty)")
-        self.assertEqual(version.numeric_version, "1.2.3.0")
-        self.assertEqual(version.revision, 0)
+        self.assertEqual(version.display_version, "v1.2.3.1 (abcdef1-dirty)")
+        self.assertEqual(version.numeric_version, "1.2.3.1")
+        self.assertEqual(version.revision, 1)
+        self.assertTrue(version.dirty)
+
+    def test_dirty_builds_after_tag_bump_revision_from_commit_count(self) -> None:
+        def fake_run_git(repo_root: Path, args: list[str]) -> str:
+            if args[:3] == ["describe", "--tags", "--long"]:
+                return "v0.3.1-4-g64d97c3-dirty"
+            if args == ["rev-parse", "v0.3.1^{}"]:
+                return "tagcommit"
+            if args == ["rev-list", "--first-parent", "--parents", "HEAD"]:
+                return "headcommit parentcommit"
+            self.fail(f"unexpected git args: {args!r}")
+
+        with patch("tools.generate_build_metadata._run_git", side_effect=fake_run_git):
+            version = derive_build_version(Path("."))
+
+        self.assertEqual(version.display_version, "v0.3.1.5 (64d97c3-dirty)")
+        self.assertEqual(version.numeric_version, "0.3.1.5")
+        self.assertEqual(version.numeric_tuple, (0, 3, 1, 5))
         self.assertTrue(version.dirty)
 
     def test_derives_revision_one_for_release_tag_back_merge_on_develop(self) -> None:
