@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from src.utils.update_monitor import format_update_status_parts
+
 
 class DashboardView:
     def __init__(
@@ -504,29 +506,7 @@ class DashboardView:
         ]
 
     def _format_update(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
-        if not isinstance(data, dict):
-            return False, [("확인 불가", "disabled")]
-        state = str(data.get("state", "") or "").strip()
-        current = str(data.get("current_tag", "") or "").strip()
-        latest = str(data.get("latest_tag", "") or "").strip()
-        if state == "update_available" and latest:
-            parts = [("업데이트 가능", "enabled")]
-            if current:
-                parts.append((f"{current} -> {latest}", "normal"))
-            else:
-                parts.append((latest, "normal"))
-            return True, parts
-        if state == "checking":
-            return False, [("확인 중", "normal")]
-        if state == "updating":
-            return True, [("업데이트 중", "enabled")]
-        if state == "unavailable":
-            return False, [("지원 안 됨", "disabled"), ("Git checkout 필요", "normal")]
-        if state == "error":
-            return False, [("확인 실패", "disabled")]
-        if current:
-            return False, [("최신", "normal"), (current, "normal")]
-        return False, [("확인 대기", "normal")]
+        return format_update_status_parts(data)
 
     def _enabled_part(self, enabled: bool) -> tuple[str, str]:
         if bool(enabled):

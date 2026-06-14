@@ -6,6 +6,7 @@ import types
 import unittest
 from pathlib import Path
 
+from src.utils.subprocess_utils import build_no_window_subprocess_kwargs
 from src.utils.worktree_runtime import (
     is_codex_temporary_worktree_path,
     resolve_persistent_executable_path,
@@ -106,6 +107,14 @@ class WorktreeRuntimeUnitTest(unittest.TestCase):
         assert resolved is not None
         self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(primary_exe)))
         self.assertEqual(commands[0][0][:4], ["git", "-C", str(temporary), "worktree"])
+        expected_no_window = build_no_window_subprocess_kwargs()
+        if "creationflags" in expected_no_window:
+            self.assertEqual(
+                commands[0][1]["creationflags"],
+                expected_no_window["creationflags"],
+            )
+        if "startupinfo" in expected_no_window:
+            self.assertIn("startupinfo", commands[0][1])
 
     def test_non_codex_linked_worktree_resolves_to_primary_worktree_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
