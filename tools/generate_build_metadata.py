@@ -130,12 +130,17 @@ def derive_build_version(repo_root: Path) -> BuildVersion:
     major = int(semver.group("major"))
     minor = int(semver.group("minor"))
     patch = int(semver.group("patch"))
+    dirty = bool(match.group("dirty"))
     revision = _derive_revision(repo_root, source_tag, commits_since_tag)
+    if dirty:
+        # Dirty builds can be deployed locally before a commit exists; do not
+        # reuse the clean tag's Windows FileVersion/ProductVersion.
+        revision += 1
     return BuildVersion(
         source_tag=source_tag,
         commits_since_tag=commits_since_tag,
         commit=match.group("commit"),
-        dirty=bool(match.group("dirty")),
+        dirty=dirty,
         major=major,
         minor=minor,
         patch=patch,
