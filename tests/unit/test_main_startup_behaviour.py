@@ -145,6 +145,16 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
         _FakeUi.instances = []
         _FakeUpdater.instances = []
 
+    def test_main_runs_update_handoff_before_gui_initialization(self) -> None:
+        with patch("main.run_update_handoff_from_argv", return_value=True) as handoff:
+            with patch("main.start_update_handoff_cleanup_thread") as cleanup:
+                with patch("main.LibConnector") as connector:
+                    main.main()
+
+        handoff.assert_called_once_with(main.sys.argv)
+        cleanup.assert_not_called()
+        connector.assert_not_called()
+
     def test_main_does_not_schedule_startup_apps_on_launch(self) -> None:
         root = _FakeRoot()
         lib = _FakeLib(root)
@@ -152,15 +162,16 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
 
         with patch("main.LibConnector", return_value=lib):
             with patch("main.StartReg"):
-                with patch("main.threading.Thread", _FakeThread):
-                    with patch("main.Monitor", return_value=_FakeMonitor()):
-                        with patch("main.StartupAppManager", return_value=startup):
-                            with patch("main.WindowsSupporterMainUI", _FakeUi):
-                                with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
-                                    with patch("main.SharedUiEventPump", _FakePump):
-                                        with patch("main.SystemTrayIcon", _FakeTray):
-                                            with patch("main.signal.signal"):
-                                                main.main()
+                with patch("main.start_update_handoff_cleanup_thread"):
+                    with patch("main.threading.Thread", _FakeThread):
+                        with patch("main.Monitor", return_value=_FakeMonitor()):
+                            with patch("main.StartupAppManager", return_value=startup):
+                                with patch("main.WindowsSupporterMainUI", _FakeUi):
+                                    with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
+                                        with patch("main.SharedUiEventPump", _FakePump):
+                                            with patch("main.SystemTrayIcon", _FakeTray):
+                                                with patch("main.signal.signal"):
+                                                    main.main()
 
         self.assertNotIn(120, [delay for delay, _callback in root.after_calls])
         self.assertEqual(startup.start_calls, [])
@@ -173,17 +184,19 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
             with patch.object(main.sys, "executable", r"C:\repo\windows-supporter.exe"):
                 with patch("main.LibConnector", return_value=lib):
                     with patch("main.StartReg"):
-                        with patch("main.threading.Thread", _FakeThread):
-                            with patch("main.Monitor", return_value=_FakeMonitor()):
-                                with patch("main.StartupAppManager", return_value=_FakeStartupManager()):
-                                    with patch("main.WindowsSupporterMainUI", _FakeUi):
-                                        with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
-                                            with patch("main.SharedUiEventPump", _FakePump):
-                                                with patch("main.SystemTrayIcon", _FakeTray):
-                                                    with patch("main.signal.signal"):
-                                                        main.main()
+                        with patch("main.start_update_handoff_cleanup_thread") as cleanup:
+                            with patch("main.threading.Thread", _FakeThread):
+                                with patch("main.Monitor", return_value=_FakeMonitor()):
+                                    with patch("main.StartupAppManager", return_value=_FakeStartupManager()):
+                                        with patch("main.WindowsSupporterMainUI", _FakeUi):
+                                            with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
+                                                with patch("main.SharedUiEventPump", _FakePump):
+                                                    with patch("main.SystemTrayIcon", _FakeTray):
+                                                        with patch("main.signal.signal"):
+                                                            main.main()
 
         self.assertEqual(len(_FakeUpdater.instances), 1)
+        cleanup.assert_called_once_with(current_executable=r"C:\repo\windows-supporter.exe")
         updater = _FakeUpdater.instances[0]
         self.assertIs(updater.kwargs["root"], root)
         self.assertEqual(updater.kwargs["repo_root"], r"C:\repo")

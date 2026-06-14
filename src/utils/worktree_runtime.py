@@ -7,6 +7,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from src.utils.subprocess_utils import build_no_window_subprocess_kwargs
+
 
 CODEX_TEMP_WORKTREE_RE = re.compile(r"(^|[/\\])\.codex[/\\]worktrees([/\\]|$)", re.IGNORECASE)
 GIT_WORKTREE_COMMAND_TIMEOUT_SECONDS = 5
@@ -51,14 +53,18 @@ def _run_git_worktree_list(
 ) -> str | None:
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
+    run_kwargs = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "env": env,
+        "timeout": GIT_WORKTREE_COMMAND_TIMEOUT_SECONDS,
+    }
+    run_kwargs.update(build_no_window_subprocess_kwargs(subprocess))
     try:
         result = runner(
             ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=GIT_WORKTREE_COMMAND_TIMEOUT_SECONDS,
+            **run_kwargs,
         )
     except Exception:
         return None

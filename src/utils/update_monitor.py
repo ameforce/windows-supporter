@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.utils.app_version import get_app_version
-from src.utils.subprocess_utils import popen_no_window
+from src.utils.subprocess_utils import popen_no_window, run_no_window
 from src.utils.worktree_runtime import is_primary_worktree
 
 
@@ -21,309 +26,33 @@ DESCRIBE_TAG_RE = re.compile(
 )
 DEFAULT_CLEAN_ALLOWLIST = ("build/", "dist/", "*.spec", "*.egg-info/")
 GIT_COMMAND_TIMEOUT_SECONDS = 20
-DETACHED_HELPER_FILENAME = "update_windows_supporter.ps1"
+UPDATE_HANDOFF_ARG = "--windows-supporter-update-handoff"
+UPDATE_HANDOFF_FILENAME = "update_handoff.json"
+UPDATE_HANDOFF_EXECUTABLE_NAME = "windows-supporter-updater.exe"
+UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS = 15.0
+UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS = 1800
+UPDATE_PROGRESS_TITLE = "Windows Supporter 업데이트"
+UPDATE_PROGRESS_FAILURE_TITLE = "Windows Supporter 업데이트 실패"
+UPDATE_PROGRESS_LOG_BUTTON_TEXT = "로그 열기"
+UPDATE_PROGRESS_RETRY_BUTTON_TEXT = "재시도"
+UPDATE_PROGRESS_CLOSE_BUTTON_TEXT = "닫기"
+UPDATE_PROGRESS_MANUAL_ACTION_TEXT = "수동 조치"
+UPDATE_CLEANUP_ONLY_NOTICE = "무시된 빌드 산출물만 정리한 뒤 업데이트를 계속합니다."
+UPDATE_SOURCE_CHANGE_NOTICE = "커밋되지 않은 변경이 있어 stash 후 업데이트를 계속합니다."
+UPDATE_FORCE_CLEAN_APPROVAL_TEXT = (
+    "로컬 변경 또는 로컬 전용 커밋 때문에 자동 업데이트를 바로 진행할 수 없습니다.\n"
+    "강제정리를 진행하면 uncommitted/untracked 변경은 stash 하고, "
+    "로컬 전용 커밋은 백업 브랜치로 보존한 뒤 main을 origin/main 기준으로 reset/동기화합니다.\n"
+    "강제정리를 진행할까요?"
+)
+UPDATE_FORCE_CLEAN_REJECTED_NOTICE = (
+    "강제정리가 취소되어 업데이트를 중단했습니다. Git 상태를 직접 정리한 뒤 다시 업데이트를 실행해 주세요."
+)
 GIT_CHECKOUT_UNAVAILABLE_MESSAGE = "Git checkout 안에서 실행되는 windows-supporter.exe만 업데이트를 지원합니다."
 NON_PRIMARY_WORKTREE_UNAVAILABLE_MESSAGE = (
     "main worktree가 아닌 worktree에서 실행 중입니다. 업데이트와 시작프로그램 등록은 "
     "main worktree의 windows-supporter.exe에서만 수행합니다."
 )
-UPDATE_HELPER_SCRIPT = """param(
-    [Parameter(Mandatory=$true)]
-    [string]$RepoRoot
-)
-
-$ErrorActionPreference = "Stop"
-$env:GIT_TERMINAL_PROMPT = "0"
-$baseLogDir = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }
-$logDir = Join-Path -Path $baseLogDir -ChildPath "windows-supporter"
-$logFile = Join-Path -Path $logDir -ChildPath "update.log"
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$script:progressForm = $null
-$script:stageLabel = $null
-$script:detailLabel = $null
-$script:currentStage = "Starting Windows Supporter update"
-
-function Write-UpdateLog {
-    param([string]$Message)
-    Add-Content -LiteralPath $logFile -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
-}
-
-function Open-UpdateLog {
-    try {
-        if (-not (Test-Path -LiteralPath $logFile)) {
-            New-Item -ItemType File -Force -Path $logFile | Out-Null
-        }
-        Start-Process -FilePath $logFile | Out-Null
-    } catch {
-        [System.Windows.Forms.MessageBox]::Show(
-            ("로그 파일을 열 수 없습니다.`n{0}" -f $_.Exception.Message),
-            "Windows Supporter 업데이트",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Warning
-        ) | Out-Null
-    }
-}
-
-function Update-ProgressStage {
-    param([string]$Stage)
-    $script:currentStage = [string]$Stage
-    Write-UpdateLog $script:currentStage
-    if ($script:stageLabel -ne $null) {
-        $script:stageLabel.Text = $script:currentStage
-    }
-    if ($script:detailLabel -ne $null) {
-        $script:detailLabel.Text = "취소는 지원하지 않습니다. 업데이트가 끝날 때까지 기다려 주세요."
-    }
-    if ($script:progressForm -ne $null) {
-        $script:progressForm.Refresh()
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-}
-
-function Initialize-ProgressWindow {
-    [System.Windows.Forms.Application]::EnableVisualStyles()
-
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Windows Supporter 업데이트"
-    $form.Size = New-Object System.Drawing.Size(440, 190)
-    $form.StartPosition = "CenterScreen"
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $true
-    $form.TopMost = $true
-
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = "Windows Supporter 업데이트 중"
-    $title.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
-    $title.AutoSize = $true
-    $title.Location = New-Object System.Drawing.Point(16, 16)
-    $form.Controls.Add($title)
-
-    $stage = New-Object System.Windows.Forms.Label
-    $stage.Text = $script:currentStage
-    $stage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $stage.AutoSize = $false
-    $stage.Size = New-Object System.Drawing.Size(390, 24)
-    $stage.Location = New-Object System.Drawing.Point(16, 52)
-    $form.Controls.Add($stage)
-
-    $detail = New-Object System.Windows.Forms.Label
-    $detail.Text = "취소는 지원하지 않습니다. 업데이트가 끝날 때까지 기다려 주세요."
-    $detail.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $detail.AutoSize = $false
-    $detail.Size = New-Object System.Drawing.Size(390, 36)
-    $detail.Location = New-Object System.Drawing.Point(16, 82)
-    $form.Controls.Add($detail)
-
-    $logButton = New-Object System.Windows.Forms.Button
-    $logButton.Text = "로그 열기"
-    $logButton.Size = New-Object System.Drawing.Size(92, 28)
-    $logButton.Location = New-Object System.Drawing.Point(314, 118)
-    $logButton.Add_Click({ Open-UpdateLog })
-    $form.Controls.Add($logButton)
-
-    $script:progressForm = $form
-    $script:stageLabel = $stage
-    $script:detailLabel = $detail
-    $form.Show()
-    $form.Activate()
-    [System.Windows.Forms.Application]::DoEvents()
-}
-
-function Invoke-NativeStep {
-    param(
-        [string]$Label,
-        [string]$CommandLine
-    )
-    Update-ProgressStage $Label
-    $redirectedCommand = "{0} >> {1} 2>&1" -f $CommandLine, (ConvertTo-CommandLineArgument $logFile)
-    $process = Start-Process `
-        -FilePath "cmd.exe" `
-        -ArgumentList @("/d", "/c", $redirectedCommand) `
-        -WorkingDirectory (Get-Location).Path `
-        -WindowStyle Hidden `
-        -PassThru
-    while (-not $process.WaitForExit(250)) {
-        if ($script:progressForm -ne $null) {
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-    }
-    if ($process.ExitCode -ne 0) {
-        throw "$Label failed with exit code $($process.ExitCode)"
-    }
-}
-
-function ConvertTo-CommandLineArgument {
-    param([string]$Value)
-    return ('"{0}"' -f ($Value -replace '"', '\\"'))
-}
-
-function Restart-UpdateHelper {
-    $scriptPath = $PSCommandPath
-    if (-not $scriptPath) {
-        $scriptPath = $MyInvocation.MyCommand.Path
-    }
-    if (-not $scriptPath) {
-        throw "Update helper script path could not be resolved"
-    }
-    $args = @(
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        (ConvertTo-CommandLineArgument $scriptPath),
-        "-RepoRoot",
-        (ConvertTo-CommandLineArgument $RepoRoot)
-    ) -join " "
-    Start-Process -FilePath "powershell" -ArgumentList $args | Out-Null
-}
-
-function Show-UpdateFailure {
-    param(
-        [string]$Stage,
-        [string]$Message
-    )
-    Write-UpdateLog ("FAILED: {0} - {1}" -f $Stage, $Message)
-    if ($script:progressForm -ne $null -and -not $script:progressForm.IsDisposed) {
-        $script:progressForm.Hide()
-    }
-
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Windows Supporter 업데이트 실패"
-    $form.Size = New-Object System.Drawing.Size(520, 250)
-    $form.StartPosition = "CenterScreen"
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-    $form.TopMost = $true
-
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = "업데이트 실패"
-    $title.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
-    $title.AutoSize = $true
-    $title.Location = New-Object System.Drawing.Point(16, 16)
-    $form.Controls.Add($title)
-
-    $stageLabel = New-Object System.Windows.Forms.Label
-    $stageLabel.Text = ("실패 단계: {0}" -f $Stage)
-    $stageLabel.AutoSize = $false
-    $stageLabel.Size = New-Object System.Drawing.Size(470, 24)
-    $stageLabel.Location = New-Object System.Drawing.Point(16, 52)
-    $form.Controls.Add($stageLabel)
-
-    $messageLabel = New-Object System.Windows.Forms.Label
-    $messageLabel.Text = $Message
-    $messageLabel.AutoSize = $false
-    $messageLabel.Size = New-Object System.Drawing.Size(470, 70)
-    $messageLabel.Location = New-Object System.Drawing.Point(16, 80)
-    $form.Controls.Add($messageLabel)
-
-    $logButton = New-Object System.Windows.Forms.Button
-    $logButton.Text = "로그 열기"
-    $logButton.Size = New-Object System.Drawing.Size(92, 30)
-    $logButton.Location = New-Object System.Drawing.Point(194, 160)
-    $logButton.Add_Click({ Open-UpdateLog })
-    $form.Controls.Add($logButton)
-
-    $retryButton = New-Object System.Windows.Forms.Button
-    $retryButton.Text = "재시도"
-    $retryButton.Size = New-Object System.Drawing.Size(92, 30)
-    $retryButton.Location = New-Object System.Drawing.Point(294, 160)
-    $retryButton.Add_Click({
-        try {
-            Restart-UpdateHelper
-            $form.Close()
-        } catch {
-            [System.Windows.Forms.MessageBox]::Show(
-                ("재시도를 시작할 수 없습니다.`n{0}" -f $_.Exception.Message),
-                "Windows Supporter 업데이트",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error
-            ) | Out-Null
-        }
-    })
-    $form.Controls.Add($retryButton)
-
-    $closeButton = New-Object System.Windows.Forms.Button
-    $closeButton.Text = "닫기"
-    $closeButton.Size = New-Object System.Drawing.Size(92, 30)
-    $closeButton.Location = New-Object System.Drawing.Point(394, 160)
-    $closeButton.Add_Click({ $form.Close() })
-    $form.Controls.Add($closeButton)
-
-    $form.ShowDialog() | Out-Null
-}
-
-function Start-UpdatedWindowsSupporter {
-    Update-ProgressStage "Relaunching Windows Supporter"
-    $exePath = Join-Path -Path $RepoRoot -ChildPath "windows-supporter.exe"
-    if (-not (Test-Path -LiteralPath $exePath)) {
-        throw "Built executable not found: $exePath"
-    }
-    try {
-        $process = Start-Process -FilePath $exePath -WorkingDirectory $RepoRoot -PassThru
-    } catch {
-        throw ("Failed to relaunch Windows Supporter: {0}" -f $_.Exception.Message)
-    }
-    for ($i = 0; $i -lt 8; $i++) {
-        if ($process.WaitForExit(250)) {
-            throw "Relaunched Windows Supporter exited immediately with code $($process.ExitCode)"
-        }
-        if ($script:progressForm -ne $null) {
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-    }
-}
-
-function Run-Update {
-    Initialize-ProgressWindow
-    Update-ProgressStage "Starting Windows Supporter update"
-    Set-Location -LiteralPath $RepoRoot
-
-    Invoke-NativeStep "Checking Git checkout" "git rev-parse --show-toplevel"
-
-    Update-ProgressStage "Inspecting Git status"
-    $status = & git status --porcelain --untracked-files=all 2>> $logFile
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to inspect Git status"
-    }
-    if (($status | Out-String).Trim().Length -gt 0) {
-        Invoke-NativeStep "Stashing tracked and untracked changes" 'git stash push --include-untracked -m "windows-supporter auto update"'
-    }
-
-    Invoke-NativeStep "Cleaning allowlisted build byproducts" 'git clean -fdX -- build/ dist/ "*.spec" "*.egg-info/"'
-    Invoke-NativeStep "Fetching origin" "git fetch --tags origin"
-
-    Update-ProgressStage "Inspecting local main branch"
-    & git show-ref --verify --quiet refs/heads/main *>> $logFile
-    if ($LASTEXITCODE -ne 0) {
-        Invoke-NativeStep "Creating local main from origin/main" "git switch -c main --track origin/main"
-    } else {
-        Invoke-NativeStep "Switching to main" "git switch main"
-    }
-
-    Invoke-NativeStep "Fast-forwarding main from origin/main" "git merge --ff-only origin/main"
-    Invoke-NativeStep "Running build.bat" 'set "WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1" && cmd /c build.bat'
-    Start-UpdatedWindowsSupporter
-
-    Write-UpdateLog "Update completed"
-    if ($script:progressForm -ne $null) {
-        $script:progressForm.Close()
-    }
-}
-
-try {
-    Run-Update
-} catch {
-    Show-UpdateFailure -Stage $script:currentStage -Message $_.Exception.Message
-    exit 1
-}
-"""
-
 
 @dataclass(frozen=True)
 class UpdateCandidate:
@@ -331,28 +60,782 @@ class UpdateCandidate:
     version: tuple[int, int, int]
 
 
-def render_update_helper_script() -> str:
-    return UPDATE_HELPER_SCRIPT.strip() + "\n"
+@dataclass(frozen=True)
+class UpdateProgressStep:
+    key: str
+    label: str
+    detail: str
+    percent: int
 
 
-def get_detached_helper_path(base_dir: str | os.PathLike[str] | None = None) -> Path:
+UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
+    UpdateProgressStep("idle", "업데이트 대기", "업데이트 확인을 기다리는 중입니다.", 0),
+    UpdateProgressStep("checking", "업데이트 확인 중", "현재 버전과 원격 릴리스를 확인합니다.", 5),
+    UpdateProgressStep("available", "업데이트 준비 완료", "새 버전을 설치할 수 있습니다.", 15),
+    UpdateProgressStep("preflight", "업데이트 사전 점검 중", "Git 상태와 로컬 변경 여부를 확인합니다.", 25),
+    UpdateProgressStep("stash", "변경 사항 스태시 중", "커밋되지 않은 변경을 stash로 보존합니다.", 35),
+    UpdateProgressStep("cleanup", "빌드 산출물 정리 중", "무시된 빌드 산출물을 allowlist 범위에서 정리합니다.", 45),
+    UpdateProgressStep("fetch", "원격 변경 확인 중", "origin 태그와 main 브랜치 정보를 가져옵니다.", 55),
+    UpdateProgressStep("sync", "main 동기화 중", "main 브랜치를 업데이트 기준으로 맞춥니다.", 65),
+    UpdateProgressStep("handoff", "업데이트 실행 준비 중", "빌드와 재실행을 맡을 업데이트 프로세스를 준비합니다.", 75),
+    UpdateProgressStep("build", "빌드 실행 중", "build.bat를 실행합니다.", 85),
+    UpdateProgressStep("relaunch", "Windows Supporter 재실행 중", "새 실행 파일을 시작합니다.", 95),
+    UpdateProgressStep("complete", "업데이트 완료", "업데이트가 완료되었습니다.", 100),
+    UpdateProgressStep("failed", "업데이트 실패", "실패 단계와 로그를 확인해 주세요.", 100),
+)
+UPDATE_PROGRESS_STEP_BY_KEY = {step.key: step for step in UPDATE_PROGRESS_STEPS}
+
+
+@dataclass(frozen=True)
+class UpdateWorkingTreeState:
+    source_status: tuple[str, ...] = ()
+    cleanup_targets: tuple[str, ...] = ()
+    local_only_count: int = 0
+    remote_only_count: int = 0
+    local_only_commits: tuple[str, ...] = ()
+    remote_only_commits: tuple[str, ...] = ()
+
+    @property
+    def has_source_changes(self) -> bool:
+        return bool(self.source_status)
+
+    @property
+    def has_cleanup_targets(self) -> bool:
+        return bool(self.cleanup_targets)
+
+    @property
+    def has_local_only_commits(self) -> bool:
+        return self.local_only_count > 0 or bool(self.local_only_commits)
+
+    @property
+    def has_remote_only_commits(self) -> bool:
+        return self.remote_only_count > 0 or bool(self.remote_only_commits)
+
+    @property
+    def is_diverged(self) -> bool:
+        return self.has_local_only_commits and self.has_remote_only_commits
+
+    @property
+    def needs_source_stash(self) -> bool:
+        return self.has_source_changes
+
+    @property
+    def needs_pre_update_notice(self) -> bool:
+        return self.has_source_changes or self.has_cleanup_targets or self.is_diverged
+
+
+
+def get_update_progress_step(step_key: str) -> UpdateProgressStep:
+    key = str(step_key or "").strip() or "idle"
+    return UPDATE_PROGRESS_STEP_BY_KEY.get(key, UPDATE_PROGRESS_STEP_BY_KEY["idle"])
+
+
+def build_update_progress_snapshot(
+    step_key: str = "idle",
+    *,
+    state: str | None = None,
+    detail: str | None = None,
+    log_path: str = "",
+    failed_step: str = "",
+    can_retry: bool = False,
+    can_manual_action: bool = False,
+) -> dict[str, Any]:
+    step = get_update_progress_step(step_key)
+    resolved_state = str(state or ("failed" if step.key == "failed" else "idle")).strip()
+    percent = max(0, min(100, int(step.percent)))
+    return {
+        "title": UPDATE_PROGRESS_FAILURE_TITLE if resolved_state == "failed" else UPDATE_PROGRESS_TITLE,
+        "state": resolved_state,
+        "step_key": step.key,
+        "label": step.label,
+        "detail": str(detail if detail is not None else step.detail),
+        "percent": percent,
+        "progressbar": {
+            "visible": True,
+            "mode": "determinate",
+            "value": percent,
+            "maximum": 100,
+        },
+        "log_path": str(log_path or ""),
+        "failed_step": str(failed_step or ""),
+        "can_open_log": bool(log_path) or resolved_state == "failed",
+        "can_retry": bool(can_retry),
+        "can_manual_action": bool(can_manual_action),
+        "labels": {
+            "log": UPDATE_PROGRESS_LOG_BUTTON_TEXT,
+            "retry": UPDATE_PROGRESS_RETRY_BUTTON_TEXT,
+            "close": UPDATE_PROGRESS_CLOSE_BUTTON_TEXT,
+            "manual_action": UPDATE_PROGRESS_MANUAL_ACTION_TEXT,
+        },
+    }
+
+
+def format_update_status_parts(data: Any) -> tuple[bool, list[tuple[str, str]]]:
+    if not isinstance(data, dict):
+        return False, [("확인 불가", "disabled")]
+    state = str(data.get("state", "") or "").strip()
+    current = str(data.get("current_tag", "") or "").strip()
+    latest = str(data.get("latest_tag", "") or "").strip()
+    progress = data.get("progress", {})
+    if not isinstance(progress, dict):
+        progress = {}
+    progress_label = str(progress.get("label", "") or "").strip()
+    progress_detail = str(progress.get("detail", "") or "").strip()
+    progress_percent = progress.get("percent", None)
+    if state == "update_available" and latest:
+        parts = [("업데이트 가능", "enabled")]
+        if current:
+            parts.append((f"{current} -> {latest}", "normal"))
+        else:
+            parts.append((latest, "normal"))
+        if progress_label:
+            parts.append((progress_label, "normal"))
+        return True, parts
+    if state == "checking":
+        parts = [(progress_label or "업데이트 확인 중", "normal")]
+        if isinstance(progress_percent, int):
+            parts.append((f"{progress_percent}%", "normal"))
+        return False, parts
+    if state == "updating":
+        parts = [("업데이트 중", "enabled")]
+        if progress_label:
+            parts.append((progress_label, "normal"))
+        if isinstance(progress_percent, int):
+            parts.append((f"{progress_percent}%", "normal"))
+        return True, parts
+    if state == "unavailable":
+        return False, [("지원 안 됨", "disabled"), ("Git checkout 필요", "normal")]
+    if state == "cancelled":
+        detail = progress_detail or str(data.get("last_error", "") or "").strip()
+        parts = [("취소됨", "disabled")]
+        if detail:
+            parts.append((detail, "normal"))
+        return False, parts
+    if state == "error":
+        parts = [("확인 실패", "disabled")]
+        failed_step = str(progress.get("failed_step", "") or "").strip()
+        if failed_step:
+            parts.append((f"실패 단계: {failed_step}", "normal"))
+        elif progress_label:
+            parts.append((progress_label, "normal"))
+        if progress_detail:
+            parts.append((progress_detail, "normal"))
+        return False, parts
+    if current:
+        return False, [("최신", "normal"), (current, "normal")]
+    return False, [("확인 대기", "normal")]
+
+
+def build_force_clean_approval_message(working_tree: UpdateWorkingTreeState) -> str:
+    local_count = int(working_tree.local_only_count or len(working_tree.local_only_commits))
+    remote_count = int(working_tree.remote_only_count or len(working_tree.remote_only_commits))
+    return (
+        f"{UPDATE_FORCE_CLEAN_APPROVAL_TEXT}\n\n"
+        f"로컬 전용 커밋: {local_count}개\n"
+        f"원격 전용 커밋: {remote_count}개\n"
+        "거부하면 stash, 백업 브랜치 생성, reset/동기화, clean을 수행하지 않습니다."
+    )
+
+
+
+def get_update_state_dir(base_dir: str | os.PathLike[str] | None = None) -> Path:
     if base_dir is None:
         root = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
         base_dir = Path(root) / "windows-supporter"
-    return Path(base_dir) / DETACHED_HELPER_FILENAME
+    return Path(base_dir)
+
+
+def get_update_log_path(base_dir: str | os.PathLike[str] | None = None) -> Path:
+    return get_update_state_dir(base_dir) / "update.log"
+
+
+def get_update_handoff_path(base_dir: str | os.PathLike[str] | None = None) -> Path:
+    return get_update_state_dir(base_dir) / UPDATE_HANDOFF_FILENAME
+
+
+def get_update_handoff_executable_path(
+    base_dir: str | os.PathLike[str] | None = None,
+) -> Path:
+    return get_update_state_dir(base_dir) / UPDATE_HANDOFF_EXECUTABLE_NAME
 
 
 def is_git_checkout_root(repo_root: str | os.PathLike[str]) -> bool:
     return (Path(repo_root) / ".git").exists()
 
 
-def write_detached_helper_script(
-    helper_path: str | os.PathLike[str] | None = None,
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def read_update_handoff_state(path: str | os.PathLike[str]) -> dict[str, Any]:
+    try:
+        with Path(path).open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_update_handoff_state(
+    path: str | os.PathLike[str],
+    payload: dict[str, Any],
 ) -> Path:
-    resolved_path = Path(helper_path) if helper_path is not None else get_detached_helper_path()
+    resolved_path = Path(path)
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_path.write_text(render_update_helper_script(), encoding="utf-8-sig", newline="\r\n")
+    with resolved_path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2, default=_json_default)
+        fp.write("\n")
     return resolved_path
+
+
+def update_handoff_state(
+    path: str | os.PathLike[str],
+    **updates: Any,
+) -> dict[str, Any]:
+    state = read_update_handoff_state(path)
+    state.update(updates)
+    write_update_handoff_state(path, state)
+    return state
+
+
+def build_update_handoff_payload(
+    *,
+    repo_root: str | os.PathLike[str],
+    target_tag: str = "",
+    working_tree: UpdateWorkingTreeState | None = None,
+    log_path: str | os.PathLike[str] | None = None,
+    preflight: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    tree = working_tree or UpdateWorkingTreeState()
+    return {
+        "version": 1,
+        "status": "pending",
+        "repo_root": str(Path(repo_root).resolve()),
+        "target_tag": str(target_tag or ""),
+        "requested_at": time.time(),
+        "acknowledged_at": None,
+        "log_path": str(log_path or get_update_log_path()),
+        "working_tree": {
+            "source_status": list(tree.source_status),
+            "cleanup_targets": list(tree.cleanup_targets),
+            "local_only_count": tree.local_only_count,
+            "remote_only_count": tree.remote_only_count,
+            "local_only_commits": list(tree.local_only_commits),
+            "remote_only_commits": list(tree.remote_only_commits),
+        },
+        "preflight": dict(preflight or {}),
+        "progress": build_update_progress_snapshot("handoff", state="pending"),
+    }
+
+
+def _resolve_script_path(
+    *,
+    argv: Sequence[str] | None = None,
+    main_file: str | os.PathLike[str] | None = None,
+) -> str:
+    resolved_argv = list(sys.argv if argv is None else argv)
+    script = resolved_argv[0] if resolved_argv else ""
+    if not script or str(script).startswith("-"):
+        script = str(main_file or Path(__file__).resolve().parents[2] / "main.py")
+    return os.path.abspath(str(script))
+
+
+def build_update_handoff_command(
+    state_path: str | os.PathLike[str],
+    *,
+    executable: str | os.PathLike[str] | None = None,
+    argv: Sequence[str] | None = None,
+    frozen: bool | None = None,
+    main_file: str | os.PathLike[str] | None = None,
+    handoff_executable_path: str | os.PathLike[str] | None = None,
+    copy_function=shutil.copy2,
+) -> list[str]:
+    is_frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
+    resolved_state = str(state_path)
+    if is_frozen:
+        source = Path(executable or sys.executable)
+        target = Path(handoff_executable_path) if handoff_executable_path is not None else get_update_handoff_executable_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.normcase(os.path.abspath(source)) != os.path.normcase(os.path.abspath(target)):
+            copy_function(source, target)
+        return [str(target), UPDATE_HANDOFF_ARG, resolved_state]
+
+    script = _resolve_script_path(argv=argv, main_file=main_file)
+    return [str(executable or sys.executable), script, UPDATE_HANDOFF_ARG, resolved_state]
+
+
+def cleanup_update_handoff_executable(
+    *,
+    base_dir: str | os.PathLike[str] | None = None,
+    executable_path: str | os.PathLike[str] | None = None,
+    current_executable: str | os.PathLike[str] | None = None,
+    unlink_function: Callable[[Path], Any] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    target = (
+        Path(executable_path)
+        if executable_path is not None
+        else get_update_handoff_executable_path(base_dir)
+    )
+    try:
+        if not target.exists():
+            return True
+        current = Path(current_executable or sys.executable)
+        if os.path.normcase(os.path.abspath(target)) == os.path.normcase(
+            os.path.abspath(current)
+        ):
+            return False
+        if unlink_function is None:
+            target.unlink()
+        else:
+            unlink_function(target)
+        return True
+    except Exception as exc:
+        if callable(log):
+            log(f"handoff helper cleanup skipped: {target} ({exc!r})")
+        return False
+
+
+def cleanup_update_handoff_executable_with_retries(
+    *,
+    base_dir: str | os.PathLike[str] | None = None,
+    executable_path: str | os.PathLike[str] | None = None,
+    current_executable: str | os.PathLike[str] | None = None,
+    attempts: int = 20,
+    delay_seconds: float = 0.5,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    total_attempts = max(1, int(attempts or 1))
+    for attempt in range(total_attempts):
+        if cleanup_update_handoff_executable(
+            base_dir=base_dir,
+            executable_path=executable_path,
+            current_executable=current_executable,
+            log=log,
+        ):
+            return True
+        if attempt < total_attempts - 1:
+            time.sleep(max(0.0, float(delay_seconds)))
+    return False
+
+
+def start_update_handoff_cleanup_thread(
+    *,
+    base_dir: str | os.PathLike[str] | None = None,
+    executable_path: str | os.PathLike[str] | None = None,
+    current_executable: str | os.PathLike[str] | None = None,
+    attempts: int = 20,
+    delay_seconds: float = 0.5,
+    thread_factory=threading.Thread,
+    log: Callable[[str], None] | None = None,
+) -> Any:
+    def worker() -> None:
+        cleanup_update_handoff_executable_with_retries(
+            base_dir=base_dir,
+            executable_path=executable_path,
+            current_executable=current_executable,
+            attempts=attempts,
+            delay_seconds=delay_seconds,
+            log=log,
+        )
+
+    thread = thread_factory(target=worker, daemon=True)
+    try:
+        thread.start()
+    except Exception as exc:
+        if callable(log):
+            log(f"handoff helper cleanup thread failed: {exc!r}")
+    return thread
+
+
+def is_update_handoff_argv(argv: Sequence[str] | None = None) -> bool:
+    resolved_argv = list(sys.argv if argv is None else argv)
+    return UPDATE_HANDOFF_ARG in resolved_argv
+
+
+def get_update_handoff_state_arg(argv: Sequence[str] | None = None) -> str:
+    resolved_argv = list(sys.argv if argv is None else argv)
+    try:
+        idx = resolved_argv.index(UPDATE_HANDOFF_ARG)
+        return str(resolved_argv[idx + 1])
+    except Exception:
+        return ""
+
+
+def wait_for_update_handoff_ack(
+    state_path: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = 0.05,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while time.monotonic() <= deadline:
+        state = read_update_handoff_state(state_path)
+        if state.get("acknowledged_at") or state.get("status") in {"running", "complete", "failed"}:
+            return True
+        time.sleep(max(0.01, float(poll_interval_seconds)))
+    return False
+
+
+def append_update_log(log_path: str | os.PathLike[str], message: str) -> None:
+    try:
+        resolved_path = Path(log_path)
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        with resolved_path.open("a", encoding="utf-8") as fp:
+            fp.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception:
+        pass
+    return
+
+
+class UpdateHandoffProgressUi:
+    def __init__(self, *, log_path: str | os.PathLike[str] = "") -> None:
+        self._log_path = str(log_path or "")
+        self._root = None
+        self._stage_label = None
+        self._detail_label = None
+        self._progressbar = None
+        self._retry_button = None
+        self._manual_button = None
+        self._close_button = None
+        self.retry_requested = False
+        self._closed = False
+        return
+
+    def show(self, snapshot: dict[str, Any]) -> None:
+        if self._root is not None:
+            self.set_snapshot(snapshot)
+            return
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except Exception:
+            return
+        try:
+            root = tk.Tk()
+            self._closed = False
+            root.title(str(snapshot.get("title") or UPDATE_PROGRESS_TITLE))
+            root.geometry("460x220")
+            root.resizable(False, False)
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            frame = tk.Frame(root, padx=16, pady=14)
+            root.protocol("WM_DELETE_WINDOW", self.close)
+            frame.pack(fill="both", expand=True)
+            title = tk.Label(
+                frame,
+                text="Windows Supporter 업데이트 중",
+                font=("Segoe UI", 11, "bold"),
+                anchor="w",
+            )
+            title.pack(fill="x")
+            stage = tk.Label(frame, text="", font=("Segoe UI", 9), anchor="w")
+            stage.pack(fill="x", pady=(12, 4))
+            progress = ttk.Progressbar(
+                frame,
+                orient="horizontal",
+                mode="determinate",
+                maximum=100,
+            )
+            progress.pack(fill="x")
+            detail = tk.Label(
+                frame,
+                text="",
+                font=("Segoe UI", 9),
+                anchor="w",
+                justify="left",
+                wraplength=410,
+            )
+            detail.pack(fill="x", pady=(10, 8))
+
+            buttons = tk.Frame(frame)
+            buttons.pack(fill="x")
+            log_button = ttk.Button(
+                buttons,
+                text=UPDATE_PROGRESS_LOG_BUTTON_TEXT,
+                command=self._open_log,
+                width=11,
+            )
+            log_button.pack(side="right")
+            close_button = ttk.Button(
+                buttons,
+                text=UPDATE_PROGRESS_CLOSE_BUTTON_TEXT,
+                command=self.close,
+                width=9,
+            )
+            close_button.pack(side="right", padx=(0, 6))
+            manual_button = ttk.Button(
+                buttons,
+                text=UPDATE_PROGRESS_MANUAL_ACTION_TEXT,
+                command=self._show_manual_action,
+                width=11,
+            )
+            manual_button.pack(side="right", padx=(0, 6))
+            retry_button = ttk.Button(
+                buttons,
+                text=UPDATE_PROGRESS_RETRY_BUTTON_TEXT,
+                command=self._request_retry,
+                width=9,
+            )
+            retry_button.pack(side="right", padx=(0, 6))
+
+            self._root = root
+            self._stage_label = stage
+            self._detail_label = detail
+            self._progressbar = progress
+            self._retry_button = retry_button
+            self._manual_button = manual_button
+            self._close_button = close_button
+            self.set_snapshot(snapshot)
+            self.pump()
+        except Exception:
+            self._root = None
+        return
+
+    def set_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if self._root is None:
+            self.show(snapshot)
+            return
+        try:
+            state = str(snapshot.get("state") or "")
+            self._root.title(str(snapshot.get("title") or UPDATE_PROGRESS_TITLE))
+            if self._stage_label is not None:
+                self._stage_label.configure(text=str(snapshot.get("label") or ""))
+            if self._detail_label is not None:
+                self._detail_label.configure(text=str(snapshot.get("detail") or ""))
+            if self._progressbar is not None:
+                self._progressbar.configure(value=int(snapshot.get("percent") or 0))
+            failure = state == "failed"
+            if self._retry_button is not None:
+                self._retry_button.configure(
+                    state="normal" if failure and bool(snapshot.get("can_retry")) else "disabled"
+                )
+            for button in (self._manual_button, self._close_button):
+                if button is not None:
+                    button.configure(state="normal" if failure else "disabled")
+            self.pump()
+        except Exception:
+            pass
+        return
+
+    def pump(self) -> None:
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.update_idletasks()
+            root.update()
+        except Exception:
+            pass
+        return
+
+    def close(self) -> None:
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        self._root = None
+        self._closed = True
+        return
+
+    def _open_log(self) -> None:
+        if not self._log_path:
+            return
+        try:
+            os.startfile(self._log_path)
+        except Exception:
+            pass
+        return
+
+    def _request_retry(self) -> None:
+        self.retry_requested = True
+        return
+
+    def wait_for_retry_or_close(self) -> bool:
+        if self._root is None:
+            return False
+        while not self._closed and not self.retry_requested:
+            self.pump()
+            time.sleep(0.1)
+        should_retry = bool(self.retry_requested)
+        self.retry_requested = False
+        return should_retry
+
+    def _show_manual_action(self) -> None:
+        try:
+            from tkinter import messagebox
+
+            messagebox.showinfo(
+                UPDATE_PROGRESS_TITLE,
+                f"수동 조치가 필요하면 로그를 확인한 뒤 Git 상태와 build.bat 실행 결과를 점검해 주세요.\n로그: {self._log_path}",
+            )
+        except Exception:
+            pass
+        return
+
+
+def run_no_window_with_progress(
+    argv: list[str],
+    *,
+    subprocess_module=subprocess,
+    progress_ui: UpdateHandoffProgressUi | None = None,
+    pump_interval_seconds: float = 0.1,
+    **kwargs: Any,
+) -> Any:
+    holder: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            holder["result"] = run_no_window(
+                argv,
+                subprocess_module=subprocess_module,
+                **kwargs,
+            )
+        except Exception as exc:
+            holder["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        if progress_ui is not None:
+            progress_ui.pump()
+        thread.join(max(0.01, float(pump_interval_seconds)))
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("result")
+
+
+def run_update_handoff(
+    state_path: str | os.PathLike[str],
+    *,
+    subprocess_module=subprocess,
+    launch=popen_no_window,
+    progress_ui_factory=UpdateHandoffProgressUi,
+    max_attempts: int = 2,
+) -> int:
+    state_path = str(state_path)
+    state = read_update_handoff_state(state_path)
+    repo_root = str(state.get("repo_root") or "").strip()
+    log_path = str(state.get("log_path") or get_update_log_path())
+    if not repo_root:
+        update_handoff_state(
+            state_path,
+            status="failed",
+            failed_step="handoff state",
+            error="repo_root is missing",
+        )
+        return 1
+
+    progress_ui = progress_ui_factory(log_path=log_path) if callable(progress_ui_factory) else None
+    attempts = max(1, int(max_attempts or 1))
+    for attempt in range(1, attempts + 1):
+        build_progress = build_update_progress_snapshot(
+            "build",
+            state="running",
+            detail=f"build.bat를 실행합니다. (시도 {attempt}/{attempts})",
+        )
+        if progress_ui is not None:
+            progress_ui.show(build_progress)
+        update_handoff_state(
+            state_path,
+            status="running",
+            acknowledged_at=time.time(),
+            attempt=attempt,
+            progress=build_progress,
+        )
+        append_update_log(log_path, f"handoff attempt {attempt} acknowledged")
+        try:
+            env = dict(os.environ)
+            env["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"] = "1"
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            result = run_no_window_with_progress(
+                ["cmd", "/c", "build.bat"],
+                subprocess_module=subprocess_module,
+                progress_ui=progress_ui,
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS,
+            )
+            output = str(getattr(result, "stdout", "") or "")
+            error_output = str(getattr(result, "stderr", "") or "")
+            if output:
+                append_update_log(log_path, output.strip())
+            if error_output:
+                append_update_log(log_path, error_output.strip())
+            if int(getattr(result, "returncode", 1) or 0) != 0:
+                raise RuntimeError(f"build.bat failed with exit code {getattr(result, 'returncode', 1)}")
+
+            relaunch_progress = build_update_progress_snapshot("relaunch", state="running")
+            if progress_ui is not None:
+                progress_ui.set_snapshot(relaunch_progress)
+            update_handoff_state(
+                state_path,
+                status="running",
+                progress=relaunch_progress,
+            )
+            exe_path = str(Path(repo_root) / "windows-supporter.exe")
+            proc = launch([exe_path], cwd=repo_root)
+            if proc is None:
+                raise RuntimeError("failed to relaunch windows-supporter.exe")
+
+            complete_progress = build_update_progress_snapshot("complete", state="complete")
+            if progress_ui is not None:
+                progress_ui.set_snapshot(complete_progress)
+            update_handoff_state(
+                state_path,
+                status="complete",
+                completed_at=time.time(),
+                progress=complete_progress,
+            )
+            append_update_log(log_path, "handoff completed")
+            if progress_ui is not None:
+                progress_ui.close()
+            return 0
+        except Exception as exc:
+            can_retry = attempt < attempts
+            failed_progress = build_update_progress_snapshot(
+                "failed",
+                state="failed",
+                detail=str(exc),
+                failed_step="build/relaunch handoff",
+                can_retry=can_retry,
+                can_manual_action=True,
+            )
+            if progress_ui is not None:
+                progress_ui.set_snapshot(failed_progress)
+            update_handoff_state(
+                state_path,
+                status="failed",
+                failed_at=time.time(),
+                failed_step="build/relaunch handoff",
+                error=str(exc),
+                attempt=attempt,
+                progress=failed_progress,
+            )
+            append_update_log(log_path, f"handoff attempt {attempt} failed: {exc}")
+            if can_retry and progress_ui is not None and progress_ui.wait_for_retry_or_close():
+                continue
+            return 1
+    return 1
+
+
+def run_update_handoff_from_argv(argv: Sequence[str] | None = None) -> bool:
+    if not is_update_handoff_argv(argv):
+        return False
+    state_path = get_update_handoff_state_arg(argv)
+    raise SystemExit(run_update_handoff(state_path))
 
 
 class UpdatePromptSession:
@@ -385,7 +868,11 @@ class WindowsSupporterUpdater:
         popen=popen_no_window,
         quit_callback=None,
         status_changed_callback=None,
-        helper_writer=write_detached_helper_script,
+        handoff_path_provider=get_update_handoff_path,
+        handoff_writer=write_update_handoff_state,
+        handoff_command_builder=build_update_handoff_command,
+        handoff_ack_waiter=wait_for_update_handoff_ack,
+        timestamp_provider=lambda: time.strftime("%Y%m%d-%H%M%S"),
         worktree_runner=subprocess.run,
     ) -> None:
         self._root = root
@@ -397,7 +884,11 @@ class WindowsSupporterUpdater:
         self._popen = popen
         self._quit_callback = quit_callback
         self._status_changed_callback = status_changed_callback
-        self._helper_writer = helper_writer
+        self._handoff_path_provider = handoff_path_provider
+        self._handoff_writer = handoff_writer
+        self._handoff_command_builder = handoff_command_builder
+        self._handoff_ack_waiter = handoff_ack_waiter
+        self._timestamp_provider = timestamp_provider
         self._worktree_runner = worktree_runner
         self._session = UpdatePromptSession()
         self._worker_active = False
@@ -405,6 +896,9 @@ class WindowsSupporterUpdater:
         self._current_tag = ""
         self._latest_tag = ""
         self._last_error = ""
+        self._working_tree_state = UpdateWorkingTreeState()
+        self._progress_snapshot = build_update_progress_snapshot("idle", state="idle")
+        self._preflight_result: dict[str, Any] = {}
         return
 
     def start(self) -> None:
@@ -422,17 +916,20 @@ class WindowsSupporterUpdater:
             return
         self._worker_active = True
         self._state = "checking"
+        self._progress_snapshot = build_update_progress_snapshot("checking", state="checking")
         self._notify_status_changed()
 
         def worker() -> None:
             candidate = None
-            dirty = False
+            working_tree = UpdateWorkingTreeState()
             error = ""
             try:
-                candidate, dirty, error = self._collect_update_candidate()
+                candidate, working_tree, error = self._collect_update_candidate()
             except Exception as exc:
                 error = repr(exc)
-            self._post_ui(lambda: self._handle_check_result(candidate, dirty, error, manual))
+            self._post_ui(
+                lambda: self._handle_check_result(candidate, working_tree, error, manual)
+            )
 
         try:
             thread = self._thread_factory(target=worker, daemon=True)
@@ -450,6 +947,15 @@ class WindowsSupporterUpdater:
             "current_tag": self._current_tag,
             "latest_tag": self._latest_tag,
             "last_error": self._last_error,
+            "working_tree": {
+                "has_source_changes": self._working_tree_state.has_source_changes,
+                "has_cleanup_targets": self._working_tree_state.has_cleanup_targets,
+                "is_diverged": self._working_tree_state.is_diverged,
+                "local_only_count": self._working_tree_state.local_only_count,
+                "remote_only_count": self._working_tree_state.remote_only_count,
+            },
+            "progress": dict(self._progress_snapshot),
+            "preflight": dict(self._preflight_result),
         }
 
     def set_status_changed_callback(self, callback) -> None:
@@ -467,6 +973,13 @@ class WindowsSupporterUpdater:
             return False
         self._state = "unavailable"
         self._last_error = message
+        self._progress_snapshot = build_update_progress_snapshot(
+            "failed",
+            state="unavailable",
+            detail=message,
+            failed_step="업데이트 지원 여부 확인",
+            can_manual_action=True,
+        )
         self._notify_status_changed()
         return True
 
@@ -494,7 +1007,9 @@ class WindowsSupporterUpdater:
             pass
         return
 
-    def _collect_update_candidate(self) -> tuple[UpdateCandidate | None, bool, str]:
+    def _collect_update_candidate(
+        self,
+    ) -> tuple[UpdateCandidate | None, UpdateWorkingTreeState, str]:
         describe = self._git_output(["git", "describe", "--tags", "--long", "--match", "v[0-9]*"])
         current_tag = resolve_current_tag(
             app_version=self._app_version_provider(),
@@ -502,20 +1017,21 @@ class WindowsSupporterUpdater:
         )
         self._current_tag = current_tag
         if not current_tag:
-            return None, False, "current tag could not be resolved"
+            return None, UpdateWorkingTreeState(), "current tag could not be resolved"
 
         remote_output = self._git_output(build_remote_tag_check_command())
         remote_tags = parse_remote_tag_refs(remote_output)
         candidate = select_update_candidate(current_tag=current_tag, remote_tags=remote_tags)
-        dirty = bool(candidate is not None and self._has_update_cleanup_targets())
-        return candidate, dirty, ""
+        working_tree = self._inspect_working_tree_state() if candidate is not None else UpdateWorkingTreeState()
+        return candidate, working_tree, ""
 
     def _git_output(self, argv: list[str]) -> str:
         env = dict(os.environ)
         env["GIT_TERMINAL_PROMPT"] = "0"
         try:
-            result = self._subprocess.run(
+            result = run_no_window(
                 argv,
+                subprocess_module=self._subprocess,
                 cwd=self._repo_root,
                 capture_output=True,
                 text=True,
@@ -535,15 +1051,35 @@ class WindowsSupporterUpdater:
     def _handle_check_result(
         self,
         candidate: UpdateCandidate | None,
-        dirty: bool,
+        working_tree: UpdateWorkingTreeState | bool,
         error: str,
         manual: bool,
     ) -> None:
         self._worker_active = False
         self._last_error = str(error or "")
+        if isinstance(working_tree, UpdateWorkingTreeState):
+            self._working_tree_state = working_tree
+        else:
+            self._working_tree_state = (
+                UpdateWorkingTreeState(source_status=("legacy-dirty",))
+                if bool(working_tree)
+                else UpdateWorkingTreeState()
+            )
         if candidate is None:
             self._latest_tag = ""
             self._state = "error" if error else "current"
+            self._progress_snapshot = (
+                build_update_progress_snapshot(
+                    "failed",
+                    state="failed",
+                    detail=self._last_error,
+                    failed_step="업데이트 확인",
+                    can_retry=True,
+                    can_manual_action=True,
+                )
+                if error
+                else build_update_progress_snapshot("complete", state="current")
+            )
             self._notify_status_changed()
             if manual:
                 self._show_info("Windows Supporter 업데이트", self._manual_no_update_message())
@@ -551,20 +1087,43 @@ class WindowsSupporterUpdater:
 
         self._latest_tag = candidate.tag
         self._state = "update_available"
+        self._progress_snapshot = build_update_progress_snapshot(
+            "available",
+            state="update_available",
+            detail=f"새 버전 {candidate.tag}을 설치할 수 있습니다.",
+        )
         self._notify_status_changed()
         if not manual and not self._session.should_prompt(candidate.tag):
             return
 
         if self._ask_update(candidate):
-            dirty = bool(dirty or self._is_worktree_dirty())
-            if dirty:
+            try:
+                working_tree = self._inspect_working_tree_state()
+            except Exception as exc:
+                self._state = "error"
+                self._last_error = f"Git 상태를 확인할 수 없습니다: {exc}"
+                self._progress_snapshot = build_update_progress_snapshot(
+                    "failed",
+                    state="failed",
+                    detail=self._last_error,
+                    failed_step="Git 상태 확인",
+                    can_retry=True,
+                    can_manual_action=True,
+                )
+                self._notify_status_changed()
+                return
+            self._working_tree_state = working_tree
+            if working_tree.has_source_changes:
                 self._show_warning(
                     "Windows Supporter 업데이트",
-                    "커밋되지 않은 변경이 있어 자동 stash 및 빌드 산출물 정리 후 업데이트를 계속합니다.",
+                    UPDATE_SOURCE_CHANGE_NOTICE,
                 )
+            if not self._prepare_repository_for_update(working_tree):
+                return
             self.launch_update()
         else:
             self._session.dismiss(candidate.tag)
+            self._progress_snapshot = build_update_progress_snapshot("idle", state="idle")
         return
 
     def _manual_no_update_message(self) -> str:
@@ -585,15 +1144,36 @@ class WindowsSupporterUpdater:
         return
 
     def _is_worktree_dirty(self) -> bool:
-        return self._has_update_cleanup_targets()
+        return self._inspect_working_tree_state().has_source_changes
 
     def _has_update_cleanup_targets(self) -> bool:
-        try:
-            if self._git_output(["git", "status", "--porcelain"]):
-                return True
-            return bool(self._git_output(build_allowed_clean_probe_command()))
-        except Exception:
-            return False
+        return self._inspect_working_tree_state().has_cleanup_targets
+
+    def _inspect_working_tree_state(self) -> UpdateWorkingTreeState:
+        source_status = parse_git_status_porcelain(
+            self._git_output(["git", "status", "--porcelain", "--untracked-files=all"])
+        )
+        cleanup_targets = parse_clean_probe_output(
+            self._git_output(build_allowed_clean_probe_command())
+        )
+        local_count, remote_count = self._read_divergence_counts()
+        local_commits, remote_commits = self._read_divergence_commits()
+        return UpdateWorkingTreeState(
+            source_status=source_status,
+            cleanup_targets=cleanup_targets,
+            local_only_count=local_count,
+            remote_only_count=remote_count,
+            local_only_commits=local_commits,
+            remote_only_commits=remote_commits,
+        )
+
+    def _read_divergence_counts(self) -> tuple[int, int]:
+        output = self._git_output(build_divergence_count_command())
+        return parse_divergence_counts(output)
+
+    def _read_divergence_commits(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        output = self._git_output(build_divergence_log_command())
+        return parse_left_right_log(output)
 
     def _ask_update(self, candidate: UpdateCandidate) -> bool:
         try:
@@ -626,24 +1206,181 @@ class WindowsSupporterUpdater:
             pass
         return
 
+    def _ask_force_clean(self, working_tree: UpdateWorkingTreeState) -> bool:
+        try:
+            from tkinter import messagebox
+
+            return bool(
+                messagebox.askyesno(
+                    "Windows Supporter 업데이트",
+                    build_force_clean_approval_message(working_tree),
+                )
+            )
+        except Exception:
+            return False
+
+    def _next_update_timestamp(self) -> str:
+        try:
+            return str(self._timestamp_provider()).strip()
+        except Exception:
+            return time.strftime("%Y%m%d-%H%M%S")
+
+    def _create_backup_branch(self, timestamp: str) -> str:
+        try:
+            short_sha = self._git_output(build_short_head_command("main"))
+        except Exception:
+            short_sha = "head"
+        last_error: Exception | None = None
+        for suffix in range(0, 10):
+            branch_name = build_backup_branch_name(timestamp, short_sha, suffix=suffix)
+            try:
+                self._git_output(build_backup_branch_command(branch_name, "main"))
+                return branch_name
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("backup branch could not be created")
+
+    def _prepare_repository_for_update(self, working_tree: UpdateWorkingTreeState) -> bool:
+        timestamp = self._next_update_timestamp()
+        preflight: dict[str, Any] = {
+            "timestamp": timestamp,
+            "force_clean_approved": False,
+            "stash_output": "",
+            "backup_branch": "",
+            "cleaned_targets": list(working_tree.cleanup_targets),
+        }
+        try:
+            self._progress_snapshot = build_update_progress_snapshot("fetch", state="running")
+            self._notify_status_changed()
+            self._git_output(build_fetch_origin_command())
+
+            fresh_tree = self._inspect_working_tree_state()
+            self._working_tree_state = fresh_tree
+            preflight["cleaned_targets"] = list(fresh_tree.cleanup_targets)
+
+            requires_force_clean = fresh_tree.is_diverged or fresh_tree.has_local_only_commits
+            if requires_force_clean:
+                self._progress_snapshot = build_update_progress_snapshot(
+                    "preflight",
+                    state="await_force_clean_approval",
+                    detail="로컬 전용 커밋을 보존한 뒤 main을 origin/main 기준으로 동기화해야 합니다.",
+                )
+                self._notify_status_changed()
+                if not self._ask_force_clean(fresh_tree):
+                    self._state = "cancelled"
+                    self._last_error = UPDATE_FORCE_CLEAN_REJECTED_NOTICE
+                    self._progress_snapshot = build_update_progress_snapshot(
+                        "failed",
+                        state="cancelled",
+                        detail=UPDATE_FORCE_CLEAN_REJECTED_NOTICE,
+                        failed_step="강제정리 승인",
+                        can_manual_action=True,
+                    )
+                    self._notify_status_changed()
+                    return False
+                preflight["force_clean_approved"] = True
+
+            if fresh_tree.has_source_changes:
+                self._progress_snapshot = build_update_progress_snapshot("stash", state="running")
+                self._notify_status_changed()
+                stash_message = f"windows-supporter auto update {timestamp}"
+                preflight["stash_output"] = self._git_output(build_stash_command(stash_message))
+
+            if fresh_tree.has_local_only_commits:
+                preflight["backup_branch"] = self._create_backup_branch(timestamp)
+
+            self._progress_snapshot = build_update_progress_snapshot("sync", state="running")
+            self._notify_status_changed()
+            self._git_output(build_switch_main_command())
+            if fresh_tree.has_local_only_commits or fresh_tree.is_diverged:
+                self._git_output(build_reset_main_command())
+            elif fresh_tree.has_remote_only_commits:
+                self._git_output(build_fast_forward_main_command())
+
+            if fresh_tree.has_cleanup_targets:
+                self._progress_snapshot = build_update_progress_snapshot("cleanup", state="running")
+                self._notify_status_changed()
+                self._git_output(build_allowed_clean_command())
+        except Exception as exc:
+            self._state = "error"
+            self._last_error = f"update preflight failed: {exc}"
+            self._progress_snapshot = build_update_progress_snapshot(
+                "failed",
+                state="failed",
+                detail=self._last_error,
+                failed_step="업데이트 사전 정리",
+                can_retry=True,
+                can_manual_action=True,
+            )
+            self._preflight_result = preflight
+            self._notify_status_changed()
+            return False
+
+        self._preflight_result = preflight
+        return True
+
     def launch_update(self) -> bool:
         if self._mark_unavailable_if_needed():
             return False
         try:
-            helper_path = Path(self._helper_writer())
+            handoff_path = Path(self._handoff_path_provider())
+            payload = build_update_handoff_payload(
+                repo_root=self._repo_root,
+                target_tag=self._latest_tag,
+                working_tree=self._working_tree_state,
+                log_path=get_update_log_path(handoff_path.parent),
+                preflight=self._preflight_result,
+            )
+            self._handoff_writer(handoff_path, payload)
+            command = self._handoff_command_builder(handoff_path)
         except Exception as exc:
             self._state = "error"
-            self._last_error = f"failed to prepare update helper: {exc}"
+            self._last_error = f"failed to prepare update handoff: {exc}"
+            self._progress_snapshot = build_update_progress_snapshot(
+                "failed",
+                state="failed",
+                detail=self._last_error,
+                failed_step="업데이트 실행 준비",
+                can_retry=True,
+                can_manual_action=True,
+            )
             self._notify_status_changed()
             return False
-        command = build_detached_helper_command(self._repo_root, helper_path=helper_path)
-        proc = self._popen(command)
+
+        proc = self._popen(command, cwd=self._repo_root)
         if proc is None:
             self._state = "error"
-            self._last_error = "failed to launch update helper"
+            self._last_error = "failed to launch update handoff"
+            self._progress_snapshot = build_update_progress_snapshot(
+                "failed",
+                state="failed",
+                detail=self._last_error,
+                failed_step="업데이트 프로세스 시작",
+                can_retry=True,
+                can_manual_action=True,
+            )
             self._notify_status_changed()
             return False
+
+        if not self._handoff_ack_waiter(handoff_path):
+            self._state = "error"
+            self._last_error = "update handoff did not acknowledge startup"
+            self._progress_snapshot = build_update_progress_snapshot(
+                "failed",
+                state="failed",
+                detail=self._last_error,
+                failed_step="업데이트 프로세스 확인",
+                can_retry=True,
+                can_manual_action=True,
+            )
+            self._notify_status_changed()
+            return False
+
         self._state = "updating"
+        self._progress_snapshot = build_update_progress_snapshot("handoff", state="running")
         self._notify_status_changed()
         try:
             if callable(self._quit_callback):
@@ -722,6 +1459,108 @@ def build_remote_tag_check_command(remote: str = "origin") -> list[str]:
     return ["git", "ls-remote", "--tags", "--refs", resolved_remote]
 
 
+def build_fetch_origin_command(remote: str = "origin") -> list[str]:
+    resolved_remote = str(remote or "").strip() or "origin"
+    return ["git", "fetch", "--tags", resolved_remote]
+
+
+def build_switch_main_command(branch: str = "main") -> list[str]:
+    return ["git", "switch", str(branch or "main")]
+
+
+def build_reset_main_command(remote_ref: str = "origin/main") -> list[str]:
+    return ["git", "reset", "--hard", str(remote_ref or "origin/main")]
+
+
+def build_fast_forward_main_command(remote_ref: str = "origin/main") -> list[str]:
+    return ["git", "merge", "--ff-only", str(remote_ref or "origin/main")]
+
+
+def build_short_head_command(ref: str = "main") -> list[str]:
+    return ["git", "rev-parse", "--short", str(ref or "main")]
+
+
+def build_backup_branch_name(timestamp: str, short_sha: str, *, suffix: int = 0) -> str:
+    safe_timestamp = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(timestamp or "").strip())
+    safe_sha = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(short_sha or "").strip())
+    name = f"backup/windows-supporter-auto-update/{safe_timestamp or 'unknown'}-{safe_sha or 'head'}"
+    if int(suffix or 0) > 0:
+        name = f"{name}-{int(suffix)}"
+    return name
+
+
+def build_backup_branch_command(branch_name: str, ref: str = "main") -> list[str]:
+    return ["git", "branch", str(branch_name), str(ref or "main")]
+
+
+def build_divergence_count_command(
+    *,
+    local_ref: str = "main",
+    remote_ref: str = "origin/main",
+) -> list[str]:
+    return ["git", "rev-list", "--left-right", "--count", f"{remote_ref}...{local_ref}"]
+
+
+def build_divergence_log_command(
+    *,
+    local_ref: str = "main",
+    remote_ref: str = "origin/main",
+) -> list[str]:
+    return [
+        "git",
+        "log",
+        "--oneline",
+        "--left-right",
+        "--cherry-pick",
+        f"{remote_ref}...{local_ref}",
+    ]
+
+
+def parse_git_status_porcelain(output: str) -> tuple[str, ...]:
+    return tuple(line.strip() for line in str(output or "").splitlines() if line.strip())
+
+
+def parse_clean_probe_output(output: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    prefix = "Would remove "
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(prefix):
+            line = line[len(prefix) :].strip()
+        targets.append(line)
+    return tuple(targets)
+
+
+def parse_divergence_counts(output: str) -> tuple[int, int]:
+    parts = str(output or "").strip().split()
+    if len(parts) < 2:
+        return 0, 0
+    try:
+        remote_only = max(0, int(parts[0]))
+        local_only = max(0, int(parts[1]))
+    except Exception:
+        return 0, 0
+    return local_only, remote_only
+
+
+def parse_left_right_log(output: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    local: list[str] = []
+    remote: list[str] = []
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        marker = line[:1]
+        commit = line[1:].strip()
+        if marker == ">":
+            local.append(commit)
+        elif marker == "<":
+            remote.append(commit)
+    return tuple(local), tuple(remote)
+
+
 def build_stash_command(message: str) -> list[str]:
     return [
         "git",
@@ -743,28 +1582,3 @@ def build_allowed_clean_probe_command(
     allowlist: tuple[str, ...] = DEFAULT_CLEAN_ALLOWLIST,
 ) -> list[str]:
     return ["git", "clean", "-ndX", "--", *[str(item) for item in allowlist]]
-
-
-def classify_switch_main_error(stderr: str) -> str:
-    text = str(stderr or "").lower()
-    if "already checked out at" in text:
-        return "main_checked_out_in_other_worktree"
-    return "unknown"
-
-
-def build_detached_helper_command(
-    repo_root: str | os.PathLike[str],
-    *,
-    helper_path: str | os.PathLike[str] | None = None,
-) -> list[str]:
-    resolved_helper = Path(helper_path) if helper_path is not None else get_detached_helper_path()
-    return [
-        "powershell",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(resolved_helper),
-        "-RepoRoot",
-        str(repo_root),
-    ]

@@ -6,8 +6,45 @@ from collections.abc import Sequence
 from typing import Any, Callable
 
 
+def build_no_window_subprocess_kwargs(
+    subprocess_module: Any = subprocess,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    creationflags = 0
+    if hasattr(subprocess_module, "CREATE_NO_WINDOW"):
+        creationflags |= int(getattr(subprocess_module, "CREATE_NO_WINDOW", 0))
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_factory = getattr(subprocess_module, "STARTUPINFO", None)
+    if callable(startupinfo_factory):
+        try:
+            startupinfo = startupinfo_factory()
+            startupinfo.dwFlags |= int(getattr(subprocess_module, "STARTF_USESHOWWINDOW", 0))
+            startupinfo.wShowWindow = int(getattr(subprocess_module, "SW_HIDE", 0))
+            kwargs["startupinfo"] = startupinfo
+        except Exception:
+            pass
+    return kwargs
+
+
+def run_no_window(
+    argv: list[str],
+    *,
+    subprocess_module: Any = subprocess,
+    **kwargs: Any,
+) -> Any:
+    run_kwargs = dict(kwargs)
+    for key, value in build_no_window_subprocess_kwargs(subprocess_module).items():
+        run_kwargs.setdefault(key, value)
+    return subprocess_module.run(argv, **run_kwargs)
+
+
 def popen_no_window(
-    argv: list[str], log: Callable[[str], None] | None = None
+    argv: list[str],
+    log: Callable[[str], None] | None = None,
+    *,
+    cwd: str | None = None,
 ) -> subprocess.Popen | None:
     try:
         creationflags = 0
@@ -15,7 +52,7 @@ def popen_no_window(
             creationflags |= subprocess.CREATE_NO_WINDOW
         if hasattr(subprocess, "DETACHED_PROCESS"):
             creationflags |= subprocess.DETACHED_PROCESS
-        return subprocess.Popen(argv, creationflags=creationflags)
+        return subprocess.Popen(argv, creationflags=creationflags, cwd=cwd)
     except Exception as exc:
         if log is not None:
             log(f"launch failed: {argv!r} ({exc!r})")

@@ -1,31 +1,62 @@
 from __future__ import annotations
 
-import codecs
 import os
 import subprocess
 import tempfile
 import types
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import src.utils.update_monitor as update_monitor_module
 from src.utils.update_monitor import (
     DEFAULT_CLEAN_ALLOWLIST,
     GIT_COMMAND_TIMEOUT_SECONDS,
+    UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS,
+    UPDATE_HANDOFF_ARG,
+    UPDATE_CLEANUP_ONLY_NOTICE,
+    UPDATE_FORCE_CLEAN_APPROVAL_TEXT,
+    UPDATE_FORCE_CLEAN_REJECTED_NOTICE,
+    UPDATE_PROGRESS_LOG_BUTTON_TEXT,
+    UPDATE_PROGRESS_MANUAL_ACTION_TEXT,
+    UPDATE_PROGRESS_RETRY_BUTTON_TEXT,
+    UPDATE_SOURCE_CHANGE_NOTICE,
     UpdateCandidate,
     UpdatePromptSession,
+    UpdateWorkingTreeState,
     WindowsSupporterUpdater,
     build_allowed_clean_command,
     build_allowed_clean_probe_command,
-    build_detached_helper_command,
+    build_divergence_count_command,
+    build_divergence_log_command,
+    build_backup_branch_command,
+    build_backup_branch_name,
+    build_fast_forward_main_command,
+    build_fetch_origin_command,
+    build_force_clean_approval_message,
     build_remote_tag_check_command,
+    build_reset_main_command,
+    build_short_head_command,
     build_stash_command,
-    classify_switch_main_error,
+    build_switch_main_command,
+    build_update_handoff_command,
+    build_update_handoff_payload,
+    build_update_progress_snapshot,
+    cleanup_update_handoff_executable,
+    get_update_progress_step,
     is_git_checkout_root,
+    parse_clean_probe_output,
+    parse_divergence_counts,
+    parse_git_status_porcelain,
+    parse_left_right_log,
     parse_remote_tag_refs,
     parse_semver_tag,
-    render_update_helper_script,
+    read_update_handoff_state,
     resolve_current_tag,
+    run_update_handoff,
     select_update_candidate,
-    write_detached_helper_script,
+    start_update_handoff_cleanup_thread,
+    wait_for_update_handoff_ack,
 )
 
 
@@ -141,102 +172,186 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertNotIn(".omx/", DEFAULT_CLEAN_ALLOWLIST)
         self.assertNotIn("windows-supporter.exe", DEFAULT_CLEAN_ALLOWLIST)
 
-    def test_switch_main_error_classifies_linked_worktree_ownership(self) -> None:
-        stderr = "fatal: 'main' is already checked out at 'C:/workspace/windows-supporter'"
-
+    def test_git_state_parsers_separate_source_cleanup_and_divergence(self) -> None:
         self.assertEqual(
-            classify_switch_main_error(stderr),
-            "main_checked_out_in_other_worktree",
+            parse_git_status_porcelain(" M src/main.py\n?? new-file.txt\n\n"),
+            ("M src/main.py", "?? new-file.txt"),
         )
-        self.assertEqual(classify_switch_main_error("fatal: something else"), "unknown")
+        self.assertEqual(
+            parse_clean_probe_output("Would remove build/generated.tmp\nWould remove dist/app\n"),
+            ("build/generated.tmp", "dist/app"),
+        )
+        self.assertEqual(parse_divergence_counts("3\t2"), (2, 3))
+        self.assertEqual(parse_divergence_counts("not counts"), (0, 0))
+        self.assertEqual(
+            parse_left_right_log("<abc123 remote commit\n>def456 local commit\nplain line"),
+            (("def456 local commit",), ("abc123 remote commit",)),
+        )
 
-    def test_detached_helper_command_uses_temp_helper_and_repo_argument(self) -> None:
-        command = build_detached_helper_command(
-            r"C:\repo\windows-supporter",
-            helper_path=r"C:\Users\me\AppData\Local\windows-supporter\update_windows_supporter.ps1",
+    def test_divergence_commands_use_remote_left_and_local_right(self) -> None:
+        self.assertEqual(
+            build_divergence_count_command(local_ref="main", remote_ref="origin/main"),
+            ["git", "rev-list", "--left-right", "--count", "origin/main...main"],
+        )
+        self.assertEqual(
+            build_divergence_log_command(local_ref="main", remote_ref="origin/main"),
+            [
+                "git",
+                "log",
+                "--oneline",
+                "--left-right",
+                "--cherry-pick",
+                "origin/main...main",
+            ],
+        )
+
+    def test_force_clean_command_builders_are_safe_and_explicit(self) -> None:
+        backup_name = build_backup_branch_name("20260614-120000", "abc123")
+
+        self.assertEqual(build_fetch_origin_command(), ["git", "fetch", "--tags", "origin"])
+        self.assertEqual(build_switch_main_command(), ["git", "switch", "main"])
+        self.assertEqual(build_reset_main_command(), ["git", "reset", "--hard", "origin/main"])
+        self.assertEqual(
+            build_fast_forward_main_command(),
+            ["git", "merge", "--ff-only", "origin/main"],
+        )
+        self.assertEqual(build_short_head_command(), ["git", "rev-parse", "--short", "main"])
+        self.assertEqual(
+            backup_name,
+            "backup/windows-supporter-auto-update/20260614-120000-abc123",
+        )
+        self.assertEqual(
+            build_backup_branch_command(backup_name),
+            ["git", "branch", backup_name, "main"],
+        )
+
+    def test_working_tree_state_flags_cleanup_without_source_stash(self) -> None:
+        cleanup_only = UpdateWorkingTreeState(cleanup_targets=("build/generated.tmp",))
+        diverged = UpdateWorkingTreeState(local_only_count=1, remote_only_count=2)
+        local_only = UpdateWorkingTreeState(local_only_count=1)
+
+        self.assertFalse(cleanup_only.has_source_changes)
+        self.assertTrue(cleanup_only.has_cleanup_targets)
+        self.assertFalse(cleanup_only.needs_source_stash)
+        self.assertTrue(cleanup_only.needs_pre_update_notice)
+        self.assertTrue(diverged.is_diverged)
+        self.assertTrue(diverged.needs_pre_update_notice)
+        self.assertFalse(local_only.is_diverged)
+
+    def test_handoff_command_uses_python_script_when_not_frozen(self) -> None:
+        command = build_update_handoff_command(
+            r"C:\state\update_handoff.json",
+            executable=r"C:\Python\python.exe",
+            argv=["main.py"],
+            frozen=False,
+            main_file=r"C:\repo\main.py",
         )
 
         self.assertEqual(
             command,
             [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                r"C:\Users\me\AppData\Local\windows-supporter\update_windows_supporter.ps1",
-                "-RepoRoot",
-                r"C:\repo\windows-supporter",
-            ],
-        )
-        self.assertNotIn("-m", command)
-
-    def test_detached_helper_command_preserves_paths_with_spaces(self) -> None:
-        command = build_detached_helper_command(
-            r"C:\repo with spaces\windows-supporter",
-            helper_path=r"C:\Users\me\AppData\Local\windows supporter\update helper.ps1",
-        )
-
-        self.assertEqual(
-            command,
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                r"C:\Users\me\AppData\Local\windows supporter\update helper.ps1",
-                "-RepoRoot",
-                r"C:\repo with spaces\windows-supporter",
+                r"C:\Python\python.exe",
+                os.path.abspath("main.py"),
+                UPDATE_HANDOFF_ARG,
+                r"C:\state\update_handoff.json",
             ],
         )
 
-    def test_detached_helper_command_executes_paths_with_cmd_metacharacters(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="ws upd & test ") as tmp:
-            helper_dir = os.path.join(tmp, "helper & dir")
-            repo_dir = os.path.join(tmp, "repo & dir")
-            os.makedirs(helper_dir)
-            os.makedirs(repo_dir)
-            helper_path = os.path.join(helper_dir, "update helper & script.ps1")
-            result_path = os.path.join(tmp, "result.txt")
-            escaped_result_path = result_path.replace("'", "''")
-            with open(helper_path, "w", encoding="utf-8") as fp:
-                fp.write(
-                    "param([string]$RepoRoot)\n"
-                    f"Set-Content -LiteralPath '{escaped_result_path}' -Value $RepoRoot\n"
-                )
+    def test_handoff_command_copies_frozen_executable_to_updater_name(self) -> None:
+        copies = []
 
-            result = subprocess.run(
-                build_detached_helper_command(repo_dir, helper_path=helper_path),
-                capture_output=True,
-                text=True,
-                check=False,
+        def copy_function(source, target):
+            copies.append((str(source), str(target)))
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            Path(target).write_text("copy", encoding="utf-8")
+            return target
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "windows-supporter.exe"
+            source.write_text("source", encoding="utf-8")
+            target = Path(tmp) / "windows-supporter-updater.exe"
+
+            command = build_update_handoff_command(
+                Path(tmp) / "update_handoff.json",
+                executable=source,
+                frozen=True,
+                handoff_executable_path=target,
+                copy_function=copy_function,
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            with open(result_path, "r", encoding="utf-8") as fp:
-                self.assertEqual(fp.read().strip(), repo_dir)
+        self.assertEqual(copies, [(str(source), str(target))])
+        self.assertEqual(command[0], str(target))
+        self.assertIn(UPDATE_HANDOFF_ARG, command)
+        self.assertNotEqual(command[0], str(source))
 
-    def test_write_detached_helper_script_uses_utf8_bom_for_windows_powershell(self) -> None:
+    def test_cleanup_update_handoff_executable_removes_helper_copy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            helper_path = write_detached_helper_script(os.path.join(tmp, "helper.ps1"))
+            helper = Path(tmp) / "windows-supporter-updater.exe"
+            helper.write_text("helper", encoding="utf-8")
+            current = Path(tmp) / "windows-supporter.exe"
+            current.write_text("current", encoding="utf-8")
 
-            with open(helper_path, "rb") as fp:
-                contents = fp.read()
+            cleaned = cleanup_update_handoff_executable(
+                executable_path=helper,
+                current_executable=current,
+            )
 
-            self.assertTrue(contents.startswith(codecs.BOM_UTF8))
+            self.assertTrue(cleaned)
+            self.assertFalse(helper.exists())
+            self.assertTrue(current.exists())
 
-    def test_rendered_update_helper_accepts_repo_root_and_runs_safe_flow(self) -> None:
-        script = render_update_helper_script()
+    def test_cleanup_update_handoff_executable_does_not_delete_current_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = Path(tmp) / "windows-supporter-updater.exe"
+            helper.write_text("helper", encoding="utf-8")
 
-        self.assertIn("param(", script)
-        self.assertIn("[string]$RepoRoot", script)
-        self.assertIn("git stash push --include-untracked", script)
-        self.assertIn('git clean -fdX -- build/ dist/ "*.spec" "*.egg-info/"', script)
-        self.assertIn("git fetch --tags origin", script)
-        self.assertIn("git merge --ff-only origin/main", script)
-        self.assertIn("cmd /c build.bat", script)
-        self.assertIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1", script)
+            cleaned = cleanup_update_handoff_executable(
+                executable_path=helper,
+                current_executable=helper,
+            )
+
+            self.assertFalse(cleaned)
+            self.assertTrue(helper.exists())
+
+    def test_start_update_handoff_cleanup_thread_retries_without_cmd_shell(self) -> None:
+        class InlineThread:
+            def __init__(self, target=None, daemon=False) -> None:
+                self.target = target
+                self.daemon = bool(daemon)
+                self.started = False
+
+            def start(self):
+                self.started = True
+                self.target()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = Path(tmp) / "windows-supporter-updater.exe"
+            helper.write_text("helper", encoding="utf-8")
+            current = Path(tmp) / "windows-supporter.exe"
+            current.write_text("current", encoding="utf-8")
+
+            thread = start_update_handoff_cleanup_thread(
+                executable_path=helper,
+                current_executable=current,
+                attempts=1,
+                delay_seconds=0,
+                thread_factory=InlineThread,
+            )
+
+            self.assertTrue(thread.started)
+            self.assertTrue(thread.daemon)
+            self.assertFalse(helper.exists())
+
+    def test_handoff_ack_timeout_allows_slow_windows_startup(self) -> None:
+        self.assertGreaterEqual(UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS, 10.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "update_handoff.json"
+            with open(state_path, "w", encoding="utf-8") as fp:
+                import json
+
+                json.dump({"status": "running"}, fp)
+
+            self.assertTrue(wait_for_update_handoff_ack(state_path))
 
     def test_build_bat_supports_updater_owned_relaunch(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
@@ -246,46 +361,47 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("SKIP_POST_BUILD_RUN", script)
         self.assertIn("Skipping post-build launch", script)
 
-    def test_rendered_update_helper_exposes_visible_progress_window_contract(self) -> None:
-        script = render_update_helper_script()
+    def test_update_progress_snapshot_exposes_korean_copy_and_progressbar(self) -> None:
+        build_step = get_update_progress_step("build")
+        snapshot = build_update_progress_snapshot("build", state="running")
+        failed = build_update_progress_snapshot(
+            "failed",
+            state="failed",
+            detail="build.bat 실패",
+            failed_step="build.bat 실행",
+            can_retry=True,
+            can_manual_action=True,
+        )
 
-        self.assertIn("Add-Type -AssemblyName System.Windows.Forms", script)
-        self.assertIn("Add-Type -AssemblyName System.Drawing", script)
-        self.assertIn("System.Windows.Forms.Form", script)
-        self.assertIn("Windows Supporter 업데이트", script)
-        self.assertIn("취소는 지원하지 않습니다", script)
-        self.assertIn("Open-UpdateLog", script)
-        self.assertIn("Update-ProgressStage", script)
-        self.assertIn("Checking Git checkout", script)
-        self.assertIn("Running build.bat", script)
-        self.assertIn("Start-Process", script)
-        self.assertIn("-PassThru", script)
-        self.assertIn("WaitForExit(250)", script)
-        self.assertIn("[System.Windows.Forms.Application]::DoEvents()", script)
+        self.assertEqual(build_step.label, "빌드 실행 중")
+        self.assertEqual(snapshot["title"], "Windows Supporter 업데이트")
+        self.assertEqual(snapshot["label"], "빌드 실행 중")
+        self.assertEqual(snapshot["percent"], 85)
+        self.assertTrue(snapshot["progressbar"]["visible"])
+        self.assertEqual(snapshot["progressbar"]["mode"], "determinate")
+        self.assertEqual(failed["title"], "Windows Supporter 업데이트 실패")
+        self.assertEqual(failed["failed_step"], "build.bat 실행")
+        self.assertTrue(failed["can_retry"])
+        self.assertTrue(failed["can_manual_action"])
+        self.assertEqual(failed["labels"]["log"], UPDATE_PROGRESS_LOG_BUTTON_TEXT)
+        self.assertEqual(failed["labels"]["retry"], UPDATE_PROGRESS_RETRY_BUTTON_TEXT)
+        self.assertEqual(failed["labels"]["manual_action"], UPDATE_PROGRESS_MANUAL_ACTION_TEXT)
 
-    def test_rendered_update_helper_exposes_failure_actions_and_retry_contract(self) -> None:
-        script = render_update_helper_script()
-
-        self.assertIn("Show-UpdateFailure", script)
-        self.assertIn("업데이트 실패", script)
-        self.assertIn("로그 열기", script)
-        self.assertIn("재시도", script)
-        self.assertIn("닫기", script)
-        self.assertIn("Restart-UpdateHelper", script)
-        self.assertIn("-ExecutionPolicy", script)
-        self.assertIn("-RepoRoot", script)
-
-    def test_rendered_update_helper_relaunches_built_executable_from_repo_root(self) -> None:
-        script = render_update_helper_script()
-
-        self.assertIn("Start-UpdatedWindowsSupporter", script)
-        self.assertIn('Join-Path -Path $RepoRoot -ChildPath "windows-supporter.exe"', script)
-        self.assertIn("Test-Path -LiteralPath $exePath", script)
-        self.assertIn("Start-Process", script)
-        self.assertIn("-WorkingDirectory $RepoRoot", script)
-        self.assertIn("Relaunched Windows Supporter exited immediately", script)
-        self.assertIn("$process.WaitForExit(250)", script)
-        self.assertIn("Update completed", script)
+    def test_update_korean_ux_copy_distinguishes_cleanup_source_and_force_clean(self) -> None:
+        self.assertIn("강제정리", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
+        self.assertIn("stash", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
+        self.assertIn("백업 브랜치", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
+        self.assertNotIn("백업 브랜치/태그", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
+        self.assertIn("reset/동기화", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
+        self.assertIn("강제정리가 취소", UPDATE_FORCE_CLEAN_REJECTED_NOTICE)
+        self.assertIn("stash", UPDATE_SOURCE_CHANGE_NOTICE)
+        self.assertNotIn("커밋되지 않은 변경", UPDATE_CLEANUP_ONLY_NOTICE)
+        self.assertIn("빌드 산출물", UPDATE_CLEANUP_ONLY_NOTICE)
+        message = build_force_clean_approval_message(
+            UpdateWorkingTreeState(local_only_count=2, remote_only_count=1)
+        )
+        self.assertIn("로컬 전용 커밋: 2개", message)
+        self.assertIn("원격 전용 커밋: 1개", message)
 
     def test_git_checkout_root_requires_git_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,20 +554,207 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         warnings = []
         launches = []
         updater._ask_update = lambda _candidate: True
-        updater._is_worktree_dirty = lambda: True
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState(
+            source_status=("M src/main.py",)
+        )
         updater._show_warning = lambda title, message: warnings.append((title, message))
+        updater._prepare_repository_for_update = lambda _working_tree: True
         updater.launch_update = lambda: launches.append(True) or True
 
         updater._handle_check_result(
             UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
-            dirty=False,
+            working_tree=UpdateWorkingTreeState(),
             error="",
             manual=True,
         )
 
         self.assertEqual(len(warnings), 1)
-        self.assertIn("자동 stash", warnings[0][1])
+        self.assertIn("커밋되지 않은 변경", warnings[0][1])
+        self.assertIn("stash", warnings[0][1])
         self.assertEqual(launches, [True])
+
+    def test_cleanup_only_update_launch_does_not_show_uncommitted_warning(self) -> None:
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+        )
+        warnings = []
+        launches = []
+        updater._ask_update = lambda _candidate: True
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState(
+            cleanup_targets=("build/generated.tmp",)
+        )
+        updater._show_warning = lambda title, message: warnings.append((title, message))
+        updater._prepare_repository_for_update = lambda _working_tree: True
+        updater.launch_update = lambda: launches.append(True) or True
+
+        updater._handle_check_result(
+            UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
+            working_tree=UpdateWorkingTreeState(cleanup_targets=("build/generated.tmp",)),
+            error="",
+            manual=True,
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(launches, [True])
+
+    def test_force_clean_rejection_stops_before_destructive_commands(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.commands = []
+
+            def run(self, argv, **_kwargs):
+                self.commands.append(list(argv))
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        fake_subprocess = FakeSubprocess()
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+            subprocess_module=fake_subprocess,
+        )
+        launches = []
+        updater._ask_update = lambda _candidate: True
+        updater._ask_force_clean = lambda _working_tree: False
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState(
+            source_status=("M src/main.py",),
+            local_only_count=1,
+            remote_only_count=1,
+        )
+        updater.launch_update = lambda: launches.append(True) or True
+        updater._show_warning = lambda _title, _message: None
+
+        updater._handle_check_result(
+            UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        snapshot = updater.get_status_snapshot()
+        destructive_verbs = {"stash", "branch", "switch", "reset", "clean"}
+        self.assertFalse(
+            any(command[1] in destructive_verbs for command in fake_subprocess.commands)
+        )
+        self.assertEqual(launches, [])
+        self.assertEqual(snapshot["state"], "cancelled")
+        self.assertIn("강제정리가 취소", snapshot["last_error"])
+        self.assertEqual(snapshot["progress"]["failed_step"], "강제정리 승인")
+
+    def test_force_clean_approval_sequences_stash_backup_sync_clean_before_handoff(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.commands = []
+
+            def run(self, argv, **_kwargs):
+                command = list(argv)
+                self.commands.append(command)
+                if command == build_short_head_command("main"):
+                    return types.SimpleNamespace(returncode=0, stdout="abc123", stderr="")
+                return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        fake_subprocess = FakeSubprocess()
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+            subprocess_module=fake_subprocess,
+            timestamp_provider=lambda: "20260614-120000",
+        )
+        launches = []
+        backup_branch = build_backup_branch_name("20260614-120000", "abc123")
+        working_tree = UpdateWorkingTreeState(
+            source_status=("M src/main.py",),
+            cleanup_targets=("build/generated.tmp",),
+            local_only_count=1,
+            remote_only_count=2,
+        )
+        updater._ask_update = lambda _candidate: True
+        updater._ask_force_clean = lambda _working_tree: True
+        updater._inspect_working_tree_state = lambda: working_tree
+        updater._show_warning = lambda _title, _message: None
+        updater.launch_update = lambda: launches.append(dict(updater._preflight_result)) or True
+
+        updater._handle_check_result(
+            UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        self.assertEqual(
+            fake_subprocess.commands,
+            [
+                build_fetch_origin_command(),
+                build_stash_command("windows-supporter auto update 20260614-120000"),
+                build_short_head_command("main"),
+                build_backup_branch_command(backup_branch, "main"),
+                build_switch_main_command(),
+                build_reset_main_command(),
+                build_allowed_clean_command(),
+            ],
+        )
+        self.assertEqual(len(launches), 1)
+        self.assertTrue(launches[0]["force_clean_approved"])
+        self.assertEqual(launches[0]["backup_branch"], backup_branch)
+        self.assertEqual(launches[0]["cleaned_targets"], ["build/generated.tmp"])
+
+    def test_post_fetch_remote_only_state_fast_forwards_before_handoff(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.commands = []
+
+            def run(self, argv, **_kwargs):
+                self.commands.append(list(argv))
+                return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        fake_subprocess = FakeSubprocess()
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+            subprocess_module=fake_subprocess,
+        )
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState(remote_only_count=1)
+
+        self.assertTrue(updater._prepare_repository_for_update(UpdateWorkingTreeState()))
+
+        self.assertEqual(
+            fake_subprocess.commands,
+            [
+                build_fetch_origin_command(),
+                build_switch_main_command(),
+                build_fast_forward_main_command(),
+            ],
+        )
+
+    def test_update_approval_fails_closed_when_git_state_inspection_fails(self) -> None:
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+        )
+        launches = []
+        updater._ask_update = lambda _candidate: True
+        updater._inspect_working_tree_state = lambda: (_ for _ in ()).throw(
+            RuntimeError("git status failed")
+        )
+        updater.launch_update = lambda: launches.append(True) or True
+
+        updater._handle_check_result(
+            UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        snapshot = updater.get_status_snapshot()
+        self.assertEqual(launches, [])
+        self.assertEqual(snapshot["state"], "error")
+        self.assertIn("Git 상태를 확인할 수 없습니다", snapshot["last_error"])
+        self.assertEqual(snapshot["progress"]["failed_step"], "Git 상태 확인")
 
     def test_ignored_build_outputs_count_as_update_cleanup_targets(self) -> None:
         class FakeSubprocess:
@@ -496,9 +799,21 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             updater.check_now(manual=True)
 
         self.assertEqual(snapshots[0]["state"], "checking")
+        self.assertEqual(snapshots[0]["progress"]["label"], "업데이트 확인 중")
+        self.assertTrue(snapshots[0]["progress"]["progressbar"]["visible"])
 
     def test_git_output_is_noninteractive_and_bounded(self) -> None:
+        class FakeStartupInfo:
+            def __init__(self) -> None:
+                self.dwFlags = 0
+                self.wShowWindow = None
+
         class FakeSubprocess:
+            CREATE_NO_WINDOW = 0x08000000
+            STARTF_USESHOWWINDOW = 1
+            SW_HIDE = 0
+            STARTUPINFO = FakeStartupInfo
+
             def __init__(self) -> None:
                 self.kwargs = None
 
@@ -517,6 +832,10 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(updater._git_output(["git", "status"]), "ok")
         self.assertEqual(fake_subprocess.kwargs["timeout"], GIT_COMMAND_TIMEOUT_SECONDS)
         self.assertEqual(fake_subprocess.kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(fake_subprocess.kwargs["creationflags"], 0x08000000)
+        self.assertIsInstance(fake_subprocess.kwargs["startupinfo"], FakeStartupInfo)
+        self.assertEqual(fake_subprocess.kwargs["startupinfo"].dwFlags, 1)
+        self.assertEqual(fake_subprocess.kwargs["startupinfo"].wShowWindow, 0)
 
     def test_git_timeout_resets_state_and_allows_manual_retry(self) -> None:
         class InlineThread:
@@ -561,8 +880,159 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         self.assertGreater(fake_subprocess.calls, first_call_count)
 
-    def test_launch_update_writes_detached_helper_and_passes_repo_root(self) -> None:
+    def test_run_update_handoff_builds_with_skip_env_and_relaunches(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def run(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                return types.SimpleNamespace(returncode=0, stdout="built", stderr="")
+
+        class FakeProgressUi:
+            def __init__(self, *, log_path="") -> None:
+                self.log_path = str(log_path)
+                self.snapshots = []
+                self.pump_calls = 0
+                self.close_calls = 0
+                self.retry_calls = 0
+
+            def show(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def set_snapshot(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def pump(self):
+                self.pump_calls += 1
+
+            def close(self):
+                self.close_calls += 1
+
+            def wait_for_retry_or_close(self):
+                self.retry_calls += 1
+                return False
+
         launches = []
+        fake_subprocess = FakeSubprocess()
+        progress_instances = []
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / "windows-supporter.exe").write_text("exe", encoding="utf-8")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_payload = build_update_handoff_payload(
+                repo_root=repo,
+                target_tag="v0.5.7",
+                log_path=Path(tmp) / "update.log",
+            )
+            with open(state_path, "w", encoding="utf-8") as fp:
+                import json
+
+                json.dump(write_payload, fp)
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=fake_subprocess,
+                launch=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                progress_ui_factory=lambda **kwargs: progress_instances.append(
+                    FakeProgressUi(**kwargs)
+                )
+                or progress_instances[-1],
+            )
+            state = read_update_handoff_state(state_path)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake_subprocess.calls[0][0], ["cmd", "/c", "build.bat"])
+        self.assertEqual(fake_subprocess.calls[0][1]["cwd"], str(repo))
+        self.assertEqual(
+            fake_subprocess.calls[0][1]["env"]["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"],
+            "1",
+        )
+        self.assertEqual(launches, [([str(repo / "windows-supporter.exe")], {"cwd": str(repo)})])
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["progress"]["label"], "업데이트 완료")
+        self.assertEqual(
+            [snapshot["label"] for snapshot in progress_instances[0].snapshots],
+            ["빌드 실행 중", "Windows Supporter 재실행 중", "업데이트 완료"],
+        )
+        self.assertEqual(progress_instances[0].close_calls, 1)
+
+    def test_run_update_handoff_retries_after_failure_when_ui_requests_retry(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def run(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                if len(self.calls) == 1:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="failed")
+                return types.SimpleNamespace(returncode=0, stdout="built", stderr="")
+
+        class RetryingProgressUi:
+            def __init__(self, *, log_path="") -> None:
+                self.snapshots = []
+                self.retry_waits = 0
+
+            def show(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def set_snapshot(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def pump(self):
+                return None
+
+            def close(self):
+                return None
+
+            def wait_for_retry_or_close(self):
+                self.retry_waits += 1
+                return True
+
+        fake_subprocess = FakeSubprocess()
+        progress_instances = []
+        launches = []
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / "windows-supporter.exe").write_text("exe", encoding="utf-8")
+            state_path = Path(tmp) / "update_handoff.json"
+            with open(state_path, "w", encoding="utf-8") as fp:
+                import json
+
+                json.dump(build_update_handoff_payload(repo_root=repo), fp)
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=fake_subprocess,
+                launch=lambda command, **kwargs: launches.append((command, kwargs)) or object(),
+                progress_ui_factory=lambda **kwargs: progress_instances.append(
+                    RetryingProgressUi(**kwargs)
+                )
+                or progress_instances[-1],
+                max_attempts=2,
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(fake_subprocess.calls), 2)
+        self.assertEqual(progress_instances[0].retry_waits, 1)
+        self.assertIn("업데이트 실패", [item["label"] for item in progress_instances[0].snapshots])
+        self.assertEqual(launches[0][1]["cwd"], str(repo))
+
+    def test_update_handoff_argv_exits_with_handoff_result_code(self) -> None:
+        with patch.object(update_monitor_module, "run_update_handoff", return_value=7):
+            with self.assertRaises(SystemExit) as caught:
+                update_monitor_module.run_update_handoff_from_argv(
+                    ["windows-supporter.exe", UPDATE_HANDOFF_ARG, "state.json"]
+                )
+
+        self.assertEqual(caught.exception.code, 7)
+
+    def test_launch_update_writes_handoff_state_and_quits_after_ack(self) -> None:
+        launches = []
+        acked_paths = []
+        quit_calls = []
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
                 fp.write("gitdir: .git\n")
@@ -574,43 +1044,96 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                     "",
                 ]
             )
-            helper_path = write_detached_helper_script(os.path.join(tmp, "helper.ps1"))
+            state_path = Path(tmp) / "update_handoff.json"
             updater = WindowsSupporterUpdater(
                 root=object(),
                 event_queue=types.SimpleNamespace(put=lambda callback: callback()),
                 repo_root=tmp,
-                popen=lambda command: launches.append(command) or object(),
-                helper_writer=lambda: helper_path,
+                popen=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                quit_callback=lambda: quit_calls.append(True),
+                handoff_path_provider=lambda: state_path,
+                handoff_command_builder=lambda path: ["python", "main.py", UPDATE_HANDOFF_ARG, str(path)],
+                handoff_ack_waiter=lambda path: acked_paths.append(str(path)) or True,
                 worktree_runner=lambda _argv, **_kwargs: types.SimpleNamespace(
                     returncode=0,
                     stdout=porcelain,
                     stderr="",
                 ),
             )
+            updater._latest_tag = "v0.5.7"
+            updater._working_tree_state = UpdateWorkingTreeState(
+                cleanup_targets=("build/generated.tmp",)
+            )
+            updater._preflight_result = {"force_clean_approved": False, "backup_branch": ""}
 
             self.assertTrue(updater.launch_update())
+            state = read_update_handoff_state(state_path)
 
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "updating")
+        self.assertEqual(snapshot["progress"]["label"], "업데이트 실행 준비 중")
+        self.assertEqual(snapshot["progress"]["percent"], 75)
         self.assertEqual(
             launches,
             [
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(helper_path),
-                    "-RepoRoot",
-                    str(updater._repo_root),
-                ]
+                (
+                    [
+                        "python",
+                        "main.py",
+                        UPDATE_HANDOFF_ARG,
+                        str(state_path),
+                    ],
+                    {"cwd": str(Path(tmp).resolve())},
+                )
             ],
         )
+        self.assertEqual(acked_paths, [str(state_path)])
+        self.assertEqual(quit_calls, [True])
+        self.assertEqual(state["status"], "pending")
+        self.assertEqual(state["repo_root"], str(Path(tmp).resolve()))
+        self.assertEqual(state["target_tag"], "v0.5.7")
+        self.assertEqual(state["working_tree"]["cleanup_targets"], ["build/generated.tmp"])
+        self.assertEqual(state["preflight"]["force_clean_approved"], False)
+
+    def test_launch_update_does_not_quit_when_handoff_ack_fails(self) -> None:
+        launches = []
+        quit_calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            state_path = Path(tmp) / "update_handoff.json"
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                popen=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                quit_callback=lambda: quit_calls.append(True),
+                handoff_path_provider=lambda: state_path,
+                handoff_command_builder=lambda path: ["python", "main.py", UPDATE_HANDOFF_ARG, str(path)],
+                handoff_ack_waiter=lambda _path: False,
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+
+            self.assertFalse(updater.launch_update())
+
+        snapshot = updater.get_status_snapshot()
+        self.assertEqual(
+            launches,
+            [
+                (
+                    ["python", "main.py", UPDATE_HANDOFF_ARG, str(state_path)],
+                    {"cwd": str(Path(tmp).resolve())},
+                )
+            ],
+        )
+        self.assertEqual(quit_calls, [])
+        self.assertEqual(snapshot["state"], "error")
+        self.assertIn("acknowledge", snapshot["last_error"])
+        self.assertEqual(snapshot["progress"]["failed_step"], "업데이트 프로세스 확인")
 
     def test_launch_update_fails_closed_in_codex_temporary_worktree(self) -> None:
         launches = []
-        helper_writes = []
+        handoff_writes = []
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = os.path.join(tmp, ".codex", "worktrees", "9f9a", "windows-supporter")
             os.makedirs(repo_root)
@@ -620,8 +1143,9 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 root=object(),
                 event_queue=types.SimpleNamespace(put=lambda callback: callback()),
                 repo_root=repo_root,
-                popen=lambda command: launches.append(command) or object(),
-                helper_writer=lambda: helper_writes.append(True) or os.path.join(tmp, "helper.ps1"),
+                popen=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                handoff_path_provider=lambda: handoff_writes.append(True)
+                or os.path.join(tmp, "update_handoff.json"),
             )
 
             self.assertFalse(updater.launch_update())
@@ -629,12 +1153,12 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "unavailable")
         self.assertIn("main worktree", snapshot["last_error"])
-        self.assertEqual(helper_writes, [])
+        self.assertEqual(handoff_writes, [])
         self.assertEqual(launches, [])
 
     def test_launch_update_fails_closed_in_non_primary_linked_worktree(self) -> None:
         launches = []
-        helper_writes = []
+        handoff_writes = []
         with tempfile.TemporaryDirectory() as tmp:
             primary = os.path.join(tmp, "main", "windows-supporter")
             linked = os.path.join(tmp, "linked", "windows-supporter")
@@ -658,8 +1182,9 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 root=object(),
                 event_queue=types.SimpleNamespace(put=lambda callback: callback()),
                 repo_root=linked,
-                popen=lambda command: launches.append(command) or object(),
-                helper_writer=lambda: helper_writes.append(True) or os.path.join(tmp, "helper.ps1"),
+                popen=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                handoff_path_provider=lambda: handoff_writes.append(True)
+                or os.path.join(tmp, "update_handoff.json"),
                 worktree_runner=lambda _argv, **_kwargs: types.SimpleNamespace(
                     returncode=0,
                     stdout=porcelain,
@@ -672,10 +1197,10 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "unavailable")
         self.assertIn("main worktree", snapshot["last_error"])
-        self.assertEqual(helper_writes, [])
+        self.assertEqual(handoff_writes, [])
         self.assertEqual(launches, [])
 
-    def test_launch_update_reports_helper_prepare_failure(self) -> None:
+    def test_launch_update_reports_handoff_prepare_failure(self) -> None:
         launches = []
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
@@ -684,8 +1209,8 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 root=object(),
                 event_queue=types.SimpleNamespace(put=lambda callback: callback()),
                 repo_root=tmp,
-                popen=lambda command: launches.append(command) or object(),
-                helper_writer=lambda: (_ for _ in ()).throw(RuntimeError("denied")),
+                popen=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                handoff_path_provider=lambda: (_ for _ in ()).throw(RuntimeError("denied")),
                 worktree_runner=_primary_worktree_runner(tmp),
             )
 
@@ -693,7 +1218,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
             snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "error")
-        self.assertIn("failed to prepare update helper", snapshot["last_error"])
+        self.assertIn("failed to prepare update handoff", snapshot["last_error"])
         self.assertEqual(launches, [])
 
 
