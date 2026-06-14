@@ -2241,7 +2241,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["orientation"], "bottom")
-        self.assertGreater(geometry["width"], 420)
+        self.assertGreater(
+            geometry["width"],
+            taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+        )
         self.assertGreaterEqual(geometry["x"], 1708)
         self.assertLessEqual(geometry["x"] + geometry["width"], 2392)
 
@@ -2259,7 +2262,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(geometry["width"], 420)
         self.assertEqual(geometry["x"], 1072)
 
-    def test_bottom_taskbar_geometry_caps_large_preferred_width(self):
+    def test_bottom_taskbar_geometry_caps_large_preferred_width_to_slot(self):
         geometry = calculate_taskbar_overlay_geometry(
             1920,
             1080,
@@ -2269,7 +2272,13 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
 
         self.assertTrue(geometry["visible"])
-        self.assertEqual(geometry["width"], taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+        self.assertGreater(
+            geometry["width"],
+            taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+        )
+        self.assertEqual(geometry["width"], 684)
+        self.assertGreaterEqual(geometry["x"], 908)
+        self.assertLessEqual(geometry["x"] + geometry["width"], 1592)
 
     def test_bottom_taskbar_geometry_uses_available_slot_below_preferred_width(self):
         geometry = calculate_taskbar_overlay_geometry(
@@ -2642,6 +2651,55 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertNotIn("부족", texts)
         self.assertNotIn("남음", texts)
 
+    def test_refresh_uses_real_preferred_width_above_old_text_cap_when_slot_is_wide(self):
+        metrics = self._row_badge_metrics()
+        window = _FakeWindow()
+        preferred_widths = []
+        original_preferred_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model
+
+        def build_model(runtime_status, geometry=None, *, now=None):
+            return self._row_badge_model(
+                int(dict(geometry or taskbar_overlay._DEFAULT_GEOMETRY)["width"]),
+                metrics=metrics,
+            )
+
+        def preferred_width(model):
+            width = original_preferred_width(model)
+            preferred_widths.append(width)
+            return width
+
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: [
+                (0, 900),
+                (1700, 1920),
+            ],
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "build_codex_usage_taskbar_overlay_model",
+            side_effect=build_model,
+        ), patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            side_effect=preferred_width,
+        ):
+            overlay.refresh()
+
+        self.assertTrue(preferred_widths)
+        self.assertGreater(
+            preferred_widths[0],
+            taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+        )
+        self.assertIn(
+            f"{taskbar_overlay._WIDE_EMPTY_SLOT_TARGET_WIDTH_PX}x",
+            window.geometry_calls[-1],
+        )
+
     def test_bottom_taskbar_geometry_uses_right_slot_as_equal_width_tie_breaker(self):
         geometry = calculate_taskbar_overlay_geometry(
             1400,
@@ -2996,8 +3054,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 2)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
+        expected_width = 1500 - 900 - taskbar_overlay._EMPTY_SLOT_PADDING_PX * 2
         self.assertIn(
-            f"{taskbar_overlay._MIN_EMPTY_SLOT_WIDTH_PX}x",
+            f"{expected_width}x",
             window.geometry_calls[-1],
         )
 
@@ -3157,8 +3216,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 2)
+        expected_width = 1500 - 900 - taskbar_overlay._EMPTY_SLOT_PADDING_PX * 2
         self.assertIn(
-            f"{taskbar_overlay._MIN_EMPTY_SLOT_WIDTH_PX}x",
+            f"{expected_width}x",
             window.geometry_calls[-1],
         )
 

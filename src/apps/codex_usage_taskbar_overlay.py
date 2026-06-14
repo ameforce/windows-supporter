@@ -39,6 +39,8 @@ _DEFAULT_GEOMETRY = {
 _EMPTY_SLOT_PADDING_PX = 8
 _MIN_EMPTY_SLOT_WIDTH_PX = 300
 _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX = 560
+# Wide taskbar slots should breathe up to the same target used by the default overlay.
+_WIDE_EMPTY_SLOT_TARGET_WIDTH_PX = int(_DEFAULT_GEOMETRY["width"])
 _TASKBAR_SAMPLE_STEP_PX = 4
 _OCCUPIED_DILATION_PX = 24
 _FLASH_DURATION_SEC = 1.0
@@ -639,8 +641,24 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
                 )
                 for visible_metrics in rows
             ):
-                return int(candidate_width)
-    return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
+                return _wide_slot_preferred_width(model, int(candidate_width))
+    return _wide_slot_preferred_width(model, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+
+
+def _wide_slot_preferred_width(model: dict[str, Any], minimum_width: int) -> int:
+    geometry = model.get("geometry") if isinstance(model, dict) else None
+    if not isinstance(geometry, dict):
+        return int(minimum_width)
+    try:
+        geometry_width = int(geometry.get("width", 0) or 0)
+    except (TypeError, ValueError):
+        geometry_width = 0
+    if geometry_width <= _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX:
+        return int(minimum_width)
+    return min(
+        max(int(minimum_width), _WIDE_EMPTY_SLOT_TARGET_WIDTH_PX),
+        int(geometry_width),
+    )
 
 
 class CodexUsageTaskbarOverlay:
@@ -1653,11 +1671,10 @@ def _fit_horizontal_geometry_to_empty_slot(
         return fitted
 
     if preferred_width is None:
-        target_width = min(desired_width, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+        target_width = desired_width
     else:
         target_width = min(
             max(_MIN_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
-            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
             desired_width,
         )
     width = min(target_width, available)
