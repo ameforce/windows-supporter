@@ -4,7 +4,7 @@ import ctypes
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 try:
@@ -164,6 +164,15 @@ _STATUS_WITH_TEXT_WIDTH_PX = 24
 _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX = 420
 _STATUS_TO_METRICS_GAP_PX = 6
 _FIVE_HOUR_RESET_MAX_SECONDS = 36 * 60 * 60
+_SNAPSHOT_WINDOW_SECONDS_BY_METRIC = {
+    "five_hour_limit": 5 * 60 * 60,
+    "weekly_limit": 7 * 24 * 60 * 60,
+}
+_SNAPSHOT_ON_TRACK_MAX_PROJECTED_REMAINING_PERCENT = 10.0
+# CodexUsageMonitor.__now_iso stores captured_at as a naive KST wall-clock
+# string, so snapshot tag projection must interpret naive captured_at values
+# the same way while keeping local overlay "now" out of tag decisions.
+_SNAPSHOT_CAPTURED_AT_FALLBACK_TZ = timezone(timedelta(hours=9))
 
 
 @dataclass(frozen=True)
@@ -199,9 +208,6 @@ def build_codex_usage_taskbar_overlay_model(
         snapshot = raw.get("last_snapshot", {})
         if not isinstance(snapshot, dict):
             snapshot = {}
-        usage_history = raw.get("usage_history", [])
-        if not isinstance(usage_history, list):
-            usage_history = []
         runtime_info = raw.get("runtime", {})
         if not isinstance(runtime_info, dict):
             runtime_info = {}
@@ -216,7 +222,6 @@ def build_codex_usage_taskbar_overlay_model(
                     raw_value=snapshot.get(metric_key),
                     reset_at_value=snapshot.get(reset_key),
                     captured_at_value=snapshot.get("captured_at"),
-                    usage_history=usage_history,
                     account_state=status["state"],
                     now=now,
                 )
@@ -2394,7 +2399,6 @@ def _build_metric(
     raw_value: Any,
     reset_at_value: Any = "",
     captured_at_value: Any = "",
-    usage_history: list[Any] | None = None,
     account_state: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -2406,25 +2410,23 @@ def _build_metric(
         percent=percent,
         now=now,
     )
-    dynamic_reset_direction = _dynamic_reset_direction(
+    snapshot_reset_direction = _snapshot_reset_direction(
         metric_key=key,
         current_percent=percent,
         reset_at_value=reset_at_value,
         captured_at_value=captured_at_value,
-        usage_history=usage_history,
-        now=now,
     )
     state = _bar_state(enabled, percent)
     color = _bar_color(enabled, percent)
     reset_state = reset_info["state"]
     reset_color = reset_info["color"]
-    reset_direction = str(reset_info.get("direction") or _RESET_DIRECTION_UNKNOWN)
-    if enabled and dynamic_reset_direction in {
+    reset_direction = _RESET_DIRECTION_UNKNOWN
+    if enabled and snapshot_reset_direction in {
         _RESET_DIRECTION_SHORTAGE,
         _RESET_DIRECTION_ON_TRACK,
         _RESET_DIRECTION_SURPLUS,
     }:
-        reset_direction = dynamic_reset_direction
+        reset_direction = snapshot_reset_direction
     reset_profile = _reset_direction_profile(reset_direction)
     reset_marker = reset_profile["marker"]
     if reset_direction != _RESET_DIRECTION_UNKNOWN:
@@ -2454,129 +2456,58 @@ def _build_metric(
     }
 
 
-def _dynamic_reset_direction(
+def _snapshot_reset_direction(
     *,
     metric_key: str,
     current_percent: int | None,
     reset_at_value: Any,
     captured_at_value: Any,
-    usage_history: list[Any] | None,
-    now: datetime | None = None,
 ) -> str | None:
     if current_percent is None:
         return None
     reset_at = _parse_reset_datetime(reset_at_value)
     if reset_at is None:
         return None
-    current_reset_now = _reset_now(reset_at, now)
-    seconds_until_reset = int((reset_at - current_reset_now).total_seconds())
-    if seconds_until_reset <= 0:
+    captured_at = _parse_reset_datetime(captured_at_value)
+    if captured_at is None:
         return None
-    if not _reset_remaining_is_plausible(metric_key, seconds_until_reset):
+    captured_at = _align_snapshot_datetime(captured_at, reset_at)
+    window_seconds = _snapshot_window_seconds(metric_key)
+    if window_seconds is None:
         return None
-    if int(current_percent) <= 0:
-        return _RESET_DIRECTION_SHORTAGE
-    base_direction = _reset_action_direction(metric_key, current_percent, seconds_until_reset)
-    if base_direction == _RESET_DIRECTION_SURPLUS:
-        return _RESET_DIRECTION_SURPLUS
-
-    current_ts = _history_timestamp_seconds(captured_at_value)
-    if current_ts is None:
+    window_start = reset_at - timedelta(seconds=int(window_seconds))
+    elapsed_seconds = (captured_at - window_start).total_seconds()
+    remaining_seconds = (reset_at - captured_at).total_seconds()
+    if elapsed_seconds <= 0.0 or remaining_seconds < 0.0:
         return None
-    reset_key = _RESET_KEY_BY_METRIC.get(str(metric_key), "")
-    reset_text = str(reset_at_value or "").strip()
-    samples = _history_samples_for_metric(
-        metric_key=str(metric_key),
-        reset_key=reset_key,
-        reset_at_value=reset_text,
-        usage_history=usage_history,
-        current_ts=current_ts,
-    )
-    current_sample = (float(current_ts), int(current_percent))
-    samples = _merge_current_history_sample(samples, current_sample)
-    if len(samples) < 2:
-        return None
-    current_ts, current_remaining = samples[-1]
-    previous_samples = samples[:-1]
-    oldest_valid: tuple[float, int] | None = None
-    for sample_ts, sample_percent in previous_samples:
-        if sample_ts >= current_ts:
-            continue
-        if int(sample_percent) < int(current_remaining):
-            continue
-        oldest_valid = (sample_ts, sample_percent)
-        break
-    if oldest_valid is None:
-        return None
-    elapsed_minutes = (float(current_ts) - float(oldest_valid[0])) / 60.0
-    if elapsed_minutes <= 0.0:
-        return None
-    consumed = float(oldest_valid[1]) - float(current_remaining)
-    rate_per_min = max(0.0, consumed / elapsed_minutes)
-    projected_remaining = float(current_remaining) - (
-        rate_per_min * (float(seconds_until_reset) / 60.0)
-    )
+    current_remaining = float(max(0, min(100, int(current_percent))))
+    consumed = 100.0 - current_remaining
+    rate_per_second = consumed / float(elapsed_seconds)
+    projected_remaining = current_remaining - (rate_per_second * float(remaining_seconds))
     if projected_remaining < 0.0:
         return _RESET_DIRECTION_SHORTAGE
-    if projected_remaining <= 20.0:
+    if projected_remaining <= _SNAPSHOT_ON_TRACK_MAX_PROJECTED_REMAINING_PERCENT:
         return _RESET_DIRECTION_ON_TRACK
     return _RESET_DIRECTION_SURPLUS
 
 
-def _history_samples_for_metric(
-    *,
-    metric_key: str,
-    reset_key: str,
-    reset_at_value: str,
-    usage_history: list[Any] | None,
-    current_ts: float,
-) -> list[tuple[float, int]]:
-    if not isinstance(usage_history, list):
-        return []
-    window_start = float(current_ts) - (15 * 60)
-    samples: list[tuple[float, int]] = []
-    for item in usage_history:
-        if not isinstance(item, dict):
-            continue
-        sample_ts = _history_timestamp_seconds(item.get("captured_at"))
-        if sample_ts is None or sample_ts < window_start or sample_ts > float(current_ts):
-            continue
-        if reset_key and reset_at_value:
-            sample_reset = str(item.get(reset_key) or "").strip()
-            if sample_reset != reset_at_value:
-                continue
-        sample_percent = _parse_percent(item.get(metric_key))
-        if sample_percent is None:
-            continue
-        samples.append((float(sample_ts), int(sample_percent)))
-    samples.sort(key=lambda value: value[0])
-    return samples[-5:]
-
-
-def _merge_current_history_sample(
-    samples: list[tuple[float, int]],
-    current_sample: tuple[float, int],
-) -> list[tuple[float, int]]:
-    current_ts, current_percent = current_sample
-    merged = [
-        (sample_ts, sample_percent)
-        for sample_ts, sample_percent in samples
-        if abs(float(sample_ts) - float(current_ts)) > 0.001
-    ]
-    merged.append((float(current_ts), int(current_percent)))
-    merged.sort(key=lambda value: value[0])
-    return merged[-5:]
-
-
-def _history_timestamp_seconds(value: Any) -> float | None:
-    text = str(value or "").strip()
-    if not text:
+def _snapshot_window_seconds(metric_key: str) -> int | None:
+    value = _SNAPSHOT_WINDOW_SECONDS_BY_METRIC.get(str(metric_key or ""))
+    if value is None:
         return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return float(parsed.timestamp())
-    except Exception:
-        return None
+    return int(value)
+
+
+def _align_snapshot_datetime(value: datetime, reference: datetime) -> datetime:
+    if reference.tzinfo is None:
+        if value.tzinfo is None:
+            return value
+        return value.astimezone().replace(tzinfo=None)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=_SNAPSHOT_CAPTURED_AT_FALLBACK_TZ).astimezone(
+            reference.tzinfo
+        )
+    return value.astimezone(reference.tzinfo)
 
 
 def _reset_direction_profile(direction: str) -> dict[str, str]:

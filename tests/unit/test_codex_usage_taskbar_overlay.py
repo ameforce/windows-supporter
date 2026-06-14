@@ -267,7 +267,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["shortage", "surplus", "surplus", "on_track"],
+            ["unknown", "unknown", "unknown", "unknown"],
         )
         self.assertEqual(
             [
@@ -275,7 +275,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["↓", "↑", "↑", "="],
+            ["", "", "", ""],
         )
         self.assertEqual(
             [
@@ -283,7 +283,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["부족", "남음", "남음", "정상"],
+            ["", "", "", ""],
         )
         self.assertEqual(
             [
@@ -291,7 +291,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["부", "남", "남", "정"],
+            ["", "", "", ""],
         )
         self.assertEqual(
             [
@@ -299,7 +299,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["#7f1d1d", "#78350f", "#78350f", "#064e3b"],
+            ["", "", "", ""],
         )
         self.assertEqual(
             [
@@ -307,7 +307,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["#ef4444", "#f59e0b", "#f59e0b", "#22c55e"],
+            ["", "", "", ""],
         )
         self.assertEqual(
             [
@@ -315,68 +315,77 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["#fee2e2", "#fef3c7", "#fef3c7", "#dcfce7"],
+            ["", "", "", ""],
         )
 
-    def test_model_uses_dynamic_usage_pace_only_for_reset_time_colors(self):
+    def test_model_uses_snapshot_only_tags_independent_of_history_and_now(self):
         runtime = self._runtime()
-        now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
+        snapshot = {
+            "captured_at": "2026-06-01T13:00:00+09:00",
+            "five_hour_limit": "46%",
+            "weekly_limit": "80%",
+            "five_hour_limit_reset_at": "2026-06-01T15:00:00+09:00",
+            "weekly_limit_reset_at": "2026-06-02T13:00:00+09:00",
+        }
         runtime["accounts"][0]["last_snapshot"].update(
-            {
-                "captured_at": "2026-06-01T10:10:00+09:00",
-                "five_hour_limit": "50%",
-                "weekly_limit": "50%",
-                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
-                "weekly_limit_reset_at": "2026-06-01T10:30:00+09:00",
-            }
+            snapshot
         )
         runtime["accounts"][0]["usage_history"] = [
             {
                 "captured_at": "2026-06-01T10:00:00+09:00",
-                "five_hour_limit": "60%",
-                "weekly_limit": "60%",
-                "five_hour_limit_reset_at": "2026-06-01T10:50:00+09:00",
-                "weekly_limit_reset_at": "2026-06-01T10:30:00+09:00",
+                "five_hour_limit": "1%",
+                "weekly_limit": "1%",
             }
         ]
         runtime["accounts"][1]["last_snapshot"].update(
-            {
-                "captured_at": "2026-06-01T10:10:00+09:00",
-                "five_hour_limit": "80%",
-                "five_hour_limit_reset_at": "2026-06-01T10:30:00+09:00",
-            }
+            snapshot
         )
         runtime["accounts"][1]["usage_history"] = [
             {
                 "captured_at": "2026-06-01T10:00:00+09:00",
-                "five_hour_limit": "82%",
-                "five_hour_limit_reset_at": "2026-06-01T10:30:00+09:00",
+                "five_hour_limit": "99%",
+                "weekly_limit": "99%",
             }
         ]
 
-        model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
-
-        first_metrics = model["bars"][0]["metrics"]
-        second_metrics = model["bars"][1]["metrics"]
-        self.assertEqual([metric["state"] for metric in first_metrics], ["warning", "warning"])
-        self.assertEqual([metric["color"] for metric in first_metrics], ["#f59e0b", "#f59e0b"])
-        self.assertEqual(
-            [metric["reset_state"] for metric in first_metrics],
-            ["stable", "warning"],
+        first_model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            now=datetime(2026, 6, 1, 13, 10, tzinfo=timezone(timedelta(hours=9))),
         )
-        self.assertEqual(
-            [metric["reset_direction"] for metric in first_metrics],
-            ["on_track", "surplus"],
+        second_model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            now=datetime(2026, 6, 1, 14, 10, tzinfo=timezone(timedelta(hours=9))),
         )
-        self.assertEqual([metric["reset_marker"] for metric in first_metrics], ["=", "↑"])
-        self.assertEqual(second_metrics[0]["state"], "normal")
-        self.assertEqual(second_metrics[0]["color"], "#22c55e")
-        self.assertEqual(second_metrics[0]["reset_state"], "warning")
-        self.assertEqual(second_metrics[0]["reset_color"], "#f59e0b")
-        self.assertEqual(second_metrics[0]["reset_direction"], "surplus")
-        self.assertEqual(second_metrics[0]["reset_marker"], "↑")
 
-    def test_model_marks_high_remaining_far_weekly_reset_as_surplus_information(self):
+        for model in (first_model, second_model):
+            first_metrics = model["bars"][0]["metrics"]
+            second_metrics = model["bars"][1]["metrics"]
+            self.assertEqual(
+                [metric["reset_direction"] for metric in first_metrics],
+                ["on_track", "surplus"],
+            )
+            self.assertEqual(
+                [metric["reset_badge_label"] for metric in first_metrics],
+                ["정상", "남음"],
+            )
+            self.assertEqual(
+                [metric["reset_badge_short_label"] for metric in first_metrics],
+                ["정", "남"],
+            )
+            self.assertEqual(
+                [metric["reset_direction"] for metric in second_metrics],
+                ["on_track", "surplus"],
+            )
+            self.assertEqual(
+                [metric["reset_badge_label"] for metric in second_metrics],
+                ["정상", "남음"],
+            )
+            self.assertEqual(
+                [metric["reset_badge_short_label"] for metric in second_metrics],
+                ["정", "남"],
+            )
+
+    def test_model_marks_fast_early_weekly_burn_as_shortage(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -401,19 +410,19 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(weekly_metric["state"], "normal")
         self.assertEqual(weekly_metric["color"], "#22c55e")
         self.assertEqual(weekly_metric["reset_text"], "6d 20h 00m")
-        self.assertEqual(weekly_metric["reset_direction"], "surplus")
-        self.assertEqual(weekly_metric["reset_marker"], "↑")
-        self.assertEqual(weekly_metric["reset_state"], "warning")
-        self.assertEqual(weekly_metric["reset_color"], "#f59e0b")
+        self.assertEqual(weekly_metric["reset_direction"], "shortage")
+        self.assertEqual(weekly_metric["reset_marker"], "↓")
+        self.assertEqual(weekly_metric["reset_state"], "urgent")
+        self.assertEqual(weekly_metric["reset_color"], "#ef4444")
 
-    def test_model_marks_dynamic_projection_below_zero_as_shortage(self):
+    def test_model_marks_snapshot_projection_below_zero_as_shortage(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
             {
-                "captured_at": "2026-06-01T10:10:00+09:00",
-                "five_hour_limit": "50%",
-                "five_hour_limit_reset_at": "2026-06-01T10:30:00+09:00",
+                "captured_at": "2026-06-01T11:00:00+09:00",
+                "five_hour_limit": "20%",
+                "five_hour_limit_reset_at": "2026-06-01T15:00:00+09:00",
             }
         )
         runtime["accounts"][0]["usage_history"] = [
@@ -432,7 +441,31 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(five_hour_metric["reset_state"], "urgent")
         self.assertEqual(five_hour_metric["reset_color"], "#ef4444")
 
-    def test_model_keeps_high_current_surplus_over_noisy_fast_burn(self):
+    def test_model_maps_snapshot_projection_thresholds(self):
+        cases = [
+            ("39%", "shortage", "부족"),
+            ("40%", "on_track", "정상"),
+            ("46%", "on_track", "정상"),
+            ("47%", "surplus", "남음"),
+        ]
+        for percent, expected_direction, expected_badge in cases:
+            with self.subTest(percent=percent):
+                runtime = self._runtime()
+                runtime["accounts"][0]["last_snapshot"].update(
+                    {
+                        "captured_at": "2026-06-01T13:00:00+09:00",
+                        "five_hour_limit": percent,
+                        "five_hour_limit_reset_at": "2026-06-01T15:00:00+09:00",
+                    }
+                )
+
+                model = build_codex_usage_taskbar_overlay_model(runtime)
+
+                five_hour_metric = model["bars"][0]["metrics"][0]
+                self.assertEqual(five_hour_metric["reset_direction"], expected_direction)
+                self.assertEqual(five_hour_metric["reset_badge_label"], expected_badge)
+
+    def test_model_keeps_snapshot_surplus_despite_noisy_history(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -498,7 +531,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(five_hour_metric["reset_badge_outline"], "")
         self.assertEqual(five_hour_metric["reset_badge_text_color"], "")
 
-    def test_model_falls_back_to_static_color_without_dynamic_history_inputs(self):
+    def test_model_keeps_snapshot_projection_when_history_is_missing_or_conflicting(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -514,6 +547,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["state"], "warning")
         self.assertEqual(first_metric["color"], "#f59e0b")
+        self.assertEqual(first_metric["reset_direction"], "surplus")
 
         runtime["accounts"][0]["usage_history"] = [
             {
@@ -528,8 +562,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["state"], "warning")
         self.assertEqual(first_metric["color"], "#f59e0b")
+        self.assertEqual(first_metric["reset_direction"], "surplus")
 
-    def test_model_falls_back_to_static_color_without_reset_time(self):
+    def test_model_keeps_unknown_reset_direction_without_reset_time_even_with_history(self):
         runtime = self._runtime()
         runtime["accounts"][0]["last_snapshot"].update(
             {
@@ -550,8 +585,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(first_metric["state"], "normal")
         self.assertEqual(first_metric["color"], "#22c55e")
         self.assertEqual(first_metric["reset_state"], "unknown")
+        self.assertEqual(first_metric["reset_direction"], "unknown")
+        self.assertEqual(first_metric["reset_badge_label"], "")
 
-    def test_model_ignores_history_without_matching_reset_window(self):
+    def test_model_ignores_history_when_projecting_from_snapshot(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 10, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -573,6 +610,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["state"], "warning")
         self.assertEqual(first_metric["color"], "#f59e0b")
+        self.assertEqual(first_metric["reset_direction"], "surplus")
 
     def test_model_keeps_zero_remaining_urgent_before_reset(self):
         runtime = self._runtime()
@@ -631,7 +669,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ["stable", "warning"],
         )
 
-    def test_model_marks_elapsed_reset_time_as_overdue(self):
+    def test_model_keeps_elapsed_reset_time_without_snapshot_tag_when_captured_at_missing(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"]["five_hour_limit_reset_at"] = (
@@ -643,11 +681,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["reset_text"], "00h 00m")
         self.assertEqual(first_metric["reset_color"], "#ef4444")
-        self.assertEqual(first_metric["reset_direction"], "shortage")
-        self.assertEqual(first_metric["reset_badge_label"], "부족")
-        self.assertEqual(first_metric["reset_badge_short_label"], "부")
+        self.assertEqual(first_metric["reset_direction"], "unknown")
+        self.assertEqual(first_metric["reset_badge_label"], "")
+        self.assertEqual(first_metric["reset_badge_short_label"], "")
 
-    def test_model_marks_elapsed_high_remaining_five_hour_reset_as_surplus(self):
+    def test_model_keeps_elapsed_high_remaining_reset_without_snapshot_tag_when_captured_at_missing(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -661,9 +699,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["reset_text"], "00h 00m")
-        self.assertEqual(first_metric["reset_direction"], "surplus")
-        self.assertEqual(first_metric["reset_badge_label"], "남음")
-        self.assertEqual(first_metric["reset_badge_short_label"], "남")
+        self.assertEqual(first_metric["reset_direction"], "unknown")
+        self.assertEqual(first_metric["reset_badge_label"], "")
+        self.assertEqual(first_metric["reset_badge_short_label"], "")
 
     def test_model_keeps_utc_reset_remaining_time_aligned_with_dashboard(self):
         runtime = self._runtime()
