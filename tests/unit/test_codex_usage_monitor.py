@@ -75,6 +75,82 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
     def test_sanitize_profile_name_strips_plan_badge_suffix(self) -> None:
         self.assertEqual(sanitize_profile_name("이 PRO"), "이")
 
+    def _usage_probe(self, profile_name: str) -> dict:
+        return {
+            "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+            "mainText": "Analytics usage 5-hour usage limit 99% weekly usage limit 96%",
+            "profileName": profile_name,
+            "metricBlocks": [
+                {
+                    "metric_key": "five_hour_limit",
+                    "label_text": "5-hour usage limit",
+                    "value_candidates": ["99%"],
+                    "block_text": "5-hour usage limit 99%",
+                },
+                {
+                    "metric_key": "weekly_limit",
+                    "label_text": "weekly usage limit",
+                    "value_candidates": ["96%"],
+                    "block_text": "weekly usage limit 96%",
+                },
+            ],
+        }
+
+    def test_build_snapshot_from_probe_binds_first_profile_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._usage_probe("Kim Jong")
+            )
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(
+                monitor.get_runtime_status().get("profile_name"),
+                "Kim Jong",
+            )
+
+    def test_build_snapshot_from_probe_rejects_conflicting_bound_profile_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            monitor._CodexUsageMonitor__profile_name = "Kim Jong"
+
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._usage_probe("Other Profile")
+            )
+
+            self.assertIsNone(snapshot)
+            self.assertEqual(
+                monitor.get_runtime_status().get("profile_name"),
+                "Kim Jong",
+            )
+
+    def test_build_snapshot_from_probe_keeps_bound_profile_name_when_probe_name_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            monitor._CodexUsageMonitor__profile_name = "Kim Jong"
+
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._usage_probe("")
+            )
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(
+                monitor.get_runtime_status().get("profile_name"),
+                "Kim Jong",
+            )
+
+    def test_build_snapshot_from_probe_accepts_empty_profile_name_when_unbound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._usage_probe("")
+            )
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(monitor.get_runtime_status().get("profile_name"), "")
+
     def test_parse_usage_metrics_from_inline_lines(self) -> None:
         raw = """
         5시간 사용 한도: 12 / 40

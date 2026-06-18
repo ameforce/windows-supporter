@@ -2175,6 +2175,13 @@ class CodexUsageMonitor:
         self.__profile_name = sanitize_profile_name(value)
         return
 
+    def __probe_profile_matches_bound_profile(self, value: Any) -> bool:
+        incoming = sanitize_profile_name(value)
+        existing = sanitize_profile_name(self.__profile_name)
+        if not incoming or not existing:
+            return True
+        return incoming == existing
+
     def __set_auth_attention(self, reason: str, source: str = "") -> None:
         self.__auth_attention_required = True
         self.__auth_attention_reason = normalize_usage_value(reason).lower() or "unknown"
@@ -6616,7 +6623,11 @@ class CodexUsageMonitor:
             return None
         if not self.__is_usage_dom_ready_from_probe(normalized_probe):
             return None
-        self.__set_profile_name(normalized_probe.get("profileName", ""))
+        profile_name = normalized_probe.get("profileName", "")
+        if not self.__probe_profile_matches_bound_profile(profile_name):
+            return None
+        if sanitize_profile_name(profile_name):
+            self.__set_profile_name(profile_name)
         captured_at = self.__now_iso()
         metrics = extract_usage_metrics_from_semantic_blocks(
             normalized_probe.get("metricBlocks", [])

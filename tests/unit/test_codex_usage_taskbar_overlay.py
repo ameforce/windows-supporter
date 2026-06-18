@@ -267,7 +267,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["unknown", "unknown", "unknown", "unknown"],
+            ["shortage", "surplus", "surplus", "on_track"],
         )
         self.assertEqual(
             [
@@ -275,7 +275,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["", "", "", ""],
+            ["↓", "↑", "↑", "="],
         )
         self.assertEqual(
             [
@@ -283,7 +283,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["", "", "", ""],
+            ["부족", "남음", "남음", "정상"],
         )
         self.assertEqual(
             [
@@ -291,7 +291,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["", "", "", ""],
+            ["부", "남", "남", "정"],
         )
         self.assertEqual(
             [
@@ -299,7 +299,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["", "", "", ""],
+            ["#7f1d1d", "#78350f", "#78350f", "#064e3b"],
         )
         self.assertEqual(
             [
@@ -307,7 +307,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["", "", "", ""],
+            ["#ef4444", "#f59e0b", "#f59e0b", "#22c55e"],
         )
         self.assertEqual(
             [
@@ -315,7 +315,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["", "", "", ""],
+            ["#fee2e2", "#fef3c7", "#fef3c7", "#dcfce7"],
         )
 
     def test_model_uses_snapshot_only_tags_independent_of_history_and_now(self):
@@ -669,7 +669,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ["stable", "warning"],
         )
 
-    def test_model_keeps_elapsed_reset_time_without_snapshot_tag_when_captured_at_missing(self):
+    def test_model_derives_elapsed_reset_badge_when_captured_at_missing(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"]["five_hour_limit_reset_at"] = (
@@ -681,11 +681,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["reset_text"], "00h 00m")
         self.assertEqual(first_metric["reset_color"], "#ef4444")
-        self.assertEqual(first_metric["reset_direction"], "unknown")
-        self.assertEqual(first_metric["reset_badge_label"], "")
-        self.assertEqual(first_metric["reset_badge_short_label"], "")
+        self.assertEqual(first_metric["reset_direction"], "shortage")
+        self.assertEqual(first_metric["reset_badge_label"], "부족")
+        self.assertEqual(first_metric["reset_badge_short_label"], "부")
 
-    def test_model_keeps_elapsed_high_remaining_reset_without_snapshot_tag_when_captured_at_missing(self):
+    def test_model_derives_elapsed_high_remaining_badge_when_captured_at_missing(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         runtime["accounts"][0]["last_snapshot"].update(
@@ -699,9 +699,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["reset_text"], "00h 00m")
-        self.assertEqual(first_metric["reset_direction"], "unknown")
-        self.assertEqual(first_metric["reset_badge_label"], "")
-        self.assertEqual(first_metric["reset_badge_short_label"], "")
+        self.assertEqual(first_metric["reset_direction"], "surplus")
+        self.assertEqual(first_metric["reset_badge_label"], "남음")
+        self.assertEqual(first_metric["reset_badge_short_label"], "남")
 
     def test_model_keeps_utc_reset_remaining_time_aligned_with_dashboard(self):
         runtime = self._runtime()
@@ -753,20 +753,23 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ["surplus", "surplus"],
         )
 
-    def test_model_keeps_elapsed_weekly_reset_without_zero_time_risk_badge(self):
+    def test_model_derives_elapsed_weekly_reset_badge(self):
         runtime = self._runtime()
         now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
-        runtime["accounts"][0]["last_snapshot"]["weekly_limit_reset_at"] = (
-            "2026-06-01T09:59:00+09:00"
+        runtime["accounts"][0]["last_snapshot"].update(
+            {
+                "weekly_limit": "99%",
+                "weekly_limit_reset_at": "2026-06-01T09:59:00+09:00",
+            }
         )
 
         model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
 
         weekly_metric = model["bars"][0]["metrics"][1]
         self.assertEqual(weekly_metric["reset_text"], "0d 00h 00m")
-        self.assertEqual(weekly_metric["reset_direction"], "unknown")
-        self.assertEqual(weekly_metric["reset_badge_label"], "")
-        self.assertEqual(weekly_metric["reset_badge_short_label"], "")
+        self.assertEqual(weekly_metric["reset_direction"], "surplus")
+        self.assertEqual(weekly_metric["reset_badge_label"], "남음")
+        self.assertEqual(weekly_metric["reset_badge_short_label"], "남")
 
     def test_draw_keeps_status_close_and_metric_groups_separated(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -2449,6 +2452,19 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ],
         }
 
+    def _two_row_badge_model(self, width, first_metrics, second_metrics):
+        model = self._row_badge_model(width, metrics=first_metrics)
+        model["bars"].append(
+            {
+                "enabled": True,
+                "label": "Codex 2",
+                "status_text": "정상",
+                "status_color": "#22c55e",
+                "metrics": [dict(metric) for metric in second_metrics],
+            }
+        )
+        return model
+
     def _draw_row_badge_texts(self, width, metrics=None):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
         canvas = _FakeCanvas()
@@ -2555,16 +2571,20 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
         )
 
-    def test_metric_row_layout_exposes_full_or_short_badge_mode(self):
+    def test_overlay_badge_mode_resolves_full_or_short_from_row_layouts(self):
         metrics = self._row_badge_metrics()
 
         full_layout = taskbar_overlay._metric_row_layout_for_overlay_width(460, metrics)
         short_layout = taskbar_overlay._metric_row_layout_for_overlay_width(414, metrics)
 
-        self.assertEqual(full_layout.badge_mode, "full")
-        self.assertEqual(short_layout.badge_mode, "short")
-        self.assertIn(full_layout.badge_mode, {"full", "short"})
-        self.assertIn(short_layout.badge_mode, {"full", "short"})
+        self.assertEqual(
+            taskbar_overlay._resolve_overlay_badge_mode((full_layout,)),
+            "full",
+        )
+        self.assertEqual(
+            taskbar_overlay._resolve_overlay_badge_mode((short_layout,)),
+            "short",
+        )
 
     def test_preferred_width_uses_full_badges_before_compacting_row(self):
         metrics = self._row_badge_metrics()
@@ -2583,8 +2603,14 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 1, metrics)
 
         self.assertGreater(width, 414)
-        self.assertEqual(row_layout.badge_mode, "full")
-        self.assertNotEqual(narrower_layout.badge_mode, "full")
+        self.assertEqual(
+            taskbar_overlay._resolve_overlay_badge_mode((row_layout,)),
+            "full",
+        )
+        self.assertNotEqual(
+            taskbar_overlay._resolve_overlay_badge_mode((narrower_layout,)),
+            "full",
+        )
 
     def test_draw_compacts_all_row_badges_when_full_mode_does_not_fit(self):
         texts = self._draw_row_badge_texts(414)
@@ -2601,6 +2627,47 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertIn("남음", texts)
         self.assertNotIn("부", texts)
         self.assertNotIn("남", texts)
+
+    def test_draw_forces_compact_badge_mode_across_all_rows(self):
+        first_metrics = tuple(
+            dict(
+                metric,
+                reset_text="00h",
+                reset_short_text="00h",
+                reset_badge_label=metric["reset_badge_short_label"],
+            )
+            for metric in self._row_badge_metrics()
+        )
+        second_metrics = self._row_badge_metrics()
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        calls = []
+
+        def capture_segment(_canvas, metric, _x, _y, _width, _row_height, **kwargs):
+            calls.append(
+                {
+                    "metric": dict(metric),
+                    "badge_mode": kwargs.get("badge_mode"),
+                    "progress_width": kwargs.get("progress_width"),
+                }
+            )
+
+        overlay._canvas = canvas
+        overlay._draw_metric_segment = capture_segment
+        overlay._draw(
+            self._two_row_badge_model(
+                414,
+                first_metrics=first_metrics,
+                second_metrics=second_metrics,
+            )
+        )
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual({call["badge_mode"] for call in calls}, {"short"})
+        self.assertEqual(
+            len({call["progress_width"] for call in calls}),
+            1,
+        )
 
     def test_fit_reset_badge_can_be_forced_to_short_or_full_mode(self):
         short_available = (
@@ -3168,6 +3235,111 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertIs(build_calls[0][2], build_calls[1][2])
         self.assertEqual(build_calls[0][1]["width"], taskbar_overlay._DEFAULT_GEOMETRY["width"])
         self.assertEqual(build_calls[1][1]["width"], 420)
+
+    def test_geometry_monitor_tick_redraws_when_time_changes_without_geometry_change(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        geometry = {
+            "x": 908,
+            "y": 1041,
+            "width": 420,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+        }
+        build_calls = []
+
+        def build_model(runtime_status, geometry=None, *, now=None):
+            build_calls.append((runtime_status, dict(geometry or {}), now))
+            return {
+                "visible": True,
+                "state": "ready",
+                "geometry": dict(geometry or taskbar_overlay._DEFAULT_GEOMETRY),
+                "bars": [
+                    {
+                        "id": "account_1",
+                        "enabled": True,
+                        "label": "Codex 1",
+                        "status_text": "정상",
+                        "status_color": "#22c55e",
+                        "metrics": [
+                            {
+                                "key": "5h",
+                                "metric_key": "five_hour_limit",
+                                "percent": 99,
+                                "value_text": "99%",
+                                "color": "#22c55e",
+                                "reset_text": "04h 59m",
+                                "reset_short_text": "04h 59m",
+                                "reset_color": "#22c55e",
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+        )
+        overlay._window = window
+        overlay._last_metric_values = {"account_1:five_hour_limit": "98%"}
+        overlay._last_model = {
+            "visible": True,
+            "geometry": dict(geometry),
+            "bars": [
+                {
+                    "id": "account_1",
+                    "enabled": True,
+                    "label": "Codex 1",
+                    "status_text": "정상",
+                    "status_color": "#22c55e",
+                    "metrics": [
+                        {
+                            "key": "5h",
+                            "metric_key": "five_hour_limit",
+                            "percent": 99,
+                            "value_text": "99%",
+                            "color": "#22c55e",
+                            "reset_text": "00h 00m",
+                            "reset_short_text": "00h 00m",
+                            "reset_color": "#ef4444",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch.object(
+            taskbar_overlay,
+            "build_codex_usage_taskbar_overlay_model",
+            side_effect=build_model,
+        ), patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=420,
+        ), patch.object(
+            overlay,
+            "_calculate_geometry",
+            return_value=dict(geometry),
+        ):
+            overlay._geometry_monitor_tick()
+
+        self.assertEqual(len(build_calls), 2)
+        self.assertEqual(window.geometry_calls, [])
+        self.assertEqual(len(window.draw_calls), 1)
+        self.assertEqual(
+            overlay._last_model["bars"][0]["metrics"][0]["reset_text"],
+            "04h 59m",
+        )
+        self.assertEqual(
+            overlay._last_metric_values.get("account_1:five_hour_limit"),
+            "99%",
+        )
+        self.assertIn("account_1:five_hour_limit", overlay._flash_until)
+        self.assertIsNotNone(overlay._geometry_after_id)
 
     def test_geometry_monitor_hard_resample_restores_window_when_slot_is_unchanged(self):
         root = _FakeRoot()
