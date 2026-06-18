@@ -173,6 +173,31 @@ _SNAPSHOT_ON_TRACK_MAX_PROJECTED_REMAINING_PERCENT = 10.0
 # string, so snapshot tag projection must interpret naive captured_at values
 # the same way while keeping local overlay "now" out of tag decisions.
 _SNAPSHOT_CAPTURED_AT_FALLBACK_TZ = timezone(timedelta(hours=9))
+_BAR_RENDER_SIGNATURE_KEYS = (
+    "enabled",
+    "label",
+    "status_text",
+    "status_color",
+)
+_METRIC_RENDER_SIGNATURE_KEYS = (
+    "metric_key",
+    "key",
+    "percent",
+    "value_text",
+    "color",
+    "state",
+    "reset_text",
+    "reset_short_text",
+    "reset_color",
+    "reset_state",
+    "reset_direction",
+    "reset_marker",
+    "reset_badge_label",
+    "reset_badge_short_label",
+    "reset_badge_fill",
+    "reset_badge_outline",
+    "reset_badge_text_color",
+)
 
 
 @dataclass(frozen=True)
@@ -184,7 +209,6 @@ class _MetricRowLayout:
     segment_gap: int
     segment_width: int
     progress_width: int
-    badge_mode: str
     visible_metrics: tuple[dict[str, Any], ...]
 
 
@@ -499,16 +523,6 @@ def _row_fits_badge_mode(
     )
 
 
-def _resolve_row_badge_mode(
-    metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
-    segment_width: int,
-    progress_width: int,
-) -> str:
-    if _row_fits_badge_mode(metrics, segment_width, progress_width, "full"):
-        return "full"
-    return "short"
-
-
 def _row_fits_badge_mode_for_overlay_width(
     width: int,
     metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
@@ -521,6 +535,20 @@ def _row_fits_badge_mode_for_overlay_width(
         row_layout.progress_width,
         badge_mode,
     )
+
+
+def _resolve_overlay_badge_mode(row_layouts: tuple[_MetricRowLayout, ...]) -> str:
+    if all(
+        _row_fits_badge_mode(
+            row_layout.visible_metrics,
+            row_layout.segment_width,
+            row_layout.progress_width,
+            "full",
+        )
+        for row_layout in row_layouts
+    ):
+        return "full"
+    return "short"
 
 
 def _metric_row_layout_for_overlay_width(
@@ -540,11 +568,6 @@ def _metric_row_layout_for_overlay_width(
         segment_gap,
     )
     progress_width = _metric_progress_width_for_segment(segment_width)
-    badge_mode = _resolve_row_badge_mode(
-        visible_metrics,
-        segment_width,
-        progress_width,
-    )
     return _MetricRowLayout(
         label_width=label_width,
         status_width=status_width,
@@ -553,7 +576,6 @@ def _metric_row_layout_for_overlay_width(
         segment_gap=segment_gap,
         segment_width=segment_width,
         progress_width=progress_width,
-        badge_mode=badge_mode,
         visible_metrics=visible_metrics,
     )
 
@@ -648,6 +670,36 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
             ):
                 return _wide_slot_preferred_width(model, int(candidate_width))
     return _wide_slot_preferred_width(model, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+
+
+def _metric_render_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(metric.get(key) for key in _METRIC_RENDER_SIGNATURE_KEYS)
+
+
+def _bar_render_signature(bar: dict[str, Any]) -> tuple[Any, ...]:
+    metrics = tuple(
+        _metric_render_signature(metric)
+        for metric in _visible_metrics_for_taskbar_bar(bar)
+    )
+    bar_fields = tuple(bar.get(key) for key in _BAR_RENDER_SIGNATURE_KEYS)
+    return bar_fields + (metrics,)
+
+
+def _overlay_render_signature(model: dict[str, Any] | None) -> tuple[Any, ...]:
+    if not isinstance(model, dict):
+        return tuple()
+    bars_signature = []
+    bars = model.get("bars")
+    if isinstance(bars, list):
+        for bar in bars[:2]:
+            if not isinstance(bar, dict):
+                continue
+            bars_signature.append(_bar_render_signature(bar))
+    return (
+        bool(model.get("visible", True)),
+        model.get("state"),
+        tuple(bars_signature),
+    )
 
 
 def _wide_slot_preferred_width(model: dict[str, Any], minimum_width: int) -> int:
@@ -992,12 +1044,16 @@ class CodexUsageTaskbarOverlay:
         previous_geometry = model.get("geometry", {})
         if not isinstance(previous_geometry, dict):
             previous_geometry = {}
-        if _geometry_changed(previous_geometry, geometry):
-            updated_model = build_codex_usage_taskbar_overlay_model(
-                runtime,
-                geometry=geometry,
-                now=model_now,
-            )
+        geometry_changed = _geometry_changed(previous_geometry, geometry)
+        updated_model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            geometry=geometry,
+            now=model_now,
+        )
+        content_changed = _overlay_render_signature(model) != _overlay_render_signature(
+            updated_model
+        )
+        if geometry_changed or content_changed:
             if bool(updated_model.get("visible")):
                 if window is None:
                     window = self._ensure_window()
@@ -1005,10 +1061,12 @@ class CodexUsageTaskbarOverlay:
                     self._last_model = updated_model
                     self._schedule_geometry_monitor_tick()
                     return
-                self._apply_geometry(window, geometry)
-                self._decorate_model_flash(updated_model)
+                if geometry_changed:
+                    self._apply_geometry(window, geometry)
+                self._update_metric_change_flash(updated_model)
                 self._draw(updated_model)
                 self._last_model = updated_model
+                self._schedule_flash_tick_if_needed()
                 try:
                     window.deiconify()
                 except Exception:
@@ -1256,11 +1314,23 @@ class CodexUsageTaskbarOverlay:
             return
         row_count = min(2, len(bars))
         row_height = max(14, (height - 8) // max(1, row_count))
-        for index, bar in enumerate(bars[:2]):
-            row_layout = _metric_row_layout_for_overlay_width(
-                width,
-                _visible_metrics_for_taskbar_bar(bar),
+        row_entries = []
+        for bar in bars[:2]:
+            if not isinstance(bar, dict):
+                continue
+            row_entries.append(
+                (
+                    bar,
+                    _metric_row_layout_for_overlay_width(
+                        width,
+                        _visible_metrics_for_taskbar_bar(bar),
+                    ),
+                )
             )
+        overlay_badge_mode = _resolve_overlay_badge_mode(
+            tuple(row_layout for _bar, row_layout in row_entries)
+        )
+        for index, (bar, row_layout) in enumerate(row_entries):
             y = 4 + index * row_height
             center_y = y + row_height // 2
             label = str(bar.get("label") or "")
@@ -1304,7 +1374,7 @@ class CodexUsageTaskbarOverlay:
                     row_layout.segment_width,
                     row_height,
                     progress_width=row_layout.progress_width,
-                    badge_mode=row_layout.badge_mode,
+                    badge_mode=overlay_badge_mode,
                 )
         return
 
@@ -2421,12 +2491,17 @@ def _build_metric(
     reset_state = reset_info["state"]
     reset_color = reset_info["color"]
     reset_direction = _RESET_DIRECTION_UNKNOWN
-    if enabled and snapshot_reset_direction in {
+    known_reset_directions = {
         _RESET_DIRECTION_SHORTAGE,
         _RESET_DIRECTION_ON_TRACK,
         _RESET_DIRECTION_SURPLUS,
-    }:
-        reset_direction = snapshot_reset_direction
+    }
+    reset_info_direction = str(reset_info.get("direction") or "")
+    if enabled:
+        if snapshot_reset_direction in known_reset_directions:
+            reset_direction = snapshot_reset_direction
+        elif reset_info_direction in known_reset_directions:
+            reset_direction = reset_info_direction
     reset_profile = _reset_direction_profile(reset_direction)
     reset_marker = reset_profile["marker"]
     if reset_direction != _RESET_DIRECTION_UNKNOWN:
@@ -2528,13 +2603,6 @@ def _reset_direction_profile(direction: str) -> dict[str, str]:
     }
 
 
-def _reset_overdue_profile() -> dict[str, str]:
-    profile = dict(_reset_direction_profile(_RESET_DIRECTION_UNKNOWN))
-    profile["state"] = "overdue"
-    profile["color"] = _reset_color("overdue")
-    return profile
-
-
 def _build_reset_info(
     value: Any,
     *,
@@ -2565,7 +2633,9 @@ def _build_reset_info(
             )
             profile = _reset_direction_profile(direction)
         else:
-            profile = _reset_overdue_profile()
+            profile = _reset_direction_profile(
+                _reset_action_direction(metric_key, percent, 0)
+            )
         return {
             "text": text,
             "short_text": text,
