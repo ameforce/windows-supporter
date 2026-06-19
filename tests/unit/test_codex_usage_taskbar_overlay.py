@@ -907,6 +907,53 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         track_widths = [int(track[1][2]) - int(track[1][0]) for track in track_rects[:4]]
         self.assertEqual(track_widths, [track_widths[0]] * 4)
 
+    def test_draw_compact_slot_keeps_progress_and_percent_inside_overlay(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        runtime = self._runtime()
+        runtime["accounts"][0]["label"] = "Kim Jong"
+        runtime["accounts"][1]["label"] = "이니미니"
+        runtime["accounts"][0]["last_snapshot"]["five_hour_limit_reset_at"] = (
+            "2026-06-01T11:35:00+09:00"
+        )
+        model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            geometry={
+                "x": 780,
+                "y": 1040,
+                "width": 176,
+                "height": 38,
+                "orientation": "bottom",
+                "visible": True,
+            },
+        )
+
+        overlay._draw(model)
+
+        status_texts = [
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") in {"OK", "OUT"}
+        ]
+        track_rects = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#2a2f38"
+        ]
+        value_texts = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("text") in {"47%", "52%", "82%", "76%"}
+        ]
+
+        self.assertEqual(status_texts, [])
+        self.assertGreaterEqual(len(track_rects), 4)
+        self.assertGreaterEqual(len(value_texts), 4)
+        for rect in track_rects[:4]:
+            self.assertLessEqual(int(rect[1][2]), 176)
+            self.assertGreaterEqual(int(rect[1][2]) - int(rect[1][0]), 6)
+        for text in value_texts[:4]:
+            self.assertLessEqual(int(text[1][0]), 176)
+
     def test_reset_badge_fit_prefers_reset_time_over_badge(self):
         badge_width = taskbar_overlay._reset_badge_width_for_label("부족")
         short_badge_width = taskbar_overlay._reset_badge_width_for_label("부")
@@ -2333,6 +2380,19 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["width"], 344)
 
+    def test_bottom_taskbar_geometry_uses_compact_safe_slot_instead_of_hiding(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1000,
+            1000,
+            (0, 0, 1000, 960),
+            occupied_spans=[(0, 780), (972, 1000)],
+            preferred_width=420,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["width"], 176)
+        self.assertEqual(geometry["x"], 788)
+
     def test_bottom_taskbar_geometry_ignores_preferred_width_without_occupied_spans(self):
         baseline = calculate_taskbar_overlay_geometry(
             1920,
@@ -2833,7 +2893,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(geometry["x"], 108)
         self.assertLessEqual(geometry["x"] + geometry["width"], 452)
 
-    def test_bottom_taskbar_geometry_does_not_fallback_left_when_right_slot_is_too_small(self):
+    def test_bottom_taskbar_geometry_uses_small_right_slot_without_left_fallback(self):
         geometry = calculate_taskbar_overlay_geometry(
             1000,
             600,
@@ -2841,8 +2901,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             occupied_spans=[(0, 100), (520, 720), (990, 1000)],
         )
 
-        self.assertFalse(geometry["visible"])
-        self.assertEqual(geometry["width"], 0)
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["width"], 254)
+        self.assertEqual(geometry["x"], 728)
 
     def test_bottom_taskbar_geometry_hides_when_no_empty_slot_can_fit(self):
         geometry = calculate_taskbar_overlay_geometry(
@@ -3103,6 +3164,19 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         current = dict(previous, width=420)
 
         self.assertTrue(taskbar_overlay._geometry_changed(previous, current))
+
+    def test_geometry_changed_ignores_width_jitter_within_tolerance(self):
+        previous = {
+            "visible": True,
+            "orientation": "bottom",
+            "x": 100,
+            "y": 200,
+            "width": 376,
+            "height": 38,
+        }
+        current = dict(previous, x=101, width=375)
+
+        self.assertFalse(taskbar_overlay._geometry_changed(previous, current))
 
     def test_geometry_invalidation_allows_explicit_resample(self):
         window = _FakeWindow()

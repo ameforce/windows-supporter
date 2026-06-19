@@ -106,8 +106,8 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
                 ui = WindowsSupporterMainUI(root=object(), startup_manager=object(), monitor=object())
 
-        self.assertEqual(ui._tab_sizes.get(ui._TAB_CODEX), (820, 520))
-        self.assertEqual(ui._tab_minsizes.get(ui._TAB_CODEX), (760, 500))
+        self.assertEqual(ui._tab_sizes.get(ui._TAB_CODEX), (880, 680))
+        self.assertEqual(ui._tab_minsizes.get(ui._TAB_CODEX), (820, 640))
 
     def test_main_shell_places_version_label_at_bottom_right(self) -> None:
         fake_ttk = _FakeTtk()

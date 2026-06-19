@@ -37,6 +37,8 @@ class _FakeWidget:
         self.bind_calls = []
         self.configure_calls = []
         self.children = []
+        self.after_calls = []
+        self.after_cancel_calls = []
 
     def pack(self, **kwargs):
         self.pack_kwargs = dict(kwargs)
@@ -66,6 +68,14 @@ class _FakeWidget:
     def destroy(self):
         return None
 
+    def after(self, delay_ms, callback):
+        self.after_calls.append((int(delay_ms), callback))
+        return f"after-{len(self.after_calls)}"
+
+    def after_cancel(self, after_id):
+        self.after_cancel_calls.append(after_id)
+        return None
+
 
 class _FakeCanvas(_FakeWidget):
     def __init__(self, owner=None, *args, **kwargs):
@@ -93,13 +103,20 @@ class _FakeCanvas(_FakeWidget):
 class _FakeVar:
     def __init__(self, value=None):
         self.value = value
+        self.callbacks = []
 
     def set(self, value):
         self.value = value
+        for callback in list(self.callbacks):
+            callback("", "", "write")
         return None
 
     def get(self):
         return self.value
+
+    def trace_add(self, _mode, callback):
+        self.callbacks.append(callback)
+        return f"trace-{len(self.callbacks)}"
 
 
 class _FakeTk:
@@ -395,12 +412,42 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
         view._usage_url_var = _FakeVar(value="https://example.test")
-        view._set_status = lambda *_args, **_kwargs: None
-        view._hide_main_ui = lambda: None
+        statuses = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+        view._hide_main_ui = lambda: self.fail("autosave/manual save must not hide main UI")
 
         view._on_save()
 
         self.assertEqual(monitor.update_payloads[-1]["taskbar_overlay_enabled"], False)
+        self.assertEqual(statuses[-1], ("저장됨", "ok"))
+
+    def test_invalid_autosave_value_does_not_update_settings(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.update_payloads = []
+
+            def get_settings_snapshot(self):
+                return {"accounts": []}
+
+            def update_settings(self, payload):
+                self.update_payloads.append(dict(payload))
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="invalid")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        statuses = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        view._autosave_now()
+
+        self.assertEqual(monitor.update_payloads, [])
+        self.assertTrue(statuses)
+        self.assertEqual(statuses[-1][1], "error")
 
     def test_mount_hides_legacy_global_login_logout_buttons_for_multi_account_settings(self) -> None:
         class _FakeMonitor:
@@ -448,10 +495,69 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertIsNone(view._login_button)
         self.assertIsNone(view._logout_button)
-        self.assertEqual(
-            [button.kwargs.get("text") for button in fake_ttk.buttons],
-            ["저장", "로드하기", "로그인", "로그아웃", "로그인", "로그아웃"],
-        )
+        button_texts = [button.kwargs.get("text") for button in fake_ttk.buttons]
+        self.assertNotIn("저장", button_texts)
+        self.assertNotIn("로드하기", button_texts)
+        self.assertNotIn("툴팁(초)", [label.kwargs.get("text") for label in fake_tk.labels])
+        self.assertEqual(button_texts.count("로그인"), 2)
+        self.assertEqual(button_texts.count("로그아웃"), 2)
+        self.assertIn("아래로", button_texts)
+        self.assertIn("위로", button_texts)
+
+    def test_profile_order_swap_autosaves_without_moving_profile_dirs(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.update_payloads = []
+                self.settings = {
+                    "enabled": True,
+                    "taskbar_overlay_enabled": True,
+                    "interval_sec": 90,
+                    "usage_url": "https://example.test",
+                    "default_account_id": "account_1",
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "label": "Codex 1",
+                            "enabled": True,
+                            "profile_dir": "profile-1",
+                        },
+                        {
+                            "id": "account_2",
+                            "label": "Codex 2",
+                            "enabled": True,
+                            "profile_dir": "profile-2",
+                        },
+                    ],
+                }
+
+            def get_settings_snapshot(self):
+                return dict(self.settings)
+
+            def update_settings(self, payload):
+                self.update_payloads.append(dict(payload))
+                self.settings.update(payload)
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._account_enabled_vars = {
+            "account_1": _FakeVar(value=True),
+            "account_2": _FakeVar(value=True),
+        }
+        view._account_order = ["account_1", "account_2"]
+        view._set_status = lambda *_args, **_kwargs: None
+
+        view._on_move_account("account_2", -1)
+
+        payload = monitor.update_payloads[-1]
+        self.assertEqual(payload["default_account_id"], "account_2")
+        self.assertEqual([item["id"] for item in payload["accounts"]], ["account_2", "account_1"])
+        self.assertEqual([item["profile_dir"] for item in payload["accounts"]], ["profile-2", "profile-1"])
 
     def test_account_login_and_release_call_account_specific_manager_methods(self) -> None:
         class _FakeMonitor:
@@ -593,10 +699,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         )
         self.assertTrue(login_btn.disabled)
         self.assertFalse(logout_btn.disabled)
-        self.assertTrue(account_1_login.disabled)
-        self.assertTrue(account_1_logout.disabled)
-        self.assertTrue(account_2_login.disabled)
-        self.assertTrue(account_2_logout.disabled)
+        self.assertFalse(account_1_login.disabled)
+        self.assertFalse(account_1_logout.disabled)
+        self.assertFalse(account_2_login.disabled)
+        self.assertFalse(account_2_logout.disabled)
 
     def test_account_login_guard_uses_account_runtime_permissions(self) -> None:
         class _FakeMonitor:
@@ -625,7 +731,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._on_account_login("account_1")
 
-        self.assertEqual(monitor.login_calls, [])
+        self.assertEqual(monitor.login_calls, ["account_1"])
         self.assertTrue(statuses)
         self.assertEqual(statuses[-1][1], "info")
 
@@ -656,9 +762,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         statuses: list[tuple[str, str]] = []
         view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
 
-        view._on_account_release_profile("account_1")
+        with patch("tkinter.messagebox.askyesno", return_value=True):
+            view._on_account_release_profile("account_1")
 
-        self.assertEqual(monitor.release_calls, [])
+        self.assertEqual(monitor.release_calls, ["account_1"])
         self.assertTrue(statuses)
         self.assertEqual(statuses[-1][1], "info")
 
