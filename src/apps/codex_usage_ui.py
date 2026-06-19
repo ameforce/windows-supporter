@@ -13,6 +13,7 @@ class CodexUsageSettingsView:
         self._tk = None
         self._ttk = None
         self._win = None
+        self._parent = None
 
         self._enabled_var = None
         self._taskbar_overlay_var = None
@@ -26,6 +27,9 @@ class CodexUsageSettingsView:
         self._account_enabled_vars = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
+        self._account_order: list[str] = []
+        self._autosave_after_id = None
+        self._loading_settings = False
         self._runtime_after_id = None
         self._collect_state_var = None
         self._next_collect_var = None
@@ -49,6 +53,7 @@ class CodexUsageSettingsView:
     def mount(self, parent: Any) -> None:
         if parent is None:
             return
+        self._parent = parent
         self._lazy_import_tk()
         self._stop_runtime_refresh()
         tk = self._tk
@@ -109,10 +114,6 @@ class CodexUsageSettingsView:
 
         btn_row = tk.Frame(title_row, bg=card_bg)
         btn_row.pack(side="right")
-        ttk.Button(btn_row, text="저장", command=self._on_save).pack(side="right")
-        ttk.Button(btn_row, text="로드하기", command=self._on_reload).pack(
-            side="right", padx=(0, 8)
-        )
         if not has_multi_accounts:
             self._logout_button = ttk.Button(
                 btn_row,
@@ -223,19 +224,6 @@ class CodexUsageSettingsView:
         ttk.Entry(body, textvariable=self._interval_var, width=12).grid(
             row=row,
             column=1,
-            sticky="w",
-            pady=2,
-        )
-        tk.Label(
-            body,
-            text="툴팁(초)",
-            bg=card_bg,
-            fg="#111827",
-            font=("Segoe UI", 9),
-        ).grid(row=row, column=2, sticky="e", padx=(18, 8), pady=2)
-        ttk.Entry(body, textvariable=self._tooltip_var, width=12).grid(
-            row=row,
-            column=3,
             sticky="w",
             pady=2,
         )
@@ -382,6 +370,7 @@ class CodexUsageSettingsView:
         )
 
         self._load_settings()
+        self._register_autosave_traces()
         self._start_runtime_refresh()
         return
 
@@ -421,7 +410,16 @@ class CodexUsageSettingsView:
             cards.columnconfigure(1, weight=1)
         except Exception:
             pass
-        for index, raw in enumerate(accounts[:2]):
+        ordered_accounts = [
+            raw
+            for raw in accounts[:2]
+            if isinstance(raw, dict) and str(raw.get("id", "") or "").strip()
+        ]
+        self._account_order = [
+            str(raw.get("id", "") or "").strip()
+            for raw in ordered_accounts
+        ]
+        for index, raw in enumerate(ordered_accounts):
             if not isinstance(raw, dict):
                 continue
             account_id = str(raw.get("id", "") or "").strip()
@@ -466,6 +464,19 @@ class CodexUsageSettingsView:
                 activeforeground="#111827",
                 font=("Segoe UI", 9),
             ).pack(side="left", padx=(5, 3))
+            if len(ordered_accounts) > 1:
+                if index > 0:
+                    ttk.Button(
+                        header,
+                        text="위로",
+                        command=lambda aid=account_id: self._on_move_account(aid, -1),
+                    ).pack(side="right", padx=(4, 0))
+                if index < len(ordered_accounts) - 1:
+                    ttk.Button(
+                        header,
+                        text="아래로",
+                        command=lambda aid=account_id: self._on_move_account(aid, 1),
+                    ).pack(side="right", padx=(4, 0))
             login_button = ttk.Button(
                 header,
                 text="로그인",
@@ -601,43 +612,52 @@ class CodexUsageSettingsView:
         return f"{seconds:.1f}".rstrip("0").rstrip(".")
 
     def _load_settings(self) -> None:
+        self._loading_settings = True
         settings = self._safe_get_settings()
         try:
-            self._enabled_var.set(bool(settings.get("enabled", True)))
-        except Exception:
-            pass
-        try:
-            self._taskbar_overlay_var.set(bool(settings.get("taskbar_overlay_enabled", True)))
-        except Exception:
-            pass
-        try:
-            interval = float(settings.get("interval_sec", 90.0))
-            self._interval_var.set(self._format_seconds(interval))
-        except Exception:
-            pass
-        try:
-            tooltip_ms = int(settings.get("tooltip_duration_ms", 7000))
-            self._tooltip_var.set(self._format_seconds(float(tooltip_ms) / 1000.0))
-        except Exception:
-            pass
-        try:
-            self._usage_url_var.set(str(settings.get("usage_url", "") or ""))
-        except Exception:
-            pass
-        accounts = settings.get("accounts")
-        if isinstance(accounts, list):
-            for raw in accounts:
-                if not isinstance(raw, dict):
-                    continue
-                account_id = str(raw.get("id", "") or "")
-                var = self._account_enabled_vars.get(account_id)
-                if var is None:
-                    continue
-                try:
-                    var.set(bool(raw.get("enabled", True)))
-                except Exception:
-                    pass
-        self._set_status("", level="info")
+            try:
+                self._enabled_var.set(bool(settings.get("enabled", True)))
+            except Exception:
+                pass
+            try:
+                self._taskbar_overlay_var.set(bool(settings.get("taskbar_overlay_enabled", True)))
+            except Exception:
+                pass
+            try:
+                interval = float(settings.get("interval_sec", 90.0))
+                self._interval_var.set(self._format_seconds(interval))
+            except Exception:
+                pass
+            try:
+                tooltip_ms = int(settings.get("tooltip_duration_ms", 7000))
+                self._tooltip_var.set(self._format_seconds(float(tooltip_ms) / 1000.0))
+            except Exception:
+                pass
+            try:
+                self._usage_url_var.set(str(settings.get("usage_url", "") or ""))
+            except Exception:
+                pass
+            accounts = settings.get("accounts")
+            if isinstance(accounts, list):
+                loaded_order = []
+                for raw in accounts:
+                    if not isinstance(raw, dict):
+                        continue
+                    account_id = str(raw.get("id", "") or "")
+                    if account_id:
+                        loaded_order.append(account_id)
+                    var = self._account_enabled_vars.get(account_id)
+                    if var is None:
+                        continue
+                    try:
+                        var.set(bool(raw.get("enabled", True)))
+                    except Exception:
+                        pass
+                if loaded_order:
+                    self._account_order = loaded_order
+            self._set_status("", level="info")
+        finally:
+            self._loading_settings = False
         return
 
     def _on_reload(self) -> None:
@@ -854,38 +874,115 @@ class CodexUsageSettingsView:
         return float(value)
 
     def _on_save(self) -> None:
+        self._save_settings()
+        return
+
+    def _register_autosave_traces(self) -> None:
+        for var in (
+            self._enabled_var,
+            self._taskbar_overlay_var,
+            self._interval_var,
+            self._usage_url_var,
+            *self._account_enabled_vars.values(),
+        ):
+            self._bind_autosave_var(var)
+        return
+
+    def _bind_autosave_var(self, var: Any) -> None:
+        tracer = getattr(var, "trace_add", None)
+        if not callable(tracer):
+            return
+        try:
+            tracer("write", lambda *_args: self._schedule_autosave())
+        except Exception:
+            return
+
+    def _schedule_autosave(self) -> None:
+        if bool(self._loading_settings):
+            return
+        win = self._win
+        after_cancel = getattr(win, "after_cancel", None)
+        if self._autosave_after_id is not None and callable(after_cancel):
+            try:
+                after_cancel(self._autosave_after_id)
+            except Exception:
+                pass
+        self._autosave_after_id = None
+        after = getattr(win, "after", None)
+        if callable(after):
+            try:
+                self._autosave_after_id = after(350, self._autosave_now)
+                return
+            except Exception:
+                self._autosave_after_id = None
+        self._autosave_now()
+        return
+
+    def _autosave_now(self) -> None:
+        self._autosave_after_id = None
+        return self._save_settings()
+
+    def _parse_positive_seconds_strict(self, text: str, label: str) -> tuple[float, str | None]:
+        raw = str(text or "").strip()
+        if not raw:
+            return 0.0, f"{label} 값을 입력해 주세요."
+        try:
+            value = float(raw)
+        except Exception:
+            return 0.0, f"{label} 값이 숫자가 아닙니다."
+        if value <= 0:
+            return 0.0, f"{label} 값은 0보다 커야 합니다."
+        return float(value), None
+
+    def _save_settings(self) -> bool:
         enabled = bool(self._enabled_var.get())
-        interval_sec = self._parse_seconds(self._interval_var.get(), default=90.0)
+        interval_sec, parse_error = self._parse_positive_seconds_strict(
+            self._interval_var.get(),
+            "주기(초)",
+        )
+        if parse_error:
+            self._set_status(f"저장 실패: {parse_error}", level="error")
+            return False
         tooltip_sec = self._parse_seconds(self._tooltip_var.get(), default=7.0)
         usage_url = str(self._usage_url_var.get() or "").strip()
+        accounts = self._build_account_settings_payload()
+        payload = {
+            "enabled": enabled,
+            "taskbar_overlay_enabled": bool(self._taskbar_overlay_var.get()),
+            "interval_sec": interval_sec,
+            "tooltip_duration_ms": int(round(tooltip_sec * 1000.0)),
+            "usage_url": usage_url,
+            "accounts": accounts,
+        }
+        if accounts:
+            payload["default_account_id"] = str(accounts[0].get("id") or "")
 
-        ok, err = self._codex.update_settings(
-            {
-                "enabled": enabled,
-                "taskbar_overlay_enabled": bool(self._taskbar_overlay_var.get()),
-                "interval_sec": interval_sec,
-                "tooltip_duration_ms": int(round(tooltip_sec * 1000.0)),
-                "usage_url": usage_url,
-                "accounts": self._build_account_settings_payload(),
-            }
-        )
+        ok, err = self._codex.update_settings(payload)
         if ok:
-            self._set_status("저장 완료", level="ok")
-            self._hide_main_ui()
-            return
+            self._set_status("저장됨", level="ok")
+            return True
         self._set_status(f"저장 실패: {err}", level="error")
-        return
+        return False
 
     def _build_account_settings_payload(self) -> list[dict[str, Any]]:
         settings = self._safe_get_settings()
         accounts = settings.get("accounts")
         if not isinstance(accounts, list):
             return []
+        accounts_by_id = {
+            str(raw.get("id", "") or ""): raw
+            for raw in accounts
+            if isinstance(raw, dict) and str(raw.get("id", "") or "")
+        }
+        order = [
+            account_id
+            for account_id in self._account_order
+            if account_id in accounts_by_id
+        ]
+        order.extend(account_id for account_id in accounts_by_id if account_id not in order)
         payload = []
-        for raw in accounts[:2]:
-            if not isinstance(raw, dict):
-                continue
-            account_id = str(raw.get("id", "") or "")
+        for account_id in order[:2]:
+            raw = accounts_by_id.get(account_id, {})
             if not account_id:
                 continue
             item = dict(raw)
@@ -897,6 +994,34 @@ class CodexUsageSettingsView:
                     pass
             payload.append(item)
         return payload
+
+    def _on_move_account(self, account_id: str, direction: int) -> None:
+        normalized = str(account_id or "")
+        if not normalized:
+            return
+        order = list(self._account_order)
+        if normalized not in order:
+            order.append(normalized)
+        index = order.index(normalized)
+        new_index = max(0, min(len(order) - 1, index + int(direction)))
+        if new_index == index:
+            return
+        order[index], order[new_index] = order[new_index], order[index]
+        self._account_order = order
+        if self._autosave_now():
+            self._remount()
+            self._set_status("저장됨", level="ok")
+        return
+
+    def _remount(self) -> None:
+        parent = self._parent
+        if parent is None:
+            return
+        try:
+            self.mount(parent)
+        except Exception:
+            pass
+        return
 
     def _set_status(self, text: str, level: str = "info") -> None:
         label = self._status_label
@@ -1162,9 +1287,9 @@ class CodexUsageSettingsView:
         *,
         manager_enabled: bool = True,
     ) -> tuple[bool, bool]:
+        _ = manager_enabled
         if (
-            not bool(manager_enabled)
-            or not isinstance(entry, dict)
+            not isinstance(entry, dict)
             or not bool(entry.get("enabled", True))
         ):
             return False, False

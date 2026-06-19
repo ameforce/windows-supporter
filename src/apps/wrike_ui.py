@@ -27,6 +27,8 @@ class WrikeSettingsView:
         self._folder_levels: list[dict] = []
         self._folder_path_label = None
         self._folder_restoring = False
+        self._autosave_after_id = None
+        self._loading_settings = False
         self._status_colors = {
             "info": "#6B7280",
             "ok": "#10B981",
@@ -89,11 +91,7 @@ class WrikeSettingsView:
 
         btn_row = tk.Frame(title_row, bg=card_bg)
         btn_row.pack(side="right")
-        ttk.Button(btn_row, text="저장", command=self._on_save).pack(side="right")
         ttk.Button(btn_row, text="토큰 지우기", command=self._on_clear_token).pack(
-            side="right", padx=(0, 8)
-        )
-        ttk.Button(btn_row, text="로드하기", command=self._on_reload).pack(
             side="right", padx=(0, 8)
         )
         ttk.Button(btn_row, text="토큰 검증", command=self._on_validate_token).pack(
@@ -274,6 +272,7 @@ class WrikeSettingsView:
         row += 1
 
         self._load_settings()
+        self._register_autosave_traces()
         try:
             if self._win is not None:
                 self._win.after(120, self._auto_validate_token)
@@ -330,39 +329,43 @@ class WrikeSettingsView:
         return f"{seconds:.1f}".rstrip("0").rstrip(".")
 
     def _load_settings(self) -> None:
+        self._loading_settings = True
         try:
             settings = self._wrike.get_settings_snapshot()
         except Exception:
             settings = {}
         try:
-            self._token_var.set("")
-        except Exception:
-            pass
-        try:
-            minutes = int(settings.get("daily_target_minutes", 480))
-            self._daily_var.set(self._format_hours(minutes))
-        except Exception:
-            pass
-        try:
-            tooltip_ms = int(settings.get("tooltip_duration_ms", 6000))
-            self._tooltip_var.set(self._format_seconds(tooltip_ms / 1000.0))
-        except Exception:
-            pass
-        try:
-            self._monitor_enabled_var.set(bool(settings.get("monitor_enabled", False)))
-        except Exception:
-            pass
-        try:
-            interval = float(settings.get("monitor_interval_sec", 5))
-            self._monitor_interval_var.set(str(int(interval)))
-        except Exception:
-            pass
-        try:
-            self._status_var.set("")
-        except Exception:
-            pass
-        self._toggle_token_visibility()
-        self._restore_folder_path()
+            try:
+                self._token_var.set("")
+            except Exception:
+                pass
+            try:
+                minutes = int(settings.get("daily_target_minutes", 480))
+                self._daily_var.set(self._format_hours(minutes))
+            except Exception:
+                pass
+            try:
+                tooltip_ms = int(settings.get("tooltip_duration_ms", 6000))
+                self._tooltip_var.set(self._format_seconds(tooltip_ms / 1000.0))
+            except Exception:
+                pass
+            try:
+                self._monitor_enabled_var.set(bool(settings.get("monitor_enabled", False)))
+            except Exception:
+                pass
+            try:
+                interval = float(settings.get("monitor_interval_sec", 5))
+                self._monitor_interval_var.set(str(int(interval)))
+            except Exception:
+                pass
+            try:
+                self._status_var.set("")
+            except Exception:
+                pass
+            self._toggle_token_visibility()
+            self._restore_folder_path()
+        finally:
+            self._loading_settings = False
         return
 
     def _on_clear_token(self) -> None:
@@ -465,15 +468,89 @@ class WrikeSettingsView:
         return False
 
     def _on_save(self) -> None:
+        self._save_settings()
+        return
+
+    def _register_autosave_traces(self) -> None:
+        for var in (
+            self._token_var,
+            self._daily_var,
+            self._tooltip_var,
+            self._monitor_enabled_var,
+            self._monitor_interval_var,
+        ):
+            self._bind_autosave_var(var)
+        return
+
+    def _bind_autosave_var(self, var: Any) -> None:
+        tracer = getattr(var, "trace_add", None)
+        if not callable(tracer):
+            return
+        try:
+            tracer("write", lambda *_args: self._schedule_autosave())
+        except Exception:
+            return
+
+    def _schedule_autosave(self) -> None:
+        if bool(self._loading_settings):
+            return
+        win = self._win
+        after_cancel = getattr(win, "after_cancel", None)
+        if self._autosave_after_id is not None and callable(after_cancel):
+            try:
+                after_cancel(self._autosave_after_id)
+            except Exception:
+                pass
+        self._autosave_after_id = None
+        after = getattr(win, "after", None)
+        if callable(after):
+            try:
+                self._autosave_after_id = after(350, self._autosave_now)
+                return
+            except Exception:
+                self._autosave_after_id = None
+        self._autosave_now()
+        return
+
+    def _autosave_now(self) -> None:
+        self._autosave_after_id = None
+        self._save_settings()
+        return
+
+    def _strict_positive_float(self, text: str, label: str) -> tuple[float, str | None]:
+        raw = str(text or "").strip()
+        if not raw:
+            return 0.0, f"{label} 값을 입력해 주세요."
+        try:
+            value = float(raw)
+        except Exception:
+            return 0.0, f"{label} 값이 숫자가 아닙니다."
+        if value <= 0:
+            return 0.0, f"{label} 값은 0보다 커야 합니다."
+        return float(value), None
+
+    def _save_settings(self) -> None:
         token = str(self._token_var.get() or "").strip()
         daily_text = str(self._daily_var.get() or "").strip()
         tooltip_text = str(self._tooltip_var.get() or "").strip()
         monitor_enabled = bool(self._monitor_enabled_var.get())
         interval_text = str(self._monitor_interval_var.get() or "").strip()
 
-        daily_minutes = self._parse_hours_to_minutes(daily_text)
-        tooltip_ms = self._parse_seconds_to_ms(tooltip_text)
-        interval_sec = self._parse_seconds(interval_text)
+        daily_hours, error = self._strict_positive_float(daily_text, "일 목표 시간")
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+        tooltip_sec, error = self._strict_positive_float(tooltip_text, "툴팁 표시 시간")
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+        interval_sec, error = self._strict_positive_float(interval_text, "모니터링 주기")
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+
+        daily_minutes = int(round(daily_hours * 60))
+        tooltip_ms = int(round(tooltip_sec * 1000))
 
         ok, err = self._wrike.update_settings(
             {
@@ -486,8 +563,7 @@ class WrikeSettingsView:
         )
         try:
             if ok:
-                self._set_status("저장 완료", level="ok")
-                self._hide_main_ui()
+                self._set_status("저장됨", level="ok")
             else:
                 self._set_status(f"저장 실패: {err}", level="error")
         except Exception:
