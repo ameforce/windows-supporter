@@ -48,6 +48,7 @@ class StartupAppsWindow:
         self._busy = False
         self._controls: list[Any] = []
         self._btn_toggle = None
+        self._autosave_after_id = None
         return
 
     def is_open(self) -> bool:
@@ -265,10 +266,6 @@ class StartupAppsWindow:
         btn_rescan = ttk.Button(toolbar, text="재스캔 + 적용", command=self._on_rescan)
         btn_rescan.pack(side="right")
         self._controls.append(btn_rescan)
-
-        btn_save = ttk.Button(toolbar, text="저장 + 적용", command=self._on_save)
-        btn_save.pack(side="right", padx=(0, 8))
-        self._controls.append(btn_save)
 
         content_card = tk.Frame(
             container,
@@ -1131,6 +1128,30 @@ class StartupAppsWindow:
         self._run_bg(task, done)
         return
 
+    def _schedule_autosave(self) -> None:
+        win = self._win
+        after_cancel = getattr(win, "after_cancel", None)
+        if self._autosave_after_id is not None and callable(after_cancel):
+            try:
+                after_cancel(self._autosave_after_id)
+            except Exception:
+                pass
+        self._autosave_after_id = None
+        after = getattr(win, "after", None)
+        if callable(after):
+            try:
+                self._autosave_after_id = after(350, self._autosave_now)
+                return
+            except Exception:
+                self._autosave_after_id = None
+        self._autosave_now()
+        return
+
+    def _autosave_now(self) -> None:
+        self._autosave_after_id = None
+        self._on_save()
+        return
+
     def _on_rescan(self) -> None:
         def task() -> None:
             self._manager.rescan_defaults_merge()
@@ -1159,6 +1180,7 @@ class StartupAppsWindow:
         except Exception:
             return
         self._refresh_tree()
+        self._schedule_autosave()
         return
 
     def _on_delete(self) -> None:
@@ -1170,6 +1192,7 @@ class StartupAppsWindow:
         except Exception:
             return
         self._refresh_tree()
+        self._schedule_autosave()
         return
 
     def _on_add(self) -> None:
@@ -1224,6 +1247,7 @@ class StartupAppsWindow:
             data.pop("_ok", None)
             self._instances.append(data)
             self._refresh_tree()
+            self._schedule_autosave()
         return
 
     def _on_edit(self) -> None:
@@ -1269,6 +1293,7 @@ class StartupAppsWindow:
             data.pop("_ok", None)
             self._instances[idx] = data
             self._refresh_tree()
+            self._schedule_autosave()
         return
 
     def _edit_dialog(self, dialog: Any, data: dict[str, Any]) -> None:

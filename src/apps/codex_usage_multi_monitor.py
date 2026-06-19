@@ -60,6 +60,7 @@ class CodexUsageMultiMonitor:
             "codex_usage_multi_state.json",
         )
         self.__default_account_id = "account_1"
+        self.__account_order = list(ACCOUNT_IDS)
         self.__enabled = True
         self.__taskbar_overlay_enabled = True
         self.__interval_sec = 90.0
@@ -119,7 +120,11 @@ class CodexUsageMultiMonitor:
             "settings_path": str(self.__settings_path),
             "state_path": str(self.__state_path),
             "default_account_id": str(self.__default_account_id),
-            "accounts": [self.__build_account_settings_snapshot(account_id) for account_id in ACCOUNT_IDS],
+            "account_order": list(self.__ordered_account_ids()),
+            "accounts": [
+                self.__build_account_settings_snapshot(account_id)
+                for account_id in self.__ordered_account_ids()
+            ],
         }
 
     def update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
@@ -147,12 +152,15 @@ class CodexUsageMultiMonitor:
             self.__usage_url = usage_url.strip()
         accounts = data.get("accounts")
         if isinstance(accounts, list):
+            requested_order: list[str] = []
             for raw in accounts:
                 if not isinstance(raw, dict):
                     continue
                 account_id = str(raw.get("id", "") or "")
                 if account_id not in self.__account_settings:
                     continue
+                if account_id not in requested_order:
+                    requested_order.append(account_id)
                 current = self.__account_settings[account_id]
                 if "label" in raw:
                     label = str(raw.get("label", "") or "").strip()
@@ -160,6 +168,15 @@ class CodexUsageMultiMonitor:
                         current.label = label
                 if "enabled" in raw:
                     current.enabled = bool(raw.get("enabled"))
+            if requested_order:
+                self.__account_order = requested_order + [
+                    account_id for account_id in ACCOUNT_IDS if account_id not in requested_order
+                ]
+        default_account_id = str(data.get("default_account_id", "") or "")
+        if default_account_id in self.__account_settings:
+            self.__default_account_id = default_account_id
+        elif isinstance(accounts, list) and self.__account_order:
+            self.__default_account_id = self.__account_order[0]
         self.__save_manager_settings()
         self.__sync_child_settings()
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
@@ -167,7 +184,10 @@ class CodexUsageMultiMonitor:
         return True, None
 
     def get_runtime_status(self) -> dict[str, Any]:
-        account_entries = [self.__build_account_runtime_entry(account_id) for account_id in ACCOUNT_IDS]
+        account_entries = [
+            self.__build_account_runtime_entry(account_id)
+            for account_id in self.__ordered_account_ids()
+        ]
         active_entries = [
             entry
             for entry in account_entries
@@ -449,7 +469,7 @@ class CodexUsageMultiMonitor:
 
     def __background_account_ids(self) -> list[str]:
         account_ids = []
-        for account_id in ACCOUNT_IDS:
+        for account_id in self.__ordered_account_ids():
             if not bool(self.__account_settings[account_id].enabled):
                 continue
             runtime = self.__safe_child_runtime(account_id)
@@ -484,7 +504,7 @@ class CodexUsageMultiMonitor:
             with self.__refresh_lock:
                 self.__refresh_inflight = True
         try:
-            for account_id in ACCOUNT_IDS:
+            for account_id in self.__ordered_account_ids():
                 if not bool(self.__account_settings[account_id].enabled):
                     continue
                 self.__show_account_status(
@@ -618,7 +638,7 @@ class CodexUsageMultiMonitor:
         return next(iter(states), "unknown")
 
     def __sync_child_settings(self) -> None:
-        for account_id in ACCOUNT_IDS:
+        for account_id in self.__ordered_account_ids():
             account = self.__account_settings[account_id]
             child = self.__child(account_id)
             updater = getattr(child, "update_settings", None)
@@ -640,6 +660,14 @@ class CodexUsageMultiMonitor:
         if normalized not in self.__children:
             raise ValueError(f"unknown Codex account id: {account_id}")
         return self.__children[normalized]
+
+    def __ordered_account_ids(self) -> list[str]:
+        ordered = []
+        for account_id in self.__account_order:
+            if account_id in ACCOUNT_IDS and account_id not in ordered:
+                ordered.append(account_id)
+        ordered.extend(account_id for account_id in ACCOUNT_IDS if account_id not in ordered)
+        return ordered
 
     def __build_account_paths(self) -> dict[str, _AccountPaths]:
         local_app_base = os.path.join(self.__local_base_dir, "windows-supporter")
@@ -675,6 +703,20 @@ class CodexUsageMultiMonitor:
         usage_url = data.get("usage_url")
         if isinstance(usage_url, str) and usage_url.strip():
             self.__usage_url = usage_url.strip()
+        account_order = data.get("account_order")
+        if isinstance(account_order, list):
+            ordered = [
+                str(account_id)
+                for account_id in account_order
+                if str(account_id) in self.__account_settings
+            ]
+            if ordered:
+                self.__account_order = ordered + [
+                    account_id for account_id in ACCOUNT_IDS if account_id not in ordered
+                ]
+        default_account_id = str(data.get("default_account_id", "") or "")
+        if default_account_id in self.__account_settings:
+            self.__default_account_id = default_account_id
         accounts = data.get("accounts")
         if isinstance(accounts, list):
             for raw in accounts:
@@ -699,13 +741,15 @@ class CodexUsageMultiMonitor:
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "usage_url": str(self.__usage_url),
+            "default_account_id": str(self.__default_account_id),
+            "account_order": list(self.__ordered_account_ids()),
             "accounts": [
                 {
                     "id": account_id,
                     "label": self.__account_settings[account_id].label,
                     "enabled": bool(self.__account_settings[account_id].enabled),
                 }
-                for account_id in ACCOUNT_IDS
+                for account_id in self.__ordered_account_ids()
             ],
         }
         self.__write_json_file(self.__settings_path, payload)

@@ -256,6 +256,42 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(runtime["accounts"][0]["label"], "Daeng")
             self.assertEqual(runtime["accounts"][0]["configured_label"], "Codex 1")
 
+    def test_account_order_round_trips_and_changes_default_without_moving_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            before = manager.get_settings_snapshot()
+            profile_by_id = {
+                account["id"]: account["profile_dir"]
+                for account in before["accounts"]
+            }
+
+            ok, error = manager.update_settings(
+                {
+                    "default_account_id": "account_2",
+                    "accounts": [
+                        {"id": "account_2", "label": "Second", "enabled": True},
+                        {"id": "account_1", "label": "First", "enabled": True},
+                    ],
+                }
+            )
+
+            self.assertTrue(ok, error)
+            snapshot = manager.get_settings_snapshot()
+            self.assertEqual(snapshot["default_account_id"], "account_2")
+            self.assertEqual([a["id"] for a in snapshot["accounts"]], ["account_2", "account_1"])
+            self.assertEqual(
+                {account["id"]: account["profile_dir"] for account in snapshot["accounts"]},
+                profile_by_id,
+            )
+
+            manager.show_current_status(source="manual_login")
+            self.assertEqual(children[1].show_calls, [{"force_refresh": True, "source": "manual_login"}])
+
+            manager_again, _ = self._build_manager(tmp)
+            again = manager_again.get_settings_snapshot()
+            self.assertEqual(again["default_account_id"], "account_2")
+            self.assertEqual([a["id"] for a in again["accounts"]], ["account_2", "account_1"])
+
     def test_tooltip_duration_round_trips_and_propagates_to_child_monitors(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)

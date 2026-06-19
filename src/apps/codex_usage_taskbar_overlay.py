@@ -38,6 +38,7 @@ _DEFAULT_GEOMETRY = {
 
 _EMPTY_SLOT_PADDING_PX = 8
 _MIN_EMPTY_SLOT_WIDTH_PX = 300
+_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX = 176
 _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX = 560
 # Wide taskbar slots should breathe up to the same target used by the default overlay.
 _WIDE_EMPTY_SLOT_TARGET_WIDTH_PX = int(_DEFAULT_GEOMETRY["width"])
@@ -157,6 +158,7 @@ _METRIC_PROGRESS_MAX_WIDTH_PX = 48
 _METRIC_SEGMENT_GAP_COMPACT_PX = 6
 _METRIC_SEGMENT_GAP_WIDE_PX = 12
 _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX = 64
+_PROFILE_LABEL_COLUMN_COMPACT_MIN_WIDTH_PX = 28
 _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX = 76
 _PROFILE_LABEL_COLUMN_WIDTH_RATIO = 0.17
 _STATUS_DOT_ONLY_WIDTH_PX = 14
@@ -381,11 +383,20 @@ def calculate_taskbar_overlay_geometry(
 
 
 def _label_width_for_overlay_width(width: int) -> int:
+    overlay_width = max(0, int(width))
+    if overlay_width < _MIN_EMPTY_SLOT_WIDTH_PX:
+        return min(
+            _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
+            max(
+                _PROFILE_LABEL_COLUMN_COMPACT_MIN_WIDTH_PX,
+                int(overlay_width * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
+            ),
+        )
     return min(
         _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX,
         max(
             _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
-            int(max(0, int(width)) * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
+            int(overlay_width * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
         ),
     )
 
@@ -560,7 +571,7 @@ def _metric_row_layout_for_overlay_width(
     label_width = _label_width_for_overlay_width(overlay_width)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
-    metrics_width = max(110, overlay_width - metrics_x - 4)
+    metrics_width = max(0, overlay_width - metrics_x - 4)
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
     segment_width = _metric_segment_width_for_metrics_width(
         metrics_width,
@@ -1739,7 +1750,7 @@ def _fit_horizontal_geometry_to_empty_slot(
 
     start, end = max(free_spans, key=lambda span: (int(span[1]), int(span[0])))
     available = max(0, int(end) - int(start))
-    if available < _MIN_EMPTY_SLOT_WIDTH_PX:
+    if available < _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX:
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
@@ -1749,7 +1760,7 @@ def _fit_horizontal_geometry_to_empty_slot(
         target_width = desired_width
     else:
         target_width = min(
-            max(_MIN_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
+            max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
             desired_width,
         )
     width = min(target_width, available)
@@ -1775,7 +1786,10 @@ def _geometry_changed(
     except Exception:
         return True
     if previous_width != current_width:
-        return True
+        if _crosses_overlay_status_text_threshold(previous_width, current_width):
+            return True
+        if abs(current_width - previous_width) > int(tolerance_px):
+            return True
     for key in ("x", "y", "height"):
         try:
             before = int(previous.get(key, 0))
@@ -1785,6 +1799,14 @@ def _geometry_changed(
         if abs(after - before) > int(tolerance_px):
             return True
     return False
+
+
+def _crosses_overlay_status_text_threshold(previous_width: int, current_width: int) -> bool:
+    threshold = int(_STATUS_TEXT_MIN_OVERLAY_WIDTH_PX)
+    return (
+        (int(previous_width) < threshold <= int(current_width))
+        or (int(current_width) < threshold <= int(previous_width))
+    )
 
 
 def _current_horizontal_window_span(window: Any) -> tuple[int, int] | None:
