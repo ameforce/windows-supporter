@@ -1290,9 +1290,21 @@ class CodexUsageSettingsView:
             return False, False
         if bool(runtime.get("profile_in_use", False)):
             return False, False
-        session_state = str(runtime.get("session_state") or "logged_out")
+        raw_session_state = runtime.get("session_state")
+        session_state = str(raw_session_state or "")
         can_login_value = runtime.get("can_login")
         can_logout_value = runtime.get("can_logout")
+        if session_state == "logged_out":
+            return True, False
+        if session_state == "logged_in":
+            can_login = bool(can_login_value) if can_login_value is not None else False
+            return can_login, True
+        if raw_session_state is None and (
+            can_login_value is not None or can_logout_value is not None
+        ):
+            return bool(can_login_value), bool(can_logout_value)
+        if raw_session_state is None:
+            return True, False
         can_login = (
             bool(can_login_value)
             if can_login_value is not None
