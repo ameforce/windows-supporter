@@ -477,6 +477,51 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
             self.assertTrue(self._wait_until(lambda: not manager.get_runtime_status()["collect_inflight"]))
 
+    def test_manual_login_account_request_is_not_dropped_while_refresh_is_inflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            children: list[_BlockingChildMonitor] = []
+
+            def factory(config_dir: str, profile_dir: str):
+                child = _BlockingChildMonitor(config_dir=config_dir, profile_dir=profile_dir)
+                child.runtime["session_state"] = "logged_out"
+                child.runtime["monitor_state"] = "running"
+                child.runtime["collect_inflight"] = True
+                child.runtime["can_login"] = False
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(object(), event_queue=queue.Queue())
+            caller = threading.Thread(
+                target=lambda: manager.show_account_status("account_2", force_refresh=True),
+                daemon=True,
+            )
+            caller.start()
+
+            try:
+                self.assertTrue(children[1].started.wait(1.0))
+                manager.login_account("account_1")
+                self.assertTrue(children[0].started.wait(1.0))
+            finally:
+                for child in children:
+                    child.release.set()
+                caller.join(1.0)
+
+            self.assertTrue(
+                self._wait_until(
+                    lambda: any(call["source"] == "manual_login" for call in children[0].show_calls)
+                )
+            )
+            self.assertEqual(
+                children[0].show_calls[-1],
+                {"force_refresh": True, "source": "manual_login"},
+            )
+
     def test_attach_gives_children_ui_context_without_starting_independent_monitoring(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)

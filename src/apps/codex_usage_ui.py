@@ -1281,6 +1281,10 @@ class CodexUsageSettingsView:
         runtime = entry.get("runtime", {})
         if not isinstance(runtime, dict):
             runtime = {}
+        raw_session_state = runtime.get("session_state")
+        session_state = str(raw_session_state or "")
+        if session_state == "logged_out":
+            return True, False
         if bool(runtime.get("collect_inflight", False)) or bool(
             runtime.get("logout_in_progress", False)
         ):
@@ -1290,12 +1294,8 @@ class CodexUsageSettingsView:
             return False, False
         if bool(runtime.get("profile_in_use", False)):
             return False, False
-        raw_session_state = runtime.get("session_state")
-        session_state = str(raw_session_state or "")
         can_login_value = runtime.get("can_login")
         can_logout_value = runtime.get("can_logout")
-        if session_state == "logged_out":
-            return True, False
         if session_state == "logged_in":
             can_login = bool(can_login_value) if can_login_value is not None else False
             return can_login, True
