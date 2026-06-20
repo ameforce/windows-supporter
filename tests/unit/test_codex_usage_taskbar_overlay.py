@@ -3488,7 +3488,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         ][0]
         geometry_tick()
 
-        self.assertGreaterEqual(window.withdraw_calls, 1)
+        self.assertEqual(window.withdraw_calls, 0)
+        self.assertEqual(len(window.geometry_calls), 1)
         self.assertIsNotNone(overlay._geometry_after_id)
 
         geometry_tick = [
@@ -3505,6 +3506,231 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             f"{expected_width}x",
             window.geometry_calls[-1],
         )
+
+    def test_geometry_monitor_defers_transient_width_shrink_without_jitter(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 900), (1700, 1920)],
+            [(0, 900), (1400, 1920)],
+            [(0, 900), (1700, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[min(len(occupied_calls) - 1, len(spans_by_call) - 1)]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        initial_geometry = window.geometry_calls[-1]
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][0]
+        geometry_tick()
+
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertIsNotNone(overlay._geometry_after_id)
+
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][-1]
+        geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 3)
+        self.assertEqual(window.geometry_calls[-1], initial_geometry)
+
+    def test_geometry_monitor_deferral_keeps_refresh_from_using_transient_cache(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        spans_by_call = [
+            [(0, 900), (1700, 1920)],
+            [(0, 900), (1400, 1920)],
+            [(0, 900), (1700, 1920)],
+        ]
+        occupied_calls = []
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        initial_geometry = window.geometry_calls[-1]
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][0]
+        geometry_tick()
+        overlay.refresh()
+
+        self.assertEqual(window.geometry_calls[-1], initial_geometry)
+        self.assertNotIn("484x", window.geometry_calls[-1])
+
+    def test_geometry_monitor_accepts_second_consecutive_width_regression_with_drift(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        spans_by_call = [
+            [(0, 900), (1700, 1920)],
+            [(0, 900), (1400, 1920)],
+            [(0, 900), (1420, 1920)],
+        ]
+        occupied_calls = []
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        initial_geometry = window.geometry_calls[-1]
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][0]
+        geometry_tick()
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][-1]
+        geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 3)
+        self.assertIn("504x", window.geometry_calls[-1])
+
+    def test_geometry_monitor_accepts_no_slot_when_work_area_context_changes(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        work_areas = [
+            (0, 0, 1920, 1040),
+            (0, 0, 1920, 1000),
+        ]
+        spans_by_call = [
+            [(0, 900), (1700, 1920)],
+            [(0, 1920)],
+        ]
+
+        def work_area_getter():
+            return work_areas[min(len(occupied_calls), len(work_areas) - 1)]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=work_area_getter,
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][0]
+        geometry_tick()
+
+        self.assertGreaterEqual(window.withdraw_calls, 1)
+        self.assertIsNotNone(overlay._geometry_after_id)
+
+    def test_geometry_monitor_pending_regression_does_not_bridge_context_refresh(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        work_area_calls = []
+        occupied_calls = []
+        work_areas = [
+            (0, 0, 1920, 1040),
+            (0, 0, 1920, 1040),
+            (0, 0, 1920, 1000),
+            (0, 0, 1920, 1000),
+        ]
+        spans_by_call = [
+            [(0, 900), (1700, 1920)],
+            [(0, 900), (1400, 1920)],
+            [(0, 900), (1700, 1920)],
+            [(0, 900), (1400, 1920)],
+        ]
+
+        def work_area_getter():
+            index = min(len(work_area_calls), len(work_areas) - 1)
+            work_area_calls.append(work_areas[index])
+            return work_areas[index]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=work_area_getter,
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][0]
+        geometry_tick()
+        self.assertNotIn("484x", window.geometry_calls[-1])
+
+        overlay.refresh()
+        refreshed_geometry = window.geometry_calls[-1]
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][-1]
+        geometry_tick()
+
+        self.assertEqual(window.geometry_calls[-1], refreshed_geometry)
+        self.assertNotIn("484x", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_excludes_current_overlay_span_from_live_sampling(self):
         root = _FakeRoot()
