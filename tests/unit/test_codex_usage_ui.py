@@ -757,6 +757,70 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertTrue(disabled_account_login.disabled)
         self.assertTrue(disabled_account_logout.disabled)
 
+    def test_refresh_action_buttons_uses_session_state_to_recover_from_stale_false_flags(self) -> None:
+        class _FakeButton:
+            def __init__(self):
+                self.disabled = False
+
+            def state(self, tokens):
+                if list(tokens) == ["disabled"]:
+                    self.disabled = True
+                    return None
+                if list(tokens) == ["!disabled"]:
+                    self.disabled = False
+                    return None
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        logged_out_login = _FakeButton()
+        logged_out_logout = _FakeButton()
+        logged_in_login = _FakeButton()
+        logged_in_logout = _FakeButton()
+        view._login_button = _FakeButton()
+        view._logout_button = _FakeButton()
+        view._account_login_buttons = {
+            "account_1": logged_out_login,
+            "account_2": logged_in_login,
+        }
+        view._account_logout_buttons = {
+            "account_1": logged_out_logout,
+            "account_2": logged_in_logout,
+        }
+
+        view._refresh_action_buttons(
+            {
+                "can_login": False,
+                "can_logout": False,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "enabled": True,
+                        "runtime": {
+                            "session_state": "logged_out",
+                            "monitor_state": "idle",
+                            "can_login": False,
+                            "can_logout": False,
+                        },
+                    },
+                    {
+                        "id": "account_2",
+                        "enabled": True,
+                        "runtime": {
+                            "session_state": "logged_in",
+                            "monitor_state": "idle",
+                            "can_login": False,
+                            "can_logout": False,
+                        },
+                    },
+                ],
+            }
+        )
+
+        self.assertFalse(logged_out_login.disabled)
+        self.assertTrue(logged_out_logout.disabled)
+        self.assertTrue(logged_in_login.disabled)
+        self.assertFalse(logged_in_logout.disabled)
+
     def test_account_login_guard_uses_account_runtime_permissions(self) -> None:
         class _FakeMonitor:
             def __init__(self):
