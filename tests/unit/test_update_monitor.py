@@ -361,6 +361,49 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("SKIP_POST_BUILD_RUN", script)
         self.assertIn("Skipping post-build launch", script)
 
+    def test_build_bat_wait_loops_do_not_depend_on_timeout_stdin(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        self.assertNotIn("timeout /t", script.lower())
+        self.assertIn("call :sleep_one_second", script)
+        self.assertIn(":sleep_one_second", script)
+        self.assertIn("Start-Sleep -Seconds 1", script)
+
+    def test_build_bat_sleep_helper_runs_with_redirected_stdin(self) -> None:
+        if os.name != "nt":
+            self.skipTest("build.bat sleep helper is a Windows command path")
+
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            lines = fp.read().splitlines()
+
+        helper_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.strip().lower() == ":sleep_one_second"
+        )
+        sleep_command = lines[helper_index + 1].strip()
+        self.assertIn("Start-Sleep -Seconds 1", sleep_command)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "sleep-helper.bat"
+            harness.write_text(
+                f"@echo off\r\n{sleep_command}\r\nexit /b %ERRORLEVEL%\r\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["cmd", "/c", str(harness)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+
+        output = f"{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 0, output)
+        self.assertNotIn("Input redirection is not supported", output)
+
     def test_update_progress_snapshot_exposes_korean_copy_and_progressbar(self) -> None:
         build_step = get_update_progress_step("build")
         snapshot = build_update_progress_snapshot("build", state="running")

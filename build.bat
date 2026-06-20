@@ -225,7 +225,7 @@ exit /b 0
 for /L %%I in (1,1,5) do (
   call :is_process_running
   if errorlevel 1 exit /b 0
-  timeout /t 1 /nobreak > NUL
+  call :sleep_one_second
 )
 call :is_process_running
 if errorlevel 1 exit /b 0
@@ -235,8 +235,12 @@ exit /b 1
 for /L %%I in (1,1,5) do (
   call :is_process_running
   if not errorlevel 1 exit /b 0
-  timeout /t 1 /nobreak > NUL
+  call :sleep_one_second
 )
 call :is_process_running
 if not errorlevel 1 exit /b 0
 exit /b 1
+
+:sleep_one_second
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 1" > NUL 2>&1
+exit /b %ERRORLEVEL%
