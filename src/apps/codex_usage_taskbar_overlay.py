@@ -764,6 +764,9 @@ class CodexUsageTaskbarOverlay:
         self._geometry_invalidated = True
         self._cached_geometry_context = None
         self._cached_geometry: dict[str, int | str] | None = None
+        self._pending_regression_geometry: dict[str, int | str] | None = None
+        self._pending_regression_context = None
+        self._pending_regression_count = 0
         self._fullscreen_suppressed = False
         return
 
@@ -833,6 +836,7 @@ class CodexUsageTaskbarOverlay:
         self._cancel_flash_tick()
         self._cancel_keepalive_tick()
         self._cancel_geometry_monitor_tick()
+        self._clear_pending_regression_geometry()
         self._fullscreen_suppressed = False
         return
 
@@ -845,6 +849,7 @@ class CodexUsageTaskbarOverlay:
             except Exception:
                 pass
         self._cancel_flash_tick()
+        self._clear_pending_regression_geometry()
         self._schedule_geometry_monitor_tick()
         return
 
@@ -852,6 +857,7 @@ class CodexUsageTaskbarOverlay:
         self._geometry_invalidated = True
         self._cached_geometry_context = None
         self._cached_geometry = None
+        self._clear_pending_regression_geometry()
         return
 
     def _update_metric_change_flash(self, model: dict[str, Any]) -> None:
@@ -1047,14 +1053,25 @@ class CodexUsageTaskbarOverlay:
             now=model_now,
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
+        previous_geometry_context = self._cached_geometry_context
         geometry = self._calculate_geometry(
             force_resample=True,
             withdraw_for_sampling=False,
             preferred_width=preferred_width,
         )
+        candidate_geometry_context = self._cached_geometry_context
         previous_geometry = model.get("geometry", {})
         if not isinstance(previous_geometry, dict):
             previous_geometry = {}
+        geometry = self._stabilize_transient_geometry_regression(
+            previous_geometry,
+            geometry,
+            previous_context=previous_geometry_context,
+            candidate_context=candidate_geometry_context,
+        )
+        if self._cached_geometry_context is not None:
+            self._cached_geometry = dict(geometry)
+            self._geometry_invalidated = False
         geometry_changed = _geometry_changed(previous_geometry, geometry)
         updated_model = build_codex_usage_taskbar_overlay_model(
             runtime,
@@ -1101,6 +1118,38 @@ class CodexUsageTaskbarOverlay:
             self._force_native_repaint(window)
         self._schedule_geometry_monitor_tick()
         return
+
+    def _clear_pending_regression_geometry(self) -> None:
+        self._pending_regression_geometry = None
+        self._pending_regression_context = None
+        self._pending_regression_count = 0
+        return
+
+    def _stabilize_transient_geometry_regression(
+        self,
+        previous_geometry: dict[str, Any],
+        candidate_geometry: dict[str, int | str],
+        *,
+        previous_context: Any,
+        candidate_context: Any,
+    ) -> dict[str, int | str]:
+        if not _is_transient_geometry_regression(previous_geometry, candidate_geometry):
+            self._clear_pending_regression_geometry()
+            return candidate_geometry
+        if previous_context is None or previous_context != candidate_context:
+            self._clear_pending_regression_geometry()
+            return candidate_geometry
+        if (
+            isinstance(self._pending_regression_geometry, dict)
+            and self._pending_regression_context == candidate_context
+            and int(self._pending_regression_count) >= 1
+        ):
+            self._clear_pending_regression_geometry()
+            return candidate_geometry
+        self._pending_regression_geometry = dict(candidate_geometry)
+        self._pending_regression_context = candidate_context
+        self._pending_regression_count = 1
+        return dict(previous_geometry)
 
     def _cancel_geometry_monitor_tick(self) -> None:
         after_id = self._geometry_after_id
@@ -1799,6 +1848,39 @@ def _geometry_changed(
         if abs(after - before) > int(tolerance_px):
             return True
     return False
+
+
+def _is_transient_geometry_regression(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    tolerance_px: int = _GEOMETRY_CHANGE_TOLERANCE_PX,
+) -> bool:
+    if not bool(previous.get("visible", True)):
+        return False
+    if str(previous.get("orientation") or "") != str(current.get("orientation") or ""):
+        return False
+    try:
+        previous_width = int(previous.get("width", 0))
+    except Exception:
+        return False
+    if previous_width <= 0:
+        return False
+    if not bool(current.get("visible", True)):
+        return True
+    try:
+        current_width = int(current.get("width", 0))
+        previous_y = int(previous.get("y", 0))
+        current_y = int(current.get("y", 0))
+        previous_height = int(previous.get("height", 0))
+        current_height = int(current.get("height", 0))
+    except Exception:
+        return False
+    if abs(current_y - previous_y) > int(tolerance_px):
+        return False
+    if abs(current_height - previous_height) > int(tolerance_px):
+        return False
+    return current_width < previous_width - int(tolerance_px)
 
 
 def _crosses_overlay_status_text_threshold(previous_width: int, current_width: int) -> bool:
