@@ -2762,6 +2762,36 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(short_fit["badge_label"], "남")
         self.assertEqual(short_fit["time_text"], "6d 20h 00m")
 
+    def test_forced_short_badge_mode_prefers_visible_badge_over_time_only(self):
+        short_badge_width = taskbar_overlay._reset_badge_width_for_label("부")
+        detail_width = taskbar_overlay._reset_column_width_for_text(
+            "4d 11h 26m",
+            metric_key="weekly_limit",
+        )
+        available = max(short_badge_width, detail_width)
+
+        self.assertLess(
+            available,
+            short_badge_width
+            + taskbar_overlay._RESET_BADGE_TIME_GAP_PX
+            + detail_width,
+        )
+
+        fit = taskbar_overlay._fit_reset_badge_for_space(
+            "4d 11h 26m",
+            "4d 11h",
+            badge_label="부족",
+            badge_short_label="부",
+            metric_key="weekly_limit",
+            available_px=available,
+            badge_mode="short",
+        )
+
+        self.assertTrue(fit["badge_visible"])
+        self.assertEqual(fit["badge_label"], "부")
+        self.assertEqual(fit["time_text"], "")
+        self.assertEqual(fit["variant"], "badge_short_only")
+
     def test_refresh_clamp_path_compacts_all_row_badges_from_final_geometry(self):
         metrics = self._row_badge_metrics()
         window = _FakeWindow()

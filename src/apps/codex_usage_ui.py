@@ -693,10 +693,7 @@ class CodexUsageSettingsView:
             runtime = self._safe_get_runtime()
             entry = self._find_account_runtime_entry(runtime, account_id)
             if entry is not None:
-                can_login, _can_logout = self._account_action_permissions(
-                    entry,
-                    manager_enabled=bool(runtime.get("enabled", True)),
-                )
+                can_login, _can_logout = self._account_action_permissions(entry)
                 if not can_login:
                     self._set_status(
                         "현재 상태에서는 해당 계정 로그인 요청을 시작할 수 없습니다.",
@@ -787,10 +784,7 @@ class CodexUsageSettingsView:
             runtime = self._safe_get_runtime()
             entry = self._find_account_runtime_entry(runtime, account_id)
             if entry is not None:
-                _can_login, can_logout = self._account_action_permissions(
-                    entry,
-                    manager_enabled=bool(runtime.get("enabled", True)),
-                )
+                _can_login, can_logout = self._account_action_permissions(entry)
                 if not can_logout:
                     self._set_status(
                         "현재 상태에서는 해당 계정 로그아웃을 시작할 수 없습니다.",
@@ -1248,20 +1242,13 @@ class CodexUsageSettingsView:
             can_logout = False
         self._set_button_enabled(login_button, can_login)
         self._set_button_enabled(logout_button, can_logout)
-        manager_enabled = bool(runtime.get("enabled", True))
         for account_id, button in self._account_login_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
-            account_can_login, _account_can_logout = self._account_action_permissions(
-                entry,
-                manager_enabled=manager_enabled,
-            )
+            account_can_login, _account_can_logout = self._account_action_permissions(entry)
             self._set_button_enabled(button, account_can_login)
         for account_id, button in self._account_logout_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
-            _account_can_login, account_can_logout = self._account_action_permissions(
-                entry,
-                manager_enabled=manager_enabled,
-            )
+            _account_can_login, account_can_logout = self._account_action_permissions(entry)
             self._set_button_enabled(button, account_can_logout)
         return
 
@@ -1284,14 +1271,12 @@ class CodexUsageSettingsView:
     def _account_action_permissions(
         self,
         entry: dict[str, Any] | None,
-        *,
-        manager_enabled: bool = True,
     ) -> tuple[bool, bool]:
-        _ = manager_enabled
-        if (
-            not isinstance(entry, dict)
-            or not bool(entry.get("enabled", True))
-        ):
+        if not isinstance(entry, dict):
+            # Missing per-account runtime should not dead-end manual login recovery;
+            # the monitor still validates the actual action.
+            return True, False
+        if not bool(entry.get("enabled", True)):
             return False, False
         runtime = entry.get("runtime", {})
         if not isinstance(runtime, dict):
@@ -1300,10 +1285,25 @@ class CodexUsageSettingsView:
             runtime.get("logout_in_progress", False)
         ):
             return False, False
-        monitor_state = str(runtime.get("monitor_state") or "")
-        if monitor_state in {"running", "cancelling"}:
+        monitor_state = str(runtime.get("monitor_state") or "idle")
+        if monitor_state in {"running", "cancelling", "paused_profile_in_use"}:
             return False, False
-        return bool(runtime.get("can_login", False)), bool(runtime.get("can_logout", False))
+        if bool(runtime.get("profile_in_use", False)):
+            return False, False
+        session_state = str(runtime.get("session_state") or "logged_out")
+        can_login_value = runtime.get("can_login")
+        can_logout_value = runtime.get("can_logout")
+        can_login = (
+            bool(can_login_value)
+            if can_login_value is not None
+            else session_state in {"logged_out", "unknown"}
+        )
+        can_logout = (
+            bool(can_logout_value)
+            if can_logout_value is not None
+            else session_state == "logged_in"
+        )
+        return can_login, can_logout
 
     def _set_button_enabled(self, button: Any, enabled: bool) -> None:
         if button is None:
