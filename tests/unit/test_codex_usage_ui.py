@@ -704,6 +704,59 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertFalse(account_2_login.disabled)
         self.assertFalse(account_2_logout.disabled)
 
+    def test_refresh_action_buttons_keeps_idle_accounts_login_actionable_without_runtime(self) -> None:
+        class _FakeButton:
+            def __init__(self):
+                self.disabled = False
+
+            def state(self, tokens):
+                if list(tokens) == ["disabled"]:
+                    self.disabled = True
+                    return None
+                if list(tokens) == ["!disabled"]:
+                    self.disabled = False
+                    return None
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        missing_runtime_login = _FakeButton()
+        missing_runtime_logout = _FakeButton()
+        empty_runtime_login = _FakeButton()
+        empty_runtime_logout = _FakeButton()
+        disabled_account_login = _FakeButton()
+        disabled_account_logout = _FakeButton()
+        view._login_button = _FakeButton()
+        view._logout_button = _FakeButton()
+        view._account_login_buttons = {
+            "account_1": missing_runtime_login,
+            "account_2": empty_runtime_login,
+            "account_3": disabled_account_login,
+        }
+        view._account_logout_buttons = {
+            "account_1": missing_runtime_logout,
+            "account_2": empty_runtime_logout,
+            "account_3": disabled_account_logout,
+        }
+
+        view._refresh_action_buttons(
+            {
+                "can_login": False,
+                "can_logout": False,
+                "enabled": False,
+                "accounts": [
+                    {"id": "account_2", "enabled": True, "runtime": {}},
+                    {"id": "account_3", "enabled": False, "runtime": {}},
+                ],
+            }
+        )
+
+        self.assertFalse(missing_runtime_login.disabled)
+        self.assertTrue(missing_runtime_logout.disabled)
+        self.assertFalse(empty_runtime_login.disabled)
+        self.assertTrue(empty_runtime_logout.disabled)
+        self.assertTrue(disabled_account_login.disabled)
+        self.assertTrue(disabled_account_logout.disabled)
+
     def test_account_login_guard_uses_account_runtime_permissions(self) -> None:
         class _FakeMonitor:
             def __init__(self):
