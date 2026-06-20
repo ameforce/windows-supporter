@@ -821,6 +821,52 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertTrue(logged_in_login.disabled)
         self.assertFalse(logged_in_logout.disabled)
 
+    def test_refresh_action_buttons_keeps_logged_out_login_actionable_while_querying(self) -> None:
+        class _FakeButton:
+            def __init__(self):
+                self.disabled = False
+
+            def state(self, tokens):
+                if list(tokens) == ["disabled"]:
+                    self.disabled = True
+                    return None
+                if list(tokens) == ["!disabled"]:
+                    self.disabled = False
+                    return None
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        login_button = _FakeButton()
+        logout_button = _FakeButton()
+        view._login_button = _FakeButton()
+        view._logout_button = _FakeButton()
+        view._account_login_buttons = {"account_1": login_button}
+        view._account_logout_buttons = {"account_1": logout_button}
+
+        view._refresh_action_buttons(
+            {
+                "can_login": False,
+                "can_logout": False,
+                "collect_inflight": True,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "enabled": True,
+                        "runtime": {
+                            "session_state": "logged_out",
+                            "monitor_state": "running",
+                            "collect_inflight": True,
+                            "can_login": False,
+                            "can_logout": False,
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertFalse(login_button.disabled)
+        self.assertTrue(logout_button.disabled)
+
     def test_account_login_guard_uses_account_runtime_permissions(self) -> None:
         class _FakeMonitor:
             def __init__(self):

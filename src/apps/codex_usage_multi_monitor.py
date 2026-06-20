@@ -530,15 +530,43 @@ class CodexUsageMultiMonitor:
         allow_async_dispatch: bool = True,
     ) -> None:
         child = self.__child(account_id)
+        source_key = str(source or "manual_query")
+        if (
+            bool(allow_async_dispatch)
+            and bool(force_refresh)
+            and source_key == "manual_login"
+            and self.__event_queue is not None
+        ):
+            with self.__refresh_lock:
+                refresh_inflight = bool(self.__refresh_inflight)
+            if bool(refresh_inflight):
+                def manual_login_worker() -> None:
+                    try:
+                        child.show_current_status(
+                            force_refresh=True,
+                            source="manual_login",
+                        )
+                    finally:
+                        if bool(refresh_taskbar):
+                            self.__refresh_taskbar_progress()
+                    return
+
+                try:
+                    threading.Thread(target=manual_login_worker, daemon=True).start()
+                except Exception:
+                    child.show_current_status(force_refresh=True, source="manual_login")
+                if bool(refresh_taskbar):
+                    self.__refresh_taskbar_progress()
+                return
         if bool(allow_async_dispatch) and bool(force_refresh) and self.__dispatch_refresh_worker(
             lambda: child.show_current_status(
                 force_refresh=True,
-                source=str(source or "manual_query"),
+                source=source_key,
             ),
             refresh_taskbar=bool(refresh_taskbar),
         ):
             return
-        child.show_current_status(force_refresh=bool(force_refresh), source=str(source or "manual_query"))
+        child.show_current_status(force_refresh=bool(force_refresh), source=source_key)
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
         return
