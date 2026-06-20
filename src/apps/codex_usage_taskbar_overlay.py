@@ -3064,6 +3064,7 @@ def _fit_reset_badge_for_space(
     candidates: list[tuple[str, str, int, str, int]] = []
     allow_full_badge = normalized_badge_mode in {"any", "full"}
     allow_short_badge = normalized_badge_mode in {"any", "short"}
+    force_visible_badge = normalized_badge_mode in {"full", "short"}
 
     def add_candidate(
         variant: str,
@@ -3112,20 +3113,32 @@ def _fit_reset_badge_for_space(
                 short,
                 short_badge_width + _RESET_BADGE_TIME_GAP_PX + short_width,
             )
-    if detail:
-        add_candidate("time_detail", "", 0, detail, detail_width)
-    if short and short != detail:
-        add_candidate("time_short", "", 0, short, short_width)
-    if allow_full_badge:
-        add_candidate("badge_only", full_label, full_badge_width, "", full_badge_width)
-    if allow_short_badge and compact_label:
-        add_candidate(
-            "badge_short_only",
-            compact_label,
-            short_badge_width,
-            "",
-            short_badge_width,
-        )
+    if force_visible_badge:
+        if allow_full_badge:
+            add_candidate("badge_only", full_label, full_badge_width, "", full_badge_width)
+        if allow_short_badge and compact_label:
+            add_candidate(
+                "badge_short_only",
+                compact_label,
+                short_badge_width,
+                "",
+                short_badge_width,
+            )
+    if not force_visible_badge:
+        if detail:
+            add_candidate("time_detail", "", 0, detail, detail_width)
+        if short and short != detail:
+            add_candidate("time_short", "", 0, short, short_width)
+        if allow_full_badge:
+            add_candidate("badge_only", full_label, full_badge_width, "", full_badge_width)
+        if allow_short_badge and compact_label:
+            add_candidate(
+                "badge_short_only",
+                compact_label,
+                short_badge_width,
+                "",
+                short_badge_width,
+            )
 
     for variant, label, badge_width, time_text, total_width in candidates:
         if total_width <= available:
