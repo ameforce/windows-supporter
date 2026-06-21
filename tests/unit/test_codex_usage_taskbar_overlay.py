@@ -2991,6 +2991,20 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(right["x"], 1840)
         self.assertLessEqual(right["x"] + right["width"], 1920)
 
+    def test_stale_work_area_outside_current_screen_falls_back_inside_primary(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (1920, 0, 3840, 1080),
+        )
+
+        self.assertEqual(geometry["orientation"], "bottom")
+        self.assertGreaterEqual(geometry["x"], 0)
+        self.assertLessEqual(geometry["x"] + geometry["width"], 1920)
+        self.assertGreaterEqual(geometry["y"], 0)
+        self.assertLessEqual(geometry["y"] + geometry["height"], 1080)
+        self.assertGreaterEqual(geometry["width"], 640)
+
     def test_thin_bottom_taskbar_geometry_keeps_overlay_inside_screen(self):
         geometry = calculate_taskbar_overlay_geometry(
             1920,
