@@ -1056,7 +1056,16 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         terminate_managed.assert_called_once_with(managed_only=True)
         sleep.assert_called_once()
         launch_interactive.assert_called_once()
-        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        self.assertEqual(
+            set_visibility.call_args_list[0].kwargs,
+            {"visible": True, "bring_to_front": True},
+        )
+        self.assertIs(set_visibility.call_args_list[0].args[0], proc)
+        self.assertEqual(
+            set_visibility.call_args_list[-1].kwargs,
+            {"visible": False, "bring_to_front": False},
+        )
+        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 24001)
         self.assertFalse(context.closed)
@@ -2038,7 +2047,16 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         hide_tooltip.assert_called_once()
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48123)
-        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        self.assertEqual(
+            set_visibility.call_args_list[0].kwargs,
+            {"visible": True, "bring_to_front": True},
+        )
+        self.assertIs(set_visibility.call_args_list[0].args[0], proc)
+        self.assertEqual(
+            set_visibility.call_args_list[-1].kwargs,
+            {"visible": False, "bring_to_front": False},
+        )
+        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
         terminate_proc.assert_not_called()
         self.assertFalse(context.closed)
         self.assertFalse(browser.closed)
@@ -2135,7 +2153,16 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48126)
-        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        self.assertEqual(
+            set_visibility.call_args_list[0].kwargs,
+            {"visible": True, "bring_to_front": True},
+        )
+        self.assertIs(set_visibility.call_args_list[0].args[0], proc)
+        self.assertEqual(
+            set_visibility.call_args_list[-1].kwargs,
+            {"visible": False, "bring_to_front": False},
+        )
+        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
         terminate_proc.assert_not_called()
         self.assertFalse(context.closed)
         self.assertFalse(browser.closed)
@@ -2235,7 +2262,16 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48124)
-        set_visibility.assert_called_once_with(proc, visible=False, bring_to_front=False)
+        self.assertEqual(
+            set_visibility.call_args_list[0].kwargs,
+            {"visible": True, "bring_to_front": True},
+        )
+        self.assertIs(set_visibility.call_args_list[0].args[0], proc)
+        self.assertEqual(
+            set_visibility.call_args_list[-1].kwargs,
+            {"visible": False, "bring_to_front": False},
+        )
+        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
         terminate_proc.assert_not_called()
         self.assertFalse(context.closed)
         self.assertFalse(browser.closed)
@@ -2322,7 +2358,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(bool(getattr(proc, "_ws_monitor_managed", False)))
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48125)
-        set_visibility.assert_not_called()
+        set_visibility.assert_called_once_with(proc, visible=True, bring_to_front=True)
         terminate_proc.assert_not_called()
         self.assertFalse(context.closed)
         self.assertFalse(browser.closed)
