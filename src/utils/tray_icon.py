@@ -18,6 +18,13 @@ except Exception:
 
 _WM_WTSSESSION_CHANGE = getattr(win32con, "WM_WTSSESSION_CHANGE", 0x02B1)
 _WM_DISPLAYCHANGE = getattr(win32con, "WM_DISPLAYCHANGE", 0x007E)
+_WM_POWERBROADCAST = getattr(win32con, "WM_POWERBROADCAST", 0x0218)
+_WM_DPICHANGED = getattr(win32con, "WM_DPICHANGED", 0x02E0)
+_WM_DEVICECHANGE = getattr(win32con, "WM_DEVICECHANGE", 0x0219)
+_WM_SETTINGCHANGE = getattr(win32con, "WM_SETTINGCHANGE", 0x001A)
+_PBT_APMRESUMEAUTOMATIC = getattr(win32con, "PBT_APMRESUMEAUTOMATIC", 0x0012)
+_PBT_APMRESUMESUSPEND = getattr(win32con, "PBT_APMRESUMESUSPEND", 0x0007)
+_PBT_APMRESUMECRITICAL = getattr(win32con, "PBT_APMRESUMECRITICAL", 0x0006)
 _WTS_SESSION_UNLOCK = 0x7
 _WTS_CONSOLE_CONNECT = 0x1
 _WTS_CONSOLE_DISCONNECT = 0x2
@@ -164,6 +171,10 @@ class SystemTrayIcon:
             win32con.WM_CLOSE: self._on_close,
             win32con.WM_DESTROY: self._on_destroy,
             _WM_DISPLAYCHANGE: self._on_display_change,
+            _WM_POWERBROADCAST: self._on_power_broadcast,
+            _WM_DPICHANGED: self._on_dpi_change,
+            _WM_DEVICECHANGE: self._on_device_change,
+            _WM_SETTINGCHANGE: self._on_setting_change,
         }
         try:
             message_map[_WM_WTSSESSION_CHANGE] = self._on_session_change
@@ -375,6 +386,31 @@ class SystemTrayIcon:
 
     def _on_display_change(self, hwnd: int, msg: int, wparam: int, lparam: int):
         self._notify_display_topology_change("display_change")
+        return 0
+
+    def _on_power_broadcast(self, hwnd: int, msg: int, wparam: int, lparam: int):
+        try:
+            event = int(wparam)
+        except Exception:
+            event = 0
+        if event in {
+            int(_PBT_APMRESUMEAUTOMATIC),
+            int(_PBT_APMRESUMESUSPEND),
+            int(_PBT_APMRESUMECRITICAL),
+        }:
+            self._notify_display_topology_change("power_resume")
+        return 1
+
+    def _on_dpi_change(self, hwnd: int, msg: int, wparam: int, lparam: int):
+        self._notify_display_topology_change("dpi_change")
+        return 0
+
+    def _on_device_change(self, hwnd: int, msg: int, wparam: int, lparam: int):
+        self._notify_display_topology_change("device_change")
+        return 0
+
+    def _on_setting_change(self, hwnd: int, msg: int, wparam: int, lparam: int):
+        self._notify_display_topology_change("setting_change")
         return 0
 
     def _notify_display_topology_change(self, reason: str) -> None:

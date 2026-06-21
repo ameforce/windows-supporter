@@ -1,16 +1,23 @@
 import unittest
 from unittest.mock import patch
 
+import src.utils.tray_icon as tray_icon
 from src.utils.tray_icon import SystemTrayIcon
 
 
 class SystemTrayIconRestartUnitTest(unittest.TestCase):
-    def _build_tray(self, *, on_restart=None) -> SystemTrayIcon:
+    def _build_tray(
+        self,
+        *,
+        on_restart=None,
+        on_display_topology_change=None,
+    ) -> SystemTrayIcon:
         return SystemTrayIcon(
             tooltip="Windows Supporter",
             on_open_settings=lambda: None,
             on_exit=lambda: None,
             on_restart=on_restart,
+            on_display_topology_change=on_display_topology_change,
         )
 
     def test_restart_menu_is_shown_before_exit_when_callback_exists(self) -> None:
@@ -52,6 +59,36 @@ class SystemTrayIconRestartUnitTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(calls, ["restart"])
         destroy_window.assert_called_once_with(200)
+
+    def test_power_resume_notifies_display_topology_change(self) -> None:
+        calls: list[str] = []
+        tray = self._build_tray(on_display_topology_change=calls.append)
+
+        result = tray._on_power_broadcast(
+            200,
+            tray_icon._WM_POWERBROADCAST,
+            tray_icon._PBT_APMRESUMEAUTOMATIC,
+            0,
+        )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, ["power_resume"])
+
+    def test_dpi_device_and_setting_changes_notify_display_topology_change(self) -> None:
+        calls: list[str] = []
+        tray = self._build_tray(on_display_topology_change=calls.append)
+
+        self.assertEqual(tray._on_dpi_change(200, tray_icon._WM_DPICHANGED, 0, 0), 0)
+        self.assertEqual(
+            tray._on_device_change(200, tray_icon._WM_DEVICECHANGE, 0, 0),
+            0,
+        )
+        self.assertEqual(
+            tray._on_setting_change(200, tray_icon._WM_SETTINGCHANGE, 0, 0),
+            0,
+        )
+
+        self.assertEqual(calls, ["dpi_change", "device_change", "setting_change"])
 
 
 if __name__ == "__main__":
