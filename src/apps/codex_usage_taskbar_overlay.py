@@ -2554,16 +2554,28 @@ def _normalize_work_area(
     screen_width: int,
     screen_height: int,
 ) -> tuple[int, int, int, int]:
+    screen_width = max(1, int(screen_width or 0))
+    screen_height = max(1, int(screen_height or 0))
     if isinstance(work_area, dict):
-        return (
+        raw = (
             int(work_area.get("left", 0)),
             int(work_area.get("top", 0)),
             int(work_area.get("right", screen_width)),
             int(work_area.get("bottom", screen_height)),
         )
-    if isinstance(work_area, tuple) and len(work_area) == 4:
-        return tuple(int(v) for v in work_area)
-    return 0, 0, int(screen_width), int(screen_height)
+    elif isinstance(work_area, tuple) and len(work_area) == 4:
+        raw = tuple(int(v) for v in work_area)
+    else:
+        raw = (0, 0, int(screen_width), int(screen_height))
+
+    left, top, right, bottom = raw
+    left = max(0, min(int(left), screen_width))
+    top = max(0, min(int(top), screen_height))
+    right = max(0, min(int(right), screen_width))
+    bottom = max(0, min(int(bottom), screen_height))
+    if right <= left or bottom <= top:
+        return 0, 0, int(screen_width), int(screen_height)
+    return int(left), int(top), int(right), int(bottom)
 
 
 def _build_metric(

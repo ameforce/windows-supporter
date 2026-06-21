@@ -4286,7 +4286,7 @@ class CodexUsageMonitor:
             if cdp_proc is not None:
                 if bool(force_hidden) and bool(should_hide_cdp_window):
                     self.__set_cdp_window_visibility(cdp_proc, visible=False, bring_to_front=False)
-                elif bool(allow_interactive_recovery) and bool(is_external_cdp):
+                elif bool(allow_interactive_recovery):
                     self.__set_cdp_window_visibility(
                         cdp_proc,
                         visible=True,
