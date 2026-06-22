@@ -50,6 +50,7 @@ _KEEPALIVE_TICK_MS = 250
 _GEOMETRY_MONITOR_TICK_MS = 400
 _GEOMETRY_MONITOR_HARD_RESAMPLE_SEC = 3.0
 _GEOMETRY_CHANGE_TOLERANCE_PX = 2
+_GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX = _OCCUPIED_DILATION_PX
 _FULLSCREEN_POLL_MS = 500
 _GWLP_HWNDPARENT = -8
 _TASKBAR_METRICS = (
@@ -1106,16 +1107,6 @@ class CodexUsageTaskbarOverlay:
                 else:
                     self.hide()
                 return
-        elif hard_resample and bool(model.get("visible", True)) and window is not None:
-            try:
-                window.deiconify()
-            except Exception:
-                pass
-            try:
-                window.lift()
-            except Exception:
-                pass
-            self._force_native_repaint(window)
         self._schedule_geometry_monitor_tick()
         return
 
@@ -1139,6 +1130,11 @@ class CodexUsageTaskbarOverlay:
         if previous_context is None or previous_context != candidate_context:
             self._clear_pending_regression_geometry()
             return candidate_geometry
+        if _is_transient_geometry_x_shift(previous_geometry, candidate_geometry):
+            self._pending_regression_geometry = dict(candidate_geometry)
+            self._pending_regression_context = candidate_context
+            self._pending_regression_count = int(self._pending_regression_count) + 1
+            return dict(previous_geometry)
         if (
             isinstance(self._pending_regression_geometry, dict)
             and self._pending_regression_context == candidate_context
@@ -1880,7 +1876,46 @@ def _is_transient_geometry_regression(
         return False
     if abs(current_height - previous_height) > int(tolerance_px):
         return False
-    return current_width < previous_width - int(tolerance_px)
+    if current_width < previous_width - int(tolerance_px):
+        return True
+    return _is_transient_geometry_x_shift(
+        previous,
+        current,
+        tolerance_px=tolerance_px,
+    )
+
+
+def _is_transient_geometry_x_shift(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    tolerance_px: int = _GEOMETRY_CHANGE_TOLERANCE_PX,
+) -> bool:
+    if not bool(previous.get("visible", True)):
+        return False
+    if not bool(current.get("visible", True)):
+        return False
+    if str(previous.get("orientation") or "") != str(current.get("orientation") or ""):
+        return False
+    try:
+        previous_width = int(previous.get("width", 0))
+        current_width = int(current.get("width", 0))
+        previous_x = int(previous.get("x", 0))
+        current_x = int(current.get("x", 0))
+        previous_y = int(previous.get("y", 0))
+        current_y = int(current.get("y", 0))
+        previous_height = int(previous.get("height", 0))
+        current_height = int(current.get("height", 0))
+    except Exception:
+        return False
+    if abs(current_width - previous_width) > int(tolerance_px):
+        return False
+    if abs(current_y - previous_y) > int(tolerance_px):
+        return False
+    if abs(current_height - previous_height) > int(tolerance_px):
+        return False
+    x_delta = abs(current_x - previous_x)
+    return int(tolerance_px) < x_delta <= _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX
 
 
 def _crosses_overlay_status_text_threshold(previous_width: int, current_width: int) -> bool:
