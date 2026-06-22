@@ -4691,6 +4691,7 @@ class CodexUsageMonitor:
                 if bool(start_hidden):
                     cmd.extend(
                         [
+                            "--headless=new",
                             "--start-minimized",
                             "--window-size=1280,720",
                             "--window-position=-32000,-32000",
@@ -4698,7 +4699,9 @@ class CodexUsageMonitor:
                             "--disable-notifications",
                         ]
                     )
-                cmd.extend(["--new-window", str(launch_url)])
+                    cmd.append(str(launch_url))
+                else:
+                    cmd.extend(["--new-window", str(launch_url)])
                 popen_kwargs: dict[str, Any] = {}
                 if bool(start_hidden):
                     try:

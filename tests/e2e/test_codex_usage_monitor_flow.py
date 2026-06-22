@@ -2951,6 +2951,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--start-minimized", cmd)
         self.assertIn("--disable-session-crashed-bubble", cmd)
         self.assertIn("--hide-crash-restore-bubble", cmd)
+        self.assertIn("--headless=new", cmd)
+        self.assertNotIn("--new-window", cmd)
         self.assertIn("--window-position=-32000,-32000", cmd)
         self.assertNotIn("about:blank", cmd)
         self.assertIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", cmd)
