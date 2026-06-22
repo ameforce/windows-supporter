@@ -1,3 +1,4 @@
+import ctypes
 import os
 import queue
 import signal
@@ -18,6 +19,103 @@ from src.utils.update_monitor import (
     run_update_handoff_from_argv,
     start_update_handoff_cleanup_thread,
 )
+
+
+_ERROR_ACCESS_DENIED = 5
+_ERROR_ALREADY_EXISTS = 183
+_SINGLE_INSTANCE_MUTEX_NAME = "Local\\windows-supporter-main-instance"
+
+
+class _NoopSingleInstanceLock:
+    def close(self) -> None:
+        return
+
+
+class _SingleInstanceLock:
+    def __init__(self, kernel32, handle: int) -> None:
+        self._kernel32 = kernel32
+        self._handle = int(handle)
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle <= 0:
+            return
+        self._handle = 0
+        try:
+            self._kernel32.ReleaseMutex(handle)
+        except Exception:
+            pass
+        try:
+            self._kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+class _Pywin32SingleInstanceLock:
+    def __init__(self, win32api_module, win32event_module, handle) -> None:
+        self._win32api = win32api_module
+        self._win32event = win32event_module
+        self._handle = handle
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            self._win32event.ReleaseMutex(handle)
+        except Exception:
+            pass
+        try:
+            self._win32api.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _acquire_single_instance_lock():
+    if os.name != "nt":
+        return _NoopSingleInstanceLock()
+    try:
+        import win32api
+        import win32event
+
+        handle = win32event.CreateMutex(
+            None,
+            True,
+            _SINGLE_INSTANCE_MUTEX_NAME,
+        )
+        last_error = int(win32api.GetLastError())
+        if last_error in {_ERROR_ALREADY_EXISTS, _ERROR_ACCESS_DENIED}:
+            try:
+                win32api.CloseHandle(handle)
+            except Exception:
+                pass
+            return None
+        return _Pywin32SingleInstanceLock(win32api, win32event, handle)
+    except Exception:
+        pass
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.GetLastError.restype = ctypes.c_ulong
+        kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.CreateMutexW(None, True, _SINGLE_INSTANCE_MUTEX_NAME)
+        last_error = int(kernel32.GetLastError())
+    except Exception:
+        return _NoopSingleInstanceLock()
+
+    if last_error in {_ERROR_ALREADY_EXISTS, _ERROR_ACCESS_DENIED}:
+        if handle:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+        return None
+    if not handle:
+        return _NoopSingleInstanceLock()
+    return _SingleInstanceLock(kernel32, int(handle))
 
 
 def _build_restart_command(
@@ -107,6 +205,16 @@ def _restart_current_process() -> None:
 def main() -> None:
     if run_update_handoff_from_argv(sys.argv):
         return
+    single_instance_lock = _acquire_single_instance_lock()
+    if single_instance_lock is None:
+        return
+    try:
+        _run_main_app()
+    finally:
+        single_instance_lock.close()
+
+
+def _run_main_app() -> None:
     try:
         start_update_handoff_cleanup_thread(current_executable=sys.executable)
     except Exception:
