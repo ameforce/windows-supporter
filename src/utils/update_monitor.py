@@ -33,7 +33,15 @@ DESCRIBE_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 DEFAULT_CLEAN_ALLOWLIST = ("build/", "dist/", "*.spec", "*.egg-info/")
+KNOWN_GIT_GUI_PROCESS_NAMES = (
+    "Fork.exe",
+    "GitHubDesktop.exe",
+    "SourceTree.exe",
+    "GitKraken.exe",
+    "TortoiseGitProc.exe",
+)
 GIT_COMMAND_TIMEOUT_SECONDS = 20
+GIT_GUI_CHECK_TIMEOUT_SECONDS = 3
 UPDATE_HANDOFF_ARG = "--windows-supporter-update-handoff"
 UPDATE_HANDOFF_FILENAME = "update_handoff.json"
 UPDATE_HANDOFF_EXECUTABLE_NAME = "windows-supporter-updater.exe"
@@ -61,6 +69,41 @@ NON_PRIMARY_WORKTREE_UNAVAILABLE_MESSAGE = (
     "main worktree가 아닌 worktree에서 실행 중입니다. 업데이트와 시작프로그램 등록은 "
     "main worktree의 windows-supporter.exe에서만 수행합니다."
 )
+GIT_GUI_UPDATE_BLOCKED_MESSAGE = (
+    "Git GUI가 이 checkout을 감시 중일 수 있어 자동 업데이트를 중단했습니다. "
+    "Fork/GitHub Desktop/SourceTree 같은 Git GUI를 닫은 뒤 다시 업데이트해 주세요."
+)
+
+
+def find_running_git_gui_processes(
+    repo_root: str | os.PathLike[str],
+    *,
+    subprocess_module=subprocess,
+) -> tuple[str, ...]:
+    _ = repo_root
+    if os.name != "nt":
+        return ()
+    found: list[str] = []
+    for process_name in KNOWN_GIT_GUI_PROCESS_NAMES:
+        result = run_no_window(
+            [
+                "tasklist",
+                "/FI",
+                f"IMAGENAME eq {process_name}",
+                "/NH",
+            ],
+            subprocess_module=subprocess_module,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_GUI_CHECK_TIMEOUT_SECONDS,
+        )
+        if int(getattr(result, "returncode", 1) or 0) != 0:
+            continue
+        output = str(getattr(result, "stdout", "") or "")
+        if process_name.lower() in output.lower():
+            found.append(process_name)
+    return tuple(found)
 
 @dataclass(frozen=True)
 class UpdateCandidate:
@@ -932,6 +975,7 @@ class WindowsSupporterUpdater:
         timestamp_provider=lambda: time.strftime("%Y%m%d-%H%M%S"),
         worktree_runner=subprocess.run,
         settings_path_provider=get_update_settings_path,
+        git_gui_process_detector=None,
     ) -> None:
         self._root = root
         self._event_queue = event_queue
@@ -949,6 +993,15 @@ class WindowsSupporterUpdater:
         self._timestamp_provider = timestamp_provider
         self._worktree_runner = worktree_runner
         self._settings_path_provider = settings_path_provider
+        if callable(git_gui_process_detector):
+            self._git_gui_process_detector = git_gui_process_detector
+        elif subprocess_module is subprocess:
+            self._git_gui_process_detector = lambda repo_root: find_running_git_gui_processes(
+                repo_root,
+                subprocess_module=self._subprocess,
+            )
+        else:
+            self._git_gui_process_detector = lambda _repo_root: ()
         self._settings_path = Path(self._settings_path_provider())
         self._settings = load_update_settings(self._settings_path)
         self._session = UpdatePromptSession()
@@ -1265,6 +1318,15 @@ class WindowsSupporterUpdater:
     def _has_update_cleanup_targets(self) -> bool:
         return self._inspect_working_tree_state().has_cleanup_targets
 
+    def _find_running_git_gui_processes(self) -> tuple[str, ...]:
+        detector = self._git_gui_process_detector
+        if not callable(detector):
+            return ()
+        try:
+            return tuple(str(item) for item in detector(self._repo_root) if str(item).strip())
+        except subprocess.TimeoutExpired:
+            return ()
+
     def _inspect_working_tree_state(self) -> UpdateWorkingTreeState:
         source_status = parse_git_status_porcelain(
             self._git_output(["git", "status", "--porcelain", "--untracked-files=all"])
@@ -1368,6 +1430,22 @@ class WindowsSupporterUpdater:
             "backup_branch": "",
             "cleaned_targets": list(working_tree.cleanup_targets),
         }
+        git_gui_processes = self._find_running_git_gui_processes()
+        if git_gui_processes:
+            process_names = ", ".join(git_gui_processes)
+            self._state = "error"
+            self._last_error = f"{GIT_GUI_UPDATE_BLOCKED_MESSAGE}\n실행 중: {process_names}"
+            self._progress_snapshot = build_update_progress_snapshot(
+                "failed",
+                state="failed",
+                detail=self._last_error,
+                failed_step="Git GUI 확인",
+                can_retry=True,
+                can_manual_action=True,
+            )
+            self._preflight_result = preflight
+            self._notify_status_changed()
+            return False
         try:
             self._progress_snapshot = build_update_progress_snapshot("fetch", state="running")
             self._notify_status_changed()

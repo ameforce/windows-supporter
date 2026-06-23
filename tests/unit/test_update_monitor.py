@@ -776,6 +776,36 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             ],
         )
 
+    def test_prepare_repository_stops_before_git_when_git_gui_is_open(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.commands = []
+
+            def run(self, argv, **_kwargs):
+                self.commands.append(list(argv))
+                return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        fake_subprocess = FakeSubprocess()
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+            subprocess_module=fake_subprocess,
+            git_gui_process_detector=lambda _repo_root: ("Fork.exe",),
+        )
+
+        self.assertFalse(
+            updater._prepare_repository_for_update(
+                UpdateWorkingTreeState(remote_only_count=1)
+            )
+        )
+
+        snapshot = updater.get_status_snapshot()
+        self.assertEqual(fake_subprocess.commands, [])
+        self.assertEqual(snapshot["state"], "error")
+        self.assertIn("Fork.exe", snapshot["last_error"])
+        self.assertEqual(snapshot["progress"]["failed_step"], "Git GUI 확인")
+
     def test_update_approval_fails_closed_when_git_state_inspection_fails(self) -> None:
         updater = WindowsSupporterUpdater(
             root=object(),
