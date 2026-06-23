@@ -1260,6 +1260,14 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             self.assertEqual(settings["check_interval_minutes"], 10)
             self.assertEqual(settings["settings_path"], str(settings_path))
 
+            ok, error = updater.update_settings(
+                {"auto_check_enabled": True, "check_interval_minutes": 1}
+            )
+            self.assertFalse(ok)
+            self.assertIn("3분 이상", str(error))
+            self.assertEqual(updater.get_settings_snapshot()["check_interval_minutes"], 10)
+            self.assertFalse(settings_path.exists())
+
             updater.start()
             self.assertEqual(root.after_calls[0][0], updater.INITIAL_CHECK_DELAY_MS)
 

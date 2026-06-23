@@ -67,6 +67,32 @@ def normalize_update_settings(
     )
 
 
+def validate_update_settings_update(
+    data: dict[str, Any],
+    *,
+    settings_path: str | os.PathLike[str] = "",
+    current: UpdateSettings | None = None,
+) -> tuple[UpdateSettings | None, str | None]:
+    source = dict(data)
+    if "check_interval_minutes" in source:
+        raw_minutes = source.get("check_interval_minutes")
+        try:
+            interval = int(str(raw_minutes).strip())
+        except Exception:
+            return None, _interval_range_message()
+        if interval < MIN_CHECK_INTERVAL_MINUTES or interval > MAX_CHECK_INTERVAL_MINUTES:
+            return None, _interval_range_message()
+        source["check_interval_minutes"] = interval
+    return normalize_update_settings(source, settings_path=settings_path, current=current), None
+
+
+def _interval_range_message() -> str:
+    return (
+        f"확인 주기는 {MIN_CHECK_INTERVAL_MINUTES}분 이상 "
+        f"{MAX_CHECK_INTERVAL_MINUTES}분 이하 숫자로 입력해 주세요."
+    )
+
+
 def load_update_settings(path: str | os.PathLike[str]) -> UpdateSettings:
     resolved = Path(path)
     try:

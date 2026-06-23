@@ -192,6 +192,12 @@ class UpdateSettingsView:
                 f"{MAX_CHECK_INTERVAL_MINUTES}분 이하 숫자로 입력해 주세요."
             )
             return False
+        if minutes < MIN_CHECK_INTERVAL_MINUTES or minutes > MAX_CHECK_INTERVAL_MINUTES:
+            self._set_status(
+                f"확인 주기는 {MIN_CHECK_INTERVAL_MINUTES}분 이상 "
+                f"{MAX_CHECK_INTERVAL_MINUTES}분 이하 숫자로 입력해 주세요."
+            )
+            return False
         try:
             ok, err = self._updater.update_settings(
                 {
