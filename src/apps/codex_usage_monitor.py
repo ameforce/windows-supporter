@@ -2228,6 +2228,20 @@ class CodexUsageMonitor:
             and not bool(self.__logout_in_progress)
         )
 
+    def __get_background_collect_block_reason(self) -> str:
+        if not bool(self.__enabled):
+            return "disabled"
+        if bool(self.__logout_in_progress):
+            return "logout_in_progress"
+        if not self.__is_logged_in_session():
+            return "logged_out"
+        if bool(self.__auth_attention_required):
+            reason = normalize_usage_value(self.__auth_attention_reason).lower()
+            return reason or "auth_attention_required"
+        if bool(self.__profile_in_use_detected):
+            return "profile_in_use"
+        return ""
+
     def __request_collect_cancel(self) -> None:
         try:
             self.__collect_cancel_event.set()
@@ -2549,6 +2563,14 @@ class CodexUsageMonitor:
         if source_key == "manual_login":
             self.__cancel_pending_login_poll()
         is_manual_surface = source_key in {"manual_query", "manual_login"}
+        if source_key == "auto_monitor" and bool(force_refresh):
+            block_reason = self.__get_background_collect_block_reason()
+            if block_reason:
+                self.__set_monitor_state("idle")
+                self.__log(
+                    f"collect skip source=auto_monitor reason={block_reason}"
+                )
+                return
 
         def worker() -> None:
             snapshot = None if bool(force_refresh) else self.get_last_snapshot()
