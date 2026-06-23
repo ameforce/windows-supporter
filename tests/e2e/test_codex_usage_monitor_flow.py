@@ -1423,7 +1423,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(calls[0]["kwargs"].get("channel"), "chrome")
         self.assertTrue(calls[0]["kwargs"].get("chromium_sandbox"))
         self.assertNotIn("ignore_default_args", calls[0]["kwargs"])
-        self.assertNotIn("args", calls[0]["kwargs"])
+        self.assertIn("--disable-extensions", calls[0]["kwargs"].get("args", []))
+        self.assertIn("--disable-notifications", calls[0]["kwargs"].get("args", []))
 
     def test_wait_until_logged_in_performs_active_login_entry(self) -> None:
         class _DummyPage:
@@ -3116,6 +3117,84 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             playwright_obj.chromium.timeouts,
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
         )
+
+    def test_launch_interactive_context_via_cdp_visible_start_disables_extensions(
+        self,
+    ) -> None:
+        class _DummyProc:
+            pid = 43212
+
+            def poll(self):
+                return None
+
+        class _DummyContext:
+            pass
+
+        class _DummyBrowser:
+            def __init__(self):
+                self.contexts = [_DummyContext()]
+
+            def close(self):
+                return None
+
+        class _DummyChromium:
+            def connect_over_cdp(self, _endpoint, **_kwargs):
+                return _DummyBrowser()
+
+        class _DummyPlaywright:
+            def __init__(self):
+                self.chromium = _DummyChromium()
+
+        popen_calls: list[tuple[list[str], dict]] = []
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append((list(cmd), dict(kwargs)))
+            return _DummyProc()
+
+        class _DummyStartupInfo:
+            def __init__(self):
+                self.dwFlags = 0
+                self.wShowWindow = 0
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__resolve_chrome_executable_path",
+            return_value="C:/Program Files/Google/Chrome/Application/chrome.exe",
+        ):
+            with patch.object(self.monitor._CodexUsageMonitor__lib.os, "makedirs"):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib.subprocess,
+                    "Popen",
+                    side_effect=fake_popen,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__find_profile_remote_debugging_pid",
+                        side_effect=[0, 43212],
+                    ):
+                        with patch.object(
+                            self.monitor._CodexUsageMonitor__lib.subprocess,
+                            "STARTUPINFO",
+                            side_effect=_DummyStartupInfo,
+                        ):
+                            context, browser, proc = (
+                                self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
+                                    _DummyPlaywright(),
+                                    start_hidden=False,
+                                )
+                            )
+
+        self.assertIsNotNone(context)
+        self.assertIsNotNone(browser)
+        self.assertIsNotNone(proc)
+        self.assertTrue(popen_calls)
+        cmd, kwargs = popen_calls[0]
+        self.assertIn("--disable-extensions", cmd)
+        self.assertIn("--disable-notifications", cmd)
+        self.assertIn("--new-window", cmd)
+        self.assertNotIn("--headless=new", cmd)
+        self.assertIn("startupinfo", kwargs)
+        self.assertIn("creationflags", kwargs)
 
     def test_collect_snapshot_once_reuses_hidden_cdp_process_between_calls(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
