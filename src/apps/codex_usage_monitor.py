@@ -1765,6 +1765,10 @@ class CodexUsageMonitor:
         self.__pending_login_poll_reason = ""
         self.__pending_login_no_cdp_miss_count = 0
         self.__pending_login_no_cdp_max_misses = 6
+        self.__pending_login_error_count = 0
+        self.__pending_login_error_max_retries = 6
+        self.__pending_login_busy_retry_delay_sec = 15.0
+        self.__pending_login_max_retry_delay_sec = 60.0
         self.__cdp_status_cache_ttl_sec = 5.0
         self.__cdp_status_cache: dict[str, int] = {"profile": 0, "system": 0}
         self.__cdp_status_cache_lock = threading.Lock()
@@ -2449,6 +2453,14 @@ class CodexUsageMonitor:
             pending_login_no_cdp_max_misses = int(self.__pending_login_no_cdp_max_misses)
         except Exception:
             pending_login_no_cdp_max_misses = 0
+        try:
+            pending_login_error_count = int(self.__pending_login_error_count)
+        except Exception:
+            pending_login_error_count = 0
+        try:
+            pending_login_error_max_retries = int(self.__pending_login_error_max_retries)
+        except Exception:
+            pending_login_error_max_retries = 0
         profile_cdp_count, system_chrome_cdp_count = self.__get_cdp_status_counts(now=now)
         remain: float | None = None
         estimated = False
@@ -2508,6 +2520,8 @@ class CodexUsageMonitor:
             "pending_login_poll_remaining_sec": pending_login_remaining,
             "pending_login_no_cdp_miss_count": max(0, pending_login_no_cdp_miss_count),
             "pending_login_no_cdp_max_misses": max(0, pending_login_no_cdp_max_misses),
+            "pending_login_error_count": max(0, pending_login_error_count),
+            "pending_login_error_max_retries": max(0, pending_login_error_max_retries),
             "profile_in_use": bool(self.__profile_in_use_detected),
             "profile_cdp_available": bool(profile_cdp_count > 0),
             "profile_cdp_count": max(0, int(profile_cdp_count)),
@@ -2931,6 +2945,7 @@ class CodexUsageMonitor:
         self.__pending_login_poll_until_ts = 0.0
         self.__pending_login_poll_reason = ""
         self.__pending_login_no_cdp_miss_count = 0
+        self.__pending_login_error_count = 0
         if root is not None and after_id is not None:
             try:
                 root.after_cancel(after_id)
@@ -2966,6 +2981,7 @@ class CodexUsageMonitor:
             until_ts = 0.0
         if until_ts <= now:
             self.__pending_login_poll_until_ts = now + float(self.__pending_login_poll_window_sec)
+            self.__pending_login_error_count = 0
         if self.__pending_login_after_id is not None:
             return
         delay_sec = (
@@ -2984,6 +3000,69 @@ class CodexUsageMonitor:
             )
         except Exception:
             self.__pending_login_after_id = None
+        return
+
+    def __pending_login_retry_delay_sec(self, error_count: int | None = None) -> float:
+        try:
+            count = int(self.__pending_login_error_count if error_count is None else error_count)
+        except Exception:
+            count = 1
+        if count < 1:
+            count = 1
+        try:
+            base_delay = float(self.__pending_login_poll_interval_sec)
+        except Exception:
+            base_delay = 8.0
+        if base_delay < 1.0:
+            base_delay = 1.0
+        try:
+            max_delay = float(self.__pending_login_max_retry_delay_sec)
+        except Exception:
+            max_delay = 60.0
+        if max_delay < base_delay:
+            max_delay = base_delay
+        multiplier = 2 ** min(max(0, count - 1), 3)
+        return min(max_delay, base_delay * multiplier)
+
+    def __pending_login_busy_retry_delay_sec_value(self) -> float:
+        try:
+            busy_delay = float(self.__pending_login_busy_retry_delay_sec)
+        except Exception:
+            busy_delay = 15.0
+        try:
+            interval_delay = float(self.__pending_login_poll_interval_sec)
+        except Exception:
+            interval_delay = 8.0
+        return max(1.0, busy_delay, interval_delay)
+
+    def __handle_pending_login_poll_error(self, error: str) -> None:
+        reason = normalize_usage_value(error) or "empty_snapshot"
+        try:
+            error_count = int(self.__pending_login_error_count) + 1
+        except Exception:
+            error_count = 1
+        try:
+            max_retries = int(self.__pending_login_error_max_retries)
+        except Exception:
+            max_retries = 6
+        if max_retries < 1:
+            max_retries = 1
+        if error_count > max_retries:
+            self.__pending_login_after_id = None
+            self.__pending_login_poll_until_ts = 0.0
+            self.__pending_login_poll_reason = ""
+            self.__pending_login_no_cdp_miss_count = 0
+            self.__pending_login_error_count = 0
+            self.__log(
+                "pending login poll stopped "
+                f"reason=repeated_error error={reason} count={error_count}"
+            )
+            return
+        self.__pending_login_error_count = error_count
+        self.__schedule_pending_login_poll(
+            reason=reason,
+            initial_delay_sec=self.__pending_login_retry_delay_sec(error_count),
+        )
         return
 
     def __pending_login_poll_tick(self) -> None:
@@ -3027,13 +3106,14 @@ class CodexUsageMonitor:
                 return
             self.__pending_login_poll_until_ts = 0.0
             self.__pending_login_no_cdp_miss_count = 0
+            self.__pending_login_error_count = 0
             self.__log("pending login poll stopped reason=no_profile_cdp")
             return
         self.__pending_login_no_cdp_miss_count = 0
         if bool(self.__collect_inflight):
             self.__schedule_pending_login_poll(
                 reason="collect_busy",
-                initial_delay_sec=min(float(self.__pending_login_poll_interval_sec), 5.0),
+                initial_delay_sec=self.__pending_login_busy_retry_delay_sec_value(),
             )
             return
         worker_epoch = int(self.__worker_epoch)
@@ -3047,6 +3127,7 @@ class CodexUsageMonitor:
                 if error is None and snapshot is not None:
                     self.__set_session_state("logged_in")
                     self.__failure_count = 0
+                    self.__pending_login_error_count = 0
                     changes = self.handle_snapshot(snapshot)
                     latest_snapshot = self.get_last_snapshot()
 
@@ -3069,9 +3150,8 @@ class CodexUsageMonitor:
                     return
                 self.__log(f"pending login poll retry error={error or 'empty_snapshot'}")
                 self.__ui_post(
-                    lambda err=error: self.__schedule_pending_login_poll(
-                        reason=str(err or "empty_snapshot"),
-                        initial_delay_sec=float(self.__pending_login_poll_interval_sec),
+                    lambda err=error: self.__handle_pending_login_poll_error(
+                        str(err or "empty_snapshot")
                     )
                 )
             except Exception as exc:
@@ -3079,10 +3159,7 @@ class CodexUsageMonitor:
                     return
                 self.__log_exception("pending login poll failed", exc)
                 self.__ui_post(
-                    lambda: self.__schedule_pending_login_poll(
-                        reason="poll_failed",
-                        initial_delay_sec=float(self.__pending_login_poll_interval_sec),
-                    )
+                    lambda: self.__handle_pending_login_poll_error("poll_failed")
                 )
             return
 
@@ -3090,10 +3167,7 @@ class CodexUsageMonitor:
             threading.Thread(target=worker, daemon=True).start()
         except Exception as exc:
             self.__log_exception("pending login poll thread start failed", exc)
-            self.__schedule_pending_login_poll(
-                reason="thread_start_failed",
-                initial_delay_sec=float(self.__pending_login_poll_interval_sec),
-            )
+            self.__handle_pending_login_poll_error("thread_start_failed")
         return
 
     def __monitor_tick(self) -> None:

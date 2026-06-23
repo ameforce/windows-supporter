@@ -46,8 +46,8 @@ _TASKBAR_SAMPLE_STEP_PX = 4
 _OCCUPIED_DILATION_PX = 24
 _FLASH_DURATION_SEC = 1.0
 _FLASH_TICK_MS = 1000
-_KEEPALIVE_TICK_MS = 250
-_GEOMETRY_MONITOR_TICK_MS = 400
+_KEEPALIVE_TICK_MS = 2000
+_GEOMETRY_MONITOR_TICK_MS = 3000
 _GEOMETRY_MONITOR_HARD_RESAMPLE_SEC = 3.0
 _GEOMETRY_CHANGE_TOLERANCE_PX = 2
 _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX = _OCCUPIED_DILATION_PX
@@ -990,8 +990,8 @@ class CodexUsageTaskbarOverlay:
         if window is None:
             return
         native_visible = self._is_native_z_order_visible(window)
-        self._reassert_native_z_order(window)
         if not native_visible:
+            self._reassert_native_z_order(window)
             self._force_native_repaint(window)
         self._schedule_keepalive_tick()
         return
