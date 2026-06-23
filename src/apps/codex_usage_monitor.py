@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - optional runtime bridge
 
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
+from src.utils.subprocess_utils import build_no_window_subprocess_kwargs
 
 
 USAGE_METRIC_KEYS = (
@@ -4768,6 +4769,8 @@ class CodexUsageMonitor:
                     "--hide-crash-restore-bubble",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--disable-extensions",
+                    "--disable-notifications",
                 ]
                 if bool(start_hidden):
                     cmd.extend(
@@ -4776,8 +4779,6 @@ class CodexUsageMonitor:
                             "--start-minimized",
                             "--window-size=1280,720",
                             "--window-position=-32000,-32000",
-                            "--disable-extensions",
-                            "--disable-notifications",
                         ]
                     )
                     cmd.append(str(launch_url))
@@ -4790,7 +4791,9 @@ class CodexUsageMonitor:
                             str(launch_url),
                         ]
                     )
-                popen_kwargs: dict[str, Any] = {}
+                popen_kwargs: dict[str, Any] = build_no_window_subprocess_kwargs(
+                    self.__lib.subprocess
+                )
                 if bool(start_hidden):
                     try:
                         startupinfo = self.__lib.subprocess.STARTUPINFO()
@@ -6396,6 +6399,10 @@ class CodexUsageMonitor:
             kwargs = {
                 "headless": bool(headless),
                 "chromium_sandbox": True,
+                "args": [
+                    "--disable-extensions",
+                    "--disable-notifications",
+                ],
             }
             if channel:
                 kwargs["channel"] = channel
