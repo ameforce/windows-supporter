@@ -256,6 +256,28 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(runtime["accounts"][0]["label"], "Daeng")
             self.assertEqual(runtime["accounts"][0]["configured_label"], "Codex 1")
 
+    def test_logged_out_accounts_with_profile_cdp_do_not_drive_background_scheduler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            for child in children:
+                child.runtime.update(
+                    {
+                        "session_state": "logged_out",
+                        "collect_inflight": False,
+                        "profile_session_present": True,
+                        "profile_cdp_available": True,
+                        "can_login": True,
+                        "can_logout": False,
+                    }
+                )
+            root = _FakeRoot()
+
+            manager.attach(root)
+            runtime = manager.get_runtime_status()
+
+            self.assertFalse(runtime["auto_monitoring_active"])
+            self.assertEqual(root.after_calls, [])
+
     def test_account_order_round_trips_and_changes_default_without_moving_profiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
@@ -559,7 +581,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(children[1].show_calls, [])
             self.assertGreaterEqual(len(root.after_calls), 2)
 
-    def test_attach_revalidates_logged_out_account_when_profile_session_is_present(self):
+    def test_attach_does_not_revalidate_logged_out_account_when_profile_session_is_present(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
             children[0].runtime["session_state"] = "logged_out"
@@ -569,13 +591,8 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             manager.attach(root, event_queue=None)
 
-            self.assertEqual(len(root.after_calls), 1)
-            root.after_calls[0]["callback"]()
-
-            self.assertEqual(
-                children[0].show_calls,
-                [{"force_refresh": True, "source": "auto_monitor"}],
-            )
+            self.assertEqual(root.after_calls, [])
+            self.assertEqual(children[0].show_calls, [])
             self.assertEqual(children[1].show_calls, [])
 
     def test_attach_does_not_mask_child_attach_type_errors(self):
