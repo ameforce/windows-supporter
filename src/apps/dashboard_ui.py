@@ -260,12 +260,23 @@ class DashboardView:
             pass
         status_frame = tk.Frame(row, bg=bg)
         status_frame.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        try:
+            status_frame.configure(cursor="hand2")
+            self._bind_click(status_frame, "update.settings")
+        except Exception:
+            pass
+        ttk.Button(
+            row,
+            text="자동 업데이트",
+            width=14,
+            command=lambda: self._invoke("update.settings"),
+        ).grid(row=0, column=1, sticky="e", padx=(0, 6))
         ttk.Button(
             row,
             text="업데이트 확인",
             width=14,
             command=lambda: self._invoke("update.check"),
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
         self._status_frames["update"] = status_frame
         return
 
