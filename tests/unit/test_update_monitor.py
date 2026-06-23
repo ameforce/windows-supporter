@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -53,6 +55,7 @@ from src.utils.update_monitor import (
     parse_semver_tag,
     read_update_handoff_state,
     resolve_current_tag,
+    run_no_window_with_progress,
     run_update_handoff,
     select_update_candidate,
     start_update_handoff_cleanup_thread,
@@ -1000,6 +1003,287 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             ["빌드 실행 중", "Windows Supporter 재실행 중", "업데이트 완료"],
         )
         self.assertEqual(progress_instances[0].close_calls, 1)
+
+    def test_run_no_window_with_progress_pumps_ui_while_waiting_for_build_output(self) -> None:
+        class SlowStdout:
+            def __init__(self, owner) -> None:
+                self.owner = owner
+                self.line_requested = threading.Event()
+                self.release_line = threading.Event()
+                self.lines = ["Building main.py to windows-supporter.exe...[ Success !! ]\n"]
+
+            def readline(self):
+                self.line_requested.set()
+                self.release_line.wait(timeout=2)
+                if self.lines:
+                    return self.lines.pop(0)
+                self.owner.returncode = 0
+                return ""
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.stdout = SlowStdout(self)
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=0):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = 1
+
+        class FakeSubprocess:
+            PIPE = subprocess.PIPE
+            STDOUT = subprocess.STDOUT
+
+            def __init__(self) -> None:
+                self.process = FakeProcess()
+
+            def Popen(self, argv, **kwargs):
+                return self.process
+
+        class FakeProgressUi:
+            def __init__(self, stdout: SlowStdout) -> None:
+                self.stdout = stdout
+                self.pumped_before_first_line = False
+                self.pump_calls = 0
+
+            def pump(self):
+                self.pump_calls += 1
+                if self.stdout.line_requested.is_set() and not self.stdout.release_line.is_set():
+                    self.pumped_before_first_line = True
+
+        fake_subprocess = FakeSubprocess()
+        progress_ui = FakeProgressUi(fake_subprocess.process.stdout)
+        holder = {}
+
+        def run_command() -> None:
+            holder["result"] = run_no_window_with_progress(
+                ["cmd", "/c", "build.bat"],
+                subprocess_module=fake_subprocess,
+                progress_ui=progress_ui,
+                capture_output=True,
+                text=True,
+                pump_interval_seconds=0.01,
+            )
+
+        worker = threading.Thread(target=run_command)
+        worker.start()
+        self.assertTrue(fake_subprocess.process.stdout.line_requested.wait(timeout=1))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not progress_ui.pumped_before_first_line:
+            time.sleep(0.01)
+        fake_subprocess.process.stdout.release_line.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(progress_ui.pumped_before_first_line)
+        self.assertIn("Building main.py", holder["result"].stdout)
+
+    def test_run_update_handoff_streams_build_progress_lines_to_ui(self) -> None:
+        class FakeStdout:
+            def __init__(self, owner) -> None:
+                self.owner = owner
+                self.lines = [
+                    "Shutting down the running windows-supporter.exe process...[ Success !! ]\n",
+                    "Syncing uv environment...[ Success !! ]\n",
+                    "Generating version metadata...[ Success !! ]\n",
+                    "Building main.py to windows-supporter.exe...[ Success !! ]\n",
+                    "Moving windows-supporter.exe...[ Success !! ]\n",
+                    "Skipping post-build launch because WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1.\n",
+                ]
+
+            def readline(self):
+                if self.lines:
+                    return self.lines.pop(0)
+                time.sleep(0.05)
+                self.owner.returncode = 0
+                return ""
+
+            def read(self):
+                return ""
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.stdout = FakeStdout(self)
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=0):
+                self.returncode = 0
+                return self.returncode
+
+            def kill(self):
+                self.returncode = 1
+
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.calls = []
+                self.process = FakeProcess()
+                self.PIPE = subprocess.PIPE
+                self.STDOUT = subprocess.STDOUT
+
+            def Popen(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                return self.process
+
+        class FakeProgressUi:
+            def __init__(self, *, log_path="", process=None) -> None:
+                self.snapshots = []
+                self.streamed_before_exit = False
+                self.process = process
+
+            def show(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def set_snapshot(self, snapshot):
+                if (
+                    self.process is not None
+                    and self.process.returncode is None
+                    and snapshot.get("label") == "실행 파일 빌드 중"
+                ):
+                    self.streamed_before_exit = True
+                self.snapshots.append(dict(snapshot))
+
+            def pump(self):
+                return None
+
+            def close(self):
+                return None
+
+            def wait_for_retry_or_close(self):
+                return False
+
+        fake_subprocess = FakeSubprocess()
+        progress_instances = []
+        launches = []
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / "windows-supporter.exe").write_text("exe", encoding="utf-8")
+            state_path = Path(tmp) / "update_handoff.json"
+            with open(state_path, "w", encoding="utf-8") as fp:
+                import json
+
+                json.dump(build_update_handoff_payload(repo_root=repo), fp)
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=fake_subprocess,
+                launch=lambda command, **kwargs: launches.append((command, kwargs)) or object(),
+                progress_ui_factory=lambda **kwargs: progress_instances.append(
+                    FakeProgressUi(process=fake_subprocess.process, **kwargs)
+                )
+                or progress_instances[-1],
+            )
+
+        labels = [snapshot["label"] for snapshot in progress_instances[0].snapshots]
+        details = [snapshot["detail"] for snapshot in progress_instances[0].snapshots]
+        self.assertEqual(rc, 0)
+        self.assertIn("실행 중인 앱 종료 중", labels)
+        self.assertIn("uv 환경 동기화 중", labels)
+        self.assertIn("버전 메타데이터 생성 중", labels)
+        self.assertIn("실행 파일 빌드 중", labels)
+        self.assertIn("실행 파일 배치 중", labels)
+        self.assertIn("Windows Supporter 재실행 중", labels)
+        self.assertTrue(progress_instances[0].streamed_before_exit)
+        self.assertTrue(
+            any("build.bat 단계" in detail for detail in details),
+            "progress detail should name the current build.bat stage",
+        )
+
+    def test_approving_update_shows_handoff_ui_before_build_completes(self) -> None:
+        snapshots_during_ack = []
+        launches = []
+        quit_calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            state_path = Path(tmp) / "update_handoff.json"
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                popen=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                quit_callback=lambda: quit_calls.append(True),
+                handoff_path_provider=lambda: state_path,
+                handoff_command_builder=lambda path: ["python", "main.py", UPDATE_HANDOFF_ARG, str(path)],
+                handoff_ack_waiter=lambda _path: snapshots_during_ack.append(
+                    updater.get_status_snapshot()
+                )
+                or True,
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+            updater._latest_tag = "v0.5.7"
+
+            self.assertTrue(updater.launch_update())
+
+        self.assertEqual(launches[0][0][-2:], [UPDATE_HANDOFF_ARG, str(state_path)])
+        self.assertEqual(snapshots_during_ack[0]["state"], "updating")
+        self.assertEqual(snapshots_during_ack[0]["progress"]["step_key"], "handoff")
+        self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 75)
+        self.assertEqual(quit_calls, [True])
+
+    def test_auto_update_settings_persist_and_gate_scheduling(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.after_calls = []
+                self.after_cancel_calls = []
+
+            def after(self, delay_ms, callback):
+                self.after_calls.append((delay_ms, callback))
+                return f"after-{len(self.after_calls)}"
+
+            def after_cancel(self, after_id):
+                self.after_cancel_calls.append(after_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            settings_path = Path(tmp) / "update_settings.json"
+            root = FakeRoot()
+            updater = WindowsSupporterUpdater(
+                root=root,
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                settings_path_provider=lambda: settings_path,
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+
+            settings = updater.get_settings_snapshot()
+            self.assertTrue(settings["auto_check_enabled"])
+            self.assertEqual(settings["check_interval_minutes"], 10)
+            self.assertEqual(settings["settings_path"], str(settings_path))
+
+            updater.start()
+            self.assertEqual(root.after_calls[0][0], updater.INITIAL_CHECK_DELAY_MS)
+
+            ok, error = updater.update_settings(
+                {"auto_check_enabled": False, "check_interval_minutes": 3}
+            )
+            self.assertTrue(ok, error)
+            self.assertFalse(updater.get_settings_snapshot()["auto_check_enabled"])
+            self.assertEqual(updater.get_settings_snapshot()["check_interval_minutes"], 3)
+            self.assertEqual(root.after_cancel_calls, ["after-1"])
+            root.after_calls[0][1]()
+            self.assertEqual(len(root.after_calls), 1)
+
+            again = WindowsSupporterUpdater(
+                root=root,
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                settings_path_provider=lambda: settings_path,
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+            self.assertFalse(again.get_settings_snapshot()["auto_check_enabled"])
+            again.start()
+
+        self.assertEqual(len(root.after_calls), 1)
 
     def test_run_update_handoff_retries_after_failure_when_ui_requests_retry(self) -> None:
         class FakeSubprocess:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -15,7 +16,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.utils.app_version import get_app_version
-from src.utils.subprocess_utils import popen_no_window, run_no_window
+from src.utils.subprocess_utils import (
+    build_no_window_subprocess_kwargs,
+    popen_no_window,
+    run_no_window,
+)
+from src.utils.update_settings import (
+    UpdateSettings,
+    get_update_settings_path,
+    load_update_settings,
+    normalize_update_settings,
+    save_update_settings,
+)
 from src.utils.worktree_runtime import is_primary_worktree
 
 
@@ -68,6 +80,13 @@ class UpdateProgressStep:
     percent: int
 
 
+@dataclass(frozen=True)
+class BuildOutputProgressRule:
+    marker: str
+    label: str
+    percent: int
+
+
 UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("idle", "업데이트 대기", "업데이트 확인을 기다리는 중입니다.", 0),
     UpdateProgressStep("checking", "업데이트 확인 중", "현재 버전과 원격 릴리스를 확인합니다.", 5),
@@ -84,6 +103,18 @@ UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("failed", "업데이트 실패", "실패 단계와 로그를 확인해 주세요.", 100),
 )
 UPDATE_PROGRESS_STEP_BY_KEY = {step.key: step for step in UPDATE_PROGRESS_STEPS}
+BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
+    BuildOutputProgressRule("Shutting down the running", "실행 중인 앱 종료 중", 86),
+    BuildOutputProgressRule("Stopping stale PyInstaller workers", "빌드 작업자 정리 중", 87),
+    BuildOutputProgressRule("Syncing uv environment", "uv 환경 동기화 중", 88),
+    BuildOutputProgressRule("Preparing bundled Playwright", "브라우저 런타임 준비 중", 89),
+    BuildOutputProgressRule("Cleaning prior PyInstaller", "이전 빌드 산출물 정리 중", 90),
+    BuildOutputProgressRule("Generating version metadata", "버전 메타데이터 생성 중", 91),
+    BuildOutputProgressRule("Building main.py", "실행 파일 빌드 중", 93),
+    BuildOutputProgressRule("Moving windows-supporter.exe", "실행 파일 배치 중", 96),
+    BuildOutputProgressRule("Remove build byproducts", "빌드 임시 파일 정리 중", 97),
+    BuildOutputProgressRule("Skipping post-build launch", "빌드 후 직접 재실행 준비 중", 98),
+)
 
 
 @dataclass(frozen=True)
@@ -168,6 +199,50 @@ def build_update_progress_snapshot(
             "manual_action": UPDATE_PROGRESS_MANUAL_ACTION_TEXT,
         },
     }
+
+
+def build_update_build_output_progress_snapshot(line: str) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    for rule in BUILD_OUTPUT_PROGRESS_RULES:
+        if rule.marker not in text:
+            continue
+        snapshot = build_update_progress_snapshot(
+            "build",
+            state="running",
+            detail=f"build.bat 단계: {text}",
+        )
+        percent = max(0, min(100, int(rule.percent)))
+        snapshot["label"] = rule.label
+        snapshot["percent"] = percent
+        progressbar = snapshot.get("progressbar", {})
+        if isinstance(progressbar, dict):
+            progressbar["value"] = percent
+        return snapshot
+    return None
+
+
+def publish_build_output_progress(
+    output: str,
+    *,
+    progress_ui: Any,
+    state_path: str | os.PathLike[str],
+    seen: set[str] | None = None,
+) -> None:
+    published = seen if seen is not None else set()
+    for line in str(output or "").splitlines():
+        snapshot = build_update_build_output_progress_snapshot(line)
+        if snapshot is None:
+            continue
+        label = str(snapshot.get("label") or "")
+        if label in published:
+            continue
+        published.add(label)
+        if progress_ui is not None:
+            progress_ui.set_snapshot(snapshot)
+        update_handoff_state(state_path, status="running", progress=snapshot)
+    return
 
 
 def format_update_status_parts(data: Any) -> tuple[bool, list[tuple[str, str]]]:
@@ -688,9 +763,87 @@ def run_no_window_with_progress(
     *,
     subprocess_module=subprocess,
     progress_ui: UpdateHandoffProgressUi | None = None,
+    progress_line_callback: Callable[[str], None] | None = None,
     pump_interval_seconds: float = 0.1,
     **kwargs: Any,
 ) -> Any:
+    popen_factory = getattr(subprocess_module, "Popen", None)
+    if callable(popen_factory) and bool(kwargs.get("capture_output")) and bool(kwargs.get("text")):
+        run_kwargs = dict(kwargs)
+        timeout = run_kwargs.pop("timeout", None)
+        check = bool(run_kwargs.pop("check", False))
+        run_kwargs.pop("capture_output", None)
+        run_kwargs.setdefault("stdout", getattr(subprocess_module, "PIPE", subprocess.PIPE))
+        run_kwargs.setdefault("stderr", getattr(subprocess_module, "STDOUT", subprocess.STDOUT))
+        for key, value in build_no_window_subprocess_kwargs(subprocess_module).items():
+            run_kwargs.setdefault(key, value)
+        process = popen_factory(argv, **run_kwargs)
+        output_parts: list[str] = []
+        deadline = (
+            time.monotonic() + float(timeout)
+            if timeout is not None and float(timeout) > 0
+            else None
+        )
+        stdout = getattr(process, "stdout", None)
+        line_queue: queue.Queue[Any] = queue.Queue()
+        reader_done = object()
+
+        def read_output() -> None:
+            if stdout is None:
+                line_queue.put(reader_done)
+                return
+            try:
+                while True:
+                    line = stdout.readline()
+                    if not line:
+                        break
+                    if isinstance(line, bytes):
+                        line = line.decode(errors="replace")
+                    line_queue.put(str(line))
+            except Exception:
+                pass
+            finally:
+                line_queue.put(reader_done)
+            return
+
+        threading.Thread(target=read_output, daemon=True).start()
+        output_complete = False
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                killer = getattr(process, "kill", None)
+                if callable(killer):
+                    killer()
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+            while True:
+                try:
+                    item = line_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is reader_done:
+                    output_complete = True
+                    continue
+                output_parts.append(str(item))
+                if callable(progress_line_callback):
+                    progress_line_callback(str(item))
+                if progress_ui is not None:
+                    progress_ui.pump()
+            poll = getattr(process, "poll", None)
+            returncode = poll() if callable(poll) else getattr(process, "returncode", None)
+            if returncode is not None and output_complete:
+                break
+            if progress_ui is not None:
+                progress_ui.pump()
+            time.sleep(max(0.01, float(pump_interval_seconds)))
+        wait = getattr(process, "wait", None)
+        returncode = getattr(process, "returncode", None)
+        if callable(wait) and returncode is None:
+            returncode = wait(timeout=0)
+        returncode = int(returncode if returncode is not None else 0)
+        stdout_text = "".join(output_parts)
+        if check and returncode != 0:
+            raise subprocess.CalledProcessError(returncode, argv, output=stdout_text)
+        return subprocess.CompletedProcess(argv, returncode, stdout_text, "")
+
     holder: dict[str, Any] = {}
 
     def worker() -> None:
@@ -738,6 +891,16 @@ def run_update_handoff(
     progress_ui = progress_ui_factory(log_path=log_path) if callable(progress_ui_factory) else None
     attempts = max(1, int(max_attempts or 1))
     for attempt in range(1, attempts + 1):
+        published_build_labels: set[str] = set()
+
+        def publish_build_line(line: str) -> None:
+            publish_build_output_progress(
+                line,
+                progress_ui=progress_ui,
+                state_path=state_path,
+                seen=published_build_labels,
+            )
+
         build_progress = build_update_progress_snapshot(
             "build",
             state="running",
@@ -761,6 +924,7 @@ def run_update_handoff(
                 ["cmd", "/c", "build.bat"],
                 subprocess_module=subprocess_module,
                 progress_ui=progress_ui,
+                progress_line_callback=publish_build_line,
                 cwd=repo_root,
                 capture_output=True,
                 text=True,
@@ -774,6 +938,12 @@ def run_update_handoff(
                 append_update_log(log_path, output.strip())
             if error_output:
                 append_update_log(log_path, error_output.strip())
+            publish_build_output_progress(
+                output,
+                progress_ui=progress_ui,
+                state_path=state_path,
+                seen=published_build_labels,
+            )
             if int(getattr(result, "returncode", 1) or 0) != 0:
                 raise RuntimeError(f"build.bat failed with exit code {getattr(result, 'returncode', 1)}")
 
@@ -854,7 +1024,7 @@ class UpdatePromptSession:
 
 class WindowsSupporterUpdater:
     INITIAL_CHECK_DELAY_MS = 1000
-    CHECK_INTERVAL_MS = 60 * 60 * 1000
+    CHECK_INTERVAL_MS = 10 * 60 * 1000
 
     def __init__(
         self,
@@ -874,6 +1044,7 @@ class WindowsSupporterUpdater:
         handoff_ack_waiter=wait_for_update_handoff_ack,
         timestamp_provider=lambda: time.strftime("%Y%m%d-%H%M%S"),
         worktree_runner=subprocess.run,
+        settings_path_provider=get_update_settings_path,
     ) -> None:
         self._root = root
         self._event_queue = event_queue
@@ -890,6 +1061,9 @@ class WindowsSupporterUpdater:
         self._handoff_ack_waiter = handoff_ack_waiter
         self._timestamp_provider = timestamp_provider
         self._worktree_runner = worktree_runner
+        self._settings_path_provider = settings_path_provider
+        self._settings_path = Path(self._settings_path_provider())
+        self._settings = load_update_settings(self._settings_path)
         self._session = UpdatePromptSession()
         self._worker_active = False
         self._state = "idle"
@@ -899,10 +1073,13 @@ class WindowsSupporterUpdater:
         self._working_tree_state = UpdateWorkingTreeState()
         self._progress_snapshot = build_update_progress_snapshot("idle", state="idle")
         self._preflight_result: dict[str, Any] = {}
+        self._scheduled_after_id = None
         return
 
     def start(self) -> None:
         if self._mark_unavailable_if_needed():
+            return
+        if not self._settings.auto_check_enabled:
             return
         self._schedule_check(self.INITIAL_CHECK_DELAY_MS)
         return
@@ -947,6 +1124,7 @@ class WindowsSupporterUpdater:
             "current_tag": self._current_tag,
             "latest_tag": self._latest_tag,
             "last_error": self._last_error,
+            "auto_update": self.get_settings_snapshot(),
             "working_tree": {
                 "has_source_changes": self._working_tree_state.has_source_changes,
                 "has_cleanup_targets": self._working_tree_state.has_cleanup_targets,
@@ -961,6 +1139,35 @@ class WindowsSupporterUpdater:
     def set_status_changed_callback(self, callback) -> None:
         self._status_changed_callback = callback
         return
+
+    def get_settings_snapshot(self) -> dict[str, Any]:
+        snapshot = self._settings.as_snapshot()
+        snapshot["auto_update_available"] = self._state != "unavailable"
+        snapshot["unavailable_reason"] = self._last_error if self._state == "unavailable" else ""
+        return snapshot
+
+    def update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
+        if not isinstance(data, dict):
+            return False, "invalid settings"
+        try:
+            next_settings = normalize_update_settings(
+                data,
+                settings_path=self._settings_path,
+                current=self._settings,
+            )
+            save_update_settings(self._settings_path, next_settings)
+        except Exception as exc:
+            return False, str(exc)
+        self._settings = next_settings
+        if self._settings.auto_check_enabled:
+            if self._mark_unavailable_if_needed():
+                self._cancel_scheduled_check()
+            else:
+                self._schedule_check(self._settings.check_interval_ms)
+        else:
+            self._cancel_scheduled_check()
+        self._notify_status_changed()
+        return True, None
 
     def _mark_unavailable_if_needed(self) -> bool:
         message = ""
@@ -984,15 +1191,35 @@ class WindowsSupporterUpdater:
         return True
 
     def _schedule_check(self, delay_ms: int) -> None:
+        self._cancel_scheduled_check()
         try:
-            self._root.after(int(delay_ms), self._scheduled_check)
+            self._scheduled_after_id = self._root.after(int(delay_ms), self._scheduled_check)
+        except Exception:
+            self._scheduled_after_id = None
+            pass
+        return
+
+    def _cancel_scheduled_check(self) -> None:
+        after_id = self._scheduled_after_id
+        self._scheduled_after_id = None
+        if after_id is None:
+            return
+        cancel = getattr(self._root, "after_cancel", None)
+        if not callable(cancel):
+            return
+        try:
+            cancel(after_id)
         except Exception:
             pass
         return
 
     def _scheduled_check(self) -> None:
+        self._scheduled_after_id = None
+        if not self._settings.auto_check_enabled:
+            return
         self.check_now(manual=False)
-        self._schedule_check(self.CHECK_INTERVAL_MS)
+        if self._settings.auto_check_enabled:
+            self._schedule_check(self._settings.check_interval_ms)
         return
 
     def _post_ui(self, callback) -> None:
@@ -1351,6 +1578,9 @@ class WindowsSupporterUpdater:
             return False
 
         proc = self._popen(command, cwd=self._repo_root)
+        self._state = "updating"
+        self._progress_snapshot = build_update_progress_snapshot("handoff", state="running")
+        self._notify_status_changed()
         if proc is None:
             self._state = "error"
             self._last_error = "failed to launch update handoff"
@@ -1379,9 +1609,6 @@ class WindowsSupporterUpdater:
             self._notify_status_changed()
             return False
 
-        self._state = "updating"
-        self._progress_snapshot = build_update_progress_snapshot("handoff", state="running")
-        self._notify_status_changed()
         try:
             if callable(self._quit_callback):
                 self._quit_callback()
