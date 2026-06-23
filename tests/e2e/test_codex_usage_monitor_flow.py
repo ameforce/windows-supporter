@@ -1061,15 +1061,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             {"visible": True, "bring_to_front": True},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
-        self.assertEqual(
-            set_visibility.call_args_list[-1].kwargs,
-            {"visible": False, "bring_to_front": False},
-        )
-        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
-        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 24001)
-        self.assertFalse(context.closed)
-        self.assertFalse(browser.closed)
+        self.assertEqual(set_visibility.call_count, 1)
+        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
 
     def test_manual_login_button_bypasses_interactive_reopen_cooldown(self) -> None:
         recovered = UsageSnapshot.from_metrics(
@@ -1946,7 +1942,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             bool(launch_cdp.call_args.kwargs.get("start_hidden", True))
         )
 
-    def test_collect_snapshot_once_interactive_recovery_keeps_app_cdp_after_success(self) -> None:
+    def test_collect_snapshot_once_interactive_recovery_closes_app_cdp_after_success(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -2045,23 +2041,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNone(err)
         self.assertIsNotNone(got)
         hide_tooltip.assert_called_once()
-        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48123)
+        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
         self.assertEqual(
             set_visibility.call_args_list[0].kwargs,
             {"visible": True, "bring_to_front": True},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
-        self.assertEqual(
-            set_visibility.call_args_list[-1].kwargs,
-            {"visible": False, "bring_to_front": False},
-        )
-        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
-        terminate_proc.assert_not_called()
-        self.assertFalse(context.closed)
-        self.assertFalse(browser.closed)
+        self.assertEqual(set_visibility.call_count, 1)
+        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
 
-    def test_collect_snapshot_once_keeps_interactive_cdp_when_hide_fails_after_snapshot(self) -> None:
+    def test_collect_snapshot_once_closes_interactive_cdp_when_hide_fails_after_snapshot(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -2151,23 +2143,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48126)
+        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
         self.assertEqual(
             set_visibility.call_args_list[0].kwargs,
             {"visible": True, "bring_to_front": True},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
-        self.assertEqual(
-            set_visibility.call_args_list[-1].kwargs,
-            {"visible": False, "bring_to_front": False},
-        )
-        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
-        terminate_proc.assert_not_called()
-        self.assertFalse(context.closed)
-        self.assertFalse(browser.closed)
+        self.assertEqual(set_visibility.call_count, 1)
+        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
 
-    def test_collect_snapshot_once_interactive_recovery_keeps_app_cdp_after_wait(self) -> None:
+    def test_collect_snapshot_once_interactive_recovery_closes_app_cdp_after_wait(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "16 / 40",
@@ -2260,21 +2248,17 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
-        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
-        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48124)
+        self.assertIsNone(self.monitor._CodexUsageMonitor__hidden_cdp_proc)
+        self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
         self.assertEqual(
             set_visibility.call_args_list[0].kwargs,
             {"visible": True, "bring_to_front": True},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
-        self.assertEqual(
-            set_visibility.call_args_list[-1].kwargs,
-            {"visible": False, "bring_to_front": False},
-        )
-        self.assertIs(set_visibility.call_args_list[-1].args[0], proc)
-        terminate_proc.assert_not_called()
-        self.assertFalse(context.closed)
-        self.assertFalse(browser.closed)
+        self.assertEqual(set_visibility.call_count, 1)
+        terminate_proc.assert_called_once_with(proc, cleanup_orphans=False)
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
 
     def test_collect_snapshot_once_keeps_interactive_cdp_open_when_login_still_pending(self) -> None:
         class _DummyProc:
@@ -3126,6 +3110,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--disable-session-crashed-bubble", popen_calls[0])
         self.assertIn("--hide-crash-restore-bubble", popen_calls[0])
         self.assertIn("--no-first-run", popen_calls[0])
+        self.assertIn("--window-size=960,720", popen_calls[0])
+        self.assertIn("--window-position=32,32", popen_calls[0])
         self.assertEqual(
             playwright_obj.chromium.timeouts,
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
@@ -3821,6 +3807,95 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(fake_win32gui.foreground_calls, [789])
         self.assertTrue(fake_win32gui.position_calls)
         self.assertEqual(fake_win32gui.position_calls[-1][2:4], (80, 80))
+
+    def test_set_windows_visibility_for_pid_moves_barely_visible_window_on_manual_restore(
+        self,
+    ) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.show_calls: list[tuple[int, int]] = []
+                self.foreground_calls: list[int] = []
+                self.position_calls: list[tuple[int, int, int, int, int, int, int]] = []
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+            def SetForegroundWindow(self, hwnd):
+                self.foreground_calls.append(int(hwnd))
+                return True
+
+            def GetWindowRect(self, _hwnd):
+                return (-990, 40, 12, 740)
+
+            def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+                self.position_calls.append(
+                    (
+                        int(hwnd),
+                        int(insert_after),
+                        int(x),
+                        int(y),
+                        int(cx),
+                        int(cy),
+                        int(flags),
+                    )
+                )
+                return True
+
+        class _DummyUser32:
+            def GetSystemMetrics(self, index):
+                values = {
+                    0: 1024,
+                    1: 768,
+                    76: 0,
+                    77: 0,
+                    78: 1024,
+                    79: 768,
+                }
+                return values.get(int(index), 0)
+
+        class _DummyCtypes:
+            class _Windll:
+                user32 = _DummyUser32()
+
+            windll = _Windll()
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib,
+                    "ctypes",
+                    _DummyCtypes(),
+                    create=True,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__list_top_windows_for_pid",
+                        return_value=[789],
+                    ):
+                        ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                            pid=123,
+                            visible=True,
+                            bring_to_front=True,
+                            timeout_sec=0.2,
+                        )
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_win32gui.show_calls, [(789, 9)])
+        self.assertEqual(fake_win32gui.foreground_calls, [789])
+        self.assertTrue(fake_win32gui.position_calls)
+        _, _, x, y, width, height, _ = fake_win32gui.position_calls[-1]
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertGreaterEqual(width, 640)
+        self.assertGreaterEqual(height, 480)
 
     def test_configure_playwright_env_adds_no_deprecation_node_option_once(self) -> None:
         with patch.dict(self.monitor._CodexUsageMonitor__lib.os.environ, {}, clear=True):
