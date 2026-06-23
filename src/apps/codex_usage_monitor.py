@@ -4467,18 +4467,7 @@ class CodexUsageMonitor:
             if snapshot is not None:
                 self.__set_session_state("logged_in")
                 if bool(allow_interactive_recovery) and cdp_proc is not None:
-                    keep_after_success = self.__keep_interactive_cdp_process_open(
-                        cdp_proc,
-                        reason="logged_in",
-                    )
-                    if bool(keep_after_success):
-                        keep_cdp_process = True
-                        self.__set_cdp_window_visibility(
-                            cdp_proc,
-                            visible=False,
-                            bring_to_front=False,
-                        )
-                    elif not bool(keep_cdp_process):
+                    if not bool(keep_cdp_process):
                         self.__log_interactive_cdp_close_after_success(cdp_proc)
                 return snapshot, None
             if bool(effective_headless):
@@ -4492,18 +4481,7 @@ class CodexUsageMonitor:
                     timeout_sec=self.__login_timeout_sec,
                 )
                 if waited_error is None and waited_snapshot is not None and cdp_proc is not None:
-                    keep_after_success = self.__keep_interactive_cdp_process_open(
-                        cdp_proc,
-                        reason="logged_in",
-                    )
-                    if bool(keep_after_success):
-                        keep_cdp_process = True
-                        self.__set_cdp_window_visibility(
-                            cdp_proc,
-                            visible=False,
-                            bring_to_front=False,
-                        )
-                    elif not bool(keep_cdp_process):
+                    if not bool(keep_cdp_process):
                         self.__log_interactive_cdp_close_after_success(cdp_proc)
                 elif waited_error in {"login_required", "parse_failed", "cloudflare_challenge"}:
                     keep_cdp_process = self.__keep_interactive_cdp_process_open(
@@ -4782,7 +4760,14 @@ class CodexUsageMonitor:
                     )
                     cmd.append(str(launch_url))
                 else:
-                    cmd.extend(["--new-window", str(launch_url)])
+                    cmd.extend(
+                        [
+                            "--new-window",
+                            "--window-size=960,720",
+                            "--window-position=32,32",
+                            str(launch_url),
+                        ]
+                    )
                 popen_kwargs: dict[str, Any] = {}
                 if bool(start_hidden):
                     try:
@@ -5883,6 +5868,20 @@ class CodexUsageMonitor:
             screen_h = 900
         screen_right = int(screen_x + screen_w)
         screen_bottom = int(screen_y + screen_h)
+        visible_left = max(left, screen_x)
+        visible_top = max(top, screen_y)
+        visible_right = min(right, screen_right)
+        visible_bottom = min(bottom, screen_bottom)
+        visible_width = max(0, int(visible_right - visible_left))
+        visible_height = max(0, int(visible_bottom - visible_top))
+        min_visible_width = min(
+            max(int(width * 0.35), 240),
+            max(int(screen_w - 40), 1),
+        )
+        min_visible_height = min(
+            max(int(height * 0.35), 160),
+            max(int(screen_h - 40), 1),
+        )
         is_offscreen = (
             right <= screen_x
             or bottom <= screen_y
@@ -5890,6 +5889,8 @@ class CodexUsageMonitor:
             or top >= screen_bottom
             or left <= -10000
             or top <= -10000
+            or visible_width < min_visible_width
+            or visible_height < min_visible_height
         )
         if not bool(is_offscreen):
             return
