@@ -474,12 +474,7 @@ class CodexUsageMultiMonitor:
                 continue
             runtime = self.__safe_child_runtime(account_id)
             session_state = str(runtime.get("session_state") or "logged_out")
-            if (
-                session_state == "logged_in"
-                or bool(runtime.get("collect_inflight"))
-                or bool(runtime.get("profile_session_present"))
-                or bool(runtime.get("profile_cdp_available"))
-            ):
+            if session_state == "logged_in" or bool(runtime.get("collect_inflight")):
                 account_ids.append(account_id)
         return account_ids
 

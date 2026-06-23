@@ -2490,7 +2490,6 @@ class CodexUsageMonitor:
             )
             and not bool(self.__logout_in_progress)
             and not bool(self.__collect_inflight)
-            and not bool(pending_login_active)
         )
         can_logout = bool(
             (str(self.__session_state) == "logged_in" or bool(self.__collect_inflight))
@@ -2545,14 +2544,19 @@ class CodexUsageMonitor:
             return
         worker_epoch = int(self.__worker_epoch)
         source_key = normalize_usage_value(source).lower()
-        if source_key not in {"manual_query", "manual_login"}:
+        if source_key not in {"manual_query", "manual_login", "auto_monitor"}:
             source_key = "manual_query"
+        if source_key == "manual_login":
+            self.__cancel_pending_login_poll()
+        is_manual_surface = source_key in {"manual_query", "manual_login"}
 
         def worker() -> None:
             snapshot = None if bool(force_refresh) else self.get_last_snapshot()
             error = None
 
             def post_terminal(callback) -> None:
+                if not bool(is_manual_surface):
+                    return
                 if bool(force_refresh):
                     self.__ui_post_coalesced(
                         self.__reset_monitor_countdown_after_manual_query,
@@ -2570,11 +2574,11 @@ class CodexUsageMonitor:
                     )
                     return
                 if bool(force_refresh):
-                    on_acquired = (
-                        self.__show_manual_login_started_tooltip
-                        if source_key == "manual_login"
-                        else self.__show_manual_collect_started_tooltip
-                    )
+                    on_acquired = None
+                    if source_key == "manual_login":
+                        on_acquired = self.__show_manual_login_started_tooltip
+                    elif source_key == "manual_query":
+                        on_acquired = self.__show_manual_collect_started_tooltip
                     refreshed, error = self.__collect_snapshot_guarded(
                         source=source_key,
                         on_acquired=on_acquired,
@@ -4004,19 +4008,21 @@ class CodexUsageMonitor:
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = self.__is_manual_collect_source(normalized_source)
+        is_manual_login = normalized_source == "manual_login"
 
         if msg == "login_required":
             self.__set_session_state("logged_out")
             self.__clear_auth_attention()
             self.__pause_background_monitor()
             self.__save_state()
-            profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
-            if bool(profile_cdp_available) or bool(is_manual_query):
+            if bool(is_manual_login):
                 self.__schedule_pending_login_poll(
                     reason=msg,
-                    initial_delay_sec=5.0 if bool(is_manual_query) else 10.0,
-                    require_profile_cdp=not bool(is_manual_query),
+                    initial_delay_sec=5.0,
+                    require_profile_cdp=False,
                 )
+            else:
+                self.__clear_hidden_cdp_process(terminate=True)
             now = 0.0
             try:
                 now = float(self.__lib.time.monotonic())
@@ -4043,13 +4049,14 @@ class CodexUsageMonitor:
             self.__set_auth_attention(msg, source=normalized_source)
             self.__pause_background_monitor()
             self.__save_state()
-            profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
-            if bool(profile_cdp_available) or bool(is_manual_query):
+            if bool(is_manual_login):
                 self.__schedule_pending_login_poll(
                     reason=msg,
-                    initial_delay_sec=5.0 if bool(is_manual_query) else 10.0,
-                    require_profile_cdp=not bool(is_manual_query),
+                    initial_delay_sec=5.0,
+                    require_profile_cdp=False,
                 )
+            else:
+                self.__clear_hidden_cdp_process(terminate=True)
             now = 0.0
             try:
                 now = float(self.__lib.time.monotonic())
