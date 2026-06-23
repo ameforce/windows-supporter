@@ -6275,6 +6275,94 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(self.monitor._CodexUsageMonitor__pending_login_after_id, "poll-1")
         self.assertEqual(root.after_calls[0][0], 8000)
 
+    def test_pending_login_poll_stops_after_repeated_login_required_with_profile_cdp(self) -> None:
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        class _DummyRoot:
+            def __init__(self):
+                self.after_calls: list[tuple[int, object]] = []
+
+            def after(self, delay, fn):
+                self.after_calls.append((int(delay), fn))
+                return f"poll-{len(self.after_calls)}"
+
+            def after_cancel(self, _token):
+                return None
+
+        root = _DummyRoot()
+        self.monitor._CodexUsageMonitor__root = root
+        self.monitor._CodexUsageMonitor__pending_login_poll_until_ts = 1000.0
+        self.monitor._CodexUsageMonitor__pending_login_error_max_retries = 2
+        self.monitor._CodexUsageMonitor__pending_login_error_count = 2
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
+                return_value=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__collect_snapshot_guarded",
+                    return_value=(None, "login_required"),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__ui_post",
+                        side_effect=lambda fn: fn(),
+                    ):
+                        with patch.object(
+                            self.monitor._CodexUsageMonitor__lib.time,
+                            "monotonic",
+                            return_value=100.0,
+                        ):
+                            self.monitor._CodexUsageMonitor__pending_login_poll_tick()
+
+        self.assertEqual(self.monitor._CodexUsageMonitor__pending_login_after_id, None)
+        self.assertFalse(root.after_calls)
+        self.assertFalse(bool(self.monitor.get_runtime_status().get("pending_login_poll_active")))
+        self.assertEqual(self.monitor._CodexUsageMonitor__pending_login_error_count, 0)
+
+    def test_pending_login_poll_uses_shell_safe_delay_when_collect_is_busy(self) -> None:
+        class _DummyRoot:
+            def __init__(self):
+                self.after_calls: list[tuple[int, object]] = []
+
+            def after(self, delay, fn):
+                self.after_calls.append((int(delay), fn))
+                return f"poll-{len(self.after_calls)}"
+
+            def after_cancel(self, _token):
+                return None
+
+        root = _DummyRoot()
+        self.monitor._CodexUsageMonitor__root = root
+        self.monitor._CodexUsageMonitor__collect_inflight = True
+        self.monitor._CodexUsageMonitor__pending_login_poll_until_ts = 1000.0
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
+            return_value=True,
+        ):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib.time,
+                "monotonic",
+                return_value=100.0,
+            ):
+                self.monitor._CodexUsageMonitor__pending_login_poll_tick()
+
+        self.assertEqual(self.monitor._CodexUsageMonitor__pending_login_after_id, "poll-1")
+        self.assertGreaterEqual(root.after_calls[0][0], 15000)
+
     def test_pending_login_poll_retries_transient_missing_profile_cdp(self) -> None:
         class _DummyRoot:
             def __init__(self):

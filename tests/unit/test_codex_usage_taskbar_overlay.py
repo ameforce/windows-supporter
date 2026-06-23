@@ -3058,6 +3058,22 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertIn("x", window.draw_calls[0]["geometry"])
         self.assertEqual(len(window.draw_calls[0]["bars"]), 2)
 
+    def test_refresh_schedules_shell_safe_monitor_cadence(self):
+        root = _FakeRoot()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+
+        self.assertTrue(overlay.refresh())
+
+        scheduled = {callback.__name__: delay for delay, callback in root.after_calls}
+        self.assertGreaterEqual(scheduled.get("_keepalive_tick", 0), 1000)
+        self.assertGreaterEqual(scheduled.get("_geometry_monitor_tick", 0), 1000)
+
     def test_refresh_suppresses_overlay_while_fullscreen_is_active(self):
         root = _FakeRoot()
         window = _FakeWindow()
@@ -3887,7 +3903,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(repaint_calls, [window])
         self.assertGreaterEqual(len(root.after_calls), 2)
 
-    def test_keepalive_tick_reasserts_z_order_without_repaint_when_overlay_is_already_topmost(self):
+    def test_keepalive_tick_skips_native_calls_when_overlay_is_already_topmost(self):
         root = _FakeRoot()
         window = _FakeWindow()
         overlay = CodexUsageTaskbarOverlay(
@@ -3908,8 +3924,12 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         repaint_calls.clear()
         root.after_calls[0][1]()
 
-        self.assertEqual(z_order_calls, [window])
+        self.assertEqual(z_order_calls, [])
         self.assertEqual(repaint_calls, [])
+        keepalive_callbacks = [
+            callback for _delay, callback in root.after_calls if callback.__name__ == "_keepalive_tick"
+        ]
+        self.assertGreaterEqual(len(keepalive_callbacks), 2)
 
 
 if __name__ == "__main__":
