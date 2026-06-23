@@ -138,6 +138,62 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertFalse(bool(status.get("auto_monitoring_active")))
         self.assertTrue(bool(status.get("can_login")))
 
+    def test_background_auth_error_after_snapshot_keeps_session_retryable(self) -> None:
+        class _DummyRoot:
+            def __init__(self):
+                self.cancelled = []
+
+            def after_cancel(self, token):
+                self.cancelled.append(token)
+                return None
+
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T11:05:00",
+        )
+
+        for source, error in (
+            ("auto_monitor", "login_required"),
+            ("monitor_tick", "cloudflare_challenge"),
+        ):
+            with self.subTest(source=source, error=error):
+                root = _DummyRoot()
+                self.monitor._CodexUsageMonitor__root = root
+                self.monitor.handle_snapshot(snapshot)
+                self.monitor._CodexUsageMonitor__monitor_after_id = "tick-1"
+                self.monitor._CodexUsageMonitor__set_auth_attention(
+                    "cloudflare_challenge",
+                    source="auto_monitor",
+                )
+
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__show_tooltip",
+                ):
+                    self.monitor._CodexUsageMonitor__handle_collect_error(
+                        error,
+                        source=source,
+                    )
+
+                status = self.monitor.get_runtime_status()
+                state_path = Path(self.monitor._CodexUsageMonitor__state_path)
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(status.get("session_state"), "logged_in")
+                self.assertEqual(payload.get("session_state"), "logged_in")
+                self.assertFalse(bool(status.get("auth_attention_required")))
+                self.assertNotEqual(status.get("monitor_state"), "paused_auth_required")
+                self.assertEqual(
+                    self.monitor._CodexUsageMonitor__monitor_after_id,
+                    "tick-1",
+                )
+                self.assertEqual(root.cancelled, [])
+
     def test_load_state_logged_in_with_profile_enables_monitoring(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
