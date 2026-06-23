@@ -214,6 +214,14 @@ class _FakeUpdater:
         self.check_calls.append(bool(manual))
 
 
+class _RefreshRecorder:
+    def __init__(self):
+        self.refresh_calls = 0
+
+    def refresh(self):
+        self.refresh_calls += 1
+
+
 class MainUiDashboardUnitTest(unittest.TestCase):
     def _build_ui(self, state_path):
         root = _FakeRoot()
@@ -235,6 +243,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
         ui._tab_kakao = "tab-kakao"
         ui._tab_wrike = "tab-wrike"
         ui._tab_codex = "tab-codex"
+        ui._tab_update = "tab-update"
         return ui, root, startup, monitor, updater
 
     def test_state_load_save_validates_tab_key(self):
@@ -369,8 +378,36 @@ class MainUiDashboardUnitTest(unittest.TestCase):
                     "wrike.settings",
                     "background.toggle",
                     "update.check",
+                    "update.settings",
                 },
             )
+
+    def test_update_settings_tab_is_registered_from_dashboard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, _, _ = self._build_ui(path)
+
+            callbacks = ui._get_dashboard_callbacks()
+            callbacks["update.settings"]()
+
+            self.assertEqual(ui._notebook.select_calls, ["tab-update"])
+            self.assertEqual(ui._current_tab, ui._TAB_UPDATE)
+            self.assertIn("update", ui._valid_tab_keys())
+            self.assertEqual(load_last_tab(valid_tabs=ui._valid_tab_keys(), path=path), "update")
+
+    def test_updater_status_callback_refreshes_dashboard_and_update_tab(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, _, updater = self._build_ui(path)
+            dashboard = _RefreshRecorder()
+            update_view = _RefreshRecorder()
+            ui._dashboard_view = dashboard
+            ui._update_view = update_view
+
+            updater.status_callback()
+
+            self.assertEqual(dashboard.refresh_calls, 1)
+            self.assertEqual(update_view.refresh_calls, 1)
 
     def test_dashboard_status_snapshot_combines_safe_feature_status(self):
         with tempfile.TemporaryDirectory() as tmp:

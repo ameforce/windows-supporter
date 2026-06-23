@@ -13,6 +13,7 @@ class WindowsSupporterMainUI:
     _TAB_KAKAO = "kakao_monitor"
     _TAB_WRIKE = "wrike"
     _TAB_CODEX = "codex_usage"
+    _TAB_UPDATE = "update"
     _KAKAO_RETRY_DELAY_MS = 500
 
     def __init__(
@@ -43,6 +44,7 @@ class WindowsSupporterMainUI:
         self._tab_kakao = None
         self._tab_wrike = None
         self._tab_codex = None
+        self._tab_update = None
 
         self._dashboard_view = None
         self._dashboard_built = False
@@ -54,6 +56,8 @@ class WindowsSupporterMainUI:
         self._wrike_built = False
         self._codex_view = None
         self._codex_built = False
+        self._update_view = None
+        self._update_built = False
         self._current_tab = None
         self._tab_sizes = {
             self._TAB_DASHBOARD: (1000, 480),
@@ -61,6 +65,7 @@ class WindowsSupporterMainUI:
             self._TAB_KAKAO: (700, 340),
             self._TAB_WRIKE: (840, 580),
             self._TAB_CODEX: (900, 760),
+            self._TAB_UPDATE: (760, 420),
         }
         self._tab_minsizes = {
             self._TAB_DASHBOARD: (940, 480),
@@ -68,6 +73,7 @@ class WindowsSupporterMainUI:
             self._TAB_KAKAO: (620, 300),
             self._TAB_WRIKE: (800, 520),
             self._TAB_CODEX: (860, 720),
+            self._TAB_UPDATE: (720, 380),
         }
 
         self._lazy_import_tk()
@@ -142,6 +148,10 @@ class WindowsSupporterMainUI:
 
     def show_codex_usage(self) -> None:
         self.show(self._TAB_CODEX)
+        return
+
+    def show_update_settings(self) -> None:
+        self.show(self._TAB_UPDATE)
         return
 
     def _lazy_import_tk(self) -> None:
@@ -224,17 +234,20 @@ class WindowsSupporterMainUI:
         tab_kakao = ttk.Frame(notebook)
         tab_wrike = ttk.Frame(notebook)
         tab_codex = ttk.Frame(notebook)
+        tab_update = ttk.Frame(notebook)
         self._tab_dashboard = tab_dashboard
         self._tab_startup = tab_startup
         self._tab_kakao = tab_kakao
         self._tab_wrike = tab_wrike
         self._tab_codex = tab_codex
+        self._tab_update = tab_update
 
         notebook.add(tab_dashboard, text="Dashboard")
         notebook.add(tab_startup, text="Startup Apps")
         notebook.add(tab_kakao, text="KakaoTalk")
         notebook.add(tab_wrike, text="Wrike")
         notebook.add(tab_codex, text="Codex")
+        notebook.add(tab_update, text="Update")
 
         try:
             notebook.bind("<<NotebookTabChanged>>", lambda _e: self._ensure_selected_tab_built())
@@ -247,6 +260,7 @@ class WindowsSupporterMainUI:
             ttk.Label(tab_kakao, text="KakaoTalk 모니터 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_wrike, text="Wrike 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_codex, text="Codex 사용량 설정을 여는 중...").pack(padx=12, pady=12)
+            ttk.Label(tab_update, text="Update 설정을 여는 중...").pack(padx=12, pady=12)
         except Exception:
             pass
         return
@@ -286,6 +300,12 @@ class WindowsSupporterMainUI:
             except Exception:
                 pass
             return
+        if t in {"update", "updates", "auto_update", "updater"}:
+            try:
+                nb.select(self._tab_update)
+            except Exception:
+                pass
+            return
         return
 
     def _valid_tab_keys(self) -> tuple[str, ...]:
@@ -295,6 +315,7 @@ class WindowsSupporterMainUI:
             self._TAB_KAKAO,
             self._TAB_WRIKE,
             self._TAB_CODEX,
+            self._TAB_UPDATE,
         )
 
     def _load_last_tab(self) -> str:
@@ -377,6 +398,8 @@ class WindowsSupporterMainUI:
                 new_tab = self._TAB_WRIKE
             elif self._tab_codex is not None and cur == str(self._tab_codex):
                 new_tab = self._TAB_CODEX
+            elif self._tab_update is not None and cur == str(self._tab_update):
+                new_tab = self._TAB_UPDATE
 
             if new_tab is None:
                 return
@@ -406,6 +429,8 @@ class WindowsSupporterMainUI:
                 self._ensure_wrike_built()
             elif new_tab == self._TAB_CODEX:
                 self._ensure_codex_built()
+            elif new_tab == self._TAB_UPDATE:
+                self._ensure_update_built()
 
             self._apply_tab_geometry(new_tab)
             self._current_tab = new_tab
@@ -442,7 +467,21 @@ class WindowsSupporterMainUI:
         if not callable(setter):
             return
         try:
-            setter(self._refresh_dashboard_status)
+            setter(self._refresh_update_surfaces)
+        except Exception:
+            pass
+        return
+
+    def _refresh_update_surfaces(self) -> None:
+        self._refresh_dashboard_status()
+        update_view = self._update_view
+        if update_view is None:
+            return
+        refresh = getattr(update_view, "refresh", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
         except Exception:
             pass
         return
@@ -469,6 +508,7 @@ class WindowsSupporterMainUI:
             "wrike.settings": self.show_wrike,
             "background.toggle": self._dashboard_background_toggle_enabled,
             "update.check": self._dashboard_update_check,
+            "update.settings": self.show_update_settings,
         }
 
     def _run_bg(self, fn) -> None:
@@ -737,6 +777,21 @@ class WindowsSupporterMainUI:
             self._startup_built = True
         except Exception:
             self._startup_built = False
+        return
+
+    def _ensure_update_built(self) -> None:
+        if self._update_built or self._tab_update is None or self._updater is None:
+            return
+        try:
+            from src.apps.update_settings_ui import UpdateSettingsView
+        except Exception:
+            return
+        try:
+            self._update_view = UpdateSettingsView(self._root, self._updater)
+            self._update_view.mount(self._tab_update)
+            self._update_built = True
+        except Exception:
+            self._update_built = False
         return
 
     def _ensure_kakao_built(self) -> None:
