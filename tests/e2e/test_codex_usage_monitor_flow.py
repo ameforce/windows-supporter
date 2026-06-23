@@ -4508,6 +4508,73 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("완료되면 결과를 자동으로 표시합니다.", shown[0][0])
         self.assertEqual(shown[0][2], 0)
 
+    def test_show_current_status_auto_monitor_skips_when_auth_attention_required(self) -> None:
+        self.monitor._CodexUsageMonitor__root = object()
+        self.monitor._CodexUsageMonitor__set_session_state("logged_in")
+        self.monitor._CodexUsageMonitor__set_monitor_state("running")
+        self.monitor._CodexUsageMonitor__set_auth_attention(
+            "cloudflare_challenge",
+            source="auto_monitor",
+        )
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread") as thread_ctor:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+            ) as collect_guarded:
+                with patch.object(self.monitor, "_CodexUsageMonitor__log") as log:
+                    self.monitor.show_current_status(
+                        force_refresh=True,
+                        source="auto_monitor",
+                    )
+
+        thread_ctor.assert_not_called()
+        collect_guarded.assert_not_called()
+        log.assert_called_once_with(
+            "collect skip source=auto_monitor reason=cloudflare_challenge"
+        )
+        status = self.monitor.get_runtime_status()
+        self.assertEqual(status.get("monitor_state"), "paused_auth_required")
+        self.assertTrue(bool(status.get("auth_attention_required")))
+
+    def test_show_current_status_manual_login_runs_when_auth_attention_required(self) -> None:
+        self.monitor._CodexUsageMonitor__root = object()
+        self.monitor._CodexUsageMonitor__set_session_state("logged_in")
+        self.monitor._CodexUsageMonitor__set_auth_attention(
+            "cloudflare_challenge",
+            source="auto_monitor",
+        )
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__ui_post",
+                side_effect=lambda fn: fn(),
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__collect_snapshot_guarded",
+                    return_value=(None, "collect_cancelled"),
+                ) as collect_guarded:
+                    with patch.object(self.monitor, "_CodexUsageMonitor__show_tooltip"):
+                        self.monitor.show_current_status(
+                            force_refresh=True,
+                            source="manual_login",
+                        )
+
+        collect_guarded.assert_called_once()
+        self.assertEqual(collect_guarded.call_args.kwargs.get("source"), "manual_login")
+
     def test_show_current_status_manual_login_busy_avoids_usage_query_wording(self) -> None:
         self.monitor._CodexUsageMonitor__root = object()
         shown: list[tuple[str, list[tuple[str, str | None]] | None, int | None]] = []
@@ -6211,6 +6278,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return None
 
         self.monitor._CodexUsageMonitor__root = object()
+        self.monitor._CodexUsageMonitor__set_session_state("logged_in")
 
         with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
             with patch.object(
