@@ -465,9 +465,9 @@ class CodexUsageMultiMonitor:
         return
 
     def __should_run_background_collection(self) -> bool:
-        return bool(self.__enabled and self.__background_account_ids())
+        return bool(self.__enabled and self.__background_scheduler_account_ids())
 
-    def __background_account_ids(self) -> list[str]:
+    def __background_scheduler_account_ids(self) -> list[str]:
         account_ids = []
         for account_id in self.__ordered_account_ids():
             if not bool(self.__account_settings[account_id].enabled):
@@ -477,6 +477,29 @@ class CodexUsageMultiMonitor:
             if session_state == "logged_in" or bool(runtime.get("collect_inflight")):
                 account_ids.append(account_id)
         return account_ids
+
+    def __background_account_ids(self) -> list[str]:
+        account_ids = []
+        for account_id in self.__ordered_account_ids():
+            if not bool(self.__account_settings[account_id].enabled):
+                continue
+            runtime = self.__safe_child_runtime(account_id)
+            if self.__is_background_account_paused(runtime):
+                continue
+            session_state = str(runtime.get("session_state") or "logged_out")
+            if session_state == "logged_in" or bool(runtime.get("collect_inflight")):
+                account_ids.append(account_id)
+        return account_ids
+
+    def __is_background_account_paused(self, runtime: dict[str, Any]) -> bool:
+        if not isinstance(runtime, dict):
+            return False
+        if bool(runtime.get("collect_inflight")):
+            return False
+        if bool(runtime.get("auth_attention_required")):
+            return True
+        monitor_state = str(runtime.get("monitor_state") or "")
+        return monitor_state in {"paused_auth_required", "paused_profile_in_use"}
 
     def __get_next_collect_remaining_sec(self) -> float | None:
         due_ts = float(self.__next_collect_due_ts or 0.0)

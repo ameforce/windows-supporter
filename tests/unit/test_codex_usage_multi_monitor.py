@@ -581,6 +581,24 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(children[1].show_calls, [])
             self.assertGreaterEqual(len(root.after_calls), 2)
 
+    def test_background_monitor_skips_paused_auth_accounts_without_stopping_scheduler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime["session_state"] = "logged_in"
+            children[0].runtime["monitor_state"] = "paused_auth_required"
+            children[0].runtime["auth_attention_required"] = True
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            manager.attach(root, event_queue=None)
+
+            self.assertEqual(len(root.after_calls), 1)
+            root.after_calls[0]["callback"]()
+
+            self.assertEqual(children[0].show_calls, [])
+            self.assertEqual(children[1].show_calls, [])
+            self.assertGreaterEqual(len(root.after_calls), 2)
+
     def test_attach_does_not_revalidate_logged_out_account_when_profile_session_is_present(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
