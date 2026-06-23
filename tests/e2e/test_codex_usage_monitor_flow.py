@@ -6081,9 +6081,120 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         status = self.monitor.get_runtime_status()
         self.assertTrue(bool(status.get("pending_login_poll_active")))
-        self.assertFalse(bool(status.get("can_login")))
+        self.assertTrue(bool(status.get("can_login")))
         self.assertEqual(self.monitor._CodexUsageMonitor__pending_login_after_id, "poll-1")
         self.assertEqual(root.after_calls[0][0], 5000)
+
+    def test_handle_collect_error_background_with_profile_cdp_does_not_schedule_poll(self) -> None:
+        class _DummyRoot:
+            def __init__(self):
+                self.after_calls: list[tuple[int, object]] = []
+
+            def after(self, delay, fn):
+                self.after_calls.append((int(delay), fn))
+                return f"poll-{len(self.after_calls)}"
+
+            def after_cancel(self, _token):
+                return None
+
+        root = _DummyRoot()
+        self.monitor._CodexUsageMonitor__root = root
+        self.monitor._CodexUsageMonitor__set_session_state("logged_in")
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
+            return_value=True,
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__clear_hidden_cdp_process",
+            ) as clear_hidden:
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__show_tooltip",
+                ):
+                    self.monitor._CodexUsageMonitor__handle_collect_error(
+                        "login_required",
+                        source="auto_monitor",
+                    )
+
+        self.assertEqual(self.monitor._CodexUsageMonitor__pending_login_after_id, None)
+        self.assertFalse(root.after_calls)
+        self.assertFalse(bool(self.monitor.get_runtime_status().get("pending_login_poll_active")))
+        clear_hidden.assert_called_once_with(terminate=True)
+
+    def test_show_current_status_preserves_auto_monitor_source_for_background_refresh(self) -> None:
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        self.monitor._CodexUsageMonitor__root = object()
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+                return_value=(None, "collect_busy"),
+            ) as collect_guarded:
+                with patch.object(self.monitor, "_CodexUsageMonitor__ui_post_coalesced"):
+                    with patch.object(self.monitor, "_CodexUsageMonitor__ui_post"):
+                        self.monitor.show_current_status(
+                            force_refresh=True,
+                            source="auto_monitor",
+                        )
+
+        collect_guarded.assert_called_once()
+        self.assertEqual(collect_guarded.call_args.kwargs.get("source"), "auto_monitor")
+
+    def test_show_current_status_manual_login_cancels_scheduled_pending_poll(self) -> None:
+        class _DummyRoot:
+            def __init__(self):
+                self.cancelled: list[str] = []
+
+            def after_cancel(self, token):
+                self.cancelled.append(str(token))
+                return None
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        root = _DummyRoot()
+        self.monitor._CodexUsageMonitor__root = root
+        self.monitor._CodexUsageMonitor__pending_login_after_id = "poll-1"
+        self.monitor._CodexUsageMonitor__pending_login_poll_until_ts = 1000.0
+        self.monitor._CodexUsageMonitor__pending_login_poll_reason = "login_required"
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+                return_value=(None, "collect_busy"),
+            ) as collect_guarded:
+                with patch.object(self.monitor, "_CodexUsageMonitor__ui_post_coalesced"):
+                    with patch.object(self.monitor, "_CodexUsageMonitor__ui_post"):
+                        self.monitor.show_current_status(
+                            force_refresh=True,
+                            source="manual_login",
+                        )
+
+        self.assertEqual(root.cancelled, ["poll-1"])
+        self.assertEqual(self.monitor._CodexUsageMonitor__pending_login_after_id, None)
+        collect_guarded.assert_called_once()
+        self.assertEqual(collect_guarded.call_args.kwargs.get("source"), "manual_login")
 
     def test_handle_collect_error_manual_login_schedules_poll_without_initial_cdp(self) -> None:
         class _DummyRoot:
