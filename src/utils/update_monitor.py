@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import re
 import shutil
 import subprocess
@@ -16,17 +15,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.utils.app_version import get_app_version
-from src.utils.subprocess_utils import (
-    build_no_window_subprocess_kwargs,
-    popen_no_window,
-    run_no_window,
-)
+from src.utils.progress_subprocess import run_no_window_with_progress
+from src.utils.subprocess_utils import popen_no_window, run_no_window
 from src.utils.update_settings import (
     UpdateSettings,
     get_update_settings_path,
     load_update_settings,
-    normalize_update_settings,
     save_update_settings,
+    validate_update_settings_update,
 )
 from src.utils.worktree_runtime import is_primary_worktree
 
@@ -758,115 +754,6 @@ class UpdateHandoffProgressUi:
         return
 
 
-def run_no_window_with_progress(
-    argv: list[str],
-    *,
-    subprocess_module=subprocess,
-    progress_ui: UpdateHandoffProgressUi | None = None,
-    progress_line_callback: Callable[[str], None] | None = None,
-    pump_interval_seconds: float = 0.1,
-    **kwargs: Any,
-) -> Any:
-    popen_factory = getattr(subprocess_module, "Popen", None)
-    if callable(popen_factory) and bool(kwargs.get("capture_output")) and bool(kwargs.get("text")):
-        run_kwargs = dict(kwargs)
-        timeout = run_kwargs.pop("timeout", None)
-        check = bool(run_kwargs.pop("check", False))
-        run_kwargs.pop("capture_output", None)
-        run_kwargs.setdefault("stdout", getattr(subprocess_module, "PIPE", subprocess.PIPE))
-        run_kwargs.setdefault("stderr", getattr(subprocess_module, "STDOUT", subprocess.STDOUT))
-        for key, value in build_no_window_subprocess_kwargs(subprocess_module).items():
-            run_kwargs.setdefault(key, value)
-        process = popen_factory(argv, **run_kwargs)
-        output_parts: list[str] = []
-        deadline = (
-            time.monotonic() + float(timeout)
-            if timeout is not None and float(timeout) > 0
-            else None
-        )
-        stdout = getattr(process, "stdout", None)
-        line_queue: queue.Queue[Any] = queue.Queue()
-        reader_done = object()
-
-        def read_output() -> None:
-            if stdout is None:
-                line_queue.put(reader_done)
-                return
-            try:
-                while True:
-                    line = stdout.readline()
-                    if not line:
-                        break
-                    if isinstance(line, bytes):
-                        line = line.decode(errors="replace")
-                    line_queue.put(str(line))
-            except Exception:
-                pass
-            finally:
-                line_queue.put(reader_done)
-            return
-
-        threading.Thread(target=read_output, daemon=True).start()
-        output_complete = False
-        while True:
-            if deadline is not None and time.monotonic() > deadline:
-                killer = getattr(process, "kill", None)
-                if callable(killer):
-                    killer()
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
-            while True:
-                try:
-                    item = line_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if item is reader_done:
-                    output_complete = True
-                    continue
-                output_parts.append(str(item))
-                if callable(progress_line_callback):
-                    progress_line_callback(str(item))
-                if progress_ui is not None:
-                    progress_ui.pump()
-            poll = getattr(process, "poll", None)
-            returncode = poll() if callable(poll) else getattr(process, "returncode", None)
-            if returncode is not None and output_complete:
-                break
-            if progress_ui is not None:
-                progress_ui.pump()
-            time.sleep(max(0.01, float(pump_interval_seconds)))
-        wait = getattr(process, "wait", None)
-        returncode = getattr(process, "returncode", None)
-        if callable(wait) and returncode is None:
-            returncode = wait(timeout=0)
-        returncode = int(returncode if returncode is not None else 0)
-        stdout_text = "".join(output_parts)
-        if check and returncode != 0:
-            raise subprocess.CalledProcessError(returncode, argv, output=stdout_text)
-        return subprocess.CompletedProcess(argv, returncode, stdout_text, "")
-
-    holder: dict[str, Any] = {}
-
-    def worker() -> None:
-        try:
-            holder["result"] = run_no_window(
-                argv,
-                subprocess_module=subprocess_module,
-                **kwargs,
-            )
-        except Exception as exc:
-            holder["error"] = exc
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    while thread.is_alive():
-        if progress_ui is not None:
-            progress_ui.pump()
-        thread.join(max(0.01, float(pump_interval_seconds)))
-    if "error" in holder:
-        raise holder["error"]
-    return holder.get("result")
-
-
 def run_update_handoff(
     state_path: str | os.PathLike[str],
     *,
@@ -1150,11 +1037,13 @@ class WindowsSupporterUpdater:
         if not isinstance(data, dict):
             return False, "invalid settings"
         try:
-            next_settings = normalize_update_settings(
+            next_settings, error = validate_update_settings_update(
                 data,
                 settings_path=self._settings_path,
                 current=self._settings,
             )
+            if next_settings is None:
+                return False, str(error or "invalid settings")
             save_update_settings(self._settings_path, next_settings)
         except Exception as exc:
             return False, str(exc)
