@@ -2199,6 +2199,23 @@ class CodexUsageMonitor:
         self.__auth_attention_source = ""
         return
 
+    def __is_deferred_background_auth_source(self, source: str) -> bool:
+        return normalize_usage_value(source).lower() in {
+            "auto_monitor",
+            "monitor_tick",
+        }
+
+    def __should_defer_background_auth_error(self, error: str, source: str) -> bool:
+        reason = normalize_usage_value(error).lower()
+        if reason not in {"login_required", "cloudflare_challenge"}:
+            return False
+        if not self.__is_deferred_background_auth_source(source):
+            return False
+        try:
+            return bool(self.__last_snapshot.has_any_metric())
+        except Exception:
+            return False
+
     def __is_logged_in_session(self) -> bool:
         return str(self.__session_state) == "logged_in"
 
@@ -4032,6 +4049,18 @@ class CodexUsageMonitor:
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = self.__is_manual_collect_source(normalized_source)
         is_manual_login = normalized_source == "manual_login"
+
+        if self.__should_defer_background_auth_error(msg, normalized_source):
+            self.__set_session_state("logged_in")
+            self.__clear_auth_attention()
+            self.__clear_hidden_cdp_process(terminate=True)
+            self.__save_state()
+            self.__log(
+                "collect auth deferred "
+                f"source={normalized_source} reason={msg} "
+                "using_last_snapshot=true"
+            )
+            return
 
         if msg == "login_required":
             self.__set_session_state("logged_out")
