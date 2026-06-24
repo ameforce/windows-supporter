@@ -27,6 +27,8 @@ class CodexUsageSettingsView:
         self._account_enabled_vars = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
+        self._account_status_vars = {}
+        self._account_snapshot_vars = {}
         self._account_order: list[str] = []
         self._autosave_after_id = None
         self._loading_settings = False
@@ -80,6 +82,8 @@ class CodexUsageSettingsView:
         self._logout_button = None
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
+        self._account_status_vars = {}
+        self._account_snapshot_vars = {}
 
         container = tk.Frame(parent, bg=bg)
         try:
@@ -492,6 +496,28 @@ class CodexUsageSettingsView:
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
             detail_row = 1
+            status_var = tk.StringVar(value="조회 상태: -")
+            snapshot_var = tk.StringVar(value="최근 값: -")
+            self._account_status_vars[account_id] = status_var
+            self._account_snapshot_vars[account_id] = snapshot_var
+            for value_var in (status_var, snapshot_var):
+                tk.Label(
+                    card,
+                    textvariable=value_var,
+                    bg=card_bg,
+                    fg="#1F2937",
+                    font=("Segoe UI", 8),
+                    anchor="w",
+                    justify="left",
+                    wraplength=330,
+                ).grid(
+                    row=detail_row,
+                    column=0,
+                    sticky="we",
+                    padx=8,
+                    pady=(0, 1),
+                )
+                detail_row += 1
             for prefix, key, clickable in (
                 ("설정 파일", "settings_path", True),
                 ("상태 파일", "state_path", False),
@@ -1039,6 +1065,174 @@ class CodexUsageSettingsView:
             payload = {}
         return payload if isinstance(payload, dict) else {}
 
+    def _snapshot_payload_from_any(self, snapshot: Any) -> dict[str, Any]:
+        if isinstance(snapshot, dict):
+            return dict(snapshot)
+        try:
+            if snapshot is not None and hasattr(snapshot, "to_dict"):
+                payload = snapshot.to_dict()
+                if isinstance(payload, dict):
+                    return dict(payload)
+        except Exception:
+            return {}
+        return {}
+
+    def _format_captured_at_value(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw or raw == "-":
+            return "-"
+        try:
+            formatter = getattr(self._codex, "format_captured_at_for_display", None)
+            if callable(formatter):
+                rendered = str(formatter(raw) or "").strip()
+                return rendered if rendered else "-"
+        except Exception:
+            pass
+        return raw
+
+    def _runtime_state_text(self, runtime: dict[str, Any] | None) -> str:
+        if not isinstance(runtime, dict):
+            runtime = {}
+        session_state = str(runtime.get("session_state", "logged_out") or "logged_out")
+        monitor_state = str(runtime.get("monitor_state", "idle") or "idle")
+        logout_in_progress = bool(runtime.get("logout_in_progress", False))
+        profile_in_use = bool(runtime.get("profile_in_use", False))
+        pending_login_poll = bool(runtime.get("pending_login_poll_active", False))
+        auth_attention_required = bool(runtime.get("auth_attention_required", False))
+        auth_attention_reason = str(runtime.get("auth_attention_reason", "") or "")
+        pending_login_reason = str(runtime.get("pending_login_poll_reason", "") or "")
+        system_chrome_cdp_available = bool(runtime.get("system_chrome_cdp_available", False))
+        try:
+            pending_cdp_misses = int(runtime.get("pending_login_no_cdp_miss_count", 0) or 0)
+        except Exception:
+            pending_cdp_misses = 0
+        try:
+            pending_cdp_max_misses = int(runtime.get("pending_login_no_cdp_max_misses", 0) or 0)
+        except Exception:
+            pending_cdp_max_misses = 0
+        try:
+            inflight = bool(runtime.get("collect_inflight", False))
+        except Exception:
+            inflight = False
+        source = str(runtime.get("collect_source", "") or "")
+        if logout_in_progress or monitor_state == "cancelling":
+            return "로그아웃 중"
+        if inflight:
+            state = "로그인 창 여는 중" if source == "manual_login" else "조회 중"
+            if source and source != "manual_login":
+                state = f"{state} ({source})"
+            return state
+        if profile_in_use or monitor_state == "paused_profile_in_use":
+            return "프로필 사용 중 (자동 일시중지)"
+        if pending_login_poll:
+            is_cloudflare_auth = (
+                auth_attention_reason == "cloudflare_challenge"
+                or pending_login_reason == "cloudflare_challenge"
+            )
+            label = "인증 창" if is_cloudflare_auth else "로그인 창"
+            if pending_cdp_misses > 0:
+                if pending_cdp_max_misses > 0:
+                    return f"{label} 감지 대기 중 ({pending_cdp_misses}/{pending_cdp_max_misses})"
+                return f"{label} 감지 대기 중 ({pending_cdp_misses})"
+            return "인증 완료 대기 중" if is_cloudflare_auth else "로그인 완료 대기 중"
+        if auth_attention_required or monitor_state == "paused_auth_required":
+            return "브라우저 인증 필요"
+        if session_state == "logged_out" and system_chrome_cdp_available:
+            return "기존 Chrome 세션 감지됨"
+        if session_state == "logged_out":
+            return "로그인 필요"
+        return "대기 중"
+
+    def _runtime_snapshot_is_previous(self, runtime: dict[str, Any] | None) -> bool:
+        if not isinstance(runtime, dict):
+            runtime = {}
+        monitor_state = str(runtime.get("monitor_state") or "idle")
+        session_state = str(runtime.get("session_state") or "")
+        if bool(runtime.get("collect_inflight", False)):
+            return True
+        if bool(runtime.get("auth_attention_required", False)):
+            return True
+        if monitor_state in {
+            "running",
+            "cancelling",
+            "paused_auth_required",
+            "paused_profile_in_use",
+        }:
+            return True
+        return session_state == "logged_out"
+
+    def _format_account_snapshot_summary(self, entry: dict[str, Any]) -> str:
+        runtime = entry.get("runtime", {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+        payload = self._snapshot_payload_from_any(entry.get("last_snapshot"))
+
+        def _val(key: str) -> str:
+            raw = str(payload.get(key, "") or "").strip()
+            return raw if raw else "-"
+
+        parts: list[str] = []
+        five_hour = _val("five_hour_limit")
+        weekly = _val("weekly_limit")
+        if five_hour != "-" or weekly != "-":
+            parts.append(f"5시간 {five_hour} / 주간 {weekly}")
+        spark_five_hour = _val("gpt_5_3_codex_spark_five_hour_limit")
+        spark_weekly = _val("gpt_5_3_codex_spark_weekly_limit")
+        if spark_five_hour != "-" or spark_weekly != "-":
+            parts.append(f"Spark 5시간 {spark_five_hour} / 주간 {spark_weekly}")
+        captured_at = self._format_captured_at_value(_val("captured_at"))
+        if captured_at != "-":
+            parts.append(f"확인 {captured_at}")
+        prefix = "이전 값" if self._runtime_snapshot_is_previous(runtime) else "최근 값"
+        body = ", ".join(parts) if parts else "-"
+        return f"{prefix}: {body}"
+
+    def _refresh_account_runtime_summaries(self, runtime: dict[str, Any]) -> None:
+        accounts = runtime.get("accounts") if isinstance(runtime, dict) else None
+        if not isinstance(accounts, list):
+            accounts = []
+        seen: set[str] = set()
+        for raw in accounts:
+            if not isinstance(raw, dict):
+                continue
+            account_id = str(raw.get("id") or "").strip()
+            if not account_id:
+                continue
+            seen.add(account_id)
+            child_runtime = raw.get("runtime", {})
+            if not isinstance(child_runtime, dict):
+                child_runtime = {}
+            if bool(raw.get("enabled", True)):
+                state = self._runtime_state_text(child_runtime)
+            else:
+                state = "비활성"
+            status_var = self._account_status_vars.get(account_id)
+            if status_var is not None:
+                try:
+                    status_var.set(f"조회 상태: {state}")
+                except Exception:
+                    pass
+            snapshot_var = self._account_snapshot_vars.get(account_id)
+            if snapshot_var is not None:
+                try:
+                    snapshot_var.set(self._format_account_snapshot_summary(raw))
+                except Exception:
+                    pass
+        for account_id, status_var in self._account_status_vars.items():
+            if account_id in seen:
+                continue
+            try:
+                status_var.set("조회 상태: -")
+            except Exception:
+                pass
+        for account_id, snapshot_var in self._account_snapshot_vars.items():
+            if account_id in seen:
+                continue
+            try:
+                snapshot_var.set("최근 값: -")
+            except Exception:
+                pass
+
     def _start_runtime_refresh(self) -> None:
         self._stop_runtime_refresh()
         self._refresh_runtime_status()
@@ -1074,57 +1268,13 @@ class CodexUsageSettingsView:
             return
         runtime = self._safe_get_runtime()
         session_state = str(runtime.get("session_state", "logged_out") or "logged_out")
-        monitor_state = str(runtime.get("monitor_state", "idle") or "idle")
-        logout_in_progress = bool(runtime.get("logout_in_progress", False))
         profile_in_use = bool(runtime.get("profile_in_use", False))
         pending_login_poll = bool(runtime.get("pending_login_poll_active", False))
-        auth_attention_required = bool(runtime.get("auth_attention_required", False))
-        auth_attention_reason = str(runtime.get("auth_attention_reason", "") or "")
-        pending_login_reason = str(runtime.get("pending_login_poll_reason", "") or "")
-        system_chrome_cdp_available = bool(runtime.get("system_chrome_cdp_available", False))
-        try:
-            pending_cdp_misses = int(runtime.get("pending_login_no_cdp_miss_count", 0) or 0)
-        except Exception:
-            pending_cdp_misses = 0
-        try:
-            pending_cdp_max_misses = int(runtime.get("pending_login_no_cdp_max_misses", 0) or 0)
-        except Exception:
-            pending_cdp_max_misses = 0
         try:
             inflight = bool(runtime.get("collect_inflight", False))
         except Exception:
             inflight = False
-        source = str(runtime.get("collect_source", "") or "")
-        if logout_in_progress or monitor_state == "cancelling":
-            state = "로그아웃 중"
-        elif inflight:
-            state = "로그인 창 여는 중" if source == "manual_login" else "조회 중"
-            if source and source != "manual_login":
-                state = f"{state} ({source})"
-        elif profile_in_use or monitor_state == "paused_profile_in_use":
-            state = "프로필 사용 중 (자동 일시중지)"
-        elif pending_login_poll:
-            is_cloudflare_auth = (
-                auth_attention_reason == "cloudflare_challenge"
-                or pending_login_reason == "cloudflare_challenge"
-            )
-            if pending_cdp_misses > 0:
-                if pending_cdp_max_misses > 0:
-                    label = "인증 창" if is_cloudflare_auth else "로그인 창"
-                    state = f"{label} 감지 대기 중 ({pending_cdp_misses}/{pending_cdp_max_misses})"
-                else:
-                    label = "인증 창" if is_cloudflare_auth else "로그인 창"
-                    state = f"{label} 감지 대기 중 ({pending_cdp_misses})"
-            else:
-                state = "인증 완료 대기 중" if is_cloudflare_auth else "로그인 완료 대기 중"
-        elif auth_attention_required or monitor_state == "paused_auth_required":
-            state = "브라우저 인증 필요"
-        elif session_state == "logged_out" and system_chrome_cdp_available:
-            state = "기존 Chrome 세션 감지됨"
-        elif session_state == "logged_out":
-            state = "로그인 필요"
-        else:
-            state = "대기 중"
+        state = self._runtime_state_text(runtime)
 
         remain_text = "-"
         remain = runtime.get("next_collect_in_sec", None)
@@ -1157,29 +1307,14 @@ class CodexUsageSettingsView:
             snapshot = self._codex.get_last_snapshot()
         except Exception:
             snapshot = None
-        payload = {}
-        try:
-            if snapshot is not None and hasattr(snapshot, "to_dict"):
-                payload = snapshot.to_dict()
-        except Exception:
-            payload = {}
+        payload = self._snapshot_payload_from_any(snapshot)
 
         def _val(key: str) -> str:
             raw = str(payload.get(key, "") or "").strip()
             return raw if raw else "-"
 
         def _fmt_time(value: str) -> str:
-            raw = str(value or "").strip()
-            if not raw:
-                return "-"
-            try:
-                formatter = getattr(self._codex, "format_captured_at_for_display", None)
-                if callable(formatter):
-                    rendered = str(formatter(raw) or "").strip()
-                    return rendered if rendered else "-"
-            except Exception:
-                pass
-            return raw
+            return self._format_captured_at_value(value)
 
         def _fmt_reset(key: str) -> str:
             raw = str(payload.get(key, "") or "").strip()
@@ -1225,6 +1360,7 @@ class CodexUsageSettingsView:
         except Exception:
             pass
 
+        self._refresh_account_runtime_summaries(runtime=runtime)
         self._refresh_action_buttons(runtime=runtime)
         self._schedule_runtime_refresh(1000)
         return
