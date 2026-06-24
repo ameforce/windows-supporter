@@ -4967,7 +4967,6 @@ class CodexUsageMonitor:
                 if bool(start_hidden):
                     cmd.extend(
                         [
-                            "--headless=new",
                             "--start-minimized",
                             "--window-size=1280,720",
                             "--window-position=-32000,-32000",
