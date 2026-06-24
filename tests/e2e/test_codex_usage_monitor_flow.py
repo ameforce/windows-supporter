@@ -881,21 +881,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(str(params.get("expression", "")).endswith(")()"))
 
     def test_collect_with_playwright_obj_manual_login_opens_interactive_without_hidden_probe(self) -> None:
-        recovered = UsageSnapshot.from_metrics(
-            {
-                "five_hour_limit": "17 / 40",
-                "weekly_limit": "109 / 300",
-                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
-                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
-                "remaining_credit": "245",
-            },
-            captured_at="2026-03-30T11:05:00",
-        )
-
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__collect_snapshot_once",
-            return_value=(recovered, None),
+            side_effect=AssertionError("manual login should not start hidden collection"),
         ) as collect_once:
             with patch.object(
                 self.monitor,
@@ -911,21 +900,48 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         "monotonic",
                         return_value=2000.0,
                     ):
-                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                            object(),
-                            source="manual_login",
-                        )
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__open_interactive_login_window",
+                            return_value=True,
+                        ) as open_login:
+                            snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                                object(),
+                                source="manual_login",
+                            )
 
-        self.assertIsNone(err)
-        self.assertIs(snap, recovered)
-        self.assertEqual(collect_once.call_count, 1)
+        self.assertEqual(err, "login_required")
+        self.assertIsNone(snap)
+        collect_once.assert_not_called()
         self.assertTrue(prepare_interactive.called)
+        open_login.assert_called_once()
         ui_post.assert_not_called()
-        only_call = collect_once.call_args_list[0]
-        self.assertTrue(only_call.kwargs.get("allow_interactive_recovery"))
-        self.assertFalse(only_call.kwargs.get("force_hidden"))
         self.assertEqual(
-            only_call.kwargs.get("initial_url"),
+            open_login.call_args.kwargs.get("initial_url"),
+            "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+        )
+
+    def test_collect_with_playwright_obj_manual_login_opens_directly_without_collection_wait(self) -> None:
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__open_interactive_login_window",
+            return_value=True,
+        ) as open_login:
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_once",
+                side_effect=AssertionError("manual login should not wait on usage collection"),
+            ):
+                snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                    object(),
+                    source="manual_login",
+                )
+
+        self.assertIsNone(snap)
+        self.assertEqual(err, "login_required")
+        open_login.assert_called_once()
+        self.assertEqual(
+            open_login.call_args.kwargs.get("initial_url"),
             "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
         )
 
@@ -1171,23 +1187,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(browser.closed)
 
     def test_manual_login_button_bypasses_interactive_reopen_cooldown(self) -> None:
-        recovered = UsageSnapshot.from_metrics(
-            {
-                "five_hour_limit": "17 / 40",
-                "weekly_limit": "109 / 300",
-                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
-                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
-                "remaining_credit": "245",
-            },
-            captured_at="2026-03-30T11:05:00",
-        )
         self.monitor._CodexUsageMonitor__last_interactive_login_ts = 1999.0
         self.monitor._CodexUsageMonitor__manual_interactive_reopen_cooldown_sec = 120.0
 
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__collect_snapshot_once",
-            return_value=(recovered, None),
+            side_effect=AssertionError("manual login should not wait on usage collection"),
         ) as collect_once:
             with patch.object(
                 self.monitor,
@@ -1199,14 +1205,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     "monotonic",
                     return_value=2000.0,
                 ):
-                    snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
-                        object(),
-                        source="manual_login",
-                    )
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__open_interactive_login_window",
+                        return_value=True,
+                    ):
+                        snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="manual_login",
+                        )
 
-        self.assertIsNone(err)
-        self.assertIs(snap, recovered)
-        self.assertEqual(collect_once.call_count, 1)
+        self.assertEqual(err, "login_required")
+        self.assertIsNone(snap)
+        collect_once.assert_not_called()
 
     def test_collect_with_playwright_obj_manual_query_does_not_open_interactive_for_login_required(self) -> None:
         with patch.object(
@@ -3298,6 +3309,61 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertNotIn("--headless=new", cmd)
         self.assertIn("startupinfo", kwargs)
         self.assertIn("creationflags", kwargs)
+
+    def test_open_interactive_login_window_uses_visible_single_chrome_launch(self) -> None:
+        class _DummyProc:
+            pid = 51234
+
+            def poll(self):
+                return None
+
+        popen_calls: list[tuple[list[str], dict]] = []
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append((list(cmd), dict(kwargs)))
+            return _DummyProc()
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__resolve_chrome_executable_path",
+            return_value="C:/Program Files/Google/Chrome/Application/chrome.exe",
+        ):
+            with patch.object(self.monitor._CodexUsageMonitor__lib.os, "makedirs"):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__allocate_ephemeral_cdp_port",
+                    return_value=9333,
+                ):
+                    with patch.object(
+                        self.monitor._CodexUsageMonitor__lib.subprocess,
+                        "Popen",
+                        side_effect=fake_popen,
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__set_cdp_window_visibility",
+                        ) as show_window:
+                            opened = self.monitor._CodexUsageMonitor__open_interactive_login_window(
+                                initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+                            )
+
+        self.assertTrue(opened)
+        self.assertEqual(len(popen_calls), 1)
+        cmd, kwargs = popen_calls[0]
+        self.assertIn("--remote-debugging-port=9333", cmd)
+        self.assertIn("--remote-debugging-address=127.0.0.1", cmd)
+        self.assertIn(f"--user-data-dir={self._profile_dir}", cmd)
+        self.assertIn("--new-window", cmd)
+        self.assertIn("--window-size=960,720", cmd)
+        self.assertIn("--window-position=32,32", cmd)
+        self.assertIn("https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage", cmd)
+        self.assertNotIn("--headless=new", cmd)
+        self.assertNotIn("--start-minimized", cmd)
+        self.assertNotIn("--window-position=-32000,-32000", cmd)
+        self.assertNotIn("startupinfo", kwargs)
+        show_window.assert_called_once()
+        self.assertTrue(show_window.call_args.kwargs.get("visible"))
+        self.assertTrue(show_window.call_args.kwargs.get("bring_to_front"))
 
     def test_collect_snapshot_once_reuses_hidden_cdp_process_between_calls(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
