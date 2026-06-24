@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import threading
 from typing import Any
 
@@ -1143,11 +1144,60 @@ class CodexUsageSettingsView:
             return "로그인 필요"
         return "대기 중"
 
-    def _runtime_snapshot_is_previous(self, runtime: dict[str, Any] | None) -> bool:
+    def _captured_at_is_stale(self, value: Any, stale_after_sec: float) -> bool:
+        raw = str(value or "").strip()
+        if not raw or raw == "-":
+            return False
+        try:
+            threshold = float(stale_after_sec)
+        except Exception:
+            threshold = 300.0
+        if threshold < 60.0:
+            threshold = 60.0
+        try:
+            normalized = raw.replace("Z", "+00:00")
+            captured_at = datetime.fromisoformat(normalized)
+        except Exception:
+            return False
+        try:
+            if captured_at.tzinfo is not None:
+                now = datetime.now(captured_at.tzinfo)
+            else:
+                now = datetime.now()
+            age_sec = (now - captured_at).total_seconds()
+        except Exception:
+            return False
+        return age_sec > threshold
+
+    def _account_snapshot_stale_after_sec(self, entry: dict[str, Any]) -> float:
+        settings = entry.get("settings", {})
+        if not isinstance(settings, dict):
+            settings = {}
+        runtime = entry.get("runtime", {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+        raw_interval = settings.get("interval_sec", runtime.get("interval_sec", 90.0))
+        try:
+            interval = float(raw_interval)
+        except Exception:
+            interval = 90.0
+        if interval <= 0.0:
+            interval = 90.0
+        return max(300.0, interval * 3.0)
+
+    def _runtime_snapshot_is_previous(
+        self,
+        runtime: dict[str, Any] | None,
+        *,
+        captured_at: Any = "",
+        stale_after_sec: float = 300.0,
+    ) -> bool:
         if not isinstance(runtime, dict):
             runtime = {}
         monitor_state = str(runtime.get("monitor_state") or "idle")
         session_state = str(runtime.get("session_state") or "")
+        if self._captured_at_is_stale(captured_at, stale_after_sec):
+            return True
         if bool(runtime.get("collect_inflight", False)):
             return True
         if bool(runtime.get("auth_attention_required", False)):
@@ -1180,10 +1230,19 @@ class CodexUsageSettingsView:
         spark_weekly = _val("gpt_5_3_codex_spark_weekly_limit")
         if spark_five_hour != "-" or spark_weekly != "-":
             parts.append(f"Spark 5시간 {spark_five_hour} / 주간 {spark_weekly}")
-        captured_at = self._format_captured_at_value(_val("captured_at"))
+        captured_at_raw = _val("captured_at")
+        captured_at = self._format_captured_at_value(captured_at_raw)
         if captured_at != "-":
             parts.append(f"확인 {captured_at}")
-        prefix = "이전 값" if self._runtime_snapshot_is_previous(runtime) else "최근 값"
+        prefix = (
+            "이전 값"
+            if self._runtime_snapshot_is_previous(
+                runtime,
+                captured_at=captured_at_raw,
+                stale_after_sec=self._account_snapshot_stale_after_sec(entry),
+            )
+            else "최근 값"
+        )
         body = ", ".join(parts) if parts else "-"
         return f"{prefix}: {body}"
 
