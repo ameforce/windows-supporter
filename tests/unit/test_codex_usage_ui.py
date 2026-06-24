@@ -543,7 +543,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                                 "collect_inflight": False,
                             },
                             "last_snapshot": {
-                                "captured_at": "2026-06-24T16:00:16+09:00",
+                                "captured_at": "2999-01-01T00:00:00+09:00",
                                 "five_hour_limit": "92%",
                                 "weekly_limit": "86%",
                             },
@@ -592,6 +592,28 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("92%", view._account_snapshot_vars["account_1"].get())
         self.assertIn("이전 값:", view._account_snapshot_vars["account_2"].get())
         self.assertIn("100%", view._account_snapshot_vars["account_2"].get())
+
+    def test_account_snapshot_summary_marks_old_logged_in_snapshot_as_previous(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        summary = view._format_account_snapshot_summary(
+            {
+                "runtime": {
+                    "monitor_state": "idle",
+                    "session_state": "logged_in",
+                    "collect_inflight": False,
+                },
+                "settings": {"interval_sec": 30},
+                "last_snapshot": {
+                    "captured_at": "2000-01-01T00:00:00",
+                    "five_hour_limit": "100%",
+                    "weekly_limit": "58%",
+                },
+            }
+        )
+
+        self.assertIn("이전 값:", summary)
+        self.assertIn("100%", summary)
 
     def test_profile_order_swap_autosaves_without_moving_profile_dirs(self) -> None:
         class _FakeMonitor:
