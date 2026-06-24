@@ -504,6 +504,95 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("아래로", button_texts)
         self.assertIn("위로", button_texts)
 
+    def test_refresh_runtime_status_updates_each_account_status_independently(self) -> None:
+        class _FakeMonitor:
+            def get_settings_snapshot(self):
+                return {
+                    "enabled": True,
+                    "interval_sec": 90,
+                    "tooltip_duration_ms": 7000,
+                    "usage_url": "https://example.test",
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "label": "Codex 1",
+                            "enabled": True,
+                            "profile_dir": "profile-1",
+                        },
+                        {
+                            "id": "account_2",
+                            "label": "이니미니",
+                            "enabled": True,
+                            "profile_dir": "profile-2",
+                        },
+                    ],
+                }
+
+            def get_runtime_status(self):
+                return {
+                    "monitor_state": "paused_auth_required",
+                    "session_state": "mixed",
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "label": "Codex 1",
+                            "enabled": True,
+                            "runtime": {
+                                "monitor_state": "idle",
+                                "session_state": "logged_in",
+                                "collect_inflight": False,
+                            },
+                            "last_snapshot": {
+                                "captured_at": "2026-06-24T16:00:16+09:00",
+                                "five_hour_limit": "92%",
+                                "weekly_limit": "86%",
+                            },
+                        },
+                        {
+                            "id": "account_2",
+                            "label": "이니미니",
+                            "enabled": True,
+                            "runtime": {
+                                "monitor_state": "paused_auth_required",
+                                "session_state": "logged_out",
+                                "collect_inflight": False,
+                                "auth_attention_required": True,
+                                "auth_attention_reason": "login_required",
+                            },
+                            "last_snapshot": {
+                                "captured_at": "2026-06-24T08:41:00+09:00",
+                                "five_hour_limit": "100%",
+                                "weekly_limit": "58%",
+                            },
+                        },
+                    ],
+                }
+
+            def get_last_snapshot(self):
+                return None
+
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+        view._refresh_runtime_status()
+
+        self.assertEqual(view._account_status_vars["account_1"].get(), "조회 상태: 대기 중")
+        self.assertEqual(
+            view._account_status_vars["account_2"].get(),
+            "조회 상태: 브라우저 인증 필요",
+        )
+        self.assertIn("최근 값:", view._account_snapshot_vars["account_1"].get())
+        self.assertIn("92%", view._account_snapshot_vars["account_1"].get())
+        self.assertIn("이전 값:", view._account_snapshot_vars["account_2"].get())
+        self.assertIn("100%", view._account_snapshot_vars["account_2"].get())
+
     def test_profile_order_swap_autosaves_without_moving_profile_dirs(self) -> None:
         class _FakeMonitor:
             def __init__(self):
