@@ -4229,6 +4229,16 @@ class CodexUsageMonitor:
             )
             if bool(raw_handled):
                 return raw_snapshot, raw_error
+        elif self.__should_open_interactive_recovery(source=source_key):
+            self.__log("collect strategy=interactive-login-direct interactive=open")
+            self.__prepare_interactive_recovery_launch(
+                source=source_key,
+                reason="login_required",
+            )
+            if self.__open_interactive_login_window(
+                initial_url=str(self.__login_entry_url),
+            ):
+                return None, "login_required"
         self.__force_playwright_mode()
         self.__configure_playwright_env()
         if not self.__ensure_playwright_available():
@@ -4281,6 +4291,10 @@ class CodexUsageMonitor:
                 source=normalized_source,
                 reason="login_required",
             )
+            if self.__open_interactive_login_window(
+                initial_url=str(self.__login_entry_url),
+            ):
+                return None, "login_required"
             return self.__collect_snapshot_once(
                 playwright_obj,
                 headless=False,
@@ -4376,6 +4390,76 @@ class CodexUsageMonitor:
         self.__pending_hidden_cdp_clear = False
         self.__clear_hidden_cdp_process(terminate=True)
         return
+
+    def __open_interactive_login_window(self, initial_url: str | None = None) -> bool:
+        chrome_path = self.__resolve_chrome_executable_path()
+        if not chrome_path:
+            return False
+        try:
+            self.__lib.os.makedirs(self.__profile_dir, exist_ok=True)
+        except Exception:
+            pass
+        self.__prepare_profile_for_chrome_launch()
+
+        launch_url = normalize_usage_value(initial_url)
+        if not launch_url:
+            launch_url = str(self.__login_entry_url)
+        port = self.__allocate_ephemeral_cdp_port()
+        cmd = [
+            str(chrome_path),
+            f"--user-data-dir={self.__profile_dir}",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-notifications",
+            "--new-window",
+            "--window-size=960,720",
+            "--window-position=32,32",
+        ]
+        if port > 0:
+            cmd.insert(1, f"--remote-debugging-port={int(port)}")
+            cmd.insert(2, "--remote-debugging-address=127.0.0.1")
+        cmd.append(str(launch_url))
+
+        popen_kwargs: dict[str, Any] = {}
+        try:
+            create_no_window = int(
+                getattr(self.__lib.subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            if create_no_window:
+                popen_kwargs["creationflags"] = create_no_window
+        except Exception:
+            pass
+        try:
+            proc = self.__lib.subprocess.Popen(cmd, **popen_kwargs)
+        except Exception as exc:
+            self.__log_exception("interactive login direct launch failed", exc)
+            return False
+        if port > 0:
+            try:
+                setattr(proc, "_ws_cdp_port", int(port))
+                setattr(proc, "_ws_monitor_managed", True)
+            except Exception:
+                pass
+            self.__hidden_cdp_proc = proc
+            self.__hidden_cdp_port = int(port)
+            self.__last_successful_cdp_port = int(port)
+        self.__log(
+            "interactive login direct launch "
+            f"port={int(port)} pid={int(getattr(proc, 'pid', 0) or 0)}"
+        )
+        try:
+            self.__set_cdp_window_visibility(
+                proc,
+                visible=True,
+                bring_to_front=True,
+                timeout_sec=1.0,
+            )
+        except Exception:
+            pass
+        return True
 
     def __collect_snapshot_once(
         self,
