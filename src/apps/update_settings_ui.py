@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.utils.update_monitor import format_update_status_parts
 from src.utils.update_settings import MAX_CHECK_INTERVAL_MINUTES, MIN_CHECK_INTERVAL_MINUTES
 
 
@@ -229,7 +230,11 @@ class UpdateSettingsView:
         available = bool(settings.get("auto_update_available", True))
         interval = int(settings.get("check_interval_minutes", 10) or 10)
         mode = "사용" if bool(settings.get("auto_check_enabled", True)) else "중지"
+        _enabled, parts = format_update_status_parts(status)
+        progress_text = " | ".join(str(part) for part, _kind in parts if str(part).strip())
         text = f"자동 확인: {mode} | 주기: {interval}분 | 상태: {state}"
+        if progress_text:
+            text = f"{text}\n진행: {progress_text}"
         if not available and reason:
             text = f"{text}\n지원 여부: {reason}"
         self._set_status(text)

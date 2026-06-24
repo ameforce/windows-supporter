@@ -65,6 +65,11 @@ class UpdateSettingsViewUnitTest(unittest.TestCase):
         updater = _FakeUpdater()
         updater.settings["check_interval_minutes"] = 15
         updater.status["state"] = "checking"
+        updater.status["progress"] = {
+            "label": "업데이트 확인 중",
+            "percent": 6,
+            "detail": "현재 버전과 원격 릴리스를 확인합니다.",
+        }
         view = UpdateSettingsView(root=object(), updater=updater)
         view._status_label = _FakeLabel()
 
@@ -72,6 +77,7 @@ class UpdateSettingsViewUnitTest(unittest.TestCase):
 
         self.assertIn("주기: 15분", view._status_label.text)
         self.assertIn("상태: checking", view._status_label.text)
+        self.assertIn("진행: 업데이트 확인 중 | 6%", view._status_label.text)
 
 
 if __name__ == "__main__":
