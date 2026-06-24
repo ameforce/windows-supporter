@@ -36,6 +36,7 @@ from src.utils.update_monitor import (
     build_fast_forward_main_command,
     build_fetch_origin_command,
     build_force_clean_approval_message,
+    build_update_build_output_progress_snapshot,
     build_remote_tag_check_command,
     build_reset_main_command,
     build_short_head_command,
@@ -365,6 +366,12 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("SKIP_POST_BUILD_RUN", script)
         self.assertIn("Skipping post-build launch", script)
 
+    def test_build_bat_terminates_running_process_tree(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read().lower()
+
+        self.assertIn('taskkill /f /t /im "%exe_name%"', script)
+
     def test_build_bat_wait_loops_do_not_depend_on_timeout_stdin(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read()
@@ -433,6 +440,59 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(failed["labels"]["log"], UPDATE_PROGRESS_LOG_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["retry"], UPDATE_PROGRESS_RETRY_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["manual_action"], UPDATE_PROGRESS_MANUAL_ACTION_TEXT)
+
+    def test_build_output_progress_is_distributed_from_early_visible_percentages(self) -> None:
+        shutdown = build_update_build_output_progress_snapshot(
+            "Shutting down the running windows-supporter.exe process...[ Success !! ]"
+        )
+        uv_sync = build_update_build_output_progress_snapshot(
+            "Syncing uv environment...[ Success !! ]"
+        )
+        build = build_update_build_output_progress_snapshot(
+            "Building main.py to windows-supporter.exe...[ Success !! ]"
+        )
+
+        self.assertIsNotNone(shutdown)
+        self.assertIsNotNone(uv_sync)
+        self.assertIsNotNone(build)
+        assert shutdown is not None
+        assert uv_sync is not None
+        assert build is not None
+        self.assertLessEqual(shutdown["percent"], 15)
+        self.assertLessEqual(uv_sync["percent"], 35)
+        self.assertLess(build["percent"], 80)
+        self.assertLess(shutdown["percent"], uv_sync["percent"])
+        self.assertLess(uv_sync["percent"], build["percent"])
+
+    def test_process_descendant_cleanup_script_does_not_shadow_powershell_pid(self) -> None:
+        if os.name != "nt":
+            self.skipTest("process descendant cleanup is a Windows command path")
+
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.argv = []
+
+            def run(self, argv, **_kwargs):
+                self.argv = list(argv)
+                return types.SimpleNamespace(
+                    returncode=0,
+                    stdout='{"parent_pid":123,"exclude_pids":[456],"terminated_pids":[],"failed_pids":[]}',
+                    stderr="",
+                )
+
+        fake_subprocess = FakeSubprocess()
+
+        result = update_monitor_module.terminate_process_descendants(
+            123,
+            exclude_pids=(456,),
+            subprocess_module=fake_subprocess,
+        )
+
+        script = fake_subprocess.argv[-1]
+        self.assertEqual(result["exclude_pids"], [456])
+        self.assertIn("function Add-Descendants([int]$treePid)", script)
+        self.assertIn("$childPid -eq $PID", script)
+        self.assertNotIn("function Add-Descendants([int]$pid)", script)
 
     def test_update_korean_ux_copy_distinguishes_cleanup_source_and_force_clean(self) -> None:
         self.assertIn("강제정리", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
@@ -1160,9 +1220,17 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(launches, [([str(repo / "windows-supporter.exe")], {"cwd": str(repo)})])
         self.assertEqual(state["status"], "complete")
         self.assertEqual(state["progress"]["label"], "업데이트 완료")
+        self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
+        self.assertLessEqual(progress_instances[0].snapshots[0]["percent"], 5)
         self.assertEqual(
             [snapshot["label"] for snapshot in progress_instances[0].snapshots],
-            ["빌드 실행 중", "Windows Supporter 재실행 중", "업데이트 완료"],
+            [
+                "업데이트 프로세스 시작",
+                "기존 앱 정리 중",
+                "빌드 준비 중",
+                "Windows Supporter 재실행 중",
+                "업데이트 완료",
+            ],
         )
         self.assertEqual(progress_instances[0].close_calls, 1)
 
@@ -1638,6 +1706,46 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(state["target_tag"], "v0.5.7")
         self.assertEqual(state["working_tree"]["cleanup_targets"], ["build/generated.tmp"])
         self.assertEqual(state["preflight"]["force_clean_approved"], False)
+
+    def test_launch_update_cleans_current_process_descendants_before_exit(self) -> None:
+        events = []
+
+        class HandoffProcess:
+            pid = 4242
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            state_path = Path(tmp) / "update_handoff.json"
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                popen=lambda _command, **_kwargs: HandoffProcess(),
+                quit_callback=lambda: events.append(("quit",)),
+                handoff_path_provider=lambda: state_path,
+                handoff_command_builder=lambda path: ["python", "main.py", UPDATE_HANDOFF_ARG, str(path)],
+                handoff_ack_waiter=lambda _path: True,
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+            updater._latest_tag = "v0.5.7"
+
+            with patch.object(
+                update_monitor_module,
+                "terminate_process_descendants",
+                side_effect=lambda pid, **kwargs: events.append(
+                    (
+                        "cleanup",
+                        pid,
+                        tuple(kwargs.get("exclude_pids") or ()),
+                    )
+                )
+                or {"terminated_pids": []},
+            ):
+                self.assertTrue(updater.launch_update())
+
+        self.assertEqual(events[0], ("cleanup", os.getpid(), (4242,)))
+        self.assertEqual(events[1], ("quit",))
 
     def test_launch_update_quits_current_process_before_waiting_for_handoff_ack(self) -> None:
         launches = []
