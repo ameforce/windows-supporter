@@ -1460,7 +1460,43 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(state["working_tree"]["cleanup_targets"], ["build/generated.tmp"])
         self.assertEqual(state["preflight"]["force_clean_approved"], False)
 
-    def test_launch_update_does_not_quit_when_handoff_ack_fails(self) -> None:
+    def test_launch_update_quits_current_process_before_waiting_for_handoff_ack(self) -> None:
+        launches = []
+        quit_calls = []
+        quit_calls_observed_by_ack = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            state_path = Path(tmp) / "update_handoff.json"
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                popen=lambda command, **kwargs: launches.append((command, dict(kwargs)))
+                or object(),
+                quit_callback=lambda: quit_calls.append(True),
+                handoff_path_provider=lambda: state_path,
+                handoff_command_builder=lambda path: [
+                    "python",
+                    "main.py",
+                    UPDATE_HANDOFF_ARG,
+                    str(path),
+                ],
+                handoff_ack_waiter=lambda _path: quit_calls_observed_by_ack.append(
+                    list(quit_calls)
+                )
+                or True,
+                worktree_runner=_primary_worktree_runner(tmp),
+            )
+            updater._latest_tag = "v0.5.7"
+
+            self.assertTrue(updater.launch_update())
+
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(quit_calls, [True])
+        self.assertEqual(quit_calls_observed_by_ack, [[True]])
+
+    def test_launch_update_reports_ack_failure_after_requesting_quit_without_exit_callback(self) -> None:
         launches = []
         quit_calls = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -1491,7 +1527,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(quit_calls, [])
+        self.assertEqual(quit_calls, [True])
         self.assertEqual(snapshot["state"], "error")
         self.assertIn("acknowledge", snapshot["last_error"])
         self.assertEqual(snapshot["progress"]["failed_step"], "업데이트 프로세스 확인")

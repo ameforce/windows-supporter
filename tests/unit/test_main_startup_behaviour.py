@@ -297,6 +297,7 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
         updater = _FakeUpdater.instances[0]
         self.assertIs(updater.kwargs["root"], root)
         self.assertEqual(updater.kwargs["repo_root"], r"C:\repo")
+        self.assertTrue(callable(updater.kwargs["exit_callback"]))
         self.assertEqual(updater.start_calls, 1)
         self.assertEqual(len(_FakeUi.instances), 1)
         self.assertIs(_FakeUi.instances[0].kwargs["updater"], updater)
