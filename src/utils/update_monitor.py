@@ -967,6 +967,7 @@ class WindowsSupporterUpdater:
         thread_factory=threading.Thread,
         popen=popen_no_window,
         quit_callback=None,
+        exit_callback=None,
         status_changed_callback=None,
         handoff_path_provider=get_update_handoff_path,
         handoff_writer=write_update_handoff_state,
@@ -985,6 +986,7 @@ class WindowsSupporterUpdater:
         self._thread_factory = thread_factory
         self._popen = popen
         self._quit_callback = quit_callback
+        self._exit_callback = exit_callback
         self._status_changed_callback = status_changed_callback
         self._handoff_path_provider = handoff_path_provider
         self._handoff_writer = handoff_writer
@@ -1397,6 +1399,21 @@ class WindowsSupporterUpdater:
         except Exception:
             return False
 
+    def _request_current_process_exit_for_update(self) -> bool:
+        try:
+            if callable(self._quit_callback):
+                self._quit_callback()
+        except Exception:
+            pass
+        exit_callback = self._exit_callback
+        if not callable(exit_callback):
+            return False
+        try:
+            exit_callback()
+            return True
+        except Exception:
+            return False
+
     def _next_update_timestamp(self) -> str:
         try:
             return str(self._timestamp_provider()).strip()
@@ -1562,6 +1579,9 @@ class WindowsSupporterUpdater:
             self._notify_status_changed()
             return False
 
+        if self._request_current_process_exit_for_update():
+            return True
+
         if not self._handoff_ack_waiter(handoff_path):
             self._state = "error"
             self._last_error = "update handoff did not acknowledge startup"
@@ -1576,11 +1596,6 @@ class WindowsSupporterUpdater:
             self._notify_status_changed()
             return False
 
-        try:
-            if callable(self._quit_callback):
-                self._quit_callback()
-        except Exception:
-            pass
         return True
 
 
