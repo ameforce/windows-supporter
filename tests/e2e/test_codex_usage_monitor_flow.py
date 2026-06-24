@@ -194,6 +194,53 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 )
                 self.assertEqual(root.cancelled, [])
 
+    def test_background_auth_retry_success_replaces_stale_snapshot_without_backfill(self) -> None:
+        previous = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T12:00:00",
+        )
+        self.monitor.handle_snapshot(previous)
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__show_tooltip",
+        ):
+            self.monitor._CodexUsageMonitor__handle_collect_error(
+                "login_required",
+                source="auto_monitor",
+            )
+
+        fresh_after_login = UsageSnapshot.from_metrics(
+            {"five_hour_limit": "16 / 40"},
+            captured_at="2026-03-30T12:10:00",
+        )
+        self.monitor.handle_snapshot(fresh_after_login)
+
+        latest = self.monitor.get_last_snapshot()
+        state_path = Path(self.monitor._CodexUsageMonitor__state_path)
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        persisted = payload.get("last_snapshot") or {}
+
+        self.assertEqual(latest.five_hour_limit, "16 / 40")
+        self.assertEqual(latest.weekly_limit, "")
+        self.assertEqual(latest.gpt_5_3_codex_spark_five_hour_limit, "")
+        self.assertEqual(latest.gpt_5_3_codex_spark_weekly_limit, "")
+        self.assertEqual(latest.remaining_credit, "")
+        self.assertEqual(persisted.get("weekly_limit"), "")
+        self.assertEqual(payload.get("session_state"), "logged_in")
+        history = self.monitor.get_runtime_status().get("usage_history") or []
+        saved_history = payload.get("usage_history") or []
+        self.assertEqual(len(history), 1)
+        self.assertEqual(len(saved_history), 1)
+        self.assertEqual(history[0].get("captured_at"), "2026-03-30T12:10:00")
+        self.assertEqual(saved_history[0].get("weekly_limit"), "")
+
     def test_load_state_logged_in_with_profile_enables_monitoring(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
             {
@@ -6474,6 +6521,70 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         collect_guarded.assert_called_once()
         self.assertEqual(collect_guarded.call_args.kwargs.get("source"), "manual_login")
 
+    def test_show_current_status_manual_login_replaces_pre_login_snapshot_without_backfill(self) -> None:
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        previous = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T12:00:00",
+        )
+        fresh_after_login = UsageSnapshot.from_metrics(
+            {"five_hour_limit": "16 / 40"},
+            captured_at="2026-03-30T12:10:00",
+        )
+        self.monitor.handle_snapshot(previous)
+        self.monitor._CodexUsageMonitor__root = object()
+        self.monitor._CodexUsageMonitor__enabled = True
+        self.monitor._CodexUsageMonitor__set_session_state("logged_out")
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+                return_value=(fresh_after_login, None),
+            ) as collect_guarded:
+                with patch.object(self.monitor, "_CodexUsageMonitor__ui_post_coalesced"):
+                    with patch.object(self.monitor, "_CodexUsageMonitor__ui_post"):
+                        self.monitor.show_current_status(
+                            force_refresh=True,
+                            source="manual_login",
+                        )
+
+        latest = self.monitor.get_last_snapshot()
+        state_path = Path(self.monitor._CodexUsageMonitor__state_path)
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        persisted = payload.get("last_snapshot") or {}
+        history = self.monitor.get_runtime_status().get("usage_history") or []
+        saved_history = payload.get("usage_history") or []
+
+        collect_guarded.assert_called_once()
+        self.assertEqual(collect_guarded.call_args.kwargs.get("source"), "manual_login")
+        self.assertEqual(latest.five_hour_limit, "16 / 40")
+        self.assertEqual(latest.weekly_limit, "")
+        self.assertEqual(latest.gpt_5_3_codex_spark_five_hour_limit, "")
+        self.assertEqual(latest.gpt_5_3_codex_spark_weekly_limit, "")
+        self.assertEqual(latest.remaining_credit, "")
+        self.assertEqual(persisted.get("weekly_limit"), "")
+        self.assertEqual(payload.get("session_state"), "logged_in")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(len(saved_history), 1)
+        self.assertEqual(history[0].get("captured_at"), "2026-03-30T12:10:00")
+        self.assertEqual(saved_history[0].get("weekly_limit"), "")
+
     def test_handle_collect_error_manual_login_schedules_poll_without_initial_cdp(self) -> None:
         class _DummyRoot:
             def __init__(self):
@@ -6611,6 +6722,82 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(payload.get("session_state"), "logged_in")
         self.assertTrue(show_snapshot.called)
         self.assertTrue(schedule_monitor.called)
+
+    def test_pending_login_poll_success_replaces_pre_login_snapshot_without_backfill(self) -> None:
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        previous = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "8 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "8 / 50",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T12:00:00",
+        )
+        fresh_after_login = UsageSnapshot.from_metrics(
+            {"five_hour_limit": "16 / 40"},
+            captured_at="2026-03-30T12:10:00",
+        )
+        self.monitor.handle_snapshot(previous)
+        self.monitor._CodexUsageMonitor__enabled = True
+        self.monitor._CodexUsageMonitor__pending_login_poll_until_ts = 1000.0
+        self.monitor._CodexUsageMonitor__set_session_state("logged_out")
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
+                return_value=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__collect_snapshot_guarded",
+                    return_value=(fresh_after_login, None),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__ui_post",
+                        side_effect=lambda fn: fn(),
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__schedule_monitor_tick",
+                        ):
+                            with patch.object(
+                                self.monitor._CodexUsageMonitor__lib.time,
+                                "monotonic",
+                                return_value=100.0,
+                            ):
+                                self.monitor._CodexUsageMonitor__pending_login_poll_tick()
+
+        latest = self.monitor.get_last_snapshot()
+        state_path = Path(self.monitor._CodexUsageMonitor__state_path)
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        persisted = payload.get("last_snapshot") or {}
+
+        self.assertEqual(latest.five_hour_limit, "16 / 40")
+        self.assertEqual(latest.weekly_limit, "")
+        self.assertEqual(latest.gpt_5_3_codex_spark_five_hour_limit, "")
+        self.assertEqual(latest.gpt_5_3_codex_spark_weekly_limit, "")
+        self.assertEqual(latest.remaining_credit, "")
+        self.assertEqual(persisted.get("weekly_limit"), "")
+        self.assertEqual(payload.get("session_state"), "logged_in")
+        history = self.monitor.get_runtime_status().get("usage_history") or []
+        saved_history = payload.get("usage_history") or []
+        self.assertEqual(len(history), 1)
+        self.assertEqual(len(saved_history), 1)
+        self.assertEqual(history[0].get("captured_at"), "2026-03-30T12:10:00")
+        self.assertEqual(saved_history[0].get("weekly_limit"), "")
 
     def test_pending_login_poll_reschedules_when_login_is_still_required(self) -> None:
         class _InlineThread:
