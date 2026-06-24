@@ -515,7 +515,7 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
                 "progress": {
                     "label": "빌드 실행 중",
                     "detail": "build.bat를 실행합니다.",
-                    "percent": 85,
+                    "percent": 74,
                 },
             }
         )
@@ -523,7 +523,27 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertEqual(parts[0], ("업데이트 중", "enabled"))
         self.assertIn(("빌드 실행 중", "normal"), parts)
-        self.assertIn(("85%", "normal"), parts)
+        self.assertIn(("74%", "normal"), parts)
+        self.assertIn(("build.bat를 실행합니다.", "normal"), parts)
+
+    def test_update_formatter_shows_git_gui_close_prompt_detail(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        enabled, parts = view._format_update(
+            {
+                "state": "updating",
+                "progress": {
+                    "label": "업데이트 사전 점검 중",
+                    "detail": "Fork.exe가 실행 중입니다. 종료 승인 대기 중입니다.",
+                    "percent": 28,
+                },
+            }
+        )
+
+        self.assertTrue(enabled)
+        self.assertIn(("업데이트 사전 점검 중", "normal"), parts)
+        self.assertIn(("28%", "normal"), parts)
+        self.assertIn(("Fork.exe가 실행 중입니다. 종료 승인 대기 중입니다.", "normal"), parts)
 
     def test_update_formatter_shows_failure_step_and_detail(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})

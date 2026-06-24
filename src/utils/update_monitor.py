@@ -73,6 +73,9 @@ GIT_GUI_UPDATE_BLOCKED_MESSAGE = (
     "Git GUI가 이 checkout을 감시 중일 수 있어 자동 업데이트를 중단했습니다. "
     "Fork/GitHub Desktop/SourceTree 같은 Git GUI를 닫은 뒤 다시 업데이트해 주세요."
 )
+GIT_GUI_UPDATE_CANCELLED_MESSAGE = (
+    "Git GUI 종료가 취소되어 업데이트를 중단했습니다. 업데이트 설정에서 다시 확인할 수 있습니다."
+)
 
 
 def find_running_git_gui_processes(
@@ -105,6 +108,142 @@ def find_running_git_gui_processes(
             found.append(process_name)
     return tuple(found)
 
+
+def _default_git_gui_relaunch_entries(process_names: Sequence[str]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for raw_name in process_names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        entries.append({"name": name, "command": [name]})
+    return entries
+
+
+def close_running_git_gui_processes(
+    process_names: Sequence[str],
+    *,
+    subprocess_module=subprocess,
+) -> dict[str, Any]:
+    names = [str(name or "").strip() for name in process_names if str(name or "").strip()]
+    result_payload: dict[str, Any] = {
+        "closed": [],
+        "still_running": [],
+        "relaunch": _default_git_gui_relaunch_entries(names),
+    }
+    if not names or os.name != "nt":
+        return result_payload
+
+    names_json = json.dumps(names, ensure_ascii=False)
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'SilentlyContinue'",
+            "$names = ConvertFrom-Json @'",
+            names_json,
+            "'@",
+            "$records = @()",
+            "foreach ($name in $names) {",
+            "  $base = [System.IO.Path]::GetFileNameWithoutExtension([string]$name)",
+            "  foreach ($proc in Get-Process -Name $base -ErrorAction SilentlyContinue) {",
+            "    $exeName = if ([string]::IsNullOrWhiteSpace($proc.Path)) { \"$($proc.ProcessName).exe\" } else { [System.IO.Path]::GetFileName($proc.Path) }",
+            "    $records += [pscustomobject]@{ name = $exeName; pid = $proc.Id; path = $proc.Path }",
+            "  }",
+            "}",
+            "foreach ($record in $records) {",
+            "  try {",
+            "    $proc = Get-Process -Id $record.pid -ErrorAction SilentlyContinue",
+            "    if ($proc) { [void]$proc.CloseMainWindow() }",
+            "  } catch { }",
+            "}",
+            "$deadline = (Get-Date).AddSeconds(8)",
+            "do {",
+            "  $remaining = @()",
+            "  foreach ($record in $records) {",
+            "    if (Get-Process -Id $record.pid -ErrorAction SilentlyContinue) { $remaining += $record }",
+            "  }",
+            "  if ($remaining.Count -eq 0) { break }",
+            "  Start-Sleep -Milliseconds 250",
+            "} while ((Get-Date) -lt $deadline)",
+            "$still = @()",
+            "foreach ($record in $records) {",
+            "  if (Get-Process -Id $record.pid -ErrorAction SilentlyContinue) { $still += $record.name }",
+            "}",
+            "$relaunch = @()",
+            "foreach ($record in $records) {",
+            "  if ([string]::IsNullOrWhiteSpace($record.path)) {",
+            "    $relaunch += [pscustomobject]@{ name = $record.name; command = @($record.name) }",
+            "  } else {",
+            "    $relaunch += [pscustomobject]@{ name = $record.name; command = @($record.path) }",
+            "  }",
+            "}",
+            "[pscustomobject]@{",
+            "  closed = @($records | ForEach-Object { $_.name })",
+            "  still_running = @($still)",
+            "  relaunch = @($relaunch)",
+            "} | ConvertTo-Json -Depth 6 -Compress",
+        ]
+    )
+    try:
+        completed = run_no_window(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            subprocess_module=subprocess_module,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except Exception as exc:
+        result_payload["error"] = repr(exc)
+        return result_payload
+
+    stdout = str(getattr(completed, "stdout", "") or "").strip()
+    if int(getattr(completed, "returncode", 1) or 0) != 0:
+        result_payload["error"] = str(getattr(completed, "stderr", "") or stdout).strip()
+        return result_payload
+    if not stdout:
+        return result_payload
+    try:
+        parsed = json.loads(stdout)
+    except Exception as exc:
+        result_payload["error"] = f"failed to parse Git GUI close output: {exc}"
+        return result_payload
+    if not isinstance(parsed, dict):
+        return result_payload
+
+    closed = parsed.get("closed", [])
+    still_running = parsed.get("still_running", [])
+    relaunch = parsed.get("relaunch", [])
+    result_payload["closed"] = [str(item) for item in closed if str(item).strip()]
+    result_payload["still_running"] = [
+        str(item) for item in still_running if str(item).strip()
+    ]
+    if isinstance(relaunch, dict):
+        relaunch = [relaunch]
+    if isinstance(relaunch, list):
+        relaunch_entries: list[dict[str, Any]] = []
+        for item in relaunch:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            command_value = item.get("command")
+            if isinstance(command_value, str):
+                command = [command_value]
+            elif isinstance(command_value, list):
+                command = [str(part) for part in command_value if str(part).strip()]
+            else:
+                command = []
+            if name and command:
+                relaunch_entries.append({"name": name, "command": command})
+        if relaunch_entries:
+            result_payload["relaunch"] = relaunch_entries
+    return result_payload
+
 @dataclass(frozen=True)
 class UpdateCandidate:
     tag: str
@@ -128,30 +267,31 @@ class BuildOutputProgressRule:
 
 UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("idle", "업데이트 대기", "업데이트 확인을 기다리는 중입니다.", 0),
-    UpdateProgressStep("checking", "업데이트 확인 중", "현재 버전과 원격 릴리스를 확인합니다.", 5),
-    UpdateProgressStep("available", "업데이트 준비 완료", "새 버전을 설치할 수 있습니다.", 15),
-    UpdateProgressStep("preflight", "업데이트 사전 점검 중", "Git 상태와 로컬 변경 여부를 확인합니다.", 25),
-    UpdateProgressStep("stash", "변경 사항 스태시 중", "커밋되지 않은 변경을 stash로 보존합니다.", 35),
-    UpdateProgressStep("cleanup", "빌드 산출물 정리 중", "무시된 빌드 산출물을 allowlist 범위에서 정리합니다.", 45),
-    UpdateProgressStep("fetch", "원격 변경 확인 중", "origin 태그와 main 브랜치 정보를 가져옵니다.", 55),
-    UpdateProgressStep("sync", "main 동기화 중", "main 브랜치를 업데이트 기준으로 맞춥니다.", 65),
-    UpdateProgressStep("handoff", "업데이트 실행 준비 중", "빌드와 재실행을 맡을 업데이트 프로세스를 준비합니다.", 75),
-    UpdateProgressStep("build", "빌드 실행 중", "build.bat를 실행합니다.", 85),
-    UpdateProgressStep("relaunch", "Windows Supporter 재실행 중", "새 실행 파일을 시작합니다.", 95),
+    UpdateProgressStep("checking", "업데이트 확인 중", "현재 버전과 원격 릴리스를 확인합니다.", 6),
+    UpdateProgressStep("available", "업데이트 준비 완료", "새 버전을 설치할 수 있습니다.", 14),
+    UpdateProgressStep("accepted", "업데이트 요청 접수", "선택한 버전을 설치할 준비를 시작합니다.", 20),
+    UpdateProgressStep("preflight", "업데이트 사전 점검 중", "Git 상태와 로컬 변경 여부를 확인합니다.", 28),
+    UpdateProgressStep("stash", "변경 사항 스태시 중", "커밋되지 않은 변경을 stash로 보존합니다.", 38),
+    UpdateProgressStep("cleanup", "빌드 산출물 정리 중", "무시된 빌드 산출물을 allowlist 범위에서 정리합니다.", 46),
+    UpdateProgressStep("fetch", "원격 변경 확인 중", "origin 태그와 main 브랜치 정보를 가져옵니다.", 54),
+    UpdateProgressStep("sync", "main 동기화 중", "main 브랜치를 업데이트 기준으로 맞춥니다.", 62),
+    UpdateProgressStep("handoff", "업데이트 실행 준비 중", "빌드와 재실행을 맡을 업데이트 프로세스를 준비합니다.", 68),
+    UpdateProgressStep("build", "빌드 실행 중", "build.bat를 실행합니다.", 74),
+    UpdateProgressStep("relaunch", "Windows Supporter 재실행 중", "새 실행 파일과 닫았던 Git 앱을 시작합니다.", 94),
     UpdateProgressStep("complete", "업데이트 완료", "업데이트가 완료되었습니다.", 100),
     UpdateProgressStep("failed", "업데이트 실패", "실패 단계와 로그를 확인해 주세요.", 100),
 )
 UPDATE_PROGRESS_STEP_BY_KEY = {step.key: step for step in UPDATE_PROGRESS_STEPS}
 BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
-    BuildOutputProgressRule("Shutting down the running", "실행 중인 앱 종료 중", 86),
-    BuildOutputProgressRule("Stopping stale PyInstaller workers", "빌드 작업자 정리 중", 87),
-    BuildOutputProgressRule("Syncing uv environment", "uv 환경 동기화 중", 88),
-    BuildOutputProgressRule("Preparing bundled Playwright", "브라우저 런타임 준비 중", 89),
-    BuildOutputProgressRule("Cleaning prior PyInstaller", "이전 빌드 산출물 정리 중", 90),
-    BuildOutputProgressRule("Generating version metadata", "버전 메타데이터 생성 중", 91),
-    BuildOutputProgressRule("Building main.py", "실행 파일 빌드 중", 93),
-    BuildOutputProgressRule("Moving windows-supporter.exe", "실행 파일 배치 중", 96),
-    BuildOutputProgressRule("Remove build byproducts", "빌드 임시 파일 정리 중", 97),
+    BuildOutputProgressRule("Shutting down the running", "실행 중인 앱 종료 중", 75),
+    BuildOutputProgressRule("Stopping stale PyInstaller workers", "빌드 작업자 정리 중", 77),
+    BuildOutputProgressRule("Syncing uv environment", "uv 환경 동기화 중", 79),
+    BuildOutputProgressRule("Preparing bundled Playwright", "브라우저 런타임 준비 중", 81),
+    BuildOutputProgressRule("Cleaning prior PyInstaller", "이전 빌드 산출물 정리 중", 83),
+    BuildOutputProgressRule("Generating version metadata", "버전 메타데이터 생성 중", 86),
+    BuildOutputProgressRule("Building main.py", "실행 파일 빌드 중", 89),
+    BuildOutputProgressRule("Moving windows-supporter.exe", "실행 파일 배치 중", 92),
+    BuildOutputProgressRule("Remove build byproducts", "빌드 임시 파일 정리 중", 96),
     BuildOutputProgressRule("Skipping post-build launch", "빌드 후 직접 재실행 준비 중", 98),
 )
 
@@ -284,6 +424,32 @@ def publish_build_output_progress(
     return
 
 
+def _extract_git_gui_relaunch_commands(state: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    preflight = state.get("preflight", {})
+    if not isinstance(preflight, dict):
+        return []
+    relaunch = preflight.get("git_gui_relaunch", [])
+    if isinstance(relaunch, dict):
+        relaunch = [relaunch]
+    commands: list[tuple[str, list[str]]] = []
+    if not isinstance(relaunch, list):
+        return commands
+    for item in relaunch:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        raw_command = item.get("command")
+        if isinstance(raw_command, str):
+            command = [raw_command]
+        elif isinstance(raw_command, list):
+            command = [str(part) for part in raw_command if str(part).strip()]
+        else:
+            command = []
+        if command:
+            commands.append((name or command[0], command))
+    return commands
+
+
 def format_update_status_parts(data: Any) -> tuple[bool, list[tuple[str, str]]]:
     if not isinstance(data, dict):
         return False, [("확인 불가", "disabled")]
@@ -316,6 +482,8 @@ def format_update_status_parts(data: Any) -> tuple[bool, list[tuple[str, str]]]:
             parts.append((progress_label, "normal"))
         if isinstance(progress_percent, int):
             parts.append((f"{progress_percent}%", "normal"))
+        if progress_detail and progress_detail != progress_label:
+            parts.append((progress_detail, "normal"))
         return True, parts
     if state == "unavailable":
         return False, [("지원 안 됨", "disabled"), ("Git checkout 필요", "normal")]
@@ -889,6 +1057,12 @@ def run_update_handoff(
             proc = launch([exe_path], cwd=repo_root)
             if proc is None:
                 raise RuntimeError("failed to relaunch windows-supporter.exe")
+            for gui_name, gui_command in _extract_git_gui_relaunch_commands(state):
+                try:
+                    launch(gui_command, cwd=repo_root)
+                    append_update_log(log_path, f"relaunch requested for {gui_name}")
+                except Exception as exc:
+                    append_update_log(log_path, f"Git GUI relaunch skipped for {gui_name}: {exc!r}")
 
             complete_progress = build_update_progress_snapshot("complete", state="complete")
             if progress_ui is not None:
@@ -977,6 +1151,7 @@ class WindowsSupporterUpdater:
         worktree_runner=subprocess.run,
         settings_path_provider=get_update_settings_path,
         git_gui_process_detector=None,
+        progress_ui_factory=UpdateHandoffProgressUi,
     ) -> None:
         self._root = root
         self._event_queue = event_queue
@@ -995,6 +1170,9 @@ class WindowsSupporterUpdater:
         self._timestamp_provider = timestamp_provider
         self._worktree_runner = worktree_runner
         self._settings_path_provider = settings_path_provider
+        self._progress_ui_factory = progress_ui_factory
+        self._preflight_progress_ui = None
+        self._show_preflight_progress_ui = False
         if callable(git_gui_process_detector):
             self._git_gui_process_detector = git_gui_process_detector
         elif subprocess_module is subprocess:
@@ -1268,12 +1446,19 @@ class WindowsSupporterUpdater:
             return
 
         if self._ask_update(candidate):
+            self._state = "updating"
+            self._publish_update_progress(
+                "accepted",
+                state="running",
+                detail=f"{candidate.tag} 업데이트 요청을 접수했습니다.",
+                show_ui=True,
+            )
             try:
                 working_tree = self._inspect_working_tree_state()
             except Exception as exc:
                 self._state = "error"
                 self._last_error = f"Git 상태를 확인할 수 없습니다: {exc}"
-                self._progress_snapshot = build_update_progress_snapshot(
+                self._publish_update_progress(
                     "failed",
                     state="failed",
                     detail=self._last_error,
@@ -1281,7 +1466,6 @@ class WindowsSupporterUpdater:
                     can_retry=True,
                     can_manual_action=True,
                 )
-                self._notify_status_changed()
                 return
             self._working_tree_state = working_tree
             if working_tree.has_source_changes:
@@ -1314,6 +1498,75 @@ class WindowsSupporterUpdater:
             pass
         return
 
+    def _publish_update_progress(
+        self,
+        step_key: str,
+        *,
+        state: str,
+        detail: str | None = None,
+        failed_step: str = "",
+        can_retry: bool = False,
+        can_manual_action: bool = False,
+        show_ui: bool = False,
+    ) -> None:
+        self._progress_snapshot = build_update_progress_snapshot(
+            step_key,
+            state=state,
+            detail=detail,
+            failed_step=failed_step,
+            can_retry=can_retry,
+            can_manual_action=can_manual_action,
+        )
+        self._notify_status_changed()
+        if show_ui:
+            self._show_or_update_preflight_progress_ui(self._progress_snapshot)
+        elif self._preflight_progress_ui is not None:
+            self._update_preflight_progress_ui(self._progress_snapshot)
+        return
+
+    def _show_or_update_preflight_progress_ui(self, snapshot: dict[str, Any]) -> None:
+        self._show_preflight_progress_ui = True
+        progress_ui = self._preflight_progress_ui
+        if progress_ui is None:
+            factory = self._progress_ui_factory
+            if not callable(factory):
+                return
+            try:
+                progress_ui = factory(log_path=str(get_update_log_path()))
+            except Exception:
+                return
+            self._preflight_progress_ui = progress_ui
+            try:
+                progress_ui.show(snapshot)
+                return
+            except Exception:
+                self._preflight_progress_ui = None
+                return
+        self._update_preflight_progress_ui(snapshot)
+        return
+
+    def _update_preflight_progress_ui(self, snapshot: dict[str, Any]) -> None:
+        progress_ui = self._preflight_progress_ui
+        if progress_ui is None:
+            return
+        try:
+            progress_ui.set_snapshot(snapshot)
+        except Exception:
+            pass
+        return
+
+    def _close_preflight_progress_ui(self) -> None:
+        progress_ui = self._preflight_progress_ui
+        self._preflight_progress_ui = None
+        self._show_preflight_progress_ui = False
+        if progress_ui is None:
+            return
+        try:
+            progress_ui.close()
+        except Exception:
+            pass
+        return
+
     def _is_worktree_dirty(self) -> bool:
         return self._inspect_working_tree_state().has_source_changes
 
@@ -1328,6 +1581,35 @@ class WindowsSupporterUpdater:
             return tuple(str(item) for item in detector(self._repo_root) if str(item).strip())
         except subprocess.TimeoutExpired:
             return ()
+
+    def _ask_close_git_gui_processes(self, process_names: Sequence[str]) -> bool:
+        names = ", ".join(str(name) for name in process_names if str(name).strip())
+        try:
+            from tkinter import messagebox
+
+            return bool(
+                messagebox.askyesno(
+                    "업데이트를 계속하려면 Git 앱을 닫아야 합니다",
+                    (
+                        f"{names}가 windows-supporter checkout을 사용 중일 수 있어 "
+                        "업데이트를 바로 진행할 수 없습니다.\n\n"
+                        "Windows Supporter가 해당 Git 앱을 닫고, 업데이트를 계속한 뒤 "
+                        "다시 실행해도 될까요?\n\n"
+                        "아니요를 선택하면 이번 업데이트 시도를 취소하고 같은 버전 팝업을 반복하지 않습니다."
+                    ),
+                )
+            )
+        except Exception:
+            return False
+
+    def _close_git_gui_processes_for_update(
+        self,
+        process_names: Sequence[str],
+    ) -> dict[str, Any]:
+        return close_running_git_gui_processes(
+            process_names,
+            subprocess_module=self._subprocess,
+        )
 
     def _inspect_working_tree_state(self) -> UpdateWorkingTreeState:
         source_status = parse_git_status_porcelain(
@@ -1446,26 +1728,82 @@ class WindowsSupporterUpdater:
             "stash_output": "",
             "backup_branch": "",
             "cleaned_targets": list(working_tree.cleanup_targets),
+            "git_gui_processes": [],
+            "git_gui_close_approved": False,
+            "git_gui_close_result": {},
+            "git_gui_relaunch": [],
         }
+        self._publish_update_progress(
+            "preflight",
+            state="running",
+            detail="Git GUI와 checkout 상태를 확인합니다.",
+            show_ui=self._show_preflight_progress_ui,
+        )
         git_gui_processes = self._find_running_git_gui_processes()
         if git_gui_processes:
             process_names = ", ".join(git_gui_processes)
-            self._state = "error"
-            self._last_error = f"{GIT_GUI_UPDATE_BLOCKED_MESSAGE}\n실행 중: {process_names}"
-            self._progress_snapshot = build_update_progress_snapshot(
-                "failed",
-                state="failed",
-                detail=self._last_error,
-                failed_step="Git GUI 확인",
-                can_retry=True,
-                can_manual_action=True,
+            preflight["git_gui_processes"] = list(git_gui_processes)
+            self._publish_update_progress(
+                "preflight",
+                state="await_git_gui_close",
+                detail=f"{process_names}가 실행 중입니다. 종료 승인 대기 중입니다.",
+                show_ui=self._show_preflight_progress_ui,
             )
-            self._preflight_result = preflight
-            self._notify_status_changed()
-            return False
+            if not self._ask_close_git_gui_processes(git_gui_processes):
+                self._state = "cancelled"
+                self._last_error = f"{GIT_GUI_UPDATE_CANCELLED_MESSAGE}\n실행 중: {process_names}"
+                self._publish_update_progress(
+                    "failed",
+                    state="cancelled",
+                    detail=self._last_error,
+                    failed_step="Git GUI 확인",
+                    can_manual_action=True,
+                    show_ui=self._show_preflight_progress_ui,
+                )
+                if self._latest_tag:
+                    self._session.dismiss(self._latest_tag)
+                self._preflight_result = preflight
+                return False
+            preflight["git_gui_close_approved"] = True
+            try:
+                close_result = self._close_git_gui_processes_for_update(git_gui_processes)
+            except Exception as exc:
+                close_result = {"error": repr(exc)}
+            if not isinstance(close_result, dict):
+                close_result = {"error": "Git GUI 종료 결과를 해석할 수 없습니다."}
+            relaunch_entries = close_result.get("relaunch", [])
+            if not relaunch_entries:
+                relaunch_entries = _default_git_gui_relaunch_entries(git_gui_processes)
+            preflight["git_gui_close_result"] = close_result
+            preflight["git_gui_relaunch"] = relaunch_entries
+            still_running = close_result.get("still_running", [])
+            if still_running:
+                still_names = ", ".join(str(item) for item in still_running)
+                self._state = "error"
+                self._last_error = f"Git GUI를 닫을 수 없어 업데이트를 중단했습니다.\n실행 중: {still_names}"
+                self._publish_update_progress(
+                    "failed",
+                    state="failed",
+                    detail=self._last_error,
+                    failed_step="Git GUI 종료",
+                    can_retry=True,
+                    can_manual_action=True,
+                    show_ui=self._show_preflight_progress_ui,
+                )
+                self._preflight_result = preflight
+                return False
+            self._publish_update_progress(
+                "preflight",
+                state="running",
+                detail=f"{process_names} 종료를 확인했습니다. 업데이트를 계속합니다.",
+                show_ui=self._show_preflight_progress_ui,
+            )
         try:
-            self._progress_snapshot = build_update_progress_snapshot("fetch", state="running")
-            self._notify_status_changed()
+            self._publish_update_progress(
+                "fetch",
+                state="running",
+                show_ui=self._show_preflight_progress_ui,
+            )
             self._git_output(build_fetch_origin_command())
 
             fresh_tree = self._inspect_working_tree_state()
@@ -1474,37 +1812,43 @@ class WindowsSupporterUpdater:
 
             requires_force_clean = fresh_tree.is_diverged or fresh_tree.has_local_only_commits
             if requires_force_clean:
-                self._progress_snapshot = build_update_progress_snapshot(
+                self._publish_update_progress(
                     "preflight",
                     state="await_force_clean_approval",
                     detail="로컬 전용 커밋을 보존한 뒤 main을 origin/main 기준으로 동기화해야 합니다.",
+                    show_ui=self._show_preflight_progress_ui,
                 )
-                self._notify_status_changed()
                 if not self._ask_force_clean(fresh_tree):
                     self._state = "cancelled"
                     self._last_error = UPDATE_FORCE_CLEAN_REJECTED_NOTICE
-                    self._progress_snapshot = build_update_progress_snapshot(
+                    self._publish_update_progress(
                         "failed",
                         state="cancelled",
                         detail=UPDATE_FORCE_CLEAN_REJECTED_NOTICE,
                         failed_step="강제정리 승인",
                         can_manual_action=True,
+                        show_ui=self._show_preflight_progress_ui,
                     )
-                    self._notify_status_changed()
                     return False
                 preflight["force_clean_approved"] = True
 
             if fresh_tree.has_source_changes:
-                self._progress_snapshot = build_update_progress_snapshot("stash", state="running")
-                self._notify_status_changed()
+                self._publish_update_progress(
+                    "stash",
+                    state="running",
+                    show_ui=self._show_preflight_progress_ui,
+                )
                 stash_message = f"windows-supporter auto update {timestamp}"
                 preflight["stash_output"] = self._git_output(build_stash_command(stash_message))
 
             if fresh_tree.has_local_only_commits:
                 preflight["backup_branch"] = self._create_backup_branch(timestamp)
 
-            self._progress_snapshot = build_update_progress_snapshot("sync", state="running")
-            self._notify_status_changed()
+            self._publish_update_progress(
+                "sync",
+                state="running",
+                show_ui=self._show_preflight_progress_ui,
+            )
             self._git_output(build_switch_main_command())
             if fresh_tree.has_local_only_commits or fresh_tree.is_diverged:
                 self._git_output(build_reset_main_command())
@@ -1512,22 +1856,25 @@ class WindowsSupporterUpdater:
                 self._git_output(build_fast_forward_main_command())
 
             if fresh_tree.has_cleanup_targets:
-                self._progress_snapshot = build_update_progress_snapshot("cleanup", state="running")
-                self._notify_status_changed()
+                self._publish_update_progress(
+                    "cleanup",
+                    state="running",
+                    show_ui=self._show_preflight_progress_ui,
+                )
                 self._git_output(build_allowed_clean_command())
         except Exception as exc:
             self._state = "error"
             self._last_error = f"update preflight failed: {exc}"
-            self._progress_snapshot = build_update_progress_snapshot(
+            self._publish_update_progress(
                 "failed",
                 state="failed",
                 detail=self._last_error,
                 failed_step="업데이트 사전 정리",
                 can_retry=True,
                 can_manual_action=True,
+                show_ui=self._show_preflight_progress_ui,
             )
             self._preflight_result = preflight
-            self._notify_status_changed()
             return False
 
         self._preflight_result = preflight
@@ -1550,33 +1897,36 @@ class WindowsSupporterUpdater:
         except Exception as exc:
             self._state = "error"
             self._last_error = f"failed to prepare update handoff: {exc}"
-            self._progress_snapshot = build_update_progress_snapshot(
+            self._publish_update_progress(
                 "failed",
                 state="failed",
                 detail=self._last_error,
                 failed_step="업데이트 실행 준비",
                 can_retry=True,
                 can_manual_action=True,
+                show_ui=self._show_preflight_progress_ui,
             )
-            self._notify_status_changed()
             return False
 
         proc = self._popen(command, cwd=self._repo_root)
         self._state = "updating"
-        self._progress_snapshot = build_update_progress_snapshot("handoff", state="running")
-        self._notify_status_changed()
+        self._publish_update_progress(
+            "handoff",
+            state="running",
+            show_ui=self._show_preflight_progress_ui,
+        )
         if proc is None:
             self._state = "error"
             self._last_error = "failed to launch update handoff"
-            self._progress_snapshot = build_update_progress_snapshot(
+            self._publish_update_progress(
                 "failed",
                 state="failed",
                 detail=self._last_error,
                 failed_step="업데이트 프로세스 시작",
                 can_retry=True,
                 can_manual_action=True,
+                show_ui=self._show_preflight_progress_ui,
             )
-            self._notify_status_changed()
             return False
 
         if self._request_current_process_exit_for_update():
@@ -1585,17 +1935,18 @@ class WindowsSupporterUpdater:
         if not self._handoff_ack_waiter(handoff_path):
             self._state = "error"
             self._last_error = "update handoff did not acknowledge startup"
-            self._progress_snapshot = build_update_progress_snapshot(
+            self._publish_update_progress(
                 "failed",
                 state="failed",
                 detail=self._last_error,
                 failed_step="업데이트 프로세스 확인",
                 can_retry=True,
                 can_manual_action=True,
+                show_ui=self._show_preflight_progress_ui,
             )
-            self._notify_status_changed()
             return False
 
+        self._close_preflight_progress_ui()
         return True
 
 
