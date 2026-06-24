@@ -1829,6 +1829,7 @@ class CodexUsageMonitor:
 
         self.__last_snapshot = UsageSnapshot()
         self.__usage_history: list[dict[str, str]] = []
+        self.__snapshot_backfill_allowed = True
 
         base_dir = self.__lib.os.getenv("APPDATA")
         if not base_dir:
@@ -1989,6 +1990,7 @@ class CodexUsageMonitor:
                 return False, message
             self.__last_snapshot = UsageSnapshot()
             self.__usage_history = []
+            self.__snapshot_backfill_allowed = False
             self.__set_session_state("logged_out")
             self.__clear_auth_attention()
             self.__save_state()
@@ -2659,8 +2661,14 @@ class CodexUsageMonitor:
                         self.__clear_auth_attention()
                         merged = merge_snapshot_with_previous(
                             refreshed,
-                            self.__last_snapshot if self.__last_snapshot.has_any_metric() else None,
+                            self.__previous_snapshot_for_backfill(
+                                allow_previous_backfill=source_key != "manual_login"
+                            ),
                         )
+                        if self.__should_reset_usage_history_for_commit(
+                            allow_previous_backfill=source_key != "manual_login"
+                        ):
+                            self.__usage_history = []
                         self.__commit_merged_snapshot(merged)
                         snapshot = merged
                         self.__profile_in_use_detected = False
@@ -2715,11 +2723,21 @@ class CodexUsageMonitor:
             )
         return
 
-    def handle_snapshot(self, snapshot: UsageSnapshot) -> list[UsageChange]:
-        prev = self.__last_snapshot if self.__last_snapshot.has_any_metric() else None
+    def handle_snapshot(
+        self,
+        snapshot: UsageSnapshot,
+        allow_previous_backfill: bool | None = None,
+    ) -> list[UsageChange]:
+        prev = self.__previous_snapshot_for_backfill(
+            allow_previous_backfill=allow_previous_backfill
+        )
         merged = merge_snapshot_with_previous(snapshot, prev)
         if not merged.has_any_metric():
             return []
+        if self.__should_reset_usage_history_for_commit(
+            allow_previous_backfill=allow_previous_backfill
+        ):
+            self.__usage_history = []
         self.__cancel_pending_login_poll()
         self.__profile_in_use_detected = False
         self.__set_session_state("logged_in")
@@ -2728,9 +2746,36 @@ class CodexUsageMonitor:
         self.__commit_merged_snapshot(merged)
         return changes
 
+    def __previous_snapshot_for_backfill(
+        self,
+        allow_previous_backfill: bool | None = None,
+    ) -> UsageSnapshot | None:
+        if allow_previous_backfill is None:
+            allowed = bool(self.__snapshot_backfill_allowed)
+        else:
+            allowed = bool(allow_previous_backfill) and bool(
+                self.__snapshot_backfill_allowed
+            )
+        if not allowed:
+            return None
+        if self.__last_snapshot.has_any_metric():
+            return self.__last_snapshot
+        return None
+
+    def __should_reset_usage_history_for_commit(
+        self,
+        allow_previous_backfill: bool | None = None,
+    ) -> bool:
+        if allow_previous_backfill is None:
+            return not bool(self.__snapshot_backfill_allowed)
+        return not (
+            bool(allow_previous_backfill) and bool(self.__snapshot_backfill_allowed)
+        )
+
     def __commit_merged_snapshot(self, snapshot: UsageSnapshot) -> None:
         self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
         self.__append_usage_history_sample(self.__last_snapshot)
+        self.__snapshot_backfill_allowed = True
         self.__save_state()
         return
 
@@ -3172,7 +3217,10 @@ class CodexUsageMonitor:
                     self.__set_session_state("logged_in")
                     self.__failure_count = 0
                     self.__pending_login_error_count = 0
-                    changes = self.handle_snapshot(snapshot)
+                    changes = self.handle_snapshot(
+                        snapshot,
+                        allow_previous_backfill=False,
+                    )
                     latest_snapshot = self.get_last_snapshot()
 
                     def on_success() -> None:
@@ -4054,6 +4102,7 @@ class CodexUsageMonitor:
             self.__set_session_state("logged_in")
             self.__clear_auth_attention()
             self.__clear_hidden_cdp_process(terminate=True)
+            self.__snapshot_backfill_allowed = False
             self.__save_state()
             self.__log(
                 "collect auth deferred "
@@ -4063,6 +4112,7 @@ class CodexUsageMonitor:
             return
 
         if msg == "login_required":
+            self.__snapshot_backfill_allowed = False
             self.__set_session_state("logged_out")
             self.__clear_auth_attention()
             self.__pause_background_monitor()
@@ -4098,6 +4148,7 @@ class CodexUsageMonitor:
                     )
                 )
         elif msg == "cloudflare_challenge":
+            self.__snapshot_backfill_allowed = False
             self.__set_auth_attention(msg, source=normalized_source)
             self.__pause_background_monitor()
             self.__save_state()
@@ -6983,6 +7034,11 @@ class CodexUsageMonitor:
             state = "logged_out"
             dirty = True
         self.__set_session_state(state)
+        raw_backfill = data.get("snapshot_backfill_allowed")
+        if isinstance(raw_backfill, bool):
+            self.__snapshot_backfill_allowed = bool(raw_backfill) and state == "logged_in"
+        else:
+            self.__snapshot_backfill_allowed = state == "logged_in"
         if bool(dirty):
             self.__save_state()
         return
@@ -6991,6 +7047,7 @@ class CodexUsageMonitor:
         payload = {
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
+            "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),
             "last_snapshot": self.__last_snapshot.to_dict(),
             "usage_history": self.__get_usage_history_snapshot(),
         }
