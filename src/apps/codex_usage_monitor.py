@@ -2160,6 +2160,34 @@ class CodexUsageMonitor:
                 managed_hit += 1
         return managed_hit >= 4
 
+    def __is_current_hidden_cdp_endpoint(self, port: int, pid: int) -> bool:
+        owned_pids: set[int] = set()
+        proc = self.__hidden_cdp_proc
+        if proc is not None:
+            for attr in ("pid", "_ws_listener_pid"):
+                try:
+                    candidate = int(getattr(proc, attr, 0) or 0)
+                except Exception:
+                    candidate = 0
+                if candidate > 0:
+                    owned_pids.add(candidate)
+        try:
+            owned_port = int(self.__hidden_cdp_port or 0)
+        except Exception:
+            owned_port = 0
+        try:
+            endpoint_port = int(port or 0)
+        except Exception:
+            endpoint_port = 0
+        try:
+            endpoint_pid = int(pid or 0)
+        except Exception:
+            endpoint_pid = 0
+        return bool(
+            (endpoint_pid > 0 and endpoint_pid in owned_pids)
+            or (owned_port > 0 and endpoint_port == owned_port)
+        )
+
     def __force_playwright_mode(self) -> None:
         self.__collection_mode = "playwright"
         return
@@ -5447,7 +5475,23 @@ class CodexUsageMonitor:
     ) -> tuple[UsageSnapshot | None, str | None, bool]:
         source_key = normalize_usage_value(source).lower()
         is_background_monitor = self.__is_background_monitor_collect_source(source_key)
-        profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
+        try:
+            profile_endpoints = self.__iter_external_profile_remote_debugging_endpoints(
+                include_owned=True,
+            )
+        except Exception:
+            profile_endpoints = []
+        profile_cdp_available = bool(profile_endpoints)
+        if not bool(profile_cdp_available):
+            profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
+        has_only_stale_managed_profile_cdp = bool(profile_endpoints) and all(
+            bool(item[2])
+            and not self.__is_current_hidden_cdp_endpoint(
+                int(item[0] or 0),
+                int(item[1] or 0),
+            )
+            for item in profile_endpoints
+        )
         raw_error: str | None = None
         if is_background_monitor:
             raw_snapshot, raw_error = self.__try_collect_snapshot_via_raw_external_cdp_result(
@@ -5462,6 +5506,18 @@ class CodexUsageMonitor:
             return raw_snapshot, None, True
         if is_background_monitor and raw_error == "collect_cancelled":
             return None, "collect_cancelled", True
+        if is_background_monitor and bool(has_only_stale_managed_profile_cdp):
+            self.__log(
+                "collect strategy=no-focus-first cleanup=stale_managed_profile_cdp"
+            )
+            self.__terminate_profile_remote_debugging_processes(
+                managed_only=True
+            )
+            try:
+                self.__lib.time.sleep(0.5)
+            except Exception:
+                pass
+            return None, None, False
         if is_background_monitor and raw_error in {"login_required", "cloudflare_challenge"}:
             self.__log(
                 "collect strategy=no-focus-first auth-evidence=raw_cdp_profile "
@@ -5506,6 +5562,7 @@ class CodexUsageMonitor:
 
     def __is_background_monitor_collect_source(self, source: str) -> bool:
         return normalize_usage_value(source).lower() in {
+            "auto_monitor",
             "monitor_tick",
             "monitor_tick_pending_retry",
         }
