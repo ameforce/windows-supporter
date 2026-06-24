@@ -4128,7 +4128,8 @@ class CodexUsageMonitor:
 
         if self.__should_defer_background_auth_error(msg, normalized_source):
             self.__set_session_state("logged_in")
-            self.__clear_auth_attention()
+            self.__set_auth_attention(msg, source=normalized_source)
+            self.__pause_background_monitor()
             self.__clear_hidden_cdp_process(terminate=True)
             self.__snapshot_backfill_allowed = False
             self.__save_state()
@@ -7179,6 +7180,13 @@ class CodexUsageMonitor:
             self.__snapshot_backfill_allowed = bool(raw_backfill) and state == "logged_in"
         else:
             self.__snapshot_backfill_allowed = state == "logged_in"
+        if bool(data.get("auth_attention_required", False)):
+            self.__set_auth_attention(
+                str(data.get("auth_attention_reason", "") or "unknown"),
+                source=str(data.get("auth_attention_source", "") or ""),
+            )
+        else:
+            self.__clear_auth_attention()
         if bool(dirty):
             self.__save_state()
         return
@@ -7188,6 +7196,9 @@ class CodexUsageMonitor:
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
             "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),
+            "auth_attention_required": bool(self.__auth_attention_required),
+            "auth_attention_reason": str(self.__auth_attention_reason or ""),
+            "auth_attention_source": str(self.__auth_attention_source or ""),
             "last_snapshot": self.__last_snapshot.to_dict(),
             "usage_history": self.__get_usage_history_snapshot(),
         }

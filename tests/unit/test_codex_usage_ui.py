@@ -298,6 +298,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         texts = [label.kwargs.get("text") for label in fake_tk.labels]
         self.assertIn("작업표시줄 표시", texts)
         self.assertIn("계정", texts)
+        self.assertNotIn("실시간 상태", texts)
+        self.assertNotIn("다음 모니터링까지", texts)
 
     def test_mount_lays_runtime_values_out_in_two_columns(self) -> None:
         fake_tk = _FakeTk()
@@ -501,6 +503,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("툴팁(초)", [label.kwargs.get("text") for label in fake_tk.labels])
         self.assertEqual(button_texts.count("로그인"), 2)
         self.assertEqual(button_texts.count("로그아웃"), 2)
+        self.assertEqual(button_texts.count("조회"), 2)
         self.assertIn("아래로", button_texts)
         self.assertIn("위로", button_texts)
 
@@ -588,10 +591,24 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             view._account_status_vars["account_2"].get(),
             "조회 상태: 브라우저 인증 필요",
         )
-        self.assertIn("최근 값:", view._account_snapshot_vars["account_1"].get())
-        self.assertIn("92%", view._account_snapshot_vars["account_1"].get())
-        self.assertIn("이전 값:", view._account_snapshot_vars["account_2"].get())
-        self.assertIn("100%", view._account_snapshot_vars["account_2"].get())
+        self.assertEqual(view._account_snapshot_vars["account_1"].get(), "값 상태: 최근 값")
+        self.assertEqual(view._account_snapshot_vars["account_2"].get(), "값 상태: 이전 값")
+        self.assertEqual(
+            view._account_metric_vars["account_1"]["five_hour_limit"].get(),
+            "92%",
+        )
+        self.assertEqual(
+            view._account_metric_vars["account_1"]["weekly_limit"].get(),
+            "86%",
+        )
+        self.assertEqual(
+            view._account_metric_vars["account_2"]["captured_at"].get(),
+            "2026-06-24 08:41:00",
+        )
+        self.assertEqual(
+            view._account_metric_vars["account_2"]["five_hour_limit"].get(),
+            "100%",
+        )
 
     def test_account_snapshot_summary_marks_old_logged_in_snapshot_as_previous(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
@@ -708,6 +725,25 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(monitor.login_calls, ["account_2"])
         self.assertEqual(monitor.release_calls, ["account_1"])
+
+    def test_account_query_calls_account_specific_manual_query(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.show_calls = []
+
+            def show_account_status(self, account_id, force_refresh=True, source=""):
+                self.show_calls.append((account_id, bool(force_refresh), source))
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        statuses: list[tuple[str, str]] = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        view._on_account_query("account_2")
+
+        self.assertEqual(monitor.show_calls, [("account_2", True, "manual_query")])
+        self.assertTrue(statuses)
+        self.assertEqual(statuses[-1][1], "info")
 
     def test_on_login_triggers_show_current_status(self) -> None:
         class _FakeMonitor:
