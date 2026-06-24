@@ -257,6 +257,7 @@ def _run_main_app() -> None:
         event_queue=event_queue,
         repo_root=_build_update_repo_root(),
         quit_callback=root.quit,
+        exit_callback=lambda: os._exit(0),
     )
     main_ui = WindowsSupporterMainUI(
         root,
