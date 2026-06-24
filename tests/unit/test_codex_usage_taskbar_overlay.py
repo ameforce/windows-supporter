@@ -3126,6 +3126,33 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(window.withdraw_calls, 0)
         self.assertEqual(len(occupied_calls), 1)
 
+    def test_refresh_keeps_unchanged_visible_window_still(self):
+        window = _FakeWindow()
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        repaint_calls = []
+        overlay._force_native_repaint = lambda target: repaint_calls.append(target)
+
+        overlay.refresh()
+        geometry_calls_before = list(window.geometry_calls)
+        draw_calls_before = list(window.draw_calls)
+        deiconify_calls_before = window.deiconify_calls
+        lift_calls_before = window.lift_calls
+        repaint_calls.clear()
+
+        overlay.refresh()
+
+        self.assertEqual(window.geometry_calls, geometry_calls_before)
+        self.assertEqual(window.draw_calls, draw_calls_before)
+        self.assertEqual(window.deiconify_calls, deiconify_calls_before)
+        self.assertEqual(window.lift_calls, lift_calls_before)
+        self.assertEqual(repaint_calls, [])
+
     def test_refresh_builds_preferred_and_final_model_from_one_runtime_snapshot_and_now(self):
         window = _FakeWindow()
         runtime_calls = []

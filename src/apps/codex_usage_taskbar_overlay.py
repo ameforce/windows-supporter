@@ -769,6 +769,7 @@ class CodexUsageTaskbarOverlay:
         self._pending_regression_context = None
         self._pending_regression_count = 0
         self._fullscreen_suppressed = False
+        self._window_visible = False
         return
 
     def refresh(self) -> bool:
@@ -803,6 +804,23 @@ class CodexUsageTaskbarOverlay:
         window = self._ensure_window()
         if window is None:
             return False
+        previous_model = self._last_model
+        previous_geometry = (
+            previous_model.get("geometry", {}) if isinstance(previous_model, dict) else {}
+        )
+        if not isinstance(previous_geometry, dict):
+            previous_geometry = {}
+        if (
+            bool(self._window_visible)
+            and isinstance(previous_model, dict)
+            and not self._has_active_metric_flash()
+            and not _geometry_changed(previous_geometry, geometry)
+            and _overlay_render_signature(previous_model) == _overlay_render_signature(model)
+        ):
+            self._last_model = model
+            self._schedule_keepalive_tick()
+            self._schedule_geometry_monitor_tick()
+            return True
         self._apply_geometry(window, geometry)
         self._update_metric_change_flash(model)
         self._draw(model)
@@ -817,6 +835,7 @@ class CodexUsageTaskbarOverlay:
         self._schedule_flash_tick_if_needed()
         try:
             window.deiconify()
+            self._window_visible = True
         except Exception:
             pass
         try:
@@ -834,6 +853,7 @@ class CodexUsageTaskbarOverlay:
             window.withdraw()
         except Exception:
             pass
+        self._window_visible = False
         self._cancel_flash_tick()
         self._cancel_keepalive_tick()
         self._cancel_geometry_monitor_tick()
@@ -849,6 +869,7 @@ class CodexUsageTaskbarOverlay:
                 window.withdraw()
             except Exception:
                 pass
+        self._window_visible = False
         self._cancel_flash_tick()
         self._clear_pending_regression_geometry()
         self._schedule_geometry_monitor_tick()
@@ -887,6 +908,19 @@ class CodexUsageTaskbarOverlay:
                 self._flash_until.pop(identity, None)
         self._decorate_model_flash(model)
         return
+
+    def _has_active_metric_flash(self) -> bool:
+        now = time.monotonic()
+        active = False
+        for identity, expires_at in list(self._flash_until.items()):
+            try:
+                if float(expires_at) > now:
+                    active = True
+                    continue
+            except (TypeError, ValueError):
+                pass
+            self._flash_until.pop(identity, None)
+        return active
 
     def _decorate_model_flash(self, model: dict[str, Any], *, now: float | None = None) -> bool:
         now_value = time.monotonic() if now is None else float(now)
@@ -1642,6 +1676,7 @@ class CodexUsageTaskbarOverlay:
                 window.withdraw()
             except Exception:
                 pass
+        self._window_visible = False
         self._cancel_flash_tick()
         self._schedule_keepalive_tick(delay_ms=_FULLSCREEN_POLL_MS)
         return
