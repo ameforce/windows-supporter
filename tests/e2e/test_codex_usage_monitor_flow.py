@@ -138,7 +138,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertFalse(bool(status.get("auto_monitoring_active")))
         self.assertTrue(bool(status.get("can_login")))
 
-    def test_background_auth_error_after_snapshot_keeps_session_retryable(self) -> None:
+    def test_background_auth_error_after_snapshot_marks_auth_attention(self) -> None:
         class _DummyRoot:
             def __init__(self):
                 self.cancelled = []
@@ -186,13 +186,29 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 payload = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(status.get("session_state"), "logged_in")
                 self.assertEqual(payload.get("session_state"), "logged_in")
-                self.assertFalse(bool(status.get("auth_attention_required")))
-                self.assertNotEqual(status.get("monitor_state"), "paused_auth_required")
+                self.assertTrue(bool(status.get("auth_attention_required")))
+                self.assertEqual(status.get("auth_attention_reason"), error)
+                self.assertEqual(status.get("auth_attention_source"), source)
+                self.assertEqual(status.get("monitor_state"), "paused_auth_required")
+                self.assertFalse(bool(status.get("auto_monitoring_active")))
+                self.assertTrue(bool(status.get("can_login")))
+                self.assertTrue(bool(payload.get("auth_attention_required")))
+                self.assertEqual(payload.get("auth_attention_reason"), error)
+                self.assertEqual(payload.get("auth_attention_source"), source)
                 self.assertEqual(
                     self.monitor._CodexUsageMonitor__monitor_after_id,
-                    "tick-1",
+                    None,
                 )
-                self.assertEqual(root.cancelled, [])
+                self.assertEqual(root.cancelled, ["tick-1"])
+
+                reloaded = CodexUsageMonitor(
+                    config_dir=str(self._config_dir),
+                    profile_dir=str(self._profile_dir),
+                )
+                reloaded_status = reloaded.get_runtime_status()
+                self.assertTrue(bool(reloaded_status.get("auth_attention_required")))
+                self.assertEqual(reloaded_status.get("auth_attention_reason"), error)
+                self.assertEqual(reloaded_status.get("monitor_state"), "paused_auth_required")
 
     def test_background_auth_retry_success_replaces_stale_snapshot_without_backfill(self) -> None:
         previous = UsageSnapshot.from_metrics(

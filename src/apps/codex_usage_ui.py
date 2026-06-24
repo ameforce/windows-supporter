@@ -26,10 +26,12 @@ class CodexUsageSettingsView:
         self._login_button = None
         self._logout_button = None
         self._account_enabled_vars = {}
+        self._account_query_buttons = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
+        self._account_metric_vars = {}
         self._account_order: list[str] = []
         self._autosave_after_id = None
         self._loading_settings = False
@@ -81,10 +83,12 @@ class CodexUsageSettingsView:
         has_multi_accounts = isinstance(accounts, list) and bool(accounts)
         self._login_button = None
         self._logout_button = None
+        self._account_query_buttons = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
+        self._account_metric_vars = {}
 
         container = tk.Frame(parent, bg=bg)
         try:
@@ -278,101 +282,8 @@ class CodexUsageSettingsView:
         if isinstance(accounts, list) and accounts:
             row = self._add_account_sections(body, row, accounts, card_bg, border, text_muted)
 
-        tk.Frame(body, bg=border, height=1).grid(
-            row=row,
-            column=0,
-            columnspan=4,
-            sticky="we",
-            pady=(6, 5),
-        )
-        row += 1
-
-        tk.Label(
-            body,
-            text="실시간 상태",
-            bg=card_bg,
-            fg="#111827",
-            font=("Segoe UI", 10, "bold"),
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 2))
-        row += 1
-
-        runtime_grid = tk.Frame(body, bg=card_bg)
-        runtime_grid.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 0))
-        runtime_grid.columnconfigure(1, minsize=210)
-        runtime_grid.columnconfigure(3, minsize=250)
-
-        runtime_row = 0
-        self._add_value_row(runtime_grid, runtime_row, "조회 상태", self._collect_state_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "다음 모니터링까지",
-            self._next_collect_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
-        self._add_value_row(runtime_grid, runtime_row, "최근 확인 시각", self._live_time_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "남은 크레딧",
-            self._live_credit_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
-        self._add_value_row(runtime_grid, runtime_row, "5시간 사용 한도", self._live_five_hour_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "5시간 한도 초기화",
-            self._live_five_hour_reset_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
-        self._add_value_row(runtime_grid, runtime_row, "주간 사용 한도", self._live_weekly_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "주간 한도 초기화",
-            self._live_weekly_reset_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 5시간 한도",
-            self._live_spark_five_hour_var,
-            card_bg,
-        )
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 5시간 초기화",
-            self._live_spark_five_hour_reset_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 주간 한도",
-            self._live_spark_weekly_var,
-            card_bg,
-        )
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 주간 초기화",
-            self._live_spark_weekly_reset_var,
-            card_bg,
-            column=2,
-        )
+        if not has_multi_accounts:
+            row = self._add_realtime_status_section(body, row, card_bg, border)
 
         self._load_settings()
         self._register_autosave_traces()
@@ -482,6 +393,12 @@ class CodexUsageSettingsView:
                         text="아래로",
                         command=lambda aid=account_id: self._on_move_account(aid, 1),
                     ).pack(side="right", padx=(4, 0))
+            query_button = ttk.Button(
+                header,
+                text="조회",
+                command=lambda aid=account_id: self._on_account_query(aid),
+            )
+            query_button.pack(side="right", padx=(4, 0))
             login_button = ttk.Button(
                 header,
                 text="로그인",
@@ -494,11 +411,12 @@ class CodexUsageSettingsView:
                 command=lambda aid=account_id: self._on_account_release_profile(aid),
             )
             logout_button.pack(side="right")
+            self._account_query_buttons[account_id] = query_button
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
             detail_row = 1
             status_var = tk.StringVar(value="조회 상태: -")
-            snapshot_var = tk.StringVar(value="최근 값: -")
+            snapshot_var = tk.StringVar(value="값 상태: -")
             self._account_status_vars[account_id] = status_var
             self._account_snapshot_vars[account_id] = snapshot_var
             for value_var in (status_var, snapshot_var):
@@ -519,6 +437,22 @@ class CodexUsageSettingsView:
                     pady=(0, 1),
                 )
                 detail_row += 1
+            metric_grid = tk.Frame(card, bg=card_bg)
+            metric_grid.grid(
+                row=detail_row,
+                column=0,
+                sticky="we",
+                padx=8,
+                pady=(1, 3),
+            )
+            try:
+                metric_grid.columnconfigure(1, weight=1)
+                metric_grid.columnconfigure(3, weight=1)
+            except Exception:
+                pass
+            metric_vars = self._build_account_metric_rows(metric_grid, card_bg)
+            self._account_metric_vars[account_id] = metric_vars
+            detail_row += 1
             for prefix, key, clickable in (
                 ("설정 파일", "settings_path", True),
                 ("상태 파일", "state_path", False),
@@ -554,6 +488,132 @@ class CodexUsageSettingsView:
                 detail_row += 1
         row += 1
         return row
+
+    def _add_realtime_status_section(self, body: Any, row: int, card_bg: str, border: str) -> int:
+        tk = self._tk
+        if tk is None:
+            return row
+        tk.Frame(body, bg=border, height=1).grid(
+            row=row,
+            column=0,
+            columnspan=4,
+            sticky="we",
+            pady=(6, 5),
+        )
+        row += 1
+
+        tk.Label(
+            body,
+            text="실시간 상태",
+            bg=card_bg,
+            fg="#111827",
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        row += 1
+
+        runtime_grid = tk.Frame(body, bg=card_bg)
+        runtime_grid.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 0))
+        runtime_grid.columnconfigure(1, minsize=210)
+        runtime_grid.columnconfigure(3, minsize=250)
+
+        runtime_row = 0
+        self._add_value_row(runtime_grid, runtime_row, "조회 상태", self._collect_state_var, card_bg)
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "다음 모니터링까지",
+            self._next_collect_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(runtime_grid, runtime_row, "최근 확인 시각", self._live_time_var, card_bg)
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "남은 크레딧",
+            self._live_credit_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(runtime_grid, runtime_row, "5시간 사용 한도", self._live_five_hour_var, card_bg)
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "5시간 한도 초기화",
+            self._live_five_hour_reset_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(runtime_grid, runtime_row, "주간 사용 한도", self._live_weekly_var, card_bg)
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "주간 한도 초기화",
+            self._live_weekly_reset_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "Spark 5시간 한도",
+            self._live_spark_five_hour_var,
+            card_bg,
+        )
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "Spark 5시간 초기화",
+            self._live_spark_five_hour_reset_var,
+            card_bg,
+            column=2,
+        )
+        runtime_row += 1
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "Spark 주간 한도",
+            self._live_spark_weekly_var,
+            card_bg,
+        )
+        self._add_value_row(
+            runtime_grid,
+            runtime_row,
+            "Spark 주간 초기화",
+            self._live_spark_weekly_reset_var,
+            card_bg,
+            column=2,
+        )
+        return row + 1
+
+    def _build_account_metric_rows(self, parent: Any, bg: str) -> dict[str, Any]:
+        tk = self._tk
+        if tk is None:
+            return {}
+        rows = (
+            (("captured_at", "최근 확인 시각"), ("remaining_credit", "남은 크레딧")),
+            (("five_hour_limit", "5시간 사용 한도"), ("five_hour_limit_reset_at", "5시간 한도 초기화")),
+            (("weekly_limit", "주간 사용 한도"), ("weekly_limit_reset_at", "주간 한도 초기화")),
+            (
+                ("gpt_5_3_codex_spark_five_hour_limit", "Spark 5시간 한도"),
+                ("gpt_5_3_codex_spark_five_hour_limit_reset_at", "Spark 5시간 초기화"),
+            ),
+            (
+                ("gpt_5_3_codex_spark_weekly_limit", "Spark 주간 한도"),
+                ("gpt_5_3_codex_spark_weekly_limit_reset_at", "Spark 주간 초기화"),
+            ),
+        )
+        metric_vars: dict[str, Any] = {}
+        for row_index, row in enumerate(rows):
+            for column, (key, label) in zip((0, 2), row):
+                value_var = tk.StringVar(value="-")
+                metric_vars[key] = value_var
+                self._add_value_row(parent, row_index, label, value_var, bg, column=column)
+        return metric_vars
 
     def _add_value_row(
         self,
@@ -746,6 +806,18 @@ class CodexUsageSettingsView:
                 self._set_status("로그인 요청 중 오류가 발생했습니다.", level="error")
             return
         self._set_status("계정별 로그인 기능을 사용할 수 없습니다.", level="error")
+        return
+
+    def _on_account_query(self, account_id: str) -> None:
+        show = getattr(self._codex, "show_account_status", None)
+        if callable(show):
+            try:
+                show(str(account_id), force_refresh=True, source="manual_query")
+                self._set_status(f"{account_id} 사용량 조회를 시작했습니다.", level="info")
+            except Exception:
+                self._set_status("사용량 조회 요청 중 오류가 발생했습니다.", level="error")
+            return
+        self._set_status("계정별 조회 기능을 사용할 수 없습니다.", level="error")
         return
 
     def _on_release_profile(self) -> None:
@@ -1089,6 +1161,11 @@ class CodexUsageSettingsView:
                 return rendered if rendered else "-"
         except Exception:
             pass
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
         return raw
 
     def _runtime_state_text(self, runtime: dict[str, Any] | None) -> str:
@@ -1246,6 +1323,42 @@ class CodexUsageSettingsView:
         body = ", ".join(parts) if parts else "-"
         return f"{prefix}: {body}"
 
+    def _account_snapshot_state_text(self, entry: dict[str, Any]) -> str:
+        runtime = entry.get("runtime", {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+        payload = self._snapshot_payload_from_any(entry.get("last_snapshot"))
+        captured_at_raw = str(payload.get("captured_at", "") or "").strip()
+        prefix = (
+            "이전 값"
+            if self._runtime_snapshot_is_previous(
+                runtime,
+                captured_at=captured_at_raw,
+                stale_after_sec=self._account_snapshot_stale_after_sec(entry),
+            )
+            else "최근 값"
+        )
+        return f"값 상태: {prefix}"
+
+    def _format_account_metric_value(self, key: str, payload: dict[str, Any]) -> str:
+        raw = str(payload.get(key, "") or "").strip()
+        if not raw:
+            return "-"
+        if key == "captured_at":
+            return self._format_captured_at_value(raw)
+        if key.endswith("_reset_at"):
+            try:
+                formatter = getattr(self._codex, "format_reset_at_for_display", None)
+                if callable(formatter):
+                    try:
+                        rendered = str(formatter(raw, key) or "").strip()
+                    except TypeError:
+                        rendered = str(formatter(raw) or "").strip()
+                    return rendered if rendered else "-"
+            except Exception:
+                pass
+        return raw
+
     def _refresh_account_runtime_summaries(self, runtime: dict[str, Any]) -> None:
         accounts = runtime.get("accounts") if isinstance(runtime, dict) else None
         if not isinstance(accounts, list):
@@ -1274,9 +1387,17 @@ class CodexUsageSettingsView:
             snapshot_var = self._account_snapshot_vars.get(account_id)
             if snapshot_var is not None:
                 try:
-                    snapshot_var.set(self._format_account_snapshot_summary(raw))
+                    snapshot_var.set(self._account_snapshot_state_text(raw))
                 except Exception:
                     pass
+            metric_vars = self._account_metric_vars.get(account_id)
+            if isinstance(metric_vars, dict):
+                payload = self._snapshot_payload_from_any(raw.get("last_snapshot"))
+                for key, value_var in metric_vars.items():
+                    try:
+                        value_var.set(self._format_account_metric_value(key, payload))
+                    except Exception:
+                        pass
         for account_id, status_var in self._account_status_vars.items():
             if account_id in seen:
                 continue
@@ -1288,9 +1409,17 @@ class CodexUsageSettingsView:
             if account_id in seen:
                 continue
             try:
-                snapshot_var.set("최근 값: -")
+                snapshot_var.set("값 상태: -")
             except Exception:
                 pass
+        for account_id, metric_vars in self._account_metric_vars.items():
+            if account_id in seen or not isinstance(metric_vars, dict):
+                continue
+            for value_var in metric_vars.values():
+                try:
+                    value_var.set("-")
+                except Exception:
+                    pass
 
     def _start_runtime_refresh(self) -> None:
         self._stop_runtime_refresh()
@@ -1437,6 +1566,10 @@ class CodexUsageSettingsView:
             can_logout = False
         self._set_button_enabled(login_button, can_login)
         self._set_button_enabled(logout_button, can_logout)
+        for account_id, button in self._account_query_buttons.items():
+            entry = self._find_account_runtime_entry(runtime, account_id)
+            account_can_query = self._account_query_permission(entry)
+            self._set_button_enabled(button, account_can_query)
         for account_id, button in self._account_login_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
             account_can_login, _account_can_logout = self._account_action_permissions(entry)
@@ -1511,6 +1644,30 @@ class CodexUsageSettingsView:
             else session_state == "logged_in"
         )
         return can_login, can_logout
+
+    def _account_query_permission(self, entry: dict[str, Any] | None) -> bool:
+        if not isinstance(entry, dict):
+            return True
+        if not bool(entry.get("enabled", True)):
+            return False
+        runtime = entry.get("runtime", {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+        if bool(runtime.get("collect_inflight", False)) or bool(
+            runtime.get("logout_in_progress", False)
+        ):
+            return False
+        monitor_state = str(runtime.get("monitor_state") or "idle")
+        if monitor_state in {"running", "cancelling", "paused_profile_in_use"}:
+            return False
+        if bool(runtime.get("profile_in_use", False)):
+            return False
+        session_state = str(runtime.get("session_state") or "")
+        return bool(
+            session_state in {"logged_in", "logged_out", "unknown", ""}
+            or bool(runtime.get("auth_attention_required", False))
+            or monitor_state == "paused_auth_required"
+        )
 
     def _set_button_enabled(self, button: Any, enabled: bool) -> None:
         if button is None:
