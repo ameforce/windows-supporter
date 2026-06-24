@@ -44,6 +44,7 @@ from src.utils.update_monitor import (
     build_update_handoff_command,
     build_update_handoff_payload,
     build_update_progress_snapshot,
+    close_running_git_gui_processes,
     cleanup_update_handoff_executable,
     get_update_progress_step,
     is_git_checkout_root,
@@ -422,7 +423,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(build_step.label, "빌드 실행 중")
         self.assertEqual(snapshot["title"], "Windows Supporter 업데이트")
         self.assertEqual(snapshot["label"], "빌드 실행 중")
-        self.assertEqual(snapshot["percent"], 85)
+        self.assertEqual(snapshot["percent"], 74)
         self.assertTrue(snapshot["progressbar"]["visible"])
         self.assertEqual(snapshot["progressbar"]["mode"], "determinate")
         self.assertEqual(failed["title"], "Windows Supporter 업데이트 실패")
@@ -776,7 +777,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             ],
         )
 
-    def test_prepare_repository_stops_before_git_when_git_gui_is_open(self) -> None:
+    def test_git_gui_blocker_prompts_for_close_and_continue(self) -> None:
         class FakeSubprocess:
             def __init__(self) -> None:
                 self.commands = []
@@ -793,6 +794,10 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             subprocess_module=fake_subprocess,
             git_gui_process_detector=lambda _repo_root: ("Fork.exe",),
         )
+        prompts = []
+        updater._ask_close_git_gui_processes = (
+            lambda processes: prompts.append(tuple(processes)) or False
+        )
 
         self.assertFalse(
             updater._prepare_repository_for_update(
@@ -801,10 +806,137 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         )
 
         snapshot = updater.get_status_snapshot()
+        self.assertEqual(prompts, [("Fork.exe",)])
         self.assertEqual(fake_subprocess.commands, [])
-        self.assertEqual(snapshot["state"], "error")
+        self.assertEqual(snapshot["state"], "cancelled")
         self.assertIn("Fork.exe", snapshot["last_error"])
         self.assertEqual(snapshot["progress"]["failed_step"], "Git GUI 확인")
+        self.assertEqual(snapshot["progress"]["state"], "cancelled")
+
+    def test_git_gui_close_and_continue_waits_and_records_relaunch(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.commands = []
+
+            def run(self, argv, **_kwargs):
+                self.commands.append(list(argv))
+                return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        fake_subprocess = FakeSubprocess()
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+            subprocess_module=fake_subprocess,
+            git_gui_process_detector=lambda _repo_root: ("Fork.exe",),
+        )
+        prompts = []
+        close_calls = []
+        updater._ask_close_git_gui_processes = (
+            lambda processes: prompts.append(tuple(processes)) or True
+        )
+        updater._close_git_gui_processes_for_update = lambda processes: close_calls.append(
+            tuple(processes)
+        ) or {
+            "closed": ["Fork.exe"],
+            "relaunch": [{"name": "Fork.exe", "command": ["Fork.exe"]}],
+        }
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState(
+            remote_only_count=1
+        )
+
+        self.assertTrue(
+            updater._prepare_repository_for_update(
+                UpdateWorkingTreeState(remote_only_count=1)
+            )
+        )
+
+        self.assertEqual(prompts, [("Fork.exe",)])
+        self.assertEqual(close_calls, [("Fork.exe",)])
+        self.assertEqual(
+            fake_subprocess.commands,
+            [build_fetch_origin_command(), build_switch_main_command(), build_fast_forward_main_command()],
+        )
+        self.assertEqual(updater._preflight_result["git_gui_processes"], ["Fork.exe"])
+        self.assertTrue(updater._preflight_result["git_gui_close_approved"])
+        self.assertEqual(
+            updater._preflight_result["git_gui_relaunch"],
+            [{"name": "Fork.exe", "command": ["Fork.exe"]}],
+        )
+
+    def test_close_running_git_gui_processes_parses_relaunch_metadata(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def run(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                return types.SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        '{"closed":["Fork.exe"],"still_running":[],'
+                        '"relaunch":[{"name":"Fork.exe","command":["C:/Apps/Fork/Fork.exe"]}]}'
+                    ),
+                    stderr="",
+                )
+
+        fake_subprocess = FakeSubprocess()
+        with patch.object(update_monitor_module.os, "name", "nt"):
+            result = close_running_git_gui_processes(
+                ("Fork.exe",),
+                subprocess_module=fake_subprocess,
+            )
+
+        self.assertEqual(fake_subprocess.calls[0][0][:4], ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass"])
+        self.assertNotIn("Stop-Process", fake_subprocess.calls[0][0][-1])
+        self.assertEqual(result["closed"], ["Fork.exe"])
+        self.assertEqual(result["still_running"], [])
+        self.assertEqual(
+            result["relaunch"],
+            [{"name": "Fork.exe", "command": ["C:/Apps/Fork/Fork.exe"]}],
+        )
+
+    def test_update_approval_publishes_preflight_progress_before_git_fetch(self) -> None:
+        class FakeSubprocess:
+            def __init__(self, snapshots) -> None:
+                self.commands = []
+                self.snapshots = snapshots
+
+            def run(self, argv, **_kwargs):
+                self.snapshots.append(updater.get_status_snapshot()["progress"])
+                self.commands.append(list(argv))
+                return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        snapshots = []
+        fake_subprocess = FakeSubprocess(snapshots)
+        updater = WindowsSupporterUpdater(
+            root=object(),
+            event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+            repo_root=".",
+            subprocess_module=fake_subprocess,
+            status_changed_callback=lambda: snapshots.append(
+                updater.get_status_snapshot()["progress"]
+            ),
+        )
+        updater._ask_update = lambda _candidate: True
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState(
+            remote_only_count=1
+        )
+        updater.launch_update = lambda: True
+
+        updater._handle_check_result(
+            UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        step_keys = [snapshot["step_key"] for snapshot in snapshots]
+        first_fetch_index = step_keys.index("fetch")
+        self.assertIn("accepted", step_keys[:first_fetch_index])
+        self.assertIn("preflight", step_keys[:first_fetch_index])
+        self.assertLess(get_update_progress_step("build").percent, 80)
+        self.assertLess(get_update_progress_step("fetch").percent, get_update_progress_step("build").percent)
 
     def test_update_approval_fails_closed_when_git_state_inspection_fails(self) -> None:
         updater = WindowsSupporterUpdater(
@@ -1034,6 +1166,53 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         )
         self.assertEqual(progress_instances[0].close_calls, 1)
 
+    def test_run_update_handoff_relaunches_approved_git_gui_apps(self) -> None:
+        class FakeSubprocess:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def run(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                return types.SimpleNamespace(returncode=0, stdout="built", stderr="")
+
+        launches = []
+        fake_subprocess = FakeSubprocess()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / "windows-supporter.exe").write_text("exe", encoding="utf-8")
+            state_path = Path(tmp) / "update_handoff.json"
+            payload = build_update_handoff_payload(
+                repo_root=repo,
+                target_tag="v0.5.7",
+                log_path=Path(tmp) / "update.log",
+                preflight={
+                    "git_gui_relaunch": [
+                        {"name": "Fork.exe", "command": ["C:/Apps/Fork/Fork.exe"]}
+                    ]
+                },
+            )
+            with open(state_path, "w", encoding="utf-8") as fp:
+                import json
+
+                json.dump(payload, fp)
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=fake_subprocess,
+                launch=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                progress_ui_factory=lambda **_kwargs: None,
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            launches,
+            [
+                ([str(repo / "windows-supporter.exe")], {"cwd": str(repo)}),
+                (["C:/Apps/Fork/Fork.exe"], {"cwd": str(repo)}),
+            ],
+        )
+
     def test_run_no_window_with_progress_pumps_ui_while_waiting_for_build_output(self) -> None:
         class SlowStdout:
             def __init__(self, owner) -> None:
@@ -1256,7 +1435,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(launches[0][0][-2:], [UPDATE_HANDOFF_ARG, str(state_path)])
         self.assertEqual(snapshots_during_ack[0]["state"], "updating")
         self.assertEqual(snapshots_during_ack[0]["progress"]["step_key"], "handoff")
-        self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 75)
+        self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 68)
         self.assertEqual(quit_calls, [True])
 
     def test_auto_update_settings_persist_and_gate_scheduling(self) -> None:
@@ -1437,7 +1616,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "updating")
         self.assertEqual(snapshot["progress"]["label"], "업데이트 실행 준비 중")
-        self.assertEqual(snapshot["progress"]["percent"], 75)
+        self.assertEqual(snapshot["progress"]["percent"], 68)
         self.assertEqual(
             launches,
             [
