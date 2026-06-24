@@ -78,23 +78,34 @@ def run_smoke(output_path: Path) -> dict[str, Any]:
             root.update()
             labels.append(str(settings_view._status_label.cget("text")))
 
-            progress = UpdateHandoffProgressUi(log_path=str(Path(tmp) / "update.log"))
-            accepted = build_update_progress_snapshot(
-                "accepted",
+            log_path = Path(tmp) / "update.log"
+            progress = UpdateHandoffProgressUi(log_path=str(log_path))
+            handoff_start = build_update_progress_snapshot(
+                "handoff_start",
                 state="running",
-                detail="선택한 버전 업데이트 요청을 접수했습니다.",
+                detail="업데이트 전용 프로세스가 시작되었습니다.",
+                log_path=str(log_path),
             )
             preflight = build_update_progress_snapshot(
                 "preflight",
                 state="await_git_gui_close",
                 detail="Fork.exe가 실행 중입니다. 종료 승인 대기 중입니다.",
             )
-            progress.show(accepted)
-            labels.append(str(accepted["label"]))
-            labels.append(str(accepted["detail"]))
+            progress.show(handoff_start)
+            labels.append(str(handoff_start["label"]))
+            labels.append(str(progress._percent_label.cget("text")))
+            labels.append("custom-canvas" if progress._progress_canvas is not None else "missing-canvas")
+            labels.append("log-visible" if progress._log_button.winfo_ismapped() else "log-hidden")
             progress.set_snapshot(preflight)
             labels.append(str(preflight["label"]))
             labels.append(str(preflight["detail"]))
+            uv_snapshot = build_update_build_output_progress_snapshot(
+                "Syncing uv environment...[ Success !! ]"
+            )
+            if uv_snapshot is not None:
+                progress.set_snapshot(uv_snapshot)
+                labels.append(str(uv_snapshot["label"]))
+                labels.append(str(progress._percent_label.cget("text")))
             build_snapshot = build_update_build_output_progress_snapshot(
                 "Building main.py to windows-supporter.exe...[ Success !! ]"
             )
@@ -114,9 +125,14 @@ def run_smoke(output_path: Path) -> dict[str, Any]:
         "ok": all(
             [
                 any("자동 확인" in label for label in labels),
-                any("업데이트 요청 접수" in label for label in labels),
+                any("업데이트 프로세스 시작" in label for label in labels),
+                any(label == "0%" for label in labels),
+                any(label == "custom-canvas" for label in labels),
+                any(label == "log-visible" for label in labels),
                 any("업데이트 사전 점검 중" in label for label in labels),
                 any("Fork.exe" in label and "종료 승인" in label for label in labels),
+                any("uv 환경 동기화 중" in label for label in labels),
+                any(label == "30%" for label in labels),
                 any("실행 파일 빌드 중" in label for label in labels),
                 any("build.bat 단계" in label for label in labels),
                 any("재실행" in label for label in labels),

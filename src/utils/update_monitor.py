@@ -276,6 +276,9 @@ UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("fetch", "원격 변경 확인 중", "origin 태그와 main 브랜치 정보를 가져옵니다.", 54),
     UpdateProgressStep("sync", "main 동기화 중", "main 브랜치를 업데이트 기준으로 맞춥니다.", 62),
     UpdateProgressStep("handoff", "업데이트 실행 준비 중", "빌드와 재실행을 맡을 업데이트 프로세스를 준비합니다.", 68),
+    UpdateProgressStep("handoff_start", "업데이트 프로세스 시작", "업데이트 전용 프로세스를 시작했습니다.", 0),
+    UpdateProgressStep("shutdown", "기존 앱 정리 중", "기존 Windows Supporter와 하위 프로세스를 정리합니다.", 8),
+    UpdateProgressStep("build_prepare", "빌드 준비 중", "build.bat 실행 환경을 준비합니다.", 14),
     UpdateProgressStep("build", "빌드 실행 중", "build.bat를 실행합니다.", 74),
     UpdateProgressStep("relaunch", "Windows Supporter 재실행 중", "새 실행 파일과 닫았던 Git 앱을 시작합니다.", 94),
     UpdateProgressStep("complete", "업데이트 완료", "업데이트가 완료되었습니다.", 100),
@@ -283,16 +286,16 @@ UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
 )
 UPDATE_PROGRESS_STEP_BY_KEY = {step.key: step for step in UPDATE_PROGRESS_STEPS}
 BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
-    BuildOutputProgressRule("Shutting down the running", "실행 중인 앱 종료 중", 75),
-    BuildOutputProgressRule("Stopping stale PyInstaller workers", "빌드 작업자 정리 중", 77),
-    BuildOutputProgressRule("Syncing uv environment", "uv 환경 동기화 중", 79),
-    BuildOutputProgressRule("Preparing bundled Playwright", "브라우저 런타임 준비 중", 81),
-    BuildOutputProgressRule("Cleaning prior PyInstaller", "이전 빌드 산출물 정리 중", 83),
-    BuildOutputProgressRule("Generating version metadata", "버전 메타데이터 생성 중", 86),
-    BuildOutputProgressRule("Building main.py", "실행 파일 빌드 중", 89),
-    BuildOutputProgressRule("Moving windows-supporter.exe", "실행 파일 배치 중", 92),
-    BuildOutputProgressRule("Remove build byproducts", "빌드 임시 파일 정리 중", 96),
-    BuildOutputProgressRule("Skipping post-build launch", "빌드 후 직접 재실행 준비 중", 98),
+    BuildOutputProgressRule("Shutting down the running", "실행 중인 앱 종료 중", 12),
+    BuildOutputProgressRule("Stopping stale PyInstaller workers", "빌드 작업자 정리 중", 18),
+    BuildOutputProgressRule("Syncing uv environment", "uv 환경 동기화 중", 30),
+    BuildOutputProgressRule("Preparing bundled Playwright", "브라우저 런타임 준비 중", 38),
+    BuildOutputProgressRule("Cleaning prior PyInstaller", "이전 빌드 산출물 정리 중", 46),
+    BuildOutputProgressRule("Generating version metadata", "버전 메타데이터 생성 중", 56),
+    BuildOutputProgressRule("Building main.py", "실행 파일 빌드 중", 72),
+    BuildOutputProgressRule("Moving windows-supporter.exe", "실행 파일 배치 중", 82),
+    BuildOutputProgressRule("Remove build byproducts", "빌드 임시 파일 정리 중", 90),
+    BuildOutputProgressRule("Skipping post-build launch", "빌드 후 직접 재실행 준비 중", 94),
 )
 
 
@@ -380,7 +383,11 @@ def build_update_progress_snapshot(
     }
 
 
-def build_update_build_output_progress_snapshot(line: str) -> dict[str, Any] | None:
+def build_update_build_output_progress_snapshot(
+    line: str,
+    *,
+    log_path: str = "",
+) -> dict[str, Any] | None:
     text = str(line or "").strip()
     if not text:
         return None
@@ -391,6 +398,7 @@ def build_update_build_output_progress_snapshot(line: str) -> dict[str, Any] | N
             "build",
             state="running",
             detail=f"build.bat 단계: {text}",
+            log_path=log_path,
         )
         percent = max(0, min(100, int(rule.percent)))
         snapshot["label"] = rule.label
@@ -407,11 +415,12 @@ def publish_build_output_progress(
     *,
     progress_ui: Any,
     state_path: str | os.PathLike[str],
+    log_path: str = "",
     seen: set[str] | None = None,
 ) -> None:
     published = seen if seen is not None else set()
     for line in str(output or "").splitlines():
-        snapshot = build_update_build_output_progress_snapshot(line)
+        snapshot = build_update_build_output_progress_snapshot(line, log_path=log_path)
         if snapshot is None:
             continue
         label = str(snapshot.get("label") or "")
@@ -773,16 +782,152 @@ def append_update_log(log_path: str | os.PathLike[str], message: str) -> None:
     return
 
 
+def _coerce_positive_pid(value: Any) -> int:
+    try:
+        pid = int(value)
+    except Exception:
+        return 0
+    return pid if pid > 0 else 0
+
+
+def terminate_process_descendants(
+    parent_pid: int,
+    *,
+    exclude_pids: Sequence[int] | None = None,
+    subprocess_module=subprocess,
+    timeout_seconds: float = 5.0,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    resolved_parent_pid = _coerce_positive_pid(parent_pid)
+    resolved_excludes = tuple(
+        pid
+        for pid in (
+            _coerce_positive_pid(item)
+            for item in (exclude_pids or ())
+        )
+        if pid > 0
+    )
+    result_payload: dict[str, Any] = {
+        "parent_pid": resolved_parent_pid,
+        "exclude_pids": list(resolved_excludes),
+        "terminated_pids": [],
+        "failed_pids": [],
+        "skipped": "",
+        "error": "",
+    }
+    if resolved_parent_pid <= 0:
+        result_payload["skipped"] = "missing parent pid"
+        return result_payload
+    if os.name != "nt":
+        result_payload["skipped"] = "unsupported platform"
+        return result_payload
+
+    exclude_literal = ", ".join(str(pid) for pid in resolved_excludes)
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'SilentlyContinue'",
+            f"$parentPid = {resolved_parent_pid}",
+            f"$exclude = @({exclude_literal})",
+            "$childrenByParent = @{}",
+            "foreach ($proc in Get-CimInstance Win32_Process) {",
+            "  $ppid = [int]$proc.ParentProcessId",
+            "  if (-not $childrenByParent.ContainsKey($ppid)) { $childrenByParent[$ppid] = @() }",
+            "  $childrenByParent[$ppid] += $proc",
+            "}",
+            "$targets = New-Object System.Collections.Generic.List[int]",
+            "function Add-Descendants([int]$treePid) {",
+            "  if (-not $childrenByParent.ContainsKey($treePid)) { return }",
+            "  foreach ($child in @($childrenByParent[$treePid])) {",
+            "    $childPid = [int]$child.ProcessId",
+            "    if ($childPid -eq $PID) { continue }",
+            "    if ($exclude -contains $childPid) { continue }",
+            "    Add-Descendants $childPid",
+            "    if ($childPid -ne $parentPid) { [void]$targets.Add($childPid) }",
+            "  }",
+            "}",
+            "Add-Descendants $parentPid",
+            "$terminated = @()",
+            "$failed = @()",
+            "foreach ($targetPid in @($targets | Select-Object -Unique)) {",
+            "  try {",
+            "    Stop-Process -Id $targetPid -Force -ErrorAction Stop",
+            "    $terminated += $targetPid",
+            "  } catch {",
+            "    $failed += $targetPid",
+            "  }",
+            "}",
+            "[pscustomobject]@{",
+            "  parent_pid = $parentPid",
+            "  exclude_pids = @($exclude)",
+            "  terminated_pids = @($terminated)",
+            "  failed_pids = @($failed)",
+            "} | ConvertTo-Json -Depth 4 -Compress",
+        ]
+    )
+    try:
+        completed = run_no_window(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            subprocess_module=subprocess_module,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except Exception as exc:
+        result_payload["error"] = repr(exc)
+        if callable(log):
+            log(f"process descendant cleanup failed: {exc!r}")
+        return result_payload
+
+    stdout = str(getattr(completed, "stdout", "") or "").strip()
+    stderr = str(getattr(completed, "stderr", "") or "").strip()
+    if int(getattr(completed, "returncode", 1) or 0) != 0:
+        result_payload["error"] = stderr or stdout or "cleanup command failed"
+        if callable(log):
+            log(f"process descendant cleanup failed: {result_payload['error']}")
+        return result_payload
+    if not stdout:
+        return result_payload
+    try:
+        parsed = json.loads(stdout)
+    except Exception as exc:
+        result_payload["error"] = f"failed to parse cleanup output: {exc}"
+        return result_payload
+    if not isinstance(parsed, dict):
+        return result_payload
+    for key in ("terminated_pids", "failed_pids", "exclude_pids"):
+        values = parsed.get(key, [])
+        if not isinstance(values, list):
+            values = [values]
+        result_payload[key] = [
+            pid
+            for pid in (_coerce_positive_pid(item) for item in values)
+            if pid > 0
+        ]
+    result_payload["parent_pid"] = _coerce_positive_pid(parsed.get("parent_pid", resolved_parent_pid))
+    return result_payload
+
+
 class UpdateHandoffProgressUi:
     def __init__(self, *, log_path: str | os.PathLike[str] = "") -> None:
         self._log_path = str(log_path or "")
         self._root = None
         self._stage_label = None
         self._detail_label = None
-        self._progressbar = None
+        self._percent_label = None
+        self._progress_canvas = None
+        self._log_button = None
         self._retry_button = None
         self._manual_button = None
         self._close_button = None
+        self._last_percent = 0
         self.retry_requested = False
         self._closed = False
         return
@@ -800,77 +945,112 @@ class UpdateHandoffProgressUi:
             root = tk.Tk()
             self._closed = False
             root.title(str(snapshot.get("title") or UPDATE_PROGRESS_TITLE))
-            root.geometry("460x220")
+            root.geometry("520x250")
             root.resizable(False, False)
+            root.configure(bg="#F8FAFC")
             try:
                 root.attributes("-topmost", True)
             except Exception:
                 pass
 
-            frame = tk.Frame(root, padx=16, pady=14)
+            frame = tk.Frame(root, padx=22, pady=18, bg="#F8FAFC")
             root.protocol("WM_DELETE_WINDOW", self.close)
             frame.pack(fill="both", expand=True)
             title = tk.Label(
                 frame,
-                text="Windows Supporter 업데이트 중",
-                font=("Segoe UI", 11, "bold"),
+                text="Windows Supporter 업데이트",
+                font=("Segoe UI", 13, "bold"),
                 anchor="w",
+                bg="#F8FAFC",
+                fg="#111827",
             )
             title.pack(fill="x")
-            stage = tk.Label(frame, text="", font=("Segoe UI", 9), anchor="w")
-            stage.pack(fill="x", pady=(12, 4))
-            progress = ttk.Progressbar(
+            subtitle = tk.Label(
                 frame,
-                orient="horizontal",
-                mode="determinate",
-                maximum=100,
+                text="새 버전을 적용하고 앱을 다시 시작합니다.",
+                font=("Segoe UI", 9),
+                anchor="w",
+                bg="#F8FAFC",
+                fg="#6B7280",
             )
-            progress.pack(fill="x")
+            subtitle.pack(fill="x", pady=(3, 16))
+
+            status_row = tk.Frame(frame, bg="#F8FAFC")
+            status_row.pack(fill="x")
+            stage = tk.Label(
+                status_row,
+                text="",
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+                bg="#F8FAFC",
+                fg="#111827",
+            )
+            stage.pack(side="left", fill="x", expand=True)
+            percent = tk.Label(
+                status_row,
+                text="0%",
+                font=("Segoe UI", 10, "bold"),
+                anchor="e",
+                bg="#F8FAFC",
+                fg="#2563EB",
+            )
+            percent.pack(side="right")
+
+            progress = tk.Canvas(
+                frame,
+                width=476,
+                height=12,
+                bg="#F8FAFC",
+                bd=0,
+                highlightthickness=0,
+                relief="flat",
+            )
+            progress.pack(fill="x", pady=(8, 0))
             detail = tk.Label(
                 frame,
                 text="",
                 font=("Segoe UI", 9),
                 anchor="w",
                 justify="left",
-                wraplength=410,
+                wraplength=470,
+                bg="#F8FAFC",
+                fg="#374151",
             )
-            detail.pack(fill="x", pady=(10, 8))
+            detail.pack(fill="x", pady=(12, 14))
 
-            buttons = tk.Frame(frame)
-            buttons.pack(fill="x")
+            buttons = tk.Frame(frame, bg="#F8FAFC")
+            buttons.pack(fill="x", side="bottom")
             log_button = ttk.Button(
                 buttons,
                 text=UPDATE_PROGRESS_LOG_BUTTON_TEXT,
                 command=self._open_log,
                 width=11,
             )
-            log_button.pack(side="right")
             close_button = ttk.Button(
                 buttons,
                 text=UPDATE_PROGRESS_CLOSE_BUTTON_TEXT,
                 command=self.close,
                 width=9,
             )
-            close_button.pack(side="right", padx=(0, 6))
             manual_button = ttk.Button(
                 buttons,
                 text=UPDATE_PROGRESS_MANUAL_ACTION_TEXT,
                 command=self._show_manual_action,
                 width=11,
             )
-            manual_button.pack(side="right", padx=(0, 6))
             retry_button = ttk.Button(
                 buttons,
                 text=UPDATE_PROGRESS_RETRY_BUTTON_TEXT,
                 command=self._request_retry,
                 width=9,
             )
-            retry_button.pack(side="right", padx=(0, 6))
 
             self._root = root
             self._stage_label = stage
             self._detail_label = detail
-            self._progressbar = progress
+            self._percent_label = percent
+            self._progress_canvas = progress
+            self._log_button = log_button
             self._retry_button = retry_button
             self._manual_button = manual_button
             self._close_button = close_button
@@ -886,22 +1066,63 @@ class UpdateHandoffProgressUi:
             return
         try:
             state = str(snapshot.get("state") or "")
+            percent = max(0, min(100, int(snapshot.get("percent") or 0)))
             self._root.title(str(snapshot.get("title") or UPDATE_PROGRESS_TITLE))
             if self._stage_label is not None:
                 self._stage_label.configure(text=str(snapshot.get("label") or ""))
             if self._detail_label is not None:
                 self._detail_label.configure(text=str(snapshot.get("detail") or ""))
-            if self._progressbar is not None:
-                self._progressbar.configure(value=int(snapshot.get("percent") or 0))
+            if self._percent_label is not None:
+                self._percent_label.configure(text=f"{percent}%")
+            self._draw_progress(percent)
             failure = state == "failed"
-            if self._retry_button is not None:
-                self._retry_button.configure(
-                    state="normal" if failure and bool(snapshot.get("can_retry")) else "disabled"
-                )
-            for button in (self._manual_button, self._close_button):
-                if button is not None:
-                    button.configure(state="normal" if failure else "disabled")
+            complete = state == "complete"
+            self._set_button_visible(
+                self._retry_button,
+                failure and bool(snapshot.get("can_retry")),
+            )
+            self._set_button_visible(
+                self._manual_button,
+                failure and bool(snapshot.get("can_manual_action")),
+            )
+            self._set_button_visible(self._close_button, failure or complete)
+            self._set_button_visible(
+                self._log_button,
+                bool(snapshot.get("can_open_log")) or failure,
+            )
             self.pump()
+        except Exception:
+            pass
+        return
+
+    def _set_button_visible(self, button: Any, visible: bool) -> None:
+        if button is None:
+            return
+        try:
+            if visible:
+                if not button.winfo_ismapped():
+                    button.pack(side="right", padx=(8, 0))
+                button.configure(state="normal")
+            else:
+                button.pack_forget()
+        except Exception:
+            pass
+        return
+
+    def _draw_progress(self, percent: int) -> None:
+        canvas = self._progress_canvas
+        if canvas is None:
+            return
+        self._last_percent = max(0, min(100, int(percent)))
+        try:
+            canvas.update_idletasks()
+            width = int(canvas.winfo_width() or 476)
+            height = int(canvas.winfo_height() or 12)
+            fill_width = int(width * (self._last_percent / 100.0))
+            canvas.delete("all")
+            canvas.create_rectangle(0, 0, width, height, fill="#E5E7EB", outline="")
+            if fill_width > 0:
+                canvas.create_rectangle(0, 0, fill_width, height, fill="#2563EB", outline="")
         except Exception:
             pass
         return
@@ -991,30 +1212,54 @@ def run_update_handoff(
     for attempt in range(1, attempts + 1):
         published_build_labels: set[str] = set()
 
+        def publish_handoff_progress(snapshot: dict[str, Any], *, first: bool = False) -> None:
+            if progress_ui is not None:
+                if first:
+                    progress_ui.show(snapshot)
+                else:
+                    progress_ui.set_snapshot(snapshot)
+            update_handoff_state(state_path, status="running", progress=snapshot)
+            return
+
         def publish_build_line(line: str) -> None:
             publish_build_output_progress(
                 line,
                 progress_ui=progress_ui,
                 state_path=state_path,
+                log_path=log_path,
                 seen=published_build_labels,
             )
 
-        build_progress = build_update_progress_snapshot(
-            "build",
+        start_progress = build_update_progress_snapshot(
+            "handoff_start",
             state="running",
-            detail=f"build.bat를 실행합니다. (시도 {attempt}/{attempts})",
+            detail=f"업데이트 전용 프로세스가 시작되었습니다. (시도 {attempt}/{attempts})",
+            log_path=log_path,
         )
-        if progress_ui is not None:
-            progress_ui.show(build_progress)
+        publish_handoff_progress(start_progress, first=True)
         update_handoff_state(
             state_path,
             status="running",
             acknowledged_at=time.time(),
             attempt=attempt,
-            progress=build_progress,
+            progress=start_progress,
         )
         append_update_log(log_path, f"handoff attempt {attempt} acknowledged")
         try:
+            shutdown_progress = build_update_progress_snapshot(
+                "shutdown",
+                state="running",
+                detail="기존 앱과 업데이트에 물린 하위 프로세스를 정리합니다.",
+                log_path=log_path,
+            )
+            publish_handoff_progress(shutdown_progress)
+            build_progress = build_update_progress_snapshot(
+                "build_prepare",
+                state="running",
+                detail="build.bat를 실행할 준비를 마쳤습니다.",
+                log_path=log_path,
+            )
+            publish_handoff_progress(build_progress)
             env = dict(os.environ)
             env["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"] = "1"
             env["GIT_TERMINAL_PROMPT"] = "0"
@@ -1040,12 +1285,17 @@ def run_update_handoff(
                 output,
                 progress_ui=progress_ui,
                 state_path=state_path,
+                log_path=log_path,
                 seen=published_build_labels,
             )
             if int(getattr(result, "returncode", 1) or 0) != 0:
                 raise RuntimeError(f"build.bat failed with exit code {getattr(result, 'returncode', 1)}")
 
-            relaunch_progress = build_update_progress_snapshot("relaunch", state="running")
+            relaunch_progress = build_update_progress_snapshot(
+                "relaunch",
+                state="running",
+                log_path=log_path,
+            )
             if progress_ui is not None:
                 progress_ui.set_snapshot(relaunch_progress)
             update_handoff_state(
@@ -1064,7 +1314,11 @@ def run_update_handoff(
                 except Exception as exc:
                     append_update_log(log_path, f"Git GUI relaunch skipped for {gui_name}: {exc!r}")
 
-            complete_progress = build_update_progress_snapshot("complete", state="complete")
+            complete_progress = build_update_progress_snapshot(
+                "complete",
+                state="complete",
+                log_path=log_path,
+            )
             if progress_ui is not None:
                 progress_ui.set_snapshot(complete_progress)
             update_handoff_state(
@@ -1083,6 +1337,7 @@ def run_update_handoff(
                 "failed",
                 state="failed",
                 detail=str(exc),
+                log_path=log_path,
                 failed_step="build/relaunch handoff",
                 can_retry=can_retry,
                 can_manual_action=True,
@@ -1513,6 +1768,7 @@ class WindowsSupporterUpdater:
             step_key,
             state=state,
             detail=detail,
+            log_path=str(get_update_log_path()),
             failed_step=failed_step,
             can_retry=can_retry,
             can_manual_action=can_manual_action,
@@ -1885,11 +2141,12 @@ class WindowsSupporterUpdater:
             return False
         try:
             handoff_path = Path(self._handoff_path_provider())
+            log_path = get_update_log_path(handoff_path.parent)
             payload = build_update_handoff_payload(
                 repo_root=self._repo_root,
                 target_tag=self._latest_tag,
                 working_tree=self._working_tree_state,
-                log_path=get_update_log_path(handoff_path.parent),
+                log_path=log_path,
                 preflight=self._preflight_result,
             )
             self._handoff_writer(handoff_path, payload)
@@ -1928,6 +2185,27 @@ class WindowsSupporterUpdater:
                 show_ui=self._show_preflight_progress_ui,
             )
             return False
+
+        helper_pid = _coerce_positive_pid(getattr(proc, "pid", 0))
+        if helper_pid > 0:
+            cleanup_result = terminate_process_descendants(
+                os.getpid(),
+                exclude_pids=(helper_pid,),
+                subprocess_module=self._subprocess,
+                timeout_seconds=3.0,
+                log=lambda message: append_update_log(log_path, message),
+            )
+            terminated_pids = cleanup_result.get("terminated_pids", [])
+            failed_pids = cleanup_result.get("failed_pids", [])
+            if terminated_pids or failed_pids:
+                append_update_log(
+                    log_path,
+                    (
+                        "pre-exit child cleanup "
+                        f"terminated={terminated_pids} failed={failed_pids} "
+                        f"excluded_helper={helper_pid}"
+                    ),
+                )
 
         if self._request_current_process_exit_for_update():
             return True
