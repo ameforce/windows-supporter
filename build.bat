@@ -24,7 +24,7 @@ if errorlevel 1 (
 REM Stop the running executable before rebuilding
 echo | set /p="Shutting down the running %EXE_NAME% process..."
 call :clear_log
-taskkill /f /im "%EXE_NAME%" > "%STEP_LOG%" 2>&1
+taskkill /f /t /im "%EXE_NAME%" > "%STEP_LOG%" 2>&1
 set "TASKKILL_ERROR=%ERRORLEVEL%"
 if "%TASKKILL_ERROR%"=="0" (
   echo [ Success !! ]
