@@ -819,6 +819,47 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(first_call.kwargs.get("force_hidden"))
         self.assertFalse(first_call.kwargs.get("allow_interactive_recovery"))
 
+    def test_auto_monitor_closes_stale_managed_profile_cdp_before_hidden_collect(
+        self,
+    ) -> None:
+        for raw_error in ("parse_failed", "login_required"):
+            with self.subTest(raw_error=raw_error):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+                    return_value=[(52654, 27920, True)],
+                ) as iter_endpoints:
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp_result",
+                        return_value=(None, raw_error),
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp_result",
+                            side_effect=AssertionError(
+                                "stale target profile must be cleaned before system fallback"
+                            ),
+                        ):
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__terminate_profile_remote_debugging_processes",
+                            ) as terminate_managed:
+                                with patch.object(
+                                    self.monitor._CodexUsageMonitor__lib.time,
+                                    "sleep",
+                                ) as sleep:
+                                    snap, err, handled = self.monitor._CodexUsageMonitor__try_no_focus_raw_preflight(
+                                        source="auto_monitor",
+                                    )
+
+                self.assertFalse(handled)
+                self.assertIsNone(snap)
+                self.assertIsNone(err)
+                iter_endpoints.assert_called_once_with(include_owned=True)
+                terminate_managed.assert_called_once_with(managed_only=True)
+                sleep.assert_called_once_with(0.5)
+
     def test_collect_with_playwright_obj_uses_hidden_cdp_before_headless_fallback(self) -> None:
         recovered = UsageSnapshot.from_metrics(
             {
