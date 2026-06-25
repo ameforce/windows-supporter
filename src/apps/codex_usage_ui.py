@@ -32,6 +32,7 @@ class CodexUsageSettingsView:
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
+        self._account_metric_display_vars = {}
         self._account_order: list[str] = []
         self._autosave_after_id = None
         self._loading_settings = False
@@ -89,6 +90,7 @@ class CodexUsageSettingsView:
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
+        self._account_metric_display_vars = {}
 
         container = tk.Frame(parent, bg=bg)
         try:
@@ -446,12 +448,13 @@ class CodexUsageSettingsView:
                 pady=(1, 3),
             )
             try:
+                metric_grid.columnconfigure(0, weight=1)
                 metric_grid.columnconfigure(1, weight=1)
-                metric_grid.columnconfigure(3, weight=1)
             except Exception:
                 pass
-            metric_vars = self._build_account_metric_rows(metric_grid, card_bg)
+            metric_vars, display_vars = self._build_account_metric_rows(metric_grid, card_bg)
             self._account_metric_vars[account_id] = metric_vars
+            self._account_metric_display_vars[account_id] = display_vars
             detail_row += 1
             for prefix, key, clickable in (
                 ("설정 파일", "settings_path", True),
@@ -590,10 +593,10 @@ class CodexUsageSettingsView:
         )
         return row + 1
 
-    def _build_account_metric_rows(self, parent: Any, bg: str) -> dict[str, Any]:
+    def _build_account_metric_rows(self, parent: Any, bg: str) -> tuple[dict[str, Any], dict[str, Any]]:
         tk = self._tk
         if tk is None:
-            return {}
+            return {}, {}
         rows = (
             (("captured_at", "최근 확인 시각"), ("remaining_credit", "남은 크레딧")),
             (("five_hour_limit", "5시간 사용 한도"), ("five_hour_limit_reset_at", "5시간 한도 초기화")),
@@ -608,12 +611,59 @@ class CodexUsageSettingsView:
             ),
         )
         metric_vars: dict[str, Any] = {}
+        display_vars: dict[str, Any] = {}
         for row_index, row in enumerate(rows):
-            for column, (key, label) in zip((0, 2), row):
+            for column, (key, label) in enumerate(row):
                 value_var = tk.StringVar(value="-")
+                display_var = tk.StringVar(value=f"{label}: -")
                 metric_vars[key] = value_var
-                self._add_value_row(parent, row_index, label, value_var, bg, column=column)
-        return metric_vars
+                display_vars[key] = display_var
+                self._bind_metric_display_value(label, value_var, display_var)
+                self._add_metric_cell(parent, row_index, column, display_var, bg)
+        return metric_vars, display_vars
+
+    def _bind_metric_display_value(self, label: str, value_var: Any, display_var: Any) -> None:
+        def sync(*_args: Any) -> None:
+            try:
+                raw = str(value_var.get() or "").strip()
+            except Exception:
+                raw = ""
+            value = raw if raw else "-"
+            try:
+                display_var.set(f"{label}: {value}")
+            except Exception:
+                pass
+
+        try:
+            value_var.trace_add("write", sync)
+        except Exception:
+            pass
+        sync()
+        return
+
+    def _add_metric_cell(
+        self,
+        parent: Any,
+        row: int,
+        column: int,
+        display_var: Any,
+        bg: str,
+    ) -> None:
+        tk = self._tk
+        if tk is None:
+            return
+        padx = (0, 8) if int(column) == 0 else (8, 0)
+        tk.Label(
+            parent,
+            textvariable=display_var,
+            bg=bg,
+            fg="#1F2937",
+            font=("Segoe UI", 8),
+            anchor="w",
+            justify="left",
+            wraplength=180,
+        ).grid(row=row, column=column, sticky="we", padx=padx, pady=1)
+        return
 
     def _add_value_row(
         self,

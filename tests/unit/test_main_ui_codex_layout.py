@@ -101,13 +101,17 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._tab_kakao = object()
         return ui, root, kakao
 
-    def test_codex_tab_default_size_fits_realtime_status_on_first_open(self) -> None:
+    def test_codex_tab_default_size_is_wider_and_content_fit(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
                 ui = WindowsSupporterMainUI(root=object(), startup_manager=object(), monitor=object())
 
-        self.assertEqual(ui._tab_sizes.get(ui._TAB_CODEX), (900, 760))
-        self.assertEqual(ui._tab_minsizes.get(ui._TAB_CODEX), (860, 720))
+        width, height = ui._tab_sizes.get(ui._TAB_CODEX)
+        min_width, min_height = ui._tab_minsizes.get(ui._TAB_CODEX)
+        self.assertGreaterEqual(width, 980)
+        self.assertLessEqual(height, 620)
+        self.assertGreaterEqual(min_width, 940)
+        self.assertLessEqual(min_height, 580)
 
     def test_main_shell_places_version_label_at_bottom_right(self) -> None:
         fake_ttk = _FakeTtk()
