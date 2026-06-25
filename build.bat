@@ -11,6 +11,7 @@ set "BUILD_GENERATED_DIR=build\generated"
 set "BUILD_INFO_MODULE=%BUILD_GENERATED_DIR%\windows_supporter_build_info.py"
 set "VERSION_FILE=%BUILD_GENERATED_DIR%\%EXE_BASE%-version-info.txt"
 set "STEP_LOG=%TEMP%\%EXE_BASE%-build-%RANDOM%%RANDOM%.log"
+set "POST_BUILD_RUN_START_TIMEOUT_SECONDS=60"
 set "SKIP_POST_BUILD_RUN=0"
 if /I "%WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN%"=="1" set "SKIP_POST_BUILD_RUN=1"
 
@@ -232,7 +233,7 @@ if errorlevel 1 exit /b 0
 exit /b 1
 
 :wait_for_process_start
-for /L %%I in (1,1,5) do (
+for /L %%I in (1,1,%POST_BUILD_RUN_START_TIMEOUT_SECONDS%) do (
   call :is_process_running
   if not errorlevel 1 exit /b 0
   call :sleep_one_second
