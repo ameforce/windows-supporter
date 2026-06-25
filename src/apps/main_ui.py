@@ -64,7 +64,7 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP: (1000, 560),
             self._TAB_KAKAO: (700, 340),
             self._TAB_WRIKE: (840, 580),
-            self._TAB_CODEX: (900, 760),
+            self._TAB_CODEX: (1000, 560),
             self._TAB_UPDATE: (760, 420),
         }
         self._tab_minsizes = {
@@ -72,7 +72,7 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP: (940, 520),
             self._TAB_KAKAO: (620, 300),
             self._TAB_WRIKE: (800, 520),
-            self._TAB_CODEX: (860, 720),
+            self._TAB_CODEX: (960, 540),
             self._TAB_UPDATE: (720, 380),
         }
 

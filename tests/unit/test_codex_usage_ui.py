@@ -200,6 +200,28 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(value_label.grid_kwargs.get("sticky"), "w")
         self.assertGreater(int(value_label.kwargs.get("wraplength", 0)), 0)
 
+    def test_account_metric_rows_use_compact_two_cell_layout(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        fake_tk = _FakeTk()
+        view._tk = fake_tk
+
+        metric_vars, _display_vars = view._build_account_metric_rows(
+            parent=object(),
+            bg="#FFFFFF",
+        )
+
+        self.assertIn("captured_at", metric_vars)
+        metric_columns = {label.grid_kwargs.get("column") for label in fake_tk.labels}
+        self.assertEqual(metric_columns, {0, 1})
+        self.assertTrue(all(label.grid_kwargs.get("sticky") == "we" for label in fake_tk.labels))
+        self.assertTrue(
+            all(int(label.kwargs.get("wraplength", 0)) <= 190 for label in fake_tk.labels)
+        )
+
+        captured_display = fake_tk.labels[0].kwargs.get("textvariable")
+        metric_vars["captured_at"].set("2026-06-25 09:07:55")
+        self.assertEqual(captured_display.get(), "최근 확인 시각: 2026-06-25 09:07:55")
+
     def test_on_release_profile_calls_monitor_and_sets_ok_status(self) -> None:
         class _FakeMonitor:
             def __init__(self):
