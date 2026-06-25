@@ -3991,6 +3991,70 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(fake_win32gui.position_calls[-1][2:4], (-32000, -32000))
         self.assertEqual(fake_win32gui.show_calls, [(789, 0)])
 
+    def test_set_windows_visibility_for_pid_hides_all_chrome_windows(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.styles = {
+                    1001: 0x00040000,
+                    1002: 0x00040000,
+                    1003: 0x00040000,
+                }
+                self.position_calls: list[tuple[int, int, int, int, int, int, int]] = []
+                self.show_calls: list[tuple[int, int]] = []
+
+            def GetWindowLong(self, hwnd, _index):
+                return self.styles.get(int(hwnd), 0)
+
+            def SetWindowLong(self, hwnd, _index, value):
+                self.styles[int(hwnd)] = int(value)
+                return int(value)
+
+            def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+                self.position_calls.append(
+                    (
+                        int(hwnd),
+                        int(insert_after),
+                        int(x),
+                        int(y),
+                        int(cx),
+                        int(cy),
+                        int(flags),
+                    )
+                )
+                return True
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    return_value=[1001, 1002, 1003],
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.2,
+                    )
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_win32gui.show_calls, [(1001, 0), (1002, 0), (1003, 0)])
+        self.assertEqual(
+            [call[0] for call in fake_win32gui.position_calls],
+            [1001, 1002, 1003],
+        )
+
     def test_set_windows_visibility_for_pid_restores_without_activating_by_default(self) -> None:
         class _DummyWin32Gui:
             def __init__(self):
@@ -4029,6 +4093,63 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(fake_win32gui.show_calls, [(789, 4)])
         self.assertEqual(fake_win32gui.foreground_calls, [])
+
+    def test_set_windows_visibility_for_pid_foregrounds_only_content_chrome_window(
+        self,
+    ) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.show_calls: list[tuple[int, int]] = []
+                self.foreground_calls: list[int] = []
+                self.classes = {
+                    1001: "Chrome_WidgetWin_0",
+                    1002: "Chrome_WidgetWin_1",
+                    1003: "Chrome_WidgetWin_0",
+                }
+                self.titles = {
+                    1001: "",
+                    1002: "Codex - Chrome",
+                    1003: "Chrome Legacy Window",
+                }
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+            def SetForegroundWindow(self, hwnd):
+                self.foreground_calls.append(int(hwnd))
+                return True
+
+            def GetClassName(self, hwnd):
+                return self.classes.get(int(hwnd), "")
+
+            def GetWindowText(self, hwnd):
+                return self.titles.get(int(hwnd), "")
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    return_value=[1001, 1002, 1003],
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=True,
+                        bring_to_front=True,
+                        timeout_sec=0.2,
+                    )
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_win32gui.show_calls, [(1002, 9)])
+        self.assertEqual(fake_win32gui.foreground_calls, [1002])
 
     def test_set_windows_visibility_for_pid_moves_offscreen_window_on_manual_restore(self) -> None:
         class _DummyWin32Gui:
