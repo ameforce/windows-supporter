@@ -6033,7 +6033,10 @@ class CodexUsageMonitor:
             handles = self.__list_top_windows_for_pid(int(pid))
             if handles:
                 changed = False
-                for hwnd in handles:
+                target_handles = handles
+                if bool(visible):
+                    target_handles = self.__select_windows_for_visible_restore(handles)
+                for hwnd in target_handles:
                     try:
                         if bool(visible):
                             if bool(bring_to_front):
@@ -6070,6 +6073,23 @@ class CodexUsageMonitor:
             except Exception:
                 break
         return False
+
+    def __select_windows_for_visible_restore(self, handles: list[int]) -> list[int]:
+        content_handles: list[int] = []
+        for hwnd in handles:
+            try:
+                class_name = str(self.__lib.win32gui.GetClassName(hwnd) or "")
+            except Exception:
+                class_name = ""
+            try:
+                title = str(self.__lib.win32gui.GetWindowText(hwnd) or "")
+            except Exception:
+                title = ""
+            if class_name == "Chrome_WidgetWin_1" and title.strip():
+                content_handles.append(int(hwnd))
+        if content_handles:
+            return content_handles
+        return handles
 
     def __restore_window_to_visible_area(self, hwnd: int, activate: bool = False) -> None:
         try:
