@@ -3072,7 +3072,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         scheduled = {callback.__name__: delay for delay, callback in root.after_calls}
         self.assertGreaterEqual(scheduled.get("_keepalive_tick", 0), 1000)
-        self.assertGreaterEqual(scheduled.get("_geometry_monitor_tick", 0), 1000)
+        self.assertEqual(scheduled.get("_geometry_monitor_tick"), 500)
 
     def test_refresh_suppresses_overlay_while_fullscreen_is_active(self):
         root = _FakeRoot()
@@ -3265,7 +3265,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertFalse(taskbar_overlay._geometry_changed(previous, current))
 
-    def test_geometry_invalidation_allows_explicit_resample(self):
+    def test_geometry_invalidation_excludes_visible_overlay_without_withdraw_or_sleep(self):
         window = _FakeWindow()
         occupied_calls = []
 
@@ -3283,10 +3283,17 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         overlay.refresh()
         overlay.invalidate_geometry()
-        overlay.refresh()
+        with patch.object(
+            taskbar_overlay,
+            "_current_horizontal_window_span",
+            return_value=(720, 1080),
+        ), patch.object(taskbar_overlay.time, "sleep") as sleep:
+            overlay.refresh()
 
-        self.assertEqual(window.withdraw_calls, 1)
+        self.assertEqual(window.withdraw_calls, 0)
+        sleep.assert_not_called()
         self.assertEqual(len(occupied_calls), 2)
+        self.assertEqual(occupied_calls[-1][3].get("_exclude_spans"), [(720, 1080)])
 
     def test_geometry_monitor_tick_resamples_slot_without_explicit_invalidation(self):
         root = _FakeRoot()
@@ -3320,6 +3327,46 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 2)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
+        expected_width = 1500 - 900 - taskbar_overlay._EMPTY_SLOT_PADDING_PX * 2
+        self.assertIn(
+            f"{expected_width}x",
+            window.geometry_calls[-1],
+        )
+
+    def test_geometry_monitor_tick_hard_resamples_changed_slot_after_scheduled_delay(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 900), (1300, 1920)],
+            [(0, 900), (1500, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[min(len(occupied_calls) - 1, len(spans_by_call) - 1)]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(taskbar_overlay.time, "monotonic", return_value=100.0):
+            overlay.refresh()
+        overlay._last_geometry_hard_resample_at = 100.0
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][0]
+        with patch.object(taskbar_overlay.time, "monotonic", return_value=100.5):
+            geometry_tick()
+
+        self.assertEqual(overlay._last_geometry_hard_resample_at, 100.5)
+        self.assertEqual(len(occupied_calls), 2)
         expected_width = 1500 - 900 - taskbar_overlay._EMPTY_SLOT_PADDING_PX * 2
         self.assertIn(
             f"{expected_width}x",
