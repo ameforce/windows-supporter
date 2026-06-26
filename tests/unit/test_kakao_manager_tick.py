@@ -88,6 +88,24 @@ class KakaoManagerTickUnitTest(unittest.TestCase):
 
         request_background.assert_called_once()
 
+    def test_tick_dispatches_again_after_normal_monitor_scheduler_interval(self) -> None:
+        request_background = Mock()
+        self.manager._KakaoManager__request_background_tick = request_background
+
+        with patch.object(
+            self.manager._KakaoManager__lib.time,
+            "monotonic",
+            side_effect=(10.0, 10.14, 10.20),
+        ):
+            self.manager.tick(root=object())
+            self.assertEqual(request_background.call_count, 1)
+
+            self.manager.tick(root=object())
+            self.assertEqual(request_background.call_count, 1)
+
+            self.manager.tick(root=object())
+            self.assertEqual(request_background.call_count, 2)
+
     def test_update_settings_disables_background_tick(self) -> None:
         request_background = Mock()
         self.manager._KakaoManager__request_background_tick = request_background
