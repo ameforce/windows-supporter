@@ -82,7 +82,7 @@ class KakaoManager:
         self.__process_name = "KakaoTalk.exe"
         self.__main_title = "카카오톡"
 
-        self.__poll_interval_sec = 0.35
+        self.__poll_interval_sec = 0.15
         self.__pid_scan_interval_sec = 2.0
         self.__monitor_scan_interval_sec = 5.0
 
