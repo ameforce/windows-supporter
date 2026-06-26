@@ -47,8 +47,8 @@ _OCCUPIED_DILATION_PX = 24
 _FLASH_DURATION_SEC = 1.0
 _FLASH_TICK_MS = 1000
 _KEEPALIVE_TICK_MS = 2000
-_GEOMETRY_MONITOR_TICK_MS = 3000
-_GEOMETRY_MONITOR_HARD_RESAMPLE_SEC = 3.0
+_GEOMETRY_MONITOR_TICK_MS = 500
+_GEOMETRY_MONITOR_HARD_RESAMPLE_SEC = 0.5
 _GEOMETRY_CHANGE_TOLERANCE_PX = 2
 _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX = _OCCUPIED_DILATION_PX
 _FULLSCREEN_POLL_MS = 500
@@ -1308,7 +1308,14 @@ class CodexUsageTaskbarOverlay:
     ) -> list[tuple[int, int]] | None:
         window = self._window
         sampling_geometry = dict(geometry)
-        if window is not None and bool(withdraw_window):
+        exclude_span = (
+            _current_horizontal_window_span(window)
+            if window is not None and bool(self._window_visible)
+            else None
+        )
+        if exclude_span is not None:
+            sampling_geometry["_exclude_spans"] = [exclude_span]
+        elif window is not None and bool(withdraw_window):
             try:
                 window.withdraw()
                 updater = getattr(self._root, "update_idletasks", None)
@@ -1317,10 +1324,6 @@ class CodexUsageTaskbarOverlay:
                 time.sleep(0.035)
             except Exception:
                 pass
-        elif window is not None:
-            exclude_span = _current_horizontal_window_span(window)
-            if exclude_span is not None:
-                sampling_geometry["_exclude_spans"] = [exclude_span]
         try:
             return self._occupied_span_getter(width, height, work_area, sampling_geometry)
         except Exception:
