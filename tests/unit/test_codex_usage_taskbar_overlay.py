@@ -1826,6 +1826,184 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(geometry["x"], 1440)
         self.assertLessEqual(geometry["x"] + geometry["width"], 1976)
 
+    def test_taskbar_geometry_telemetry_reports_source_specific_spans_and_basis(self):
+        class _FakeWin32Gui:
+            windows = {
+                10: ("ReBarWindow32", (100, 560, 260, 600), True),
+                11: ("TrayNotifyWnd", (820, 560, 960, 600), True),
+            }
+
+            def FindWindow(self, class_name, _title):
+                return 1 if class_name == "Shell_TrayWnd" else 0
+
+            def EnumChildWindows(self, _hwnd, callback, extra):
+                for hwnd in self.windows:
+                    callback(hwnd, extra)
+
+            def GetClassName(self, hwnd):
+                return self.windows[int(hwnd)][0]
+
+            def IsWindowVisible(self, hwnd):
+                return self.windows[int(hwnd)][2]
+
+            def GetWindowRect(self, hwnd):
+                return self.windows[int(hwnd)][1]
+
+        background = [(24, 24, 24)] * 5
+        control = [(240, 240, 240)] * 5
+        columns = [(x, control if x == 480 else background) for x in range(0, 1000, 40)]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "win32gui",
+            _FakeWin32Gui(),
+        ), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=columns,
+        ):
+            spans, telemetry = taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                1000,
+                600,
+                (0, 0, 1000, 560),
+                {"orientation": "bottom"},
+            )
+
+        self.assertIsNotNone(spans)
+        self.assertEqual(telemetry["coordinate_basis"], "physical_px")
+        self.assertIn("ReBarWindow32", telemetry["child_spans_by_class"])
+        self.assertIn("TrayNotifyWnd", telemetry["child_spans_by_class"])
+        self.assertEqual(
+            telemetry["child_spans_by_class"]["ReBarWindow32"][0]["raw_basis"],
+            "global_physical_px",
+        )
+        self.assertEqual(telemetry["pixel_spans"][0]["coordinate_basis"], "physical_px")
+        self.assertEqual(telemetry["edge_guards"][0]["span"][0], 0)
+        self.assertTrue(telemetry["merged_occupied_spans"])
+
+    def test_local_taskbar_snapshot_schema_is_debug_only(self):
+        sample = {
+            "coordinate_basis": "physical_px",
+            "monitor_rect": [0, 0, 1000, 600],
+            "work_area": {"normalized": [0, 0, 1000, 560]},
+            "taskbar_rect": [0, 560, 1000, 600],
+            "taskbar_hwnd": 1,
+            "child_spans_by_class": {},
+            "pixel_spans": [],
+            "edge_guards": [],
+            "merged_occupied_spans": [],
+            "free_spans": [[8, 992]],
+            "padded_free_spans": [[8, 992]],
+            "preferred_width": None,
+            "chosen_geometry": {
+                "x": 120,
+                "y": 561,
+                "width": 460,
+                "height": 38,
+                "orientation": "bottom",
+                "visible": True,
+            },
+            "dpi": {"scale_x": 1.0, "scale_y": 1.0},
+            "theme": {"name": "unknown"},
+            "icon_alignment": "unknown",
+            "conversions": {},
+        }
+
+        with patch.object(
+            taskbar_overlay,
+            "_collect_local_taskbar_overlay_geometry_sample",
+            return_value=sample,
+        ), patch.object(taskbar_overlay.time, "sleep") as sleep:
+            snapshot = taskbar_overlay.capture_local_taskbar_overlay_geometry_snapshot(
+                sample_count=2,
+                sample_interval_sec=0,
+            )
+
+        self.assertEqual(snapshot["coordinate_basis"], "physical_px")
+        self.assertEqual(len(snapshot["samples"]), 2)
+        self.assertTrue(snapshot["repeated_sample_stability"]["stable"])
+        self.assertEqual(snapshot["chosen_geometry"], sample["chosen_geometry"])
+        sleep.assert_not_called()
+
+    def test_taskbar_child_spans_convert_from_global_physical_to_monitor_physical(self):
+        class _FakeWin32Gui:
+            windows = {
+                20: ("MSTaskSwWClass", (2020, 1040, 2220, 1080), True),
+            }
+
+            def EnumChildWindows(self, _hwnd, callback, extra):
+                for hwnd in self.windows:
+                    callback(hwnd, extra)
+
+            def GetClassName(self, hwnd):
+                return self.windows[int(hwnd)][0]
+
+            def IsWindowVisible(self, hwnd):
+                return self.windows[int(hwnd)][2]
+
+            def GetWindowRect(self, hwnd):
+                return self.windows[int(hwnd)][1]
+
+        with patch.object(taskbar_overlay, "win32gui", _FakeWin32Gui()):
+            records = taskbar_overlay._taskbar_child_occupied_span_records(
+                1920,
+                1040,
+                1080,
+                taskbar_hwnd=20,
+                origin_x=1920,
+            )
+
+        self.assertEqual(records[0]["span"], (100, 300))
+        self.assertEqual(records[0]["raw_rect"], (2020, 1040, 2220, 1080))
+        self.assertEqual(records[0]["raw_basis"], "global_physical_px")
+        self.assertEqual(records[0]["conversion"]["origin_x"], 1920)
+
+    def test_pixel_sample_spans_record_physical_basis(self):
+        background = [(24, 24, 24)] * 5
+        control = [(240, 240, 240)] * 5
+        columns = [(x, control if x == 320 else background) for x in range(0, 800, 40)]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=columns,
+        ):
+            _spans, telemetry = taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                800,
+                600,
+                (0, 0, 800, 560),
+                {"orientation": "bottom"},
+            )
+
+        pixel_spans = telemetry["pixel_spans"]
+        self.assertTrue(pixel_spans)
+        self.assertEqual(pixel_spans[0]["raw_basis"], "monitor_local_physical_px")
+        self.assertEqual(pixel_spans[0]["coordinate_basis"], "physical_px")
+        self.assertLessEqual(pixel_spans[0]["span"][0], 320)
+        self.assertGreater(pixel_spans[0]["span"][1], 320)
+
+    def test_work_area_conversion_records_logical_to_physical_scale(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            {
+                "left": 0,
+                "top": 0,
+                "right": 960,
+                "bottom": 520,
+                "coordinate_basis": "logical_px",
+                "scale": 2,
+            },
+            occupied_spans=[(0, 900), (1500, 1920)],
+            include_telemetry=True,
+        )
+
+        telemetry = geometry["_telemetry"]
+        self.assertEqual(telemetry["coordinate_basis"], "physical_px")
+        self.assertEqual(telemetry["work_area"]["normalized"], (0, 0, 1920, 1040))
+        self.assertEqual(telemetry["work_area"]["raw_basis"], "logical_px")
+        self.assertEqual(telemetry["work_area"]["conversion"]["scale_x"], 2.0)
+
     def test_subtract_spans_preserves_all_non_overlapping_fragments(self):
         spans = [(100, 200), (300, 400), (500, 650)]
 
@@ -2392,6 +2570,125 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["width"], 176)
         self.assertEqual(geometry["x"], 788)
+
+    def test_bottom_taskbar_geometry_repeats_same_result_for_same_physical_inputs(self):
+        kwargs = {
+            "screen_width": 1200,
+            "screen_height": 600,
+            "work_area": (0, 0, 1200, 560),
+            "occupied_spans": [(0, 120), (520, 720), (1040, 1200)],
+            "preferred_width": 420,
+            "include_telemetry": True,
+        }
+
+        first = calculate_taskbar_overlay_geometry(**kwargs)
+        second = calculate_taskbar_overlay_geometry(**kwargs)
+
+        for key in ("x", "width", "visible"):
+            self.assertEqual(first[key], second[key])
+        self.assertEqual(first["_telemetry"]["coordinate_basis"], "physical_px")
+        self.assertEqual(first["_telemetry"]["padded_free_spans"], second["_telemetry"]["padded_free_spans"])
+
+    def test_taskbar_geometry_telemetry_keeps_raw_and_normalized_spans_separate(self):
+        raw_spans = [(900, 1100), (-50, 100), (80, 180)]
+
+        geometry = calculate_taskbar_overlay_geometry(
+            1000,
+            600,
+            (0, 0, 1000, 560),
+            occupied_spans=raw_spans,
+            include_telemetry=True,
+        )
+
+        telemetry = geometry["_telemetry"]
+        self.assertEqual(telemetry["raw_occupied_spans"], raw_spans)
+        self.assertEqual(telemetry["normalized_occupied_spans"], ((0, 180), (900, 1000)))
+        self.assertEqual(telemetry["merged_occupied_spans"], ((0, 180), (900, 1000)))
+        self.assertEqual(telemetry["padded_free_spans"], ((188, 892),))
+
+    def test_bottom_taskbar_geometry_hides_at_padded_slot_175_and_shows_at_176(self):
+        hidden = calculate_taskbar_overlay_geometry(
+            1000,
+            600,
+            (0, 0, 1000, 560),
+            occupied_spans=[(0, 100), (291, 1000)],
+            include_telemetry=True,
+        )
+        visible = calculate_taskbar_overlay_geometry(
+            1000,
+            600,
+            (0, 0, 1000, 560),
+            occupied_spans=[(0, 100), (292, 1000)],
+            include_telemetry=True,
+        )
+
+        self.assertFalse(hidden["visible"])
+        self.assertEqual(hidden["width"], 0)
+        self.assertEqual(hidden["_telemetry"]["selected_slot"]["available_width"], 175)
+        self.assertTrue(visible["visible"])
+        self.assertEqual(visible["width"], 176)
+        self.assertEqual(visible["_telemetry"]["selected_slot"]["available_width"], 176)
+
+    def test_bottom_taskbar_geometry_uses_rightmost_usable_slot_when_tail_slot_is_too_small(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            2000,
+            600,
+            (0, 0, 2000, 560),
+            occupied_spans=[(0, 92), (436, 1888)],
+            include_telemetry=True,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["x"], 100)
+        self.assertEqual(geometry["width"], 328)
+        self.assertEqual(geometry["_telemetry"]["selected_slot"]["span"], (100, 428))
+        self.assertEqual(geometry["_telemetry"]["selected_slot"]["classification"], "compact")
+
+    def test_bottom_taskbar_geometry_marks_status_threshold_at_419_420(self):
+        compact = calculate_taskbar_overlay_geometry(
+            1000,
+            600,
+            (0, 0, 1000, 560),
+            occupied_spans=[(0, 100), (535, 1000)],
+            preferred_width=420,
+            include_telemetry=True,
+        )
+        status_text = calculate_taskbar_overlay_geometry(
+            1000,
+            600,
+            (0, 0, 1000, 560),
+            occupied_spans=[(0, 100), (536, 1000)],
+            preferred_width=420,
+            include_telemetry=True,
+        )
+
+        self.assertEqual(compact["width"], 419)
+        self.assertEqual(compact["_telemetry"]["selected_slot"]["classification"], "compact")
+        self.assertEqual(status_text["width"], 420)
+        self.assertEqual(status_text["_telemetry"]["selected_slot"]["classification"], "status_text")
+
+    def test_bottom_taskbar_geometry_marks_text_friendly_threshold_at_559_560(self):
+        status_text = calculate_taskbar_overlay_geometry(
+            1200,
+            600,
+            (0, 0, 1200, 560),
+            occupied_spans=[(0, 100), (675, 1200)],
+            preferred_width=760,
+            include_telemetry=True,
+        )
+        text_friendly = calculate_taskbar_overlay_geometry(
+            1200,
+            600,
+            (0, 0, 1200, 560),
+            occupied_spans=[(0, 100), (676, 1200)],
+            preferred_width=760,
+            include_telemetry=True,
+        )
+
+        self.assertEqual(status_text["width"], 559)
+        self.assertEqual(status_text["_telemetry"]["selected_slot"]["classification"], "status_text")
+        self.assertEqual(text_friendly["width"], 560)
+        self.assertEqual(text_friendly["_telemetry"]["selected_slot"]["classification"], "text_friendly")
 
     def test_bottom_taskbar_geometry_ignores_preferred_width_without_occupied_spans(self):
         baseline = calculate_taskbar_overlay_geometry(
@@ -3124,7 +3421,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         overlay.refresh()
 
         self.assertEqual(window.withdraw_calls, 0)
-        self.assertEqual(len(occupied_calls), 1)
+        self.assertEqual(len(occupied_calls), 2)
+        self.assertEqual(len(window.geometry_calls), 1)
 
     def test_refresh_keeps_unchanged_visible_window_still(self):
         window = _FakeWindow()
@@ -3238,6 +3536,113 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(len(occupied_calls), 2)
         self.assertIn("420x", window.geometry_calls[0])
         self.assertIn("360x", window.geometry_calls[1])
+
+    def test_refresh_resamples_when_measured_spans_change_under_same_base_context(self):
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 900), (1500, 1920)],
+            [(0, 900), (1600, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=760,
+            create=True,
+        ):
+            overlay.refresh()
+            overlay.refresh()
+
+        self.assertEqual(len(occupied_calls), 2)
+        self.assertIn("684x", window.geometry_calls[-1])
+
+    def test_transient_stabilizer_accepts_real_coordinate_basis_change(self):
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+        )
+        previous_context = overlay._geometry_context(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            {"orientation": "bottom"},
+            preferred_width=760,
+            occupied_spans=[(0, 900), (1700, 1920)],
+            coordinate_basis="logical_px",
+        )
+        candidate_context = overlay._geometry_context(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            {"orientation": "bottom"},
+            preferred_width=760,
+            occupied_spans=[(0, 900), (1400, 1920)],
+            coordinate_basis="physical_px",
+        )
+        previous_geometry = {
+            "visible": True,
+            "orientation": "bottom",
+            "x": 908,
+            "y": 1041,
+            "width": 760,
+            "height": 38,
+        }
+        candidate_geometry = dict(previous_geometry, x=908, width=484)
+
+        stabilized = overlay._stabilize_transient_geometry_regression(
+            previous_geometry,
+            candidate_geometry,
+            previous_context=previous_context,
+            candidate_context=candidate_context,
+        )
+
+        self.assertNotEqual(previous_context, candidate_context)
+        self.assertEqual(stabilized, candidate_geometry)
+
+    def test_geometry_cache_key_includes_normalized_occupied_span_signature(self):
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+        )
+
+        first = overlay._geometry_context(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            {"orientation": "bottom"},
+            preferred_width=760,
+            occupied_spans=[(0, 900), (1500, 1920)],
+            coordinate_basis="physical_px",
+        )
+        second = overlay._geometry_context(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            {"orientation": "bottom"},
+            preferred_width=760,
+            occupied_spans=[(0, 900), (1600, 1920)],
+            coordinate_basis="physical_px",
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertIn(("occupied_spans", ((0, 900), (1500, 1920))), first)
+        self.assertIn(("free_spans", ((908, 1492),)), first)
 
     def test_geometry_changed_detects_status_text_threshold_crossing(self):
         previous = {
