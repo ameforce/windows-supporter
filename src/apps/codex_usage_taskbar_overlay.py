@@ -7,6 +7,19 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from src.apps.codex_usage_taskbar_targets import (
+    TaskbarMonitorSnapshot,
+    TaskbarOverlayTarget,
+    TaskbarWindowSnapshot,
+    build_taskbar_overlay_targets,
+    globalize_geometry,
+    local_work_area,
+    monitor_size,
+    normalize_rect,
+    parse_display_num,
+    target_cache_key,
+)
+
 try:
     from ctypes import wintypes
 except Exception:  # pragma: no cover - non-CPython fallback.
@@ -744,6 +757,7 @@ class CodexUsageTaskbarOverlay:
         ]
         | None = None,
         fullscreen_detector: Callable[[Any | None], bool] | None = None,
+        taskbar_target_getter: Callable[[], tuple[TaskbarOverlayTarget, ...]] | None = None,
     ) -> None:
         self._root = root
         self._runtime_getter = runtime_getter
@@ -753,6 +767,7 @@ class CodexUsageTaskbarOverlay:
             occupied_span_getter or _detect_horizontal_taskbar_occupied_spans
         )
         self._fullscreen_detector = fullscreen_detector
+        self._taskbar_target_getter = taskbar_target_getter
         self._window = None
         self._canvas = None
         self._last_metric_values: dict[str, str] = {}
@@ -770,6 +785,7 @@ class CodexUsageTaskbarOverlay:
         self._pending_regression_count = 0
         self._fullscreen_suppressed = False
         self._window_visible = False
+        self._active_taskbar_hwnd = 0
         return
 
     def refresh(self) -> bool:
@@ -1201,6 +1217,178 @@ class CodexUsageTaskbarOverlay:
         withdraw_for_sampling: bool = True,
         preferred_width: int | None = None,
     ) -> dict[str, int | str]:
+        target_geometry = self._calculate_monitor_target_geometry(
+            force_resample=force_resample,
+            withdraw_for_sampling=withdraw_for_sampling,
+            preferred_width=preferred_width,
+        )
+        if target_geometry is not None:
+            return target_geometry
+        return self._calculate_root_geometry(
+            force_resample=force_resample,
+            withdraw_for_sampling=withdraw_for_sampling,
+            preferred_width=preferred_width,
+        )
+
+    def _calculate_monitor_target_geometry(
+        self,
+        *,
+        force_resample: bool,
+        withdraw_for_sampling: bool,
+        preferred_width: int | None,
+    ) -> dict[str, int | str] | None:
+        targets = self._collect_taskbar_targets_for_geometry()
+        if not targets:
+            return None
+        primary = next((target for target in targets if target.is_primary), targets[0])
+        overlay_hwnd = _get_window_handle(self._window) if self._window is not None else 0
+        if overlay_hwnd <= 0:
+            overlay_hwnd = _get_window_handle(self._root)
+        primary_fullscreen = _is_monitor_fullscreen(
+            primary.monitor.monitor,
+            int(overlay_hwnd),
+            self._root,
+        )
+        if not primary_fullscreen:
+            return None
+        for target in targets:
+            if target.is_primary or not bool(target.displayable):
+                continue
+            if _is_monitor_fullscreen(target.monitor.monitor, int(overlay_hwnd), self._root):
+                continue
+            geometry = self._calculate_geometry_for_target(
+                target,
+                force_resample=force_resample,
+                withdraw_for_sampling=withdraw_for_sampling,
+                preferred_width=preferred_width,
+            )
+            if bool(geometry.get("visible", True)):
+                return geometry
+        hidden = {
+            "x": int(primary.monitor.monitor[0]),
+            "y": int(primary.monitor.monitor[1]),
+            "width": 0,
+            "height": 0,
+            "orientation": "bottom",
+            "visible": False,
+        }
+        self._cached_geometry_context = (
+            "monitor-target-hidden",
+            target_cache_key(primary),
+            int(preferred_width or 0),
+        )
+        self._cached_geometry = dict(hidden)
+        self._geometry_invalidated = False
+        return hidden
+
+    def _collect_taskbar_targets_for_geometry(self) -> tuple[TaskbarOverlayTarget, ...]:
+        if callable(self._taskbar_target_getter):
+            try:
+                return tuple(self._taskbar_target_getter())
+            except Exception:
+                return ()
+        if (
+            self._work_area_getter is not _get_primary_work_area
+            or self._occupied_span_getter is not _detect_horizontal_taskbar_occupied_spans
+        ):
+            return ()
+        return _collect_taskbar_overlay_targets()
+
+    def _calculate_geometry_for_target(
+        self,
+        target: TaskbarOverlayTarget,
+        *,
+        force_resample: bool,
+        withdraw_for_sampling: bool,
+        preferred_width: int | None,
+    ) -> dict[str, int | str]:
+        width, height = monitor_size(target.monitor)
+        work_area = local_work_area(target.monitor)
+        geometry = calculate_taskbar_overlay_geometry(
+            width,
+            height,
+            work_area,
+            preferred_width=preferred_width,
+        )
+        context = self._target_geometry_context(
+            target,
+            width,
+            height,
+            work_area,
+            geometry,
+            preferred_width=preferred_width,
+        )
+        if (
+            not bool(force_resample)
+            and not bool(self._geometry_invalidated)
+            and self._cached_geometry_context == context
+            and isinstance(self._cached_geometry, dict)
+        ):
+            return dict(self._cached_geometry)
+        if str(geometry.get("orientation") or "") in {"bottom", "top"}:
+            sampling_geometry = self._sampling_geometry_for_target(geometry, target)
+            occupied_spans = self._calculate_occupied_spans(
+                width,
+                height,
+                work_area,
+                sampling_geometry,
+                withdraw_window=withdraw_for_sampling,
+            )
+            if occupied_spans is not None:
+                geometry = calculate_taskbar_overlay_geometry(
+                    width,
+                    height,
+                    work_area,
+                    occupied_spans=occupied_spans,
+                    preferred_width=preferred_width,
+                )
+        fitted = globalize_geometry(geometry, target.monitor)
+        fitted["_taskbar_hwnd"] = int(target.taskbar_hwnd)
+        self._cached_geometry_context = context
+        self._cached_geometry = dict(fitted)
+        self._geometry_invalidated = False
+        return fitted
+
+    def _target_geometry_context(
+        self,
+        target: TaskbarOverlayTarget,
+        width: int,
+        height: int,
+        work_area: tuple[int, int, int, int],
+        geometry: dict[str, int | str],
+        *,
+        preferred_width: int | None = None,
+    ) -> tuple[Any, ...]:
+        return (
+            "monitor-target",
+            target_cache_key(target),
+            self._geometry_context(
+                width,
+                height,
+                work_area,
+                geometry,
+                preferred_width=preferred_width,
+            ),
+        )
+
+    def _sampling_geometry_for_target(
+        self,
+        geometry: dict[str, int | str],
+        target: TaskbarOverlayTarget,
+    ) -> dict[str, int | str]:
+        sampling_geometry = dict(geometry)
+        sampling_geometry["_screen_origin_x"] = int(target.monitor.monitor[0])
+        sampling_geometry["_screen_origin_y"] = int(target.monitor.monitor[1])
+        sampling_geometry["_taskbar_hwnd"] = int(target.taskbar_hwnd)
+        return sampling_geometry
+
+    def _calculate_root_geometry(
+        self,
+        *,
+        force_resample: bool = False,
+        withdraw_for_sampling: bool = True,
+        preferred_width: int | None = None,
+    ) -> dict[str, int | str]:
         width = _root_int(self._root, "winfo_screenwidth", 1920)
         height = _root_int(self._root, "winfo_screenheight", 1080)
         try:
@@ -1308,13 +1496,19 @@ class CodexUsageTaskbarOverlay:
     ) -> list[tuple[int, int]] | None:
         window = self._window
         sampling_geometry = dict(geometry)
+        try:
+            origin_x = int(sampling_geometry.get("_screen_origin_x", 0) or 0)
+        except Exception:
+            origin_x = 0
         exclude_span = (
             _current_horizontal_window_span(window)
             if window is not None and bool(self._window_visible)
             else None
         )
         if exclude_span is not None:
-            sampling_geometry["_exclude_spans"] = [exclude_span]
+            sampling_geometry["_exclude_spans"] = [
+                (int(exclude_span[0]) - origin_x, int(exclude_span[1]) - origin_x)
+            ]
         elif window is not None and bool(withdraw_window):
             try:
                 window.withdraw()
@@ -1370,6 +1564,10 @@ class CodexUsageTaskbarOverlay:
         return window
 
     def _apply_geometry(self, window: Any, geometry: dict[str, int | str]) -> None:
+        try:
+            self._active_taskbar_hwnd = int(geometry.get("_taskbar_hwnd", 0) or 0)
+        except Exception:
+            self._active_taskbar_hwnd = 0
         self._prepare_native_window(window)
         x = int(geometry.get("x", 0))
         y = int(geometry.get("y", 0))
@@ -1630,10 +1828,12 @@ class CodexUsageTaskbarOverlay:
     def _bind_native_owner_to_taskbar(self, hwnd: int) -> None:
         if hwnd <= 0 or win32gui is None or not hasattr(ctypes, "windll"):
             return
-        try:
-            taskbar_hwnd = int(win32gui.FindWindow("Shell_TrayWnd", None) or 0)
-        except Exception:
-            taskbar_hwnd = 0
+        taskbar_hwnd = int(self._active_taskbar_hwnd or 0)
+        if taskbar_hwnd <= 0:
+            try:
+                taskbar_hwnd = int(win32gui.FindWindow("Shell_TrayWnd", None) or 0)
+            except Exception:
+                taskbar_hwnd = 0
         if taskbar_hwnd <= 0 or taskbar_hwnd == int(hwnd):
             return
         try:
@@ -2086,6 +2286,18 @@ def _detect_horizontal_taskbar_occupied_spans(
 ) -> list[tuple[int, int]] | None:
     if not hasattr(ctypes, "windll"):
         return None
+    try:
+        origin_x = int(geometry.get("_screen_origin_x", 0) or 0)
+    except Exception:
+        origin_x = 0
+    try:
+        origin_y = int(geometry.get("_screen_origin_y", 0) or 0)
+    except Exception:
+        origin_y = 0
+    try:
+        taskbar_hwnd = int(geometry.get("_taskbar_hwnd", 0) or 0)
+    except Exception:
+        taskbar_hwnd = 0
     left, top, right, bottom = _normalize_work_area(work_area, screen_width, screen_height)
     orientation = str(geometry.get("orientation") or "")
     if orientation == "bottom":
@@ -2102,13 +2314,20 @@ def _detect_horizontal_taskbar_occupied_spans(
     excluded_spans = _geometry_exclude_spans(geometry, int(screen_width))
     occupied = _taskbar_child_occupied_spans(
         int(screen_width),
-        int(band_top),
-        int(band_bottom),
+        int(band_top) + origin_y,
+        int(band_bottom) + origin_y,
+        taskbar_hwnd=taskbar_hwnd,
+        origin_x=origin_x,
     )
     if excluded_spans:
         occupied = _subtract_spans(occupied, excluded_spans)
     sample_rows = _taskbar_sample_rows(band_top, band_bottom)
-    columns = _sample_taskbar_columns(int(screen_width), sample_rows)
+    columns = _sample_taskbar_columns(
+        int(screen_width),
+        sample_rows,
+        origin_x=origin_x,
+        origin_y=origin_y,
+    )
     if not columns and not occupied:
         return None
     if columns:
@@ -2139,13 +2358,17 @@ def _taskbar_child_occupied_spans(
     screen_width: int,
     band_top: int,
     band_bottom: int,
+    *,
+    taskbar_hwnd: int = 0,
+    origin_x: int = 0,
 ) -> list[tuple[int, int]]:
     if win32gui is None:
         return []
-    try:
-        taskbar_hwnd = int(win32gui.FindWindow("Shell_TrayWnd", None) or 0)
-    except Exception:
-        return []
+    if int(taskbar_hwnd) <= 0:
+        try:
+            taskbar_hwnd = int(win32gui.FindWindow("Shell_TrayWnd", None) or 0)
+        except Exception:
+            return []
     if taskbar_hwnd <= 0:
         return []
 
@@ -2172,8 +2395,8 @@ def _taskbar_child_occupied_spans(
         vertical_overlap = min(int(bottom), int(band_bottom)) - max(int(top), int(band_top))
         if vertical_overlap < 8:
             return True
-        start = max(0, min(int(screen_width), int(left)))
-        end = max(0, min(int(screen_width), int(right)))
+        start = max(0, min(int(screen_width), int(left) - int(origin_x)))
+        end = max(0, min(int(screen_width), int(right) - int(origin_x)))
         if end - start >= 8:
             spans.append((start, end))
         return True
@@ -2197,13 +2420,21 @@ def _taskbar_sample_rows(band_top: int, band_bottom: int) -> list[int]:
 def _sample_taskbar_columns(
     screen_width: int,
     sample_rows: list[int],
+    *,
+    origin_x: int = 0,
+    origin_y: int = 0,
 ) -> list[tuple[int, list[tuple[int, int, int]]]]:
     if not sample_rows or screen_width <= 0:
         return []
     capture_top = min(sample_rows)
     capture_bottom = max(sample_rows) + 1
     capture_height = max(1, capture_bottom - capture_top)
-    pixels = _capture_screen_region_bgra(0, capture_top, int(screen_width), capture_height)
+    pixels = _capture_screen_region_bgra(
+        int(origin_x),
+        int(origin_y) + capture_top,
+        int(screen_width),
+        capture_height,
+    )
     if pixels is None:
         return []
 
@@ -2347,6 +2578,114 @@ def _column_looks_occupied(
         for index in range(3)
     )
     return _rgb_distance(average, background) >= 52
+
+
+def _collect_taskbar_overlay_targets() -> tuple[TaskbarOverlayTarget, ...]:
+    if win32api is None or win32gui is None or win32con is None:
+        return ()
+    enum_monitors = getattr(win32api, "EnumDisplayMonitors", None)
+    if not callable(enum_monitors):
+        return ()
+    monitors: list[TaskbarMonitorSnapshot] = []
+    try:
+        for hmon, _hdc, _rect in enum_monitors(None, None):
+            info = win32api.GetMonitorInfo(hmon)
+            monitor_rect = normalize_rect(info.get("Monitor"))
+            work_rect = normalize_rect(info.get("Work"))
+            if monitor_rect is None or work_rect is None:
+                continue
+            device = str(info.get("Device") or "")
+            flags = int(info.get("Flags", 0) or 0)
+            monitors.append(
+                TaskbarMonitorSnapshot(
+                    handle=int(hmon or 0),
+                    device=device,
+                    display_num=parse_display_num(device),
+                    is_primary=bool(
+                        flags & int(getattr(win32con, "MONITORINFOF_PRIMARY", 1))
+                    ),
+                    monitor=monitor_rect,
+                    work=work_rect,
+                )
+            )
+    except Exception:
+        return ()
+    if not monitors:
+        return ()
+    return build_taskbar_overlay_targets(monitors, _collect_taskbar_windows())
+
+
+def _collect_taskbar_windows() -> tuple[TaskbarWindowSnapshot, ...]:
+    if win32gui is None:
+        return ()
+    taskbars: dict[int, TaskbarWindowSnapshot] = {}
+
+    def add(hwnd: int) -> None:
+        snapshot = _taskbar_window_snapshot(hwnd)
+        if snapshot is not None:
+            taskbars[int(snapshot.hwnd)] = snapshot
+
+    try:
+        add(int(win32gui.FindWindow("Shell_TrayWnd", None) or 0))
+    except Exception:
+        pass
+    enum_windows = getattr(win32gui, "EnumWindows", None)
+    if callable(enum_windows):
+        def visit(hwnd: int, _extra: Any) -> bool:
+            add(int(hwnd))
+            return True
+
+        try:
+            enum_windows(visit, None)
+        except Exception:
+            pass
+    return tuple(taskbars.values())
+
+
+def _taskbar_window_snapshot(hwnd: int) -> TaskbarWindowSnapshot | None:
+    hwnd = int(hwnd or 0)
+    if hwnd <= 0 or win32gui is None:
+        return None
+    try:
+        class_name = str(win32gui.GetClassName(hwnd) or "")
+    except Exception:
+        return None
+    if class_name not in {"Shell_TrayWnd", "Shell_SecondaryTrayWnd"}:
+        return None
+    rect = normalize_rect(_safe_window_rect(hwnd))
+    if rect is None:
+        return None
+    try:
+        visible = bool(win32gui.IsWindowVisible(hwnd))
+    except Exception:
+        visible = False
+    return TaskbarWindowSnapshot(
+        hwnd=hwnd,
+        class_name=class_name,
+        rect=rect,
+        visible=visible,
+    )
+
+
+def _safe_window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    try:
+        return tuple(int(v) for v in win32gui.GetWindowRect(int(hwnd)))[:4]
+    except Exception:
+        return None
+
+
+def _is_monitor_fullscreen(
+    monitor_rect: tuple[int, int, int, int],
+    overlay_hwnd: int,
+    root: Any | None,
+) -> bool:
+    if win32gui is None or win32con is None:
+        return False
+    return _visible_fullscreen_window_exists(
+        int(overlay_hwnd),
+        root,
+        tuple(int(v) for v in monitor_rect),
+    )
 
 
 def _is_foreground_fullscreen(
