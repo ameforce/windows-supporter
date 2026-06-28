@@ -49,6 +49,7 @@ _DEFAULT_GEOMETRY = {
     "visible": True,
 }
 
+_GEOMETRY_COORDINATE_BASIS = "physical_px"
 _EMPTY_SLOT_PADDING_PX = 8
 _MIN_EMPTY_SLOT_WIDTH_PX = 300
 _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX = 176
@@ -310,10 +311,16 @@ def calculate_taskbar_overlay_geometry(
     *,
     occupied_spans: list[tuple[int, int]] | None = None,
     preferred_width: int | None = None,
-) -> dict[str, int | str]:
+    include_telemetry: bool = False,
+) -> dict[str, Any]:
     screen_width = max(320, int(screen_width or 0))
     screen_height = max(240, int(screen_height or 0))
-    left, top, right, bottom = _normalize_work_area(work_area, screen_width, screen_height)
+    work_area_rect, work_area_telemetry = _normalize_work_area_with_metadata(
+        work_area,
+        screen_width,
+        screen_height,
+    )
+    left, top, right, bottom = work_area_rect
     width = min(max(640, int(screen_width * 0.46)), 900, screen_width - 24)
     height = 38
 
@@ -329,12 +336,16 @@ def calculate_taskbar_overlay_geometry(
             "height": int(height),
             "orientation": "bottom",
             "visible": True,
+            "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+            "_geometry_basis": "monitor_local_physical_px",
         }
         return _fit_horizontal_geometry_to_empty_slot(
             geometry,
             int(screen_width),
             occupied_spans,
             preferred_width=preferred_width,
+            work_area_telemetry=work_area_telemetry,
+            include_telemetry=include_telemetry,
         )
     if top > 0:
         band_height = max(1, top)
@@ -348,36 +359,66 @@ def calculate_taskbar_overlay_geometry(
             "height": int(height),
             "orientation": "top",
             "visible": True,
+            "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+            "_geometry_basis": "monitor_local_physical_px",
         }
         return _fit_horizontal_geometry_to_empty_slot(
             geometry,
             int(screen_width),
             occupied_spans,
             preferred_width=preferred_width,
+            work_area_telemetry=work_area_telemetry,
+            include_telemetry=include_telemetry,
         )
     if left > 0:
         width = max(1, min(320, left - 2))
         height = min(86, max(58, int(screen_height * 0.12)))
-        return {
+        geometry = {
             "x": max(0, min(left - width, (left - width) // 2)),
             "y": max(8, screen_height - height - 8),
             "width": int(width),
             "height": int(height),
             "orientation": "left",
             "visible": True,
+            "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+            "_geometry_basis": "monitor_local_physical_px",
         }
+        if include_telemetry:
+            geometry["_telemetry"] = _geometry_telemetry(
+                screen_width,
+                preferred_width,
+                work_area_telemetry=work_area_telemetry,
+                occupied_spans=None,
+                free_spans=[],
+                selected_slot=None,
+                chosen_geometry=geometry,
+            )
+        return geometry
     if right < screen_width:
         band_width = max(1, screen_width - right)
         width = max(1, min(320, band_width - 2))
         height = min(86, max(58, int(screen_height * 0.12)))
-        return {
+        geometry = {
             "x": int(right + max(0, min(band_width - width, (band_width - width) // 2))),
             "y": max(8, screen_height - height - 8),
             "width": int(width),
             "height": int(height),
             "orientation": "right",
             "visible": True,
+            "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+            "_geometry_basis": "monitor_local_physical_px",
         }
+        if include_telemetry:
+            geometry["_telemetry"] = _geometry_telemetry(
+                screen_width,
+                preferred_width,
+                work_area_telemetry=work_area_telemetry,
+                occupied_spans=None,
+                free_spans=[],
+                selected_slot=None,
+                chosen_geometry=geometry,
+            )
+        return geometry
 
     x = max(8, (screen_width - width) // 2)
     geometry = {
@@ -387,12 +428,16 @@ def calculate_taskbar_overlay_geometry(
         "height": int(height),
         "orientation": "bottom",
         "visible": True,
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "_geometry_basis": "monitor_local_physical_px",
     }
     return _fit_horizontal_geometry_to_empty_slot(
         geometry,
         int(screen_width),
         occupied_spans,
         preferred_width=preferred_width,
+        work_area_telemetry=work_area_telemetry,
+        include_telemetry=include_telemetry,
     )
 
 
@@ -1178,7 +1223,9 @@ class CodexUsageTaskbarOverlay:
         if not _is_transient_geometry_regression(previous_geometry, candidate_geometry):
             self._clear_pending_regression_geometry()
             return candidate_geometry
-        if previous_context is None or previous_context != candidate_context:
+        previous_stable_context = _transient_geometry_context_key(previous_context)
+        candidate_stable_context = _transient_geometry_context_key(candidate_context)
+        if previous_stable_context is None or previous_stable_context != candidate_stable_context:
             self._clear_pending_regression_geometry()
             return candidate_geometry
         if _is_transient_geometry_x_shift(previous_geometry, candidate_geometry):
@@ -1188,7 +1235,8 @@ class CodexUsageTaskbarOverlay:
             return dict(previous_geometry)
         if (
             isinstance(self._pending_regression_geometry, dict)
-            and self._pending_regression_context == candidate_context
+            and _transient_geometry_context_key(self._pending_regression_context)
+            == candidate_stable_context
             and int(self._pending_regression_count) >= 1
         ):
             self._clear_pending_regression_geometry()
@@ -1272,6 +1320,8 @@ class CodexUsageTaskbarOverlay:
             "height": 0,
             "orientation": "bottom",
             "visible": False,
+            "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+            "_geometry_basis": "global_physical_px",
         }
         self._cached_geometry_context = (
             "monitor-target-hidden",
@@ -1311,21 +1361,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             preferred_width=preferred_width,
         )
-        context = self._target_geometry_context(
-            target,
-            width,
-            height,
-            work_area,
-            geometry,
-            preferred_width=preferred_width,
-        )
-        if (
-            not bool(force_resample)
-            and not bool(self._geometry_invalidated)
-            and self._cached_geometry_context == context
-            and isinstance(self._cached_geometry, dict)
-        ):
-            return dict(self._cached_geometry)
+        occupied_spans: list[tuple[int, int]] | None = None
         if str(geometry.get("orientation") or "") in {"bottom", "top"}:
             sampling_geometry = self._sampling_geometry_for_target(geometry, target)
             occupied_spans = self._calculate_occupied_spans(
@@ -1343,8 +1379,27 @@ class CodexUsageTaskbarOverlay:
                     occupied_spans=occupied_spans,
                     preferred_width=preferred_width,
                 )
+        context = self._target_geometry_context(
+            target,
+            width,
+            height,
+            work_area,
+            geometry,
+            preferred_width=preferred_width,
+            occupied_spans=occupied_spans,
+            coordinate_basis=_GEOMETRY_COORDINATE_BASIS,
+        )
+        if (
+            not bool(force_resample)
+            and not bool(self._geometry_invalidated)
+            and self._cached_geometry_context == context
+            and isinstance(self._cached_geometry, dict)
+        ):
+            return dict(self._cached_geometry)
         fitted = globalize_geometry(geometry, target.monitor)
         fitted["_taskbar_hwnd"] = int(target.taskbar_hwnd)
+        fitted["coordinate_basis"] = _GEOMETRY_COORDINATE_BASIS
+        fitted["_geometry_basis"] = "global_physical_px"
         self._cached_geometry_context = context
         self._cached_geometry = dict(fitted)
         self._geometry_invalidated = False
@@ -1359,6 +1414,8 @@ class CodexUsageTaskbarOverlay:
         geometry: dict[str, int | str],
         *,
         preferred_width: int | None = None,
+        occupied_spans: list[tuple[int, int]] | None = None,
+        coordinate_basis: str = _GEOMETRY_COORDINATE_BASIS,
     ) -> tuple[Any, ...]:
         return (
             "monitor-target",
@@ -1369,6 +1426,8 @@ class CodexUsageTaskbarOverlay:
                 work_area,
                 geometry,
                 preferred_width=preferred_width,
+                occupied_spans=occupied_spans,
+                coordinate_basis=coordinate_basis,
             ),
         )
 
@@ -1417,14 +1476,9 @@ class CodexUsageTaskbarOverlay:
             work_area,
             geometry,
             preferred_width=preferred_width,
+            occupied_spans=None,
+            coordinate_basis=_GEOMETRY_COORDINATE_BASIS,
         )
-        if (
-            not bool(force_resample)
-            and not bool(self._geometry_invalidated)
-            and self._cached_geometry_context == context
-            and isinstance(self._cached_geometry, dict)
-        ):
-            return dict(self._cached_geometry)
         occupied_spans = self._calculate_occupied_spans(
             width,
             height,
@@ -1433,6 +1487,13 @@ class CodexUsageTaskbarOverlay:
             withdraw_window=withdraw_for_sampling,
         )
         if occupied_spans is None:
+            if (
+                not bool(force_resample)
+                and not bool(self._geometry_invalidated)
+                and self._cached_geometry_context == context
+                and isinstance(self._cached_geometry, dict)
+            ):
+                return dict(self._cached_geometry)
             self._cached_geometry_context = context
             self._cached_geometry = dict(geometry)
             self._geometry_invalidated = False
@@ -1444,6 +1505,22 @@ class CodexUsageTaskbarOverlay:
             occupied_spans=occupied_spans,
             preferred_width=preferred_width,
         )
+        context = self._geometry_context(
+            width,
+            height,
+            work_area,
+            fitted,
+            preferred_width=preferred_width,
+            occupied_spans=occupied_spans,
+            coordinate_basis=_GEOMETRY_COORDINATE_BASIS,
+        )
+        if (
+            not bool(force_resample)
+            and not bool(self._geometry_invalidated)
+            and self._cached_geometry_context == context
+            and isinstance(self._cached_geometry, dict)
+        ):
+            return dict(self._cached_geometry)
         self._cached_geometry_context = context
         self._cached_geometry = dict(fitted)
         self._geometry_invalidated = False
@@ -1457,13 +1534,26 @@ class CodexUsageTaskbarOverlay:
         geometry: dict[str, int | str],
         *,
         preferred_width: int | None = None,
-    ) -> tuple[int, int, tuple[int, int, int, int], str, int]:
+        occupied_spans: list[tuple[int, int]] | None = None,
+        coordinate_basis: str = _GEOMETRY_COORDINATE_BASIS,
+    ) -> tuple[Any, ...]:
+        normalized_spans = _normalized_occupied_spans(int(width), occupied_spans)
+        free_spans = tuple(
+            _free_spans_from_occupied_spans(
+                int(width),
+                list(normalized_spans),
+                padding_px=_EMPTY_SLOT_PADDING_PX,
+            )
+        )
         return (
             int(width),
             int(height),
             _normalize_work_area(work_area, int(width), int(height)),
             str(geometry.get("orientation") or ""),
-            int(preferred_width or 0),
+            ("preferred_width", int(preferred_width or 0)),
+            ("coordinate_basis", str(coordinate_basis or _GEOMETRY_COORDINATE_BASIS)),
+            ("occupied_spans", tuple(normalized_spans)),
+            ("free_spans", free_spans),
         )
 
     def _cache_geometry(
@@ -1474,6 +1564,7 @@ class CodexUsageTaskbarOverlay:
         geometry: dict[str, int | str],
         *,
         preferred_width: int | None = None,
+        occupied_spans: list[tuple[int, int]] | None = None,
     ) -> None:
         self._cached_geometry_context = self._geometry_context(
             width,
@@ -1481,6 +1572,8 @@ class CodexUsageTaskbarOverlay:
             work_area,
             geometry,
             preferred_width=preferred_width,
+            occupied_spans=occupied_spans,
+            coordinate_basis=str(geometry.get("coordinate_basis") or _GEOMETRY_COORDINATE_BASIS),
         )
         self._cached_geometry = dict(geometry)
         self._geometry_invalidated = False
@@ -1510,7 +1603,11 @@ class CodexUsageTaskbarOverlay:
             sampling_geometry["_exclude_spans"] = [
                 (int(exclude_span[0]) - origin_x, int(exclude_span[1]) - origin_x)
             ]
-        elif window is not None and bool(withdraw_window):
+        elif (
+            window is not None
+            and bool(withdraw_window)
+            and self._occupied_span_getter is _detect_horizontal_taskbar_occupied_spans
+        ):
             try:
                 window.withdraw()
                 updater = getattr(self._root, "update_idletasks", None)
@@ -2015,29 +2112,63 @@ def _fit_horizontal_geometry_to_empty_slot(
     occupied_spans: list[tuple[int, int]] | None,
     *,
     preferred_width: int | None = None,
-) -> dict[str, int | str]:
+    work_area_telemetry: dict[str, Any] | None = None,
+    include_telemetry: bool = False,
+) -> dict[str, Any]:
     fitted = dict(geometry)
     if occupied_spans is None:
+        if include_telemetry:
+            fitted["_telemetry"] = _geometry_telemetry(
+                int(screen_width),
+                preferred_width,
+                work_area_telemetry=work_area_telemetry,
+                occupied_spans=None,
+                free_spans=[],
+                selected_slot=None,
+                chosen_geometry=fitted,
+            )
         return fitted
 
     desired_width = max(1, int(fitted.get("width", 0) or 0))
+    normalized_spans = _normalized_occupied_spans(int(screen_width), occupied_spans)
     free_spans = _free_spans_from_occupied_spans(
         int(screen_width),
-        occupied_spans,
+        list(normalized_spans),
         padding_px=_EMPTY_SLOT_PADDING_PX,
     )
+    selected_slot = _selected_free_slot(free_spans)
     if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
+        if include_telemetry:
+            fitted["_telemetry"] = _geometry_telemetry(
+                int(screen_width),
+                preferred_width,
+                work_area_telemetry=work_area_telemetry,
+                occupied_spans=occupied_spans,
+                free_spans=free_spans,
+                selected_slot=selected_slot,
+                chosen_geometry=fitted,
+            )
         return fitted
 
-    start, end = max(free_spans, key=lambda span: (int(span[1]), int(span[0])))
+    start, end = selected_slot if selected_slot is not None else (0, 0)
     available = max(0, int(end) - int(start))
     if available < _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX:
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
+        if include_telemetry:
+            fitted["_telemetry"] = _geometry_telemetry(
+                int(screen_width),
+                preferred_width,
+                work_area_telemetry=work_area_telemetry,
+                occupied_spans=occupied_spans,
+                free_spans=free_spans,
+                selected_slot=selected_slot,
+                chosen_geometry=fitted,
+            )
         return fitted
 
     if preferred_width is None:
@@ -2051,7 +2182,99 @@ def _fit_horizontal_geometry_to_empty_slot(
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
     fitted["visible"] = True
+    if include_telemetry:
+            fitted["_telemetry"] = _geometry_telemetry(
+                int(screen_width),
+                preferred_width,
+                work_area_telemetry=work_area_telemetry,
+                occupied_spans=occupied_spans,
+                free_spans=free_spans,
+                selected_slot=selected_slot,
+                chosen_geometry=fitted,
+            )
     return fitted
+
+
+def _selected_free_slot(free_spans: list[tuple[int, int]]) -> tuple[int, int] | None:
+    if not free_spans:
+        return None
+    usable_spans = [
+        span
+        for span in free_spans
+        if int(span[1]) - int(span[0]) >= _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+    ]
+    candidates = usable_spans or free_spans
+    return max(candidates, key=lambda span: (int(span[1]), int(span[0])))
+
+
+def _slot_classification(width: int) -> str:
+    width = int(width)
+    if width < _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX:
+        return "hidden"
+    if width < _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX:
+        return "compact"
+    if width < _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX:
+        return "status_text"
+    return "text_friendly"
+
+
+def _geometry_telemetry(
+    screen_width: int,
+    preferred_width: int | None,
+    *,
+    work_area_telemetry: dict[str, Any] | None,
+    occupied_spans: list[tuple[int, int]] | None,
+    free_spans: list[tuple[int, int]],
+    selected_slot: tuple[int, int] | None,
+    chosen_geometry: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_spans = (
+        _normalized_occupied_spans(int(screen_width), occupied_spans)
+        if occupied_spans is not None
+        else tuple()
+    )
+    visible = bool(chosen_geometry.get("visible", True))
+    try:
+        chosen_width = int(chosen_geometry.get("width", 0) or 0)
+    except Exception:
+        chosen_width = 0
+    available_width = (
+        max(0, int(selected_slot[1]) - int(selected_slot[0]))
+        if selected_slot is not None
+        else 0
+    )
+    classification_width = chosen_width if visible else available_width
+    telemetry_geometry = {
+        key: value
+        for key, value in chosen_geometry.items()
+        if key != "_telemetry"
+    }
+    return {
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "screen_width": int(screen_width),
+        "work_area": work_area_telemetry or {},
+        "raw_occupied_spans": list(occupied_spans or []),
+        "merged_occupied_spans": tuple(normalized_spans),
+        "normalized_occupied_spans": tuple(normalized_spans),
+        "free_spans": tuple((int(start), int(end)) for start, end in free_spans),
+        "padded_free_spans": tuple((int(start), int(end)) for start, end in free_spans),
+        "preferred_width": None if preferred_width is None else int(preferred_width),
+        "selected_slot": {
+            "span": None
+            if selected_slot is None
+            else (int(selected_slot[0]), int(selected_slot[1])),
+            "available_width": int(available_width),
+            "classification": _slot_classification(int(classification_width)),
+        },
+        "chosen_geometry": telemetry_geometry,
+        "conversions": {
+            "work_area": (work_area_telemetry or {}).get("conversion", {}),
+            "occupied_spans": {
+                "raw_basis": _GEOMETRY_COORDINATE_BASIS,
+                "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+            },
+        },
+    }
 
 
 def _geometry_changed(
@@ -2122,6 +2345,32 @@ def _is_transient_geometry_regression(
         current,
         tolerance_px=tolerance_px,
     )
+
+
+def _transient_geometry_context_key(context: Any) -> Any:
+    if context is None:
+        return None
+    if isinstance(context, tuple):
+        if (
+            len(context) == 2
+            and isinstance(context[0], str)
+            and context[0] in {"occupied_spans", "free_spans"}
+        ):
+            return None
+        items = []
+        for item in context:
+            normalized = _transient_geometry_context_key(item)
+            if normalized is not None:
+                items.append(normalized)
+        return tuple(items)
+    if isinstance(context, list):
+        items = []
+        for item in context:
+            normalized = _transient_geometry_context_key(item)
+            if normalized is not None:
+                items.append(normalized)
+        return tuple(items)
+    return context
 
 
 def _is_transient_geometry_x_shift(
@@ -2242,16 +2491,7 @@ def _free_spans_from_occupied_spans(
     *,
     padding_px: int,
 ) -> list[tuple[int, int]]:
-    normalized = _merge_spans(
-        [
-            (
-                max(0, min(int(screen_width), int(start))),
-                max(0, min(int(screen_width), int(end))),
-            )
-            for start, end in occupied_spans
-            if int(end) > int(start)
-        ]
-    )
+    normalized = list(_normalized_occupied_spans(int(screen_width), occupied_spans))
     free_spans: list[tuple[int, int]] = []
     cursor = 0
     for start, end in normalized:
@@ -2267,6 +2507,25 @@ def _free_spans_from_occupied_spans(
         if free_end > free_start:
             free_spans.append((free_start, free_end))
     return free_spans
+
+
+def _normalized_occupied_spans(
+    screen_width: int,
+    occupied_spans: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None,
+) -> tuple[tuple[int, int], ...]:
+    if not occupied_spans:
+        return tuple()
+    normalized: list[tuple[int, int]] = []
+    for span in occupied_spans:
+        try:
+            start, end = span
+            start_i = max(0, min(int(screen_width), int(start)))
+            end_i = max(0, min(int(screen_width), int(end)))
+        except Exception:
+            continue
+        if end_i > start_i:
+            normalized.append((start_i, end_i))
+    return tuple(_merge_spans(normalized))
 
 
 def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -2285,8 +2544,34 @@ def _detect_horizontal_taskbar_occupied_spans(
     work_area: tuple[int, int, int, int] | dict[str, int] | None,
     geometry: dict[str, Any],
 ) -> list[tuple[int, int]] | None:
+    spans, _telemetry = _detect_horizontal_taskbar_occupied_spans_with_debug(
+        screen_width,
+        screen_height,
+        work_area,
+        geometry,
+    )
+    return spans
+
+
+def _detect_horizontal_taskbar_occupied_spans_with_debug(
+    screen_width: int,
+    screen_height: int,
+    work_area: tuple[int, int, int, int] | dict[str, int] | None,
+    geometry: dict[str, Any],
+) -> tuple[list[tuple[int, int]] | None, dict[str, Any]]:
+    telemetry: dict[str, Any] = {
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "child_spans_by_class": {},
+        "child_spans": [],
+        "pixel_spans": [],
+        "edge_guards": [],
+        "merged_occupied_spans": [],
+        "free_spans": [],
+        "padded_free_spans": [],
+        "conversions": {},
+    }
     if not hasattr(ctypes, "windll"):
-        return None
+        return None, telemetry
     try:
         origin_x = int(geometry.get("_screen_origin_x", 0) or 0)
     except Exception:
@@ -2299,7 +2584,13 @@ def _detect_horizontal_taskbar_occupied_spans(
         taskbar_hwnd = int(geometry.get("_taskbar_hwnd", 0) or 0)
     except Exception:
         taskbar_hwnd = 0
-    left, top, right, bottom = _normalize_work_area(work_area, screen_width, screen_height)
+    (left, top, right, bottom), work_area_debug = _normalize_work_area_with_metadata(
+        work_area,
+        screen_width,
+        screen_height,
+    )
+    telemetry["work_area"] = work_area_debug
+    telemetry["conversions"]["work_area"] = work_area_debug.get("conversion", {})
     orientation = str(geometry.get("orientation") or "")
     if orientation == "bottom":
         band_top = max(0, min(int(screen_height), int(bottom)))
@@ -2308,21 +2599,36 @@ def _detect_horizontal_taskbar_occupied_spans(
         band_top = 0
         band_bottom = max(0, min(int(screen_height), int(top)))
     else:
-        return None
+        return None, telemetry
     if band_bottom - band_top < 8:
-        return None
+        return None, telemetry
 
     excluded_spans = _geometry_exclude_spans(geometry, int(screen_width))
-    occupied = _taskbar_child_occupied_spans(
+    child_records = _taskbar_child_occupied_span_records(
         int(screen_width),
         int(band_top) + origin_y,
         int(band_bottom) + origin_y,
         taskbar_hwnd=taskbar_hwnd,
         origin_x=origin_x,
     )
+    telemetry["child_spans"] = child_records
+    child_spans_by_class: dict[str, list[dict[str, Any]]] = {}
+    for record in child_records:
+        class_name = str(record.get("class_name") or "")
+        child_spans_by_class.setdefault(class_name, []).append(record)
+    telemetry["child_spans_by_class"] = child_spans_by_class
+    telemetry["conversions"]["child_window_rects"] = {
+        "raw_basis": "global_physical_px",
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "origin_x": int(origin_x),
+        "origin_y": int(origin_y),
+    }
+    occupied = [tuple(record["span"]) for record in child_records]
     if excluded_spans:
         occupied = _subtract_spans(occupied, excluded_spans)
+    telemetry["excluded_spans"] = excluded_spans
     sample_rows = _taskbar_sample_rows(band_top, band_bottom)
+    telemetry["sample_rows"] = sample_rows
     columns = _sample_taskbar_columns(
         int(screen_width),
         sample_rows,
@@ -2330,9 +2636,10 @@ def _detect_horizontal_taskbar_occupied_spans(
         origin_y=origin_y,
     )
     if not columns and not occupied:
-        return None
+        return None, telemetry
     if columns:
         background = _median_background_color(columns)
+        telemetry["pixel_background"] = background
         for x, colors in columns:
             if excluded_spans and _span_overlaps_any(
                 int(x),
@@ -2341,28 +2648,62 @@ def _detect_horizontal_taskbar_occupied_spans(
             ):
                 continue
             if _column_looks_occupied(colors, background):
+                span = (
+                    max(0, x - _OCCUPIED_DILATION_PX),
+                    min(int(screen_width), x + _TASKBAR_SAMPLE_STEP_PX + _OCCUPIED_DILATION_PX),
+                )
+                telemetry["pixel_spans"].append(
+                    {
+                        "sample_x": int(x),
+                        "span": span,
+                        "raw_basis": "monitor_local_physical_px",
+                        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+                        "colors": list(colors),
+                    }
+                )
                 occupied.append(
-                    (
-                        max(0, x - _OCCUPIED_DILATION_PX),
-                        min(int(screen_width), x + _TASKBAR_SAMPLE_STEP_PX + _OCCUPIED_DILATION_PX),
-                    )
+                    span
                 )
 
     # Keep the reserved taskbar edge controls out of the overlay even when the
     # sampled pixels happen to be close to the background color.
     edge_guard = max(72, min(180, int(screen_width * 0.04)))
-    occupied.extend([(0, edge_guard), (int(screen_width) - edge_guard, int(screen_width))])
-    return _merge_spans(occupied)
+    edge_spans = [(0, edge_guard), (int(screen_width) - edge_guard, int(screen_width))]
+    telemetry["edge_guards"] = [
+        {
+            "span": span,
+            "raw_basis": "monitor_local_physical_px",
+            "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        }
+        for span in edge_spans
+    ]
+    occupied.extend(edge_spans)
+    merged = _merge_spans(occupied)
+    free_spans = _free_spans_from_occupied_spans(
+        int(screen_width),
+        merged,
+        padding_px=_EMPTY_SLOT_PADDING_PX,
+    )
+    telemetry["merged_occupied_spans"] = merged
+    telemetry["free_spans"] = free_spans
+    telemetry["padded_free_spans"] = free_spans
+    telemetry["conversions"]["pixel_samples"] = {
+        "raw_basis": "monitor_local_physical_px",
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "origin_x": int(origin_x),
+        "origin_y": int(origin_y),
+    }
+    return merged, telemetry
 
 
-def _taskbar_child_occupied_spans(
+def _taskbar_child_occupied_span_records(
     screen_width: int,
     band_top: int,
     band_bottom: int,
     *,
     taskbar_hwnd: int = 0,
     origin_x: int = 0,
-) -> list[tuple[int, int]]:
+) -> list[dict[str, Any]]:
     if win32gui is None:
         return []
     if int(taskbar_hwnd) <= 0:
@@ -2373,7 +2714,7 @@ def _taskbar_child_occupied_spans(
     if taskbar_hwnd <= 0:
         return []
 
-    spans: list[tuple[int, int]] = []
+    records: list[dict[str, Any]] = []
 
     def visit(hwnd, _extra) -> bool:
         try:
@@ -2399,14 +2740,48 @@ def _taskbar_child_occupied_spans(
         start = max(0, min(int(screen_width), int(left) - int(origin_x)))
         end = max(0, min(int(screen_width), int(right) - int(origin_x)))
         if end - start >= 8:
-            spans.append((start, end))
+            records.append(
+                {
+                    "hwnd": int(hwnd),
+                    "class_name": class_name,
+                    "raw_rect": (int(left), int(top), int(right), int(bottom)),
+                    "raw_basis": "global_physical_px",
+                    "span": (int(start), int(end)),
+                    "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+                    "conversion": {
+                        "origin_x": int(origin_x),
+                        "band_top": int(band_top),
+                        "band_bottom": int(band_bottom),
+                    },
+                }
+            )
         return True
 
     try:
         win32gui.EnumChildWindows(taskbar_hwnd, visit, None)
     except Exception:
-        return spans
-    return spans
+        return records
+    return records
+
+
+def _taskbar_child_occupied_spans(
+    screen_width: int,
+    band_top: int,
+    band_bottom: int,
+    *,
+    taskbar_hwnd: int = 0,
+    origin_x: int = 0,
+) -> list[tuple[int, int]]:
+    return [
+        tuple(record["span"])
+        for record in _taskbar_child_occupied_span_records(
+            screen_width,
+            band_top,
+            band_bottom,
+            taskbar_hwnd=taskbar_hwnd,
+            origin_x=origin_x,
+        )
+    ]
 
 
 def _taskbar_sample_rows(band_top: int, band_bottom: int) -> list[int]:
@@ -2614,6 +2989,203 @@ def _collect_taskbar_overlay_targets() -> tuple[TaskbarOverlayTarget, ...]:
     if not monitors:
         return ()
     return build_taskbar_overlay_targets(monitors, _collect_taskbar_windows())
+
+
+def capture_local_taskbar_overlay_geometry_snapshot(
+    sample_count: int = 5,
+    sample_interval_sec: float = 0.5,
+) -> dict[str, Any]:
+    count = max(1, int(sample_count or 1))
+    interval = max(0.0, float(sample_interval_sec or 0.0))
+    samples: list[dict[str, Any]] = []
+    for index in range(count):
+        samples.append(_collect_local_taskbar_overlay_geometry_sample())
+        if interval > 0.0 and index < count - 1:
+            time.sleep(interval)
+    latest = dict(samples[-1])
+    signatures = [_taskbar_geometry_sample_signature(sample) for sample in samples]
+    stable = all(signature == signatures[0] for signature in signatures)
+    latest["samples"] = samples
+    latest["repeated_sample_stability"] = {
+        "stable": bool(stable),
+        "sample_count": int(count),
+        "signatures": signatures,
+    }
+    return latest
+
+
+def _collect_local_taskbar_overlay_geometry_sample() -> dict[str, Any]:
+    target = _local_debug_taskbar_target()
+    if target is not None:
+        width, height = monitor_size(target.monitor)
+        work_area = local_work_area(target.monitor)
+        monitor_rect = tuple(target.monitor.monitor)
+        taskbar_rect = target.taskbar_rect
+        taskbar_hwnd = int(target.taskbar_hwnd)
+        origin_x = int(target.monitor.monitor[0])
+        origin_y = int(target.monitor.monitor[1])
+    else:
+        width, height = _fallback_screen_size()
+        work_area = _get_primary_work_area() or (0, 0, width, height)
+        monitor_rect = (0, 0, width, height)
+        taskbar_rect = None
+        taskbar_hwnd = 0
+        origin_x = 0
+        origin_y = 0
+    base_geometry = calculate_taskbar_overlay_geometry(
+        width,
+        height,
+        work_area,
+        include_telemetry=True,
+    )
+    sampling_geometry = dict(base_geometry)
+    sampling_geometry["_screen_origin_x"] = int(origin_x)
+    sampling_geometry["_screen_origin_y"] = int(origin_y)
+    sampling_geometry["_taskbar_hwnd"] = int(taskbar_hwnd)
+    occupied_spans: list[tuple[int, int]] | None = None
+    occupancy_telemetry: dict[str, Any] = {
+        "child_spans_by_class": {},
+        "pixel_spans": [],
+        "edge_guards": [],
+        "merged_occupied_spans": [],
+        "free_spans": [],
+        "padded_free_spans": [],
+        "conversions": {},
+    }
+    if str(base_geometry.get("orientation") or "") in {"bottom", "top"}:
+        occupied_spans, occupancy_telemetry = (
+            _detect_horizontal_taskbar_occupied_spans_with_debug(
+                width,
+                height,
+                work_area,
+                sampling_geometry,
+            )
+        )
+    chosen_geometry = (
+        calculate_taskbar_overlay_geometry(
+            width,
+            height,
+            work_area,
+            occupied_spans=occupied_spans,
+            include_telemetry=True,
+        )
+        if occupied_spans is not None
+        else base_geometry
+    )
+    geometry_telemetry = dict(chosen_geometry.get("_telemetry", {}))
+    merged_spans = occupancy_telemetry.get(
+        "merged_occupied_spans",
+        geometry_telemetry.get("merged_occupied_spans", []),
+    )
+    free_spans = occupancy_telemetry.get(
+        "padded_free_spans",
+        geometry_telemetry.get("padded_free_spans", []),
+    )
+    conversions = dict(geometry_telemetry.get("conversions", {}))
+    conversions.update(dict(occupancy_telemetry.get("conversions", {})))
+    return {
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "monitor_rect": list(monitor_rect),
+        "work_area": geometry_telemetry.get("work_area", {}),
+        "taskbar_rect": list(taskbar_rect) if taskbar_rect is not None else None,
+        "taskbar_hwnd": int(taskbar_hwnd),
+        "child_spans_by_class": occupancy_telemetry.get("child_spans_by_class", {}),
+        "pixel_spans": occupancy_telemetry.get("pixel_spans", []),
+        "edge_guards": occupancy_telemetry.get("edge_guards", []),
+        "merged_occupied_spans": merged_spans,
+        "free_spans": free_spans,
+        "padded_free_spans": free_spans,
+        "preferred_width": geometry_telemetry.get("preferred_width"),
+        "chosen_geometry": {
+            key: value
+            for key, value in chosen_geometry.items()
+            if key != "_telemetry"
+        },
+        "dpi": _taskbar_debug_dpi(int(taskbar_hwnd)),
+        "theme": _windows_theme_snapshot(),
+        "icon_alignment": _taskbar_icon_alignment(),
+        "conversions": conversions,
+    }
+
+
+def _local_debug_taskbar_target() -> TaskbarOverlayTarget | None:
+    targets = _collect_taskbar_overlay_targets()
+    if not targets:
+        return None
+    for target in targets:
+        if target.is_primary and bool(target.displayable):
+            return target
+    for target in targets:
+        if bool(target.displayable):
+            return target
+    return targets[0]
+
+
+def _fallback_screen_size() -> tuple[int, int]:
+    if win32api is not None:
+        try:
+            return int(win32api.GetSystemMetrics(0)), int(win32api.GetSystemMetrics(1))
+        except Exception:
+            pass
+    return 1920, 1080
+
+
+def _taskbar_geometry_sample_signature(sample: dict[str, Any]) -> tuple[Any, ...]:
+    geometry = sample.get("chosen_geometry")
+    if not isinstance(geometry, dict):
+        geometry = {}
+    return (
+        tuple(sample.get("merged_occupied_spans") or ()),
+        tuple(sample.get("padded_free_spans") or ()),
+        bool(geometry.get("visible", True)),
+        int(geometry.get("x", 0) or 0),
+        int(geometry.get("width", 0) or 0),
+        str(sample.get("coordinate_basis") or ""),
+    )
+
+
+def _taskbar_debug_dpi(taskbar_hwnd: int) -> dict[str, Any]:
+    dpi = 96
+    if hasattr(ctypes, "windll"):
+        try:
+            getter = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
+            if callable(getter) and int(taskbar_hwnd) > 0:
+                dpi = int(getter(int(taskbar_hwnd)) or 96)
+        except Exception:
+            dpi = 96
+    scale = max(0.1, float(dpi) / 96.0)
+    return {"dpi": int(dpi), "scale_x": scale, "scale_y": scale}
+
+
+def _windows_theme_snapshot() -> dict[str, Any]:
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as key:
+            apps_light, _value_type = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return {
+            "name": "light" if int(apps_light) else "dark",
+            "apps_use_light_theme": bool(apps_light),
+        }
+    except Exception:
+        return {"name": "unknown"}
+
+
+def _taskbar_icon_alignment() -> str:
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+        ) as key:
+            value, _value_type = winreg.QueryValueEx(key, "TaskbarAl")
+        return "left" if int(value) == 0 else "center"
+    except Exception:
+        return "unknown"
 
 
 def _collect_taskbar_windows() -> tuple[TaskbarWindowSnapshot, ...]:
@@ -2967,28 +3539,83 @@ def _normalize_work_area(
     screen_width: int,
     screen_height: int,
 ) -> tuple[int, int, int, int]:
+    normalized, _metadata = _normalize_work_area_with_metadata(
+        work_area,
+        screen_width,
+        screen_height,
+    )
+    return normalized
+
+
+def _normalize_work_area_with_metadata(
+    work_area: tuple[int, int, int, int] | dict[str, int] | None,
+    screen_width: int,
+    screen_height: int,
+) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
     screen_width = max(1, int(screen_width or 0))
     screen_height = max(1, int(screen_height or 0))
     if isinstance(work_area, dict):
+        raw_basis = str(work_area.get("coordinate_basis") or "physical_px")
+        try:
+            scale_x = float(work_area.get("scale_x", work_area.get("scale", 1)) or 1)
+        except Exception:
+            scale_x = 1.0
+        try:
+            scale_y = float(work_area.get("scale_y", work_area.get("scale", 1)) or 1)
+        except Exception:
+            scale_y = 1.0
         raw = (
             int(work_area.get("left", 0)),
             int(work_area.get("top", 0)),
             int(work_area.get("right", screen_width)),
             int(work_area.get("bottom", screen_height)),
         )
+        if raw_basis == "logical_px":
+            converted = (
+                int(round(raw[0] * scale_x)),
+                int(round(raw[1] * scale_y)),
+                int(round(raw[2] * scale_x)),
+                int(round(raw[3] * scale_y)),
+            )
+        else:
+            converted = raw
     elif isinstance(work_area, tuple) and len(work_area) == 4:
+        raw_basis = "physical_px"
+        scale_x = 1.0
+        scale_y = 1.0
         raw = tuple(int(v) for v in work_area)
+        converted = raw
     else:
+        raw_basis = "default_full_screen"
+        scale_x = 1.0
+        scale_y = 1.0
         raw = (0, 0, int(screen_width), int(screen_height))
+        converted = raw
 
-    left, top, right, bottom = raw
+    left, top, right, bottom = converted
     left = max(0, min(int(left), screen_width))
     top = max(0, min(int(top), screen_height))
     right = max(0, min(int(right), screen_width))
     bottom = max(0, min(int(bottom), screen_height))
     if right <= left or bottom <= top:
-        return 0, 0, int(screen_width), int(screen_height)
-    return int(left), int(top), int(right), int(bottom)
+        normalized = (0, 0, int(screen_width), int(screen_height))
+    else:
+        normalized = (int(left), int(top), int(right), int(bottom))
+    metadata = {
+        "raw": raw,
+        "raw_basis": raw_basis,
+        "converted": converted,
+        "normalized": normalized,
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "conversion": {
+            "from": raw_basis,
+            "to": _GEOMETRY_COORDINATE_BASIS,
+            "scale_x": float(scale_x),
+            "scale_y": float(scale_y),
+            "applied": raw_basis == "logical_px",
+        },
+    }
+    return normalized, metadata
 
 
 def _build_metric(
