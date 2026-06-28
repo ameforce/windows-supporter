@@ -252,6 +252,15 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
         self.assertEqual(geometry["orientation"], "bottom")
         self.assertEqual(window.withdraw_calls, 0)
 
+    def test_secondary_taskbar_geometry_keeps_physical_coordinate_basis(self):
+        _overlay, _root, window = _refresh_with_desktop(_Desktop())
+
+        geometry = window.draw_calls[-1]["geometry"]
+        self.assertGreaterEqual(int(geometry["x"]), 1920)
+        self.assertEqual(geometry["orientation"], "bottom")
+        self.assertEqual(geometry["coordinate_basis"], "physical_px")
+        self.assertEqual(geometry["_geometry_basis"], "global_physical_px")
+
     def test_geometry_monitor_relocates_existing_primary_overlay_when_fullscreen_starts(self):
         desktop = _Desktop()
         desktop.primary_fullscreen = False
