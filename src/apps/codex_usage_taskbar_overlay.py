@@ -1031,7 +1031,8 @@ class CodexUsageTaskbarOverlay:
         if not bool(model.get("visible", True)):
             return
         if self._is_fullscreen_active(window, model.get("geometry")):
-            self._suppress_for_fullscreen()
+            self.invalidate_geometry()
+            self.refresh()
             return
         if bool(self._fullscreen_suppressed):
             self._fullscreen_suppressed = False
@@ -1080,12 +1081,6 @@ class CodexUsageTaskbarOverlay:
         if not isinstance(model, dict):
             return
         window = self._window
-        if bool(model.get("visible", True)) and self._is_fullscreen_active(
-            window,
-            model.get("geometry"),
-        ):
-            self._suppress_for_fullscreen()
-            return
         now = time.monotonic()
         hard_resample = (
             now - float(self._last_geometry_hard_resample_at)
@@ -1129,6 +1124,12 @@ class CodexUsageTaskbarOverlay:
             geometry=geometry,
             now=model_now,
         )
+        if bool(updated_model.get("visible", True)) and self._is_fullscreen_active(
+            window,
+            geometry,
+        ):
+            self._suppress_for_fullscreen()
+            return
         content_changed = _overlay_render_signature(model) != _overlay_render_signature(
             updated_model
         )

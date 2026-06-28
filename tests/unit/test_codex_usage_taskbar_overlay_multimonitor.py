@@ -252,6 +252,29 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
         self.assertEqual(geometry["orientation"], "bottom")
         self.assertEqual(window.withdraw_calls, 0)
 
+    def test_geometry_monitor_relocates_existing_primary_overlay_when_fullscreen_starts(self):
+        desktop = _Desktop()
+        desktop.primary_fullscreen = False
+        overlay, _root, window = _refresh_with_desktop(desktop)
+        self.assertLess(int(window.draw_calls[-1]["geometry"]["x"]), 1920)
+
+        desktop.primary_fullscreen = True
+        with patch.object(taskbar_overlay, "win32gui", _FakeWin32Gui(desktop)), patch.object(
+            taskbar_overlay,
+            "win32api",
+            _FakeWin32Api(desktop),
+        ), patch.object(taskbar_overlay, "win32con", _FakeWin32Con), patch.object(
+            taskbar_overlay.ctypes,
+            "windll",
+            _FakeWindll(),
+            create=True,
+        ):
+            overlay._geometry_monitor_tick()
+
+        self.assertGreaterEqual(int(window.draw_calls[-1]["geometry"]["x"]), 1920)
+        self.assertEqual(window.draw_calls[-1]["geometry"]["_taskbar_hwnd"], 20)
+        self.assertEqual(window.withdraw_calls, 0)
+
     def test_invalid_first_secondary_falls_through_to_next_displayable_taskbar(self):
         desktop = _Desktop()
         desktop.monitor_infos[2]["Work"] = (1920, 0, 3840, 1080)
