@@ -265,6 +265,16 @@ class BuildOutputProgressRule:
     percent: int
 
 
+BUILD_OUTPUT_DETAIL_LABEL = "빌드 세부 로그 처리 중"
+BUILD_OUTPUT_DETAIL_MIN_PERCENT = 15
+BUILD_OUTPUT_DETAIL_MAX_PERCENT = 93
+BUILD_OUTPUT_DETAIL_PERCENT_STEP = 1
+BUILD_OUTPUT_LAST_PERCENT_PREFIX = "__last_percent__:"
+BUILD_OUTPUT_STEP_LOG_PREFIX = "WINDOWS_SUPPORTER_STEP_LOG="
+BUILD_LOG_TAIL_POLL_SECONDS = 0.05
+BUILD_LOG_TAIL_STOP_WAIT_SECONDS = 1.0
+
+
 UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("idle", "업데이트 대기", "업데이트 확인을 기다리는 중입니다.", 0),
     UpdateProgressStep("checking", "업데이트 확인 중", "현재 버전과 원격 릴리스를 확인합니다.", 6),
@@ -383,6 +393,89 @@ def build_update_progress_snapshot(
     }
 
 
+def _build_output_activity(text: str) -> dict[str, str]:
+    return {"source": "build.bat", "line": str(text or "").strip()}
+
+
+def _attach_build_output_activity(
+    snapshot: dict[str, Any],
+    text: str,
+) -> dict[str, Any]:
+    snapshot["activity"] = _build_output_activity(text)
+    return snapshot
+
+
+def _get_seen_last_percent(published: set[str]) -> int:
+    for item in tuple(published):
+        if not item.startswith(BUILD_OUTPUT_LAST_PERCENT_PREFIX):
+            continue
+        try:
+            return int(item.removeprefix(BUILD_OUTPUT_LAST_PERCENT_PREFIX))
+        except Exception:
+            return 0
+    return 0
+
+
+def _set_seen_last_percent(published: set[str], percent: int) -> None:
+    for item in tuple(published):
+        if item.startswith(BUILD_OUTPUT_LAST_PERCENT_PREFIX):
+            published.discard(item)
+    published.add(f"{BUILD_OUTPUT_LAST_PERCENT_PREFIX}{max(0, min(100, int(percent)))}")
+    return
+
+
+def _next_build_detail_percent(last_percent: int) -> int:
+    baseline = max(BUILD_OUTPUT_DETAIL_MIN_PERCENT, int(last_percent or 0))
+    return min(
+        BUILD_OUTPUT_DETAIL_MAX_PERCENT,
+        baseline + BUILD_OUTPUT_DETAIL_PERCENT_STEP,
+    )
+
+
+def _build_update_build_detail_progress_snapshot(
+    line: str,
+    *,
+    log_path: str = "",
+    percent: int,
+) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    snapshot = build_update_progress_snapshot(
+        "build",
+        state="running",
+        detail=f"build.bat 로그: {text}",
+        log_path=log_path,
+    )
+    resolved_percent = max(0, min(100, int(percent)))
+    snapshot["label"] = BUILD_OUTPUT_DETAIL_LABEL
+    snapshot["percent"] = resolved_percent
+    progressbar = snapshot.get("progressbar", {})
+    if isinstance(progressbar, dict):
+        progressbar["value"] = resolved_percent
+    return _attach_build_output_activity(snapshot, text)
+
+
+def _is_build_output_control_line(line: str) -> bool:
+    return str(line or "").strip().startswith(BUILD_OUTPUT_STEP_LOG_PREFIX)
+
+
+def _extract_build_step_log_path(line: str) -> str:
+    text = str(line or "").strip()
+    if not text.startswith(BUILD_OUTPUT_STEP_LOG_PREFIX):
+        return ""
+    return text.removeprefix(BUILD_OUTPUT_STEP_LOG_PREFIX).strip().strip('"')
+
+
+def _filter_build_output_control_lines(output: str) -> str:
+    lines = [
+        line
+        for line in str(output or "").splitlines()
+        if not _is_build_output_control_line(line)
+    ]
+    return "\n".join(lines)
+
+
 def build_update_build_output_progress_snapshot(
     line: str,
     *,
@@ -406,7 +499,7 @@ def build_update_build_output_progress_snapshot(
         progressbar = snapshot.get("progressbar", {})
         if isinstance(progressbar, dict):
             progressbar["value"] = percent
-        return snapshot
+        return _attach_build_output_activity(snapshot, text)
     return None
 
 
@@ -419,18 +512,156 @@ def publish_build_output_progress(
     seen: set[str] | None = None,
 ) -> None:
     published = seen if seen is not None else set()
+    last_percent = _get_seen_last_percent(published)
     for line in str(output or "").splitlines():
+        if _is_build_output_control_line(line):
+            continue
         snapshot = build_update_build_output_progress_snapshot(line, log_path=log_path)
         if snapshot is None:
+            if last_percent <= 0:
+                continue
+            next_percent = _next_build_detail_percent(last_percent)
+            snapshot = _build_update_build_detail_progress_snapshot(
+                line,
+                log_path=log_path,
+                percent=next_percent,
+            )
+        if snapshot is None:
             continue
+        percent = max(0, min(100, int(snapshot.get("percent") or 0)))
+        if percent < last_percent:
+            percent = last_percent
+            snapshot["percent"] = percent
+            progressbar = snapshot.get("progressbar", {})
+            if isinstance(progressbar, dict):
+                progressbar["value"] = percent
         label = str(snapshot.get("label") or "")
-        if label in published:
+        detail = str(snapshot.get("detail") or "")
+        activity = snapshot.get("activity", {})
+        activity_line = ""
+        if isinstance(activity, dict):
+            activity_line = str(activity.get("line") or "")
+        dedupe_key = f"{label}\n{detail}\n{activity_line}"
+        if dedupe_key in published:
             continue
-        published.add(label)
+        published.add(dedupe_key)
+        last_percent = max(last_percent, percent)
+        _set_seen_last_percent(published, last_percent)
         if progress_ui is not None:
             progress_ui.set_snapshot(snapshot)
         update_handoff_state(state_path, status="running", progress=snapshot)
     return
+
+
+class _BuildStepLogTailer:
+    def __init__(
+        self,
+        publish_line: Callable[[str], None],
+        *,
+        poll_seconds: float = BUILD_LOG_TAIL_POLL_SECONDS,
+        stop_wait_seconds: float = BUILD_LOG_TAIL_STOP_WAIT_SECONDS,
+    ) -> None:
+        self._publish_line = publish_line
+        self._poll_seconds = max(0.01, float(poll_seconds))
+        self._stop_wait_seconds = max(0.1, float(stop_wait_seconds))
+        self._stop_event: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self, path: str | os.PathLike[str]) -> None:
+        resolved_path = str(path or "").strip().strip('"')
+        if not resolved_path:
+            return
+        self.stop()
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._tail_loop,
+            args=(resolved_path, stop_event),
+            daemon=True,
+        )
+        self._stop_event = stop_event
+        self._thread = thread
+        thread.start()
+        return
+
+    def stop(self) -> None:
+        stop_event = self._stop_event
+        thread = self._thread
+        if stop_event is not None:
+            stop_event.set()
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=self._stop_wait_seconds)
+        self._stop_event = None
+        self._thread = None
+        return
+
+    def _tail_loop(self, path: str, stop_event: threading.Event) -> None:
+        log_path = Path(path)
+        signature: tuple[int, int] | None = None
+        position = 0
+        partial = ""
+        empty_reads_after_stop = 0
+        while True:
+            data = ""
+            try:
+                stat = log_path.stat()
+                current_signature = (
+                    int(getattr(stat, "st_ctime_ns", 0) or 0),
+                    int(getattr(stat, "st_ino", 0) or 0),
+                )
+                if signature is not None and current_signature != signature:
+                    position = 0
+                    partial = ""
+                signature = current_signature
+                if int(stat.st_size) < int(position):
+                    position = 0
+                    partial = ""
+                with log_path.open("r", encoding="utf-8", errors="replace") as fp:
+                    fp.seek(position)
+                    data = fp.read()
+                    position = fp.tell()
+            except FileNotFoundError:
+                signature = None
+                position = 0
+                partial = ""
+            except Exception:
+                data = ""
+
+            if data:
+                empty_reads_after_stop = 0
+                partial = self._publish_complete_lines(partial + data)
+            elif stop_event.is_set():
+                empty_reads_after_stop += 1
+                if empty_reads_after_stop >= 2:
+                    break
+
+            time.sleep(self._poll_seconds)
+
+        if partial.strip():
+            self._safe_publish(partial.strip())
+        return
+
+    def _publish_complete_lines(self, text: str) -> str:
+        parts = text.splitlines(keepends=True)
+        if parts and not parts[-1].endswith(("\n", "\r")):
+            partial = parts.pop()
+        else:
+            partial = ""
+        for item in parts:
+            line = item.strip("\r\n")
+            if line.strip():
+                self._safe_publish(line)
+        return partial
+
+    def _safe_publish(self, line: str) -> None:
+        try:
+            self._publish_line(line)
+        except Exception:
+            pass
+        return
 
 
 def _extract_git_gui_relaunch_commands(state: dict[str, Any]) -> list[tuple[str, list[str]]]:
@@ -923,6 +1154,9 @@ class UpdateHandoffProgressUi:
         self._detail_label = None
         self._percent_label = None
         self._progress_canvas = None
+        self._activity_title_label = None
+        self._activity_labels = []
+        self._activity_lines = []
         self._log_button = None
         self._retry_button = None
         self._manual_button = None
@@ -945,80 +1179,122 @@ class UpdateHandoffProgressUi:
             root = tk.Tk()
             self._closed = False
             root.title(str(snapshot.get("title") or UPDATE_PROGRESS_TITLE))
-            root.geometry("520x250")
+            root.geometry("600x360")
             root.resizable(False, False)
-            root.configure(bg="#F8FAFC")
+            root.configure(bg="#EEF2F7")
             try:
                 root.attributes("-topmost", True)
             except Exception:
                 pass
 
-            frame = tk.Frame(root, padx=22, pady=18, bg="#F8FAFC")
+            frame = tk.Frame(root, padx=24, pady=22, bg="#EEF2F7")
             root.protocol("WM_DELETE_WINDOW", self.close)
             frame.pack(fill="both", expand=True)
-            title = tk.Label(
+            shell = tk.Frame(
                 frame,
+                bg="#FFFFFF",
+                highlightthickness=1,
+                highlightbackground="#D8DEE9",
+            )
+            shell.pack(fill="both", expand=True)
+            accent = tk.Frame(shell, height=3, bg="#2563EB")
+            accent.pack(fill="x", side="top")
+            body = tk.Frame(shell, padx=22, pady=18, bg="#FFFFFF")
+            body.pack(fill="both", expand=True)
+            title = tk.Label(
+                body,
                 text="Windows Supporter 업데이트",
-                font=("Segoe UI", 13, "bold"),
+                font=("Segoe UI", 15, "bold"),
                 anchor="w",
-                bg="#F8FAFC",
-                fg="#111827",
+                bg="#FFFFFF",
+                fg="#0F172A",
             )
             title.pack(fill="x")
             subtitle = tk.Label(
-                frame,
-                text="새 버전을 적용하고 앱을 다시 시작합니다.",
+                body,
+                text="Git 동기화, 빌드, 재실행 상태를 실시간으로 반영합니다.",
                 font=("Segoe UI", 9),
                 anchor="w",
-                bg="#F8FAFC",
-                fg="#6B7280",
+                bg="#FFFFFF",
+                fg="#64748B",
             )
-            subtitle.pack(fill="x", pady=(3, 16))
+            subtitle.pack(fill="x", pady=(3, 18))
 
-            status_row = tk.Frame(frame, bg="#F8FAFC")
+            status_row = tk.Frame(body, bg="#FFFFFF")
             status_row.pack(fill="x")
             stage = tk.Label(
                 status_row,
                 text="",
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 11, "bold"),
                 anchor="w",
-                bg="#F8FAFC",
+                bg="#FFFFFF",
                 fg="#111827",
             )
             stage.pack(side="left", fill="x", expand=True)
             percent = tk.Label(
                 status_row,
                 text="0%",
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 12, "bold"),
                 anchor="e",
-                bg="#F8FAFC",
+                bg="#FFFFFF",
                 fg="#2563EB",
             )
             percent.pack(side="right")
 
             progress = tk.Canvas(
-                frame,
-                width=476,
-                height=12,
-                bg="#F8FAFC",
+                body,
+                width=532,
+                height=14,
+                bg="#FFFFFF",
                 bd=0,
                 highlightthickness=0,
                 relief="flat",
             )
             progress.pack(fill="x", pady=(8, 0))
             detail = tk.Label(
-                frame,
+                body,
                 text="",
                 font=("Segoe UI", 9),
                 anchor="w",
                 justify="left",
-                wraplength=470,
-                bg="#F8FAFC",
-                fg="#374151",
+                wraplength=532,
+                bg="#FFFFFF",
+                fg="#334155",
             )
-            detail.pack(fill="x", pady=(12, 14))
+            detail.pack(fill="x", pady=(12, 12))
 
-            buttons = tk.Frame(frame, bg="#F8FAFC")
+            activity_shell = tk.Frame(
+                body,
+                bg="#F8FAFC",
+                highlightthickness=1,
+                highlightbackground="#E2E8F0",
+            )
+            activity_shell.pack(fill="x", pady=(0, 14))
+            activity_title = tk.Label(
+                activity_shell,
+                text="최근 작업 로그",
+                font=("Segoe UI", 8, "bold"),
+                anchor="w",
+                bg="#F8FAFC",
+                fg="#475569",
+            )
+            activity_title.pack(fill="x", padx=10, pady=(8, 3))
+            activity_labels = []
+            for _idx in range(4):
+                row = tk.Label(
+                    activity_shell,
+                    text="",
+                    font=("Consolas", 8),
+                    anchor="w",
+                    justify="left",
+                    bg="#F8FAFC",
+                    fg="#64748B",
+                    wraplength=510,
+                )
+                row.pack(fill="x", padx=10, pady=(0, 3))
+                activity_labels.append(row)
+
+            buttons = tk.Frame(body, bg="#FFFFFF")
             buttons.pack(fill="x", side="bottom")
             log_button = ttk.Button(
                 buttons,
@@ -1050,6 +1326,8 @@ class UpdateHandoffProgressUi:
             self._detail_label = detail
             self._percent_label = percent
             self._progress_canvas = progress
+            self._activity_title_label = activity_title
+            self._activity_labels = activity_labels
             self._log_button = log_button
             self._retry_button = retry_button
             self._manual_button = manual_button
@@ -1075,6 +1353,7 @@ class UpdateHandoffProgressUi:
             if self._percent_label is not None:
                 self._percent_label.configure(text=f"{percent}%")
             self._draw_progress(percent)
+            self._record_activity(snapshot)
             failure = state == "failed"
             complete = state == "complete"
             self._set_button_visible(
@@ -1093,6 +1372,36 @@ class UpdateHandoffProgressUi:
             self.pump()
         except Exception:
             pass
+        return
+
+    def _record_activity(self, snapshot: dict[str, Any]) -> None:
+        activity = snapshot.get("activity", {})
+        line = ""
+        if isinstance(activity, dict):
+            line = str(activity.get("line") or "").strip()
+        if not line:
+            detail = str(snapshot.get("detail") or "").strip()
+            if detail.startswith("build.bat "):
+                line = detail
+        if line:
+            if not self._activity_lines or self._activity_lines[-1] != line:
+                self._activity_lines.append(line)
+            self._activity_lines = self._activity_lines[-6:]
+        self._render_activity_lines()
+        return
+
+    def _render_activity_lines(self) -> None:
+        labels = list(self._activity_labels or [])
+        if not labels:
+            return
+        visible_lines = list(self._activity_lines[-len(labels):])
+        while len(visible_lines) < len(labels):
+            visible_lines.insert(0, "")
+        for label, line in zip(labels, visible_lines, strict=False):
+            try:
+                label.configure(text=line)
+            except Exception:
+                continue
         return
 
     def _set_button_visible(self, button: Any, visible: bool) -> None:
@@ -1117,12 +1426,30 @@ class UpdateHandoffProgressUi:
         try:
             canvas.update_idletasks()
             width = int(canvas.winfo_width() or 476)
-            height = int(canvas.winfo_height() or 12)
-            fill_width = int(width * (self._last_percent / 100.0))
+            height = int(canvas.winfo_height() or 14)
+            inset = max(4, int(height / 2))
+            fill_width = max(inset, int((width - inset * 2) * (self._last_percent / 100.0)) + inset)
+            center = int(height / 2)
             canvas.delete("all")
-            canvas.create_rectangle(0, 0, width, height, fill="#E5E7EB", outline="")
-            if fill_width > 0:
-                canvas.create_rectangle(0, 0, fill_width, height, fill="#2563EB", outline="")
+            canvas.create_line(
+                inset,
+                center,
+                width - inset,
+                center,
+                fill="#E2E8F0",
+                width=height,
+                capstyle="round",
+            )
+            if self._last_percent > 0:
+                canvas.create_line(
+                    inset,
+                    center,
+                    min(width - inset, fill_width),
+                    center,
+                    fill="#2563EB",
+                    width=height,
+                    capstyle="round",
+                )
         except Exception:
             pass
         return
@@ -1211,6 +1538,8 @@ def run_update_handoff(
     attempts = max(1, int(max_attempts or 1))
     for attempt in range(1, attempts + 1):
         published_build_labels: set[str] = set()
+        publish_build_lock = threading.Lock()
+        step_log_tailer: _BuildStepLogTailer | None = None
 
         def publish_handoff_progress(snapshot: dict[str, Any], *, first: bool = False) -> None:
             if progress_ui is not None:
@@ -1222,14 +1551,22 @@ def run_update_handoff(
             return
 
         def publish_build_line(line: str) -> None:
-            publish_build_output_progress(
-                line,
-                progress_ui=progress_ui,
-                state_path=state_path,
-                log_path=log_path,
-                seen=published_build_labels,
-            )
+            step_log_path = _extract_build_step_log_path(line)
+            if step_log_path:
+                if step_log_tailer is not None:
+                    step_log_tailer.start(step_log_path)
+                return
+            with publish_build_lock:
+                publish_build_output_progress(
+                    line,
+                    progress_ui=progress_ui,
+                    state_path=state_path,
+                    log_path=log_path,
+                    seen=published_build_labels,
+                )
+            return
 
+        step_log_tailer = _BuildStepLogTailer(publish_build_line)
         start_progress = build_update_progress_snapshot(
             "handoff_start",
             state="running",
@@ -1262,27 +1599,33 @@ def run_update_handoff(
             publish_handoff_progress(build_progress)
             env = dict(os.environ)
             env["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"] = "1"
+            env["WINDOWS_SUPPORTER_EMIT_STEP_LOG"] = "1"
             env["GIT_TERMINAL_PROMPT"] = "0"
-            result = run_no_window_with_progress(
-                ["cmd", "/c", "build.bat"],
-                subprocess_module=subprocess_module,
-                progress_ui=progress_ui,
-                progress_line_callback=publish_build_line,
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=env,
-                timeout=UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS,
-            )
+            try:
+                result = run_no_window_with_progress(
+                    ["cmd", "/c", "build.bat"],
+                    subprocess_module=subprocess_module,
+                    progress_ui=progress_ui,
+                    progress_line_callback=publish_build_line,
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=env,
+                    timeout=UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS,
+                )
+            finally:
+                if step_log_tailer is not None:
+                    step_log_tailer.stop()
             output = str(getattr(result, "stdout", "") or "")
             error_output = str(getattr(result, "stderr", "") or "")
-            if output:
-                append_update_log(log_path, output.strip())
+            visible_output = _filter_build_output_control_lines(output)
+            if visible_output:
+                append_update_log(log_path, visible_output.strip())
             if error_output:
                 append_update_log(log_path, error_output.strip())
             publish_build_output_progress(
-                output,
+                visible_output,
                 progress_ui=progress_ui,
                 state_path=state_path,
                 log_path=log_path,

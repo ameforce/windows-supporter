@@ -366,6 +366,14 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("SKIP_POST_BUILD_RUN", script)
         self.assertIn("Skipping post-build launch", script)
 
+    def test_build_bat_can_emit_step_log_for_updater_progress(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        self.assertIn("WINDOWS_SUPPORTER_EMIT_STEP_LOG", script)
+        self.assertIn("WINDOWS_SUPPORTER_STEP_LOG=%STEP_LOG%", script)
+        self.assertIn('if "%EMIT_STEP_LOG%"=="1"', script)
+
     def test_build_bat_terminates_running_process_tree(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read().lower()
@@ -477,6 +485,48 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertLess(build["percent"], 80)
         self.assertLess(shutdown["percent"], uv_sync["percent"])
         self.assertLess(uv_sync["percent"], build["percent"])
+
+    def test_build_output_progress_advances_for_real_substep_logs(self) -> None:
+        class FakeProgressUi:
+            def __init__(self) -> None:
+                self.snapshots = []
+
+            def set_snapshot(self, snapshot) -> None:
+                self.snapshots.append(dict(snapshot))
+
+        output = "\n".join(
+            [
+                "Building main.py to windows-supporter.exe...",
+                "1432 INFO: PyInstaller: checking Analysis",
+                "2179 INFO: Building PYZ (ZlibArchive)",
+                "3120 INFO: Building PKG (CArchive) windows-supporter.pkg",
+                "Moving windows-supporter.exe...",
+            ]
+        )
+        progress_ui = FakeProgressUi()
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "update_handoff.json"
+            with open(state_path, "w", encoding="utf-8") as fp:
+                import json
+
+                json.dump(build_update_handoff_payload(repo_root=tmp), fp)
+
+            update_monitor_module.publish_build_output_progress(
+                output,
+                progress_ui=progress_ui,
+                state_path=state_path,
+                log_path=str(Path(tmp) / "update.log"),
+                seen=set(),
+            )
+
+        details = [str(snapshot["detail"]) for snapshot in progress_ui.snapshots]
+        percents = [int(snapshot["percent"]) for snapshot in progress_ui.snapshots]
+        self.assertGreaterEqual(len(progress_ui.snapshots), 5)
+        self.assertTrue(any("checking Analysis" in detail for detail in details))
+        self.assertTrue(any("Building PYZ" in detail for detail in details))
+        self.assertTrue(any("Building PKG" in detail for detail in details))
+        self.assertEqual(percents, sorted(percents))
+        self.assertGreater(percents[-2], percents[0])
 
     def test_process_descendant_cleanup_script_does_not_shadow_powershell_pid(self) -> None:
         if os.name != "nt":
@@ -1487,6 +1537,131 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             any("build.bat 단계" in detail for detail in details),
             "progress detail should name the current build.bat stage",
         )
+
+    def test_run_update_handoff_tails_emitted_build_step_log(self) -> None:
+        class FakeStdout:
+            def __init__(self, owner, step_log: Path) -> None:
+                self.owner = owner
+                self.step_log = step_log
+                self.index = 0
+
+            def readline(self):
+                if self.index == 0:
+                    self.index += 1
+                    return f"WINDOWS_SUPPORTER_STEP_LOG={self.step_log}\n"
+                if self.index == 1:
+                    self.index += 1
+                    return "Generating version metadata...[ Success !! ]\n"
+                if self.index == 2:
+                    self.index += 1
+                    self.step_log.write_text(
+                        "\n".join(
+                            [
+                                "1432 INFO: PyInstaller: checking Analysis",
+                                "2179 INFO: Building PYZ (ZlibArchive)",
+                                "3120 INFO: Building PKG (CArchive) windows-supporter.pkg",
+                            ]
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    time.sleep(0.2)
+                    return "Building main.py to windows-supporter.exe...[ Success !! ]\n"
+                if self.index == 3:
+                    self.index += 1
+                    return "Skipping post-build launch because WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1.\n"
+                time.sleep(0.05)
+                self.owner.returncode = 0
+                return ""
+
+            def read(self):
+                return ""
+
+        class FakeProcess:
+            def __init__(self, step_log: Path) -> None:
+                self.returncode = None
+                self.stdout = FakeStdout(self, step_log)
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=0):
+                self.returncode = 0
+                return self.returncode
+
+            def kill(self):
+                self.returncode = 1
+
+        class FakeSubprocess:
+            def __init__(self, step_log: Path) -> None:
+                self.calls = []
+                self.process = FakeProcess(step_log)
+                self.PIPE = subprocess.PIPE
+                self.STDOUT = subprocess.STDOUT
+
+            def Popen(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                return self.process
+
+        class FakeProgressUi:
+            def __init__(self, *, log_path="", process=None) -> None:
+                self.snapshots = []
+                self.tailed_before_exit = False
+                self.process = process
+
+            def show(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def set_snapshot(self, snapshot):
+                if (
+                    self.process is not None
+                    and self.process.returncode is None
+                    and "checking Analysis" in str(snapshot.get("detail") or "")
+                ):
+                    self.tailed_before_exit = True
+                self.snapshots.append(dict(snapshot))
+
+            def pump(self):
+                return None
+
+            def close(self):
+                return None
+
+            def wait_for_retry_or_close(self):
+                return False
+
+        progress_instances = []
+        launches = []
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / "windows-supporter.exe").write_text("exe", encoding="utf-8")
+            step_log = Path(tmp) / "windows-supporter-build.log"
+            fake_subprocess = FakeSubprocess(step_log)
+            state_path = Path(tmp) / "update_handoff.json"
+            with open(state_path, "w", encoding="utf-8") as fp:
+                import json
+
+                json.dump(build_update_handoff_payload(repo_root=repo), fp)
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=fake_subprocess,
+                launch=lambda command, **kwargs: launches.append((command, kwargs)) or object(),
+                progress_ui_factory=lambda **kwargs: progress_instances.append(
+                    FakeProgressUi(process=fake_subprocess.process, **kwargs)
+                )
+                or progress_instances[-1],
+            )
+
+        details = [str(snapshot["detail"]) for snapshot in progress_instances[0].snapshots]
+        call_env = fake_subprocess.calls[0][1]["env"]
+        self.assertEqual(rc, 0)
+        self.assertEqual(call_env["WINDOWS_SUPPORTER_EMIT_STEP_LOG"], "1")
+        self.assertTrue(progress_instances[0].tailed_before_exit)
+        self.assertTrue(any("checking Analysis" in detail for detail in details))
+        self.assertTrue(any("Building PYZ" in detail for detail in details))
+        self.assertTrue(any("Building PKG" in detail for detail in details))
 
     def test_approving_update_shows_handoff_ui_before_build_completes(self) -> None:
         snapshots_during_ack = []
