@@ -79,6 +79,11 @@ _TASKBAR_OCCUPIED_CHILD_CLASSES = {
     "Start",
     "TrayNotifyWnd",
 }
+_TASKBAR_STRUCTURAL_CHILD_CLASSES = {
+    "MSTaskListWClass",
+    "MSTaskSwWClass",
+    "ReBarWindow32",
+}
 _FULLSCREEN_EXCLUDED_WINDOW_CLASSES = {
     "Dwm",
     "Progman",
@@ -2662,7 +2667,18 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
         "origin_x": int(origin_x),
         "origin_y": int(origin_y),
     }
-    occupied = [tuple(record["span"]) for record in child_records]
+    suppressed_child_records = [
+        record
+        for record in child_records
+        if _child_span_is_structural_overlay_container(record, excluded_spans)
+    ]
+    if suppressed_child_records:
+        telemetry["suppressed_child_spans"] = suppressed_child_records
+    occupied = [
+        tuple(record["span"])
+        for record in child_records
+        if record not in suppressed_child_records
+    ]
     if excluded_spans:
         occupied = _subtract_spans(occupied, excluded_spans)
     telemetry["excluded_spans"] = excluded_spans
@@ -2677,15 +2693,19 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
     if not columns and not occupied:
         return None, telemetry
     if columns:
-        background = _median_background_color(columns)
-        telemetry["pixel_background"] = background
-        for x, colors in columns:
-            if excluded_spans and _span_overlaps_any(
+        sampled_columns = [
+            (x, colors)
+            for x, colors in columns
+            if not excluded_spans
+            or not _span_overlaps_any(
                 int(x),
                 int(x) + _TASKBAR_SAMPLE_STEP_PX,
                 excluded_spans,
-            ):
-                continue
+            )
+        ]
+        background = _median_background_color(sampled_columns or columns)
+        telemetry["pixel_background"] = background
+        for x, colors in sampled_columns:
             if _column_looks_occupied(colors, background):
                 span = (
                     max(0, x - _OCCUPIED_DILATION_PX),
@@ -2733,6 +2753,37 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
         "origin_y": int(origin_y),
     }
     return merged, telemetry
+
+
+def _child_span_is_structural_overlay_container(
+    record: dict[str, Any],
+    excluded_spans: list[tuple[int, int]],
+) -> bool:
+    if not excluded_spans:
+        return False
+    class_name = str(record.get("class_name") or "")
+    if class_name not in _TASKBAR_STRUCTURAL_CHILD_CLASSES:
+        return False
+    try:
+        start, end = tuple(record.get("span") or ())[:2]
+        span_start = int(start)
+        span_end = int(end)
+    except (TypeError, ValueError):
+        return False
+    span_width = max(0, span_end - span_start)
+    if span_width <= 0:
+        return False
+    for excluded_start, excluded_end in excluded_spans:
+        excluded_width = max(0, int(excluded_end) - int(excluded_start))
+        if not _span_overlaps_any(span_start, span_end, [(excluded_start, excluded_end)]):
+            continue
+        structural_width = max(
+            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+            excluded_width + _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX,
+        )
+        if span_width >= structural_width:
+            return True
+    return False
 
 
 def _taskbar_child_occupied_span_records(
