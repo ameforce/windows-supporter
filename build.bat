@@ -138,6 +138,18 @@ if errorlevel 1 (
 )
 echo [ Success !! ]
 
+REM Validate the promoted onefile archive before cleanup and launch
+echo | set /p="Validating PyInstaller archive..."
+call :clear_log
+uv run python "tools\verify_pyinstaller_archive.py" "%ROOT_EXE%" --entry "playwright\driver\node.exe" --match-file ".venv\Lib\site-packages\playwright\driver\node.exe" > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo PyInstaller archive validation failed.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+
 REM Remove build byproducts
 echo | set /p="Remove build byproducts..."
 call :clear_log

@@ -381,6 +381,20 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn(":sleep_one_second", script)
         self.assertIn("Start-Sleep -Seconds 1", script)
 
+    def test_build_bat_validates_pyinstaller_archive_before_launch(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        validation_index = script.index("tools\\verify_pyinstaller_archive.py")
+        move_index = script.index("Moving %EXE_NAME%")
+        cleanup_index = script.index("Remove build byproducts")
+        launch_index = script.index("Running %EXE_NAME%")
+
+        self.assertGreater(validation_index, move_index)
+        self.assertLess(validation_index, cleanup_index)
+        self.assertLess(validation_index, launch_index)
+        self.assertIn("playwright\\driver\\node.exe", script)
+
     def test_build_bat_sleep_helper_runs_with_redirected_stdin(self) -> None:
         if os.name != "nt":
             self.skipTest("build.bat sleep helper is a Windows command path")
