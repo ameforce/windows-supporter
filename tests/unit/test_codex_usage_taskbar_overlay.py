@@ -2063,6 +2063,63 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(any(start <= 380 and end >= 480 for start, end in spans))
         self.assertTrue(any(start <= 820 and end >= 960 for start, end in spans))
 
+    def test_detect_horizontal_taskbar_occupied_spans_does_not_shrink_to_self_hole_in_broad_task_list(self):
+        class _FakeWin32Gui:
+            windows = {
+                10: ("Start", (0, 560, 92, 600), True),
+                11: ("MSTaskListWClass", (420, 560, 1510, 600), True),
+                12: ("TrayNotifyWnd", (1820, 560, 1920, 600), True),
+            }
+
+            def FindWindow(self, class_name, _title):
+                return 1 if class_name == "Shell_TrayWnd" else 0
+
+            def EnumChildWindows(self, _hwnd, callback, extra):
+                for hwnd in self.windows:
+                    callback(hwnd, extra)
+
+            def GetClassName(self, hwnd):
+                return self.windows[int(hwnd)][0]
+
+            def IsWindowVisible(self, hwnd):
+                return self.windows[int(hwnd)][2]
+
+            def GetWindowRect(self, hwnd):
+                return self.windows[int(hwnd)][1]
+
+        background = [(118, 84, 154)] * 5
+        columns = [(x, background) for x in range(0, 1920, 40)]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "win32gui",
+            _FakeWin32Gui(),
+        ), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=columns,
+        ):
+            spans = taskbar_overlay._detect_horizontal_taskbar_occupied_spans(
+                1920,
+                600,
+                (0, 0, 1920, 560),
+                {"orientation": "bottom", "_exclude_spans": [(900, 1300)]},
+            )
+
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            600,
+            (0, 0, 1920, 560),
+            occupied_spans=spans,
+            preferred_width=760,
+        )
+
+        self.assertIsNotNone(spans)
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["width"], 760)
+        self.assertGreaterEqual(geometry["x"], 900)
+        self.assertLessEqual(geometry["x"] + geometry["width"], 1820)
+
     def test_foreground_fullscreen_detector_uses_foreground_window_monitor_bounds(self):
         class _FakeWin32Gui:
             def __init__(self):
