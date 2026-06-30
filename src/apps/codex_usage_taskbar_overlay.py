@@ -1228,10 +1228,27 @@ class CodexUsageTaskbarOverlay:
         if previous_stable_context is None or previous_stable_context != candidate_stable_context:
             self._clear_pending_regression_geometry()
             return candidate_geometry
-        if _is_transient_geometry_x_shift(previous_geometry, candidate_geometry):
+        x_shift_delta = _same_width_geometry_x_shift_delta(
+            previous_geometry,
+            candidate_geometry,
+        )
+        if x_shift_delta is not None:
+            if x_shift_delta <= _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX:
+                self._pending_regression_geometry = dict(candidate_geometry)
+                self._pending_regression_context = candidate_context
+                self._pending_regression_count = int(self._pending_regression_count) + 1
+                return dict(previous_geometry)
+            if (
+                isinstance(self._pending_regression_geometry, dict)
+                and self._pending_regression_context == candidate_context
+                and self._pending_regression_geometry == dict(candidate_geometry)
+                and int(self._pending_regression_count) >= 1
+            ):
+                self._clear_pending_regression_geometry()
+                return candidate_geometry
             self._pending_regression_geometry = dict(candidate_geometry)
             self._pending_regression_context = candidate_context
-            self._pending_regression_count = int(self._pending_regression_count) + 1
+            self._pending_regression_count = 1
             return dict(previous_geometry)
         if (
             isinstance(self._pending_regression_geometry, dict)
@@ -2340,10 +2357,13 @@ def _is_transient_geometry_regression(
         return False
     if current_width < previous_width - int(tolerance_px):
         return True
-    return _is_transient_geometry_x_shift(
-        previous,
-        current,
-        tolerance_px=tolerance_px,
+    return (
+        _same_width_geometry_x_shift_delta(
+            previous,
+            current,
+            tolerance_px=tolerance_px,
+        )
+        is not None
     )
 
 
@@ -2379,12 +2399,29 @@ def _is_transient_geometry_x_shift(
     *,
     tolerance_px: int = _GEOMETRY_CHANGE_TOLERANCE_PX,
 ) -> bool:
+    x_delta = _same_width_geometry_x_shift_delta(
+        previous,
+        current,
+        tolerance_px=tolerance_px,
+    )
+    return (
+        x_delta is not None
+        and x_delta <= _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX
+    )
+
+
+def _same_width_geometry_x_shift_delta(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    tolerance_px: int = _GEOMETRY_CHANGE_TOLERANCE_PX,
+) -> int | None:
     if not bool(previous.get("visible", True)):
-        return False
+        return None
     if not bool(current.get("visible", True)):
-        return False
+        return None
     if str(previous.get("orientation") or "") != str(current.get("orientation") or ""):
-        return False
+        return None
     try:
         previous_width = int(previous.get("width", 0))
         current_width = int(current.get("width", 0))
@@ -2395,15 +2432,17 @@ def _is_transient_geometry_x_shift(
         previous_height = int(previous.get("height", 0))
         current_height = int(current.get("height", 0))
     except Exception:
-        return False
+        return None
     if abs(current_width - previous_width) > int(tolerance_px):
-        return False
+        return None
     if abs(current_y - previous_y) > int(tolerance_px):
-        return False
+        return None
     if abs(current_height - previous_height) > int(tolerance_px):
-        return False
+        return None
     x_delta = abs(current_x - previous_x)
-    return int(tolerance_px) < x_delta <= _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX
+    if x_delta <= int(tolerance_px):
+        return None
+    return int(x_delta)
 
 
 def _crosses_overlay_status_text_threshold(previous_width: int, current_width: int) -> bool:

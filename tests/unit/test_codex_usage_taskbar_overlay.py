@@ -4138,6 +4138,54 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertEqual(window.geometry_calls, [initial_geometry])
 
+    def test_geometry_monitor_defers_large_same_width_x_shift_until_confirmed(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 900), (1700, 1920)],
+            [(0, 980), (1780, 1920)],
+            [(0, 980), (1780, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        initial_geometry = window.geometry_calls[-1]
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][0]
+        geometry_tick()
+
+        self.assertEqual(len(occupied_calls), 2)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertIsNotNone(overlay._geometry_after_id)
+
+        geometry_tick = [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][-1]
+        geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 3)
+        self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
+        self.assertIn("+1012+", window.geometry_calls[-1])
+
     def test_geometry_monitor_deferral_keeps_refresh_from_using_transient_cache(self):
         root = _FakeRoot()
         window = _FakeWindow()
