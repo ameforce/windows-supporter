@@ -32,8 +32,14 @@ class TaskbarOverlayTarget:
     taskbar_hwnd: int
     taskbar_class: str
     taskbar_rect: Rect | None
+    taskbar_visible: bool
     orientation: str
+    orientation_source: str
+    orientation_confidence: str
     displayable: bool
+    displayable_reason: str
+    fallback_reason: str
+    rca_class: str
 
     @property
     def is_primary(self) -> bool:
@@ -125,7 +131,13 @@ def target_cache_key(target: TaskbarOverlayTarget) -> tuple[Any, ...]:
         tuple(monitor.work),
         int(target.taskbar_hwnd),
         str(target.orientation),
+        bool(target.taskbar_visible),
+        str(target.orientation_source),
+        str(target.orientation_confidence),
         bool(target.displayable),
+        str(target.displayable_reason),
+        str(target.fallback_reason),
+        str(target.rca_class),
     )
 
 
@@ -138,22 +150,98 @@ def build_taskbar_overlay_targets(
     for monitor in sorted_monitors(tuple(monitors)):
         taskbar = _best_taskbar_window_for_monitor(monitor, windows)
         orientation = taskbar_orientation(monitor)
-        displayable = bool(
-            taskbar is not None
-            and taskbar.visible
-            and orientation in {"bottom", "top"}
-        )
+        (
+            taskbar_visible,
+            orientation_source,
+            orientation_confidence,
+            displayable,
+            displayable_reason,
+            fallback_reason,
+            rca_class,
+        ) = _target_decision(taskbar, orientation)
         targets.append(
             TaskbarOverlayTarget(
                 monitor=monitor,
                 taskbar_hwnd=int(taskbar.hwnd) if taskbar is not None else 0,
                 taskbar_class=str(taskbar.class_name) if taskbar is not None else "",
                 taskbar_rect=taskbar.rect if taskbar is not None else None,
+                taskbar_visible=taskbar_visible,
                 orientation=orientation,
+                orientation_source=orientation_source,
+                orientation_confidence=orientation_confidence,
                 displayable=displayable,
+                displayable_reason=displayable_reason,
+                fallback_reason=fallback_reason,
+                rca_class=rca_class,
             )
         )
     return tuple(targets)
+
+
+def _target_decision(
+    taskbar: TaskbarWindowSnapshot | None,
+    orientation: str,
+) -> tuple[bool, str, str, bool, str, str, str]:
+    if orientation:
+        orientation_source = "work_area_reserved"
+        orientation_confidence = "high"
+    else:
+        orientation_source = "work_area_unreserved"
+        orientation_confidence = "low"
+    if taskbar is None:
+        reason = "taskbar_window_missing"
+        return (
+            False,
+            orientation_source,
+            orientation_confidence,
+            False,
+            reason,
+            reason,
+            "taskbar_window_unavailable",
+        )
+    taskbar_visible = bool(taskbar.visible)
+    if not taskbar_visible:
+        reason = "taskbar_hidden"
+        return (
+            False,
+            orientation_source,
+            orientation_confidence,
+            False,
+            reason,
+            reason,
+            "taskbar_window_unavailable",
+        )
+    if not orientation:
+        reason = "no_reserved_taskbar_edge"
+        return (
+            True,
+            orientation_source,
+            orientation_confidence,
+            False,
+            reason,
+            reason,
+            "work_area_unreserved",
+        )
+    if orientation not in {"bottom", "top"}:
+        reason = "unsupported_side_taskbar"
+        return (
+            True,
+            orientation_source,
+            orientation_confidence,
+            False,
+            reason,
+            reason,
+            "unsupported_orientation",
+        )
+    return (
+        True,
+        orientation_source,
+        orientation_confidence,
+        True,
+        "displayable",
+        "",
+        "displayable_horizontal_taskbar",
+    )
 
 
 def _best_taskbar_window_for_monitor(

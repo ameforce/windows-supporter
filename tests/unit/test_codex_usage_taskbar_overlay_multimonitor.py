@@ -81,6 +81,7 @@ class _FakeWin32Con:
 class _Desktop:
     def __init__(self):
         self.primary_fullscreen = True
+        self.fullscreen_monitors = set()
         self.monitor_infos = {
             1: {
                 "Device": r"\\.\DISPLAY1",
@@ -126,9 +127,23 @@ class _Desktop:
     def monitor_for_window(self, hwnd):
         if int(hwnd) == 100:
             return 1
+        if int(hwnd) >= 1000:
+            return int(hwnd) - 1000
         if int(hwnd) in self.taskbars:
             return self.monitor_for_rect(self.taskbars[int(hwnd)][1])
         return 1
+
+    def fullscreen_windows(self):
+        windows = {}
+        if self.primary_fullscreen:
+            windows[100] = ("GameWindow", self.monitor_infos[1]["Monitor"], True)
+        for handle in self.fullscreen_monitors:
+            windows[1000 + int(handle)] = (
+                "GameWindow",
+                self.monitor_infos[int(handle)]["Monitor"],
+                True,
+            )
+        return windows
 
 
 class _FakeWin32Api:
@@ -163,8 +178,7 @@ class _FakeWin32Gui:
 
     def EnumWindows(self, callback, extra):
         windows = dict(self._desktop.taskbars)
-        if self._desktop.primary_fullscreen:
-            windows[100] = ("GameWindow", (0, 0, 1920, 1080), True)
+        windows.update(self._desktop.fullscreen_windows())
         for hwnd in windows:
             if not callback(hwnd, extra):
                 break
@@ -176,7 +190,7 @@ class _FakeWin32Gui:
         return int(hwnd)
 
     def GetClassName(self, hwnd):
-        if int(hwnd) == 100:
+        if int(hwnd) in self._desktop.fullscreen_windows():
             return "GameWindow"
         return self._desktop.taskbars[int(hwnd)][0]
 
@@ -184,22 +198,27 @@ class _FakeWin32Gui:
         return ""
 
     def IsWindowVisible(self, hwnd):
-        if int(hwnd) == 100:
-            return self._desktop.primary_fullscreen
+        if int(hwnd) in self._desktop.fullscreen_windows():
+            return True
         return self._desktop.taskbars[int(hwnd)][2]
 
     def IsIconic(self, _hwnd):
         return False
 
     def GetWindowRect(self, hwnd):
-        if int(hwnd) == 100:
-            return (0, 0, 1920, 1080)
+        fullscreen = self._desktop.fullscreen_windows()
+        if int(hwnd) in fullscreen:
+            return fullscreen[int(hwnd)][1]
         return self._desktop.taskbars[int(hwnd)][1]
 
     def WindowFromPoint(self, point):
         x, _y = point
         if self._desktop.primary_fullscreen and 0 <= int(x) < 1920:
             return 100
+        for hwnd, (_class_name, rect, _visible) in self._desktop.fullscreen_windows().items():
+            left, top, right, bottom = rect
+            if int(left) <= int(x) < int(right) and int(top) <= int(_y) < int(bottom):
+                return int(hwnd)
         return 0
 
 
@@ -251,6 +270,28 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
         self.assertGreaterEqual(int(geometry["x"]), 1920)
         self.assertEqual(geometry["orientation"], "bottom")
         self.assertEqual(window.withdraw_calls, 0)
+
+    def test_secondary_relocation_telemetry_includes_target_decision_and_fullscreen_state(self):
+        _overlay, _root, window = _refresh_with_desktop(_Desktop())
+
+        geometry = window.draw_calls[-1]["geometry"]
+        self.assertEqual(geometry["fallback_reason"], "")
+        self.assertEqual(geometry["rca_class"], "displayable_horizontal_taskbar")
+        self.assertEqual(geometry["selected_target"]["taskbar_hwnd"], 20)
+        self.assertEqual(geometry["selected_target"]["displayable_reason"], "displayable")
+        self.assertFalse(geometry["selected_target"]["fullscreen"])
+
+        fullscreen_by_hwnd = {
+            item["taskbar_hwnd"]: item["fullscreen"]
+            for item in geometry["fullscreen_decisions"]
+        }
+        self.assertTrue(fullscreen_by_hwnd[10])
+        self.assertFalse(fullscreen_by_hwnd[20])
+        target_by_hwnd = {
+            item["taskbar_hwnd"]: item
+            for item in geometry["target_decisions"]
+        }
+        self.assertEqual(target_by_hwnd[20]["rca_class"], "displayable_horizontal_taskbar")
 
     def test_secondary_taskbar_geometry_keeps_physical_coordinate_basis(self):
         _overlay, _root, window = _refresh_with_desktop(_Desktop())
@@ -322,6 +363,40 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
         self.assertGreaterEqual(window.withdraw_calls, 1)
         self.assertFalse(overlay._window_visible)
         self.assertTrue(any(call[1].__name__ == "_geometry_monitor_tick" for call in root.after_calls))
+
+    def test_all_fullscreen_targets_withdraws_overlay_with_rca_reason(self):
+        desktop = _Desktop()
+        desktop.primary_fullscreen = False
+        overlay, _root, window = _refresh_with_desktop(desktop)
+        self.assertTrue(window.draw_calls)
+
+        desktop.primary_fullscreen = True
+        desktop.fullscreen_monitors.add(2)
+        with patch.object(taskbar_overlay, "win32gui", _FakeWin32Gui(desktop)), patch.object(
+            taskbar_overlay,
+            "win32api",
+            _FakeWin32Api(desktop),
+        ), patch.object(taskbar_overlay, "win32con", _FakeWin32Con), patch.object(
+            taskbar_overlay.ctypes,
+            "windll",
+            _FakeWindll(),
+            create=True,
+        ):
+            overlay.invalidate_geometry()
+            overlay.refresh()
+
+        hidden = overlay._cached_geometry
+        self.assertGreaterEqual(window.withdraw_calls, 1)
+        self.assertFalse(overlay._window_visible)
+        self.assertFalse(hidden["visible"])
+        self.assertEqual(hidden["fallback_reason"], "all_candidate_targets_fullscreen")
+        self.assertEqual(hidden["rca_class"], "all_targets_fullscreen")
+        fullscreen_by_hwnd = {
+            item["taskbar_hwnd"]: item["fullscreen"]
+            for item in hidden["fullscreen_decisions"]
+        }
+        self.assertTrue(fullscreen_by_hwnd[10])
+        self.assertTrue(fullscreen_by_hwnd[20])
 
     def test_fullscreen_release_restores_overlay_to_primary_taskbar(self):
         desktop = _Desktop()
