@@ -1179,6 +1179,7 @@ class UpdateHandoffProgressUi:
             root = tk.Tk()
             self._closed = False
             root.title(str(snapshot.get("title") or UPDATE_PROGRESS_TITLE))
+            root.overrideredirect(True)
             root.geometry("600x360")
             root.resizable(False, False)
             root.configure(bg="#EEF2F7")
