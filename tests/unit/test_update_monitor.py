@@ -24,6 +24,7 @@ from src.utils.update_monitor import (
     UPDATE_PROGRESS_RETRY_BUTTON_TEXT,
     UPDATE_SOURCE_CHANGE_NOTICE,
     UpdateCandidate,
+    UpdateHandoffProgressUi,
     UpdatePromptSession,
     UpdateWorkingTreeState,
     WindowsSupporterUpdater,
@@ -462,6 +463,35 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(failed["labels"]["log"], UPDATE_PROGRESS_LOG_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["retry"], UPDATE_PROGRESS_RETRY_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["manual_action"], UPDATE_PROGRESS_MANUAL_ACTION_TEXT)
+
+    def test_update_handoff_progress_ui_uses_borderless_chrome(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        try:
+            probe = tk.Tk()
+            probe.withdraw()
+            probe.destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi()
+        try:
+            progress.show(
+                build_update_progress_snapshot(
+                    "handoff_start",
+                    state="running",
+                    detail="업데이트 전용 프로세스가 시작되었습니다.",
+                )
+            )
+
+            self.assertIsNotNone(progress._root)
+            assert progress._root is not None
+            self.assertTrue(progress._root.overrideredirect())
+        finally:
+            progress.close()
 
     def test_build_output_progress_is_distributed_from_early_visible_percentages(self) -> None:
         shutdown = build_update_build_output_progress_snapshot(
