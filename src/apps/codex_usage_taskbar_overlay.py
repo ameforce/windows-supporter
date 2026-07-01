@@ -1312,20 +1312,27 @@ class CodexUsageTaskbarOverlay:
         if not targets:
             return None
         primary = next((target for target in targets if target.is_primary), targets[0])
+        target_decisions = _target_decisions_telemetry(targets)
+        fullscreen_by_key: dict[tuple[Any, ...], bool] = {}
         overlay_hwnd = _get_window_handle(self._window) if self._window is not None else 0
         if overlay_hwnd <= 0:
             overlay_hwnd = _get_window_handle(self._root)
-        primary_fullscreen = _is_monitor_fullscreen(
-            primary.monitor.monitor,
+        primary_fullscreen = _fullscreen_for_target(
+            primary,
+            fullscreen_by_key,
             int(overlay_hwnd),
             self._root,
         )
         if not primary_fullscreen:
             return None
+        hidden_fallback_reason = ""
+        hidden_rca_class = ""
+        displayable_secondary_found = False
         for target in targets:
             if target.is_primary or not bool(target.displayable):
                 continue
-            if _is_monitor_fullscreen(target.monitor.monitor, int(overlay_hwnd), self._root):
+            displayable_secondary_found = True
+            if _fullscreen_for_target(target, fullscreen_by_key, int(overlay_hwnd), self._root):
                 continue
             geometry = self._calculate_geometry_for_target(
                 target,
@@ -1334,7 +1341,35 @@ class CodexUsageTaskbarOverlay:
                 preferred_width=preferred_width,
             )
             if bool(geometry.get("visible", True)):
-                return geometry
+                return _attach_target_placement_telemetry(
+                    geometry,
+                    targets,
+                    target_decisions,
+                    target,
+                    fullscreen_by_key,
+                    int(overlay_hwnd),
+                    self._root,
+                    fallback_reason="",
+                    rca_class=str(target.rca_class or "displayable_horizontal_taskbar"),
+                )
+            if not hidden_fallback_reason:
+                hidden_fallback_reason = str(geometry.get("fallback_reason") or "")
+                hidden_rca_class = str(geometry.get("rca_class") or "")
+        if not hidden_fallback_reason:
+            if displayable_secondary_found:
+                hidden_fallback_reason = "all_candidate_targets_fullscreen"
+                hidden_rca_class = "all_targets_fullscreen"
+            else:
+                hidden_fallback_reason = "no_displayable_secondary_target"
+                hidden_rca_class = "target_unavailable"
+        if not hidden_rca_class:
+            hidden_rca_class = "target_unavailable"
+        fullscreen_decisions = _fullscreen_decisions_telemetry(
+            targets,
+            fullscreen_by_key,
+            int(overlay_hwnd),
+            self._root,
+        )
         hidden = {
             "x": int(primary.monitor.monitor[0]),
             "y": int(primary.monitor.monitor[1]),
@@ -1344,11 +1379,22 @@ class CodexUsageTaskbarOverlay:
             "visible": False,
             "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
             "_geometry_basis": "global_physical_px",
+            "target_decisions": target_decisions,
+            "fullscreen_decisions": fullscreen_decisions,
+            "selected_target": None,
+            "fallback_reason": hidden_fallback_reason,
+            "rca_class": hidden_rca_class,
         }
         self._cached_geometry_context = (
             "monitor-target-hidden",
-            target_cache_key(primary),
+            tuple(target_cache_key(target) for target in targets),
+            tuple(
+                (int(item["taskbar_hwnd"]), bool(item["fullscreen"]))
+                for item in fullscreen_decisions
+            ),
             int(preferred_width or 0),
+            hidden_fallback_reason,
+            hidden_rca_class,
         )
         self._cached_geometry = dict(hidden)
         self._geometry_invalidated = False
@@ -2128,6 +2174,124 @@ class CodexUsageTaskbarOverlay:
         return
 
 
+def _target_decision_telemetry(
+    target: TaskbarOverlayTarget,
+    *,
+    fullscreen: bool | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "monitor_rect": list(target.monitor.monitor),
+        "work_area_rect": list(target.monitor.work),
+        "is_primary": bool(target.is_primary),
+        "taskbar_hwnd": int(target.taskbar_hwnd),
+        "taskbar_class": str(target.taskbar_class or ""),
+        "taskbar_rect": list(target.taskbar_rect) if target.taskbar_rect is not None else None,
+        "taskbar_visible": bool(target.taskbar_visible),
+        "orientation": str(target.orientation or ""),
+        "orientation_source": str(target.orientation_source or ""),
+        "orientation_confidence": str(target.orientation_confidence or ""),
+        "displayable": bool(target.displayable),
+        "displayable_reason": str(target.displayable_reason or ""),
+        "fallback_reason": str(target.fallback_reason or ""),
+        "rca_class": str(target.rca_class or ""),
+    }
+    if fullscreen is not None:
+        payload["fullscreen"] = bool(fullscreen)
+    return payload
+
+
+def _target_decisions_telemetry(
+    targets: tuple[TaskbarOverlayTarget, ...],
+) -> list[dict[str, Any]]:
+    return [_target_decision_telemetry(target) for target in targets]
+
+
+def _fullscreen_for_target(
+    target: TaskbarOverlayTarget,
+    fullscreen_by_key: dict[tuple[Any, ...], bool],
+    overlay_hwnd: int,
+    root: Any | None,
+) -> bool:
+    key = target_cache_key(target)
+    if key not in fullscreen_by_key:
+        fullscreen_by_key[key] = bool(
+            _is_monitor_fullscreen(
+                target.monitor.monitor,
+                int(overlay_hwnd),
+                root,
+            )
+        )
+    return bool(fullscreen_by_key[key])
+
+
+def _fullscreen_decisions_telemetry(
+    targets: tuple[TaskbarOverlayTarget, ...],
+    fullscreen_by_key: dict[tuple[Any, ...], bool],
+    overlay_hwnd: int,
+    root: Any | None,
+) -> list[dict[str, Any]]:
+    return [
+        _target_decision_telemetry(
+            target,
+            fullscreen=_fullscreen_for_target(
+                target,
+                fullscreen_by_key,
+                int(overlay_hwnd),
+                root,
+            ),
+        )
+        for target in targets
+    ]
+
+
+def _attach_target_placement_telemetry(
+    geometry: dict[str, Any],
+    targets: tuple[TaskbarOverlayTarget, ...],
+    target_decisions: list[dict[str, Any]],
+    selected_target: TaskbarOverlayTarget,
+    fullscreen_by_key: dict[tuple[Any, ...], bool],
+    overlay_hwnd: int,
+    root: Any | None,
+    *,
+    fallback_reason: str,
+    rca_class: str,
+) -> dict[str, Any]:
+    fitted = dict(geometry)
+    selected_fullscreen = bool(fullscreen_by_key.get(target_cache_key(selected_target), False))
+    fitted["target_decisions"] = list(target_decisions)
+    fitted["fullscreen_decisions"] = _fullscreen_decisions_telemetry(
+        targets,
+        fullscreen_by_key,
+        int(overlay_hwnd),
+        root,
+    )
+    fitted["selected_target"] = _target_decision_telemetry(
+        selected_target,
+        fullscreen=selected_fullscreen,
+    )
+    fitted["fallback_reason"] = str(fallback_reason or "")
+    fitted["rca_class"] = str(rca_class or selected_target.rca_class or "")
+    return fitted
+
+
+def _rca_class_summary(*items: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+
+    def add(value: Any) -> None:
+        if isinstance(value, dict):
+            rca_class = str(value.get("rca_class") or "")
+            if rca_class:
+                counts[rca_class] = counts.get(rca_class, 0) + 1
+            return
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                add(nested)
+
+    for item in items:
+        add(item)
+    return counts
+
+
 def _fit_horizontal_geometry_to_empty_slot(
     geometry: dict[str, int | str],
     screen_width: int,
@@ -2138,6 +2302,8 @@ def _fit_horizontal_geometry_to_empty_slot(
     include_telemetry: bool = False,
 ) -> dict[str, Any]:
     fitted = dict(geometry)
+    fitted.setdefault("fallback_reason", "")
+    fitted.setdefault("rca_class", "displayable_horizontal_taskbar")
     if occupied_spans is None:
         if include_telemetry:
             fitted["_telemetry"] = _geometry_telemetry(
@@ -2163,6 +2329,8 @@ def _fit_horizontal_geometry_to_empty_slot(
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
+        fitted["fallback_reason"] = "no_taskbar_empty_slot"
+        fitted["rca_class"] = "taskbar_slot_unavailable"
         if include_telemetry:
             fitted["_telemetry"] = _geometry_telemetry(
                 int(screen_width),
@@ -2181,6 +2349,8 @@ def _fit_horizontal_geometry_to_empty_slot(
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
+        fitted["fallback_reason"] = "taskbar_empty_slot_too_narrow"
+        fitted["rca_class"] = "taskbar_slot_unavailable"
         if include_telemetry:
             fitted["_telemetry"] = _geometry_telemetry(
                 int(screen_width),
@@ -2204,16 +2374,18 @@ def _fit_horizontal_geometry_to_empty_slot(
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
     fitted["visible"] = True
+    fitted["fallback_reason"] = ""
+    fitted["rca_class"] = "displayable_horizontal_taskbar"
     if include_telemetry:
-            fitted["_telemetry"] = _geometry_telemetry(
-                int(screen_width),
-                preferred_width,
-                work_area_telemetry=work_area_telemetry,
-                occupied_spans=occupied_spans,
-                free_spans=free_spans,
-                selected_slot=selected_slot,
-                chosen_geometry=fitted,
-            )
+        fitted["_telemetry"] = _geometry_telemetry(
+            int(screen_width),
+            preferred_width,
+            work_area_telemetry=work_area_telemetry,
+            occupied_spans=occupied_spans,
+            free_spans=free_spans,
+            selected_slot=selected_slot,
+            chosen_geometry=fitted,
+        )
     return fitted
 
 
@@ -2266,6 +2438,21 @@ def _geometry_telemetry(
         else 0
     )
     classification_width = chosen_width if visible else available_width
+    fallback_reason = str(chosen_geometry.get("fallback_reason") or "")
+    rca_class = str(chosen_geometry.get("rca_class") or "")
+    if not fallback_reason and not visible:
+        if not free_spans:
+            fallback_reason = "no_taskbar_empty_slot"
+        elif available_width < _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX:
+            fallback_reason = "taskbar_empty_slot_too_narrow"
+        else:
+            fallback_reason = "taskbar_geometry_hidden"
+    if not rca_class:
+        rca_class = (
+            "displayable_horizontal_taskbar"
+            if visible
+            else "taskbar_slot_unavailable"
+        )
     telemetry_geometry = {
         key: value
         for key, value in chosen_geometry.items()
@@ -2281,6 +2468,8 @@ def _geometry_telemetry(
         "free_spans": tuple((int(start), int(end)) for start, end in free_spans),
         "padded_free_spans": tuple((int(start), int(end)) for start, end in free_spans),
         "preferred_width": None if preferred_width is None else int(preferred_width),
+        "fallback_reason": fallback_reason,
+        "rca_class": rca_class,
         "selected_slot": {
             "span": None
             if selected_slot is None
@@ -3105,7 +3294,16 @@ def capture_local_taskbar_overlay_geometry_snapshot(
 
 
 def _collect_local_taskbar_overlay_geometry_sample() -> dict[str, Any]:
-    target = _local_debug_taskbar_target()
+    targets = _collect_taskbar_overlay_targets()
+    target = _select_local_debug_taskbar_target(targets)
+    target_decisions = _target_decisions_telemetry(targets)
+    fullscreen_by_key: dict[tuple[Any, ...], bool] = {}
+    fullscreen_decisions = _fullscreen_decisions_telemetry(
+        targets,
+        fullscreen_by_key,
+        0,
+        None,
+    )
     if target is not None:
         width, height = monitor_size(target.monitor)
         work_area = local_work_area(target.monitor)
@@ -3173,6 +3371,20 @@ def _collect_local_taskbar_overlay_geometry_sample() -> dict[str, Any]:
     )
     conversions = dict(geometry_telemetry.get("conversions", {}))
     conversions.update(dict(occupancy_telemetry.get("conversions", {})))
+    selected_target = (
+        _target_decision_telemetry(
+            target,
+            fullscreen=bool(fullscreen_by_key.get(target_cache_key(target), False)),
+        )
+        if target is not None
+        else None
+    )
+    fallback_reason = str(chosen_geometry.get("fallback_reason") or "")
+    if not fallback_reason and target is not None:
+        fallback_reason = str(target.fallback_reason or "")
+    rca_class = str(chosen_geometry.get("rca_class") or "")
+    if not rca_class and target is not None:
+        rca_class = str(target.rca_class or "")
     return {
         "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
         "monitor_rect": list(monitor_rect),
@@ -3195,11 +3407,22 @@ def _collect_local_taskbar_overlay_geometry_sample() -> dict[str, Any]:
         "theme": _windows_theme_snapshot(),
         "icon_alignment": _taskbar_icon_alignment(),
         "conversions": conversions,
+        "target_decisions": target_decisions,
+        "selected_target": selected_target,
+        "fullscreen_decisions": fullscreen_decisions,
+        "fallback_reason": fallback_reason,
+        "rca_class": rca_class,
+        "rca_class_summary": _rca_class_summary(
+            target_decisions,
+            selected_target,
+            {"rca_class": rca_class},
+        ),
     }
 
 
-def _local_debug_taskbar_target() -> TaskbarOverlayTarget | None:
-    targets = _collect_taskbar_overlay_targets()
+def _select_local_debug_taskbar_target(
+    targets: tuple[TaskbarOverlayTarget, ...],
+) -> TaskbarOverlayTarget | None:
     if not targets:
         return None
     for target in targets:
@@ -3209,6 +3432,11 @@ def _local_debug_taskbar_target() -> TaskbarOverlayTarget | None:
         if bool(target.displayable):
             return target
     return targets[0]
+
+
+def _local_debug_taskbar_target() -> TaskbarOverlayTarget | None:
+    targets = _collect_taskbar_overlay_targets()
+    return _select_local_debug_taskbar_target(targets)
 
 
 def _fallback_screen_size() -> tuple[int, int]:
