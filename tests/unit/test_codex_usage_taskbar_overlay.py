@@ -10,6 +10,10 @@ from src.apps.codex_usage_taskbar_overlay import (
     build_codex_usage_taskbar_overlay_model,
     calculate_taskbar_overlay_geometry,
 )
+from src.apps.codex_usage_taskbar_targets import (
+    TaskbarMonitorSnapshot,
+    TaskbarOverlayTarget,
+)
 
 
 class _FakeRoot:
@@ -1925,6 +1929,82 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(snapshot["chosen_geometry"], sample["chosen_geometry"])
         sleep.assert_not_called()
 
+    def test_local_taskbar_snapshot_includes_target_decision_and_rca_class_summary(self):
+        monitor = TaskbarMonitorSnapshot(
+            handle=1,
+            device=r"\\.\DISPLAY1",
+            display_num=1,
+            is_primary=True,
+            monitor=(0, 0, 1000, 600),
+            work=(0, 0, 1000, 560),
+        )
+        target = TaskbarOverlayTarget(
+            monitor=monitor,
+            taskbar_hwnd=11,
+            taskbar_class="Shell_TrayWnd",
+            taskbar_rect=(0, 560, 1000, 600),
+            taskbar_visible=True,
+            orientation="bottom",
+            orientation_source="work_area_reserved",
+            orientation_confidence="high",
+            displayable=True,
+            displayable_reason="displayable",
+            fallback_reason="",
+            rca_class="displayable_horizontal_taskbar",
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_collect_taskbar_overlay_targets",
+            return_value=(target,),
+        ), patch.object(
+            taskbar_overlay,
+            "_detect_horizontal_taskbar_occupied_spans_with_debug",
+            return_value=(
+                [],
+                {
+                    "child_spans_by_class": {},
+                    "pixel_spans": [],
+                    "edge_guards": [],
+                    "merged_occupied_spans": [],
+                    "free_spans": [(8, 992)],
+                    "padded_free_spans": [(8, 992)],
+                    "conversions": {},
+                },
+            ),
+        ), patch.object(
+            taskbar_overlay,
+            "_is_monitor_fullscreen",
+            return_value=False,
+        ), patch.object(
+            taskbar_overlay,
+            "_taskbar_debug_dpi",
+            return_value={"scale_x": 1.0, "scale_y": 1.0},
+        ), patch.object(
+            taskbar_overlay,
+            "_windows_theme_snapshot",
+            return_value={"name": "unknown"},
+        ), patch.object(
+            taskbar_overlay,
+            "_taskbar_icon_alignment",
+            return_value="unknown",
+        ):
+            snapshot = taskbar_overlay.capture_local_taskbar_overlay_geometry_snapshot(
+                sample_count=1,
+                sample_interval_sec=0,
+            )
+
+        self.assertEqual(snapshot["target_decisions"][0]["taskbar_hwnd"], 11)
+        self.assertEqual(snapshot["target_decisions"][0]["displayable_reason"], "displayable")
+        self.assertEqual(snapshot["selected_target"]["taskbar_hwnd"], 11)
+        self.assertFalse(snapshot["fullscreen_decisions"][0]["fullscreen"])
+        self.assertEqual(snapshot["fallback_reason"], "")
+        self.assertEqual(snapshot["rca_class"], "displayable_horizontal_taskbar")
+        self.assertGreaterEqual(
+            snapshot["rca_class_summary"]["displayable_horizontal_taskbar"],
+            1,
+        )
+
     def test_taskbar_child_spans_convert_from_global_physical_to_monitor_physical(self):
         class _FakeWin32Gui:
             windows = {
@@ -2662,6 +2742,23 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(telemetry["normalized_occupied_spans"], ((0, 180), (900, 1000)))
         self.assertEqual(telemetry["merged_occupied_spans"], ((0, 180), (900, 1000)))
         self.assertEqual(telemetry["padded_free_spans"], ((188, 892),))
+
+    def test_taskbar_geometry_telemetry_reports_hide_reason_when_no_slot_can_fit(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1000,
+            600,
+            (0, 0, 1000, 560),
+            occupied_spans=[(0, 1000)],
+            include_telemetry=True,
+        )
+
+        telemetry = geometry["_telemetry"]
+        self.assertFalse(geometry["visible"])
+        self.assertEqual(geometry["fallback_reason"], "no_taskbar_empty_slot")
+        self.assertEqual(geometry["rca_class"], "taskbar_slot_unavailable")
+        self.assertEqual(telemetry["fallback_reason"], "no_taskbar_empty_slot")
+        self.assertEqual(telemetry["rca_class"], "taskbar_slot_unavailable")
+        self.assertEqual(telemetry["selected_slot"]["classification"], "hidden")
 
     def test_bottom_taskbar_geometry_hides_at_padded_slot_175_and_shows_at_176(self):
         hidden = calculate_taskbar_overlay_geometry(
