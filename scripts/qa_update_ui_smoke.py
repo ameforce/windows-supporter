@@ -222,6 +222,12 @@ def run_smoke(output_path: Path, screenshot_path: Path | None = None) -> dict[st
             labels.append(str(handoff_start["label"]))
             labels.append(str(progress._percent_label.cget("text")))
             labels.append("custom-canvas" if progress._progress_canvas is not None else "missing-canvas")
+            borderless = progress._root.overrideredirect() if progress._root is not None else None
+            labels.append(
+                "borderless-true"
+                if borderless is True or borderless == 1 or str(borderless).lower() == "true"
+                else f"borderless-{borderless!r}"
+            )
             labels.append(
                 "log-visible"
                 if progress._log_button.winfo_ismapped()
@@ -292,6 +298,7 @@ def run_smoke(output_path: Path, screenshot_path: Path | None = None) -> dict[st
                 any("업데이트 프로세스 시작" in label for label in labels),
                 any(label == "0%" for label in labels),
                 any(label == "custom-canvas" for label in labels),
+                any(label == "borderless-true" for label in labels),
                 any(label == "log-visible" for label in labels),
                 any("업데이트 사전 점검 중" in label for label in labels),
                 any("Fork.exe" in label and "종료 승인" in label for label in labels),
