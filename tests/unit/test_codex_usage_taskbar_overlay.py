@@ -4340,6 +4340,92 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
         self.assertIn("+1012+", window.geometry_calls[-1])
 
+    def test_geometry_monitor_keeps_current_viable_slot_when_new_right_slot_appears(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 100), (520, 1920)],
+            [(0, 100), (520, 900), (1320, 1920)],
+            [(0, 100), (520, 900), (1320, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+            initial_geometry = window.geometry_calls[-1]
+            geometry_tick = [
+                callback
+                for _delay, callback in root.after_calls
+                if callback.__name__ == "_geometry_monitor_tick"
+            ][0]
+            geometry_tick()
+
+            geometry_tick = [
+                callback
+                for _delay, callback in root.after_calls
+                if callback.__name__ == "_geometry_monitor_tick"
+            ][-1]
+            geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 3)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertIn("300x", initial_geometry)
+        self.assertIn("+212+", initial_geometry)
+
+    def test_root_geometry_drops_target_previous_geometry_on_fallback(self):
+        root = _FakeRoot()
+        occupied_calls = []
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return [(0, 100), (520, 900), (1320, 1920)]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+        previous_target_geometry = {
+            "x": 212,
+            "y": 1041,
+            "width": 300,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+            "coordinate_basis": "physical_px",
+            "_geometry_basis": "global_physical_px",
+            "_taskbar_hwnd": 20,
+        }
+
+        geometry = overlay._calculate_root_geometry(
+            force_resample=True,
+            preferred_width=300,
+            previous_geometry=previous_target_geometry,
+        )
+
+        self.assertEqual(geometry["x"], 1012)
+        self.assertGreaterEqual(len(occupied_calls), 1)
+
     def test_geometry_monitor_deferral_keeps_refresh_from_using_transient_cache(self):
         root = _FakeRoot()
         window = _FakeWindow()
