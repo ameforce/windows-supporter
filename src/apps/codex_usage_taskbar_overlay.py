@@ -316,6 +316,7 @@ def calculate_taskbar_overlay_geometry(
     *,
     occupied_spans: list[tuple[int, int]] | None = None,
     preferred_width: int | None = None,
+    previous_geometry: dict[str, Any] | None = None,
     include_telemetry: bool = False,
 ) -> dict[str, Any]:
     screen_width = max(320, int(screen_width or 0))
@@ -349,6 +350,7 @@ def calculate_taskbar_overlay_geometry(
             int(screen_width),
             occupied_spans,
             preferred_width=preferred_width,
+            previous_geometry=previous_geometry,
             work_area_telemetry=work_area_telemetry,
             include_telemetry=include_telemetry,
         )
@@ -372,6 +374,7 @@ def calculate_taskbar_overlay_geometry(
             int(screen_width),
             occupied_spans,
             preferred_width=preferred_width,
+            previous_geometry=previous_geometry,
             work_area_telemetry=work_area_telemetry,
             include_telemetry=include_telemetry,
         )
@@ -441,6 +444,7 @@ def calculate_taskbar_overlay_geometry(
         int(screen_width),
         occupied_spans,
         preferred_width=preferred_width,
+        previous_geometry=previous_geometry,
         work_area_telemetry=work_area_telemetry,
         include_telemetry=include_telemetry,
     )
@@ -793,6 +797,71 @@ def _wide_slot_preferred_width(model: dict[str, Any], minimum_width: int) -> int
     )
 
 
+def _model_geometry(model: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(model, dict):
+        return None
+    geometry = model.get("geometry")
+    if not isinstance(geometry, dict):
+        return None
+    return dict(geometry)
+
+
+def _local_previous_geometry_for_target(
+    previous_geometry: dict[str, Any] | None,
+    target: TaskbarOverlayTarget,
+) -> dict[str, Any] | None:
+    if not isinstance(previous_geometry, dict) or not bool(
+        previous_geometry.get("visible", True)
+    ):
+        return None
+    try:
+        previous_taskbar_hwnd = int(previous_geometry.get("_taskbar_hwnd", 0) or 0)
+    except (TypeError, ValueError):
+        previous_taskbar_hwnd = 0
+    target_taskbar_hwnd = int(target.taskbar_hwnd)
+    if (
+        previous_taskbar_hwnd > 0
+        and target_taskbar_hwnd > 0
+        and previous_taskbar_hwnd != target_taskbar_hwnd
+    ):
+        return None
+    geometry_rect = _geometry_screen_rect(previous_geometry)
+    if geometry_rect is not None and not _rects_overlap(
+        geometry_rect,
+        target.monitor.monitor,
+    ):
+        return None
+    local_geometry = dict(previous_geometry)
+    try:
+        local_geometry["x"] = int(previous_geometry.get("x", 0)) - int(
+            target.monitor.monitor[0]
+        )
+    except (TypeError, ValueError):
+        return None
+    return local_geometry
+
+
+def _root_previous_geometry(
+    previous_geometry: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(previous_geometry, dict):
+        return None
+    if "_taskbar_hwnd" in previous_geometry:
+        return None
+    if str(previous_geometry.get("_geometry_basis") or "") == "global_physical_px":
+        return None
+    return dict(previous_geometry)
+
+
+def _rects_overlap(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> bool:
+    left_x1, left_y1, left_x2, left_y2 = left
+    right_x1, right_y1, right_x2, right_y2 = right
+    return (
+        min(int(left_x2), int(right_x2)) > max(int(left_x1), int(right_x1))
+        and min(int(left_y2), int(right_y2)) > max(int(left_y1), int(right_y1))
+    )
+
+
 class CodexUsageTaskbarOverlay:
     def __init__(
         self,
@@ -850,7 +919,10 @@ class CodexUsageTaskbarOverlay:
             now=now,
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
-        geometry = self._calculate_geometry(preferred_width=preferred_width)
+        geometry = self._calculate_geometry(
+            preferred_width=preferred_width,
+            previous_geometry=_model_geometry(self._last_model),
+        )
         model = build_codex_usage_taskbar_overlay_model(
             runtime,
             geometry=geometry,
@@ -1150,15 +1222,16 @@ class CodexUsageTaskbarOverlay:
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
         previous_geometry_context = self._cached_geometry_context
+        previous_geometry = model.get("geometry", {})
+        if not isinstance(previous_geometry, dict):
+            previous_geometry = {}
         geometry = self._calculate_geometry(
             force_resample=True,
             withdraw_for_sampling=False,
             preferred_width=preferred_width,
+            previous_geometry=previous_geometry,
         )
         candidate_geometry_context = self._cached_geometry_context
-        previous_geometry = model.get("geometry", {})
-        if not isinstance(previous_geometry, dict):
-            previous_geometry = {}
         geometry = self._stabilize_transient_geometry_regression(
             previous_geometry,
             geometry,
@@ -1287,11 +1360,13 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool = False,
         withdraw_for_sampling: bool = True,
         preferred_width: int | None = None,
+        previous_geometry: dict[str, Any] | None = None,
     ) -> dict[str, int | str]:
         target_geometry = self._calculate_monitor_target_geometry(
             force_resample=force_resample,
             withdraw_for_sampling=withdraw_for_sampling,
             preferred_width=preferred_width,
+            previous_geometry=previous_geometry,
         )
         if target_geometry is not None:
             return target_geometry
@@ -1299,6 +1374,7 @@ class CodexUsageTaskbarOverlay:
             force_resample=force_resample,
             withdraw_for_sampling=withdraw_for_sampling,
             preferred_width=preferred_width,
+            previous_geometry=previous_geometry,
         )
 
     def _calculate_monitor_target_geometry(
@@ -1307,6 +1383,7 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool,
         withdraw_for_sampling: bool,
         preferred_width: int | None,
+        previous_geometry: dict[str, Any] | None,
     ) -> dict[str, int | str] | None:
         targets = self._collect_taskbar_targets_for_geometry()
         if not targets:
@@ -1339,6 +1416,7 @@ class CodexUsageTaskbarOverlay:
                 force_resample=force_resample,
                 withdraw_for_sampling=withdraw_for_sampling,
                 preferred_width=preferred_width,
+                previous_geometry=previous_geometry,
             )
             if bool(geometry.get("visible", True)):
                 return _attach_target_placement_telemetry(
@@ -1420,14 +1498,20 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool,
         withdraw_for_sampling: bool,
         preferred_width: int | None,
+        previous_geometry: dict[str, Any] | None,
     ) -> dict[str, int | str]:
         width, height = monitor_size(target.monitor)
         work_area = local_work_area(target.monitor)
+        local_previous_geometry = _local_previous_geometry_for_target(
+            previous_geometry,
+            target,
+        )
         geometry = calculate_taskbar_overlay_geometry(
             width,
             height,
             work_area,
             preferred_width=preferred_width,
+            previous_geometry=local_previous_geometry,
         )
         occupied_spans: list[tuple[int, int]] | None = None
         if str(geometry.get("orientation") or "") in {"bottom", "top"}:
@@ -1446,6 +1530,7 @@ class CodexUsageTaskbarOverlay:
                     work_area,
                     occupied_spans=occupied_spans,
                     preferred_width=preferred_width,
+                    previous_geometry=local_previous_geometry,
                 )
         context = self._target_geometry_context(
             target,
@@ -1516,6 +1601,7 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool = False,
         withdraw_for_sampling: bool = True,
         preferred_width: int | None = None,
+        previous_geometry: dict[str, Any] | None = None,
     ) -> dict[str, int | str]:
         width = _root_int(self._root, "winfo_screenwidth", 1920)
         height = _root_int(self._root, "winfo_screenheight", 1080)
@@ -1523,11 +1609,13 @@ class CodexUsageTaskbarOverlay:
             work_area = self._work_area_getter()
         except Exception:
             work_area = None
+        root_previous_geometry = _root_previous_geometry(previous_geometry)
         geometry = calculate_taskbar_overlay_geometry(
             width,
             height,
             work_area,
             preferred_width=preferred_width,
+            previous_geometry=root_previous_geometry,
         )
         if str(geometry.get("orientation") or "") not in {"bottom", "top"}:
             self._cache_geometry(
@@ -1572,6 +1660,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             occupied_spans=occupied_spans,
             preferred_width=preferred_width,
+            previous_geometry=root_previous_geometry,
         )
         context = self._geometry_context(
             width,
@@ -2298,6 +2387,7 @@ def _fit_horizontal_geometry_to_empty_slot(
     occupied_spans: list[tuple[int, int]] | None,
     *,
     preferred_width: int | None = None,
+    previous_geometry: dict[str, Any] | None = None,
     work_area_telemetry: dict[str, Any] | None = None,
     include_telemetry: bool = False,
 ) -> dict[str, Any]:
@@ -2324,7 +2414,18 @@ def _fit_horizontal_geometry_to_empty_slot(
         list(normalized_spans),
         padding_px=_EMPTY_SLOT_PADDING_PX,
     )
-    selected_slot = _selected_free_slot(free_spans)
+    if preferred_width is None:
+        target_width = desired_width
+    else:
+        target_width = min(
+            max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
+            desired_width,
+        )
+    selected_slot = _selected_free_slot(
+        free_spans,
+        previous_geometry=previous_geometry,
+        target_width=target_width,
+    )
     if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
@@ -2363,13 +2464,6 @@ def _fit_horizontal_geometry_to_empty_slot(
             )
         return fitted
 
-    if preferred_width is None:
-        target_width = desired_width
-    else:
-        target_width = min(
-            max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
-            desired_width,
-        )
     width = min(target_width, available)
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
@@ -2389,7 +2483,12 @@ def _fit_horizontal_geometry_to_empty_slot(
     return fitted
 
 
-def _selected_free_slot(free_spans: list[tuple[int, int]]) -> tuple[int, int] | None:
+def _selected_free_slot(
+    free_spans: list[tuple[int, int]],
+    *,
+    previous_geometry: dict[str, Any] | None = None,
+    target_width: int | None = None,
+) -> tuple[int, int] | None:
     if not free_spans:
         return None
     usable_spans = [
@@ -2398,7 +2497,52 @@ def _selected_free_slot(free_spans: list[tuple[int, int]]) -> tuple[int, int] | 
         if int(span[1]) - int(span[0]) >= _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
     ]
     candidates = usable_spans or free_spans
+    previous_slot = _previous_geometry_free_slot(
+        candidates,
+        previous_geometry=previous_geometry,
+        target_width=target_width,
+    )
+    if previous_slot is not None:
+        return previous_slot
     return max(candidates, key=lambda span: (int(span[1]), int(span[0])))
+
+
+def _previous_geometry_free_slot(
+    free_spans: list[tuple[int, int]],
+    *,
+    previous_geometry: dict[str, Any] | None,
+    target_width: int | None,
+) -> tuple[int, int] | None:
+    if not isinstance(previous_geometry, dict) or not bool(
+        previous_geometry.get("visible", True)
+    ):
+        return None
+    if str(previous_geometry.get("orientation") or "") not in {"bottom", "top"}:
+        return None
+    try:
+        previous_x = int(previous_geometry.get("x", 0))
+        previous_width = int(previous_geometry.get("width", 0))
+    except (TypeError, ValueError):
+        return None
+    if previous_width <= 0:
+        return None
+    previous_center = previous_x + max(1, previous_width) // 2
+    min_slot_width = _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+    if target_width is not None:
+        try:
+            min_slot_width = min(
+                max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(target_width)),
+                max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, previous_width),
+            )
+        except (TypeError, ValueError):
+            min_slot_width = _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+    for start, end in free_spans:
+        span_width = int(end) - int(start)
+        if span_width < min_slot_width:
+            continue
+        if int(start) <= previous_center <= int(end):
+            return int(start), int(end)
+    return None
 
 
 def _slot_classification(width: int) -> str:
