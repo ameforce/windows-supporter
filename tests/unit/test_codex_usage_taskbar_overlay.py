@@ -4606,6 +4606,65 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(window.geometry_calls[-1], refreshed_geometry)
         self.assertNotIn("484x", window.geometry_calls[-1])
 
+    def test_geometry_monitor_uses_previous_geometry_exclusion_when_window_span_unavailable(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        base_spans = [(0, 100), (520, 900), (1320, 1920)]
+        current_overlay_span = None
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            if geometry.get("_exclude_spans") or current_overlay_span is None:
+                return list(base_spans)
+            return list(base_spans) + [current_overlay_span]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+            initial_geometry = window.geometry_calls[-1]
+            initial_model_geometry = overlay._last_model["geometry"]
+            current_overlay_span = (
+                int(initial_model_geometry["x"]),
+                int(initial_model_geometry["x"]) + int(initial_model_geometry["width"]),
+            )
+
+            with patch.object(
+                taskbar_overlay,
+                "_current_horizontal_window_span",
+                return_value=None,
+            ):
+                geometry_tick = [
+                    callback
+                    for _delay, callback in root.after_calls
+                    if callback.__name__ == "_geometry_monitor_tick"
+                ][0]
+                geometry_tick()
+
+                geometry_tick = [
+                    callback
+                    for _delay, callback in root.after_calls
+                    if callback.__name__ == "_geometry_monitor_tick"
+                ][-1]
+                geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 3)
+        self.assertEqual(window.geometry_calls[-1], initial_geometry)
+        self.assertIn("300x", initial_geometry)
+        self.assertIn("+1012+", initial_geometry)
+
     def test_geometry_monitor_tick_excludes_current_overlay_span_from_live_sampling(self):
         root = _FakeRoot()
         window = _FakeWindow()
