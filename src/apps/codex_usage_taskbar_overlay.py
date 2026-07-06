@@ -1522,6 +1522,7 @@ class CodexUsageTaskbarOverlay:
                 work_area,
                 sampling_geometry,
                 withdraw_window=withdraw_for_sampling,
+                fallback_exclude_geometry=local_previous_geometry,
             )
             if occupied_spans is not None:
                 geometry = calculate_taskbar_overlay_geometry(
@@ -1641,6 +1642,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             geometry,
             withdraw_window=withdraw_for_sampling,
+            fallback_exclude_geometry=root_previous_geometry,
         )
         if occupied_spans is None:
             if (
@@ -1744,6 +1746,7 @@ class CodexUsageTaskbarOverlay:
         geometry: dict[str, int | str],
         *,
         withdraw_window: bool = True,
+        fallback_exclude_geometry: dict[str, Any] | None = None,
     ) -> list[tuple[int, int]] | None:
         window = self._window
         sampling_geometry = dict(geometry)
@@ -1760,6 +1763,10 @@ class CodexUsageTaskbarOverlay:
             sampling_geometry["_exclude_spans"] = [
                 (int(exclude_span[0]) - origin_x, int(exclude_span[1]) - origin_x)
             ]
+        elif window is not None and bool(self._window_visible):
+            fallback_span = _horizontal_geometry_exclude_span(fallback_exclude_geometry)
+            if fallback_span is not None:
+                sampling_geometry["_exclude_spans"] = [fallback_span]
         elif (
             window is not None
             and bool(withdraw_window)
@@ -2781,6 +2788,23 @@ def _same_width_geometry_x_shift_delta(
     if x_delta <= int(tolerance_px):
         return None
     return int(x_delta)
+
+
+def _horizontal_geometry_exclude_span(
+    geometry: dict[str, Any] | None,
+) -> tuple[int, int] | None:
+    if not isinstance(geometry, dict) or not bool(geometry.get("visible", True)):
+        return None
+    if str(geometry.get("orientation") or "") not in {"bottom", "top"}:
+        return None
+    try:
+        x = int(geometry.get("x", 0))
+        width = int(geometry.get("width", 0))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0:
+        return None
+    return int(x), int(x + width)
 
 
 def _crosses_overlay_status_text_threshold(previous_width: int, current_width: int) -> bool:
