@@ -2795,6 +2795,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["x"], 100)
         self.assertEqual(geometry["width"], 328)
+        self.assertEqual(geometry["_slot_side"], "left")
         self.assertEqual(geometry["_telemetry"]["selected_slot"]["span"], (100, 428))
         self.assertEqual(geometry["_telemetry"]["selected_slot"]["classification"], "compact")
 
@@ -3385,6 +3386,44 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["width"], 254)
         self.assertEqual(geometry["x"], 728)
+        self.assertEqual(geometry["_slot_side"], "right")
+
+    def test_bottom_taskbar_geometry_prefers_recovered_right_slot_over_previous_left_slot(self):
+        previous_left_geometry = {
+            "x": 212,
+            "y": 1041,
+            "width": 300,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+        }
+
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            occupied_spans=[(0, 100), (520, 900), (1320, 1920)],
+            preferred_width=300,
+            previous_geometry=previous_left_geometry,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["x"], 1012)
+        self.assertEqual(geometry["width"], 300)
+        self.assertEqual(geometry["_slot_side"], "right")
+
+    def test_cross_center_slot_uses_final_overlay_position_for_right_side_identity(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            occupied_spans=[(0, 92), (1820, 1920)],
+            preferred_width=300,
+        )
+
+        self.assertEqual(geometry["x"], 1512)
+        self.assertEqual(geometry["width"], 300)
+        self.assertEqual(geometry["_slot_side"], "right")
 
     def test_bottom_taskbar_geometry_hides_when_no_empty_slot_can_fit(self):
         geometry = calculate_taskbar_overlay_geometry(
@@ -4340,7 +4379,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
         self.assertIn("+1012+", window.geometry_calls[-1])
 
-    def test_geometry_monitor_keeps_current_viable_slot_when_new_right_slot_appears(self):
+    def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
         window = _FakeWindow()
         occupied_calls = []
@@ -4389,6 +4428,232 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(window.geometry_calls, [initial_geometry])
         self.assertIn("300x", initial_geometry)
         self.assertIn("+212+", initial_geometry)
+
+    def test_geometry_monitor_does_not_ping_pong_on_two_sample_side_feedback(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 100), (560, 1360), (1820, 1920)],
+            [(0, 100), (560, 1920)],
+            [(0, 100), (560, 1920)],
+            [(0, 1360), (1820, 1920)],
+            [(0, 1360), (1820, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            initial_geometry = window.geometry_calls[-1]
+            for _index in range(4):
+                geometry_tick = [
+                    callback
+                    for _delay, callback in root.after_calls
+                    if callback.__name__ == "_geometry_monitor_tick"
+                ][-1]
+                geometry_tick()
+
+        self.assertEqual(len(occupied_calls), 5)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertIn("+1512+", initial_geometry)
+
+    def test_side_transition_requires_dwell_before_accepting_left_fallback(self):
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+        previous = {
+            "x": 1512,
+            "y": 1041,
+            "width": 300,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+            "_slot_side": "right",
+        }
+        candidate = {
+            "x": 252,
+            "y": 1041,
+            "width": 300,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+            "_slot_side": "left",
+        }
+        previous_context = (
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            "bottom",
+            ("preferred_width", 300),
+            ("occupied_spans", ((0, 100), (560, 1360), (1820, 1920))),
+            ("free_spans", ((108, 552), (1368, 1812))),
+        )
+        candidate_context = (
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            "bottom",
+            ("preferred_width", 300),
+            ("occupied_spans", ((0, 100), (560, 1920))),
+            ("free_spans", ((108, 552),)),
+        )
+
+        with patch.object(
+            taskbar_overlay.time,
+            "monotonic",
+            side_effect=[0.0, 0.5, 2.1],
+        ):
+            first = overlay._stabilize_transient_geometry_regression(
+                previous,
+                candidate,
+                previous_context=previous_context,
+                candidate_context=candidate_context,
+            )
+            second = overlay._stabilize_transient_geometry_regression(
+                previous,
+                candidate,
+                previous_context=previous_context,
+                candidate_context=candidate_context,
+            )
+            third = overlay._stabilize_transient_geometry_regression(
+                previous,
+                candidate,
+                previous_context=previous_context,
+                candidate_context=candidate_context,
+            )
+
+        self.assertEqual(first, previous)
+        self.assertEqual(second, previous)
+        self.assertEqual(third, candidate)
+
+    def test_side_transition_returns_to_right_after_promotion_dwell(self):
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+        previous = {
+            "x": 252,
+            "y": 1041,
+            "width": 300,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+            "_slot_side": "left",
+        }
+        candidate = {
+            "x": 1512,
+            "y": 1041,
+            "width": 300,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+            "_slot_side": "right",
+        }
+        previous_context = (
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            "bottom",
+            ("preferred_width", 300),
+            ("occupied_spans", ((0, 100), (560, 1920))),
+            ("free_spans", ((108, 552),)),
+        )
+        candidate_context = (
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            "bottom",
+            ("preferred_width", 300),
+            ("occupied_spans", ((0, 1360), (1820, 1920))),
+            ("free_spans", ((1368, 1812),)),
+        )
+
+        with patch.object(
+            taskbar_overlay.time,
+            "monotonic",
+            side_effect=[0.0, 0.5, 1.1],
+        ):
+            first = overlay._stabilize_transient_geometry_regression(
+                previous,
+                candidate,
+                previous_context=previous_context,
+                candidate_context=candidate_context,
+            )
+            second = overlay._stabilize_transient_geometry_regression(
+                previous,
+                candidate,
+                previous_context=previous_context,
+                candidate_context=candidate_context,
+            )
+            third = overlay._stabilize_transient_geometry_regression(
+                previous,
+                candidate,
+                previous_context=previous_context,
+                candidate_context=candidate_context,
+            )
+
+        self.assertEqual(first, previous)
+        self.assertEqual(second, previous)
+        self.assertEqual(third, candidate)
+
+    def test_refresh_defers_cross_side_move_until_side_dwell_is_satisfied(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 100), (560, 1360), (1820, 1920)],
+            [(0, 100), (560, 1920)],
+            [(0, 100), (560, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            initial_geometry = window.geometry_calls[-1]
+            overlay.refresh()
+            overlay.refresh()
+
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertIn("+1512+", initial_geometry)
 
     def test_root_geometry_drops_target_previous_geometry_on_fallback(self):
         root = _FakeRoot()
