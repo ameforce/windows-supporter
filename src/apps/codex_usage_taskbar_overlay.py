@@ -65,6 +65,10 @@ _GEOMETRY_MONITOR_TICK_MS = 500
 _GEOMETRY_MONITOR_HARD_RESAMPLE_SEC = 0.5
 _GEOMETRY_CHANGE_TOLERANCE_PX = 2
 _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX = _OCCUPIED_DILATION_PX
+_RIGHT_TO_LEFT_SWITCH_DWELL_SEC = 2.0
+_LEFT_TO_RIGHT_SWITCH_DWELL_SEC = 1.0
+_SLOT_SIDE_LEFT = "left"
+_SLOT_SIDE_RIGHT = "right"
 _FULLSCREEN_POLL_MS = 500
 _GWLP_HWNDPARENT = -8
 _TASKBAR_METRICS = (
@@ -902,6 +906,9 @@ class CodexUsageTaskbarOverlay:
         self._pending_regression_geometry: dict[str, int | str] | None = None
         self._pending_regression_context = None
         self._pending_regression_count = 0
+        self._pending_side_transition: tuple[str, str] | None = None
+        self._pending_side_transition_context = None
+        self._pending_side_transition_started_at = 0.0
         self._fullscreen_suppressed = False
         self._window_visible = False
         self._active_taskbar_hwnd = 0
@@ -919,9 +926,17 @@ class CodexUsageTaskbarOverlay:
             now=now,
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
+        previous_geometry_context = self._cached_geometry_context
+        previous_geometry = _model_geometry(self._last_model) or {}
         geometry = self._calculate_geometry(
             preferred_width=preferred_width,
-            previous_geometry=_model_geometry(self._last_model),
+            previous_geometry=previous_geometry,
+        )
+        geometry = self._stabilize_transient_geometry_regression(
+            previous_geometry,
+            geometry,
+            previous_context=previous_geometry_context,
+            candidate_context=self._cached_geometry_context,
         )
         model = build_codex_usage_taskbar_overlay_model(
             runtime,
@@ -996,6 +1011,7 @@ class CodexUsageTaskbarOverlay:
         self._cancel_keepalive_tick()
         self._cancel_geometry_monitor_tick()
         self._clear_pending_regression_geometry()
+        self._clear_pending_side_transition()
         self._fullscreen_suppressed = False
         return
 
@@ -1010,6 +1026,7 @@ class CodexUsageTaskbarOverlay:
         self._window_visible = False
         self._cancel_flash_tick()
         self._clear_pending_regression_geometry()
+        self._clear_pending_side_transition()
         self._schedule_geometry_monitor_tick()
         return
 
@@ -1018,6 +1035,7 @@ class CodexUsageTaskbarOverlay:
         self._cached_geometry_context = None
         self._cached_geometry = None
         self._clear_pending_regression_geometry()
+        self._clear_pending_side_transition()
         return
 
     def _update_metric_change_flash(self, model: dict[str, Any]) -> None:
@@ -1239,7 +1257,6 @@ class CodexUsageTaskbarOverlay:
             candidate_context=candidate_geometry_context,
         )
         if self._cached_geometry_context is not None:
-            self._cached_geometry = dict(geometry)
             self._geometry_invalidated = False
         geometry_changed = _geometry_changed(previous_geometry, geometry)
         updated_model = build_codex_usage_taskbar_overlay_model(
@@ -1290,6 +1307,12 @@ class CodexUsageTaskbarOverlay:
         self._pending_regression_count = 0
         return
 
+    def _clear_pending_side_transition(self) -> None:
+        self._pending_side_transition = None
+        self._pending_side_transition_context = None
+        self._pending_side_transition_started_at = 0.0
+        return
+
     def _stabilize_transient_geometry_regression(
         self,
         previous_geometry: dict[str, Any],
@@ -1298,6 +1321,43 @@ class CodexUsageTaskbarOverlay:
         previous_context: Any,
         candidate_context: Any,
     ) -> dict[str, int | str]:
+        previous_side = _horizontal_geometry_slot_side(previous_geometry)
+        candidate_side = _horizontal_geometry_slot_side(candidate_geometry)
+        if previous_side and candidate_side and previous_side != candidate_side:
+            previous_stable_context = _transient_geometry_context_key(previous_context)
+            candidate_stable_context = _transient_geometry_context_key(candidate_context)
+            if (
+                previous_stable_context is None
+                or previous_stable_context != candidate_stable_context
+            ):
+                self._clear_pending_side_transition()
+                self._clear_pending_regression_geometry()
+                return candidate_geometry
+            transition = (previous_side, candidate_side)
+            now = time.monotonic()
+            if (
+                self._pending_side_transition != transition
+                or self._pending_side_transition_context != candidate_stable_context
+            ):
+                self._pending_side_transition = transition
+                self._pending_side_transition_context = candidate_stable_context
+                self._pending_side_transition_started_at = float(now)
+                self._clear_pending_regression_geometry()
+                return dict(previous_geometry)
+            dwell_seconds = (
+                _RIGHT_TO_LEFT_SWITCH_DWELL_SEC
+                if transition == (_SLOT_SIDE_RIGHT, _SLOT_SIDE_LEFT)
+                else _LEFT_TO_RIGHT_SWITCH_DWELL_SEC
+            )
+            if float(now) - float(self._pending_side_transition_started_at) < float(
+                dwell_seconds
+            ):
+                self._clear_pending_regression_geometry()
+                return dict(previous_geometry)
+            self._clear_pending_side_transition()
+            self._clear_pending_regression_geometry()
+            return candidate_geometry
+        self._clear_pending_side_transition()
         if not _is_transient_geometry_regression(previous_geometry, candidate_geometry):
             self._clear_pending_regression_geometry()
             return candidate_geometry
@@ -2401,6 +2461,7 @@ def _fit_horizontal_geometry_to_empty_slot(
     fitted = dict(geometry)
     fitted.setdefault("fallback_reason", "")
     fitted.setdefault("rca_class", "displayable_horizontal_taskbar")
+    fitted.setdefault("_slot_side", "")
     if occupied_spans is None:
         if include_telemetry:
             fitted["_telemetry"] = _geometry_telemetry(
@@ -2437,6 +2498,7 @@ def _fit_horizontal_geometry_to_empty_slot(
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
+        fitted["_slot_side"] = ""
         fitted["fallback_reason"] = "no_taskbar_empty_slot"
         fitted["rca_class"] = "taskbar_slot_unavailable"
         if include_telemetry:
@@ -2457,6 +2519,7 @@ def _fit_horizontal_geometry_to_empty_slot(
         fitted["visible"] = False
         fitted["width"] = 0
         fitted["height"] = 0
+        fitted["_slot_side"] = ""
         fitted["fallback_reason"] = "taskbar_empty_slot_too_narrow"
         fitted["rca_class"] = "taskbar_slot_unavailable"
         if include_telemetry:
@@ -2474,6 +2537,10 @@ def _fit_horizontal_geometry_to_empty_slot(
     width = min(target_width, available)
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
+    fitted["_slot_side"] = _slot_side_for_geometry(
+        fitted,
+        int(screen_width),
+    )
     fitted["visible"] = True
     fitted["fallback_reason"] = ""
     fitted["rca_class"] = "displayable_horizontal_taskbar"
@@ -2504,14 +2571,29 @@ def _selected_free_slot(
         if int(span[1]) - int(span[0]) >= _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
     ]
     candidates = usable_spans or free_spans
+    rightmost_slot = max(candidates, key=lambda span: (int(span[1]), int(span[0])))
     previous_slot = _previous_geometry_free_slot(
-        candidates,
+        [rightmost_slot],
         previous_geometry=previous_geometry,
         target_width=target_width,
     )
     if previous_slot is not None:
         return previous_slot
-    return max(candidates, key=lambda span: (int(span[1]), int(span[0])))
+    return rightmost_slot
+
+
+def _slot_side_for_geometry(geometry: dict[str, Any], screen_width: int) -> str:
+    try:
+        x = int(geometry.get("x", 0) or 0)
+        width = int(geometry.get("width", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if width <= 0:
+        return ""
+    midpoint_twice = x * 2 + width
+    if midpoint_twice >= int(screen_width):
+        return _SLOT_SIDE_RIGHT
+    return _SLOT_SIDE_LEFT
 
 
 def _previous_geometry_free_slot(
@@ -2676,6 +2758,10 @@ def _is_transient_geometry_regression(
     *,
     tolerance_px: int = _GEOMETRY_CHANGE_TOLERANCE_PX,
 ) -> bool:
+    previous_side = _horizontal_geometry_slot_side(previous)
+    current_side = _horizontal_geometry_slot_side(current)
+    if previous_side and current_side and previous_side != current_side:
+        return False
     if not bool(previous.get("visible", True)):
         return False
     if str(previous.get("orientation") or "") != str(current.get("orientation") or ""):
@@ -2710,6 +2796,17 @@ def _is_transient_geometry_regression(
         )
         is not None
     )
+
+
+def _horizontal_geometry_slot_side(geometry: dict[str, Any]) -> str:
+    if not bool(geometry.get("visible", True)):
+        return ""
+    if str(geometry.get("orientation") or "") not in {"bottom", "top"}:
+        return ""
+    side = str(geometry.get("_slot_side") or "")
+    if side in {_SLOT_SIDE_LEFT, _SLOT_SIDE_RIGHT}:
+        return side
+    return ""
 
 
 def _transient_geometry_context_key(context: Any) -> Any:
