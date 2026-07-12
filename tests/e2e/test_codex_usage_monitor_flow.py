@@ -4709,6 +4709,56 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             self.assertFalse(bool(call.kwargs.get("bring_to_front", True)))
             self.assertEqual(call.kwargs.get("source"), "pending_login_poll")
 
+    def test_managed_hidden_cdp_guard_rehides_window_that_reappears(self) -> None:
+        class _DummyProc:
+            pid = 43210
+
+            def poll(self):
+                return None
+
+        class _InlineThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        proc = _DummyProc()
+        self.monitor._CodexUsageMonitor__root = object()
+        self.monitor._CodexUsageMonitor__hidden_cdp_proc = proc
+
+        def rehide_once(*_args, **_kwargs):
+            self.monitor._CodexUsageMonitor__hidden_cdp_proc = None
+            return True
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _InlineThread):
+            with patch.object(self.monitor._CodexUsageMonitor__lib.time, "sleep"):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__is_subprocess_running",
+                    return_value=True,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__set_windows_visibility_for_pid",
+                        side_effect=rehide_once,
+                    ) as set_visibility:
+                        started = self.monitor._CodexUsageMonitor__start_hidden_cdp_visibility_guard(
+                            proc,
+                            source="auto_monitor",
+                        )
+
+        self.assertTrue(started)
+        self.assertTrue(bool(getattr(proc, "_ws_hidden_visibility_guard_started", False)))
+        set_visibility.assert_called_once_with(
+            pid=43210,
+            visible=False,
+            bring_to_front=False,
+            timeout_sec=0.2,
+            source="auto_monitor",
+        )
+
     def test_unexpected_visible_window_log_has_diagnostics_and_redacts_url(self) -> None:
         class _DummyWin32Gui:
             def __init__(self):
