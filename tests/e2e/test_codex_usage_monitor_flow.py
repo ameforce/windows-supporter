@@ -4803,9 +4803,15 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(fake_win32gui.position_calls)
         self.assertEqual(fake_win32gui.position_calls[0][2:4], (-32000, -32000))
         self.assertEqual(fake_win32gui.show_calls, [(789, 0)])
+        # Paint suppression SetWindowLong(WS_EX_LAYERED) runs before SW_HIDE.
         self.assertLess(
-            fake_win32gui.events.index("ShowWindow"),
             fake_win32gui.events.index("SetWindowLong"),
+            fake_win32gui.events.index("ShowWindow"),
+        )
+        # Toolwindow style SetWindowLong still runs after hide/evacuate.
+        self.assertGreater(
+            fake_win32gui.events.count("SetWindowLong"),
+            1,
         )
 
     def test_toolwindow_style_is_not_applied_when_hide_fails(self) -> None:
@@ -4872,8 +4878,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         )
 
         self.assertFalse(ok)
-        self.assertEqual(fake_win32gui.set_long_calls, 0)
-        self.assertEqual(fake_win32gui.style, 0x00040000)
+        # Layered paint suppression may SetWindowLong(WS_EX_LAYERED), but the
+        # taskbar toolwindow bit must not be applied while the frame stays on-screen.
+        self.assertEqual(fake_win32gui.style & 0x00000080, 0)
+        self.assertTrue(fake_win32gui.style & 0x00040000)
 
     def test_set_windows_visibility_for_pid_hides_all_chrome_windows(self) -> None:
         class _DummyWin32Gui:
@@ -5003,10 +5011,12 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     )
 
         self.assertTrue(ok)
-        self.assertGreaterEqual(fake_win32gui.visibility_checks, 2)
-        self.assertEqual(fake_win32gui.show_calls, [(789, 0), (789, 0)])
+        # Success is on-screen absence, not IsWindowVisible=False. A late HWND that
+        # is already off-screen is accepted without polling visibility bits.
+        self.assertEqual(fake_win32gui.show_calls, [(789, 0)])
+        self.assertGreaterEqual(len(handle_scans), 2)
 
-    def test_hidden_visibility_does_not_accept_offscreen_but_visible_window(self) -> None:
+    def test_hidden_visibility_accepts_offscreen_even_if_still_visible(self) -> None:
         class _DummyWin32Gui:
             def __init__(self):
                 self.show_calls: list[tuple[int, int]] = []
@@ -5058,7 +5068,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         source="startup_warmup",
                     )
 
-        self.assertFalse(ok)
+        self.assertTrue(
+            ok,
+            "Chrome headless often keeps IsWindowVisible=True while off-screen; "
+            "that must still count as hidden",
+        )
         self.assertGreaterEqual(len(fake_win32gui.show_calls), 1)
 
     def test_hidden_visibility_accepts_blank_title_chrome_content_hwnd(self) -> None:
@@ -5177,6 +5191,144 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(fake.position_calls[0][1:3], (-32000, -32000))
         self.assertEqual(fake.position_calls[0][3:5], (0, 0))
         self.assertTrue(fake.style & 0x00000080)
+
+    def test_hidden_visibility_suppresses_paint_before_evacuate(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.style = 0x00040000
+                self.rect = (0, 0, 800, 600)
+                self.visible = True
+                self.events: list[str] = []
+                self.layered_alpha: list[tuple[int, int]] = []
+                self.cloak_values: list[int] = []
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return "WindowsSupporterHidden - Chrome"
+
+            def IsWindowVisible(self, _hwnd):
+                return bool(self.visible)
+
+            def GetWindowLong(self, _hwnd, _index):
+                return self.style
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                self.style = int(value)
+                self.events.append("SetWindowLong")
+                return int(value)
+
+            def GetWindowRect(self, _hwnd):
+                return self.rect
+
+            def SetWindowPos(self, hwnd, _insert_after, x, y, cx, cy, flags):
+                flags_value = int(flags)
+                left, top, right, bottom = self.rect
+                width = int(right - left)
+                height = int(bottom - top)
+                if not (flags_value & 0x0002):  # SWP_NOMOVE
+                    left = int(x)
+                    top = int(y)
+                if not (flags_value & 0x0001):  # SWP_NOSIZE
+                    width = int(cx)
+                    height = int(cy)
+                self.rect = (left, top, left + width, top + height)
+                self.events.append("SetWindowPos")
+                return True
+
+            def ShowWindow(self, _hwnd, command):
+                self.events.append(f"ShowWindow:{int(command)}")
+                return True
+
+            def GetForegroundWindow(self):
+                return 0
+
+            def SetLayeredWindowAttributes(self, hwnd, _color, alpha, flags):
+                self.layered_alpha.append((int(hwnd), int(alpha), int(flags)))
+                self.events.append("SetLayeredWindowAttributes")
+                return True
+
+        class _DummyUser32:
+            def __init__(self, gui: _DummyWin32Gui):
+                self._gui = gui
+
+            def SetLayeredWindowAttributes(self, hwnd, color, alpha, flags):
+                return self._gui.SetLayeredWindowAttributes(hwnd, color, alpha, flags)
+
+            def GetSystemMetrics(self, index):
+                return {0: 1920, 1: 1080, 76: 0, 77: 0, 78: 1920, 79: 1080}.get(
+                    int(index),
+                    0,
+                )
+
+        class _DummyDwmapi:
+            def __init__(self, gui: _DummyWin32Gui):
+                self._gui = gui
+
+            def DwmSetWindowAttribute(self, hwnd, attribute, value_ref, size):
+                del hwnd, size
+                if int(attribute) != 13:
+                    return 0
+                self._gui.cloak_values.append(int(value_ref[0]))
+                self._gui.events.append("DwmCloak")
+                return 0
+
+        fake = _DummyWin32Gui()
+        fake_ctypes = type(
+            "CTypesNamespace",
+            (),
+            {},
+        )()
+        fake_ctypes.windll = type("WindllNamespace", (), {})()
+        fake_ctypes.windll.user32 = _DummyUser32(fake)
+        fake_ctypes.windll.dwmapi = _DummyDwmapi(fake)
+        fake_ctypes.c_int = int
+        fake_ctypes.byref = lambda value: [int(value)]
+        fake_ctypes.sizeof = lambda _value: 4
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib,
+                    "ctypes",
+                    fake_ctypes,
+                    create=True,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__list_top_windows_for_pid",
+                        return_value=[2173640],
+                    ):
+                        ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                            pid=45396,
+                            visible=False,
+                            bring_to_front=False,
+                            timeout_sec=0.2,
+                            source="auto_monitor",
+                        )
+
+        self.assertTrue(
+            ok,
+            "hide must succeed when paint is suppressed even if IsWindowVisible stays True",
+        )
+        self.assertTrue(fake.layered_alpha)
+        self.assertEqual(fake.layered_alpha[0][1], 0)
+        self.assertEqual(fake.cloak_values, [1])
+        self.assertLess(
+            fake.events.index("SetLayeredWindowAttributes"),
+            fake.events.index("ShowWindow:0"),
+        )
+        self.assertLess(
+            fake.events.index("DwmCloak"),
+            fake.events.index("ShowWindow:0"),
+        )
+        self.assertEqual(fake.rect[:2], (-32000, -32000))
 
     def test_cdp_hide_fails_when_any_content_pid_remains_visible(self) -> None:
         class _DummyProc:
@@ -5523,6 +5675,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         class _DummyWin32Gui:
             def __init__(self):
                 self.visible = True
+                self.rect = (0, 0, 800, 600)
 
             def GetWindowLong(self, _hwnd, _index):
                 return 0x00040000
@@ -5530,7 +5683,18 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             def SetWindowLong(self, _hwnd, _index, value):
                 return int(value)
 
-            def SetWindowPos(self, *_args):
+            def SetWindowPos(self, _hwnd, _insert_after, x, y, cx, cy, flags):
+                flags_value = int(flags)
+                left, top, right, bottom = self.rect
+                width = int(right - left)
+                height = int(bottom - top)
+                if not (flags_value & 0x0002):
+                    left = int(x)
+                    top = int(y)
+                if not (flags_value & 0x0001):
+                    width = int(cx)
+                    height = int(cy)
+                self.rect = (left, top, left + width, top + height)
                 return True
 
             def GetClassName(self, _hwnd):
@@ -5540,7 +5704,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return "https://example.test/?token=secret-value"
 
             def GetWindowRect(self, _hwnd):
-                return (-32000, -32000, -30720, -31280)
+                return self.rect
 
             def GetForegroundWindow(self):
                 return 900
@@ -5595,7 +5759,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("pid=123", diagnostic)
         self.assertIn("hwnd=789", diagnostic)
         self.assertIn("class=Chrome_WidgetWin_1", diagnostic)
-        self.assertIn("rect=(-32000,-32000,-30720,-31280)", diagnostic)
+        self.assertIn("rect=(0,0,800,600)", diagnostic)
         self.assertIn("foreground_hwnd=900", diagnostic)
         self.assertIn("foreground_pid=777", diagnostic)
         self.assertIn("foreground_ppid=555", diagnostic)
