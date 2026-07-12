@@ -83,6 +83,19 @@ class Monitor:
             pass
         return
 
+    def shutdown(self) -> None:
+        self.__stop_background_tasks()
+        codex = self.__codex_usage
+        shutdown = getattr(codex, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
+        self.__root = None
+        self.__event_queue = None
+        return
+
     def __ui_post(self, fn) -> None:
         q = self.__event_queue
         if q is None:

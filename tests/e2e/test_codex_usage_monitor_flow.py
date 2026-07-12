@@ -585,7 +585,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(collect_once.call_count, 0)
         self.assertEqual(raw_collect.call_count, 1)
 
-    def test_collect_with_playwright_obj_prefers_system_chrome_raw_cdp_when_available(self) -> None:
+    def test_collect_with_playwright_obj_never_targets_system_chrome_raw_cdp(self) -> None:
         recovered = UsageSnapshot.from_metrics(
             {
                 "five_hour_limit": "18 / 40",
@@ -600,17 +600,17 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__collect_snapshot_once",
-            side_effect=AssertionError("browser launch should not run"),
+            return_value=(recovered, None),
         ) as collect_once:
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
-                return_value=None,
+                "_CodexUsageMonitor__try_no_focus_raw_preflight",
+                return_value=(None, None, False),
             ):
                 with patch.object(
                     self.monitor,
                     "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp",
-                    return_value=recovered,
+                    side_effect=AssertionError("system Chrome is not an automation target"),
                 ) as raw_system:
                     snap, err = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
                         object(),
@@ -619,8 +619,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertIsNone(err)
         self.assertIs(snap, recovered)
-        self.assertEqual(collect_once.call_count, 0)
-        self.assertEqual(raw_system.call_count, 1)
+        self.assertEqual(collect_once.call_count, 1)
+        self.assertEqual(raw_system.call_count, 0)
 
     def test_collect_with_playwright_obj_skips_headless_when_profile_cdp_is_active(self) -> None:
         with patch.object(
@@ -630,8 +630,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ) as collect_once:
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
-                return_value=True,
+                "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+                return_value=[(9333, 3002, True)],
             ):
                 with patch.object(
                     self.monitor,
@@ -655,6 +655,12 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
     def test_collect_with_playwright_obj_background_raw_miss_with_profile_cdp_is_parse_failed(
         self,
     ) -> None:
+        class _CurrentProc:
+            pid = 3002
+            _ws_listener_pid = 3002
+
+        self.monitor._CodexUsageMonitor__hidden_cdp_proc = _CurrentProc()
+        self.monitor._CodexUsageMonitor__hidden_cdp_port = 9333
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__collect_snapshot_once",
@@ -662,8 +668,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ) as collect_once:
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
-                return_value=True,
+                "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+                return_value=[(9333, 3002, True)],
             ):
                 with patch.object(
                     self.monitor,
@@ -694,6 +700,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.monitor._CodexUsageMonitor__event_queue = _InlineQueue()
         self.monitor._CodexUsageMonitor__set_session_state("logged_in")
 
+        class _CurrentProc:
+            pid = 3002
+            _ws_listener_pid = 3002
+
+        self.monitor._CodexUsageMonitor__hidden_cdp_proc = _CurrentProc()
+        self.monitor._CodexUsageMonitor__hidden_cdp_port = 9333
+
         with patch.object(
             self.monitor,
             "_CodexUsageMonitor__collect_snapshot_once",
@@ -701,8 +714,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ):
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
-                return_value=True,
+                "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+                return_value=[(9333, 3002, True)],
             ):
                 with patch.object(
                     self.monitor,
@@ -743,8 +756,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         ):
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__has_profile_remote_debugging_endpoint",
-                return_value=True,
+                "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+                return_value=[(9333, 3002, True)],
             ):
                 with patch.object(
                     self.monitor,
@@ -875,6 +888,76 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 iter_endpoints.assert_called_once_with(include_owned=True)
                 terminate_managed.assert_called_once_with(managed_only=True)
                 sleep.assert_called_once_with(0.5)
+
+    def test_no_focus_raw_preflight_uses_only_managed_headless_profile_cdp(self) -> None:
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "18 / 40",
+                "weekly_limit": "110 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "9 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "9 / 50",
+                "remaining_credit": "250",
+            },
+            captured_at="2026-03-30T11:15:00",
+        )
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+            return_value=[(11119, 31088, True), (9222, 3001, False)],
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp_result",
+                return_value=(snapshot, None),
+            ) as raw_profile:
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp_result",
+                    side_effect=AssertionError("noninteractive collection must not create system Chrome targets"),
+                ):
+                    got, error, handled = (
+                        self.monitor._CodexUsageMonitor__try_no_focus_raw_preflight(
+                            source="auto_monitor",
+                        )
+                    )
+
+        self.assertIs(got, snapshot)
+        self.assertIsNone(error)
+        self.assertTrue(handled)
+        raw_profile.assert_called_once_with(
+            wait_timeout_sec=None,
+            managed_only=True,
+        )
+
+    def test_hidden_collect_failure_does_not_mutate_external_or_system_chrome(self) -> None:
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__try_no_focus_raw_preflight",
+            return_value=(None, None, False),
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_once",
+                return_value=(None, "profile_in_use"),
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__try_collect_snapshot_via_raw_external_cdp",
+                    side_effect=AssertionError("external profile Chrome is not an automation target"),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__try_collect_snapshot_via_raw_system_chrome_cdp",
+                        side_effect=AssertionError("system Chrome is not an automation target"),
+                    ):
+                        got, error = self.monitor._CodexUsageMonitor__collect_with_playwright_obj(
+                            object(),
+                            source="manual_query",
+                        )
+
+        self.assertIsNone(got)
+        self.assertEqual(error, "profile_in_use")
 
     def test_collect_with_playwright_obj_uses_hidden_cdp_before_headless_fallback(self) -> None:
         recovered = UsageSnapshot.from_metrics(
@@ -2530,7 +2613,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIsNone(got)
         self.assertEqual(err, "login_required")
         self.assertEqual(int(self.monitor._CodexUsageMonitor__last_successful_cdp_port), 48125)
-        self.assertTrue(bool(getattr(proc, "_ws_monitor_managed", False)))
+        self.assertFalse(bool(getattr(proc, "_ws_monitor_managed", True)))
+        self.assertTrue(bool(getattr(proc, "_ws_interactive_cdp", False)))
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48125)
         set_visibility.assert_called_once_with(
@@ -2619,7 +2703,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         args, kwargs = set_visibility.call_args
         self.assertFalse(kwargs.get("visible", args[1] if len(args) > 1 else True))
 
-    def test_connect_hidden_cdp_context_attaches_existing_remote_debug_process(self) -> None:
+    def test_connect_hidden_cdp_context_does_not_attach_external_headed_process(self) -> None:
         profile = "c:/tmp/chatgpt-profile"
         self.monitor._CodexUsageMonitor__profile_dir = profile
         self.monitor._CodexUsageMonitor__hidden_cdp_proc = None
@@ -2673,23 +2757,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             with patch.object(
                 self.monitor,
                 "_CodexUsageMonitor__is_profile_locked_without_remote_debugging",
-                side_effect=AssertionError("lock check should not run after successful external attach"),
+                return_value=True,
             ):
                 context, browser, proc, keep = self.monitor._CodexUsageMonitor__connect_hidden_cdp_context(
                     playwright_obj,
                     launch_url="https://chatgpt.com/codex/cloud/settings/analytics#usage",
                 )
 
-        self.assertIsNotNone(context)
-        self.assertIsNotNone(browser)
-        self.assertTrue(bool(keep))
-        self.assertTrue(bool(getattr(proc, "_ws_external_cdp", False)))
-        self.assertEqual(int(getattr(proc, "_ws_cdp_port", 0)), 9333)
-        self.assertEqual(playwright_obj.chromium.endpoints, ["http://127.0.0.1:9333"])
-        self.assertEqual(
-            playwright_obj.chromium.timeouts,
-            [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
-        )
+        self.assertIsNone(context)
+        self.assertIsNone(browser)
+        self.assertIsNone(proc)
+        self.assertFalse(keep)
+        self.assertEqual(playwright_obj.chromium.endpoints, [])
+        self.assertEqual(playwright_obj.chromium.timeouts, [])
 
     def test_collect_snapshot_once_external_cdp_avoids_window_hide_and_closes_temp_page(self) -> None:
         snapshot = UsageSnapshot.from_metrics(
@@ -2902,6 +2982,9 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     "--no-default-browser-check",
                     "--disable-extensions",
                     "--disable-notifications",
+                    "--headless=new",
+                    "--no-startup-window",
+                    "--windows-supporter-managed-cdp",
                 ],
             ),
             _DummyProcInfo(
@@ -2926,6 +3009,27 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(rows[0], (9333, 24652, True))
         self.assertEqual(rows[1], (9334, 24653, False))
 
+    def test_managed_signature_rejects_lookalike_headless_chrome_without_owner_marker(
+        self,
+    ) -> None:
+        cmdline = [
+            "chrome.exe",
+            "--headless=new",
+            "--no-startup-window",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-notifications",
+        ]
+
+        managed = self.monitor._CodexUsageMonitor__is_monitor_managed_chrome_cmdline(
+            cmdline
+        )
+
+        self.assertFalse(managed)
+
     def test_iter_external_profile_remote_debugging_endpoints_can_include_owned_process(
         self,
     ) -> None:
@@ -2936,6 +3040,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         class _OwnedProc:
             pid = 24652
             _ws_listener_pid = 24652
+            _ws_monitor_managed = True
+            _ws_headless_cdp = True
 
         profile = "c:/tmp/chatgpt-profile"
         self.monitor._CodexUsageMonitor__profile_dir = profile
@@ -2954,6 +3060,9 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     "--hide-crash-restore-bubble",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--headless=new",
+                    "--no-startup-window",
+                    "--windows-supporter-managed-cdp",
                 ],
             ),
         ]
@@ -3146,15 +3255,17 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         cmd, kwargs = popen_calls[0]
         self.assertIn("--disable-extensions", cmd)
         self.assertIn("--disable-notifications", cmd)
-        self.assertIn("--start-minimized", cmd)
+        self.assertNotIn("--start-minimized", cmd)
         self.assertIn("--no-startup-window", cmd)
         self.assertIn("--disable-session-crashed-bubble", cmd)
         self.assertIn("--hide-crash-restore-bubble", cmd)
-        self.assertNotIn("--headless=new", cmd)
+        self.assertIn("--headless=new", cmd)
         self.assertNotIn("--new-window", cmd)
-        self.assertIn("--window-position=-32000,-32000", cmd)
+        self.assertFalse(any(arg.startswith("--window-position=") for arg in cmd))
+        self.assertFalse(any(arg.startswith("--window-size=") for arg in cmd))
         self.assertNotIn("about:blank", cmd)
         self.assertNotIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", cmd)
+        self.assertTrue(bool(getattr(proc, "_ws_headless_cdp", False)))
         self.assertEqual(
             background_target_calls,
             [
@@ -3173,6 +3284,258 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             playwright_obj.chromium.timeouts,
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
         )
+
+    def test_headless_cdp_handle_never_uses_win32_visibility_or_guard_thread(self) -> None:
+        class _HeadlessProc:
+            pid = 43210
+            _ws_headless_cdp = True
+
+            def poll(self):
+                return None
+
+        proc = _HeadlessProc()
+        self.monitor._CodexUsageMonitor__root = object()
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__list_profile_chrome_pids",
+            return_value=[],
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__list_top_windows_for_pid",
+                side_effect=AssertionError("headless CDP must not enumerate native windows"),
+            ):
+                hidden = self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
+                    proc,
+                    visible=False,
+                    source="auto_monitor",
+                )
+
+        with patch(
+            "src.apps.codex_usage_monitor.threading.Thread",
+            side_effect=AssertionError("headless CDP must not start a Win32 visibility guard"),
+        ):
+            guarded = self.monitor._CodexUsageMonitor__start_hidden_cdp_visibility_guard(
+                proc,
+                source="auto_monitor",
+            )
+
+        self.assertTrue(hidden)
+        self.assertTrue(guarded)
+
+    def test_raw_cdp_reuses_bootstrap_target_without_target_churn(self) -> None:
+        class _DummyWebSocket:
+            def close(self):
+                return None
+
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "18 / 40",
+                "weekly_limit": "110 / 300",
+                "gpt_5_3_codex_spark_five_hour_limit": "9 / 50",
+                "gpt_5_3_codex_spark_weekly_limit": "9 / 50",
+                "remaining_credit": "250",
+            },
+            captured_at="2026-03-30T11:15:00",
+        )
+        methods: list[str] = []
+
+        def fake_send(_ws, method, params=None, session_id=None, timeout_sec=None):
+            _ = params, session_id, timeout_sec
+            methods.append(str(method))
+            if method == "Target.getTargets":
+                return {
+                    "result": {
+                        "targetInfos": [
+                            {
+                                "targetId": "bootstrap-1",
+                                "type": "page",
+                                "url": "data:text/html,<title>WindowsSupporterHidden</title>",
+                            }
+                        ]
+                    }
+                }
+            if method == "Target.attachToTarget":
+                return {"result": {"sessionId": "session-1"}}
+            if method in {"Target.createTarget", "Target.closeTarget"}:
+                raise AssertionError(f"unexpected target churn: {method}")
+            return {"result": {}}
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__fetch_raw_cdp_browser_websocket_url",
+            return_value="ws://127.0.0.1/devtools/browser/test",
+        ):
+            with patch(
+                "src.apps.codex_usage_monitor._create_raw_websocket_connection",
+                return_value=_DummyWebSocket(),
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__raw_cdp_send",
+                    side_effect=fake_send,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__raw_cdp_probe_target",
+                        return_value={"url": "https://chatgpt.com/codex/settings/usage"},
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__build_snapshot_from_probe",
+                            return_value=snapshot,
+                        ):
+                            got, error = (
+                                self.monitor._CodexUsageMonitor__collect_snapshot_via_raw_cdp_port_result(
+                                    11119,
+                                )
+                            )
+
+        self.assertIs(got, snapshot)
+        self.assertIsNone(error)
+        self.assertIn("Target.getTargets", methods)
+        self.assertNotIn("Target.createTarget", methods)
+        self.assertNotIn("Target.closeTarget", methods)
+
+    def test_raw_cdp_missing_bootstrap_never_creates_a_polling_target(self) -> None:
+        class _DummyWebSocket:
+            def close(self):
+                return None
+
+        methods: list[str] = []
+
+        def fake_send(_ws, method, params=None, session_id=None, timeout_sec=None):
+            _ = params, session_id, timeout_sec
+            methods.append(str(method))
+            if method == "Target.getTargets":
+                return {"result": {"targetInfos": []}}
+            if method in {"Target.createTarget", "Target.closeTarget"}:
+                raise AssertionError(f"polling must not own target lifecycle: {method}")
+            return {"result": {}}
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__fetch_raw_cdp_browser_websocket_url",
+            return_value="ws://127.0.0.1/devtools/browser/test",
+        ):
+            with patch(
+                "src.apps.codex_usage_monitor._create_raw_websocket_connection",
+                return_value=_DummyWebSocket(),
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__raw_cdp_send",
+                    side_effect=fake_send,
+                ):
+                    got, error = (
+                        self.monitor._CodexUsageMonitor__collect_snapshot_via_raw_cdp_port_result(
+                            11119,
+                        )
+                    )
+
+        self.assertIsNone(got)
+        self.assertEqual(error, "managed_target_missing")
+        self.assertEqual(methods, ["Target.getTargets"])
+
+    def test_raw_cdp_attach_failure_never_closes_reused_target(self) -> None:
+        class _DummyWebSocket:
+            def close(self):
+                return None
+
+        methods: list[str] = []
+
+        def fake_send(_ws, method, params=None, session_id=None, timeout_sec=None):
+            _ = params, session_id, timeout_sec
+            methods.append(str(method))
+            if method == "Target.getTargets":
+                return {
+                    "result": {
+                        "targetInfos": [
+                            {
+                                "targetId": "bootstrap-1",
+                                "type": "page",
+                                "url": "data:text/html,<title>WindowsSupporterHidden</title>",
+                            }
+                        ]
+                    }
+                }
+            if method == "Target.attachToTarget":
+                return {"result": {}}
+            if method == "Target.closeTarget":
+                raise AssertionError("polling must not close the persistent bootstrap target")
+            return {"result": {}}
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__fetch_raw_cdp_browser_websocket_url",
+            return_value="ws://127.0.0.1/devtools/browser/test",
+        ):
+            with patch(
+                "src.apps.codex_usage_monitor._create_raw_websocket_connection",
+                return_value=_DummyWebSocket(),
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__raw_cdp_send",
+                    side_effect=fake_send,
+                ):
+                    got, error = (
+                        self.monitor._CodexUsageMonitor__collect_snapshot_via_raw_cdp_port_result(
+                            11119,
+                        )
+                    )
+
+        self.assertIsNone(got)
+        self.assertEqual(error, "parse_failed")
+        self.assertNotIn("Target.closeTarget", methods)
+
+    def test_pending_login_poll_reads_interactive_usage_target_without_hiding_it(self) -> None:
+        class _InteractiveProc:
+            pid = 51234
+            _ws_cdp_port = 9333
+            _ws_monitor_managed = False
+            _ws_headless_cdp = False
+            _ws_interactive_cdp = True
+
+            def poll(self):
+                return None
+
+        snapshot = UsageSnapshot.from_metrics(
+            {"five_hour_limit": "18 / 40"},
+            captured_at="2026-07-12T18:00:00",
+        )
+        interactive_proc = _InteractiveProc()
+        self.monitor._CodexUsageMonitor__hidden_cdp_proc = interactive_proc
+        self.monitor._CodexUsageMonitor__hidden_cdp_port = 9333
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__iter_external_profile_remote_debugging_endpoints",
+            return_value=[(9333, 51234, False)],
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__collect_snapshot_via_raw_cdp_port_result",
+                return_value=(snapshot, None),
+            ) as collect_raw:
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__set_cdp_window_visibility",
+                    side_effect=AssertionError("pending login polling must not hide or activate the window"),
+                ):
+                    got, error, handled = (
+                        self.monitor._CodexUsageMonitor__try_no_focus_raw_preflight(
+                            wait_timeout_sec=4.0,
+                            source="pending_login_poll",
+                        )
+                    )
+
+        self.assertIs(got, snapshot)
+        self.assertIsNone(error)
+        self.assertTrue(handled)
+        collect_raw.assert_called_once_with(9333, wait_timeout_sec=4.0)
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, interactive_proc)
 
     def test_launch_interactive_context_via_cdp_uses_ephemeral_loopback_debug_port(
         self,
@@ -3627,6 +3990,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         class _DummyProc:
             pid = 54321
             _ws_cdp_port = 48125
+            _ws_monitor_managed = True
+            _ws_headless_cdp = True
 
             def poll(self):
                 return None
@@ -3733,6 +4098,43 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             self.assertFalse(bool(call.kwargs.get("visible", True)))
             self.assertFalse(bool(call.kwargs.get("bring_to_front", True)))
             self.assertEqual(call.kwargs.get("source"), "auto_monitor")
+
+    def test_hidden_cdp_connect_never_attaches_or_hides_interactive_login_process(self) -> None:
+        class _InteractiveProc:
+            pid = 51234
+            _ws_cdp_port = 9333
+            _ws_monitor_managed = False
+            _ws_headless_cdp = False
+
+            def poll(self):
+                return None
+
+        interactive_proc = _InteractiveProc()
+        self.monitor._CodexUsageMonitor__hidden_cdp_proc = interactive_proc
+        self.monitor._CodexUsageMonitor__hidden_cdp_port = 9333
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__connect_managed_hidden_cdp_context",
+            side_effect=AssertionError("interactive login Chrome is not a hidden collection target"),
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__connect_existing_profile_remote_debug_context",
+                side_effect=AssertionError("external headed Chrome is not a hidden collection target"),
+            ):
+                context, browser, proc, keep = (
+                    self.monitor._CodexUsageMonitor__connect_hidden_cdp_context(
+                        object(),
+                        source="pending_login_poll",
+                    )
+                )
+
+        self.assertIsNone(context)
+        self.assertIsNone(browser)
+        self.assertIsNone(proc)
+        self.assertFalse(keep)
+        self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, interactive_proc)
 
     def test_refresh_collect_page_reloads_existing_usage_page(self) -> None:
         class _DummyPage:
@@ -4109,6 +4511,9 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     "--no-default-browser-check",
                     "--disable-extensions",
                     "--disable-notifications",
+                    "--headless=new",
+                    "--no-startup-window",
+                    "--windows-supporter-managed-cdp",
                 ],
             ),
             _DummyProcInfo(
@@ -4768,6 +5173,19 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         )
 
     def test_unexpected_visible_window_log_has_diagnostics_and_redacts_url(self) -> None:
+        class _ForegroundProcess:
+            def ppid(self):
+                return 555
+
+            def name(self):
+                return "SnippingTool.exe"
+
+            def exe(self):
+                return "C:/Program Files/WindowsApps/Microsoft.ScreenSketch/SnippingTool.exe"
+
+            def cmdline(self):
+                return ["SnippingTool.exe", "https://example.test/?token=secret-value"]
+
         class _DummyWin32Gui:
             def __init__(self):
                 self.visible = True
@@ -4815,21 +5233,26 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     return_value=(1, 777),
                 ):
                     with patch.object(
-                        self.monitor,
-                        "_CodexUsageMonitor__list_top_windows_for_pid",
-                        return_value=[789],
+                        self.monitor._CodexUsageMonitor__lib.psutil,
+                        "Process",
+                        return_value=_ForegroundProcess(),
                     ):
                         with patch.object(
                             self.monitor,
-                            "_CodexUsageMonitor__log",
-                        ) as log:
-                            ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
-                                pid=123,
-                                visible=False,
-                                bring_to_front=False,
-                                timeout_sec=0.2,
-                                source="manual_query",
-                            )
+                            "_CodexUsageMonitor__list_top_windows_for_pid",
+                            return_value=[789],
+                        ):
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__log",
+                            ) as log:
+                                ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                                    pid=123,
+                                    visible=False,
+                                    bring_to_front=False,
+                                    timeout_sec=0.2,
+                                    source="manual_query",
+                                )
 
         self.assertTrue(ok)
         diagnostic = "\n".join(str(call.args[0]) for call in log.call_args_list)
@@ -4841,6 +5264,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("rect=(-32000,-32000,-30720,-31280)", diagnostic)
         self.assertIn("foreground_hwnd=900", diagnostic)
         self.assertIn("foreground_pid=777", diagnostic)
+        self.assertIn("foreground_ppid=555", diagnostic)
+        self.assertIn("foreground_name=SnippingTool.exe", diagnostic)
+        self.assertIn("foreground_exe=C:/Program Files/WindowsApps/Microsoft.ScreenSketch/SnippingTool.exe", diagnostic)
+        self.assertIn("foreground_cmd=SnippingTool.exe <url>", diagnostic)
         self.assertNotIn("secret-value", diagnostic)
         self.assertNotIn("https://", diagnostic)
 

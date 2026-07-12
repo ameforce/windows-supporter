@@ -34,6 +34,7 @@ USAGE_METRIC_KEYS = (
 )
 
 HIDDEN_CDP_BOOTSTRAP_URL = "data:text/html,<title>WindowsSupporterHidden</title>"
+MANAGED_CDP_OWNER_SWITCH = "--windows-supporter-managed-cdp"
 
 USAGE_LIMIT_METRIC_KEYS = USAGE_METRIC_KEYS[:-1]
 
@@ -1881,6 +1882,20 @@ class CodexUsageMonitor:
         self.__clear_monitor_schedule()
         return
 
+    def shutdown(self) -> None:
+        self.__request_collect_cancel()
+        self.__pause_background_monitor()
+        self.__cancel_pending_login_poll()
+        try:
+            self.__worker_epoch = int(self.__worker_epoch) + 1
+        except Exception:
+            self.__worker_epoch = 1
+        self.__hide_active_tooltip()
+        self.__clear_hidden_cdp_process(terminate=True)
+        self.__root = None
+        self.__event_queue = None
+        return
+
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
@@ -2147,6 +2162,10 @@ class CodexUsageMonitor:
     def __is_monitor_managed_chrome_cmdline(self, cmdline: Any) -> bool:
         cmd_text = " ".join(str(x) for x in (cmdline or [])).lower()
         if not cmd_text:
+            return False
+        if MANAGED_CDP_OWNER_SWITCH not in cmd_text:
+            return False
+        if "--headless" not in cmd_text or "--no-startup-window" not in cmd_text:
             return False
         managed_tokens = (
             "--disable-session-crashed-bubble",
@@ -4349,15 +4368,6 @@ class CodexUsageMonitor:
             prefer_system_channel=True,
             source=normalized_source,
         )
-        if error in {"profile_in_use", "collect_failed", "parse_failed", "cloudflare_challenge"}:
-            raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp()
-            if raw_snapshot is not None:
-                self.__log("collect strategy=no-focus-first recovered=raw_cdp_profile_after_hidden_cdp")
-                return raw_snapshot, None
-            raw_system_snapshot = self.__try_collect_snapshot_via_raw_system_chrome_cdp()
-            if raw_system_snapshot is not None:
-                self.__log("collect strategy=no-focus-first recovered=raw_cdp_system_after_hidden_cdp")
-                return raw_system_snapshot, None
         if error == "collect_cancelled":
             return None, "collect_cancelled"
         if is_manual_query and error == "cloudflare_challenge":
@@ -4474,7 +4484,9 @@ class CodexUsageMonitor:
         if port > 0:
             try:
                 setattr(proc, "_ws_cdp_port", int(port))
-                setattr(proc, "_ws_monitor_managed", True)
+                setattr(proc, "_ws_monitor_managed", False)
+                setattr(proc, "_ws_headless_cdp", False)
+                setattr(proc, "_ws_interactive_cdp", True)
             except Exception:
                 pass
             self.__hidden_cdp_proc = proc
@@ -5043,10 +5055,9 @@ class CodexUsageMonitor:
                 if bool(start_hidden):
                     cmd.extend(
                         [
-                            "--start-minimized",
+                            "--headless=new",
                             "--no-startup-window",
-                            "--window-size=1280,720",
-                            "--window-position=-32000,-32000",
+                            MANAGED_CDP_OWNER_SWITCH,
                         ]
                     )
                 else:
@@ -5084,6 +5095,11 @@ class CodexUsageMonitor:
                     except Exception:
                         pass
                 proc = self.__lib.subprocess.Popen(cmd, **popen_kwargs)
+                if bool(start_hidden):
+                    try:
+                        setattr(proc, "_ws_headless_cdp", True)
+                    except Exception:
+                        pass
                 if bool(start_hidden) and not self.__start_hidden_cdp_visibility_guard(
                     proc,
                     source=normalized_source,
@@ -5375,6 +5391,8 @@ class CodexUsageMonitor:
     def __start_hidden_cdp_visibility_guard(self, proc, source: str = "") -> bool:
         if proc is None:
             return False
+        if self.__is_headless_cdp_handle(proc):
+            return True
         if self.__root is None:
             return True
         try:
@@ -5474,7 +5492,9 @@ class CodexUsageMonitor:
         if port <= 0:
             return False
         try:
-            setattr(proc, "_ws_monitor_managed", True)
+            setattr(proc, "_ws_monitor_managed", False)
+            setattr(proc, "_ws_headless_cdp", False)
+            setattr(proc, "_ws_interactive_cdp", True)
         except Exception:
             pass
         self.__pending_hidden_cdp_clear = False
@@ -5504,6 +5524,14 @@ class CodexUsageMonitor:
         except Exception:
             return False
 
+    def __is_headless_cdp_handle(self, proc) -> bool:
+        if proc is None:
+            return False
+        try:
+            return bool(getattr(proc, "_ws_headless_cdp", False))
+        except Exception:
+            return False
+
     def __build_external_cdp_handle(self, pid: int, port: int, monitor_managed: bool = False):
         class _ExternalCdpHandle:
             pass
@@ -5516,6 +5544,7 @@ class CodexUsageMonitor:
         setattr(handle, "_ws_cdp_port", safe_port)
         setattr(handle, "_ws_external_cdp", True)
         setattr(handle, "_ws_monitor_managed", bool(monitor_managed))
+        setattr(handle, "_ws_headless_cdp", bool(monitor_managed))
         return handle
 
     def __iter_external_profile_remote_debugging_endpoints(
@@ -5651,10 +5680,13 @@ class CodexUsageMonitor:
     def __try_collect_snapshot_via_raw_external_cdp(
         self,
         wait_timeout_sec: float | None = None,
+        managed_only: bool = False,
     ) -> UsageSnapshot | None:
-        for port, _pid, _managed in self.__iter_external_profile_remote_debugging_endpoints(
+        for port, _pid, managed in self.__iter_external_profile_remote_debugging_endpoints(
             include_owned=True,
         ):
+            if bool(managed_only) and not bool(managed):
+                continue
             snapshot = self.__collect_snapshot_via_raw_cdp_port(
                 int(port),
                 wait_timeout_sec=wait_timeout_sec,
@@ -5666,11 +5698,14 @@ class CodexUsageMonitor:
     def __try_collect_snapshot_via_raw_external_cdp_result(
         self,
         wait_timeout_sec: float | None = None,
+        managed_only: bool = False,
     ) -> tuple[UsageSnapshot | None, str | None]:
         last_error: str | None = None
-        for port, _pid, _managed in self.__iter_external_profile_remote_debugging_endpoints(
+        for port, _pid, managed in self.__iter_external_profile_remote_debugging_endpoints(
             include_owned=True,
         ):
+            if bool(managed_only) and not bool(managed):
+                continue
             snapshot, error = self.__collect_snapshot_via_raw_cdp_port_result(
                 int(port),
                 wait_timeout_sec=wait_timeout_sec,
@@ -5694,31 +5729,65 @@ class CodexUsageMonitor:
             )
         except Exception:
             profile_endpoints = []
-        profile_cdp_available = bool(profile_endpoints)
-        if not bool(profile_cdp_available):
-            profile_cdp_available = self.__has_profile_remote_debugging_endpoint()
-        has_only_stale_managed_profile_cdp = bool(profile_endpoints) and all(
-            bool(item[2])
-            and not self.__is_current_hidden_cdp_endpoint(
+        current_proc = self.__hidden_cdp_proc
+        interactive_port = 0
+        if (
+            source_key == "pending_login_poll"
+            and current_proc is not None
+            and bool(getattr(current_proc, "_ws_interactive_cdp", False))
+            and self.__is_subprocess_running(current_proc)
+        ):
+            try:
+                interactive_port = int(self.__hidden_cdp_port or 0)
+            except Exception:
+                interactive_port = 0
+        if interactive_port > 0:
+            for port, _pid, _managed in profile_endpoints:
+                if int(port or 0) != interactive_port:
+                    continue
+                snapshot, error = self.__collect_snapshot_via_raw_cdp_port_result(
+                    interactive_port,
+                    wait_timeout_sec=wait_timeout_sec,
+                )
+                if snapshot is not None:
+                    self.__log(
+                        "collect strategy=pending-login recovered=interactive_usage_target"
+                    )
+                    return snapshot, None, True
+                if error == "managed_target_missing":
+                    error = "login_required"
+                return None, error or "parse_failed", True
+        managed_profile_endpoints = [item for item in profile_endpoints if bool(item[2])]
+        profile_cdp_available = bool(managed_profile_endpoints)
+        has_only_stale_managed_profile_cdp = bool(managed_profile_endpoints) and all(
+            not self.__is_current_hidden_cdp_endpoint(
                 int(item[0] or 0),
                 int(item[1] or 0),
             )
-            for item in profile_endpoints
+            for item in managed_profile_endpoints
         )
         raw_error: str | None = None
         if is_background_monitor:
             raw_snapshot, raw_error = self.__try_collect_snapshot_via_raw_external_cdp_result(
                 wait_timeout_sec=wait_timeout_sec,
+                managed_only=True,
             )
         else:
             raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp(
                 wait_timeout_sec=wait_timeout_sec,
+                managed_only=True,
             )
         if raw_snapshot is not None:
             self.__log("collect strategy=no-focus-first recovered=raw_cdp_profile")
             return raw_snapshot, None, True
         if is_background_monitor and raw_error == "collect_cancelled":
             return None, "collect_cancelled", True
+        if is_background_monitor and raw_error == "managed_target_missing":
+            self.__log(
+                "collect strategy=no-focus-first recycle=managed_target_missing"
+            )
+            self.__clear_hidden_cdp_process(terminate=True)
+            return None, None, False
         if is_background_monitor and bool(has_only_stale_managed_profile_cdp):
             self.__log(
                 "collect strategy=no-focus-first cleanup=stale_managed_profile_cdp"
@@ -5737,31 +5806,9 @@ class CodexUsageMonitor:
                 f"reason={raw_error}"
             )
             return None, raw_error, True
-        raw_system_error: str | None = None
-        if is_background_monitor:
-            raw_system_snapshot, raw_system_error = (
-                self.__try_collect_snapshot_via_raw_system_chrome_cdp_result(
-                    wait_timeout_sec=wait_timeout_sec,
-                )
-            )
-        else:
-            raw_system_snapshot = self.__try_collect_snapshot_via_raw_system_chrome_cdp(
-                wait_timeout_sec=wait_timeout_sec,
-            )
-        if raw_system_snapshot is not None:
-            self.__log("collect strategy=no-focus-first recovered=raw_cdp_system_chrome")
-            return raw_system_snapshot, None, True
-        if is_background_monitor and raw_system_error == "collect_cancelled":
-            return None, "collect_cancelled", True
-        if is_background_monitor and raw_system_error in {"login_required", "cloudflare_challenge"}:
-            self.__log(
-                "collect strategy=no-focus-first auth-evidence=raw_cdp_system_chrome "
-                f"reason={raw_system_error}"
-            )
-            return None, raw_system_error, True
         if bool(profile_cdp_available):
             if is_background_monitor:
-                error = raw_error or raw_system_error or "parse_failed"
+                error = raw_error or "parse_failed"
                 if error not in {"login_required", "cloudflare_challenge"}:
                     error = "parse_failed"
                 self.__log(
@@ -5891,9 +5938,9 @@ class CodexUsageMonitor:
         last_probe: dict[str, Any] | None = None
         try:
             ws = _create_raw_websocket_connection(browser_ws, socket_timeout_sec)
-            target_id = self.__raw_cdp_create_target(ws)
+            target_id = self.__raw_cdp_find_reusable_target_id(ws)
             if not target_id:
-                return None, "parse_failed"
+                return None, "managed_target_missing"
             attach = self.__raw_cdp_send(
                 ws,
                 "Target.attachToTarget",
@@ -5901,12 +5948,6 @@ class CodexUsageMonitor:
             )
             session_id = str((attach.get("result") or {}).get("sessionId") or "")
             if not session_id:
-                self.__raw_cdp_send(
-                    ws,
-                    "Target.closeTarget",
-                    {"targetId": str(target_id)},
-                )
-                target_id = ""
                 return None, "parse_failed"
             self.__raw_cdp_send(ws, "Runtime.enable", session_id=session_id)
             self.__raw_cdp_send(ws, "Page.enable", session_id=session_id)
@@ -5952,15 +5993,6 @@ class CodexUsageMonitor:
         except Exception as exc:
             self.__log_exception("raw cdp snapshot failed", exc)
         finally:
-            if ws is not None and target_id:
-                try:
-                    self.__raw_cdp_send(
-                        ws,
-                        "Target.closeTarget",
-                        {"targetId": str(target_id)},
-                    )
-                except Exception:
-                    pass
             if ws is not None:
                 try:
                     ws.close()
@@ -5988,13 +6020,22 @@ class CodexUsageMonitor:
             return ""
         return normalize_usage_value(payload.get("webSocketDebuggerUrl", ""))
 
-    def __raw_cdp_create_target(self, ws) -> str:
-        response = self.__raw_cdp_send(
-            ws,
-            "Target.createTarget",
-            {"url": "about:blank", "newWindow": False, "background": True},
-        )
-        return str((response.get("result") or {}).get("targetId") or "")
+    def __raw_cdp_find_reusable_target_id(self, ws) -> str:
+        response = self.__raw_cdp_send(ws, "Target.getTargets")
+        target_infos = (response.get("result") or {}).get("targetInfos") or []
+        bootstrap_target_id = ""
+        for item in target_infos:
+            if str((item or {}).get("type") or "") != "page":
+                continue
+            target_id = str((item or {}).get("targetId") or "")
+            target_url = str((item or {}).get("url") or "")
+            if not target_id:
+                continue
+            if are_equivalent_codex_usage_urls(target_url, str(self.__usage_url)):
+                return target_id
+            if target_url == HIDDEN_CDP_BOOTSTRAP_URL:
+                bootstrap_target_id = target_id
+        return bootstrap_target_id
 
     def __raw_cdp_probe_target(self, ws, session_id: str) -> dict[str, Any]:
         response = self.__raw_cdp_send(
@@ -6133,6 +6174,10 @@ class CodexUsageMonitor:
         launch_url: str | None = None,
         source: str = "",
     ):
+        current_proc = self.__hidden_cdp_proc
+        if current_proc is not None and not self.__is_headless_cdp_handle(current_proc):
+            self.__log("hidden cdp skipped reason=interactive_profile_active")
+            return None, None, None, False
         context, browser, proc, keep = self.__connect_managed_hidden_cdp_context(
             playwright_obj,
             source=source,
@@ -6159,12 +6204,6 @@ class CodexUsageMonitor:
             port = 0
         if proc is not None or port > 0:
             self.__clear_hidden_cdp_process(terminate=True)
-
-        ext_context, ext_browser, ext_proc, ext_keep = (
-            self.__connect_existing_profile_remote_debug_context(playwright_obj)
-        )
-        if ext_context is not None:
-            return ext_context, ext_browser, ext_proc, ext_keep
 
         if self.__is_profile_locked_without_remote_debugging():
             self.__log("hidden cdp launch skipped reason=profile_locked_non_debug")
@@ -6217,6 +6256,8 @@ class CodexUsageMonitor:
                 f"source={normalized_source or 'unknown'}"
             )
             return False
+        if self.__is_headless_cdp_handle(proc):
+            return not bool(visible)
         pid_candidates: list[int] = []
         for attr in ("_ws_listener_pid", "pid"):
             try:
@@ -6421,6 +6462,20 @@ class CodexUsageMonitor:
         )
         return value[:240]
 
+    def __read_process_log_fields(self, pid: int) -> tuple[int, str, str, str]:
+        try:
+            proc = self.__lib.psutil.Process(int(pid))
+            ppid = int(proc.ppid() or 0)
+            name = self.__sanitize_window_log_text(str(proc.name() or ""))
+            exe = self.__sanitize_window_log_text(str(proc.exe() or ""))
+            cmdline = proc.cmdline() or []
+            command = self.__sanitize_window_log_text(
+                " ".join(str(item) for item in cmdline)
+            )
+            return ppid, name, exe, command
+        except Exception:
+            return 0, "", "", ""
+
     def __log_unexpected_visible_window(self, source: str, pid: int, hwnd: int) -> None:
         try:
             class_name = str(self.__lib.win32gui.GetClassName(int(hwnd)) or "")
@@ -6450,6 +6505,9 @@ class CodexUsageMonitor:
                 foreground_pid = int(foreground_pid or 0)
             except Exception:
                 foreground_pid = 0
+        foreground_ppid, foreground_name, foreground_exe, foreground_cmd = (
+            self.__read_process_log_fields(foreground_pid)
+        )
         rect_text = "(" + ",".join(str(value) for value in rect) + ")"
         self.__log(
             "unexpected visible managed chrome "
@@ -6458,7 +6516,11 @@ class CodexUsageMonitor:
             f"class={self.__sanitize_window_log_text(class_name)} "
             f"title={title} rect={rect_text} "
             f"foreground_hwnd={int(foreground_hwnd)} "
-            f"foreground_pid={int(foreground_pid)}"
+            f"foreground_pid={int(foreground_pid)} "
+            f"foreground_ppid={int(foreground_ppid)} "
+            f"foreground_name={foreground_name} "
+            f"foreground_exe={foreground_exe} "
+            f"foreground_cmd={foreground_cmd}"
         )
         return
 

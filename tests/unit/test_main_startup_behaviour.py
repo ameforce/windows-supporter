@@ -76,6 +76,9 @@ class _FakeStartupManager:
 
 
 class _FakeMonitor:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
     def attach(self, _root, _event_queue):
         return None
 
@@ -83,6 +86,10 @@ class _FakeMonitor:
         return None
 
     def on_display_topology_changed(self, _reason):
+        return None
+
+    def shutdown(self):
+        self.shutdown_calls += 1
         return None
 
 
@@ -253,12 +260,13 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
         startup = _FakeStartupManager()
         instance_lock = _FakeInstanceLock()
 
+        monitor = _FakeMonitor()
         with patch("main._acquire_single_instance_lock", return_value=instance_lock):
             with patch("main.LibConnector", return_value=lib):
                 with patch("main.StartReg"):
                     with patch("main.start_update_handoff_cleanup_thread"):
                         with patch("main.threading.Thread", _FakeThread):
-                            with patch("main.Monitor", return_value=_FakeMonitor()):
+                            with patch("main.Monitor", return_value=monitor):
                                 with patch("main.StartupAppManager", return_value=startup):
                                     with patch("main.WindowsSupporterMainUI", _FakeUi):
                                         with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
@@ -269,6 +277,7 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
 
         self.assertNotIn(120, [delay for delay, _callback in root.after_calls])
         self.assertEqual(startup.start_calls, [])
+        self.assertEqual(monitor.shutdown_calls, 1)
         self.assertEqual(instance_lock.close_calls, 1)
 
     def test_main_starts_update_monitor_and_passes_it_to_ui(self) -> None:
