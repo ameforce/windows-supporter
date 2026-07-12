@@ -5084,6 +5084,13 @@ class CodexUsageMonitor:
                     except Exception:
                         pass
                 proc = self.__lib.subprocess.Popen(cmd, **popen_kwargs)
+                if bool(start_hidden) and not self.__start_hidden_cdp_visibility_guard(
+                    proc,
+                    source=normalized_source,
+                ):
+                    self.__terminate_cdp_launch_attempt(proc, int(port))
+                    last_error = RuntimeError("hidden cdp visibility guard start failed")
+                    continue
                 endpoint = f"http://127.0.0.1:{int(port)}"
                 connect_deadline = 0.0
                 try:
@@ -5371,6 +5378,17 @@ class CodexUsageMonitor:
         if self.__root is None:
             return True
         try:
+            guard_pid = int(getattr(proc, "_ws_listener_pid", 0) or 0)
+        except Exception:
+            guard_pid = 0
+        if guard_pid <= 0:
+            try:
+                guard_pid = int(getattr(proc, "pid", 0) or 0)
+            except Exception:
+                guard_pid = 0
+        if guard_pid <= 0 or not self.__is_pid_alive(guard_pid):
+            return True
+        try:
             if bool(getattr(proc, "_ws_hidden_visibility_guard_started", False)):
                 return True
             setattr(proc, "_ws_hidden_visibility_guard_started", True)
@@ -5380,12 +5398,20 @@ class CodexUsageMonitor:
         normalized_source = normalize_usage_value(source).lower() or "auto_monitor"
 
         def guard_hidden_window() -> None:
+            was_managed = False
             try:
-                while self.__hidden_cdp_proc is proc:
-                    self.__lib.time.sleep(0.15)
-                    if self.__hidden_cdp_proc is not proc:
+                while True:
+                    current_proc = self.__hidden_cdp_proc
+                    if current_proc is proc:
+                        was_managed = True
+                    elif current_proc is not None or bool(was_managed):
                         break
                     if not self.__is_subprocess_running(proc):
+                        break
+                    current_proc = self.__hidden_cdp_proc
+                    if current_proc is proc:
+                        was_managed = True
+                    elif current_proc is not None:
                         break
                     try:
                         pid = int(getattr(proc, "_ws_listener_pid", 0) or 0)
@@ -5405,12 +5431,12 @@ class CodexUsageMonitor:
                         timeout_sec=0.2,
                         source=normalized_source,
                     )
+                    self.__lib.time.sleep(0.15)
             finally:
-                if self.__hidden_cdp_proc is proc:
-                    try:
-                        setattr(proc, "_ws_hidden_visibility_guard_started", False)
-                    except Exception:
-                        pass
+                try:
+                    setattr(proc, "_ws_hidden_visibility_guard_started", False)
+                except Exception:
+                    pass
 
         try:
             threading.Thread(target=guard_hidden_window, daemon=True).start()

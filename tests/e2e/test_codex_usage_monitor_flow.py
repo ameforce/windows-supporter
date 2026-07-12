@@ -4726,7 +4726,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         proc = _DummyProc()
         self.monitor._CodexUsageMonitor__root = object()
-        self.monitor._CodexUsageMonitor__hidden_cdp_proc = proc
+
+        def register_hidden_proc(*_args, **_kwargs):
+            self.monitor._CodexUsageMonitor__hidden_cdp_proc = proc
+            return True
 
         def rehide_once(*_args, **_kwargs):
             self.monitor._CodexUsageMonitor__hidden_cdp_proc = None
@@ -4736,21 +4739,26 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             with patch.object(self.monitor._CodexUsageMonitor__lib.time, "sleep"):
                 with patch.object(
                     self.monitor,
-                    "_CodexUsageMonitor__is_subprocess_running",
+                    "_CodexUsageMonitor__is_pid_alive",
                     return_value=True,
                 ):
                     with patch.object(
                         self.monitor,
-                        "_CodexUsageMonitor__set_windows_visibility_for_pid",
-                        side_effect=rehide_once,
-                    ) as set_visibility:
-                        started = self.monitor._CodexUsageMonitor__start_hidden_cdp_visibility_guard(
-                            proc,
-                            source="auto_monitor",
-                        )
+                        "_CodexUsageMonitor__is_subprocess_running",
+                        side_effect=register_hidden_proc,
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__set_windows_visibility_for_pid",
+                            side_effect=rehide_once,
+                        ) as set_visibility:
+                            started = self.monitor._CodexUsageMonitor__start_hidden_cdp_visibility_guard(
+                                proc,
+                                source="auto_monitor",
+                            )
 
         self.assertTrue(started)
-        self.assertTrue(bool(getattr(proc, "_ws_hidden_visibility_guard_started", False)))
+        self.assertFalse(bool(getattr(proc, "_ws_hidden_visibility_guard_started", True)))
         set_visibility.assert_called_once_with(
             pid=43210,
             visible=False,
