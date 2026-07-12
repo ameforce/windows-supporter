@@ -20,6 +20,11 @@ try:
 except Exception:  # pragma: no cover - optional runtime bridge
     websocket = None
 
+try:
+    import win32api
+except Exception:  # pragma: no cover - Windows runtime dependency
+    win32api = None
+
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.utils.subprocess_utils import build_no_window_subprocess_kwargs
@@ -2180,6 +2185,22 @@ class CodexUsageMonitor:
             if token in cmd_text:
                 managed_hit += 1
         return managed_hit >= 4
+
+    def __build_headless_user_agent(self, chrome_path: str) -> str:
+        if win32api is None:
+            return ""
+        try:
+            version_info = win32api.GetFileVersionInfo(str(chrome_path), "\\")
+            major = int(version_info.get("FileVersionMS", 0) or 0) >> 16
+        except Exception:
+            return ""
+        if major <= 0:
+            return ""
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36"
+        )
 
     def __is_current_hidden_cdp_endpoint(self, port: int, pid: int) -> bool:
         owned_pids: set[int] = set()
@@ -5053,6 +5074,9 @@ class CodexUsageMonitor:
                     "--disable-notifications",
                 ]
                 if bool(start_hidden):
+                    headless_user_agent = self.__build_headless_user_agent(
+                        str(chrome_path)
+                    )
                     cmd.extend(
                         [
                             "--headless=new",
@@ -5060,6 +5084,8 @@ class CodexUsageMonitor:
                             MANAGED_CDP_OWNER_SWITCH,
                         ]
                     )
+                    if headless_user_agent:
+                        cmd.append(f"--user-agent={headless_user_agent}")
                 else:
                     cmd.extend(
                         [

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import src.apps.codex_usage_monitor as codex_usage_monitor_module
 from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
     UsageChange,
@@ -3261,6 +3262,13 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--hide-crash-restore-bubble", cmd)
         self.assertIn("--headless=new", cmd)
         self.assertNotIn("--new-window", cmd)
+        self.assertTrue(
+            any(
+                arg.startswith("--user-agent=Mozilla/5.0 ")
+                and " HeadlessChrome/" not in arg
+                for arg in cmd
+            )
+        )
         self.assertFalse(any(arg.startswith("--window-position=") for arg in cmd))
         self.assertFalse(any(arg.startswith("--window-size=") for arg in cmd))
         self.assertNotIn("about:blank", cmd)
@@ -3323,6 +3331,28 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertTrue(hidden)
         self.assertTrue(guarded)
+
+    def test_headless_user_agent_uses_installed_chrome_major_version(self) -> None:
+        version_info = {
+            "FileVersionMS": (150 << 16),
+            "FileVersionLS": (7871 << 16) | 101,
+        }
+
+        with patch.object(
+            codex_usage_monitor_module.win32api,
+            "GetFileVersionInfo",
+            return_value=version_info,
+        ) as get_version:
+            user_agent = self.monitor._CodexUsageMonitor__build_headless_user_agent(
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            )
+
+        self.assertIn("Chrome/150.0.0.0", user_agent)
+        self.assertNotIn("HeadlessChrome", user_agent)
+        get_version.assert_called_once_with(
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "\\",
+        )
 
     def test_raw_cdp_reuses_bootstrap_target_without_target_churn(self) -> None:
         class _DummyWebSocket:
