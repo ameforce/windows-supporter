@@ -1101,6 +1101,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                                 "https://chatgpt.com/auth/login?"
                                                 "next=/codex/cloud/settings/analytics%23usage"
                                             ),
+                                            source="manual_login",
                                         )
 
         self.assertIsNone(err)
@@ -1111,6 +1112,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             proc,
             visible=True,
             bring_to_front=True,
+            source="manual_login",
         )
         self.assertFalse(context.closed)
         self.assertFalse(browser.closed)
@@ -1224,6 +1226,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                                         "https://chatgpt.com/auth/login?"
                                                         "next=/codex/cloud/settings/analytics%23usage"
                                                     ),
+                                                    source="manual_login",
                                                 )
 
         self.assertIsNone(err)
@@ -1234,7 +1237,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         launch_interactive.assert_called_once()
         self.assertEqual(
             set_visibility.call_args_list[0].kwargs,
-            {"visible": True, "bring_to_front": True},
+            {"visible": True, "bring_to_front": True, "source": "manual_login"},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
         self.assertEqual(set_visibility.call_count, 1)
@@ -1818,11 +1821,22 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 "monotonic",
                 side_effect=[0.0, 0.2, 0.4, 0.6],
             ):
-                got, err = self.monitor._CodexUsageMonitor__wait_for_snapshot_ready(page, timeout_sec=5.0)
+                guard_calls: list[bool] = []
+
+                def rehide_after_navigation() -> bool:
+                    guard_calls.append(True)
+                    return True
+
+                got, err = self.monitor._CodexUsageMonitor__wait_for_snapshot_ready(
+                    page,
+                    timeout_sec=5.0,
+                    after_navigation=rehide_after_navigation,
+                )
 
         self.assertIsNone(err)
         self.assertIsNotNone(got)
         self.assertIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", page.goto_calls)
+        self.assertEqual(guard_calls, [True])
 
     def test_build_snapshot_accepts_semantic_limit_metric_snapshot(self) -> None:
         class _DummyPage:
@@ -2105,6 +2119,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 allow_interactive_recovery=True,
                                 prefer_system_channel=True,
                                 initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+                                source="manual_login",
                             )
 
         self.assertIsNone(err)
@@ -2208,6 +2223,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                             force_hidden=False,
                                             prefer_system_channel=True,
                                             initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+                                            source="manual_login",
                                         )
 
         self.assertIsNone(err)
@@ -2217,7 +2233,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
         self.assertEqual(
             set_visibility.call_args_list[0].kwargs,
-            {"visible": True, "bring_to_front": True},
+            {"visible": True, "bring_to_front": True, "source": "manual_login"},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
         self.assertEqual(set_visibility.call_count, 1)
@@ -2311,6 +2327,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                     force_hidden=False,
                                     prefer_system_channel=True,
                                     initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+                                    source="manual_login",
                                 )
 
         self.assertIsNone(err)
@@ -2319,7 +2336,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
         self.assertEqual(
             set_visibility.call_args_list[0].kwargs,
-            {"visible": True, "bring_to_front": True},
+            {"visible": True, "bring_to_front": True, "source": "manual_login"},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
         self.assertEqual(set_visibility.call_count, 1)
@@ -2416,6 +2433,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                         force_hidden=False,
                                         prefer_system_channel=True,
                                         initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+                                        source="manual_login",
                                     )
 
         self.assertIsNone(err)
@@ -2424,7 +2442,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 0)
         self.assertEqual(
             set_visibility.call_args_list[0].kwargs,
-            {"visible": True, "bring_to_front": True},
+            {"visible": True, "bring_to_front": True, "source": "manual_login"},
         )
         self.assertIs(set_visibility.call_args_list[0].args[0], proc)
         self.assertEqual(set_visibility.call_count, 1)
@@ -2506,6 +2524,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                     force_hidden=False,
                                     prefer_system_channel=True,
                                     initial_url="https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+                                    source="manual_login",
                                 )
 
         self.assertIsNone(got)
@@ -2514,7 +2533,12 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertTrue(bool(getattr(proc, "_ws_monitor_managed", False)))
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, proc)
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48125)
-        set_visibility.assert_called_once_with(proc, visible=True, bring_to_front=True)
+        set_visibility.assert_called_once_with(
+            proc,
+            visible=True,
+            bring_to_front=True,
+            source="manual_login",
+        )
         terminate_proc.assert_not_called()
         self.assertFalse(context.closed)
         self.assertFalse(browser.closed)
@@ -3026,6 +3050,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
     def test_launch_interactive_context_via_cdp_hidden_start_disables_extensions_and_notifications(
         self,
     ) -> None:
+        background_target_calls: list[tuple[str, dict]] = []
+
         class _DummyProc:
             pid = 43210
 
@@ -3035,12 +3061,23 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         class _DummyContext:
             pass
 
+        class _HiddenTargetCdpSession:
+            def send(self, method, params):
+                background_target_calls.append((str(method), dict(params)))
+                return {"targetId": "target-1"}
+
+            def detach(self):
+                return None
+
         class _DummyBrowser:
             def __init__(self):
                 self.contexts = [_DummyContext()]
 
             def close(self):
                 return None
+
+            def new_browser_cdp_session(self):
+                return _HiddenTargetCdpSession()
 
         class _DummyChromium:
             def __init__(self):
@@ -3090,12 +3127,17 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                             "STARTUPINFO",
                             side_effect=_DummyStartupInfo,
                         ):
-                            context, browser, proc = (
-                                self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
-                                    playwright_obj,
-                                    start_hidden=True,
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__set_cdp_window_visibility",
+                                return_value=True,
+                            ):
+                                context, browser, proc = (
+                                    self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
+                                        playwright_obj,
+                                        start_hidden=True,
+                                    )
                                 )
-                            )
 
         self.assertIsNotNone(context)
         self.assertIsNotNone(browser)
@@ -3105,13 +3147,26 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertIn("--disable-extensions", cmd)
         self.assertIn("--disable-notifications", cmd)
         self.assertIn("--start-minimized", cmd)
+        self.assertIn("--no-startup-window", cmd)
         self.assertIn("--disable-session-crashed-bubble", cmd)
         self.assertIn("--hide-crash-restore-bubble", cmd)
         self.assertNotIn("--headless=new", cmd)
         self.assertNotIn("--new-window", cmd)
         self.assertIn("--window-position=-32000,-32000", cmd)
         self.assertNotIn("about:blank", cmd)
-        self.assertIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", cmd)
+        self.assertNotIn("https://chatgpt.com/codex/cloud/settings/analytics#usage", cmd)
+        self.assertEqual(
+            background_target_calls,
+            [
+                (
+                    "Target.createTarget",
+                    {
+                        "url": "data:text/html,<title>WindowsSupporterHidden</title>",
+                        "background": True,
+                    },
+                )
+            ],
+        )
         self.assertIn("startupinfo", kwargs)
         self.assertIn("creationflags", kwargs)
         self.assertEqual(
@@ -3176,12 +3231,22 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         "_CodexUsageMonitor__find_profile_remote_debugging_pid",
                         side_effect=[0, 43211],
                     ):
-                        context, browser, proc = (
-                            self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
-                                playwright_obj,
-                                start_hidden=True,
-                            )
-                        )
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__set_cdp_window_visibility",
+                            return_value=True,
+                        ):
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__create_hidden_background_target",
+                                return_value=True,
+                            ):
+                                context, browser, proc = (
+                                    self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
+                                        playwright_obj,
+                                        start_hidden=True,
+                                    )
+                                )
 
         self.assertIsNotNone(context)
         self.assertIsNotNone(browser)
@@ -3197,6 +3262,129 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertGreater(debug_port, 0)
         self.assertIn("--remote-debugging-address=127.0.0.1", cmd)
         self.assertEqual(playwright_obj.chromium.endpoints, [f"http://127.0.0.1:{debug_port}"])
+
+    def test_hidden_target_failure_records_remapped_listener_before_cleanup(self) -> None:
+        class _DummyProc:
+            pid = 11111
+
+            def poll(self):
+                return 0
+
+        class _DummyBrowser:
+            def close(self):
+                return None
+
+        proc = _DummyProc()
+        cleaned_listener_pids: list[int] = []
+
+        def record_cleanup(got_proc, cleanup_orphans=False):
+            _ = cleanup_orphans
+            cleaned_listener_pids.append(int(getattr(got_proc, "_ws_listener_pid", 0) or 0))
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__resolve_chrome_executable_path",
+            return_value="C:/Program Files/Google/Chrome/Application/chrome.exe",
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__iter_cdp_ports",
+                return_value=[9333],
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib.subprocess,
+                    "Popen",
+                    return_value=proc,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__find_profile_remote_debugging_pid",
+                        side_effect=[0, 99999],
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__connect_browser_over_cdp",
+                            return_value=_DummyBrowser(),
+                        ):
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__create_hidden_background_target",
+                                return_value=False,
+                            ):
+                                with patch.object(
+                                    self.monitor,
+                                    "_CodexUsageMonitor__terminate_spawned_process",
+                                    side_effect=record_cleanup,
+                                ):
+                                    context, browser, got_proc = (
+                                        self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
+                                            object(),
+                                            start_hidden=True,
+                                            source="auto_monitor",
+                                        )
+                                    )
+
+        self.assertIsNone(context)
+        self.assertIsNone(browser)
+        self.assertIsNone(got_proc)
+        self.assertEqual(cleaned_listener_pids, [99999])
+
+    def test_hidden_launch_cancel_resolves_remapped_listener_before_cleanup(self) -> None:
+        class _DummyProc:
+            pid = 11111
+
+            def poll(self):
+                return 0
+
+        proc = _DummyProc()
+        cleaned_listener_pids: list[int] = []
+
+        def record_cleanup(got_proc, cleanup_orphans=False):
+            _ = cleanup_orphans
+            cleaned_listener_pids.append(int(getattr(got_proc, "_ws_listener_pid", 0) or 0))
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__resolve_chrome_executable_path",
+            return_value="C:/Program Files/Google/Chrome/Application/chrome.exe",
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__iter_cdp_ports",
+                return_value=[9333],
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__is_collect_cancel_requested",
+                    side_effect=[False, True],
+                ):
+                    with patch.object(
+                        self.monitor._CodexUsageMonitor__lib.subprocess,
+                        "Popen",
+                        return_value=proc,
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__find_profile_remote_debugging_pid",
+                            side_effect=[0, 99999],
+                        ):
+                            with patch.object(
+                                self.monitor,
+                                "_CodexUsageMonitor__terminate_spawned_process",
+                                side_effect=record_cleanup,
+                            ):
+                                context, browser, got_proc = (
+                                    self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
+                                        object(),
+                                        start_hidden=True,
+                                        source="auto_monitor",
+                                    )
+                                )
+
+        self.assertIsNone(context)
+        self.assertIsNone(browser)
+        self.assertIsNone(got_proc)
+        self.assertEqual(cleaned_listener_pids, [99999])
 
     def test_launch_interactive_context_via_cdp_accepts_listener_pid_remap(self) -> None:
         class _DummyProc:
@@ -3263,6 +3451,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
                                     playwright_obj,
                                     start_hidden=False,
+                                    source="manual_login",
                                 )
                             )
 
@@ -3352,6 +3541,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                 self.monitor._CodexUsageMonitor__launch_interactive_context_via_cdp(
                                     _DummyPlaywright(),
                                     start_hidden=False,
+                                    source="manual_login",
                                 )
                             )
 
@@ -3497,7 +3687,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                     self.monitor,
                     "_CodexUsageMonitor__set_cdp_window_visibility",
                     return_value=True,
-                ):
+                ) as set_visibility:
                     with patch.object(
                         self.monitor,
                         "_CodexUsageMonitor__is_cloudflare_challenge",
@@ -3519,6 +3709,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                     allow_interactive_recovery=False,
                                     force_hidden=True,
                                     prefer_system_channel=True,
+                                    source="auto_monitor",
                                 )
                                 got2, err2 = self.monitor._CodexUsageMonitor__collect_snapshot_once(
                                     pw,
@@ -3526,6 +3717,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                                     allow_interactive_recovery=False,
                                     force_hidden=True,
                                     prefer_system_channel=True,
+                                    source="auto_monitor",
                                 )
 
         self.assertIsNone(err1)
@@ -3536,6 +3728,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(pw.chromium.connect_calls, 1)
         self.assertIs(self.monitor._CodexUsageMonitor__hidden_cdp_proc, launch_cdp.return_value[2])
         self.assertEqual(int(self.monitor._CodexUsageMonitor__hidden_cdp_port), 48125)
+        self.assertEqual(set_visibility.call_count, 6)
+        for call in set_visibility.call_args_list:
+            self.assertFalse(bool(call.kwargs.get("visible", True)))
+            self.assertFalse(bool(call.kwargs.get("bring_to_front", True)))
+            self.assertEqual(call.kwargs.get("source"), "auto_monitor")
 
     def test_refresh_collect_page_reloads_existing_usage_page(self) -> None:
         class _DummyPage:
@@ -3837,22 +4034,46 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         class _DummyProc:
             pid = 111
 
+        class _DummyWin32Gui:
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, hwnd):
+                return "Codex - Chrome" if int(hwnd) == 2002 else ""
+
+            def IsWindowVisible(self, _hwnd):
+                return False
+
+        def list_windows(pid):
+            return [2002] if int(pid) == 222 else []
+
         with patch.object(
-            self.monitor,
-            "_CodexUsageMonitor__set_windows_visibility_for_pid",
-            side_effect=[False, True],
-        ) as set_by_pid:
+            self.monitor._CodexUsageMonitor__lib,
+            "win32gui",
+            _DummyWin32Gui(),
+            create=True,
+        ):
             with patch.object(
                 self.monitor,
-                "_CodexUsageMonitor__list_profile_chrome_pids",
-                return_value=[111, 222],
-            ):
-                ok = self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
-                    _DummyProc(),
-                    visible=False,
-                    bring_to_front=False,
-                    timeout_sec=1.0,
-                )
+                "_CodexUsageMonitor__set_windows_visibility_for_pid",
+                side_effect=[False, True],
+            ) as set_by_pid:
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_profile_chrome_pids",
+                    return_value=[111, 222],
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__list_top_windows_for_pid",
+                        side_effect=list_windows,
+                    ):
+                        ok = self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
+                            _DummyProc(),
+                            visible=False,
+                            bring_to_front=False,
+                            timeout_sec=1.0,
+                        )
 
         self.assertTrue(ok)
         called_pids: list[int] = []
@@ -3936,6 +4157,9 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 self.position_calls: list[tuple[int, int, int, int, int, int, int]] = []
                 self.show_calls: list[tuple[int, int]] = []
 
+            def IsWindowVisible(self, _hwnd):
+                return False
+
             def GetWindowLong(self, hwnd, index):
                 self.set_styles.append((int(hwnd), int(index), self.style))
                 return self.style
@@ -4002,6 +4226,9 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 self.position_calls: list[tuple[int, int, int, int, int, int, int]] = []
                 self.show_calls: list[tuple[int, int]] = []
 
+            def IsWindowVisible(self, _hwnd):
+                return False
+
             def GetWindowLong(self, hwnd, _index):
                 return self.styles.get(int(hwnd), 0)
 
@@ -4055,6 +4282,510 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             [1001, 1002, 1003],
         )
 
+    def test_hidden_visibility_waits_for_late_content_hwnd_and_confirms_hidden(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.show_calls: list[tuple[int, int]] = []
+                self.visibility_checks = 0
+
+            def GetWindowLong(self, _hwnd, _index):
+                return 0x00040000
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                return int(value)
+
+            def SetWindowPos(self, *_args):
+                return True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return "Codex - Chrome"
+
+            def GetWindowRect(self, _hwnd):
+                return (-32000, -32000, -30720, -31280)
+
+            def IsWindowVisible(self, _hwnd):
+                self.visibility_checks += 1
+                return len(self.show_calls) < 2
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+        fake_win32gui = _DummyWin32Gui()
+        handle_scans = [[], [789], [789]]
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    side_effect=handle_scans,
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.6,
+                        source="auto_monitor",
+                    )
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(fake_win32gui.visibility_checks, 2)
+        self.assertEqual(fake_win32gui.show_calls, [(789, 0), (789, 0)])
+
+    def test_hidden_visibility_does_not_accept_offscreen_but_visible_window(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.show_calls: list[tuple[int, int]] = []
+
+            def GetWindowLong(self, _hwnd, _index):
+                return 0x00000080
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                return int(value)
+
+            def SetWindowPos(self, *_args):
+                return True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return "Codex - Chrome"
+
+            def GetWindowRect(self, _hwnd):
+                return (-32000, -32000, -30720, -31280)
+
+            def IsWindowVisible(self, _hwnd):
+                return True
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    return_value=[789],
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.2,
+                        source="startup_warmup",
+                    )
+
+        self.assertFalse(ok)
+        self.assertGreaterEqual(len(fake_win32gui.show_calls), 1)
+
+    def test_hidden_visibility_waits_for_titled_content_hwnd(self) -> None:
+        class _DummyWin32Gui:
+            def GetWindowLong(self, _hwnd, _index):
+                return 0x00000080
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                return int(value)
+
+            def SetWindowPos(self, *_args):
+                return True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return ""
+
+            def IsWindowVisible(self, _hwnd):
+                return False
+
+            def ShowWindow(self, _hwnd, _command):
+                return True
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                _DummyWin32Gui(),
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    return_value=[789],
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.2,
+                        source="auto_monitor",
+                    )
+
+        self.assertFalse(ok)
+
+    def test_cdp_hide_fails_when_any_content_pid_remains_visible(self) -> None:
+        class _DummyProc:
+            pid = 111
+            _ws_listener_pid = 111
+
+        class _DummyWin32Gui:
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, hwnd):
+                return "Codex - Chrome" if int(hwnd) in {1001, 2002} else ""
+
+            def IsWindowVisible(self, hwnd):
+                return int(hwnd) == 1001
+
+        def list_windows(pid):
+            return {111: [1001], 222: [2002]}.get(int(pid), [])
+
+        with patch.object(
+            self.monitor._CodexUsageMonitor__lib,
+            "win32gui",
+            _DummyWin32Gui(),
+            create=True,
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__list_profile_chrome_pids",
+                return_value=[222],
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    side_effect=list_windows,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__set_windows_visibility_for_pid",
+                        side_effect=[False, True],
+                    ):
+                        ok = self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
+                            _DummyProc(),
+                            visible=False,
+                            bring_to_front=False,
+                            timeout_sec=0.2,
+                            source="auto_monitor",
+                        )
+
+        self.assertFalse(ok)
+
+    def test_hidden_collect_rehides_after_reload_and_goto_exceptions(self) -> None:
+        class _DummyProc:
+            pid = 43210
+
+        class _DummyPage:
+            url = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
+
+            def reload(self, **_kwargs):
+                raise RuntimeError("reload failed")
+
+            def goto(self, _url, **_kwargs):
+                raise RuntimeError("goto failed")
+
+        class _DummyContext:
+            pages = [_DummyPage()]
+
+            def close(self):
+                return None
+
+        class _DummyBrowser:
+            def close(self):
+                return None
+
+        proc = _DummyProc()
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__connect_hidden_cdp_context",
+            return_value=(_DummyContext(), _DummyBrowser(), proc, True),
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__set_cdp_window_visibility",
+                return_value=True,
+            ) as set_visibility:
+                snapshot, error = self.monitor._CodexUsageMonitor__collect_snapshot_once(
+                    object(),
+                    headless=False,
+                    allow_interactive_recovery=False,
+                    force_hidden=True,
+                    prefer_system_channel=True,
+                    source="auto_monitor",
+                )
+
+        self.assertIsNone(snapshot)
+        self.assertEqual(error, "collect_failed")
+        self.assertEqual(set_visibility.call_count, 3)
+        for call in set_visibility.call_args_list:
+            self.assertFalse(bool(call.kwargs.get("visible", True)))
+            self.assertEqual(call.kwargs.get("source"), "auto_monitor")
+
+    def test_auto_monitor_visibility_request_preserves_foreground_hwnd(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.foreground = 900
+                self.show_calls: list[tuple[int, int]] = []
+                self.foreground_calls: list[int] = []
+
+            def GetForegroundWindow(self):
+                return self.foreground
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                return True
+
+            def SetForegroundWindow(self, hwnd):
+                self.foreground_calls.append(int(hwnd))
+                self.foreground = int(hwnd)
+                return True
+
+        fake_win32gui = _DummyWin32Gui()
+        before = fake_win32gui.GetForegroundWindow()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    return_value=[789],
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=True,
+                        bring_to_front=True,
+                        timeout_sec=0.2,
+                        source="auto_monitor",
+                    )
+
+        self.assertFalse(ok)
+        self.assertEqual(fake_win32gui.GetForegroundWindow(), before)
+        self.assertEqual(fake_win32gui.show_calls, [])
+        self.assertEqual(fake_win32gui.foreground_calls, [])
+
+    def test_auto_monitor_hidden_collect_preserves_foreground_hwnd(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.foreground = 900
+                self.visible = True
+                self.show_calls: list[tuple[int, int]] = []
+                self.foreground_calls: list[int] = []
+
+            def GetForegroundWindow(self):
+                return self.foreground
+
+            def GetWindowLong(self, _hwnd, _index):
+                return 0x00040000
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                return int(value)
+
+            def SetWindowPos(self, *_args):
+                return True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return "Codex - Chrome"
+
+            def GetWindowRect(self, _hwnd):
+                return (100, 100, 1380, 820)
+
+            def IsWindowVisible(self, _hwnd):
+                return self.visible
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                self.visible = False
+                return True
+
+            def SetForegroundWindow(self, hwnd):
+                self.foreground_calls.append(int(hwnd))
+                self.foreground = int(hwnd)
+                return True
+
+        fake_win32gui = _DummyWin32Gui()
+        before = fake_win32gui.GetForegroundWindow()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__list_top_windows_for_pid",
+                    return_value=[789],
+                ):
+                    ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                        pid=123,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.2,
+                        source="auto_monitor",
+                    )
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_win32gui.GetForegroundWindow(), before)
+        self.assertEqual(fake_win32gui.show_calls, [(789, 0)])
+        self.assertEqual(fake_win32gui.foreground_calls, [])
+
+    def test_managed_hidden_cdp_reuse_rehides_before_and_after_connect(self) -> None:
+        class _DummyProc:
+            pid = 43210
+
+            def poll(self):
+                return None
+
+        class _DummyContext:
+            pass
+
+        class _DummyBrowser:
+            contexts = [_DummyContext()]
+
+            def close(self):
+                return None
+
+        proc = _DummyProc()
+        self.monitor._CodexUsageMonitor__hidden_cdp_proc = proc
+        self.monitor._CodexUsageMonitor__hidden_cdp_port = 9333
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__find_profile_remote_debugging_pid",
+            return_value=43210,
+        ):
+            with patch.object(
+                self.monitor,
+                "_CodexUsageMonitor__connect_browser_over_cdp",
+                return_value=_DummyBrowser(),
+            ):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__set_cdp_window_visibility",
+                    return_value=True,
+                ) as set_visibility:
+                    context, browser, got_proc, keep = (
+                        self.monitor._CodexUsageMonitor__connect_managed_hidden_cdp_context(
+                            object(),
+                            source="pending_login_poll",
+                        )
+                    )
+
+        self.assertIsNotNone(context)
+        self.assertIsNotNone(browser)
+        self.assertIs(got_proc, proc)
+        self.assertTrue(keep)
+        self.assertEqual(set_visibility.call_count, 2)
+        for call in set_visibility.call_args_list:
+            self.assertFalse(bool(call.kwargs.get("visible", True)))
+            self.assertFalse(bool(call.kwargs.get("bring_to_front", True)))
+            self.assertEqual(call.kwargs.get("source"), "pending_login_poll")
+
+    def test_unexpected_visible_window_log_has_diagnostics_and_redacts_url(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.visible = True
+
+            def GetWindowLong(self, _hwnd, _index):
+                return 0x00040000
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                return int(value)
+
+            def SetWindowPos(self, *_args):
+                return True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return "https://example.test/?token=secret-value"
+
+            def GetWindowRect(self, _hwnd):
+                return (-32000, -32000, -30720, -31280)
+
+            def GetForegroundWindow(self):
+                return 900
+
+            def IsWindowVisible(self, _hwnd):
+                return self.visible
+
+            def ShowWindow(self, _hwnd, _command):
+                self.visible = False
+                return True
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib.win32process,
+                    "GetWindowThreadProcessId",
+                    return_value=(1, 777),
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__list_top_windows_for_pid",
+                        return_value=[789],
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__log",
+                        ) as log:
+                            ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                                pid=123,
+                                visible=False,
+                                bring_to_front=False,
+                                timeout_sec=0.2,
+                                source="manual_query",
+                            )
+
+        self.assertTrue(ok)
+        diagnostic = "\n".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("unexpected visible managed chrome", diagnostic)
+        self.assertIn("source=manual_query", diagnostic)
+        self.assertIn("pid=123", diagnostic)
+        self.assertIn("hwnd=789", diagnostic)
+        self.assertIn("class=Chrome_WidgetWin_1", diagnostic)
+        self.assertIn("rect=(-32000,-32000,-30720,-31280)", diagnostic)
+        self.assertIn("foreground_hwnd=900", diagnostic)
+        self.assertIn("foreground_pid=777", diagnostic)
+        self.assertNotIn("secret-value", diagnostic)
+        self.assertNotIn("https://", diagnostic)
+
     def test_set_windows_visibility_for_pid_restores_without_activating_by_default(self) -> None:
         class _DummyWin32Gui:
             def __init__(self):
@@ -4088,6 +4819,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         visible=True,
                         bring_to_front=False,
                         timeout_sec=0.2,
+                        source="manual_login",
                     )
 
         self.assertTrue(ok)
@@ -4145,6 +4877,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         visible=True,
                         bring_to_front=True,
                         timeout_sec=0.2,
+                        source="manual_login",
                     )
 
         self.assertTrue(ok)
@@ -4226,6 +4959,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                             visible=True,
                             bring_to_front=True,
                             timeout_sec=0.2,
+                            source="manual_login",
                         )
 
         self.assertTrue(ok)
@@ -4311,6 +5045,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                             visible=True,
                             bring_to_front=True,
                             timeout_sec=0.2,
+                            source="manual_login",
                         )
 
         self.assertTrue(ok)

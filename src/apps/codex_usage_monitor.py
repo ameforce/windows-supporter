@@ -12,7 +12,7 @@ import threading
 import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 
 try:
@@ -32,6 +32,8 @@ USAGE_METRIC_KEYS = (
     "gpt_5_3_codex_spark_weekly_limit",
     "remaining_credit",
 )
+
+HIDDEN_CDP_BOOTSTRAP_URL = "data:text/html,<title>WindowsSupporterHidden</title>"
 
 USAGE_LIMIT_METRIC_KEYS = USAGE_METRIC_KEYS[:-1]
 
@@ -4331,6 +4333,7 @@ class CodexUsageMonitor:
                 force_hidden=False,
                 prefer_system_channel=True,
                 initial_url=str(self.__login_entry_url),
+                source=normalized_source,
             )
         raw_snapshot, raw_error, raw_handled = self.__try_no_focus_raw_preflight(
             source=normalized_source,
@@ -4344,6 +4347,7 @@ class CodexUsageMonitor:
             allow_interactive_recovery=False,
             force_hidden=True,
             prefer_system_channel=True,
+            source=normalized_source,
         )
         if error in {"profile_in_use", "collect_failed", "parse_failed", "cloudflare_challenge"}:
             raw_snapshot = self.__try_collect_snapshot_via_raw_external_cdp()
@@ -4391,6 +4395,7 @@ class CodexUsageMonitor:
             force_hidden=False,
             prefer_system_channel=True,
             initial_url=str(self.__login_entry_url),
+            source=normalized_source,
         )
 
     def __should_open_interactive_recovery(self, source: str = "") -> bool:
@@ -4485,6 +4490,7 @@ class CodexUsageMonitor:
                 visible=True,
                 bring_to_front=True,
                 timeout_sec=1.0,
+                source="manual_login",
             )
         except Exception:
             pass
@@ -4498,6 +4504,7 @@ class CodexUsageMonitor:
         force_hidden: bool = False,
         prefer_system_channel: bool = False,
         initial_url: str | None = None,
+        source: str = "",
     ) -> tuple[UsageSnapshot | None, str | None]:
         if self.__is_collect_cancel_requested():
             return None, "collect_cancelled"
@@ -4513,9 +4520,14 @@ class CodexUsageMonitor:
             start_url = usage_url
         needs_usage_navigation = not are_equivalent_codex_usage_urls(str(start_url), usage_url)
         effective_headless = bool(headless)
+        normalized_source = normalize_usage_value(source).lower()
+        interactive_allowed = bool(
+            normalized_source == "manual_login" and bool(allow_interactive_recovery)
+        )
+        effective_force_hidden = bool(force_hidden) or not bool(interactive_allowed)
         try:
             if (not bool(effective_headless)) and bool(prefer_system_channel):
-                if bool(force_hidden) and not bool(allow_interactive_recovery):
+                if bool(effective_force_hidden) and not bool(interactive_allowed):
                     (
                         context,
                         cdp_browser,
@@ -4524,11 +4536,12 @@ class CodexUsageMonitor:
                     ) = self.__connect_hidden_cdp_context(
                         playwright_obj,
                         launch_url=start_url,
+                        source=normalized_source,
                     )
                     if context is None and self.__is_profile_locked_without_remote_debugging():
                         return None, "profile_in_use"
                 else:
-                    if bool(allow_interactive_recovery):
+                    if bool(interactive_allowed):
                         existing_profile_endpoints = (
                             self.__iter_external_profile_remote_debugging_endpoints(
                                 include_owned=True,
@@ -4560,10 +4573,11 @@ class CodexUsageMonitor:
                             playwright_obj,
                             start_hidden=False,
                             initial_url=start_url,
+                            source=normalized_source,
                         )
             if context is None:
                 launch_headless = bool(effective_headless)
-                if (not launch_headless) and bool(force_hidden):
+                if (not launch_headless) and bool(effective_force_hidden):
                     launch_headless = True
                 context = self.__launch_browser_context(
                     playwright_obj,
@@ -4581,13 +4595,20 @@ class CodexUsageMonitor:
             is_monitor_managed_cdp = self.__is_monitor_managed_cdp_handle(cdp_proc)
             should_hide_cdp_window = bool((not is_external_cdp) or is_monitor_managed_cdp)
             if cdp_proc is not None:
-                if bool(force_hidden) and bool(should_hide_cdp_window):
-                    self.__set_cdp_window_visibility(cdp_proc, visible=False, bring_to_front=False)
-                elif bool(allow_interactive_recovery):
+                if bool(effective_force_hidden) and bool(should_hide_cdp_window):
+                    if not self.__set_cdp_window_visibility(
+                        cdp_proc,
+                        visible=False,
+                        bring_to_front=False,
+                        source=normalized_source,
+                    ):
+                        return None, "collect_failed"
+                elif bool(interactive_allowed):
                     self.__set_cdp_window_visibility(
                         cdp_proc,
                         visible=True,
                         bring_to_front=True,
+                        source=normalized_source,
                     )
             if bool(is_external_cdp) and not bool(is_monitor_managed_cdp):
                 try:
@@ -4607,22 +4628,34 @@ class CodexUsageMonitor:
                 )
             if self.__is_collect_cancel_requested():
                 return None, "collect_cancelled"
-            self.__refresh_collect_page(page, str(start_url))
-            if bool(allow_interactive_recovery) and not bool(force_hidden):
-                self.__ui_post(self.__hide_active_tooltip)
+            after_navigation: Callable[[], bool] | None = None
             if (
                 cdp_proc is not None
-                and bool(force_hidden)
-                and not bool(allow_interactive_recovery)
+                and bool(effective_force_hidden)
+                and not bool(interactive_allowed)
                 and bool(should_hide_cdp_window)
             ):
-                # Navigation can trigger profile popups; re-hide the window defensively.
-                self.__set_cdp_window_visibility(cdp_proc, visible=False, bring_to_front=False)
+                def _rehide_after_navigation() -> bool:
+                    return self.__set_cdp_window_visibility(
+                        cdp_proc,
+                        visible=False,
+                        bring_to_front=False,
+                        source=normalized_source,
+                    )
+
+                after_navigation = _rehide_after_navigation
+            self.__refresh_collect_page(
+                page,
+                str(start_url),
+                after_navigation=after_navigation,
+            )
+            if bool(interactive_allowed) and not bool(effective_force_hidden):
+                self.__ui_post(self.__hide_active_tooltip)
 
             if self.__is_cloudflare_challenge(page):
                 if bool(effective_headless):
                     return None, "cloudflare_challenge"
-                if not bool(allow_interactive_recovery):
+                if not bool(interactive_allowed):
                     grace_sec = 0.0
                     try:
                         grace_sec = float(self.__background_cloudflare_grace_sec)
@@ -4653,7 +4686,7 @@ class CodexUsageMonitor:
                         return None, "cloudflare_challenge"
 
             if self.__is_login_required(page):
-                if bool(effective_headless) or not bool(allow_interactive_recovery):
+                if bool(effective_headless) or not bool(interactive_allowed):
                     self.__set_session_state("logged_out")
                     return None, "login_required"
                 ok = self.__wait_until_logged_in(page, timeout_sec=self.__login_timeout_sec)
@@ -4670,11 +4703,14 @@ class CodexUsageMonitor:
                 try:
                     if self.__is_collect_cancel_requested():
                         return None, "collect_cancelled"
-                    page.goto(
-                        usage_url,
-                        wait_until="domcontentloaded",
-                        timeout=int(self.__navigation_timeout_ms),
-                    )
+                    try:
+                        page.goto(
+                            usage_url,
+                            wait_until="domcontentloaded",
+                            timeout=int(self.__navigation_timeout_ms),
+                        )
+                    finally:
+                        self.__require_post_navigation_guard(after_navigation)
                 except Exception as exc:
                     self.__log_exception("navigate usage after login failed", exc)
                     return None, "collect_failed"
@@ -4682,7 +4718,7 @@ class CodexUsageMonitor:
             snapshot = self.__build_snapshot_from_page(page)
             if snapshot is not None:
                 self.__set_session_state("logged_in")
-                if bool(allow_interactive_recovery) and cdp_proc is not None:
+                if bool(interactive_allowed) and cdp_proc is not None:
                     if not bool(keep_cdp_process):
                         self.__log_interactive_cdp_close_after_success(cdp_proc)
                 return snapshot, None
@@ -4690,11 +4726,13 @@ class CodexUsageMonitor:
                 return self.__wait_for_snapshot_ready(
                     page,
                     timeout_sec=min(float(self.__login_timeout_sec), float(self.__headless_wait_timeout_sec)),
+                    after_navigation=after_navigation,
                 )
-            if not bool(effective_headless) and bool(allow_interactive_recovery):
+            if not bool(effective_headless) and bool(interactive_allowed):
                 waited_snapshot, waited_error = self.__wait_for_snapshot_ready(
                     page,
                     timeout_sec=self.__login_timeout_sec,
+                    after_navigation=after_navigation,
                 )
                 if waited_error is None and waited_snapshot is not None and cdp_proc is not None:
                     if not bool(keep_cdp_process):
@@ -4709,6 +4747,7 @@ class CodexUsageMonitor:
                 return self.__wait_for_snapshot_ready(
                     page,
                     timeout_sec=float(self.__headless_wait_timeout_sec),
+                    after_navigation=after_navigation,
                 )
             try:
                 self.__log(
@@ -4747,7 +4786,12 @@ class CodexUsageMonitor:
         probe = self.__probe_usage_page(page)
         return self.__build_snapshot_from_probe(probe)
 
-    def __refresh_collect_page(self, page, target_url: str) -> None:
+    def __refresh_collect_page(
+        self,
+        page,
+        target_url: str,
+        after_navigation: Callable[[], bool] | None = None,
+    ) -> None:
         current_url = self.__get_page_url(page)
         if are_equivalent_codex_usage_urls(current_url, target_url):
             reload_page = getattr(page, "reload", None)
@@ -4761,14 +4805,34 @@ class CodexUsageMonitor:
                     return
                 except Exception as exc:
                     self.__log_exception("usage page reload failed", exc)
-        page.goto(
-            str(target_url),
-            wait_until="domcontentloaded",
-            timeout=int(self.__navigation_timeout_ms),
-        )
+                finally:
+                    self.__require_post_navigation_guard(after_navigation)
+        try:
+            page.goto(
+                str(target_url),
+                wait_until="domcontentloaded",
+                timeout=int(self.__navigation_timeout_ms),
+            )
+        finally:
+            self.__require_post_navigation_guard(after_navigation)
         return
 
-    def __wait_for_snapshot_ready(self, page, timeout_sec: float) -> tuple[UsageSnapshot | None, str | None]:
+    def __require_post_navigation_guard(
+        self,
+        after_navigation: Callable[[], bool] | None,
+    ) -> None:
+        if after_navigation is None:
+            return
+        if not bool(after_navigation()):
+            raise RuntimeError("managed chrome window could not be re-hidden after navigation")
+        return
+
+    def __wait_for_snapshot_ready(
+        self,
+        page,
+        timeout_sec: float,
+        after_navigation: Callable[[], bool] | None = None,
+    ) -> tuple[UsageSnapshot | None, str | None]:
         deadline = 0.0
         try:
             deadline = float(self.__lib.time.monotonic()) + float(timeout_sec)
@@ -4792,29 +4856,32 @@ class CodexUsageMonitor:
             if now >= float(next_home_recovery_ts):
                 current_url = self.__get_page_url(page)
                 if self.__is_chatgpt_home_url(current_url):
-                    if self.__is_login_required(page):
-                        try:
-                            if self.__try_open_login_entry(page, force=False):
-                                next_home_recovery_ts = now + 4.0
-                                continue
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            page.goto(
-                                str(self.__usage_url),
-                                wait_until="domcontentloaded",
-                                timeout=int(self.__navigation_timeout_ms),
-                            )
+                    try:
+                        if self.__is_login_required(page):
                             try:
-                                page.wait_for_timeout(900)
+                                if self.__try_open_login_entry(page, force=False):
+                                    next_home_recovery_ts = now + 4.0
+                                    continue
                             except Exception:
                                 pass
-                            self.__log("usage retry navigation from chatgpt home")
-                            next_home_recovery_ts = now + 4.0
-                            continue
-                        except Exception as exc:
-                            self.__log_exception("usage retry from home failed", exc)
+                        else:
+                            try:
+                                page.goto(
+                                    str(self.__usage_url),
+                                    wait_until="domcontentloaded",
+                                    timeout=int(self.__navigation_timeout_ms),
+                                )
+                                try:
+                                    page.wait_for_timeout(900)
+                                except Exception:
+                                    pass
+                                self.__log("usage retry navigation from chatgpt home")
+                                next_home_recovery_ts = now + 4.0
+                                continue
+                            except Exception as exc:
+                                self.__log_exception("usage retry from home failed", exc)
+                    finally:
+                        self.__require_post_navigation_guard(after_navigation)
                     next_home_recovery_ts = now + 4.0
             if now > deadline:
                 if self.__is_cloudflare_challenge(page):
@@ -4914,7 +4981,15 @@ class CodexUsageMonitor:
         playwright_obj,
         start_hidden: bool = False,
         initial_url: str | None = None,
+        source: str = "",
     ):
+        normalized_source = normalize_usage_value(source).lower()
+        if not bool(start_hidden) and normalized_source != "manual_login":
+            self.__log(
+                "interactive cdp launch blocked "
+                f"source={normalized_source or 'unknown'}"
+            )
+            return None, None, None
         chrome_path = self.__resolve_chrome_executable_path()
         if not chrome_path:
             return None, None, None
@@ -4969,11 +5044,11 @@ class CodexUsageMonitor:
                     cmd.extend(
                         [
                             "--start-minimized",
+                            "--no-startup-window",
                             "--window-size=1280,720",
                             "--window-position=-32000,-32000",
                         ]
                     )
-                    cmd.append(str(launch_url))
                 else:
                     cmd.extend(
                         [
@@ -5009,13 +5084,6 @@ class CodexUsageMonitor:
                     except Exception:
                         pass
                 proc = self.__lib.subprocess.Popen(cmd, **popen_kwargs)
-                if bool(start_hidden):
-                    self.__set_cdp_window_visibility(
-                        proc,
-                        visible=False,
-                        bring_to_front=False,
-                        timeout_sec=0.2,
-                    )
                 endpoint = f"http://127.0.0.1:{int(port)}"
                 connect_deadline = 0.0
                 try:
@@ -5026,7 +5094,7 @@ class CodexUsageMonitor:
                     connect_deadline = total_deadline
                 while True:
                     if self.__is_collect_cancel_requested():
-                        self.__terminate_spawned_process(proc, cleanup_orphans=False)
+                        self.__terminate_cdp_launch_attempt(proc, int(port))
                         return None, None, None
                     try:
                         browser = self.__connect_browser_over_cdp(playwright_obj, endpoint)
@@ -5038,7 +5106,8 @@ class CodexUsageMonitor:
                                 proc,
                                 visible=False,
                                 bring_to_front=False,
-                                timeout_sec=0.1,
+                                timeout_sec=0.5,
+                                source=normalized_source,
                             )
                         now = 0.0
                         try:
@@ -5053,20 +5122,7 @@ class CodexUsageMonitor:
                             pass
 
                 if browser is None:
-                    self.__terminate_spawned_process(proc, cleanup_orphans=False)
-                    continue
-                contexts = []
-                try:
-                    contexts = list(browser.contexts or [])
-                except Exception:
-                    contexts = []
-                if not contexts:
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
-                    self.__terminate_spawned_process(proc, cleanup_orphans=False)
-                    last_error = RuntimeError("cdp browser has no context")
+                    self.__terminate_cdp_launch_attempt(proc, int(port))
                     continue
                 spawned_pid = 0
                 try:
@@ -5083,6 +5139,27 @@ class CodexUsageMonitor:
                         setattr(proc, "_ws_listener_pid", int(listener_pid))
                     except Exception:
                         pass
+                if bool(start_hidden) and not self.__create_hidden_background_target(browser):
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    self.__terminate_cdp_launch_attempt(proc, int(port))
+                    last_error = RuntimeError("hidden cdp background target creation failed")
+                    continue
+                contexts = []
+                try:
+                    contexts = list(browser.contexts or [])
+                except Exception:
+                    contexts = []
+                if not contexts:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    self.__terminate_cdp_launch_attempt(proc, int(port))
+                    last_error = RuntimeError("cdp browser has no context")
+                    continue
                 if spawned_pid > 0 and (not self.__is_subprocess_running(proc)):
                     if listener_pid <= 0:
                         self.__log(
@@ -5093,13 +5170,27 @@ class CodexUsageMonitor:
                             browser.close()
                         except Exception:
                             pass
-                        self.__terminate_spawned_process(proc, cleanup_orphans=False)
+                        self.__terminate_cdp_launch_attempt(proc, int(port))
                         last_error = RuntimeError("cdp spawned process exited")
                         continue
                     try:
                         setattr(proc, "_ws_listener_pid", int(listener_pid))
                     except Exception:
                         pass
+                if bool(start_hidden) and not self.__set_cdp_window_visibility(
+                    proc,
+                    visible=False,
+                    bring_to_front=False,
+                    timeout_sec=5.0,
+                    source=normalized_source,
+                ):
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    self.__terminate_cdp_launch_attempt(proc, int(port))
+                    last_error = RuntimeError("hidden cdp window could not be verified hidden")
+                    continue
                 self.__log(
                     f"interactive cdp connected port={int(port)} pid={int(spawned_pid)}"
                 )
@@ -5117,11 +5208,49 @@ class CodexUsageMonitor:
                     except Exception:
                         pass
                 if proc is not None:
-                    self.__terminate_spawned_process(proc, cleanup_orphans=False)
+                    self.__terminate_cdp_launch_attempt(proc, int(port))
                 continue
         if last_error is not None:
             self.__log_exception("interactive cdp launch failed", last_error)
         return None, None, None
+
+    def __create_hidden_background_target(self, browser) -> bool:
+        cdp_session = None
+        try:
+            cdp_session = browser.new_browser_cdp_session()
+            response = cdp_session.send(
+                "Target.createTarget",
+                {
+                    "url": HIDDEN_CDP_BOOTSTRAP_URL,
+                    "background": True,
+                },
+            )
+            return bool(normalize_usage_value((response or {}).get("targetId", "")))
+        except Exception as exc:
+            self.__log_exception("hidden cdp background target creation failed", exc)
+            return False
+        finally:
+            if cdp_session is not None:
+                try:
+                    cdp_session.detach()
+                except Exception:
+                    pass
+
+    def __terminate_cdp_launch_attempt(self, proc, port: int) -> None:
+        listener_pid = 0
+        try:
+            listener_pid = int(getattr(proc, "_ws_listener_pid", 0) or 0)
+        except Exception:
+            listener_pid = 0
+        if listener_pid <= 0:
+            listener_pid = int(self.__find_profile_remote_debugging_pid(int(port)) or 0)
+            if listener_pid > 0:
+                try:
+                    setattr(proc, "_ws_listener_pid", int(listener_pid))
+                except Exception:
+                    pass
+        self.__terminate_spawned_process(proc, cleanup_orphans=False)
+        return
 
     def __iter_cdp_ports(self) -> list[int]:
         ports: list[int] = []
@@ -5840,7 +5969,7 @@ class CodexUsageMonitor:
                 raise RuntimeError(str(message.get("error")))
             return message
 
-    def __connect_managed_hidden_cdp_context(self, playwright_obj):
+    def __connect_managed_hidden_cdp_context(self, playwright_obj, source: str = ""):
         proc = self.__hidden_cdp_proc
         port = 0
         try:
@@ -5863,6 +5992,16 @@ class CodexUsageMonitor:
             self.__clear_hidden_cdp_process(terminate=False)
             return None, None, None, False
 
+        if not self.__set_cdp_window_visibility(
+            proc,
+            visible=False,
+            bring_to_front=False,
+            timeout_sec=1.0,
+            source=source,
+        ):
+            self.__clear_hidden_cdp_process(terminate=True)
+            return None, None, None, False
+
         endpoint = f"http://127.0.0.1:{int(port)}"
         browser = None
         try:
@@ -5873,6 +6012,19 @@ class CodexUsageMonitor:
             except Exception:
                 contexts = []
             if not contexts:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                self.__clear_hidden_cdp_process(terminate=True)
+                return None, None, None, False
+            if not self.__set_cdp_window_visibility(
+                proc,
+                visible=False,
+                bring_to_front=False,
+                timeout_sec=1.0,
+                source=source,
+            ):
                 try:
                     browser.close()
                 except Exception:
@@ -5891,8 +6043,16 @@ class CodexUsageMonitor:
             self.__clear_hidden_cdp_process(terminate=True)
             return None, None, None, False
 
-    def __connect_hidden_cdp_context(self, playwright_obj, launch_url: str | None = None):
-        context, browser, proc, keep = self.__connect_managed_hidden_cdp_context(playwright_obj)
+    def __connect_hidden_cdp_context(
+        self,
+        playwright_obj,
+        launch_url: str | None = None,
+        source: str = "",
+    ):
+        context, browser, proc, keep = self.__connect_managed_hidden_cdp_context(
+            playwright_obj,
+            source=source,
+        )
         if context is not None:
             return context, browser, proc, keep
 
@@ -5919,6 +6079,7 @@ class CodexUsageMonitor:
             playwright_obj,
             start_hidden=True,
             initial_url=launch_url,
+            source=source,
         )
         if proc is None:
             return context, browser, proc, False
@@ -5942,8 +6103,16 @@ class CodexUsageMonitor:
         visible: bool,
         bring_to_front: bool = False,
         timeout_sec: float = 3.0,
+        source: str = "",
     ) -> bool:
         if proc is None:
+            return False
+        normalized_source = normalize_usage_value(source).lower()
+        if bool(visible) and normalized_source != "manual_login":
+            self.__log(
+                "managed chrome visible request blocked "
+                f"source={normalized_source or 'unknown'}"
+            )
             return False
         pid_candidates: list[int] = []
         for attr in ("_ws_listener_pid", "pid"):
@@ -5971,25 +6140,35 @@ class CodexUsageMonitor:
             return False
 
         if not bool(visible):
-            hidden_any = False
-            hide_timeout = float(timeout_sec)
-            if hide_timeout > 1.0:
-                hide_timeout = 1.0
-            for candidate in unique_pids:
-                if self.__set_windows_visibility_for_pid(
+            content_pid_results: list[bool] = []
+            for index, candidate in enumerate(unique_pids):
+                hide_timeout = float(timeout_sec) if index == 0 else min(float(timeout_sec), 0.5)
+                hidden = self.__set_windows_visibility_for_pid(
                     pid=candidate,
                     visible=False,
                     bring_to_front=False,
                     timeout_sec=hide_timeout,
-                ):
-                    hidden_any = True
-            return hidden_any
+                    source=normalized_source,
+                )
+                content_handles = self.__select_hidden_content_windows(
+                    self.__list_top_windows_for_pid(candidate)
+                )
+                if content_handles:
+                    content_pid_results.append(
+                        bool(hidden)
+                        and all(
+                            self.__is_window_visible(hwnd) is False
+                            for hwnd in content_handles
+                        )
+                    )
+            return bool(content_pid_results) and all(content_pid_results)
 
         primary = self.__set_windows_visibility_for_pid(
             pid=unique_pids[0],
             visible=True,
             bring_to_front=bool(bring_to_front),
             timeout_sec=float(timeout_sec),
+            source=normalized_source,
         )
         if primary:
             return True
@@ -6002,6 +6181,7 @@ class CodexUsageMonitor:
                 visible=True,
                 bring_to_front=bool(bring_to_front),
                 timeout_sec=fallback_timeout,
+                source=normalized_source,
             ):
                 return True
         return False
@@ -6012,6 +6192,7 @@ class CodexUsageMonitor:
         visible: bool,
         bring_to_front: bool = False,
         timeout_sec: float = 3.0,
+        source: str = "",
     ) -> bool:
         if int(pid) <= 0:
             return False
@@ -6019,6 +6200,14 @@ class CodexUsageMonitor:
             if str(self.__lib.os.name).lower() != "nt":
                 return False
         except Exception:
+            return False
+
+        normalized_source = normalize_usage_value(source).lower()
+        if bool(visible) and normalized_source != "manual_login":
+            self.__log(
+                "managed chrome visible request blocked "
+                f"source={normalized_source or 'unknown'} pid={int(pid)}"
+            )
             return False
 
         now = 0.0
@@ -6029,6 +6218,7 @@ class CodexUsageMonitor:
         except Exception:
             deadline = 0.0
 
+        logged_visible_handles: set[int] = set()
         while True:
             handles = self.__list_top_windows_for_pid(int(pid))
             if handles:
@@ -6036,6 +6226,11 @@ class CodexUsageMonitor:
                 target_handles = handles
                 if bool(visible):
                     target_handles = self.__select_windows_for_visible_restore(handles)
+                content_handles = (
+                    self.__select_hidden_content_windows(handles)
+                    if not bool(visible)
+                    else []
+                )
                 for hwnd in target_handles:
                     try:
                         if bool(visible):
@@ -6053,13 +6248,27 @@ class CodexUsageMonitor:
                                 except Exception:
                                     pass
                         else:
+                            is_visible = self.__is_window_visible(hwnd)
+                            if bool(is_visible) and int(hwnd) not in logged_visible_handles:
+                                self.__log_unexpected_visible_window(
+                                    source=normalized_source,
+                                    pid=int(pid),
+                                    hwnd=int(hwnd),
+                                )
+                                logged_visible_handles.add(int(hwnd))
                             self.__hide_window_from_taskbar(hwnd)
                             self.__lib.win32gui.ShowWindow(hwnd, 0)  # SW_HIDE
                         changed = True
                     except Exception:
                         continue
-                if changed:
+                if bool(visible) and changed:
                     return True
+                if not bool(visible) and content_handles:
+                    visibility_states = [
+                        self.__is_window_visible(hwnd) for hwnd in target_handles
+                    ]
+                    if visibility_states and all(state is False for state in visibility_states):
+                        return True
             if deadline <= 0.0:
                 break
             try:
@@ -6073,6 +6282,82 @@ class CodexUsageMonitor:
             except Exception:
                 break
         return False
+
+    def __select_hidden_content_windows(self, handles: list[int]) -> list[int]:
+        class_reader = getattr(self.__lib.win32gui, "GetClassName", None)
+        title_reader = getattr(self.__lib.win32gui, "GetWindowText", None)
+        if not callable(class_reader) or not callable(title_reader):
+            return [int(hwnd) for hwnd in handles]
+        content_handles: list[int] = []
+        for hwnd in handles:
+            try:
+                class_name = str(class_reader(hwnd) or "")
+                title = str(title_reader(hwnd) or "").strip()
+            except Exception:
+                continue
+            if class_name == "Chrome_WidgetWin_1" and title:
+                content_handles.append(int(hwnd))
+        return content_handles
+
+    def __is_window_visible(self, hwnd: int) -> bool | None:
+        is_window_visible = getattr(self.__lib.win32gui, "IsWindowVisible", None)
+        if not callable(is_window_visible):
+            return None
+        try:
+            return bool(is_window_visible(int(hwnd)))
+        except Exception:
+            return None
+
+    def __sanitize_window_log_text(self, text: str) -> str:
+        value = str(text or "").replace("\r", " ").replace("\n", " ").strip()
+        value = re.sub(r"https?://\S+", "<url>", value, flags=re.IGNORECASE)
+        value = re.sub(
+            r"(?i)\b(token|key|auth|session|code)=\S+",
+            r"\1=<redacted>",
+            value,
+        )
+        return value[:240]
+
+    def __log_unexpected_visible_window(self, source: str, pid: int, hwnd: int) -> None:
+        try:
+            class_name = str(self.__lib.win32gui.GetClassName(int(hwnd)) or "")
+        except Exception:
+            class_name = ""
+        try:
+            title = self.__sanitize_window_log_text(
+                str(self.__lib.win32gui.GetWindowText(int(hwnd)) or "")
+            )
+        except Exception:
+            title = ""
+        try:
+            rect_raw = self.__lib.win32gui.GetWindowRect(int(hwnd))
+            rect = tuple(int(value) for value in rect_raw)
+        except Exception:
+            rect = ()
+        try:
+            foreground_hwnd = int(self.__lib.win32gui.GetForegroundWindow() or 0)
+        except Exception:
+            foreground_hwnd = 0
+        foreground_pid = 0
+        if foreground_hwnd > 0:
+            try:
+                _, foreground_pid = self.__lib.win32process.GetWindowThreadProcessId(
+                    foreground_hwnd
+                )
+                foreground_pid = int(foreground_pid or 0)
+            except Exception:
+                foreground_pid = 0
+        rect_text = "(" + ",".join(str(value) for value in rect) + ")"
+        self.__log(
+            "unexpected visible managed chrome "
+            f"source={normalize_usage_value(source) or 'unknown'} "
+            f"pid={int(pid)} hwnd={int(hwnd)} "
+            f"class={self.__sanitize_window_log_text(class_name)} "
+            f"title={title} rect={rect_text} "
+            f"foreground_hwnd={int(foreground_hwnd)} "
+            f"foreground_pid={int(foreground_pid)}"
+        )
+        return
 
     def __select_windows_for_visible_restore(self, handles: list[int]) -> list[int]:
         content_handles: list[int] = []
