@@ -5478,7 +5478,7 @@ class CodexUsageMonitor:
                         timeout_sec=0.2,
                         source=normalized_source,
                     )
-                    self.__lib.time.sleep(0.15)
+                    self.__lib.time.sleep(0.05)
             finally:
                 try:
                     setattr(proc, "_ws_hidden_visibility_guard_started", False)
@@ -6329,10 +6329,13 @@ class CodexUsageMonitor:
                 if not content_handles:
                     continue
                 saw_content = True
+                # Chrome headless=new often keeps IsWindowVisible=True even after
+                # SW_HIDE + off-screen evacuate. User-visible failure is on-screen
+                # paint, so treat "not on screen" as the hide success signal.
                 if not (
                     bool(hidden)
                     and all(
-                        self.__is_window_visible(hwnd) is False
+                        not bool(self.__is_window_on_screen(hwnd))
                         for hwnd in content_handles
                     )
                 ):
@@ -6412,6 +6415,7 @@ class CodexUsageMonitor:
                 for hwnd in target_handles:
                     try:
                         if bool(visible):
+                            self.__restore_window_paint(hwnd)
                             if bool(bring_to_front):
                                 self.__lib.win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
                             else:
@@ -6426,10 +6430,9 @@ class CodexUsageMonitor:
                                 except Exception:
                                     pass
                         else:
-                            is_visible = self.__is_window_visible(hwnd)
                             on_screen = self.__is_window_on_screen(hwnd)
                             if (
-                                (bool(is_visible) or bool(on_screen))
+                                bool(on_screen)
                                 and int(hwnd) not in logged_visible_handles
                             ):
                                 self.__log_unexpected_visible_window(
@@ -6438,17 +6441,13 @@ class CodexUsageMonitor:
                                     hwnd=int(hwnd),
                                 )
                                 logged_visible_handles.add(int(hwnd))
-                            # Hide first, then strip taskbar only after the
-                            # window is actually invisible AND off-screen.
-                            # Headless Chrome can keep painting a blank 800x600
-                            # Codex frame at on-screen coords while IsWindowVisible
-                            # is already false.
+                            # Suppress paint before SW_HIDE. Headless Chrome can
+                            # keep IsWindowVisible=True and briefly paint a blank
+                            # dark 800x600 frame with the Win11 accent border.
+                            self.__suppress_window_paint(hwnd)
                             self.__lib.win32gui.ShowWindow(hwnd, 0)  # SW_HIDE
                             self.__evacuate_window_offscreen(hwnd)
-                            if (
-                                self.__is_window_visible(hwnd) is False
-                                and not bool(self.__is_window_on_screen(hwnd))
-                            ):
+                            if not bool(self.__is_window_on_screen(hwnd)):
                                 self.__apply_toolwindow_exstyle(hwnd)
                         changed = True
                     except Exception:
@@ -6457,8 +6456,7 @@ class CodexUsageMonitor:
                     return True
                 if not bool(visible) and content_handles:
                     if all(
-                        self.__is_window_visible(hwnd) is False
-                        and not bool(self.__is_window_on_screen(hwnd))
+                        not bool(self.__is_window_on_screen(hwnd))
                         for hwnd in content_handles
                     ):
                         return True
@@ -6747,7 +6745,8 @@ class CodexUsageMonitor:
             # Collapse to 0x0 and park far off-screen. Keeping the original
             # 800x600 size at (0,0) still paints a blank dark ghost frame even
             # when IsWindowVisible is false on some Chrome/DWM paths.
-            # SWP_NOZORDER=0x0004, SWP_NOACTIVATE=0x0010, SWP_FRAMECHANGED=0x0020.
+            # SWP_NOZORDER=0x0004, SWP_NOACTIVATE=0x0010, SWP_FRAMECHANGED=0x0020,
+            # SWP_HIDEWINDOW=0x0080.
             self.__lib.win32gui.SetWindowPos(
                 handle,
                 0,
@@ -6755,10 +6754,90 @@ class CodexUsageMonitor:
                 -32000,
                 0,
                 0,
-                0x0004 | 0x0010 | 0x0020,
+                0x0004 | 0x0010 | 0x0020 | 0x0080,
             )
         except Exception:
             return
+        return
+
+    def __suppress_window_paint(self, hwnd: int) -> None:
+        try:
+            handle = int(hwnd)
+        except Exception:
+            return
+        if handle <= 0:
+            return
+        # Make the frame invisible to the user even while Chrome/DWM still
+        # reports IsWindowVisible=True. Order matters: alpha/cloak first so a
+        # brief on-screen 800x600 host never paints the accent-border ghost.
+        try:
+            current_style = int(self.__lib.win32gui.GetWindowLong(handle, -20))
+            layered_style = int(current_style) | 0x00080000  # WS_EX_LAYERED
+            if layered_style != current_style:
+                self.__lib.win32gui.SetWindowLong(handle, -20, layered_style)
+        except Exception:
+            pass
+        try:
+            user32 = self.__lib.ctypes.windll.user32
+            set_layered = getattr(user32, "SetLayeredWindowAttributes", None)
+            if callable(set_layered):
+                set_layered(handle, 0, 0, 0x00000002)  # LWA_ALPHA
+            else:
+                set_layered_gui = getattr(
+                    self.__lib.win32gui,
+                    "SetLayeredWindowAttributes",
+                    None,
+                )
+                if callable(set_layered_gui):
+                    set_layered_gui(handle, 0, 0, 0x00000002)
+        except Exception:
+            pass
+        try:
+            dwmapi = self.__lib.ctypes.windll.dwmapi
+            cloak = self.__lib.ctypes.c_int(1)
+            dwmapi.DwmSetWindowAttribute(
+                handle,
+                13,  # DWMWA_CLOAK
+                self.__lib.ctypes.byref(cloak),
+                self.__lib.ctypes.sizeof(cloak),
+            )
+        except Exception:
+            pass
+        return
+
+    def __restore_window_paint(self, hwnd: int) -> None:
+        try:
+            handle = int(hwnd)
+        except Exception:
+            return
+        if handle <= 0:
+            return
+        try:
+            dwmapi = self.__lib.ctypes.windll.dwmapi
+            cloak = self.__lib.ctypes.c_int(0)
+            dwmapi.DwmSetWindowAttribute(
+                handle,
+                13,  # DWMWA_CLOAK
+                self.__lib.ctypes.byref(cloak),
+                self.__lib.ctypes.sizeof(cloak),
+            )
+        except Exception:
+            pass
+        try:
+            user32 = self.__lib.ctypes.windll.user32
+            set_layered = getattr(user32, "SetLayeredWindowAttributes", None)
+            if callable(set_layered):
+                set_layered(handle, 0, 255, 0x00000002)  # LWA_ALPHA
+            else:
+                set_layered_gui = getattr(
+                    self.__lib.win32gui,
+                    "SetLayeredWindowAttributes",
+                    None,
+                )
+                if callable(set_layered_gui):
+                    set_layered_gui(handle, 0, 255, 0x00000002)
+        except Exception:
+            pass
         return
 
     def __apply_toolwindow_exstyle(self, hwnd: int) -> None:
@@ -6790,11 +6869,9 @@ class CodexUsageMonitor:
         return
 
     def __hide_window_from_taskbar(self, hwnd: int) -> None:
+        self.__suppress_window_paint(hwnd)
         self.__evacuate_window_offscreen(hwnd)
-        if (
-            self.__is_window_visible(hwnd) is False
-            and not bool(self.__is_window_on_screen(hwnd))
-        ):
+        if not bool(self.__is_window_on_screen(hwnd)):
             self.__apply_toolwindow_exstyle(hwnd)
         return
 
