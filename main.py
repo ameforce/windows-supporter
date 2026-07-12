@@ -362,6 +362,10 @@ def _run_main_app() -> None:
         root.mainloop()
     finally:
         try:
+            monitor.shutdown()
+        except Exception:
+            pass
+        try:
             if tray is not None:
                 tray.stop()
         except Exception:

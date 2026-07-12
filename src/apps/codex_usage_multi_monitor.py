@@ -108,6 +108,19 @@ class CodexUsageMultiMonitor:
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         return
 
+    def shutdown(self) -> None:
+        self.__clear_monitor_schedule()
+        for child in self.__children.values():
+            shutdown = getattr(child, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    pass
+        self.__root = None
+        self.__event_queue = None
+        return
+
     def get_settings_snapshot(self) -> dict[str, Any]:
         return {
             "settings_version": 2,

@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
@@ -19,6 +20,28 @@ from src.apps.codex_usage_monitor import (
 
 
 class CodexUsageMonitorUnitTest(unittest.TestCase):
+    def test_shutdown_terminates_owned_cdp_process(self) -> None:
+        class _OwnedProc:
+            pid = 43210
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+            )
+            proc = _OwnedProc()
+            monitor._CodexUsageMonitor__hidden_cdp_proc = proc
+            monitor._CodexUsageMonitor__hidden_cdp_port = 11119
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__terminate_spawned_process",
+            ) as terminate:
+                monitor.shutdown()
+
+            terminate.assert_called_once_with(proc, cleanup_orphans=True)
+            self.assertIsNone(monitor._CodexUsageMonitor__hidden_cdp_proc)
+            self.assertEqual(monitor._CodexUsageMonitor__hidden_cdp_port, 0)
+
     def test_canonicalize_codex_usage_url_promotes_legacy_usage_path_to_analytics_hash(self) -> None:
         self.assertEqual(
             canonicalize_codex_usage_url("https://chatgpt.com/codex/settings/usage"),
