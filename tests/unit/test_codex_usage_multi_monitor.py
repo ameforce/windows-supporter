@@ -16,6 +16,7 @@ class _FakeChildMonitor:
         self.update_calls: list[dict] = []
         self.show_calls: list[dict] = []
         self.release_calls = 0
+        self.shutdown_calls = 0
         self.attach_calls = []
         self.tooltip_duration_ms = 7000
         self.runtime = {
@@ -78,6 +79,10 @@ class _FakeChildMonitor:
                 "start_monitor": bool(start_monitor),
             }
         )
+        return None
+
+    def shutdown(self):
+        self.shutdown_calls += 1
         return None
 
 
@@ -163,6 +168,20 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 return True
             time.sleep(0.01)
         return bool(predicate())
+
+    def test_shutdown_cancels_scheduler_and_shuts_down_every_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            root = _FakeRoot()
+            manager.attach(root)
+            scheduled_id = "after-owned"
+            manager._CodexUsageMultiMonitor__monitor_after_id = scheduled_id
+
+            manager.shutdown()
+
+            self.assertIn(scheduled_id, root.after_cancel_calls)
+            self.assertEqual([child.shutdown_calls for child in children], [1, 1])
+            self.assertIsNone(manager._CodexUsageMultiMonitor__monitor_after_id)
 
     def test_settings_snapshot_creates_two_isolated_accounts_and_migrates_legacy_files_once(self):
         with tempfile.TemporaryDirectory() as tmp:
