@@ -3293,7 +3293,77 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             [self.monitor._CodexUsageMonitor__cdp_connect_timeout_ms],
         )
 
-    def test_headless_cdp_handle_never_uses_win32_visibility_or_guard_thread(self) -> None:
+    def test_headless_cdp_handle_still_hides_visible_native_windows(self) -> None:
+        class _HeadlessProc:
+            pid = 43210
+            _ws_listener_pid = 43210
+            _ws_headless_cdp = True
+
+            def poll(self):
+                return None
+
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.show_calls: list[tuple[int, int]] = []
+                self.style = 0x00040000
+                self.visible = True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return ""
+
+            def IsWindowVisible(self, _hwnd):
+                return bool(self.visible)
+
+            def GetWindowLong(self, _hwnd, _index):
+                return self.style
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                self.style = int(value)
+                return int(value)
+
+            def SetWindowPos(self, *_args):
+                return True
+
+            def ShowWindow(self, hwnd, command):
+                self.show_calls.append((int(hwnd), int(command)))
+                if int(command) == 0:
+                    self.visible = False
+                return True
+
+        proc = _HeadlessProc()
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(
+            self.monitor,
+            "_CodexUsageMonitor__list_profile_chrome_pids",
+            return_value=[],
+        ):
+            with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib,
+                    "win32gui",
+                    fake_win32gui,
+                    create=True,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__list_top_windows_for_pid",
+                        return_value=[789],
+                    ):
+                        hidden = self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
+                            proc,
+                            visible=False,
+                            source="auto_monitor",
+                        )
+
+        self.assertTrue(hidden)
+        self.assertEqual(fake_win32gui.show_calls, [(789, 0)])
+        self.assertTrue(fake_win32gui.style & 0x00000080)
+
+    def test_headless_cdp_visibility_guard_starts_rehide_thread(self) -> None:
         class _HeadlessProc:
             pid = 43210
             _ws_headless_cdp = True
@@ -3301,8 +3371,71 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             def poll(self):
                 return None
 
+        class _InlineThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+                self.started = False
+
+            def start(self):
+                self.started = True
+                self.target()
+
         proc = _HeadlessProc()
         self.monitor._CodexUsageMonitor__root = object()
+        thread_holder: list[_InlineThread] = []
+
+        def _thread_factory(*, target, daemon):
+            thread = _InlineThread(target=target, daemon=daemon)
+            thread_holder.append(thread)
+            return thread
+
+        def register_hidden_proc(*_args, **_kwargs):
+            self.monitor._CodexUsageMonitor__hidden_cdp_proc = proc
+            return True
+
+        def rehide_once(*_args, **_kwargs):
+            self.monitor._CodexUsageMonitor__hidden_cdp_proc = None
+            return True
+
+        with patch("src.apps.codex_usage_monitor.threading.Thread", _thread_factory):
+            with patch.object(self.monitor._CodexUsageMonitor__lib.time, "sleep"):
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__is_pid_alive",
+                    return_value=True,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__is_subprocess_running",
+                        side_effect=register_hidden_proc,
+                    ):
+                        with patch.object(
+                            self.monitor,
+                            "_CodexUsageMonitor__set_windows_visibility_for_pid",
+                            side_effect=rehide_once,
+                        ) as set_visibility:
+                            guarded = self.monitor._CodexUsageMonitor__start_hidden_cdp_visibility_guard(
+                                proc,
+                                source="auto_monitor",
+                            )
+
+        self.assertTrue(guarded)
+        self.assertEqual(len(thread_holder), 1)
+        self.assertTrue(thread_holder[0].started)
+        set_visibility.assert_called_once_with(
+            pid=43210,
+            visible=False,
+            bring_to_front=False,
+            timeout_sec=0.2,
+            source="auto_monitor",
+        )
+
+    def test_headless_cdp_hide_succeeds_when_no_native_windows_exist(self) -> None:
+        class _HeadlessProc:
+            pid = 43210
+            _ws_listener_pid = 43210
+            _ws_headless_cdp = True
 
         with patch.object(
             self.monitor,
@@ -3312,25 +3445,21 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             with patch.object(
                 self.monitor,
                 "_CodexUsageMonitor__list_top_windows_for_pid",
-                side_effect=AssertionError("headless CDP must not enumerate native windows"),
+                return_value=[],
             ):
-                hidden = self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
-                    proc,
-                    visible=False,
-                    source="auto_monitor",
-                )
-
-        with patch(
-            "src.apps.codex_usage_monitor.threading.Thread",
-            side_effect=AssertionError("headless CDP must not start a Win32 visibility guard"),
-        ):
-            guarded = self.monitor._CodexUsageMonitor__start_hidden_cdp_visibility_guard(
-                proc,
-                source="auto_monitor",
-            )
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__set_windows_visibility_for_pid",
+                    return_value=False,
+                ) as set_visibility:
+                    hidden = self.monitor._CodexUsageMonitor__set_cdp_window_visibility(
+                        _HeadlessProc(),
+                        visible=False,
+                        source="auto_monitor",
+                    )
 
         self.assertTrue(hidden)
-        self.assertTrue(guarded)
+        set_visibility.assert_called_once()
 
     def test_headless_user_agent_uses_installed_chrome_major_version(self) -> None:
         version_info = {
@@ -4591,20 +4720,24 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 self.set_styles: list[tuple[int, int, int]] = []
                 self.position_calls: list[tuple[int, int, int, int, int, int, int]] = []
                 self.show_calls: list[tuple[int, int]] = []
+                self.events: list[str] = []
+                self.visible = True
 
             def IsWindowVisible(self, _hwnd):
-                return False
+                return bool(self.visible)
 
             def GetWindowLong(self, hwnd, index):
                 self.set_styles.append((int(hwnd), int(index), self.style))
                 return self.style
 
             def SetWindowLong(self, hwnd, index, value):
+                self.events.append("SetWindowLong")
                 self.style = int(value)
                 self.set_styles.append((int(hwnd), int(index), int(value)))
                 return int(value)
 
             def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+                self.events.append("SetWindowPos")
                 self.position_calls.append(
                     (
                         int(hwnd),
@@ -4619,8 +4752,23 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 return True
 
             def ShowWindow(self, hwnd, command):
+                self.events.append("ShowWindow")
                 self.show_calls.append((int(hwnd), int(command)))
+                if int(command) == 0:
+                    self.visible = False
                 return True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return "Codex"
+
+            def GetWindowRect(self, _hwnd):
+                return (10, 10, 100, 100)
+
+            def GetForegroundWindow(self):
+                return 0
 
         fake_win32gui = _DummyWin32Gui()
 
@@ -4647,8 +4795,79 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(fake_win32gui.style & 0x00040000, 0)
         self.assertTrue(fake_win32gui.style & 0x00000080)
         self.assertTrue(fake_win32gui.position_calls)
-        self.assertEqual(fake_win32gui.position_calls[-1][2:4], (-32000, -32000))
+        self.assertEqual(fake_win32gui.position_calls[0][2:4], (-32000, -32000))
         self.assertEqual(fake_win32gui.show_calls, [(789, 0)])
+        self.assertLess(
+            fake_win32gui.events.index("ShowWindow"),
+            fake_win32gui.events.index("SetWindowLong"),
+        )
+
+    def test_toolwindow_style_is_not_applied_when_hide_fails(self) -> None:
+        class _DummyWin32Gui:
+            def __init__(self):
+                self.style = 0x00040000
+                self.set_long_calls = 0
+
+            def IsWindowVisible(self, _hwnd):
+                return True
+
+            def GetWindowLong(self, _hwnd, _index):
+                return self.style
+
+            def SetWindowLong(self, _hwnd, _index, value):
+                self.set_long_calls += 1
+                self.style = int(value)
+                return int(value)
+
+            def SetWindowPos(self, *_args):
+                return True
+
+            def ShowWindow(self, *_args):
+                return True
+
+            def GetClassName(self, _hwnd):
+                return "Chrome_WidgetWin_1"
+
+            def GetWindowText(self, _hwnd):
+                return "Codex"
+
+            def GetWindowRect(self, _hwnd):
+                return (10, 10, 100, 100)
+
+            def GetForegroundWindow(self):
+                return 0
+
+        fake_win32gui = _DummyWin32Gui()
+
+        with patch.object(self.monitor._CodexUsageMonitor__lib.os, "name", "nt"):
+            with patch.object(
+                self.monitor._CodexUsageMonitor__lib,
+                "win32gui",
+                fake_win32gui,
+                create=True,
+            ):
+                with patch.object(
+                    self.monitor._CodexUsageMonitor__lib,
+                    "win32process",
+                    type("P", (), {"GetWindowThreadProcessId": staticmethod(lambda *_: (0, 0))})(),
+                    create=True,
+                ):
+                    with patch.object(
+                        self.monitor,
+                        "_CodexUsageMonitor__list_top_windows_for_pid",
+                        return_value=[789],
+                    ):
+                        ok = self.monitor._CodexUsageMonitor__set_windows_visibility_for_pid(
+                            pid=123,
+                            visible=False,
+                            bring_to_front=False,
+                            timeout_sec=0.2,
+                            source="auto_monitor",
+                        )
+
+        self.assertFalse(ok)
+        self.assertEqual(fake_win32gui.set_long_calls, 0)
+        self.assertEqual(fake_win32gui.style, 0x00040000)
 
     def test_set_windows_visibility_for_pid_hides_all_chrome_windows(self) -> None:
         class _DummyWin32Gui:
@@ -4712,9 +4931,14 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(fake_win32gui.show_calls, [(1001, 0), (1002, 0), (1003, 0)])
+        # Off-screen move + toolwindow frame change per HWND.
         self.assertEqual(
             [call[0] for call in fake_win32gui.position_calls],
-            [1001, 1002, 1003],
+            [1001, 1001, 1002, 1002, 1003, 1003],
+        )
+        self.assertEqual(
+            [call[2:4] for call in fake_win32gui.position_calls if call[2:4] == (-32000, -32000)],
+            [(-32000, -32000), (-32000, -32000), (-32000, -32000)],
         )
 
     def test_hidden_visibility_waits_for_late_content_hwnd_and_confirms_hidden(self) -> None:
@@ -4831,10 +5055,10 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertGreaterEqual(len(fake_win32gui.show_calls), 1)
 
-    def test_hidden_visibility_waits_for_titled_content_hwnd(self) -> None:
+    def test_hidden_visibility_accepts_blank_title_chrome_content_hwnd(self) -> None:
         class _DummyWin32Gui:
             def GetWindowLong(self, _hwnd, _index):
-                return 0x00000080
+                return 0x00040000
 
             def SetWindowLong(self, _hwnd, _index, value):
                 return int(value)
@@ -4874,7 +5098,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                         source="auto_monitor",
                     )
 
-        self.assertFalse(ok)
+        self.assertTrue(ok)
 
     def test_cdp_hide_fails_when_any_content_pid_remains_visible(self) -> None:
         class _DummyProc:
