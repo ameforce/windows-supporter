@@ -5417,8 +5417,8 @@ class CodexUsageMonitor:
     def __start_hidden_cdp_visibility_guard(self, proc, source: str = "") -> bool:
         if proc is None:
             return False
-        if self.__is_headless_cdp_handle(proc):
-            return True
+        # Headless-marked CDP can still paint intermittent top-level HWNDs on
+        # Windows; keep the Win32 rehide guard active for those leaks.
         if self.__root is None:
             return True
         try:
@@ -6282,8 +6282,6 @@ class CodexUsageMonitor:
                 f"source={normalized_source or 'unknown'}"
             )
             return False
-        if self.__is_headless_cdp_handle(proc):
-            return not bool(visible)
         pid_candidates: list[int] = []
         for attr in ("_ws_listener_pid", "pid"):
             try:
@@ -6307,10 +6305,12 @@ class CodexUsageMonitor:
             seen.add(pid)
             unique_pids.append(pid)
         if not unique_pids:
-            return False
+            # Headless Chrome often has no top-level HWND yet; treat as hidden.
+            return not bool(visible)
 
         if not bool(visible):
-            content_pid_results: list[bool] = []
+            saw_content = False
+            all_hidden = True
             for index, candidate in enumerate(unique_pids):
                 hide_timeout = float(timeout_sec) if index == 0 else min(float(timeout_sec), 0.5)
                 hidden = self.__set_windows_visibility_for_pid(
@@ -6323,15 +6323,20 @@ class CodexUsageMonitor:
                 content_handles = self.__select_hidden_content_windows(
                     self.__list_top_windows_for_pid(candidate)
                 )
-                if content_handles:
-                    content_pid_results.append(
-                        bool(hidden)
-                        and all(
-                            self.__is_window_visible(hwnd) is False
-                            for hwnd in content_handles
-                        )
+                if not content_handles:
+                    continue
+                saw_content = True
+                if not (
+                    bool(hidden)
+                    and all(
+                        self.__is_window_visible(hwnd) is False
+                        for hwnd in content_handles
                     )
-            return bool(content_pid_results) and all(content_pid_results)
+                ):
+                    all_hidden = False
+            if not saw_content:
+                return True
+            return bool(all_hidden)
 
         primary = self.__set_windows_visibility_for_pid(
             pid=unique_pids[0],
@@ -6426,8 +6431,13 @@ class CodexUsageMonitor:
                                     hwnd=int(hwnd),
                                 )
                                 logged_visible_handles.add(int(hwnd))
-                            self.__hide_window_from_taskbar(hwnd)
+                            # Hide first, then strip taskbar only after the
+                            # window is actually invisible. TOOLWINDOW-before-hide
+                            # creates visible ghost windows with no taskbar button.
                             self.__lib.win32gui.ShowWindow(hwnd, 0)  # SW_HIDE
+                            self.__move_window_offscreen(hwnd)
+                            if self.__is_window_visible(hwnd) is False:
+                                self.__apply_toolwindow_exstyle(hwnd)
                         changed = True
                     except Exception:
                         continue
@@ -6435,7 +6445,7 @@ class CodexUsageMonitor:
                     return True
                 if not bool(visible) and content_handles:
                     visibility_states = [
-                        self.__is_window_visible(hwnd) for hwnd in target_handles
+                        self.__is_window_visible(hwnd) for hwnd in content_handles
                     ]
                     if visibility_states and all(state is False for state in visibility_states):
                         return True
@@ -6455,17 +6465,16 @@ class CodexUsageMonitor:
 
     def __select_hidden_content_windows(self, handles: list[int]) -> list[int]:
         class_reader = getattr(self.__lib.win32gui, "GetClassName", None)
-        title_reader = getattr(self.__lib.win32gui, "GetWindowText", None)
-        if not callable(class_reader) or not callable(title_reader):
+        if not callable(class_reader):
             return [int(hwnd) for hwnd in handles]
         content_handles: list[int] = []
         for hwnd in handles:
             try:
                 class_name = str(class_reader(hwnd) or "")
-                title = str(title_reader(hwnd) or "").strip()
             except Exception:
                 continue
-            if class_name == "Chrome_WidgetWin_1" and title:
+            # Blank-title Chrome windows still paint the ghost dark surface.
+            if class_name == "Chrome_WidgetWin_1":
                 content_handles.append(int(hwnd))
         return content_handles
 
@@ -6666,20 +6675,16 @@ class CodexUsageMonitor:
             return
         return
 
-    def __hide_window_from_taskbar(self, hwnd: int) -> None:
+    def __move_window_offscreen(self, hwnd: int) -> None:
         try:
             handle = int(hwnd)
         except Exception:
             return
         if handle <= 0:
             return
-        # Stable Win32 constants: GWL_EXSTYLE=-20, WS_EX_APPWINDOW=0x40000,
-        # WS_EX_TOOLWINDOW=0x80. Tool windows do not leave taskbar buttons.
         try:
-            current_style = int(self.__lib.win32gui.GetWindowLong(handle, -20))
-            hidden_style = (current_style & ~0x00040000) | 0x00000080
-            if hidden_style != current_style:
-                self.__lib.win32gui.SetWindowLong(handle, -20, hidden_style)
+            # SWP_NOSIZE=0x0001, SWP_NOZORDER=0x0004,
+            # SWP_NOACTIVATE=0x0010, SWP_FRAMECHANGED=0x0020.
             self.__lib.win32gui.SetWindowPos(
                 handle,
                 0,
@@ -6691,6 +6696,40 @@ class CodexUsageMonitor:
             )
         except Exception:
             return
+        return
+
+    def __apply_toolwindow_exstyle(self, hwnd: int) -> None:
+        try:
+            handle = int(hwnd)
+        except Exception:
+            return
+        if handle <= 0:
+            return
+        # Stable Win32 constants: GWL_EXSTYLE=-20, WS_EX_APPWINDOW=0x40000,
+        # WS_EX_TOOLWINDOW=0x80. Tool windows do not leave taskbar buttons.
+        # Only apply after the window is confirmed hidden.
+        try:
+            current_style = int(self.__lib.win32gui.GetWindowLong(handle, -20))
+            hidden_style = (current_style & ~0x00040000) | 0x00000080
+            if hidden_style != current_style:
+                self.__lib.win32gui.SetWindowLong(handle, -20, hidden_style)
+                self.__lib.win32gui.SetWindowPos(
+                    handle,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020,
+                )
+        except Exception:
+            return
+        return
+
+    def __hide_window_from_taskbar(self, hwnd: int) -> None:
+        self.__move_window_offscreen(hwnd)
+        if self.__is_window_visible(hwnd) is False:
+            self.__apply_toolwindow_exstyle(hwnd)
         return
 
     def __list_top_windows_for_pid(self, pid: int) -> list[int]:
