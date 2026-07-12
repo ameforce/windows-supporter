@@ -5365,6 +5365,64 @@ class CodexUsageMonitor:
             self.__terminate_spawned_process(proc, cleanup_orphans=True)
         return
 
+    def __start_hidden_cdp_visibility_guard(self, proc, source: str = "") -> bool:
+        if proc is None:
+            return False
+        if self.__root is None:
+            return True
+        try:
+            if bool(getattr(proc, "_ws_hidden_visibility_guard_started", False)):
+                return True
+            setattr(proc, "_ws_hidden_visibility_guard_started", True)
+        except Exception:
+            return False
+
+        normalized_source = normalize_usage_value(source).lower() or "auto_monitor"
+
+        def guard_hidden_window() -> None:
+            try:
+                while self.__hidden_cdp_proc is proc:
+                    self.__lib.time.sleep(0.15)
+                    if self.__hidden_cdp_proc is not proc:
+                        break
+                    if not self.__is_subprocess_running(proc):
+                        break
+                    try:
+                        pid = int(getattr(proc, "_ws_listener_pid", 0) or 0)
+                    except Exception:
+                        pid = 0
+                    if pid <= 0:
+                        try:
+                            pid = int(getattr(proc, "pid", 0) or 0)
+                        except Exception:
+                            pid = 0
+                    if pid <= 0:
+                        continue
+                    self.__set_windows_visibility_for_pid(
+                        pid=pid,
+                        visible=False,
+                        bring_to_front=False,
+                        timeout_sec=0.2,
+                        source=normalized_source,
+                    )
+            finally:
+                if self.__hidden_cdp_proc is proc:
+                    try:
+                        setattr(proc, "_ws_hidden_visibility_guard_started", False)
+                    except Exception:
+                        pass
+
+        try:
+            threading.Thread(target=guard_hidden_window, daemon=True).start()
+            return True
+        except Exception as exc:
+            try:
+                setattr(proc, "_ws_hidden_visibility_guard_started", False)
+            except Exception:
+                pass
+            self.__log_exception("hidden cdp visibility guard start failed", exc)
+            return False
+
     def __log_interactive_cdp_close_after_success(self, proc) -> None:
         if proc is None:
             return
@@ -6054,6 +6112,16 @@ class CodexUsageMonitor:
             source=source,
         )
         if context is not None:
+            if proc is not None and not self.__start_hidden_cdp_visibility_guard(
+                proc,
+                source=source,
+            ):
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                self.__clear_hidden_cdp_process(terminate=True)
+                return None, None, None, False
             return context, browser, proc, keep
 
         proc = self.__hidden_cdp_proc
@@ -6094,6 +6162,13 @@ class CodexUsageMonitor:
                 pass
             self.__hidden_cdp_proc = proc
             self.__hidden_cdp_port = int(port)
+            if not self.__start_hidden_cdp_visibility_guard(proc, source=source):
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                self.__clear_hidden_cdp_process(terminate=True)
+                return None, None, None, False
             return context, browser, proc, True
         return context, browser, proc, False
 
