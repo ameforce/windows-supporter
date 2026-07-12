@@ -58,7 +58,7 @@ def _run_popen_with_output_progress(
     process = subprocess_module.Popen(argv, **run_kwargs)
     output_parts: list[str] = []
     deadline = time.monotonic() + float(timeout) if timeout is not None and float(timeout) > 0 else None
-    line_queue: queue.Queue[Any] = queue.Queue()
+    line_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
     reader_done = object()
     _start_output_reader(getattr(process, "stdout", None), line_queue, reader_done)
 
