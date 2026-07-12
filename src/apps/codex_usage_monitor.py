@@ -5468,8 +5468,11 @@ class CodexUsageMonitor:
                             pid = 0
                     if pid <= 0:
                         continue
-                    self.__set_windows_visibility_for_pid(
-                        pid=pid,
+                    # Rehide across all managed profile PIDs, not only the
+                    # listener pid. Ghost frames often belong to sibling
+                    # Chrome processes in the same user-data-dir tree.
+                    self.__set_cdp_window_visibility(
+                        proc,
                         visible=False,
                         bring_to_front=False,
                         timeout_sec=0.2,
@@ -6424,7 +6427,11 @@ class CodexUsageMonitor:
                                     pass
                         else:
                             is_visible = self.__is_window_visible(hwnd)
-                            if bool(is_visible) and int(hwnd) not in logged_visible_handles:
+                            on_screen = self.__is_window_on_screen(hwnd)
+                            if (
+                                (bool(is_visible) or bool(on_screen))
+                                and int(hwnd) not in logged_visible_handles
+                            ):
                                 self.__log_unexpected_visible_window(
                                     source=normalized_source,
                                     pid=int(pid),
@@ -6432,11 +6439,16 @@ class CodexUsageMonitor:
                                 )
                                 logged_visible_handles.add(int(hwnd))
                             # Hide first, then strip taskbar only after the
-                            # window is actually invisible. TOOLWINDOW-before-hide
-                            # creates visible ghost windows with no taskbar button.
+                            # window is actually invisible AND off-screen.
+                            # Headless Chrome can keep painting a blank 800x600
+                            # Codex frame at on-screen coords while IsWindowVisible
+                            # is already false.
                             self.__lib.win32gui.ShowWindow(hwnd, 0)  # SW_HIDE
-                            self.__move_window_offscreen(hwnd)
-                            if self.__is_window_visible(hwnd) is False:
+                            self.__evacuate_window_offscreen(hwnd)
+                            if (
+                                self.__is_window_visible(hwnd) is False
+                                and not bool(self.__is_window_on_screen(hwnd))
+                            ):
                                 self.__apply_toolwindow_exstyle(hwnd)
                         changed = True
                     except Exception:
@@ -6444,10 +6456,11 @@ class CodexUsageMonitor:
                 if bool(visible) and changed:
                     return True
                 if not bool(visible) and content_handles:
-                    visibility_states = [
-                        self.__is_window_visible(hwnd) for hwnd in content_handles
-                    ]
-                    if visibility_states and all(state is False for state in visibility_states):
+                    if all(
+                        self.__is_window_visible(hwnd) is False
+                        and not bool(self.__is_window_on_screen(hwnd))
+                        for hwnd in content_handles
+                    ):
                         return True
             if deadline <= 0.0:
                 break
@@ -6473,10 +6486,54 @@ class CodexUsageMonitor:
                 class_name = str(class_reader(hwnd) or "")
             except Exception:
                 continue
-            # Blank-title Chrome windows still paint the ghost dark surface.
-            if class_name == "Chrome_WidgetWin_1":
+            # Both host (Win_0) and content (Win_1) frames paint the blank
+            # dark ghost surface with a Win11 accent border.
+            if class_name in {"Chrome_WidgetWin_0", "Chrome_WidgetWin_1"}:
                 content_handles.append(int(hwnd))
         return content_handles
+
+    def __is_window_on_screen(self, hwnd: int) -> bool | None:
+        get_window_rect = getattr(self.__lib.win32gui, "GetWindowRect", None)
+        if not callable(get_window_rect):
+            return None
+        try:
+            left, top, right, bottom = get_window_rect(int(hwnd))
+            left = int(left)
+            top = int(top)
+            right = int(right)
+            bottom = int(bottom)
+        except Exception:
+            return None
+        width = int(right - left)
+        height = int(bottom - top)
+        if width <= 1 or height <= 1:
+            return False
+        if right <= -10000 or bottom <= -10000 or left <= -10000 or top <= -10000:
+            return False
+        try:
+            user32 = self.__lib.ctypes.windll.user32
+            screen_x = int(user32.GetSystemMetrics(76) or 0)
+            screen_y = int(user32.GetSystemMetrics(77) or 0)
+            screen_w = int(user32.GetSystemMetrics(78) or 0)
+            screen_h = int(user32.GetSystemMetrics(79) or 0)
+            if screen_w <= 0 or screen_h <= 0:
+                screen_x = 0
+                screen_y = 0
+                screen_w = int(user32.GetSystemMetrics(0) or 0)
+                screen_h = int(user32.GetSystemMetrics(1) or 0)
+        except Exception:
+            screen_x = 0
+            screen_y = 0
+            screen_w = 0
+            screen_h = 0
+        if screen_w <= 0 or screen_h <= 0:
+            screen_w = 1920
+            screen_h = 1080
+        screen_right = int(screen_x + screen_w)
+        screen_bottom = int(screen_y + screen_h)
+        if right <= screen_x or bottom <= screen_y or left >= screen_right or top >= screen_bottom:
+            return False
+        return True
 
     def __is_window_visible(self, hwnd: int) -> bool | None:
         is_window_visible = getattr(self.__lib.win32gui, "IsWindowVisible", None)
@@ -6676,6 +6733,10 @@ class CodexUsageMonitor:
         return
 
     def __move_window_offscreen(self, hwnd: int) -> None:
+        self.__evacuate_window_offscreen(hwnd)
+        return
+
+    def __evacuate_window_offscreen(self, hwnd: int) -> None:
         try:
             handle = int(hwnd)
         except Exception:
@@ -6683,8 +6744,10 @@ class CodexUsageMonitor:
         if handle <= 0:
             return
         try:
-            # SWP_NOSIZE=0x0001, SWP_NOZORDER=0x0004,
-            # SWP_NOACTIVATE=0x0010, SWP_FRAMECHANGED=0x0020.
+            # Collapse to 0x0 and park far off-screen. Keeping the original
+            # 800x600 size at (0,0) still paints a blank dark ghost frame even
+            # when IsWindowVisible is false on some Chrome/DWM paths.
+            # SWP_NOZORDER=0x0004, SWP_NOACTIVATE=0x0010, SWP_FRAMECHANGED=0x0020.
             self.__lib.win32gui.SetWindowPos(
                 handle,
                 0,
@@ -6692,7 +6755,7 @@ class CodexUsageMonitor:
                 -32000,
                 0,
                 0,
-                0x0001 | 0x0004 | 0x0010 | 0x0020,
+                0x0004 | 0x0010 | 0x0020,
             )
         except Exception:
             return
@@ -6727,8 +6790,11 @@ class CodexUsageMonitor:
         return
 
     def __hide_window_from_taskbar(self, hwnd: int) -> None:
-        self.__move_window_offscreen(hwnd)
-        if self.__is_window_visible(hwnd) is False:
+        self.__evacuate_window_offscreen(hwnd)
+        if (
+            self.__is_window_visible(hwnd) is False
+            and not bool(self.__is_window_on_screen(hwnd))
+        ):
             self.__apply_toolwindow_exstyle(hwnd)
         return
 
