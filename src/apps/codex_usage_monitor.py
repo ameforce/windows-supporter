@@ -6142,10 +6142,11 @@ class CodexUsageMonitor:
                 proc,
                 source=source,
             ):
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
                 self.__clear_hidden_cdp_process(terminate=True)
                 return None, None, None, False
             return context, browser, proc, keep
@@ -6189,10 +6190,11 @@ class CodexUsageMonitor:
             self.__hidden_cdp_proc = proc
             self.__hidden_cdp_port = int(port)
             if not self.__start_hidden_cdp_visibility_guard(proc, source=source):
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
                 self.__clear_hidden_cdp_process(terminate=True)
                 return None, None, None, False
             return context, browser, proc, True
