@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from src.apps.codex_local_usage import LocalCodexUsageSnapshot
 from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
     UsageSnapshot,
@@ -174,6 +175,61 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertIsNotNone(snapshot)
             self.assertEqual(monitor.get_runtime_status().get("profile_name"), "")
 
+    def test_build_snapshot_keeps_web_value_when_local_provider_fails(self) -> None:
+        # Given: web collection succeeds while the optional local adapter raises.
+        def broken_local_provider():
+            raise OSError("rollout unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                local_usage_provider=broken_local_provider,
+            )
+
+            # When: a valid web probe crosses the acquisition boundary.
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._usage_probe("Kim Jong")
+            )
+
+        # Then: the optional adapter failure cannot discard authoritative web data.
+        if snapshot is None:
+            self.fail("valid web snapshot was discarded")
+        self.assertEqual(snapshot.weekly_limit, "96%")
+
+    def test_build_snapshot_applies_local_usage_to_matching_web_account(self) -> None:
+        # Given: the web session and Windows Codex auth expose the same stable account ID.
+        local = LocalCodexUsageSnapshot(
+            captured_at="2026-07-13T00:52:19.258Z",
+            account_id="acct-local",
+            plan_type="pro",
+            weekly_limit="95%",
+            weekly_limit_reset_at="2026-07-20T04:01:12+09:00",
+            reported_metric_keys=("weekly_limit",),
+        )
+        probe = self._usage_probe("Kim Jong")
+        probe["accountId"] = "acct-local"
+        probe["planType"] = "pro"
+        probe["metricBlocks"][1]["reset_at_candidates"] = [
+            "2026-07-20T04:01:00+09:00"
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                local_usage_provider=lambda: local,
+            )
+            monitor._CodexUsageMonitor__now_iso = lambda: "2026-07-13T09:52:20+09:00"
+
+            # When: the same-account probe crosses the acquisition boundary.
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(probe)
+
+        # Then: the fresher local remaining value replaces lagging web analytics.
+        if snapshot is None:
+            self.fail("valid same-account snapshot was discarded")
+        self.assertEqual(snapshot.weekly_limit, "95%")
+        self.assertEqual(snapshot.five_hour_limit, "")
+
     def test_parse_usage_metrics_from_inline_lines(self) -> None:
         raw = """
         5시간 사용 한도: 12 / 40
@@ -184,11 +240,61 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         """
         parsed = parse_usage_metrics_from_text(raw)
 
-        self.assertEqual(parsed.get("five_hour_limit"), "12 / 40")
-        self.assertEqual(parsed.get("weekly_limit"), "111 / 300")
-        self.assertEqual(parsed.get("gpt_5_3_codex_spark_five_hour_limit"), "8 / 10")
-        self.assertEqual(parsed.get("gpt_5_3_codex_spark_weekly_limit"), "80 / 100")
+        self.assertEqual(parsed.get("five_hour_limit"), "70%")
+        self.assertEqual(parsed.get("weekly_limit"), "63%")
+        self.assertEqual(parsed.get("gpt_5_3_codex_spark_five_hour_limit"), "20%")
+        self.assertEqual(parsed.get("gpt_5_3_codex_spark_weekly_limit"), "20%")
         self.assertEqual(parsed.get("remaining_credit"), "320")
+
+    def test_parse_usage_percent_converts_explicit_used_value_to_remaining(self) -> None:
+        # Given: Codex reports a weekly window as an explicit used percentage.
+        raw = "weekly usage limit: 5% used"
+
+        # When: the external value crosses the usage parser boundary.
+        parsed = parse_usage_metrics_from_text(raw)
+
+        # Then: the snapshot contract contains remaining percentage.
+        self.assertEqual(parsed.get("weekly_limit"), "95%")
+
+    def test_parse_usage_ratio_converts_used_over_limit_to_remaining(self) -> None:
+        # Given: Codex reports a five-hour window as used tokens over its limit.
+        raw = "5-hour usage limit: 17 / 40"
+
+        # When: the external ratio crosses the usage parser boundary.
+        parsed = parse_usage_metrics_from_text(raw)
+
+        # Then: the snapshot contract contains remaining percentage.
+        self.assertEqual(parsed.get("five_hour_limit"), "57.5%")
+
+    def test_semantic_usage_block_converts_explicit_used_value_to_remaining(self) -> None:
+        # Given: the live DOM candidate explicitly qualifies its percentage as used.
+        blocks = [
+            {
+                "metric_key": "weekly_limit",
+                "label_text": "weekly usage limit",
+                "value_candidates": ["5% used"],
+                "block_text": "weekly usage limit 5% used",
+            }
+        ]
+
+        # When: the semantic DOM contract is parsed.
+        parsed = extract_usage_metrics_from_semantic_blocks(blocks)
+
+        # Then: all acquisition paths expose the same remaining-percentage contract.
+        self.assertEqual(parsed.get("weekly_limit"), "95%")
+
+    def test_snapshot_from_dict_migrates_legacy_used_ratio_to_remaining(self) -> None:
+        # Given: persisted state contains the legacy used-over-limit representation.
+        payload = {
+            "five_hour_limit": "17 / 40",
+            "captured_at": "2026-07-13T09:48:03+09:00",
+        }
+
+        # When: the cache payload crosses the snapshot boundary.
+        snapshot = UsageSnapshot.from_dict(payload)
+
+        # Then: loaded state follows the canonical remaining-percentage contract.
+        self.assertEqual(snapshot.five_hour_limit, "57.5%")
 
     def test_parse_usage_metrics_from_multiline_blocks(self) -> None:
         raw = """
@@ -205,10 +311,10 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         """
         parsed = parse_usage_metrics_from_text(raw)
 
-        self.assertEqual(parsed.get("five_hour_limit"), "15 / 40")
-        self.assertEqual(parsed.get("weekly_limit"), "123 / 300")
-        self.assertEqual(parsed.get("gpt_5_3_codex_spark_five_hour_limit"), "10 / 12")
-        self.assertEqual(parsed.get("gpt_5_3_codex_spark_weekly_limit"), "84 / 100")
+        self.assertEqual(parsed.get("five_hour_limit"), "62.5%")
+        self.assertEqual(parsed.get("weekly_limit"), "59%")
+        self.assertEqual(parsed.get("gpt_5_3_codex_spark_five_hour_limit"), "16.6667%")
+        self.assertEqual(parsed.get("gpt_5_3_codex_spark_weekly_limit"), "16%")
         self.assertEqual(parsed.get("remaining_credit"), "287")
 
     def test_parse_usage_metrics_prefers_spark_specific_labels_over_generic_suffix_matches(self) -> None:
@@ -331,10 +437,10 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         )
         merged = merge_snapshot_with_previous(partial, prev)
 
-        self.assertEqual(merged.five_hour_limit, "19 / 40")
-        self.assertEqual(merged.weekly_limit, "120 / 300")
-        self.assertEqual(merged.gpt_5_3_codex_spark_five_hour_limit, "10 / 12")
-        self.assertEqual(merged.gpt_5_3_codex_spark_weekly_limit, "84 / 100")
+        self.assertEqual(merged.five_hour_limit, "52.5%")
+        self.assertEqual(merged.weekly_limit, "60%")
+        self.assertEqual(merged.gpt_5_3_codex_spark_five_hour_limit, "16.6667%")
+        self.assertEqual(merged.gpt_5_3_codex_spark_weekly_limit, "16%")
         self.assertEqual(merged.remaining_credit, "260")
 
     def test_merge_snapshot_with_previous_preserves_missing_values_after_semantic_partial_snapshot(self) -> None:
@@ -369,6 +475,48 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         self.assertEqual(merged.gpt_5_3_codex_spark_five_hour_limit, "83%")
         self.assertEqual(merged.gpt_5_3_codex_spark_weekly_limit, "95%")
         self.assertEqual(merged.remaining_credit, "959")
+
+    def test_merge_snapshot_drops_stale_limits_absent_from_current_usage_page(self) -> None:
+        # Given: an older page reported 5-hour and Spark limits, while the current
+        # authoritative page reports only the weekly limit and credits.
+        previous = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "0%",
+                "weekly_limit": "98%",
+                "gpt_5_3_codex_spark_five_hour_limit": "100%",
+                "gpt_5_3_codex_spark_weekly_limit": "100%",
+                "remaining_credit": "0",
+            },
+            captured_at="2026-07-13T09:47:33+09:00",
+            reset_info={
+                "five_hour_limit_reset_at": "2026-07-14T02:39:00+09:00",
+                "weekly_limit_reset_at": "2026-07-20T04:01:00+09:00",
+            },
+        )
+        current = UsageSnapshot.from_metrics(
+            {
+                "weekly_limit": "97%",
+                "remaining_credit": "0",
+            },
+            captured_at="2026-07-13T09:48:03+09:00",
+            reset_info={
+                "weekly_limit_reset_at": "2026-07-20T04:01:00+09:00",
+            },
+        )
+        current.reported_metric_keys = ("weekly_limit", "remaining_credit")
+
+        # When: the current snapshot is merged with the previous successful one.
+        merged = merge_snapshot_with_previous(current, previous)
+
+        # Then: metrics absent from the current authoritative page are not
+        # relabeled with the current capture time as if they were fresh.
+        self.assertEqual(merged.five_hour_limit, "")
+        self.assertEqual(merged.gpt_5_3_codex_spark_five_hour_limit, "")
+        self.assertEqual(merged.gpt_5_3_codex_spark_weekly_limit, "")
+        self.assertEqual(merged.five_hour_limit_reset_at, "")
+        self.assertEqual(merged.weekly_limit, "97%")
+        self.assertEqual(merged.remaining_credit, "0")
+        self.assertEqual(merged.captured_at, "2026-07-13T09:48:03+09:00")
 
     def test_snapshot_from_dict_drops_implausible_day_scale_five_hour_reset(self) -> None:
         snapshot = UsageSnapshot.from_dict(
@@ -520,6 +668,53 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
                 "2026-06-01T11:00:00+09:00",
             )
             self.assertEqual(monitor.get_runtime_status()["usage_history"], history)
+            self.assertEqual(state.get("snapshot_contract_version"), 2)
+
+    def test_load_state_invalidates_ambiguous_legacy_percent_cache(self) -> None:
+        # Given: v0.6.60 persisted bare percentages after erasing used/remaining meaning.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, "codex_usage_state.json")
+            with open(state_path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "session_state": "logged_in",
+                        "last_snapshot": {
+                            "five_hour_limit": "5%",
+                            "weekly_limit": "17 / 40",
+                            "remaining_credit": "320",
+                            "captured_at": "2026-07-13T09:48:03+09:00",
+                        },
+                        "usage_history": [
+                            {
+                                "captured_at": "2026-07-13T09:46:03+09:00",
+                                "five_hour_limit": "5%",
+                            },
+                            {
+                                "captured_at": "2026-07-13T09:48:03+09:00",
+                                "weekly_limit": "17 / 40",
+                            },
+                        ],
+                    },
+                    fp,
+                )
+
+            # When: the unversioned cache crosses the v2 snapshot contract boundary.
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+            )
+            snapshot = monitor.get_last_snapshot()
+            history = monitor.get_runtime_status()["usage_history"]
+            with open(state_path, encoding="utf-8") as fp:
+                migrated = json.load(fp)
+
+        # Then: ambiguous bare percentages disappear; unambiguous ratios migrate.
+        self.assertEqual(snapshot.five_hour_limit, "")
+        self.assertEqual(snapshot.weekly_limit, "57.5%")
+        self.assertEqual(snapshot.remaining_credit, "320")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["weekly_limit"], "57.5%")
+        self.assertEqual(migrated.get("snapshot_contract_version"), 2)
 
     def test_load_state_normalizes_old_or_oversized_usage_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -538,6 +733,7 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
                 json.dump(
                     {
                         "session_state": "logged_in",
+                        "snapshot_contract_version": 2,
                         "last_snapshot": {"five_hour_limit": "75%"},
                         "usage_history": raw_history,
                     },
