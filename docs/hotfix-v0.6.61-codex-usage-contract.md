@@ -27,6 +27,7 @@
 - Windows Codex `auth.json`과 web `/api/auth/session`의 stable account ID가 정확히 일치해야 local 값을 결합한다. identity를 얻지 못하거나 다른 계정이면 reset이 같아도 web 값을 유지한다.
 - 계정 전환 직후 이전 rollout을 새 auth identity로 잘못 라벨링하지 않도록, `session_meta` 시작 시각과 rate-limit event가 모두 `auth.json` 변경 이후인 rollout에만 identity를 귀속한다. auth read 중 파일이 바뀌어도 identity를 폐기한다.
 - rollout `plan_type`, Codex auth plan, web session plan이 모두 제공될 때 서로 충돌하면 identity 결합과 local 보정을 거부한다.
+- 여러 rollout이 동시에 갱신되면 전체 최신값을 먼저 고르지 않고, session/auth/plan 소유권을 통과한 후보 집합에서 최신값을 선택한다. 스캔 종료 시 auth file revision이 바뀌었으면 결합을 폐기한다.
 - local payload가 두 시간창을 보고하면 두 reset이 모두 일치해야 결합한다. 한 시간창만 일치하는 partial match는 계정/세션 오염 가능성이 있으므로 web snapshot을 유지한다.
 - rollout timestamp는 timezone-aware ISO 값만 허용하고, 세션 시작 날짜와 무관하게 최근 수정된 rollout 16개를 검사한다. 탐색 중 사라진 파일은 해당 후보만 건너뛴다.
 - persisted state에 snapshot contract v2를 기록한다. 버전 없는 legacy cache의 bare percentage는 used/remaining 의미가 모호하므로 무효화하고, 의미가 확정되는 `used / limit` ratio만 remaining으로 이관한다.
@@ -57,8 +58,8 @@
 ## 검증
 
 - 신규 RED/GREEN 회귀: absent metric stale backfill, explicit used percentage, used/limit ratio, versioned legacy cache migration, zero-used boundary, window mapping, stable account ID, account-switch race, reset/account matching, timezone-less timestamp, partial reset match, older-start active session, transient file race, local provider failure fallback
-- Codex usage 관련 489 tests 통과
-- 전체 742 tests 통과
+- Codex usage 관련 490 tests 통과
+- 전체 743 tests 통과
 - Ruff changed-file lint 통과
 - 신규 adapter와 테스트 basedpyright `0 errors, 0 warnings`
 - 실제 web `/api/auth/session`과 Windows Codex `auth.json` 모두 stable account ID를 제공했고 exact match임을 값 노출 없이 확인했다.

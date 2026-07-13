@@ -555,6 +555,96 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
         self.assertEqual(snapshot.weekly_limit, "20%")
         self.assertEqual(snapshot.account_id, "")
 
+    def test_finder_selects_latest_owned_rollout_over_newer_unowned_rollout(self) -> None:
+        # Given: an old account session writes the newest event after the switch,
+        # while the new account has a slightly older but ownership-valid event.
+        old_session = {
+            "timestamp": "2026-07-13T00:50:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": "session-account-a"},
+        }
+        old_event = {
+            "timestamp": "2026-07-13T00:53:00.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "plan_type": "pro",
+                    "primary": {
+                        "used_percent": 80.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        new_session = {
+            "timestamp": "2026-07-13T00:51:30.000Z",
+            "type": "session_meta",
+            "payload": {"id": "session-account-b"},
+        }
+        new_event = {
+            "timestamp": "2026-07-13T00:52:30.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "plan_type": "pro",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout_dir = Path(tmp) / "sessions" / "2026" / "07" / "13"
+            rollout_dir.mkdir(parents=True)
+            (rollout_dir / "rollout-account-a.jsonl").write_text(
+                json.dumps(old_session) + "\n" + json.dumps(old_event) + "\n",
+                encoding="utf-8",
+            )
+            (rollout_dir / "rollout-account-b.jsonl").write_text(
+                json.dumps(new_session) + "\n" + json.dumps(new_event) + "\n",
+                encoding="utf-8",
+            )
+            claims = {
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-B",
+                    "chatgpt_plan_type": "pro",
+                }
+            }
+            encoded_claims = base64.urlsafe_b64encode(
+                json.dumps(claims).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            auth_path = Path(tmp) / "auth.json"
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            "account_id": "acct-B",
+                            "id_token": f"header.{encoded_claims}.signature",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            switch_time = datetime.fromisoformat("2026-07-13T00:51:00+00:00").timestamp()
+            os.utime(auth_path, (switch_time, switch_time))
+
+            # When: the finder selects among multiple concurrent rollout files.
+            with patch("src.apps.codex_local_usage.os.name", "nt"):
+                snapshot = find_latest_windows_codex_usage(tmp)
+
+        # Then: selection occurs inside the ownership-valid candidate set.
+        if snapshot is None:
+            self.fail("owned rollout was discarded")
+        self.assertEqual(snapshot.weekly_limit, "95%")
+        self.assertEqual(snapshot.account_id, "acct-B")
+
     def test_finder_skips_rollout_that_disappears_during_scan(self) -> None:
         # Given: one candidate disappears while another valid rollout remains readable.
         event = {

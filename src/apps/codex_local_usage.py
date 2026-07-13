@@ -31,21 +31,23 @@ class LocalCodexUsageSnapshot:
     reported_metric_keys: tuple[str, ...] = ()
 
 
-def _read_codex_identity(root: Path) -> tuple[str, str, datetime | None]:
+def _read_codex_identity(
+    root: Path,
+) -> tuple[str, str, datetime | None, tuple[int, int] | None]:
     auth_path = root / "auth.json"
     try:
         before = auth_path.stat()
         auth = json.loads(auth_path.read_text(encoding="utf-8"))
         after = auth_path.stat()
     except (OSError, json.JSONDecodeError):
-        return "", "", None
+        return "", "", None, None
     if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
-        return "", "", None
+        return "", "", None, None
     if not isinstance(auth, dict):
-        return "", "", None
+        return "", "", None, None
     tokens = auth.get("tokens")
     if not isinstance(tokens, dict):
-        return "", "", None
+        return "", "", None, None
     account_id = str(tokens.get("account_id") or "").strip()
     plan_type = ""
     token_parts = str(tokens.get("id_token") or "").split(".")
@@ -62,7 +64,17 @@ def _read_codex_identity(root: Path) -> tuple[str, str, datetime | None]:
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
     changed_at = datetime.fromtimestamp(after.st_mtime, tz=timezone.utc)
-    return account_id, plan_type, changed_at
+    return account_id, plan_type, changed_at, (after.st_mtime_ns, after.st_size)
+
+
+def _auth_revision_matches(root: Path, revision: tuple[int, int] | None) -> bool:
+    if revision is None:
+        return False
+    try:
+        current = (root / "auth.json").stat()
+    except OSError:
+        return False
+    return (current.st_mtime_ns, current.st_size) == revision
 
 
 def _format_remaining_percent(used_percent: float) -> str:
@@ -211,9 +223,12 @@ def find_latest_windows_codex_usage(
         else:
             heapq.heappushpop(candidates, candidate)
 
+    account_id, auth_plan, auth_changed_at, auth_revision = _read_codex_identity(root)
+    auth_plan_type = str(auth_plan or "").strip().lower()
     latest: LocalCodexUsageSnapshot | None = None
     latest_at: datetime | None = None
-    latest_path: Path | None = None
+    latest_owned: LocalCodexUsageSnapshot | None = None
+    latest_owned_at: datetime | None = None
     for _, _, path in sorted(candidates, reverse=True):
         snapshot = _latest_snapshot_in_rollout(path)
         if snapshot is None:
@@ -222,25 +237,28 @@ def find_latest_windows_codex_usage(
         if captured_at is not None and (latest_at is None or captured_at > latest_at):
             latest = snapshot
             latest_at = captured_at
-            latest_path = path
+        if (
+            captured_at is None
+            or not account_id
+            or auth_changed_at is None
+            or captured_at < auth_changed_at
+        ):
+            continue
+        session_started_at = _rollout_started_at(path)
+        if session_started_at is None or session_started_at < auth_changed_at:
+            continue
+        event_plan_type = str(snapshot.plan_type or "").strip().lower()
+        if event_plan_type and auth_plan_type and event_plan_type != auth_plan_type:
+            continue
+        if latest_owned_at is None or captured_at > latest_owned_at:
+            latest_owned = replace(
+                snapshot,
+                account_id=account_id,
+                plan_type=event_plan_type or auth_plan_type,
+            )
+            latest_owned_at = captured_at
     if latest is None:
         return None
-    account_id, plan_type, auth_changed_at = _read_codex_identity(root)
-    session_started_at = _rollout_started_at(latest_path) if latest_path is not None else None
-    if (
-        latest_at is None
-        or auth_changed_at is None
-        or latest_at < auth_changed_at
-        or session_started_at is None
-        or session_started_at < auth_changed_at
-    ):
-        return latest
-    event_plan_type = str(latest.plan_type or "").strip().lower()
-    auth_plan_type = str(plan_type or "").strip().lower()
-    if event_plan_type and auth_plan_type and event_plan_type != auth_plan_type:
-        return latest
-    return replace(
-        latest,
-        account_id=account_id,
-        plan_type=event_plan_type or auth_plan_type,
-    )
+    if latest_owned is not None and _auth_revision_matches(root, auth_revision):
+        return latest_owned
+    return latest
