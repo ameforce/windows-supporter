@@ -8,6 +8,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from src.apps.codex_local_usage import find_latest_windows_codex_usage
 from src.apps.codex_usage_monitor import CURRENT_CODEX_USAGE_URL, CodexUsageMonitor, UsageSnapshot
 from src.apps.codex_usage_taskbar_overlay import CodexUsageTaskbarOverlay
 
@@ -894,6 +895,7 @@ class CodexUsageMultiMonitor:
             profile_dir=profile_dir,
             notification_sink=self.__handle_child_notification,
             suppress_normal_tooltips=True,
+            local_usage_provider=find_latest_windows_codex_usage,
         )
 
     def __handle_child_notification(self, event: dict[str, Any]) -> None:

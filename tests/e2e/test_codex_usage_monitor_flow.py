@@ -244,7 +244,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         payload = json.loads(state_path.read_text(encoding="utf-8"))
         persisted = payload.get("last_snapshot") or {}
 
-        self.assertEqual(latest.five_hour_limit, "16 / 40")
+        self.assertEqual(latest.five_hour_limit, "60%")
         self.assertEqual(latest.weekly_limit, "")
         self.assertEqual(latest.gpt_5_3_codex_spark_five_hour_limit, "")
         self.assertEqual(latest.gpt_5_3_codex_spark_weekly_limit, "")
@@ -7844,7 +7844,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         lines = captured.get("lines") or []
         line_map = {str(text): color for text, color in lines}
-        self.assertEqual(line_map.get("5시간 사용 한도: 19 / 40"), "#16A34A")
+        self.assertEqual(line_map.get("5시간 사용 한도: 52.5%"), "#16A34A")
         self.assertEqual(line_map.get("남은 크레딧: 259"), "#DC2626")
 
     def test_monitor_tick_defers_change_tooltip_until_input_changes(self) -> None:
@@ -8064,8 +8064,8 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         self.assertEqual(len(shown), 1)
         lines = shown[0][1] or []
         joined = " | ".join(str(line[0]) for line in lines)
-        self.assertIn("5시간 사용 한도: 18 / 40", joined)
-        self.assertIn("주간 사용 한도: 119 / 300", joined)
+        self.assertIn("5시간 사용 한도: 55%", joined)
+        self.assertIn("주간 사용 한도: 60.3333%", joined)
         self.assertIn("남은 크레딧: 259", joined)
         self.assertIn("5시간 사용 한도: 20 / 40 -> 18 / 40", joined)
         self.assertIn("주간 사용 한도: 120 / 300 -> 119 / 300", joined)
@@ -8535,7 +8535,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
 
         collect_guarded.assert_called_once()
         self.assertEqual(collect_guarded.call_args.kwargs.get("source"), "manual_login")
-        self.assertEqual(latest.five_hour_limit, "16 / 40")
+        self.assertEqual(latest.five_hour_limit, "60%")
         self.assertEqual(latest.weekly_limit, "")
         self.assertEqual(latest.gpt_5_3_codex_spark_five_hour_limit, "")
         self.assertEqual(latest.gpt_5_3_codex_spark_weekly_limit, "")
@@ -8747,7 +8747,7 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
         payload = json.loads(state_path.read_text(encoding="utf-8"))
         persisted = payload.get("last_snapshot") or {}
 
-        self.assertEqual(latest.five_hour_limit, "16 / 40")
+        self.assertEqual(latest.five_hour_limit, "60%")
         self.assertEqual(latest.weekly_limit, "")
         self.assertEqual(latest.gpt_5_3_codex_spark_five_hour_limit, "")
         self.assertEqual(latest.gpt_5_3_codex_spark_weekly_limit, "")
