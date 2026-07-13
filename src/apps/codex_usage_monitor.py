@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover - Windows runtime dependency
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.utils.subprocess_utils import build_no_window_subprocess_kwargs
+from src.apps.codex_local_usage import LocalCodexUsageSnapshot
 
 
 USAGE_METRIC_KEYS = (
@@ -983,6 +984,24 @@ def _line_contains_any_usage_label(line: str) -> bool:
     return key is not None
 
 
+def _format_remaining_percent(value: float) -> str:
+    clamped = max(0.0, min(100.0, float(value)))
+    rendered = f"{clamped:.4f}".rstrip("0").rstrip(".")
+    return f"{rendered}%"
+
+
+def _metric_value_is_explicitly_used(value: str) -> bool:
+    text = normalize_usage_value(value)
+    return bool(
+        re.search(r"\bused\b\s*[:：-]?\s*\d+(?:\.\d+)?\s*%", text, re.IGNORECASE)
+        or re.search(
+            r"\d+(?:\.\d+)?\s*%\s*(?:used\b|사용(?:됨)?|소진(?:됨)?)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _normalize_metric_candidate(key: str, value: str) -> str:
     text = normalize_usage_value(value)
     if not text:
@@ -993,12 +1012,19 @@ def _normalize_metric_candidate(key: str, value: str) -> str:
         return ""
 
     if key in USAGE_LIMIT_METRIC_KEYS:
-        ratio = re.search(r"(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)", text)
+        ratio = re.search(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", text)
         if ratio:
-            return normalize_usage_value(ratio.group(1))
+            used = float(ratio.group(1))
+            limit = float(ratio.group(2))
+            if limit <= 0.0:
+                return ""
+            return _format_remaining_percent(100.0 - (used / limit * 100.0))
         percent = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
         if percent:
-            return f"{percent.group(1)}%"
+            parsed = float(percent.group(1))
+            if _metric_value_is_explicitly_used(text):
+                parsed = 100.0 - parsed
+            return _format_remaining_percent(parsed)
         return ""
 
     if key == "remaining_credit":
@@ -1382,6 +1408,23 @@ def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str
     return parsed
 
 
+def extract_reported_usage_metric_keys_from_semantic_blocks(raw_blocks: Any) -> tuple[str, ...]:
+    if not isinstance(raw_blocks, list):
+        return ()
+    reported: set[str] = set()
+    for raw_block in raw_blocks:
+        if not isinstance(raw_block, dict):
+            continue
+        key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
+        if not key:
+            key = str(_find_metric_key_for_label(raw_block.get("block_text", "")) or "")
+        if not key:
+            key = normalize_usage_value(raw_block.get("metric_key", ""))
+        if key in USAGE_METRIC_KEYS:
+            reported.add(key)
+    return tuple(key for key in USAGE_METRIC_KEYS if key in reported)
+
+
 def _normalize_reset_at_candidate(value: str) -> str:
     text = normalize_usage_value(value)
     if not text:
@@ -1598,6 +1641,7 @@ class UsageSnapshot:
     weekly_limit_reset_at: str = ""
     gpt_5_3_codex_spark_five_hour_limit_reset_at: str = ""
     gpt_5_3_codex_spark_weekly_limit_reset_at: str = ""
+    reported_metric_keys: tuple[str, ...] = ()
 
     @classmethod
     def from_metrics(
@@ -1605,6 +1649,7 @@ class UsageSnapshot:
         metrics: dict[str, str] | None,
         captured_at: str = "",
         reset_info: dict[str, str] | None = None,
+        reported_metric_keys: tuple[str, ...] | None = None,
     ) -> "UsageSnapshot":
         data = metrics or {}
         reset_data = reset_info or {}
@@ -1613,18 +1658,28 @@ class UsageSnapshot:
             "captured_at": captured_at,
             **{key: reset_data.get(key, "") for key in USAGE_RESET_AT_KEYS},
         }
-        return cls.from_dict(payload)
+        snapshot = cls.from_dict(payload)
+        snapshot.reported_metric_keys = tuple(
+            key for key in USAGE_METRIC_KEYS if key in set(reported_metric_keys or ())
+        )
+        return snapshot
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UsageSnapshot":
         payload = _sanitize_snapshot_reset_payload(data)
         return cls(
-            five_hour_limit=normalize_usage_value(payload.get("five_hour_limit", "")),
-            weekly_limit=normalize_usage_value(payload.get("weekly_limit", "")),
-            gpt_5_3_codex_spark_five_hour_limit=normalize_usage_value(
+            five_hour_limit=_normalize_metric_candidate(
+                "five_hour_limit", payload.get("five_hour_limit", "")
+            ),
+            weekly_limit=_normalize_metric_candidate(
+                "weekly_limit", payload.get("weekly_limit", "")
+            ),
+            gpt_5_3_codex_spark_five_hour_limit=_normalize_metric_candidate(
+                "gpt_5_3_codex_spark_five_hour_limit",
                 payload.get("gpt_5_3_codex_spark_five_hour_limit", "")
             ),
-            gpt_5_3_codex_spark_weekly_limit=normalize_usage_value(
+            gpt_5_3_codex_spark_weekly_limit=_normalize_metric_candidate(
+                "gpt_5_3_codex_spark_weekly_limit",
                 payload.get("gpt_5_3_codex_spark_weekly_limit", "")
             ),
             remaining_credit=normalize_usage_value(payload.get("remaining_credit", "")),
@@ -1677,6 +1732,75 @@ class UsageSnapshot:
         return any(bool(v) for v in self.metrics().values())
 
 
+def reconcile_snapshot_with_local_codex_usage(
+    current: UsageSnapshot,
+    local: LocalCodexUsageSnapshot | None,
+    *,
+    now: datetime | None = None,
+) -> UsageSnapshot:
+    if local is None:
+        return current
+    current_at = _parse_base_reset_datetime(current.captured_at)
+    local_at = _parse_base_reset_datetime(local.captured_at)
+    reference_at = now or current_at
+    if current_at is None or local_at is None or reference_at is None:
+        return current
+    if abs((local_at - current_at).total_seconds()) > 5 * 60:
+        return current
+    if abs((reference_at - local_at).total_seconds()) > 5 * 60:
+        return current
+
+    local_values = {
+        "five_hour_limit": local.five_hour_limit,
+        "weekly_limit": local.weekly_limit,
+    }
+    local_resets = {
+        "five_hour_limit": local.five_hour_limit_reset_at,
+        "weekly_limit": local.weekly_limit_reset_at,
+    }
+    matched = False
+    current_payload = current.to_dict()
+    for metric_key in local.reported_metric_keys:
+        reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
+        current_reset = _parse_base_reset_datetime(str(current_payload.get(reset_key, "")))
+        local_reset = _parse_base_reset_datetime(local_resets.get(metric_key, ""))
+        if current_reset is None or local_reset is None:
+            continue
+        if abs((current_reset - local_reset).total_seconds()) <= 2 * 60:
+            matched = True
+            break
+    if not matched:
+        return current
+
+    metrics = current.metrics()
+    reset_info = {
+        key: str(current_payload.get(key, "") or "") for key in USAGE_RESET_AT_KEYS
+    }
+    for metric_key in ("five_hour_limit", "weekly_limit"):
+        reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC[metric_key]
+        if metric_key in local.reported_metric_keys:
+            metrics[metric_key] = local_values[metric_key]
+            reset_info[reset_key] = local_resets[metric_key]
+        else:
+            metrics[metric_key] = ""
+            reset_info[reset_key] = ""
+    reported = tuple(
+        key
+        for key in USAGE_METRIC_KEYS
+        if (
+            key in local.reported_metric_keys
+            or key not in ("five_hour_limit", "weekly_limit")
+            and key in current.reported_metric_keys
+        )
+    )
+    return UsageSnapshot.from_metrics(
+        metrics,
+        captured_at=local.captured_at,
+        reset_info=reset_info,
+        reported_metric_keys=reported,
+    )
+
+
 @dataclass
 class UsageChange:
     key: str
@@ -1694,17 +1818,36 @@ def merge_snapshot_with_previous(
         return current
     merged = _sanitize_snapshot_reset_payload(current.to_dict())
     prev_payload = _sanitize_snapshot_reset_payload(prev.to_dict())
+    reported_metric_keys = tuple(
+        key for key in USAGE_METRIC_KEYS if key in set(current.reported_metric_keys)
+    )
+    has_reported_metric_contract = bool(reported_metric_keys)
     for key in USAGE_METRIC_KEYS:
-        if not merged.get(key):
+        if not merged.get(key) and (
+            not has_reported_metric_contract or key in reported_metric_keys
+        ):
             merged[key] = prev_payload.get(key, "")
     for key in USAGE_SNAPSHOT_META_KEYS:
         if key == "captured_at":
+            continue
+        metric_key = next(
+            (
+                candidate
+                for candidate, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items()
+                if reset_key == key
+            ),
+            "",
+        )
+        if has_reported_metric_contract and metric_key not in reported_metric_keys:
+            merged[key] = ""
             continue
         if not merged.get(key):
             merged[key] = prev_payload.get(key, "")
     if not merged.get("captured_at"):
         merged["captured_at"] = prev_payload.get("captured_at", "")
-    return UsageSnapshot.from_dict(merged)
+    snapshot = UsageSnapshot.from_dict(merged)
+    snapshot.reported_metric_keys = reported_metric_keys
+    return snapshot
 
 
 def compute_usage_changes(
@@ -1742,6 +1885,7 @@ class CodexUsageMonitor:
         profile_dir: str | None = None,
         notification_sink=None,
         suppress_normal_tooltips: bool = False,
+        local_usage_provider: Callable[[], LocalCodexUsageSnapshot | None] | None = None,
     ) -> None:
         self.__lib = LibConnector()
         self.__root = None
@@ -1749,6 +1893,7 @@ class CodexUsageMonitor:
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         self.__external_scheduler = False
+        self.__local_usage_provider = local_usage_provider
 
         self.__monitor_after_id = None
         self.__monitor_running = False
@@ -7642,9 +7787,8 @@ class CodexUsageMonitor:
         if sanitize_profile_name(profile_name):
             self.__set_profile_name(profile_name)
         captured_at = self.__now_iso()
-        metrics = extract_usage_metrics_from_semantic_blocks(
-            normalized_probe.get("metricBlocks", [])
-        )
+        metric_blocks = normalized_probe.get("metricBlocks", [])
+        metrics = extract_usage_metrics_from_semantic_blocks(metric_blocks)
         if not metrics:
             return None
         limit_keys = USAGE_LIMIT_METRIC_KEYS
@@ -7659,7 +7803,15 @@ class CodexUsageMonitor:
             metrics,
             captured_at=captured_at,
             reset_info=reset_info,
+            reported_metric_keys=extract_reported_usage_metric_keys_from_semantic_blocks(
+                metric_blocks
+            ),
         )
+        if self.__local_usage_provider is not None:
+            snapshot = reconcile_snapshot_with_local_codex_usage(
+                snapshot,
+                self.__local_usage_provider(),
+            )
         if not snapshot.has_any_metric():
             return None
         return snapshot
