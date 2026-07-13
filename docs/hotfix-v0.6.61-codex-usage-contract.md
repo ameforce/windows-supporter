@@ -24,6 +24,8 @@
 - 명시적 used percentage와 legacy used/limit ratio를 parser/cache 경계에서 remaining percentage로 정규화한다.
 - Windows native `CODEX_HOME`의 최신 rollout `token_count.payload.rate_limits`를 읽고 `window_minutes`로 5시간/주간을 판별한다.
 - web/local capture 시각이 5분 이내이고 reset 시각이 2분 이내로 일치할 때만 local Codex 값을 해당 웹 계정 snapshot에 결합한다. WSL 또는 다른 계정/reset은 결합하지 않는다.
+- local payload가 두 시간창을 보고하면 두 reset이 모두 일치해야 결합한다. 한 시간창만 일치하는 partial match는 계정/세션 오염 가능성이 있으므로 web snapshot을 유지한다.
+- rollout timestamp는 timezone-aware ISO 값만 허용하고, 세션 시작 날짜와 무관하게 최근 수정된 rollout 16개를 검사한다. 탐색 중 사라진 파일은 해당 후보만 건너뛴다.
 
 ## 영향 범위
 
@@ -39,11 +41,18 @@
 - partial merge 테스트는 누락 field 보존만 검사했고 “현재 source에서 metric 자체가 제거된 경우”를 구분하지 않았다.
 - web DOM, persisted cache, Windows Codex rollout을 같은 시점에 연결한 회귀 시나리오가 없었다.
 
+## 디버깅 runtime audit
+
+1. **stale cache 가설 — 확정.** live DOM에는 5시간 metric이 없었지만 persisted snapshot에는 과거 `0%`와 새 `captured_at`이 함께 있었다. field-level backfill이 source 부재를 파싱 실패로 취급했다.
+2. **percentage 의미 반전 가설 — 확정.** parser가 `used`, `remaining`, `used / limit` qualifier를 제거했고 표시 계층은 모든 숫자를 remaining으로 간주했다. explicit-used와 ratio 회귀 테스트가 수정 전 각각 반전된 값을 재현했다.
+3. **Windows/WSL 또는 다른 계정 선택 가설 — 배제.** 실행 중 앱은 Windows native `CODEX_HOME`과 main physical worktree EXE를 사용했다. WSL은 별도 binary/home/session이었다. web과 Windows rollout의 capture 시각 및 weekly reset이 일치했고, 다른 reset fixture는 local 보정을 거부했다.
+4. **API/CLI 포맷 및 analytics 지연 가설 — 확정.** 실제 payload는 `primary.window_minutes=10080`, `secondary=null`이었고 web analytics가 rollout보다 낮은 used 값을 보였다. 위치가 아니라 `window_minutes`로 시간창을 판별하고 동일 reset/time에서 local event를 authoritative current 값으로 사용했다.
+
 ## 검증
 
-- 신규 RED/GREEN 회귀: absent metric stale backfill, explicit used percentage, used/limit ratio, legacy cache migration, zero-used boundary, window mapping, reset/account matching
-- Codex usage 관련 252 tests 통과
-- 전체 726 tests 통과
+- 신규 RED/GREEN 회귀: absent metric stale backfill, explicit used percentage, used/limit ratio, legacy cache migration, zero-used boundary, window mapping, reset/account matching, timezone-less timestamp, partial reset match, older-start active session, transient file race
+- Codex usage 관련 481 tests 통과
+- 전체 734 tests 통과
 - Ruff changed-file lint 통과
 - 신규 adapter와 테스트 basedpyright `0 errors, 0 warnings`
 - 실제 raw CDP 사용자 경로에서 weekly `94%`, 5시간 미제공, reset `04:01:12`를 얻었고 같은 시점 Windows Codex rollout의 `6% used`, 10080분, 동일 reset과 일치함을 확인했다.

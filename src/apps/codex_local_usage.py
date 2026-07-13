@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import heapq
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,16 @@ def _format_reset_at(value: Any) -> str:
     return parsed.strftime("%Y-%m-%dT%H:%M:%S+09:00")
 
 
+def _parse_captured_at(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def parse_codex_rate_limit_event(event: dict[str, Any]) -> LocalCodexUsageSnapshot | None:
     if str(event.get("type") or "") != "event_msg":
         return None
@@ -50,7 +61,7 @@ def parse_codex_rate_limit_event(event: dict[str, Any]) -> LocalCodexUsageSnapsh
     if not isinstance(rate_limits, dict) or str(rate_limits.get("limit_id") or "") != "codex":
         return None
     captured_at = str(event.get("timestamp") or "").strip()
-    if not captured_at:
+    if not captured_at or _parse_captured_at(captured_at) is None:
         return None
 
     values: dict[str, str] = {}
@@ -123,34 +134,27 @@ def _latest_snapshot_in_rollout(path: Path) -> LocalCodexUsageSnapshot | None:
     return None
 
 
-def _parse_captured_at(value: str) -> datetime | None:
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
 def find_latest_windows_codex_usage(
     codex_home: str | None = None,
 ) -> LocalCodexUsageSnapshot | None:
     if os.name != "nt":
         return None
     root = Path(codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    now = datetime.now().astimezone()
-    candidates: list[Path] = []
-    for day_offset in (0, 1):
-        day = now - timedelta(days=day_offset)
-        folder = root / "sessions" / day.strftime("%Y") / day.strftime("%m") / day.strftime("%d")
-        if folder.is_dir():
-            candidates.extend(folder.glob("rollout-*.jsonl"))
-    try:
-        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    except OSError:
-        return None
+    candidates: list[tuple[float, str, Path]] = []
+    sessions_root = root / "sessions"
+    for path in sessions_root.glob("*/*/*/rollout-*.jsonl"):
+        try:
+            candidate = (path.stat().st_mtime, str(path), path)
+        except OSError:
+            continue
+        if len(candidates) < _MAX_ROLLOUT_FILES:
+            heapq.heappush(candidates, candidate)
+        else:
+            heapq.heappushpop(candidates, candidate)
 
     latest: LocalCodexUsageSnapshot | None = None
     latest_at: datetime | None = None
-    for path in candidates[:_MAX_ROLLOUT_FILES]:
+    for _, _, path in sorted(candidates, reverse=True):
         snapshot = _latest_snapshot_in_rollout(path)
         if snapshot is None:
             continue

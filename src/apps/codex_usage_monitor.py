@@ -1758,19 +1758,17 @@ def reconcile_snapshot_with_local_codex_usage(
         "five_hour_limit": local.five_hour_limit_reset_at,
         "weekly_limit": local.weekly_limit_reset_at,
     }
-    matched = False
     current_payload = current.to_dict()
+    if not local.reported_metric_keys:
+        return current
     for metric_key in local.reported_metric_keys:
         reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
         current_reset = _parse_base_reset_datetime(str(current_payload.get(reset_key, "")))
         local_reset = _parse_base_reset_datetime(local_resets.get(metric_key, ""))
         if current_reset is None or local_reset is None:
-            continue
-        if abs((current_reset - local_reset).total_seconds()) <= 2 * 60:
-            matched = True
-            break
-    if not matched:
-        return current
+            return current
+        if abs((current_reset - local_reset).total_seconds()) > 2 * 60:
+            return current
 
     metrics = current.metrics()
     reset_info = {

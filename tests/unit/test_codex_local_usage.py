@@ -1,11 +1,42 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
-from src.apps.codex_local_usage import parse_codex_rate_limit_event
+from src.apps.codex_local_usage import (
+    find_latest_windows_codex_usage,
+    parse_codex_rate_limit_event,
+)
 from src.apps.codex_usage_monitor import UsageSnapshot, reconcile_snapshot_with_local_codex_usage
 
 
 class CodexLocalUsageUnitTest(unittest.TestCase):
+    def test_parser_rejects_timezone_less_timestamp(self) -> None:
+        # Given: a malformed rollout event has no timezone on its timestamp.
+        event = {
+            "timestamp": "2026-07-13T00:52:19",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+
+        # When: the malformed event crosses the parser boundary.
+        snapshot = parse_codex_rate_limit_event(event)
+
+        # Then: it cannot mix naive and aware timestamps in latest-event ordering.
+        self.assertIsNone(snapshot)
+
     def test_parser_preserves_zero_used_as_full_remaining(self) -> None:
         # Given: Windows Codex reports an untouched five-hour window.
         event = {
@@ -144,3 +175,117 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
 
         # Then: the other account's web snapshot remains untouched.
         self.assertEqual(reconciled.to_dict(), web.to_dict())
+
+    def test_reconcile_rejects_when_only_one_local_window_reset_matches(self) -> None:
+        # Given: weekly reset matches but the local five-hour reset belongs to another window.
+        web = UsageSnapshot.from_metrics(
+            {"five_hour_limit": "70%", "weekly_limit": "61%"},
+            captured_at="2026-07-13T09:52:20+09:00",
+            reset_info={
+                "five_hour_limit_reset_at": "2026-07-13T12:00:00+09:00",
+                "weekly_limit_reset_at": "2026-07-20T04:01:00+09:00",
+            },
+            reported_metric_keys=("five_hour_limit", "weekly_limit"),
+        )
+        local_event = {
+            "timestamp": "2026-07-13T00:52:19.258Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                    "secondary": {
+                        "used_percent": 30.0,
+                        "window_minutes": 300,
+                        "resets_at": 1783908000,
+                    },
+                },
+            },
+        }
+        local = parse_codex_rate_limit_event(local_event)
+
+        # When: reconciliation checks the mixed-reset payload.
+        reconciled = reconcile_snapshot_with_local_codex_usage(web, local)
+
+        # Then: one matching reset cannot authorize cross-window replacement.
+        self.assertEqual(reconciled.to_dict(), web.to_dict())
+
+    def test_finder_includes_recently_updated_rollout_from_older_session_date(self) -> None:
+        # Given: an active long-running session is stored under an older start date.
+        event = {
+            "timestamp": "2026-07-13T00:52:19.258Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout_dir = Path(tmp) / "sessions" / "2026" / "01" / "01"
+            rollout_dir.mkdir(parents=True)
+            rollout = rollout_dir / "rollout-old-start.jsonl"
+            rollout.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+            # When: the Windows finder scans the Codex home.
+            with patch("src.apps.codex_local_usage.os.name", "nt"):
+                snapshot = find_latest_windows_codex_usage(tmp)
+
+        # Then: session start date does not hide the latest runtime event.
+        if snapshot is None:
+            self.fail("active older-date rollout was not discovered")
+        self.assertEqual(snapshot.weekly_limit, "95%")
+
+    def test_finder_skips_rollout_that_disappears_during_scan(self) -> None:
+        # Given: one candidate disappears while another valid rollout remains readable.
+        event = {
+            "timestamp": "2026-07-13T00:52:19.258Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout_dir = Path(tmp) / "sessions" / "2026" / "07" / "13"
+            rollout_dir.mkdir(parents=True)
+            missing = rollout_dir / "rollout-missing.jsonl"
+            missing.write_text("{}\n", encoding="utf-8")
+            valid = rollout_dir / "rollout-valid.jsonl"
+            valid.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            original_stat = Path.stat
+
+            def flaky_stat(path: Path, *args: object, **kwargs: object) -> object:
+                if path == missing:
+                    raise FileNotFoundError(path)
+                return original_stat(path, *args, **kwargs)
+
+            # When: the bounded latest-rollout scan encounters the vanished file.
+            with (
+                patch("src.apps.codex_local_usage.os.name", "nt"),
+                patch.object(Path, "stat", autospec=True, side_effect=flaky_stat),
+            ):
+                snapshot = find_latest_windows_codex_usage(tmp)
+
+        # Then: the transient filesystem race does not discard other candidates.
+        if snapshot is None:
+            self.fail("valid rollout was discarded after another candidate vanished")
+        self.assertEqual(snapshot.weekly_limit, "95%")
