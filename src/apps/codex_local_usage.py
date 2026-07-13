@@ -30,16 +30,21 @@ class LocalCodexUsageSnapshot:
     reported_metric_keys: tuple[str, ...] = ()
 
 
-def _read_codex_identity(root: Path) -> tuple[str, str]:
+def _read_codex_identity(root: Path) -> tuple[str, str, datetime | None]:
+    auth_path = root / "auth.json"
     try:
-        auth = json.loads((root / "auth.json").read_text(encoding="utf-8"))
+        before = auth_path.stat()
+        auth = json.loads(auth_path.read_text(encoding="utf-8"))
+        after = auth_path.stat()
     except (OSError, json.JSONDecodeError):
-        return "", ""
+        return "", "", None
+    if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
+        return "", "", None
     if not isinstance(auth, dict):
-        return "", ""
+        return "", "", None
     tokens = auth.get("tokens")
     if not isinstance(tokens, dict):
-        return "", ""
+        return "", "", None
     account_id = str(tokens.get("account_id") or "").strip()
     plan_type = ""
     token_parts = str(tokens.get("id_token") or "").split(".")
@@ -55,7 +60,8 @@ def _read_codex_identity(root: Path) -> tuple[str, str]:
                 plan_type = str(auth_claims.get("chatgpt_plan_type") or "").strip()
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
-    return account_id, plan_type
+    changed_at = datetime.fromtimestamp(after.st_mtime, tz=timezone.utc)
+    return account_id, plan_type, changed_at
 
 
 def _format_remaining_percent(used_percent: float) -> str:
@@ -129,6 +135,7 @@ def parse_codex_rate_limit_event(event: dict[str, Any]) -> LocalCodexUsageSnapsh
         return None
     return LocalCodexUsageSnapshot(
         captured_at=captured_at,
+        plan_type=str(rate_limits.get("plan_type") or "").strip().lower(),
         five_hour_limit=values.get("five_hour_limit", ""),
         weekly_limit=values.get("weekly_limit", ""),
         five_hour_limit_reset_at=values.get("five_hour_limit_reset_at", ""),
@@ -196,5 +203,15 @@ def find_latest_windows_codex_usage(
             latest_at = captured_at
     if latest is None:
         return None
-    account_id, plan_type = _read_codex_identity(root)
-    return replace(latest, account_id=account_id, plan_type=plan_type)
+    account_id, plan_type, auth_changed_at = _read_codex_identity(root)
+    if latest_at is None or auth_changed_at is None or latest_at < auth_changed_at:
+        return latest
+    event_plan_type = str(latest.plan_type or "").strip().lower()
+    auth_plan_type = str(plan_type or "").strip().lower()
+    if event_plan_type and auth_plan_type and event_plan_type != auth_plan_type:
+        return latest
+    return replace(
+        latest,
+        account_id=account_id,
+        plan_type=event_plan_type or auth_plan_type,
+    )

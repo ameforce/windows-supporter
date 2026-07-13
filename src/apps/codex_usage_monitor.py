@@ -1767,6 +1767,7 @@ def reconcile_snapshot_with_local_codex_usage(
     *,
     now: datetime | None = None,
     web_account_id: str = "",
+    web_plan_type: str = "",
 ) -> UsageSnapshot:
     if local is None:
         return current
@@ -1775,6 +1776,14 @@ def reconcile_snapshot_with_local_codex_usage(
     if not local_account_id or not normalized_web_account_id:
         return current
     if local_account_id != normalized_web_account_id:
+        return current
+    local_plan_type = str(local.plan_type or "").strip().lower()
+    normalized_web_plan_type = str(web_plan_type or "").strip().lower()
+    if (
+        local_plan_type
+        and normalized_web_plan_type
+        and local_plan_type != normalized_web_plan_type
+    ):
         return current
     current_at = _parse_base_reset_datetime(current.captured_at)
     local_at = _parse_base_reset_datetime(local.captured_at)
@@ -7857,6 +7866,7 @@ class CodexUsageMonitor:
                 snapshot,
                 local_usage,
                 web_account_id=normalized_probe.get("accountId", ""),
+                web_plan_type=normalized_probe.get("planType", ""),
             )
         if not snapshot.has_any_metric():
             return None

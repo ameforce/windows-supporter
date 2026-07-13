@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -273,6 +274,46 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
         # Then: reset coincidence alone cannot cross the account boundary.
         self.assertEqual(reconciled.to_dict(), web.to_dict())
 
+    def test_reconcile_rejects_matching_account_with_different_plan(self) -> None:
+        # Given: stable account ID matches but rollout/auth plan conflicts with web plan.
+        web = UsageSnapshot.from_metrics(
+            {"weekly_limit": "61%"},
+            captured_at="2026-07-13T09:52:20+09:00",
+            reset_info={"weekly_limit_reset_at": "2026-07-20T04:01:00+09:00"},
+            reported_metric_keys=("weekly_limit",),
+        )
+        local_event = {
+            "timestamp": "2026-07-13T00:52:19.258Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "plan_type": "free",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        local = parse_codex_rate_limit_event(local_event)
+        if local is None:
+            self.fail("valid local event was discarded")
+        local = replace(local, account_id="acct-local")
+
+        # When: reconciliation evaluates the web plan boundary.
+        reconciled = reconcile_snapshot_with_local_codex_usage(
+            web,
+            local,
+            web_account_id="acct-local",
+            web_plan_type="pro",
+        )
+
+        # Then: the conflicting plan keeps the web snapshot authoritative.
+        self.assertEqual(reconciled.to_dict(), web.to_dict())
+
     def test_finder_includes_recently_updated_rollout_from_older_session_date(self) -> None:
         # Given: an active long-running session is stored under an older start date.
         event = {
@@ -304,7 +345,8 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
             encoded_claims = base64.urlsafe_b64encode(
                 json.dumps(claims).encode("utf-8")
             ).decode("ascii").rstrip("=")
-            (Path(tmp) / "auth.json").write_text(
+            auth_path = Path(tmp) / "auth.json"
+            auth_path.write_text(
                 json.dumps(
                     {
                         "tokens": {
@@ -315,6 +357,10 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            event_time = datetime.fromisoformat(
+                str(event["timestamp"]).replace("Z", "+00:00")
+            )
+            os.utime(auth_path, (event_time.timestamp() - 60, event_time.timestamp() - 60))
 
             # When: the Windows finder scans the Codex home.
             with patch("src.apps.codex_local_usage.os.name", "nt"):
@@ -326,6 +372,106 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
         self.assertEqual(snapshot.weekly_limit, "95%")
         self.assertEqual(snapshot.account_id, "acct-local")
         self.assertEqual(snapshot.plan_type, "pro")
+
+    def test_finder_does_not_attach_new_auth_identity_to_older_rollout(self) -> None:
+        # Given: account B auth was written after account A's latest usage event.
+        event = {
+            "timestamp": "2026-07-13T00:52:19.258Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout_dir = Path(tmp) / "sessions" / "2026" / "07" / "13"
+            rollout_dir.mkdir(parents=True)
+            (rollout_dir / "rollout-account-a.jsonl").write_text(
+                json.dumps(event) + "\n",
+                encoding="utf-8",
+            )
+            (Path(tmp) / "auth.json").write_text(
+                json.dumps({"tokens": {"account_id": "acct-B"}}),
+                encoding="utf-8",
+            )
+
+            # When: the finder observes the account switch before a new usage event.
+            with patch("src.apps.codex_local_usage.os.name", "nt"):
+                snapshot = find_latest_windows_codex_usage(tmp)
+
+        # Then: old usage remains unbound and cannot overwrite account B's web value.
+        if snapshot is None:
+            self.fail("valid rollout usage was discarded")
+        self.assertEqual(snapshot.weekly_limit, "95%")
+        self.assertEqual(snapshot.account_id, "")
+
+    def test_finder_rejects_auth_identity_when_event_plan_differs(self) -> None:
+        # Given: a free-plan rollout conflicts with current pro-plan auth.
+        event = {
+            "timestamp": "2026-07-13T00:52:19.258Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "plan_type": "free",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout_dir = Path(tmp) / "sessions" / "2026" / "07" / "13"
+            rollout_dir.mkdir(parents=True)
+            (rollout_dir / "rollout-free.jsonl").write_text(
+                json.dumps(event) + "\n",
+                encoding="utf-8",
+            )
+            claims = {
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-local",
+                    "chatgpt_plan_type": "pro",
+                }
+            }
+            encoded_claims = base64.urlsafe_b64encode(
+                json.dumps(claims).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            auth_path = Path(tmp) / "auth.json"
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            "account_id": "acct-local",
+                            "id_token": f"header.{encoded_claims}.signature",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            event_time = datetime.fromisoformat(
+                str(event["timestamp"]).replace("Z", "+00:00")
+            )
+            os.utime(auth_path, (event_time.timestamp() - 60, event_time.timestamp() - 60))
+
+            # When: the finder validates event and auth identity as one contract.
+            with patch("src.apps.codex_local_usage.os.name", "nt"):
+                snapshot = find_latest_windows_codex_usage(tmp)
+
+        # Then: plan mismatch leaves usage unbound despite matching account ID.
+        if snapshot is None:
+            self.fail("valid rollout usage was discarded")
+        self.assertEqual(snapshot.plan_type, "free")
+        self.assertEqual(snapshot.account_id, "")
 
     def test_finder_skips_rollout_that_disappears_during_scan(self) -> None:
         # Given: one candidate disappears while another valid rollout remains readable.
