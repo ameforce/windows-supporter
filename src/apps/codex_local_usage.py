@@ -15,6 +15,7 @@ _FIVE_HOUR_WINDOW_MINUTES = 300
 _WEEKLY_WINDOW_MINUTES = 10080
 _KOREA_TZ = timezone(timedelta(hours=9), name="KST")
 _TAIL_BYTES = 512 * 1024
+_SESSION_META_BYTES = 64 * 1024
 _MAX_ROLLOUT_FILES = 16
 
 
@@ -173,6 +174,25 @@ def _latest_snapshot_in_rollout(path: Path) -> LocalCodexUsageSnapshot | None:
     return None
 
 
+def _rollout_started_at(path: Path) -> datetime | None:
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(_SESSION_META_BYTES).decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+    for line in payload.splitlines():
+        if '"session_meta"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or str(event.get("type") or "") != "session_meta":
+            continue
+        return _parse_captured_at(str(event.get("timestamp") or ""))
+    return None
+
+
 def find_latest_windows_codex_usage(
     codex_home: str | None = None,
 ) -> LocalCodexUsageSnapshot | None:
@@ -193,6 +213,7 @@ def find_latest_windows_codex_usage(
 
     latest: LocalCodexUsageSnapshot | None = None
     latest_at: datetime | None = None
+    latest_path: Path | None = None
     for _, _, path in sorted(candidates, reverse=True):
         snapshot = _latest_snapshot_in_rollout(path)
         if snapshot is None:
@@ -201,10 +222,18 @@ def find_latest_windows_codex_usage(
         if captured_at is not None and (latest_at is None or captured_at > latest_at):
             latest = snapshot
             latest_at = captured_at
+            latest_path = path
     if latest is None:
         return None
     account_id, plan_type, auth_changed_at = _read_codex_identity(root)
-    if latest_at is None or auth_changed_at is None or latest_at < auth_changed_at:
+    session_started_at = _rollout_started_at(latest_path) if latest_path is not None else None
+    if (
+        latest_at is None
+        or auth_changed_at is None
+        or latest_at < auth_changed_at
+        or session_started_at is None
+        or session_started_at < auth_changed_at
+    ):
         return latest
     event_plan_type = str(latest.plan_type or "").strip().lower()
     auth_plan_type = str(plan_type or "").strip().lower()
