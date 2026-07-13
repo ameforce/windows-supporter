@@ -1,6 +1,8 @@
+import base64
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -130,9 +132,16 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
             },
         }
         local = parse_codex_rate_limit_event(local_event)
+        if local is None:
+            self.fail("valid local event was discarded")
+        local = replace(local, account_id="acct-local")
 
         # When: the web snapshot is reconciled at the acquisition boundary.
-        reconciled = reconcile_snapshot_with_local_codex_usage(web, local)
+        reconciled = reconcile_snapshot_with_local_codex_usage(
+            web,
+            local,
+            web_account_id="acct-local",
+        )
 
         # Then: Codex's remaining value replaces lagging web data and absent windows stay absent.
         self.assertEqual(reconciled.weekly_limit, "95%")
@@ -165,12 +174,16 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
             },
         }
         local = parse_codex_rate_limit_event(local_event)
+        if local is None:
+            self.fail("valid local event was discarded")
+        local = replace(local, account_id="acct-local")
 
         # When: reconciliation evaluates the mismatched account.
         reconciled = reconcile_snapshot_with_local_codex_usage(
             web,
             local,
             now=datetime(2026, 7, 13, 0, 52, 20, tzinfo=timezone.utc),
+            web_account_id="acct-local",
         )
 
         # Then: the other account's web snapshot remains untouched.
@@ -208,11 +221,56 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
             },
         }
         local = parse_codex_rate_limit_event(local_event)
+        if local is None:
+            self.fail("valid local event was discarded")
+        local = replace(local, account_id="acct-local")
 
         # When: reconciliation checks the mixed-reset payload.
-        reconciled = reconcile_snapshot_with_local_codex_usage(web, local)
+        reconciled = reconcile_snapshot_with_local_codex_usage(
+            web,
+            local,
+            web_account_id="acct-local",
+        )
 
         # Then: one matching reset cannot authorize cross-window replacement.
+        self.assertEqual(reconciled.to_dict(), web.to_dict())
+
+    def test_reconcile_rejects_same_reset_from_different_account(self) -> None:
+        # Given: two accounts share a weekly reset but have different stable IDs.
+        web = UsageSnapshot.from_metrics(
+            {"weekly_limit": "61%"},
+            captured_at="2026-07-13T09:52:20+09:00",
+            reset_info={"weekly_limit_reset_at": "2026-07-20T04:01:00+09:00"},
+            reported_metric_keys=("weekly_limit",),
+        )
+        local_event = {
+            "timestamp": "2026-07-13T00:52:19.258Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1784487672,
+                    },
+                },
+            },
+        }
+        local = parse_codex_rate_limit_event(local_event)
+        if local is None:
+            self.fail("valid local event was discarded")
+        local = replace(local, account_id="acct-local")
+
+        # When: reconciliation sees the other web account's stable ID.
+        reconciled = reconcile_snapshot_with_local_codex_usage(
+            web,
+            local,
+            web_account_id="acct-other",
+        )
+
+        # Then: reset coincidence alone cannot cross the account boundary.
         self.assertEqual(reconciled.to_dict(), web.to_dict())
 
     def test_finder_includes_recently_updated_rollout_from_older_session_date(self) -> None:
@@ -237,6 +295,26 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
             rollout_dir.mkdir(parents=True)
             rollout = rollout_dir / "rollout-old-start.jsonl"
             rollout.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            claims = {
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-local",
+                    "chatgpt_plan_type": "pro",
+                }
+            }
+            encoded_claims = base64.urlsafe_b64encode(
+                json.dumps(claims).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            (Path(tmp) / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            "account_id": "acct-local",
+                            "id_token": f"header.{encoded_claims}.signature",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             # When: the Windows finder scans the Codex home.
             with patch("src.apps.codex_local_usage.os.name", "nt"):
@@ -246,6 +324,8 @@ class CodexLocalUsageUnitTest(unittest.TestCase):
         if snapshot is None:
             self.fail("active older-date rollout was not discovered")
         self.assertEqual(snapshot.weekly_limit, "95%")
+        self.assertEqual(snapshot.account_id, "acct-local")
+        self.assertEqual(snapshot.plan_type, "pro")
 
     def test_finder_skips_rollout_that_disappears_during_scan(self) -> None:
         # Given: one candidate disappears while another valid rollout remains readable.

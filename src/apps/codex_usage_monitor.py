@@ -46,6 +46,7 @@ USAGE_LIMIT_METRIC_KEYS = USAGE_METRIC_KEYS[:-1]
 
 USAGE_HISTORY_MAX_SAMPLES = 5
 USAGE_HISTORY_WINDOW_SECONDS = 15 * 60
+USAGE_SNAPSHOT_CONTRACT_VERSION = 2
 
 USAGE_RESET_AT_KEYS = (
     "five_hour_limit_reset_at",
@@ -576,7 +577,7 @@ async () => {
     } catch (_) {}
     return '';
   };
-  const collectSessionProfileName = async () => {
+  const collectSessionIdentity = async () => {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 2500);
@@ -586,20 +587,32 @@ async () => {
         signal: controller.signal,
       });
       clearTimeout(timeout);
-      if (!response.ok) return '';
+      if (!response.ok) return { profileName: '', accountId: '', planType: '' };
       const session = await response.json();
-      return cleanProfileName(
-        session && session.user
-          ? (session.user.name || session.user.displayName || '')
-          : ''
-      );
+      const user = session && session.user && typeof session.user === 'object'
+        ? session.user
+        : {};
+      const account = session && session.account && typeof session.account === 'object'
+        ? session.account
+        : {};
+      return {
+        profileName: cleanProfileName(user.name || user.displayName || ''),
+        accountId: String(
+          account.id || account.account_id || account.accountId
+          || session.account_id || session.accountId
+          || user.account_id || user.accountId || ''
+        ).trim(),
+        planType: String(
+          account.planType || account.plan_type || session.planType || session.plan_type || ''
+        ).trim(),
+      };
     } catch (_) {
-      return '';
+      return { profileName: '', accountId: '', planType: '' };
     }
   };
+  const sessionIdentity = await collectSessionIdentity();
   const collectProfileName = async () => {
-    const session = await collectSessionProfileName();
-    if (session) return session;
+    if (sessionIdentity.profileName) return sessionIdentity.profileName;
     const stored = collectStoredProfileName();
     if (stored) return stored;
     const selectors = [
@@ -762,6 +775,8 @@ async () => {
     title: document.title,
     mainText: normalize(scope.innerText || scope.textContent || ''),
     profileName: await collectProfileName(),
+    accountId: sessionIdentity.accountId,
+    planType: sessionIdentity.planType,
     metricBlocks,
   };
 }
@@ -1036,6 +1051,20 @@ def _normalize_metric_candidate(key: str, value: str) -> str:
         return number.group(0).replace(",", "")
 
     return text
+
+
+def _migrate_legacy_snapshot_payload(value: Any) -> dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    for metric_key in USAGE_LIMIT_METRIC_KEYS:
+        raw_value = normalize_usage_value(payload.get(metric_key, ""))
+        if re.search(r"\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?", raw_value):
+            payload[metric_key] = _normalize_metric_candidate(metric_key, raw_value)
+            continue
+        payload[metric_key] = ""
+        reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
+        if reset_key:
+            payload[reset_key] = ""
+    return payload
 
 
 def parse_usage_metrics_from_text(raw_text: str) -> dict[str, str]:
@@ -1737,8 +1766,15 @@ def reconcile_snapshot_with_local_codex_usage(
     local: LocalCodexUsageSnapshot | None,
     *,
     now: datetime | None = None,
+    web_account_id: str = "",
 ) -> UsageSnapshot:
     if local is None:
+        return current
+    local_account_id = str(local.account_id or "").strip()
+    normalized_web_account_id = str(web_account_id or "").strip()
+    if not local_account_id or not normalized_web_account_id:
+        return current
+    if local_account_id != normalized_web_account_id:
         return current
     current_at = _parse_base_reset_datetime(current.captured_at)
     local_at = _parse_base_reset_datetime(local.captured_at)
@@ -7763,6 +7799,12 @@ class CodexUsageMonitor:
         normalized_payload["profileName"] = normalize_usage_value(
             normalized_payload.get("profileName", "")
         )
+        normalized_payload["accountId"] = normalize_usage_value(
+            normalized_payload.get("accountId", "")
+        )
+        normalized_payload["planType"] = normalize_usage_value(
+            normalized_payload.get("planType", "")
+        )
         metric_blocks = normalized_payload.get("metricBlocks", [])
         if not isinstance(metric_blocks, list):
             metric_blocks = []
@@ -7806,9 +7848,15 @@ class CodexUsageMonitor:
             ),
         )
         if self.__local_usage_provider is not None:
+            try:
+                local_usage = self.__local_usage_provider()
+            except Exception as exc:
+                self.__log(f"local usage provider failed type={type(exc).__name__}")
+                local_usage = None
             snapshot = reconcile_snapshot_with_local_codex_usage(
                 snapshot,
-                self.__local_usage_provider(),
+                local_usage,
+                web_account_id=normalized_probe.get("accountId", ""),
             )
         if not snapshot.has_any_metric():
             return None
@@ -7992,13 +8040,22 @@ class CodexUsageMonitor:
             self.__usage_history = []
             self.__set_session_state("logged_out")
             return
-        snap = UsageSnapshot.from_dict(data.get("last_snapshot"))
+        dirty = data.get("snapshot_contract_version") != USAGE_SNAPSHOT_CONTRACT_VERSION
+        raw_snapshot = data.get("last_snapshot")
+        raw_history = data.get("usage_history")
+        if dirty:
+            raw_snapshot = _migrate_legacy_snapshot_payload(raw_snapshot)
+            raw_history = [
+                _migrate_legacy_snapshot_payload(item)
+                for item in raw_history
+                if isinstance(item, dict)
+            ] if isinstance(raw_history, list) else []
+        snap = UsageSnapshot.from_dict(raw_snapshot)
         self.__last_snapshot = snap
-        self.__usage_history = self.__normalize_usage_history(data.get("usage_history"))
+        self.__usage_history = self.__normalize_usage_history(raw_history)
         self.__set_profile_name(data.get("profile_name", ""))
         raw_state = data.get("session_state", "")
         state = normalize_usage_value(raw_state)
-        dirty = False
         if state not in {"logged_in", "logged_out"}:
             state = "logged_out"
             dirty = True
@@ -8021,6 +8078,7 @@ class CodexUsageMonitor:
 
     def __save_state(self) -> None:
         payload = {
+            "snapshot_contract_version": USAGE_SNAPSHOT_CONTRACT_VERSION,
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
             "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),

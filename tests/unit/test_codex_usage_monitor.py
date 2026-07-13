@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from src.apps.codex_local_usage import LocalCodexUsageSnapshot
 from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
     UsageSnapshot,
@@ -173,6 +174,61 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
 
             self.assertIsNotNone(snapshot)
             self.assertEqual(monitor.get_runtime_status().get("profile_name"), "")
+
+    def test_build_snapshot_keeps_web_value_when_local_provider_fails(self) -> None:
+        # Given: web collection succeeds while the optional local adapter raises.
+        def broken_local_provider():
+            raise OSError("rollout unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                local_usage_provider=broken_local_provider,
+            )
+
+            # When: a valid web probe crosses the acquisition boundary.
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._usage_probe("Kim Jong")
+            )
+
+        # Then: the optional adapter failure cannot discard authoritative web data.
+        if snapshot is None:
+            self.fail("valid web snapshot was discarded")
+        self.assertEqual(snapshot.weekly_limit, "96%")
+
+    def test_build_snapshot_applies_local_usage_to_matching_web_account(self) -> None:
+        # Given: the web session and Windows Codex auth expose the same stable account ID.
+        local = LocalCodexUsageSnapshot(
+            captured_at="2026-07-13T00:52:19.258Z",
+            account_id="acct-local",
+            plan_type="pro",
+            weekly_limit="95%",
+            weekly_limit_reset_at="2026-07-20T04:01:12+09:00",
+            reported_metric_keys=("weekly_limit",),
+        )
+        probe = self._usage_probe("Kim Jong")
+        probe["accountId"] = "acct-local"
+        probe["planType"] = "pro"
+        probe["metricBlocks"][1]["reset_at_candidates"] = [
+            "2026-07-20T04:01:00+09:00"
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                local_usage_provider=lambda: local,
+            )
+            monitor._CodexUsageMonitor__now_iso = lambda: "2026-07-13T09:52:20+09:00"
+
+            # When: the same-account probe crosses the acquisition boundary.
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(probe)
+
+        # Then: the fresher local remaining value replaces lagging web analytics.
+        if snapshot is None:
+            self.fail("valid same-account snapshot was discarded")
+        self.assertEqual(snapshot.weekly_limit, "95%")
+        self.assertEqual(snapshot.five_hour_limit, "")
 
     def test_parse_usage_metrics_from_inline_lines(self) -> None:
         raw = """
@@ -612,6 +668,53 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
                 "2026-06-01T11:00:00+09:00",
             )
             self.assertEqual(monitor.get_runtime_status()["usage_history"], history)
+            self.assertEqual(state.get("snapshot_contract_version"), 2)
+
+    def test_load_state_invalidates_ambiguous_legacy_percent_cache(self) -> None:
+        # Given: v0.6.60 persisted bare percentages after erasing used/remaining meaning.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, "codex_usage_state.json")
+            with open(state_path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "session_state": "logged_in",
+                        "last_snapshot": {
+                            "five_hour_limit": "5%",
+                            "weekly_limit": "17 / 40",
+                            "remaining_credit": "320",
+                            "captured_at": "2026-07-13T09:48:03+09:00",
+                        },
+                        "usage_history": [
+                            {
+                                "captured_at": "2026-07-13T09:46:03+09:00",
+                                "five_hour_limit": "5%",
+                            },
+                            {
+                                "captured_at": "2026-07-13T09:48:03+09:00",
+                                "weekly_limit": "17 / 40",
+                            },
+                        ],
+                    },
+                    fp,
+                )
+
+            # When: the unversioned cache crosses the v2 snapshot contract boundary.
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+            )
+            snapshot = monitor.get_last_snapshot()
+            history = monitor.get_runtime_status()["usage_history"]
+            with open(state_path, encoding="utf-8") as fp:
+                migrated = json.load(fp)
+
+        # Then: ambiguous bare percentages disappear; unambiguous ratios migrate.
+        self.assertEqual(snapshot.five_hour_limit, "")
+        self.assertEqual(snapshot.weekly_limit, "57.5%")
+        self.assertEqual(snapshot.remaining_credit, "320")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["weekly_limit"], "57.5%")
+        self.assertEqual(migrated.get("snapshot_contract_version"), 2)
 
     def test_load_state_normalizes_old_or_oversized_usage_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -630,6 +733,7 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
                 json.dump(
                     {
                         "session_state": "logged_in",
+                        "snapshot_contract_version": 2,
                         "last_snapshot": {"five_hour_limit": "75%"},
                         "usage_history": raw_history,
                     },

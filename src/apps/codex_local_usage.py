@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import heapq
 import json
@@ -19,11 +21,41 @@ _MAX_ROLLOUT_FILES = 16
 @dataclass(frozen=True, slots=True)
 class LocalCodexUsageSnapshot:
     captured_at: str
+    account_id: str = ""
+    plan_type: str = ""
     five_hour_limit: str = ""
     weekly_limit: str = ""
     five_hour_limit_reset_at: str = ""
     weekly_limit_reset_at: str = ""
     reported_metric_keys: tuple[str, ...] = ()
+
+
+def _read_codex_identity(root: Path) -> tuple[str, str]:
+    try:
+        auth = json.loads((root / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "", ""
+    if not isinstance(auth, dict):
+        return "", ""
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict):
+        return "", ""
+    account_id = str(tokens.get("account_id") or "").strip()
+    plan_type = ""
+    token_parts = str(tokens.get("id_token") or "").split(".")
+    if len(token_parts) >= 2:
+        try:
+            encoded = token_parts[1] + "=" * (-len(token_parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(encoded))
+            auth_claims = claims.get("https://api.openai.com/auth", {})
+            if isinstance(auth_claims, dict):
+                account_id = account_id or str(
+                    auth_claims.get("chatgpt_account_id") or ""
+                ).strip()
+                plan_type = str(auth_claims.get("chatgpt_plan_type") or "").strip()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return account_id, plan_type
 
 
 def _format_remaining_percent(used_percent: float) -> str:
@@ -162,4 +194,7 @@ def find_latest_windows_codex_usage(
         if captured_at is not None and (latest_at is None or captured_at > latest_at):
             latest = snapshot
             latest_at = captured_at
-    return latest
+    if latest is None:
+        return None
+    account_id, plan_type = _read_codex_identity(root)
+    return replace(latest, account_id=account_id, plan_type=plan_type)
