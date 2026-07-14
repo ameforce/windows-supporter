@@ -268,6 +268,11 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
     def test_collect_classifies_profile_lock_and_missing_chrome_channel(self) -> None:
         cases = (
             ("ProcessSingleton: profile is already in use", "profile_in_use", BrowserState.PROFILE_IN_USE),
+            (
+                'taskkill stderr: ERROR: The process "12476" not found. process did exit: exitCode=21',
+                "profile_in_use",
+                BrowserState.PROFILE_IN_USE,
+            ),
             ("Chromium distribution 'chrome' is not found", "browser_channel_unavailable", BrowserState.FAILED),
         )
         for message, error, state in cases:

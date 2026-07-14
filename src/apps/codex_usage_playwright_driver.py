@@ -59,9 +59,28 @@ def _canonical_usage_url(url: str) -> str:
 
 def _classify_error(message: str, *, login_poll: bool = False) -> str:
     lowered = message.lower()
-    if any(token in lowered for token in ("processsingleton", "profile is already in use", "user data directory is already in use", "singletonlock")):
+    if any(
+        token in lowered
+        for token in (
+            "processsingleton",
+            "profile is already in use",
+            "user data directory is already in use",
+            "singletonlock",
+            "exitcode=21",
+            "exit code: 21",
+        )
+    ):
         return BrowserErrorCode.PROFILE_IN_USE.value
-    if "chrome" in lowered and any(token in lowered for token in ("not found", "doesn't exist", "not installed", "distribution")):
+    if any(
+        token in lowered
+        for token in (
+            "chromium distribution 'chrome' is not found",
+            'chromium distribution "chrome" is not found',
+            "chrome distribution is not found",
+            "chrome is not installed",
+            "executable doesn't exist",
+        )
+    ):
         return BrowserErrorCode.BROWSER_CHANNEL_UNAVAILABLE.value
     if any(token in lowered for token in ("playwright unavailable", "no module named 'playwright'", "playwright not installed")):
         return BrowserErrorCode.PLAYWRIGHT_UNAVAILABLE.value
@@ -127,11 +146,13 @@ class CodexUsagePlaywrightDriver:
                         page = self._replace_page()
                 error = _classify_error(last_error)
             except (DriverOperationError, OSError, RuntimeError) as exc:
-                error = _classify_error(str(exc))
+                last_error = str(exc)
+                error = _classify_error(last_error)
             except _playwright_error_type() as exc:
-                error = _classify_error(str(exc))
+                last_error = str(exc)
+                error = _classify_error(last_error)
             if error != BrowserErrorCode.COLLECT_FAILED.value:
-                return self._fail(error)
+                return self._fail(error, last_error)
             if context_attempt == 0:
                 self._set_status(BrowserState.RECOVERING)
                 self._close_context()
