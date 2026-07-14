@@ -275,7 +275,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(runtime["accounts"][0]["label"], "Daeng")
             self.assertEqual(runtime["accounts"][0]["configured_label"], "Codex 1")
 
-    def test_logged_out_accounts_with_profile_cdp_do_not_drive_background_scheduler(self):
+    def test_logged_out_accounts_with_stopped_browser_do_not_drive_background_scheduler(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
             for child in children:
@@ -284,7 +284,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                         "session_state": "logged_out",
                         "collect_inflight": False,
                         "profile_session_present": True,
-                        "profile_cdp_available": True,
+                        "browser_state": "stopped",
                         "can_login": True,
                         "can_logout": False,
                     }

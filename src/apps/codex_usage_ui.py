@@ -1229,15 +1229,9 @@ class CodexUsageSettingsView:
         auth_attention_required = bool(runtime.get("auth_attention_required", False))
         auth_attention_reason = str(runtime.get("auth_attention_reason", "") or "")
         pending_login_reason = str(runtime.get("pending_login_poll_reason", "") or "")
-        system_chrome_cdp_available = bool(runtime.get("system_chrome_cdp_available", False))
-        try:
-            pending_cdp_misses = int(runtime.get("pending_login_no_cdp_miss_count", 0) or 0)
-        except Exception:
-            pending_cdp_misses = 0
-        try:
-            pending_cdp_max_misses = int(runtime.get("pending_login_no_cdp_max_misses", 0) or 0)
-        except Exception:
-            pending_cdp_max_misses = 0
+        browser_state = str(runtime.get("browser_state", "stopped") or "stopped")
+        browser_last_error = str(runtime.get("browser_last_error", "") or "")
+        login_window_open = bool(runtime.get("login_window_open", False))
         try:
             inflight = bool(runtime.get("collect_inflight", False))
         except Exception:
@@ -1250,23 +1244,22 @@ class CodexUsageSettingsView:
             if source and source != "manual_login":
                 state = f"{state} ({source})"
             return state
-        if profile_in_use or monitor_state == "paused_profile_in_use":
+        if profile_in_use or monitor_state == "paused_profile_in_use" or browser_state == "profile_in_use":
             return "프로필 사용 중 (자동 일시중지)"
-        if pending_login_poll:
+        if pending_login_poll or login_window_open:
             is_cloudflare_auth = (
                 auth_attention_reason == "cloudflare_challenge"
                 or pending_login_reason == "cloudflare_challenge"
             )
-            label = "인증 창" if is_cloudflare_auth else "로그인 창"
-            if pending_cdp_misses > 0:
-                if pending_cdp_max_misses > 0:
-                    return f"{label} 감지 대기 중 ({pending_cdp_misses}/{pending_cdp_max_misses})"
-                return f"{label} 감지 대기 중 ({pending_cdp_misses})"
             return "인증 완료 대기 중" if is_cloudflare_auth else "로그인 완료 대기 중"
+        if browser_state == "starting":
+            return "브라우저 시작 중"
+        if browser_state == "recovering":
+            return "브라우저 복구 중"
+        if browser_state == "failed" and browser_last_error == "browser_channel_unavailable":
+            return "Google Chrome 필요"
         if auth_attention_required or monitor_state == "paused_auth_required":
             return "브라우저 인증 필요"
-        if session_state == "logged_out" and system_chrome_cdp_available:
-            return "기존 Chrome 세션 감지됨"
         if session_state == "logged_out":
             return "로그인 필요"
         return "대기 중"
