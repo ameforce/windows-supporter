@@ -66,13 +66,27 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Bootstrap the pinned uv build tool without modifying the global PATH
+echo | set /p="Preparing pinned uv build tool..."
+call :clear_log
+call "tools\ensure_uv_ready.bat" "%STEP_LOG%"
+if errorlevel 1 (
+  echo Failure
+  echo Failed to prepare the pinned uv build tool.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+set "UV_PYTHON=%WINDOWS_SUPPORTER_BUILD_PYTHON%"
+set "UV_PYTHON_DOWNLOADS=never"
+
 REM Sync uv environment (PyInstaller is in the build extra)
 echo | set /p="Syncing uv environment..."
 call :clear_log
-uv sync --extra build > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" sync --locked --extra build > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
-  echo uv sync failed. Please check that uv is installed and available in PATH.
+  echo uv sync failed. Check the locked dependencies and network settings.
   call :print_log
   exit /b 1
 )
@@ -82,7 +96,7 @@ REM Install bundled Playwright browser runtime into package-local path
 echo | set /p="Preparing bundled Playwright Chromium runtime..."
 call :clear_log
 set "PLAYWRIGHT_BROWSERS_PATH=0"
-uv run python -m playwright install chromium > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m playwright install chromium > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo Playwright Chromium runtime install failed.
@@ -101,7 +115,7 @@ echo [ Success !! ]
 REM Generate build-time version metadata from Git tags and current commit
 echo | set /p="Generating version metadata..."
 call :clear_log
-uv run python "tools\generate_build_metadata.py" --repo-root "%CURRENT_DIR:~0,-1%" --module-output "%BUILD_INFO_MODULE%" --version-file "%VERSION_FILE%" --exe-name "%EXE_NAME%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\generate_build_metadata.py" --repo-root "%CURRENT_DIR:~0,-1%" --module-output "%BUILD_INFO_MODULE%" --version-file "%VERSION_FILE%" --exe-name "%EXE_NAME%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo Version metadata generation failed.
@@ -113,7 +127,7 @@ echo [ Success !! ]
 REM Build the executable
 echo | set /p="Building %MAIN_SOURCE% to %EXE_NAME%..."
 call :clear_log
-uv run python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller build failed.
@@ -122,32 +136,32 @@ if errorlevel 1 (
 )
 echo [ Success !! ]
 
-REM Promote the built artifact to the repo root
-echo | set /p="Moving %EXE_NAME%..."
+REM Validate the staged onefile archive before replacing the current executable
+echo | set /p="Validating PyInstaller archive..."
 call :clear_log
 if not exist "dist\%EXE_NAME%" (
   > "%STEP_LOG%" echo Expected build artifact was not found: dist\%EXE_NAME%
   echo Failure
-  echo Built artifact move failed.
+  echo PyInstaller archive validation failed.
   call :print_log
   exit /b 1
 )
-move /Y "dist\%EXE_NAME%" "%ROOT_EXE%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\verify_pyinstaller_archive.py" "dist\%EXE_NAME%" --entry "playwright\driver\node.exe" --match-file ".venv\Lib\site-packages\playwright\driver\node.exe" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
-  echo Built artifact move failed.
+  echo PyInstaller archive validation failed.
   call :print_log
   exit /b 1
 )
 echo [ Success !! ]
 
-REM Validate the promoted onefile archive before cleanup and launch
-echo | set /p="Validating PyInstaller archive..."
+REM Promote the verified artifact to the repo root
+echo | set /p="Moving %EXE_NAME%..."
 call :clear_log
-uv run python "tools\verify_pyinstaller_archive.py" "%ROOT_EXE%" --entry "playwright\driver\node.exe" --match-file ".venv\Lib\site-packages\playwright\driver\node.exe" > "%STEP_LOG%" 2>&1
+move /Y "dist\%EXE_NAME%" "%ROOT_EXE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
-  echo PyInstaller archive validation failed.
+  echo Built artifact move failed.
   call :print_log
   exit /b 1
 )

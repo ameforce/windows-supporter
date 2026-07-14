@@ -399,7 +399,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         cleanup_index = script.index("Remove build byproducts")
         launch_index = script.index("Running %EXE_NAME%")
 
-        self.assertGreater(validation_index, move_index)
+        self.assertLess(validation_index, move_index)
         self.assertLess(validation_index, cleanup_index)
         self.assertLess(validation_index, launch_index)
         self.assertIn("playwright\\driver\\node.exe", script)

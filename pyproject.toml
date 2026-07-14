@@ -29,3 +29,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = ["main"]
 packages = ["src", "src.apps", "src.utils"]
+
+[tool.uv]
+required-version = "==0.10.2"
