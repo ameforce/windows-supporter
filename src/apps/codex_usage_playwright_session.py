@@ -123,6 +123,15 @@ class CodexUsagePlaywrightSession:
         envelope = _CommandEnvelope(command)
         self._queue.put(envelope)
         if not envelope.completed.wait(self._config.command_timeout_sec):
+            with self._lock:
+                worker = self._thread
+                worker_alive = bool(worker is not None and worker.is_alive())
+                queue_depth = self._queue.qsize()
+            self._log(
+                "browser owner command timed out "
+                f"command={type(command).__name__} "
+                f"worker_alive={worker_alive} queue_depth={queue_depth}"
+            )
             self._update_status(BrowserRuntimeStatus(BrowserState.FAILED, False, "collect_failed"))
             return BrowserOperationResult(error="collect_failed")
         return envelope.result
@@ -131,8 +140,12 @@ class CodexUsagePlaywrightSession:
         with self._lock:
             if self._shutdown:
                 return False
-            if self._thread is not None:
+            if self._thread is not None and self._thread.is_alive():
                 return True
+            if self._thread is not None:
+                self._queue = Queue()
+                self._thread = None
+                self._driver = None
             self._status = BrowserRuntimeStatus(BrowserState.STARTING, False, "")
             self._thread = threading.Thread(
                 target=self._run,
@@ -158,8 +171,25 @@ class CodexUsagePlaywrightSession:
             if started.error is not None:
                 envelope.result = started
             else:
-                envelope.result = self._dispatch(driver, command)
-                self._update_status(driver.get_runtime_status())
+                try:
+                    envelope.result = self._dispatch(driver, command)
+                    self._update_status(driver.get_runtime_status())
+                except Exception as exc:
+                    self._log(
+                        "browser owner command failed "
+                        f"command={type(command).__name__} type={type(exc).__name__}"
+                    )
+                    try:
+                        driver.close_session()
+                    except Exception as close_exc:
+                        self._log(
+                            "browser owner recovery failed "
+                            f"type={type(close_exc).__name__}"
+                        )
+                    envelope.result = BrowserOperationResult(error="collect_failed")
+                    self._update_status(
+                        BrowserRuntimeStatus(BrowserState.FAILED, False, "collect_failed")
+                    )
             envelope.completed.set()
 
     def _dispatch(self, driver: DriverProtocol, command: BrowserCommand) -> BrowserOperationResult:
@@ -178,3 +208,12 @@ class CodexUsagePlaywrightSession:
     def _update_status(self, status: BrowserRuntimeStatus) -> None:
         with self._lock:
             self._status = status
+
+    def _log(self, message: str) -> None:
+        sink = self._log_sink
+        if sink is None:
+            return
+        try:
+            sink(message)
+        except Exception:
+            return
