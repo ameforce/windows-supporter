@@ -23,6 +23,7 @@ class BrowserErrorCode(StrEnum):
     BROWSER_CHANNEL_UNAVAILABLE = "browser_channel_unavailable"
     PLAYWRIGHT_UNAVAILABLE = "playwright_unavailable"
     COLLECT_FAILED = "collect_failed"
+    COMMAND_TIMEOUT = "command_timeout"
     LOGIN_WINDOW_CLOSED = "login_window_closed"
     LOGIN_REQUIRED = "login_required"
     CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
@@ -155,6 +156,9 @@ class PlaywrightSessionConfig:
     probe_script: str
     navigation_timeout_ms: int = 30_000
     command_timeout_sec: float = 45.0
+    collect_timeout_sec: float = 90.0
+    timeout_retry_delays_sec: tuple[float, ...] = (5.0, 15.0, 30.0)
+    timeout_recovery_grace_sec: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +172,8 @@ class BrowserRuntimeStatus:
     state: BrowserState
     login_window_open: bool
     last_error: str
+    retry_attempt: int = 0
+    retry_max: int = 0
 
 
 @dataclass(frozen=True, slots=True)

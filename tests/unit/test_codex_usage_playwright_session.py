@@ -94,6 +94,66 @@ class DriverFactory:
         return self.driver
 
 
+@final
+class BlockingDriver(FakeDriver):
+    def __init__(
+        self,
+        release: threading.Event,
+        *,
+        release_after_sec: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.release = release
+        self.release_after_sec = release_after_sec
+
+    def collect(self) -> BrowserOperationResult:
+        self._record("collect")
+        if self.release_after_sec is not None:
+            timer = threading.Timer(self.release_after_sec, self.release.set)
+            timer.daemon = True
+            timer.start()
+        _ = self.release.wait(2.0)
+        self.status = BrowserRuntimeStatus(BrowserState.FAILED, False, "collect_failed")
+        return BrowserOperationResult(error="collect_failed")
+
+
+@final
+class TimeoutThenSuccessDriver(FakeDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.collect_count = 0
+
+    def collect(self) -> BrowserOperationResult:
+        self._record("collect")
+        self.collect_count += 1
+        if self.collect_count == 1:
+            self.status = BrowserRuntimeStatus(
+                BrowserState.FAILED,
+                False,
+                "command_timeout",
+            )
+            return BrowserOperationResult(error="command_timeout")
+        self.status = BrowserRuntimeStatus(BrowserState.HEADLESS_READY, False, "")
+        return BrowserOperationResult(probe={"url": "usage", "metricBlocks": []})
+
+
+@final
+class SequenceDriverFactory:
+    def __init__(self, drivers: list[FakeDriver]) -> None:
+        self.drivers = list(drivers)
+        self.calls = 0
+
+    def __call__(
+        self,
+        _config: PlaywrightSessionConfig,
+        _log_sink: LogSink | None,
+        _playwright_starter: PlaywrightStarter | None,
+    ) -> FakeDriver:
+        driver = self.drivers[self.calls]
+        self.calls += 1
+        return driver
+
+
 def make_session(
     factory: DriverFactory,
     *,
@@ -216,6 +276,94 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
             ["start", "collect", "close_session", "collect"],
         )
         session.shutdown()
+
+    def test_command_timeout_recovers_connection_and_retries_on_a_fresh_owner(self) -> None:
+        release = threading.Event()
+        first = BlockingDriver(release, release_after_sec=0.06)
+        second = FakeDriver()
+        factory = SequenceDriverFactory([first, second])
+        session = make_session(factory, command_timeout_sec=0.05)
+        session._timeout_retry_delays_sec = (0.0,)
+        session._timeout_recovery_grace_sec = 0.2
+        session._sleep = lambda _delay: None
+
+        try:
+            result = session.collect()
+
+            self.assertIsNotNone(
+                result.probe,
+                "a timed-out owner must be discarded before the automatic retry",
+            )
+            self.assertEqual(factory.calls, 2)
+            self.assertIn("shutdown", first.calls)
+            self.assertEqual(second.calls[:2], ["start", "collect"])
+        finally:
+            release.set()
+            session.shutdown()
+
+    def test_driver_timeout_result_is_automatically_retried(self) -> None:
+        driver = TimeoutThenSuccessDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory)
+        session._timeout_retry_delays_sec = (0.0,)
+        session._sleep = lambda _delay: None
+
+        result = session.collect()
+
+        self.assertIsNotNone(result.probe)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(driver.calls[:3], ["start", "collect", "collect"])
+        status = session.get_runtime_status()
+        self.assertEqual(status.state, BrowserState.HEADLESS_READY)
+        self.assertEqual(status.retry_attempt, 0)
+        session.shutdown()
+
+    def test_command_timeout_retries_are_bounded_and_remain_visible(self) -> None:
+        releases = [threading.Event() for _ in range(3)]
+        drivers = [
+            BlockingDriver(release, release_after_sec=0.04)
+            for release in releases
+        ]
+        factory = SequenceDriverFactory(drivers)
+        session = make_session(factory, command_timeout_sec=0.03)
+        session._timeout_retry_delays_sec = (0.0, 0.0)
+        session._timeout_recovery_grace_sec = 0.2
+        session._sleep = lambda _delay: None
+
+        try:
+            result = session.collect()
+            status = session.get_runtime_status()
+
+            self.assertEqual(result.error, "command_timeout")
+            self.assertEqual(factory.calls, 3)
+            self.assertEqual(status.state, BrowserState.FAILED)
+            self.assertEqual(status.last_error, "command_timeout")
+            self.assertEqual(status.retry_attempt, 2)
+            self.assertEqual(status.retry_max, 2)
+        finally:
+            for release in releases:
+                release.set()
+            session.shutdown()
+
+    def test_command_timeout_does_not_queue_more_work_behind_unresponsive_owner(self) -> None:
+        release = threading.Event()
+        driver = BlockingDriver(release)
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=0.03)
+        session._timeout_retry_delays_sec = (0.0, 0.0)
+        session._timeout_recovery_grace_sec = 0.0
+        session._sleep = lambda _delay: None
+
+        try:
+            result = session.collect()
+
+            self.assertEqual(result.error, "command_timeout")
+            self.assertEqual(factory.calls, 1)
+            self.assertEqual(driver.calls, ["start", "collect"])
+            self.assertEqual(session._queue.qsize(), 0)
+        finally:
+            release.set()
+            session.shutdown()
 
 
 if __name__ == "__main__":

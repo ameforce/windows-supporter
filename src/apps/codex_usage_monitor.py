@@ -2357,6 +2357,12 @@ class CodexUsageMonitor:
             "browser_state": browser_state,
             "login_window_open": login_window_open,
             "browser_last_error": str(browser_runtime.last_error or ""),
+            "browser_retry_attempt": max(
+                0, int(getattr(browser_runtime, "retry_attempt", 0) or 0)
+            ),
+            "browser_retry_max": max(
+                0, int(getattr(browser_runtime, "retry_max", 0) or 0)
+            ),
             "auth_attention_required": bool(self.__auth_attention_required),
             "auth_attention_reason": str(self.__auth_attention_reason or ""),
             "auth_attention_source": str(self.__auth_attention_source or ""),
@@ -3592,6 +3598,7 @@ class CodexUsageMonitor:
         mapping = {
             "parse_failed": "페이지에서 사용량을 읽지 못했습니다.",
             "collect_failed": "조회 작업 중 오류가 발생했습니다.",
+            "command_timeout": "조회 시간이 초과되어 브라우저 연결을 복구한 뒤 자동 재시도합니다.",
             "playwright_unavailable": "브라우저 런타임을 확인해 주세요.",
             "browser_channel_unavailable": "설치된 Google Chrome을 찾을 수 없습니다.",
             "login_window_closed": "로그인 창이 닫혔습니다.",
