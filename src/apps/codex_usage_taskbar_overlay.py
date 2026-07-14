@@ -4912,6 +4912,10 @@ def _account_status(
         return {"state": "profile_busy", "text": "WAIT", "color": "#f59e0b"}
     if monitor_state == "paused_auth_required" or session_state == "logged_out":
         return {"state": "login", "text": "OUT", "color": "#f59e0b"}
+    failure_count = int(runtime.get("failure_count") or 0)
+    browser_last_error = str(runtime.get("browser_last_error") or "").strip()
+    if failure_count > 0 or browser_last_error:
+        return {"state": "error", "text": "ERR", "color": "#f59e0b"}
     if not has_metric:
         return {"state": "nodata", "text": "DATA", "color": "#94a3b8"}
     return {"state": "ready", "text": "OK", "color": "#22c55e"}
