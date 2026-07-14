@@ -187,6 +187,23 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ["47%", "52%"],
         )
 
+    def test_model_marks_command_timeout_without_hiding_preserved_metrics(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["runtime"]["failure_count"] = 1
+        runtime["accounts"][0]["runtime"]["browser_state"] = "recovering"
+        runtime["accounts"][0]["runtime"]["browser_last_error"] = "command_timeout"
+        runtime["accounts"][0]["runtime"]["browser_retry_attempt"] = 1
+        runtime["accounts"][0]["runtime"]["browser_retry_max"] = 3
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        self.assertEqual(model["bars"][0]["status_text"], "TIME")
+        self.assertEqual(model["bars"][0]["status_color"], "#f59e0b")
+        self.assertEqual(
+            [metric["value_text"] for metric in model["bars"][0]["metrics"]],
+            ["47%", "52%"],
+        )
+
     def test_model_shows_sync_when_collecting_without_snapshot_data(self):
         runtime = self._runtime()
         runtime["accounts"][0]["runtime"]["collect_inflight"] = True

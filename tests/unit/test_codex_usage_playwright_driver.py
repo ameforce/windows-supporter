@@ -44,12 +44,14 @@ class FakePage:
         probe: UsageProbePayload | None = None,
         probes: list[UsageProbePayload] | None = None,
         failures: int = 0,
+        failure_message: str = "page navigation failed",
     ) -> None:
         self.url: str = url
         self.user_agent: str = user_agent
         self.probe: UsageProbePayload = probe or PROBE
         self.probes: list[UsageProbePayload] = list(probes or [])
         self.failures: int = failures
+        self.failure_message = failure_message
         self.closed: bool = False
         self.calls: list[tuple[str, str]] = []
 
@@ -65,7 +67,7 @@ class FakePage:
         self.calls.append((method, url))
         if self.failures:
             self.failures -= 1
-            raise OSError("page navigation failed")
+            raise OSError(self.failure_message)
         self.url = url
 
     def evaluate(self, expression: str) -> str | UsageProbePayload:
@@ -223,6 +225,41 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         self.assertEqual(first_page.calls[0], ("goto", USAGE_URL))
         self.assertTrue(first_context.closed)
         self.assertEqual(len(chromium.calls), 2)
+
+    def test_collect_recreates_context_after_navigation_timeout(self) -> None:
+        first_context = FakeContext(
+            [FakePage(failures=1, failure_message="Timeout 30000ms exceeded")]
+        )
+        recovered_context = FakeContext([FakePage()])
+        driver, chromium, _controller = make_driver(
+            [first_context, recovered_context]
+        )
+
+        result = driver.collect()
+
+        self.assertEqual(result.probe, PROBE)
+        self.assertTrue(first_context.closed)
+        self.assertFalse(recovered_context.closed)
+        self.assertEqual(len(chromium.calls), 2)
+        self.assertEqual(driver.get_runtime_status().state, BrowserState.HEADLESS_READY)
+
+    def test_collect_preserves_timeout_after_bounded_context_recovery(self) -> None:
+        contexts = [
+            FakeContext(
+                [FakePage(failures=1, failure_message="Timeout 30000ms exceeded")]
+            )
+            for _ in range(2)
+        ]
+        driver, chromium, _controller = make_driver(contexts)
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, "command_timeout")
+        self.assertTrue(all(context.closed for context in contexts))
+        self.assertEqual(len(chromium.calls), 2)
+        status = driver.get_runtime_status()
+        self.assertEqual(status.state, BrowserState.FAILED)
+        self.assertEqual(status.last_error, "command_timeout")
 
     def test_collect_waits_for_client_rendered_usage_metrics(self) -> None:
         loading: UsageProbePayload = {

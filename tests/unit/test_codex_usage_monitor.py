@@ -124,6 +124,47 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(runtime["browser_state"], "headed_login")
             self.assertTrue(runtime["login_window_open"])
             self.assertEqual(runtime["browser_last_error"], "login_required")
+            self.assertEqual(runtime["browser_retry_attempt"], 0)
+            self.assertEqual(runtime["browser_retry_max"], 0)
+
+    def test_runtime_status_exposes_timeout_retry_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            session.status = BrowserRuntimeStatus(
+                BrowserState.RECOVERING,
+                False,
+                "command_timeout",
+                2,
+                3,
+            )
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+
+            runtime = monitor.get_runtime_status()
+
+            self.assertEqual(runtime["browser_state"], "recovering")
+            self.assertEqual(runtime["browser_last_error"], "command_timeout")
+            self.assertEqual(runtime["browser_retry_attempt"], 2)
+            self.assertEqual(runtime["browser_retry_max"], 3)
+
+    def test_command_timeout_user_message_explains_automatic_connection_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+
+            message = monitor._CodexUsageMonitor__describe_collect_error_for_user(
+                "command_timeout"
+            )
+
+            self.assertIn("시간이 초과", message)
+            self.assertIn("연결을 복구", message)
+            self.assertIn("자동 재시도", message)
 
     def test_browser_channel_failure_keeps_last_successful_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
