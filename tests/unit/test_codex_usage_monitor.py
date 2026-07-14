@@ -5,6 +5,11 @@ import unittest
 from unittest.mock import patch
 
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
+from src.apps.codex_usage_browser_types import (
+    BrowserOperationResult,
+    BrowserRuntimeStatus,
+    BrowserState,
+)
 from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
     UsageSnapshot,
@@ -21,27 +26,194 @@ from src.apps.codex_usage_monitor import (
 
 
 class CodexUsageMonitorUnitTest(unittest.TestCase):
-    def test_shutdown_terminates_owned_cdp_process(self) -> None:
-        class _OwnedProc:
-            pid = 43210
+    class _BrowserSession:
+        def __init__(self) -> None:
+            self.collect_result = BrowserOperationResult()
+            self.open_login_result = BrowserOperationResult()
+            self.poll_login_result = BrowserOperationResult()
+            self.calls: list[str] = []
+            self.status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
+
+        def collect(self) -> BrowserOperationResult:
+            self.calls.append("collect")
+            return self.collect_result
+
+        def open_login(self) -> BrowserOperationResult:
+            self.calls.append("open_login")
+            return self.open_login_result
+
+        def poll_login(self) -> BrowserOperationResult:
+            self.calls.append("poll_login")
+            return self.poll_login_result
+
+        def close_session(self) -> None:
+            self.calls.append("close_session")
+
+        def shutdown(self) -> None:
+            self.calls.append("shutdown")
+
+        def get_runtime_status(self) -> BrowserRuntimeStatus:
+            return self.status
+
+    def test_shutdown_closes_playwright_session(self) -> None:
+        class _BrowserSession:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+
+            def shutdown(self) -> None:
+                self.shutdown_calls += 1
 
         with tempfile.TemporaryDirectory() as tmp:
+            session = _BrowserSession()
             monitor = CodexUsageMonitor(
                 config_dir=tmp,
                 profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
             )
-            proc = _OwnedProc()
-            monitor._CodexUsageMonitor__hidden_cdp_proc = proc
-            monitor._CodexUsageMonitor__hidden_cdp_port = 11119
+            monitor.shutdown()
+
+            self.assertEqual(session.shutdown_calls, 1)
+
+    def test_collect_snapshot_routes_only_through_playwright_session_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+            session.collect_result = BrowserOperationResult(
+                probe=self._usage_probe("")
+            )
+            session.open_login_result = BrowserOperationResult(error="login_required")
+            session.poll_login_result = BrowserOperationResult(error="login_window_closed")
+
+            snapshot, collect_error = monitor._CodexUsageMonitor__collect_snapshot(
+                source="manual_query"
+            )
+            _login_snapshot, login_error = monitor._CodexUsageMonitor__collect_snapshot(
+                source="manual_login"
+            )
+            _poll_snapshot, poll_error = monitor._CodexUsageMonitor__collect_snapshot(
+                source="pending_login_poll"
+            )
+
+            self.assertIsNotNone(snapshot)
+            self.assertIsNone(collect_error)
+            self.assertEqual(login_error, "login_required")
+            self.assertEqual(poll_error, "login_window_closed")
+            self.assertEqual(session.calls, ["collect", "open_login", "poll_login"])
+
+    def test_runtime_status_exposes_transport_neutral_browser_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            session.status = BrowserRuntimeStatus(
+                BrowserState.HEADED_LOGIN,
+                True,
+                "login_required",
+            )
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+
+            runtime = monitor.get_runtime_status()
+
+            self.assertEqual(runtime["collection_mode"], "playwright")
+            self.assertEqual(runtime["browser_state"], "headed_login")
+            self.assertTrue(runtime["login_window_open"])
+            self.assertEqual(runtime["browser_last_error"], "login_required")
+
+    def test_browser_channel_failure_keeps_last_successful_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+            previous = UsageSnapshot.from_metrics(
+                {"weekly_limit": "48%"},
+                captured_at="2026-07-14T15:00:00+09:00",
+            )
+            monitor.handle_snapshot(previous)
+
+            monitor._CodexUsageMonitor__handle_collect_error(
+                "browser_channel_unavailable",
+                source="monitor_tick",
+            )
+
+            self.assertEqual(monitor.get_last_snapshot().weekly_limit, "48%")
+
+    def test_profile_in_use_pauses_background_collection_until_manual_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            monitor._CodexUsageMonitor__profile_in_use_detected = True
+
+            runtime = monitor.get_runtime_status()
+
+            self.assertEqual(runtime["monitor_state"], "paused_profile_in_use")
+            self.assertFalse(runtime["auto_monitoring_active"])
+
+    def test_logout_closes_browser_session_before_deleting_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events: list[str] = []
+            session = self._BrowserSession()
+
+            def close_session() -> None:
+                events.append("close_session")
+
+            session.close_session = close_session
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+
+            def clear_profile() -> tuple[bool, str]:
+                events.append("clear_profile")
+                return True, "로그아웃되었습니다."
+
             with patch.object(
                 monitor,
-                "_CodexUsageMonitor__terminate_spawned_process",
-            ) as terminate:
-                monitor.shutdown()
+                "_CodexUsageMonitor__clear_profile_directory",
+                side_effect=clear_profile,
+            ):
+                ok, _message = monitor.release_profile_session()
 
-            terminate.assert_called_once_with(proc, cleanup_orphans=True)
-            self.assertIsNone(monitor._CodexUsageMonitor__hidden_cdp_proc)
-            self.assertEqual(monitor._CodexUsageMonitor__hidden_cdp_port, 0)
+            self.assertTrue(ok)
+            self.assertEqual(events, ["close_session", "clear_profile"])
+
+    def test_pending_login_timeout_closes_headed_session_after_fifteen_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            monitor._CodexUsageMonitor__pending_login_poll_until_ts = 900.0
+
+            with patch.object(
+                monitor._CodexUsageMonitor__lib.time,
+                "monotonic",
+                return_value=900.0,
+            ):
+                monitor._CodexUsageMonitor__pending_login_poll_tick()
+
+            self.assertEqual(session.calls, ["close_session"])
+            self.assertEqual(
+                monitor.get_runtime_status()["session_state"],
+                "logged_out",
+            )
 
     def test_canonicalize_codex_usage_url_promotes_legacy_usage_path_to_analytics_hash(self) -> None:
         self.assertEqual(
