@@ -67,7 +67,6 @@ class CodexUsageMultiMonitor:
         self.__interval_sec = 90.0
         self.__tooltip_duration_ms = 7000
         self.__usage_url = CURRENT_CODEX_USAGE_URL
-        self.__collection_mode = "playwright"
         self.__refresh_inflight = False
         self.__refresh_lock = threading.Lock()
         self.__root = None
@@ -130,7 +129,7 @@ class CodexUsageMultiMonitor:
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "usage_url": str(self.__usage_url),
-            "collection_mode": str(self.__collection_mode or "playwright"),
+            "collection_mode": "playwright",
             "settings_path": str(self.__settings_path),
             "state_path": str(self.__state_path),
             "default_account_id": str(self.__default_account_id),
@@ -710,7 +709,6 @@ class CodexUsageMultiMonitor:
                     "interval_sec": float(self.__interval_sec),
                     "tooltip_duration_ms": int(self.__tooltip_duration_ms),
                     "usage_url": str(self.__usage_url),
-                    "collection_mode": "playwright",
                 }
             )
         return
