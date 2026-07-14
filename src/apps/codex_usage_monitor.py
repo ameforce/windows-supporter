@@ -4145,6 +4145,8 @@ class CodexUsageMonitor:
             "cloudflare",
             "verify you are human",
             "checking your browser",
+            "challenge-error-text",
+            "enable javascript and cookies to continue",
             "사람인지 확인",
         )
         if any(marker in combined_text for marker in cloudflare_markers):

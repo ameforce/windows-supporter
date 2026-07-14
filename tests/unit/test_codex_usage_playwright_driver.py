@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Callable
 from typing import TypedDict, final
 
 from src.apps.codex_usage_browser_types import (
@@ -41,11 +42,13 @@ class FakePage:
         url: str = USAGE_URL,
         user_agent: str = "Chrome/140",
         probe: UsageProbePayload | None = None,
+        probes: list[UsageProbePayload] | None = None,
         failures: int = 0,
     ) -> None:
         self.url: str = url
         self.user_agent: str = user_agent
         self.probe: UsageProbePayload = probe or PROBE
+        self.probes: list[UsageProbePayload] = list(probes or [])
         self.failures: int = failures
         self.closed: bool = False
         self.calls: list[tuple[str, str]] = []
@@ -68,6 +71,8 @@ class FakePage:
     def evaluate(self, expression: str) -> str | UsageProbePayload:
         if expression == "() => navigator.userAgent":
             return self.user_agent
+        if self.probes:
+            return self.probes.pop(0)
         return self.probe
 
     def is_closed(self) -> bool:
@@ -166,11 +171,12 @@ def make_driver(
     outcomes: list[FakeContext | OSError],
     *,
     event_log: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[CodexUsagePlaywrightDriver, FakeChromium, FakeStarter]:
     chromium = FakeChromium(outcomes, event_log)
     starter = FakeStarter(chromium)
     config = PlaywrightSessionConfig("profile", USAGE_URL, "probe()")
-    driver = CodexUsagePlaywrightDriver(config, playwright_starter=starter)
+    driver = CodexUsagePlaywrightDriver(config, playwright_starter=starter, sleep=sleep)
     _ = driver.start()
     return driver, chromium, starter
 
@@ -217,6 +223,47 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         self.assertEqual(first_page.calls[0], ("goto", USAGE_URL))
         self.assertTrue(first_context.closed)
         self.assertEqual(len(chromium.calls), 2)
+
+    def test_collect_waits_for_client_rendered_usage_metrics(self) -> None:
+        loading: UsageProbePayload = {
+            "url": USAGE_URL,
+            "mainText": "Usage data loading",
+            "metricBlocks": [],
+        }
+        partial: UsageProbePayload = {
+            "url": USAGE_URL,
+            "mainText": "Remaining credit 0",
+            "metricBlocks": [{"metric_key": "remaining_credit"}],
+        }
+        sleeps: list[float] = []
+        page = FakePage(probes=[loading, partial, PROBE])
+        driver, _chromium, _controller = make_driver(
+            [FakeContext([page])],
+            sleep=sleeps.append,
+        )
+
+        result = driver.collect()
+
+        self.assertEqual(result.probe, PROBE)
+        self.assertEqual(sleeps, [0.25, 0.25])
+
+    def test_collect_returns_cloudflare_challenge_without_waiting(self) -> None:
+        challenge: UsageProbePayload = {
+            "url": USAGE_URL,
+            "title": "Just a moment...",
+            "mainText": "Enable JavaScript and cookies to continue challenge-error-text",
+            "metricBlocks": [],
+        }
+        sleeps: list[float] = []
+        driver, _chromium, _controller = make_driver(
+            [FakeContext([FakePage(probe=challenge)])],
+            sleep=sleeps.append,
+        )
+
+        result = driver.collect()
+
+        self.assertEqual(result.probe, challenge)
+        self.assertEqual(sleeps, [])
 
     def test_collect_classifies_profile_lock_and_missing_chrome_channel(self) -> None:
         cases = (

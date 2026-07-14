@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import final, override
 from urllib.parse import urlsplit, urlunsplit
@@ -77,10 +79,12 @@ class CodexUsagePlaywrightDriver:
         config: PlaywrightSessionConfig,
         log_sink: LogSink | None = None,
         playwright_starter: PlaywrightStarter | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self._config: PlaywrightSessionConfig = config
         self._log_sink: LogSink | None = log_sink
         self._starter: PlaywrightStarter = playwright_starter or _default_playwright_starter
+        self._sleep: Callable[[float], None] = sleep or time.sleep
         self._playwright: PlaywrightLike | None = None
         self._context: ContextLike | None = None
         self._page: PageLike | None = None
@@ -110,11 +114,11 @@ class CodexUsagePlaywrightDriver:
                 for page_attempt in range(2):
                     try:
                         self._navigate_for_collect(page)
-                        probe = parse_usage_probe(page.evaluate(self._config.probe_script))
-                        if probe is not None:
+                        probe = self._evaluate_probe_until_ready(page)
+                        if probe is not None and self._probe_is_terminal(probe):
                             self._set_status(BrowserState.HEADLESS_READY)
                             return BrowserOperationResult(probe=probe)
-                        raise DriverOperationError("usage probe did not return an object")
+                        raise DriverOperationError("usage probe did not become ready")
                     except (DriverOperationError, OSError, RuntimeError) as exc:
                         last_error = str(exc)
                     except _playwright_error_type() as exc:
@@ -137,7 +141,7 @@ class CodexUsagePlaywrightDriver:
         try:
             page = self._ensure_context(headless=False)
             _ = page.goto(self._config.usage_url, timeout=self._config.navigation_timeout_ms, wait_until="domcontentloaded")
-            probe = parse_usage_probe(page.evaluate(self._config.probe_script))
+            probe = self._evaluate_probe_until_ready(page)
             if probe is not None and self._probe_is_authenticated(probe):
                 self._close_context()
                 _ = self._ensure_context(headless=True)
@@ -165,7 +169,7 @@ class CodexUsagePlaywrightDriver:
             self._close_context()
             return self._fail(BrowserErrorCode.LOGIN_WINDOW_CLOSED.value)
         try:
-            probe = parse_usage_probe(page.evaluate(self._config.probe_script))
+            probe = self._evaluate_probe_until_ready(page)
             if probe is not None and self._probe_is_cloudflare(probe):
                 return self._fail(
                     BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
@@ -267,6 +271,41 @@ class CodexUsagePlaywrightDriver:
             return False
         return bool(probe.get("metricBlocks")) or any(token in main_text for token in ("usage", "limit", "사용", "한도"))
 
+    def _evaluate_probe_until_ready(self, page: PageLike) -> UsageProbePayload | None:
+        last_probe: UsageProbePayload | None = None
+        for attempt in range(21):
+            probe = parse_usage_probe(page.evaluate(self._config.probe_script))
+            if probe is None:
+                raise DriverOperationError("usage probe did not return an object")
+            last_probe = probe
+            if self._probe_is_terminal(probe):
+                return probe
+            if attempt < 20:
+                self._sleep(0.25)
+        return last_probe
+
+    def _probe_is_terminal(self, probe: UsageProbePayload) -> bool:
+        if any(
+            str(block.get("metric_key", "")) != "remaining_credit"
+            for block in probe.get("metricBlocks", [])
+        ):
+            return True
+        if self._probe_is_cloudflare(probe):
+            return True
+        url = str(probe.get("url", "")).lower()
+        combined = " ".join(str(probe.get(key, "")) for key in ("title", "mainText")).lower()
+        if any(token in url for token in ("/login", "/auth", "signin", "sign-in")):
+            return True
+        return any(
+            marker in combined
+            for marker in (
+                "log in",
+                "sign in",
+                "continue with google",
+                "로그인",
+            )
+        )
+
     def _probe_is_cloudflare(self, probe: UsageProbePayload) -> bool:
         combined = " ".join(
             str(probe.get(key, ""))
@@ -279,6 +318,8 @@ class CodexUsagePlaywrightDriver:
                 "verify you are human",
                 "checking your browser",
                 "challenge-platform",
+                "challenge-error-text",
+                "enable javascript and cookies to continue",
             )
         )
 
