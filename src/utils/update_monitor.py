@@ -2709,7 +2709,7 @@ def build_remote_tag_check_command(remote: str = "origin") -> list[str]:
 
 def build_fetch_origin_command(remote: str = "origin") -> list[str]:
     resolved_remote = str(remote or "").strip() or "origin"
-    return ["git", "fetch", "--tags", resolved_remote]
+    return ["git", "fetch", "--force", "--tags", resolved_remote]
 
 
 def build_switch_main_command(branch: str = "main") -> list[str]:
