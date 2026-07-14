@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# noqa: SIZE_OK — legacy updater/UI integration module; recovery logic stays extracted.
+
 import json
 import os
 import re
@@ -17,8 +19,13 @@ from typing import Any, Callable
 from src.utils.app_version import get_app_version
 from src.utils.progress_subprocess import run_no_window_with_progress
 from src.utils.subprocess_utils import popen_no_window, run_no_window
+from src.utils.update_handoff_recovery import (
+    UpdateHandoffError,
+    build_relaunch_environment,
+    restore_previous_executable,
+    wait_for_process_stability,
+)
 from src.utils.update_settings import (
-    UpdateSettings,
     get_update_settings_path,
     load_update_settings,
     save_update_settings,
@@ -47,6 +54,7 @@ UPDATE_HANDOFF_FILENAME = "update_handoff.json"
 UPDATE_HANDOFF_EXECUTABLE_NAME = "windows-supporter-updater.exe"
 UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS = 15.0
 UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS = 1800
+UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS = 5.0
 UPDATE_PROGRESS_TITLE = "Windows Supporter 업데이트"
 UPDATE_PROGRESS_FAILURE_TITLE = "Windows Supporter 업데이트 실패"
 UPDATE_PROGRESS_LOG_BUTTON_TEXT = "로그 열기"
@@ -298,6 +306,7 @@ UPDATE_PROGRESS_STEP_BY_KEY = {step.key: step for step in UPDATE_PROGRESS_STEPS}
 BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
     BuildOutputProgressRule("Shutting down the running", "실행 중인 앱 종료 중", 12),
     BuildOutputProgressRule("Stopping stale PyInstaller workers", "빌드 작업자 정리 중", 18),
+    BuildOutputProgressRule("Preparing pinned uv", "uv 빌드 도구 준비 중", 22),
     BuildOutputProgressRule("Syncing uv environment", "uv 환경 동기화 중", 30),
     BuildOutputProgressRule("Preparing bundled Playwright", "브라우저 런타임 준비 중", 38),
     BuildOutputProgressRule("Cleaning prior PyInstaller", "이전 빌드 산출물 정리 중", 46),
@@ -1535,6 +1544,9 @@ def run_update_handoff(
         )
         return 1
 
+    root_executable = Path(repo_root) / "windows-supporter.exe"
+    recovery_executable = Path(str(state.get("recovery_executable_path") or ""))
+    relaunch_environment = build_relaunch_environment(os.environ)
     progress_ui = progress_ui_factory(log_path=log_path) if callable(progress_ui_factory) else None
     attempts = max(1, int(max_attempts or 1))
     for attempt in range(1, attempts + 1):
@@ -1583,6 +1595,7 @@ def run_update_handoff(
             progress=start_progress,
         )
         append_update_log(log_path, f"handoff attempt {attempt} acknowledged")
+        failed_step = "build.bat 실행"
         try:
             shutdown_progress = build_update_progress_snapshot(
                 "shutdown",
@@ -1633,8 +1646,11 @@ def run_update_handoff(
                 seen=published_build_labels,
             )
             if int(getattr(result, "returncode", 1) or 0) != 0:
-                raise RuntimeError(f"build.bat failed with exit code {getattr(result, 'returncode', 1)}")
+                raise UpdateHandoffError(
+                    f"build.bat failed with exit code {getattr(result, 'returncode', 1)}"
+                )
 
+            failed_step = "새 버전 기동 확인"
             relaunch_progress = build_update_progress_snapshot(
                 "relaunch",
                 state="running",
@@ -1647,10 +1663,18 @@ def run_update_handoff(
                 status="running",
                 progress=relaunch_progress,
             )
-            exe_path = str(Path(repo_root) / "windows-supporter.exe")
-            proc = launch([exe_path], cwd=repo_root)
+            exe_path = str(root_executable)
+            proc = launch([exe_path], cwd=repo_root, env=relaunch_environment)
             if proc is None:
-                raise RuntimeError("failed to relaunch windows-supporter.exe")
+                raise UpdateHandoffError("failed to relaunch windows-supporter.exe")
+            is_stable, returncode = wait_for_process_stability(
+                proc,
+                timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
+            )
+            if not is_stable:
+                raise UpdateHandoffError(
+                    f"windows-supporter.exe exited during startup with code {returncode}"
+                )
             for gui_name, gui_command in _extract_git_gui_relaunch_commands(state):
                 try:
                     launch(gui_command, cwd=repo_root)
@@ -1677,12 +1701,48 @@ def run_update_handoff(
             return 0
         except Exception as exc:
             can_retry = attempt < attempts
+            recovery_status = "failed"
+            recovery_error = ""
+            recovered_at = None
+            try:
+                restore_previous_executable(recovery_executable, root_executable)
+                recovery_proc = launch(
+                    [str(root_executable)],
+                    cwd=repo_root,
+                    env=relaunch_environment,
+                )
+                if recovery_proc is None:
+                    raise UpdateHandoffError(
+                        "failed to relaunch the previous windows-supporter.exe"
+                    )
+                recovery_stable, recovery_returncode = wait_for_process_stability(
+                    recovery_proc,
+                    timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
+                )
+                if not recovery_stable:
+                    raise UpdateHandoffError(
+                        "previous windows-supporter.exe exited during startup "
+                        f"with code {recovery_returncode}"
+                    )
+                recovery_status = "complete"
+                recovered_at = time.time()
+                append_update_log(log_path, "previous executable restored and relaunched")
+            except (OSError, UpdateHandoffError) as recovery_exc:
+                recovery_error = str(recovery_exc)
+                append_update_log(log_path, f"previous executable recovery failed: {recovery_error}")
+
+            recovery_detail = (
+                "이전 버전 복원 및 재기동 완료"
+                if recovery_status == "complete"
+                else f"이전 버전 복구 실패: {recovery_error}"
+            )
+            error_detail = f"{exc} ({recovery_detail})"
             failed_progress = build_update_progress_snapshot(
                 "failed",
                 state="failed",
-                detail=str(exc),
+                detail=error_detail,
                 log_path=log_path,
-                failed_step="build/relaunch handoff",
+                failed_step=failed_step,
                 can_retry=can_retry,
                 can_manual_action=True,
             )
@@ -1692,12 +1752,15 @@ def run_update_handoff(
                 state_path,
                 status="failed",
                 failed_at=time.time(),
-                failed_step="build/relaunch handoff",
-                error=str(exc),
+                failed_step=failed_step,
+                error=error_detail,
                 attempt=attempt,
+                recovery_status=recovery_status,
+                recovery_error=recovery_error,
+                recovered_at=recovered_at,
                 progress=failed_progress,
             )
-            append_update_log(log_path, f"handoff attempt {attempt} failed: {exc}")
+            append_update_log(log_path, f"handoff attempt {attempt} failed: {error_detail}")
             if can_retry and progress_ui is not None and progress_ui.wait_for_retry_or_close():
                 continue
             return 1
@@ -2492,6 +2555,9 @@ class WindowsSupporterUpdater:
                 working_tree=self._working_tree_state,
                 log_path=log_path,
                 preflight=self._preflight_result,
+            )
+            payload["recovery_executable_path"] = str(
+                get_update_handoff_executable_path(handoff_path.parent)
             )
             self._handoff_writer(handoff_path, payload)
             command = self._handoff_command_builder(handoff_path)
