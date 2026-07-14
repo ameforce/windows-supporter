@@ -86,6 +86,15 @@ def _classify_error(message: str, *, login_poll: bool = False) -> str:
         return BrowserErrorCode.PLAYWRIGHT_UNAVAILABLE.value
     if login_poll and any(token in lowered for token in ("closed", "target page", "browser has been closed")):
         return BrowserErrorCode.LOGIN_WINDOW_CLOSED.value
+    if any(
+        token in lowered
+        for token in (
+            "timeout",
+            "timed out",
+            "deadline exceeded",
+        )
+    ):
+        return BrowserErrorCode.COMMAND_TIMEOUT.value
     return BrowserErrorCode.COLLECT_FAILED.value
 
 
@@ -130,20 +139,17 @@ class CodexUsagePlaywrightDriver:
             last_error = "usage collection failed"
             try:
                 page = self._ensure_context(headless=True)
-                for page_attempt in range(2):
-                    try:
-                        self._navigate_for_collect(page)
-                        probe = self._evaluate_probe_until_ready(page)
-                        if probe is not None and self._probe_is_terminal(probe):
-                            self._set_status(BrowserState.HEADLESS_READY)
-                            return BrowserOperationResult(probe=probe)
-                        raise DriverOperationError("usage probe did not become ready")
-                    except (DriverOperationError, OSError, RuntimeError) as exc:
-                        last_error = str(exc)
-                    except _playwright_error_type() as exc:
-                        last_error = str(exc)
-                    if page_attempt == 0:
-                        page = self._replace_page()
+                try:
+                    self._navigate_for_collect(page)
+                    probe = self._evaluate_probe_until_ready(page)
+                    if probe is not None and self._probe_is_terminal(probe):
+                        self._set_status(BrowserState.HEADLESS_READY)
+                        return BrowserOperationResult(probe=probe)
+                    raise DriverOperationError("usage probe did not become ready")
+                except (DriverOperationError, OSError, RuntimeError) as exc:
+                    last_error = str(exc)
+                except _playwright_error_type() as exc:
+                    last_error = str(exc)
                 error = _classify_error(last_error)
             except (DriverOperationError, OSError, RuntimeError) as exc:
                 last_error = str(exc)
@@ -151,11 +157,17 @@ class CodexUsagePlaywrightDriver:
             except _playwright_error_type() as exc:
                 last_error = str(exc)
                 error = _classify_error(last_error)
-            if error != BrowserErrorCode.COLLECT_FAILED.value:
+            if error not in {
+                BrowserErrorCode.COLLECT_FAILED.value,
+                BrowserErrorCode.COMMAND_TIMEOUT.value,
+            }:
                 return self._fail(error, last_error)
             if context_attempt == 0:
                 self._set_status(BrowserState.RECOVERING)
                 self._close_context()
+                continue
+            self._close_context()
+            return self._fail(error, last_error)
         return self._fail(BrowserErrorCode.COLLECT_FAILED.value)
 
     def open_login(self) -> BrowserOperationResult:

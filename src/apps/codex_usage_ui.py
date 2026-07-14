@@ -1231,6 +1231,8 @@ class CodexUsageSettingsView:
         pending_login_reason = str(runtime.get("pending_login_poll_reason", "") or "")
         browser_state = str(runtime.get("browser_state", "stopped") or "stopped")
         browser_last_error = str(runtime.get("browser_last_error", "") or "")
+        retry_attempt = max(0, int(runtime.get("browser_retry_attempt", 0) or 0))
+        retry_max = max(0, int(runtime.get("browser_retry_max", 0) or 0))
         login_window_open = bool(runtime.get("login_window_open", False))
         try:
             inflight = bool(runtime.get("collect_inflight", False))
@@ -1239,6 +1241,11 @@ class CodexUsageSettingsView:
         source = str(runtime.get("collect_source", "") or "")
         if logout_in_progress or monitor_state == "cancelling":
             return "로그아웃 중"
+        if browser_last_error == "command_timeout":
+            if browser_state == "recovering" or inflight:
+                progress = f" ({retry_attempt}/{retry_max})" if retry_max > 0 else ""
+                return f"조회 시간 초과 · 연결 복구 중{progress}"
+            return "조회 시간 초과 · 자동 재시도 종료"
         if inflight:
             state = "로그인 창 여는 중" if source == "manual_login" else "조회 중"
             if source and source != "manual_login":
@@ -1316,7 +1323,11 @@ class CodexUsageSettingsView:
             runtime = {}
         monitor_state = str(runtime.get("monitor_state") or "idle")
         session_state = str(runtime.get("session_state") or "")
+        failure_count = int(runtime.get("failure_count") or 0)
+        browser_last_error = str(runtime.get("browser_last_error") or "").strip()
         if self._captured_at_is_stale(captured_at, stale_after_sec):
+            return True
+        if failure_count > 0 or browser_last_error:
             return True
         if bool(runtime.get("collect_inflight", False)):
             return True
