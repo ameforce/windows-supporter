@@ -20,11 +20,16 @@ from src.apps.codex_usage_playwright_session import CodexUsagePlaywrightSession
 class FakeDriver:
     """Mutable driver fake that records owner-thread command routing."""
 
-    def __init__(self, start_error: str | None = None) -> None:
+    def __init__(
+        self,
+        start_error: str | None = None,
+        collect_failures: list[Exception] | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self.thread_ids: list[int] = []
         self.daemon_flags: list[bool] = []
         self.start_error: str | None = start_error
+        self.collect_failures: list[Exception] = list(collect_failures or [])
         self.status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
 
     def _record(self, name: str) -> None:
@@ -41,6 +46,8 @@ class FakeDriver:
 
     def collect(self) -> BrowserOperationResult:
         self._record("collect")
+        if self.collect_failures:
+            raise self.collect_failures.pop(0)
         self.status = BrowserRuntimeStatus(BrowserState.HEADLESS_READY, False, "")
         return BrowserOperationResult(probe={"url": "usage", "metricBlocks": []})
 
@@ -69,8 +76,12 @@ class FakeDriver:
 class DriverFactory:
     """Mutable factory fake proving lazy construction."""
 
-    def __init__(self, start_error: str | None = None) -> None:
-        self.driver: FakeDriver = FakeDriver(start_error)
+    def __init__(
+        self,
+        start_error: str | None = None,
+        collect_failures: list[Exception] | None = None,
+    ) -> None:
+        self.driver: FakeDriver = FakeDriver(start_error, collect_failures)
         self.calls: int = 0
 
     def __call__(
@@ -83,12 +94,16 @@ class DriverFactory:
         return self.driver
 
 
-def make_session(factory: DriverFactory) -> CodexUsagePlaywrightSession:
+def make_session(
+    factory: DriverFactory,
+    *,
+    command_timeout_sec: float = 2.0,
+) -> CodexUsagePlaywrightSession:
     config = PlaywrightSessionConfig(
         profile_dir="profile",
         usage_url="https://chatgpt.com/codex/settings/usage",
         probe_script="probe()",
-        command_timeout_sec=2.0,
+        command_timeout_sec=command_timeout_sec,
     )
     return CodexUsagePlaywrightSession(config, driver_factory=factory)
 
@@ -180,6 +195,26 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertEqual(result.error, "playwright_unavailable")
         self.assertEqual(factory.driver.calls, ["start"])
         self.assertEqual(session.get_runtime_status().state, BrowserState.FAILED)
+        session.shutdown()
+
+    def test_unexpected_collect_exception_does_not_kill_owner_or_stall_next_refresh(self) -> None:
+        factory = DriverFactory(
+            collect_failures=[RuntimeError("unexpected browser owner failure")]
+        )
+        session = make_session(factory, command_timeout_sec=0.1)
+
+        failed = session.collect()
+        recovered = session.collect()
+
+        self.assertEqual(failed.error, "collect_failed")
+        self.assertIsNotNone(
+            recovered.probe,
+            "the next refresh must run instead of timing out behind a dead owner thread",
+        )
+        self.assertEqual(
+            factory.driver.calls[:4],
+            ["start", "collect", "close_session", "collect"],
+        )
         session.shutdown()
 
 
