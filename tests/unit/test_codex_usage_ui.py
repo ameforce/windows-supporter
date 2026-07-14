@@ -654,6 +654,30 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("이전 값:", summary)
         self.assertIn("100%", summary)
 
+    def test_command_timeout_shows_recovery_progress_and_marks_snapshot_previous(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        runtime = {
+            "monitor_state": "idle",
+            "session_state": "logged_in",
+            "collect_inflight": False,
+            "browser_state": "recovering",
+            "browser_last_error": "command_timeout",
+            "browser_retry_attempt": 1,
+            "browser_retry_max": 3,
+        }
+
+        self.assertEqual(
+            view._runtime_state_text(runtime),
+            "조회 시간 초과 · 연결 복구 중 (1/3)",
+        )
+        self.assertTrue(
+            view._runtime_snapshot_is_previous(
+                runtime,
+                captured_at="2999-01-01T00:00:00+09:00",
+                stale_after_sec=300.0,
+            )
+        )
+
     def test_profile_order_swap_autosaves_without_moving_profile_dirs(self) -> None:
         class _FakeMonitor:
             def __init__(self):

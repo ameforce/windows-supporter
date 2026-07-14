@@ -4906,6 +4906,9 @@ def _account_status(
         _parse_percent(snapshot.get(metric_key)) is not None
         for metric_key, _label in _TASKBAR_METRICS
     )
+    browser_last_error = str(runtime.get("browser_last_error") or "").strip()
+    if browser_last_error == "command_timeout":
+        return {"state": "timeout", "text": "TIME", "color": "#f59e0b"}
     if collect_inflight and not has_metric:
         return {"state": "sync", "text": "SYNC", "color": "#38bdf8"}
     if monitor_state == "paused_profile_in_use":
@@ -4913,7 +4916,6 @@ def _account_status(
     if monitor_state == "paused_auth_required" or session_state == "logged_out":
         return {"state": "login", "text": "OUT", "color": "#f59e0b"}
     failure_count = int(runtime.get("failure_count") or 0)
-    browser_last_error = str(runtime.get("browser_last_error") or "").strip()
     if failure_count > 0 or browser_last_error:
         return {"state": "error", "text": "ERR", "color": "#f59e0b"}
     if not has_metric:
