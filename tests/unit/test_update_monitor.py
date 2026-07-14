@@ -220,7 +220,6 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
     def test_force_clean_command_builders_are_safe_and_explicit(self) -> None:
         backup_name = build_backup_branch_name("20260614-120000", "abc123")
 
-        self.assertEqual(build_fetch_origin_command(), ["git", "fetch", "--tags", "origin"])
         self.assertEqual(build_switch_main_command(), ["git", "switch", "main"])
         self.assertEqual(build_reset_main_command(), ["git", "reset", "--hard", "origin/main"])
         self.assertEqual(
@@ -236,6 +235,13 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             build_backup_branch_command(backup_name),
             ["git", "branch", backup_name, "main"],
         )
+
+    def test_fetch_command_forces_authoritative_remote_tags(self) -> None:
+        # Given / When
+        command = build_fetch_origin_command()
+
+        # Then
+        self.assertEqual(command, ["git", "fetch", "--force", "--tags", "origin"])
 
     def test_working_tree_state_flags_cleanup_without_source_stash(self) -> None:
         cleanup_only = UpdateWorkingTreeState(cleanup_targets=("build/generated.tmp",))
