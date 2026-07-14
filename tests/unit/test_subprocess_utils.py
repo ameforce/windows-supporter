@@ -86,6 +86,36 @@ class SubprocessUtilsUnitTest(unittest.TestCase):
         self.assertEqual(calls[0][0], ["app.exe"])
         self.assertEqual(calls[0][1]["cwd"], r"C:\repo")
 
+    def test_popen_no_window_passes_explicit_environment(self) -> None:
+        # Given
+        calls = []
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs) -> None:
+                calls.append((list(argv), dict(kwargs)))
+
+        import src.utils.subprocess_utils as subprocess_utils
+
+        original_popen = subprocess_utils.subprocess.Popen
+        try:
+            subprocess_utils.subprocess.Popen = FakePopen
+
+            # When
+            proc = popen_no_window(
+                ["app.exe"],
+                cwd=r"C:\repo",
+                env={"PYINSTALLER_RESET_ENVIRONMENT": "1"},
+            )
+        finally:
+            subprocess_utils.subprocess.Popen = original_popen
+
+        # Then
+        self.assertIsNotNone(proc)
+        self.assertEqual(
+            calls[0][1]["env"],
+            {"PYINSTALLER_RESET_ENVIRONMENT": "1"},
+        )
+
     def test_build_python_module_command_skips_frozen_runtime(self) -> None:
         logs: list[str] = []
         runtime = types.SimpleNamespace(

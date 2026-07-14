@@ -48,6 +48,7 @@ from src.utils.update_monitor import (
     build_update_progress_snapshot,
     close_running_git_gui_processes,
     cleanup_update_handoff_executable,
+    get_update_handoff_executable_path,
     get_update_progress_step,
     is_git_checkout_root,
     parse_clean_probe_output,
@@ -81,6 +82,11 @@ def _primary_worktree_runner(repo_root: str | os.PathLike[str] = "."):
         stdout=output,
         stderr="",
     )
+
+
+class StablePopen:
+    def wait(self, timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(cmd=["windows-supporter.exe"], timeout=timeout)
 
 
 class UpdateMonitorCoreUnitTest(unittest.TestCase):
@@ -1296,7 +1302,8 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                launch=lambda command, **kwargs: launches.append((command, dict(kwargs)))
+                or StablePopen(),
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     FakeProgressUi(**kwargs)
                 )
@@ -1311,7 +1318,12 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             fake_subprocess.calls[0][1]["env"]["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"],
             "1",
         )
-        self.assertEqual(launches, [([str(repo / "windows-supporter.exe")], {"cwd": str(repo)})])
+        self.assertEqual(launches[0][0], [str(repo / "windows-supporter.exe")])
+        self.assertEqual(launches[0][1]["cwd"], str(repo))
+        self.assertEqual(
+            launches[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"],
+            "1",
+        )
         self.assertEqual(state["status"], "complete")
         self.assertEqual(state["progress"]["label"], "업데이트 완료")
         self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
@@ -1362,18 +1374,19 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, dict(kwargs))) or object(),
+                launch=lambda command, **kwargs: launches.append((command, dict(kwargs)))
+                or StablePopen(),
                 progress_ui_factory=lambda **_kwargs: None,
             )
 
         self.assertEqual(rc, 0)
+        self.assertEqual(launches[0][0], [str(repo / "windows-supporter.exe")])
+        self.assertEqual(launches[0][1]["cwd"], str(repo))
         self.assertEqual(
-            launches,
-            [
-                ([str(repo / "windows-supporter.exe")], {"cwd": str(repo)}),
-                (["C:/Apps/Fork/Fork.exe"], {"cwd": str(repo)}),
-            ],
+            launches[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"],
+            "1",
         )
+        self.assertEqual(launches[1], (["C:/Apps/Fork/Fork.exe"], {"cwd": str(repo)}))
 
     def test_run_no_window_with_progress_pumps_ui_while_waiting_for_build_output(self) -> None:
         class SlowStdout:
@@ -1546,7 +1559,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, kwargs)) or object(),
+                launch=lambda command, **kwargs: launches.append((command, kwargs)) or StablePopen(),
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     FakeProgressUi(process=fake_subprocess.process, **kwargs)
                 )
@@ -1677,7 +1690,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, kwargs)) or object(),
+                launch=lambda command, **kwargs: launches.append((command, kwargs)) or StablePopen(),
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     FakeProgressUi(process=fake_subprocess.process, **kwargs)
                 )
@@ -1837,7 +1850,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, kwargs)) or object(),
+                launch=lambda command, **kwargs: launches.append((command, kwargs)) or StablePopen(),
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     RetryingProgressUi(**kwargs)
                 )
@@ -1923,6 +1936,10 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(state["status"], "pending")
         self.assertEqual(state["repo_root"], str(Path(tmp).resolve()))
         self.assertEqual(state["target_tag"], "v0.5.7")
+        self.assertEqual(
+            state["recovery_executable_path"],
+            str(get_update_handoff_executable_path(state_path.parent)),
+        )
         self.assertEqual(state["working_tree"]["cleanup_targets"], ["build/generated.tmp"])
         self.assertEqual(state["preflight"]["force_clean_approved"], False)
 
