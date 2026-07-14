@@ -1187,7 +1187,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(view._collect_state_var.value, "로그인 완료 대기 중")
         self.assertEqual(view._next_collect_var.value, "최대 482초")
 
-    def test_refresh_runtime_status_shows_pending_login_cdp_wait_state(self) -> None:
+    def test_refresh_runtime_status_shows_open_login_window_wait_state(self) -> None:
         class _Var:
             def __init__(self):
                 self.value = None
@@ -1221,8 +1221,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "profile_in_use": False,
             "pending_login_poll_active": True,
             "pending_login_poll_remaining_sec": 321.2,
-            "pending_login_no_cdp_miss_count": 2,
-            "pending_login_no_cdp_max_misses": 6,
+            "browser_state": "headed_login",
+            "login_window_open": True,
             "collect_inflight": False,
             "next_collect_in_sec": None,
             "next_collect_estimated": False,
@@ -1230,10 +1230,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "로그인 창 감지 대기 중 (2/6)")
+        self.assertEqual(view._collect_state_var.value, "로그인 완료 대기 중")
         self.assertEqual(view._next_collect_var.value, "최대 321초")
 
-    def test_refresh_runtime_status_shows_existing_chrome_cdp_state(self) -> None:
+    def test_refresh_runtime_status_shows_missing_chrome_channel_state(self) -> None:
         class _Var:
             def __init__(self):
                 self.value = None
@@ -1265,7 +1265,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "session_state": "logged_out",
             "monitor_state": "idle",
             "profile_in_use": False,
-            "system_chrome_cdp_available": True,
+            "browser_state": "failed",
+            "browser_last_error": "browser_channel_unavailable",
             "pending_login_poll_active": False,
             "collect_inflight": False,
             "next_collect_in_sec": None,
@@ -1274,7 +1275,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "기존 Chrome 세션 감지됨")
+        self.assertEqual(view._collect_state_var.value, "Google Chrome 필요")
         self.assertEqual(view._next_collect_var.value, "-")
 
     def test_refresh_runtime_status_shows_auth_attention_state(self) -> None:
@@ -1359,8 +1360,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "pending_login_poll_active": True,
             "pending_login_poll_reason": "cloudflare_challenge",
             "pending_login_poll_remaining_sec": 88.8,
-            "pending_login_no_cdp_miss_count": 0,
-            "pending_login_no_cdp_max_misses": 6,
+            "browser_state": "headed_login",
+            "login_window_open": True,
             "collect_inflight": False,
             "next_collect_in_sec": None,
             "next_collect_estimated": False,
