@@ -79,6 +79,7 @@ class CodexUsagePlaywrightSession:
         driver_factory: DriverFactory | None = None,
         playwright_starter: PlaywrightStarter | None = None,
         sleep: Callable[[float], None] | None = None,
+        unrecoverable_timeout_handler: Callable[[], bool] | None = None,
     ) -> None:
         self._config: PlaywrightSessionConfig = config
         self._log_sink: LogSink | None = log_sink
@@ -90,6 +91,8 @@ class CodexUsagePlaywrightSession:
         self._driver: DriverProtocol | None = None
         self._worker_generation: int = 0
         self._worker_poisoned: bool = False
+        self._worker_recovery_exhausted: bool = False
+        self._recovery_request_sent: bool = False
         self._status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         self._shutdown: bool = False
         self._timeout_retry_delays_sec = tuple(
@@ -99,6 +102,7 @@ class CodexUsagePlaywrightSession:
             0.0, float(config.timeout_recovery_grace_sec)
         )
         self._sleep = sleep or time.sleep
+        self._unrecoverable_timeout_handler = unrecoverable_timeout_handler
 
     def collect(self) -> BrowserOperationResult:
         retry_max = len(self._timeout_retry_delays_sec)
@@ -110,6 +114,19 @@ class CodexUsagePlaywrightSession:
                 retry_max=retry_max,
             )
             if result.error != BrowserErrorCode.COMMAND_TIMEOUT.value:
+                return result
+            with self._lock:
+                recovery_exhausted = bool(self._worker_recovery_exhausted)
+            if recovery_exhausted:
+                self._update_status(
+                    BrowserRuntimeStatus(
+                        BrowserState.FAILED,
+                        False,
+                        BrowserErrorCode.COMMAND_TIMEOUT.value,
+                        retry_max,
+                        retry_max,
+                    )
+                )
                 return result
             if retry_attempt >= retry_max:
                 self._update_status(
@@ -198,8 +215,11 @@ class CodexUsagePlaywrightSession:
         retry_max: int = 0,
     ) -> BrowserOperationResult:
         worker = self._ensure_worker()
-        if worker is None and self._recover_poisoned_worker():
-            worker = self._ensure_worker()
+        if worker is None:
+            if self._recover_poisoned_worker():
+                worker = self._ensure_worker()
+            else:
+                self._trip_unrecoverable_timeout_circuit()
         if worker is None:
             with self._lock:
                 timeout_pending = self._status.last_error == BrowserErrorCode.COMMAND_TIMEOUT.value
@@ -239,7 +259,8 @@ class CodexUsagePlaywrightSession:
                     retry_max,
                 )
             )
-            _ = self._recover_poisoned_worker()
+            if not self._recover_poisoned_worker():
+                self._trip_unrecoverable_timeout_circuit()
             return BrowserOperationResult(error=BrowserErrorCode.COMMAND_TIMEOUT.value)
         return envelope.result
 
@@ -267,6 +288,8 @@ class CodexUsagePlaywrightSession:
                 self._thread = None
                 self._driver = None
                 self._worker_poisoned = False
+                self._worker_recovery_exhausted = False
+                self._recovery_request_sent = False
             self._status = BrowserRuntimeStatus(BrowserState.STARTING, False, "")
             self._worker_generation += 1
             generation = self._worker_generation
@@ -372,6 +395,25 @@ class CodexUsagePlaywrightSession:
         except Exception:
             pass
         return not thread.is_alive()
+
+    def _trip_unrecoverable_timeout_circuit(self) -> None:
+        with self._lock:
+            self._worker_recovery_exhausted = True
+            if self._recovery_request_sent:
+                return
+            self._recovery_request_sent = True
+            handler = self._unrecoverable_timeout_handler
+        requested = False
+        if handler is not None:
+            try:
+                requested = bool(handler())
+            except Exception as exc:
+                self._log(
+                    "browser owner process-boundary recovery failed "
+                    f"type={type(exc).__name__}"
+                )
+        outcome = "app_restart_requested" if requested else "circuit_open"
+        self._log(f"browser owner unresponsive recovery={outcome}")
 
     def _shutdown_driver(self, driver: DriverProtocol) -> None:
         try:

@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 
 from src.utils.LibConnector import LibConnector
@@ -24,6 +25,8 @@ from src.utils.update_monitor import (
 _ERROR_ACCESS_DENIED = 5
 _ERROR_ALREADY_EXISTS = 183
 _SINGLE_INSTANCE_MUTEX_NAME = "Local\\windows-supporter-main-instance"
+_CODEX_TIMEOUT_RECOVERY_RESTART_ENV = "WINDOWS_SUPPORTER_CODEX_TIMEOUT_RECOVERY_RESTART_AT"
+_CODEX_TIMEOUT_RECOVERY_RESTART_COOLDOWN_SEC = 900.0
 
 
 class _NoopSingleInstanceLock:
@@ -138,6 +141,24 @@ def _build_restart_command(
     return [resolved_executable, os.path.abspath(str(script)), *extra_args]
 
 
+def _claim_codex_timeout_recovery_restart(
+    *,
+    environ: dict[str, str] | None = None,
+    now: float | None = None,
+    cooldown_sec: float = _CODEX_TIMEOUT_RECOVERY_RESTART_COOLDOWN_SEC,
+) -> bool:
+    env = os.environ if environ is None else environ
+    current = float(time.time() if now is None else now)
+    try:
+        previous = float(env.get(_CODEX_TIMEOUT_RECOVERY_RESTART_ENV, "") or 0.0)
+    except (TypeError, ValueError):
+        previous = 0.0
+    if previous > 0.0 and current - previous < max(0.0, float(cooldown_sec)):
+        return False
+    env[_CODEX_TIMEOUT_RECOVERY_RESTART_ENV] = f"{current:.6f}"
+    return True
+
+
 def _build_restart_environment(
     *,
     environ: Mapping[str, str] | None = None,
@@ -249,8 +270,30 @@ def _run_main_app() -> None:
         root.withdraw()
     except Exception:
         pass
-    monitor = Monitor()
     event_queue: queue.SimpleQueue = queue.SimpleQueue()
+    restart_requested = False
+
+    def _request_restart() -> None:
+        nonlocal restart_requested
+        restart_requested = True
+        try:
+            root.quit()
+        except Exception:
+            pass
+        return
+
+    def _request_codex_timeout_recovery_restart() -> bool:
+        if not _claim_codex_timeout_recovery_restart():
+            return False
+        try:
+            event_queue.put(_request_restart)
+        except Exception:
+            return False
+        return True
+
+    monitor = Monitor(
+        codex_timeout_recovery_handler=_request_codex_timeout_recovery_restart,
+    )
     startup_manager = StartupAppManager()
     updater = WindowsSupporterUpdater(
         root=root,
@@ -314,17 +357,6 @@ def _run_main_app() -> None:
             event_queue.put(lambda: monitor.on_display_topology_changed(reason))
         except Exception:
             pass
-
-    restart_requested = False
-
-    def _request_restart() -> None:
-        nonlocal restart_requested
-        restart_requested = True
-        try:
-            root.quit()
-        except Exception:
-            pass
-        return
 
     tray = SystemTrayIcon(
         tooltip="Windows Supporter",
