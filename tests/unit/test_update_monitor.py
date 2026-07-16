@@ -379,6 +379,22 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("SKIP_POST_BUILD_RUN", script)
         self.assertIn("Skipping post-build launch", script)
 
+    def test_build_bat_artifact_only_mode_avoids_global_process_and_root_exe_mutation(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        self.assertIn("WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY", script)
+        taskkill_guard = script.index('if "%ARTIFACT_ONLY%"=="0" (')
+        taskkill_index = script.index('taskkill /f /t /im "%EXE_NAME%"')
+        taskkill_guard_end = script.index("\n)", taskkill_index)
+        artifact_exit = script.index('if "%ARTIFACT_ONLY%"=="1" (')
+        move_index = script.index('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"')
+
+        self.assertLess(taskkill_guard, taskkill_index)
+        self.assertLess(taskkill_index, taskkill_guard_end)
+        self.assertLess(artifact_exit, move_index)
+        self.assertIn("dist\\%EXE_NAME%", script[artifact_exit:move_index])
+
     def test_build_bat_can_emit_step_log_for_updater_progress(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read()
