@@ -4,7 +4,7 @@ from collections.abc import Callable
 from queue import Queue
 import threading
 import time
-from typing import Protocol, final
+from typing import Any, Protocol, final
 
 from src.apps.codex_usage_browser_types import (
     BrowserCommand,
@@ -24,6 +24,16 @@ from src.apps.codex_usage_browser_types import (
 from src.apps.codex_usage_playwright_driver import (
     CodexUsagePlaywrightDriver,
 )
+from src.apps.codex_usage_playwright_process import (
+    CodexUsagePlaywrightProcessDriver,
+)
+
+
+_RECOVERABLE_WORKER_ERRORS = {
+    BrowserErrorCode.COMMAND_TIMEOUT.value,
+    BrowserErrorCode.RENDERER_CRASHED.value,
+    BrowserErrorCode.TRANSPORT_CLOSED.value,
+}
 
 
 class DriverProtocol(Protocol):
@@ -34,6 +44,7 @@ class DriverProtocol(Protocol):
     def close_session(self) -> None: ...
     def shutdown(self) -> None: ...
     def get_runtime_status(self) -> BrowserRuntimeStatus: ...
+    def force_terminate(self, reason: str) -> bool: ...
 
 
 DriverFactory = Callable[
@@ -47,7 +58,9 @@ def _default_driver_factory(
     log_sink: LogSink | None,
     playwright_starter: PlaywrightStarter | None,
 ) -> DriverProtocol:
-    return CodexUsagePlaywrightDriver(config, log_sink, playwright_starter)
+    if playwright_starter is not None:
+        return CodexUsagePlaywrightDriver(config, log_sink, playwright_starter)
+    return CodexUsagePlaywrightProcessDriver(config, log_sink)
 
 
 @final
@@ -95,6 +108,7 @@ class CodexUsagePlaywrightSession:
         self._recovery_request_sent: bool = False
         self._status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         self._shutdown: bool = False
+        self._session_cookies: list[dict[str, Any]] = []
         self._timeout_retry_delays_sec = tuple(
             max(0.0, float(delay)) for delay in config.timeout_retry_delays_sec
         )
@@ -113,8 +127,9 @@ class CodexUsagePlaywrightSession:
                 retry_attempt=retry_attempt,
                 retry_max=retry_max,
             )
-            if result.error != BrowserErrorCode.COMMAND_TIMEOUT.value:
+            if result.error not in _RECOVERABLE_WORKER_ERRORS:
                 return result
+            recovery_error = result.error or BrowserErrorCode.COMMAND_TIMEOUT.value
             with self._lock:
                 recovery_exhausted = bool(self._worker_recovery_exhausted)
             if recovery_exhausted:
@@ -122,7 +137,7 @@ class CodexUsagePlaywrightSession:
                     BrowserRuntimeStatus(
                         BrowserState.FAILED,
                         False,
-                        BrowserErrorCode.COMMAND_TIMEOUT.value,
+                        recovery_error,
                         retry_max,
                         retry_max,
                     )
@@ -133,7 +148,7 @@ class CodexUsagePlaywrightSession:
                     BrowserRuntimeStatus(
                         BrowserState.FAILED,
                         False,
-                        BrowserErrorCode.COMMAND_TIMEOUT.value,
+                        recovery_error,
                         retry_attempt,
                         retry_max,
                     )
@@ -149,13 +164,14 @@ class CodexUsagePlaywrightSession:
                 BrowserRuntimeStatus(
                     BrowserState.RECOVERING,
                     False,
-                    BrowserErrorCode.COMMAND_TIMEOUT.value,
+                    recovery_error,
                     retry_attempt,
                     retry_max,
                 )
             )
             self._log(
-                "browser timeout retry scheduled "
+                "browser worker recovery retry scheduled "
+                f"error={recovery_error} "
                 f"attempt={retry_attempt} max={retry_max} delay_sec={delay_sec:g}"
             )
             if delay_sec > 0.0:
@@ -186,7 +202,16 @@ class CodexUsagePlaywrightSession:
             self._shutdown = True
             poisoned = bool(self._worker_poisoned)
         if poisoned:
-            _ = self._recover_poisoned_worker()
+            recovered = self._recover_poisoned_worker()
+            if not recovered:
+                self._trip_unrecoverable_timeout_circuit()
+                with self._lock:
+                    self._status = BrowserRuntimeStatus(
+                        BrowserState.FAILED,
+                        False,
+                        BrowserErrorCode.COMMAND_TIMEOUT.value,
+                    )
+                return
             with self._lock:
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
             return
@@ -194,10 +219,27 @@ class CodexUsagePlaywrightSession:
         self._queue.put(envelope)
         completed = envelope.completed.wait(self._config.command_timeout_sec)
         if not completed:
+            driver: DriverProtocol | None = None
             with self._lock:
                 if thread is self._thread:
                     self._worker_poisoned = True
-            _ = self._recover_poisoned_worker()
+                    driver = self._driver
+            hard_boundary_supported = self._driver_supports_hard_termination(driver)
+            hard_cancelled = self._force_terminate_driver(
+                driver,
+                reason=BrowserErrorCode.COMMAND_TIMEOUT.value,
+            )
+            self._capture_session_cookies(driver)
+            recovered = self._recover_poisoned_worker()
+            if not recovered or (hard_boundary_supported and not hard_cancelled):
+                self._trip_unrecoverable_timeout_circuit()
+                with self._lock:
+                    self._status = BrowserRuntimeStatus(
+                        BrowserState.FAILED,
+                        False,
+                        BrowserErrorCode.COMMAND_TIMEOUT.value,
+                    )
+                return
         else:
             thread.join(self._timeout_recovery_grace_sec)
         with self._lock:
@@ -239,29 +281,48 @@ class CodexUsagePlaywrightSession:
         queue.put(envelope)
         timeout_sec = self._command_timeout_sec(command)
         if not envelope.completed.wait(timeout_sec):
+            driver: DriverProtocol | None = None
             with self._lock:
                 worker_alive = bool(thread.is_alive())
                 queue_depth = queue.qsize()
                 if generation == self._worker_generation and thread is self._thread:
                     self._worker_poisoned = True
+                    driver = self._driver
+            hard_cancelled = self._force_terminate_driver(
+                driver,
+                reason=BrowserErrorCode.COMMAND_TIMEOUT.value,
+            )
+            self._capture_session_cookies(driver)
+            hard_boundary_supported = self._driver_supports_hard_termination(driver)
+            recovery_error = BrowserErrorCode.COMMAND_TIMEOUT.value
+            if hard_cancelled and driver is not None:
+                try:
+                    signaled_error = driver.get_runtime_status().last_error
+                except Exception:
+                    signaled_error = ""
+                if signaled_error in _RECOVERABLE_WORKER_ERRORS:
+                    recovery_error = signaled_error
             self._log(
                 "browser owner command timed out "
                 f"command={type(command).__name__} "
                 f"worker_alive={worker_alive} queue_depth={queue_depth} "
-                f"generation={generation} timeout_sec={timeout_sec:g}"
+                f"generation={generation} timeout_sec={timeout_sec:g} "
+                f"hard_cancelled={str(hard_cancelled).lower()} "
+                f"error={recovery_error}"
             )
             self._update_status(
                 BrowserRuntimeStatus(
                     BrowserState.RECOVERING,
                     False,
-                    BrowserErrorCode.COMMAND_TIMEOUT.value,
+                    recovery_error,
                     min(retry_attempt + 1, retry_max),
                     retry_max,
                 )
             )
-            if not self._recover_poisoned_worker():
+            recovered = self._recover_poisoned_worker()
+            if not recovered or (hard_boundary_supported and not hard_cancelled):
                 self._trip_unrecoverable_timeout_circuit()
-            return BrowserOperationResult(error=BrowserErrorCode.COMMAND_TIMEOUT.value)
+            return BrowserOperationResult(error=recovery_error)
         return envelope.result
 
     def _command_timeout_sec(self, command: BrowserCommand) -> float:
@@ -306,6 +367,7 @@ class CodexUsagePlaywrightSession:
 
     def _run(self, queue: Queue[_CommandEnvelope], generation: int) -> None:
         driver = self._driver_factory(self._config, self._log_sink, self._playwright_starter)
+        self._restore_session_cookies(driver)
         with self._lock:
             if generation == self._worker_generation:
                 self._driver = driver
@@ -330,11 +392,15 @@ class CodexUsagePlaywrightSession:
                             envelope.retry_max,
                         )
                     )
+                if started.error in _RECOVERABLE_WORKER_ERRORS:
+                    started = driver.start()
+                    self._update_status(driver.get_runtime_status())
                 if started.error is not None:
                     envelope.result = started
                 else:
                     try:
                         result = self._dispatch(driver, command)
+                        self._capture_session_cookies(driver)
                         if self._is_worker_poisoned(generation):
                             envelope.result = BrowserOperationResult(
                                 error=BrowserErrorCode.COMMAND_TIMEOUT.value
@@ -420,6 +486,65 @@ class CodexUsagePlaywrightSession:
             driver.shutdown()
         except Exception as exc:
             self._log(f"browser owner shutdown failed type={type(exc).__name__}")
+
+    def _force_terminate_driver(
+        self,
+        driver: DriverProtocol | None,
+        *,
+        reason: str,
+    ) -> bool:
+        if driver is None:
+            return False
+        terminate = getattr(driver, "force_terminate", None)
+        if not callable(terminate):
+            return False
+        try:
+            terminated = bool(terminate(reason))
+        except Exception as exc:
+            self._log(
+                "browser worker hard cancel failed "
+                f"reason={reason} type={type(exc).__name__}"
+            )
+            return False
+        self._log(
+            "browser worker hard cancel "
+            f"reason={reason} terminated={str(terminated).lower()}"
+        )
+        return terminated
+
+    def _driver_supports_hard_termination(
+        self,
+        driver: DriverProtocol | None,
+    ) -> bool:
+        return bool(driver is not None and callable(getattr(driver, "force_terminate", None)))
+
+    def _capture_session_cookies(self, driver: DriverProtocol | None) -> None:
+        if driver is None:
+            return
+        exporter = getattr(driver, "export_session_cookies", None)
+        if not callable(exporter):
+            return
+        try:
+            cookies = exporter()
+        except Exception:
+            return
+        if not isinstance(cookies, list):
+            return
+        with self._lock:
+            self._session_cookies = [
+                dict(cookie) for cookie in cookies if isinstance(cookie, dict)
+            ]
+
+    def _restore_session_cookies(self, driver: DriverProtocol) -> None:
+        importer = getattr(driver, "import_session_cookies", None)
+        if not callable(importer):
+            return
+        with self._lock:
+            cookies = [dict(cookie) for cookie in self._session_cookies]
+        try:
+            importer(cookies)
+        except Exception:
+            return
 
     def _finish_worker(self, generation: int) -> None:
         with self._lock:
