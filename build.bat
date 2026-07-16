@@ -155,6 +155,18 @@ if errorlevel 1 (
 )
 echo [ Success !! ]
 
+REM Exercise frozen multiprocessing re-entry and Windows Job containment
+echo | set /p="Validating Codex usage worker boundary..."
+call :clear_log
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\verify_codex_usage_worker_smoke.py" "dist\%EXE_NAME%" > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo Codex usage worker boundary validation failed.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+
 REM Promote the verified artifact to the repo root
 echo | set /p="Moving %EXE_NAME%..."
 call :clear_log
