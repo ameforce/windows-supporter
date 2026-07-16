@@ -95,6 +95,31 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
             ["account_1", "account_2"],
         )
 
+    def test_codex_timeout_recovery_handler_reaches_each_browser_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            appdata = os.path.join(tmp, "Roaming")
+            localappdata = os.path.join(tmp, "Local")
+            os.makedirs(appdata)
+            os.makedirs(localappdata)
+            handler = lambda: True
+            monitor = Monitor(codex_timeout_recovery_handler=handler)
+
+            with patch.dict(
+                os.environ,
+                {"APPDATA": appdata, "LOCALAPPDATA": localappdata},
+                clear=True,
+            ):
+                codex = monitor.get_codex_usage_monitor()
+
+            self.assertIs(
+                codex._CodexUsageMultiMonitor__unrecoverable_timeout_handler,
+                handler,
+            )
+            for child in codex._CodexUsageMultiMonitor__children.values():
+                session = child._CodexUsageMonitor__browser_session
+                self.assertIs(session._unrecoverable_timeout_handler, handler)
+            codex.shutdown()
+
     def test_display_topology_change_repositions_existing_codex_overlay(self) -> None:
         monitor = Monitor()
         root = object()

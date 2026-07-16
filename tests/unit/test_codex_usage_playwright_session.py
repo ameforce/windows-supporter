@@ -101,10 +101,12 @@ class BlockingDriver(FakeDriver):
         release: threading.Event,
         *,
         release_after_sec: float | None = None,
+        wait_timeout_sec: float | None = 2.0,
     ) -> None:
         super().__init__()
         self.release = release
         self.release_after_sec = release_after_sec
+        self.wait_timeout_sec = wait_timeout_sec
 
     def collect(self) -> BrowserOperationResult:
         self._record("collect")
@@ -112,7 +114,7 @@ class BlockingDriver(FakeDriver):
             timer = threading.Timer(self.release_after_sec, self.release.set)
             timer.daemon = True
             timer.start()
-        _ = self.release.wait(2.0)
+        _ = self.release.wait(self.wait_timeout_sec)
         self.status = BrowserRuntimeStatus(BrowserState.FAILED, False, "collect_failed")
         return BrowserOperationResult(error="collect_failed")
 
@@ -158,6 +160,7 @@ def make_session(
     factory: DriverFactory,
     *,
     command_timeout_sec: float = 2.0,
+    unrecoverable_timeout_handler: Callable[[], bool] | None = None,
 ) -> CodexUsagePlaywrightSession:
     config = PlaywrightSessionConfig(
         profile_dir="profile",
@@ -165,7 +168,11 @@ def make_session(
         probe_script="probe()",
         command_timeout_sec=command_timeout_sec,
     )
-    return CodexUsagePlaywrightSession(config, driver_factory=factory)
+    return CodexUsagePlaywrightSession(
+        config,
+        driver_factory=factory,
+        unrecoverable_timeout_handler=unrecoverable_timeout_handler,
+    )
 
 
 class CodexUsagePlaywrightSessionTest(unittest.TestCase):
@@ -361,6 +368,46 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
             self.assertEqual(factory.calls, 1)
             self.assertEqual(driver.calls, ["start", "collect"])
             self.assertEqual(session._queue.qsize(), 0)
+        finally:
+            release.set()
+            session.shutdown()
+
+    def test_permanently_stuck_owner_requests_process_boundary_recovery_once(self) -> None:
+        release = threading.Event()
+        driver = BlockingDriver(release, wait_timeout_sec=None)
+        factory = SequenceDriverFactory([driver])
+        recovery_requests: list[str] = []
+        retry_sleeps: list[float] = []
+        session = make_session(
+            factory,
+            command_timeout_sec=0.03,
+            unrecoverable_timeout_handler=(
+                lambda: recovery_requests.append("restart") or True
+            ),
+        )
+        session._timeout_retry_delays_sec = (5.0, 15.0, 30.0)
+        session._timeout_recovery_grace_sec = 0.0
+        session._sleep = retry_sleeps.append
+
+        try:
+            first = session.collect()
+            second = session.collect()
+
+            self.assertEqual(first.error, "command_timeout")
+            self.assertEqual(second.error, "command_timeout")
+            self.assertEqual(
+                recovery_requests,
+                ["restart"],
+                "an immortal Playwright owner must request one process-boundary restart",
+            )
+            self.assertEqual(
+                retry_sleeps,
+                [],
+                "once owner cleanup is impossible, fake retries must not sustain a timeout storm",
+            )
+            self.assertEqual(factory.calls, 1)
+            status = session.get_runtime_status()
+            self.assertEqual(status.retry_attempt, status.retry_max)
         finally:
             release.set()
             session.shutdown()
