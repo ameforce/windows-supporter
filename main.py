@@ -1,3 +1,8 @@
+import multiprocessing
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
 import ctypes
 import os
 import queue
@@ -13,6 +18,7 @@ from src.apps.Monitor import Monitor
 from src.apps.main_ui import WindowsSupporterMainUI
 from src.utils.StartReg import StartReg
 from src.apps.startup_apps import StartupAppManager
+from src.apps.codex_usage_playwright_process import run_process_boundary_smoke
 from src.utils.tray_icon import SystemTrayIcon
 from src.utils.ui_event_pump import SharedUiEventPump
 from src.utils.update_monitor import (
@@ -224,6 +230,8 @@ def _restart_current_process() -> None:
 
 
 def main() -> None:
+    if "--codex-usage-worker-smoke" in sys.argv:
+        raise SystemExit(run_process_boundary_smoke())
     if run_update_handoff_from_argv(sys.argv):
         return
     single_instance_lock = _acquire_single_instance_lock()

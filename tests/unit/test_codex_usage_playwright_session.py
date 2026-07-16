@@ -140,6 +140,50 @@ class TimeoutThenSuccessDriver(FakeDriver):
 
 
 @final
+class TerminableBlockingDriver(BlockingDriver):
+    def force_terminate(self, reason: str) -> bool:
+        self.calls.append(f"force_terminate:{reason}")
+        self.release.set()
+        return True
+
+
+@final
+class TerminableShutdownBlockingDriver(FakeDriver):
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self.release = release
+
+    def shutdown(self) -> None:
+        self._record("shutdown")
+        self.release.wait()
+
+    def force_terminate(self, reason: str) -> bool:
+        self.calls.append(f"force_terminate:{reason}")
+        self.release.set()
+        return True
+
+
+@final
+class GatedTerminateBlockingDriver(BlockingDriver):
+    def __init__(
+        self,
+        collect_release: threading.Event,
+        terminate_started: threading.Event,
+        terminate_release: threading.Event,
+    ) -> None:
+        super().__init__(collect_release, wait_timeout_sec=None)
+        self.terminate_started = terminate_started
+        self.terminate_release = terminate_release
+
+    def force_terminate(self, reason: str) -> bool:
+        self.calls.append(f"force_terminate:{reason}")
+        self.terminate_started.set()
+        self.terminate_release.wait(2.0)
+        self.release.set()
+        return True
+
+
+@final
 class SequenceDriverFactory:
     def __init__(self, drivers: list[FakeDriver]) -> None:
         self.drivers = list(drivers)
@@ -411,6 +455,76 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         finally:
             release.set()
             session.shutdown()
+
+    def test_stuck_owner_is_hard_cancelled_and_retried_without_app_restart(self) -> None:
+        release = threading.Event()
+        first = TerminableBlockingDriver(release, wait_timeout_sec=None)
+        second = FakeDriver()
+        factory = SequenceDriverFactory([first, second])
+        recovery_requests: list[str] = []
+        session = make_session(
+            factory,
+            command_timeout_sec=0.03,
+            unrecoverable_timeout_handler=(
+                lambda: recovery_requests.append("restart") or True
+            ),
+        )
+        session._timeout_retry_delays_sec = (0.0,)
+        session._timeout_recovery_grace_sec = 0.2
+        session._sleep = lambda _delay: None
+
+        try:
+            result = session.collect()
+
+            self.assertIsNotNone(
+                result.probe,
+                "the killed browser worker must be replaced in the same app process",
+            )
+            self.assertIn("force_terminate:command_timeout", first.calls)
+            self.assertEqual(factory.calls, 2)
+            self.assertEqual(recovery_requests, [])
+        finally:
+            release.set()
+            session.shutdown()
+
+    def test_shutdown_timeout_hard_cancels_the_owner_before_returning(self) -> None:
+        release = threading.Event()
+        driver = TerminableShutdownBlockingDriver(release)
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=0.03)
+        session._timeout_recovery_grace_sec = 0.2
+        self.assertIsNotNone(session.collect().probe)
+
+        session.shutdown()
+
+        self.assertIn("force_terminate:command_timeout", driver.calls)
+        self.assertTrue(session._thread is None or not session._thread.is_alive())
+        self.assertEqual(session.get_runtime_status().state, BrowserState.STOPPED)
+
+    def test_concurrent_shutdown_never_reports_stopped_with_poisoned_owner_alive(self) -> None:
+        collect_release = threading.Event()
+        terminate_started = threading.Event()
+        terminate_release = threading.Event()
+        driver = GatedTerminateBlockingDriver(
+            collect_release,
+            terminate_started,
+            terminate_release,
+        )
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=0.03)
+        session._timeout_retry_delays_sec = ()
+        session._timeout_recovery_grace_sec = 0.02
+        collect_thread = threading.Thread(target=session.collect)
+        collect_thread.start()
+        self.assertTrue(terminate_started.wait(1.0))
+
+        session.shutdown()
+
+        self.assertEqual(session.get_runtime_status().state, BrowserState.FAILED)
+        self.assertTrue(collect_thread.is_alive())
+        terminate_release.set()
+        collect_thread.join(1.0)
+        collect_release.set()
 
 
 if __name__ == "__main__":

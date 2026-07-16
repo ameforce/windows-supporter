@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum, unique
-from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, TypeAlias
+from typing import Any, TYPE_CHECKING, NotRequired, Protocol, TypedDict, TypeAlias
 
 
 @unique
@@ -24,6 +24,8 @@ class BrowserErrorCode(StrEnum):
     PLAYWRIGHT_UNAVAILABLE = "playwright_unavailable"
     COLLECT_FAILED = "collect_failed"
     COMMAND_TIMEOUT = "command_timeout"
+    RENDERER_CRASHED = "renderer_crashed"
+    TRANSPORT_CLOSED = "transport_closed"
     LOGIN_WINDOW_CLOSED = "login_window_closed"
     LOGIN_REQUIRED = "login_required"
     CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
@@ -60,6 +62,7 @@ class PageProtocol(Protocol):
     def evaluate(self, expression: str) -> str | UsageProbePayload: ...
     def is_closed(self) -> bool: ...
     def close(self) -> None: ...
+    def on(self, event: str, handler: Callable[[], None]) -> None: ...
 
 
 class ContextProtocol(Protocol):
@@ -67,6 +70,8 @@ class ContextProtocol(Protocol):
     def pages(self) -> Sequence[PageProtocol]: ...
 
     def new_page(self) -> PageProtocol: ...
+    def cookies(self) -> list[dict[str, Any]]: ...
+    def add_cookies(self, cookies: list[dict[str, Any]]) -> None: ...
     def close(self) -> None: ...
 
 
@@ -159,6 +164,14 @@ class PlaywrightSessionConfig:
     collect_timeout_sec: float = 90.0
     timeout_retry_delays_sec: tuple[float, ...] = (5.0, 15.0, 30.0)
     timeout_recovery_grace_sec: float = 5.0
+    page_recycle_success_count: int = 25
+    worker_recycle_success_count: int = 100
+    worker_recycle_max_age_sec: float = 3_600.0
+    worker_recycle_max_process_rss_bytes: int = 1_610_612_736
+    headed_login_recycle_max_age_sec: float = 7_200.0
+    headed_login_emergency_max_process_rss_bytes: int = 2_147_483_648
+    worker_cleanup_timeout_sec: float = 5.0
+    worker_bootstrap_timeout_sec: float = 15.0
 
 
 @dataclass(frozen=True, slots=True)

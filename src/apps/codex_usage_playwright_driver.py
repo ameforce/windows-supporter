@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import final, override
+from typing import Any, TypeVar, final, override
 from urllib.parse import urlsplit, urlunsplit
 
 from src.apps.codex_usage_browser_types import (
@@ -20,6 +20,9 @@ from src.apps.codex_usage_browser_types import (
     UsageProbePayload,
     parse_usage_probe,
 )
+
+
+_T = TypeVar("_T")
 
 
 @final
@@ -59,6 +62,15 @@ def _canonical_usage_url(url: str) -> str:
 
 def _classify_error(message: str, *, login_poll: bool = False) -> str:
     lowered = message.lower()
+    if any(
+        token in lowered
+        for token in (
+            "page crashed",
+            "renderer process crashed",
+            "renderer crashed",
+        )
+    ):
+        return BrowserErrorCode.RENDERER_CRASHED.value
     if any(
         token in lowered
         for token in (
@@ -108,6 +120,7 @@ class CodexUsagePlaywrightDriver:
         log_sink: LogSink | None = None,
         playwright_starter: PlaywrightStarter | None = None,
         sleep: Callable[[float], None] | None = None,
+        initial_session_cookies: list[dict[str, Any]] | None = None,
     ) -> None:
         self._config: PlaywrightSessionConfig = config
         self._log_sink: LogSink | None = log_sink
@@ -120,13 +133,20 @@ class CodexUsagePlaywrightDriver:
         self._cached_user_agent: str | None = None
         self._status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         self._shutdown: bool = False
+        self._context_generation: int = 0
+        self._page_generation: int = 0
+        self._page_success_count: int = 0
+        self._page_crashed: bool = False
+        self._session_cookies: list[dict[str, Any]] = [
+            dict(cookie) for cookie in (initial_session_cookies or [])
+        ]
 
     def start(self) -> BrowserOperationResult:
         if self._playwright is not None:
             return BrowserOperationResult()
         self._set_status(BrowserState.STARTING)
         try:
-            self._playwright = self._starter()
+            self._playwright = self._run_stage("playwright_start", self._starter)
         except (ImportError, OSError, RuntimeError) as exc:
             return self._fail(BrowserErrorCode.PLAYWRIGHT_UNAVAILABLE.value, str(exc))
         except _playwright_error_type() as exc:
@@ -141,8 +161,14 @@ class CodexUsagePlaywrightDriver:
                 page = self._ensure_context(headless=True)
                 try:
                     self._navigate_for_collect(page)
-                    probe = self._evaluate_probe_until_ready(page)
+                    self._raise_if_page_crashed()
+                    probe = self._run_stage(
+                        "evaluate_probe",
+                        lambda: self._evaluate_probe_until_ready(page),
+                    )
+                    self._raise_if_page_crashed()
                     if probe is not None and self._probe_is_terminal(probe):
+                        self._page_success_count += 1
                         self._set_status(BrowserState.HEADLESS_READY)
                         return BrowserOperationResult(probe=probe)
                     raise DriverOperationError("usage probe did not become ready")
@@ -150,13 +176,19 @@ class CodexUsagePlaywrightDriver:
                     last_error = str(exc)
                 except _playwright_error_type() as exc:
                     last_error = str(exc)
-                error = _classify_error(last_error)
+                last_error = self._probe_crash_after_navigation_abort(
+                    page,
+                    last_error,
+                )
+                error = self._classify_driver_error(last_error)
             except (DriverOperationError, OSError, RuntimeError) as exc:
                 last_error = str(exc)
-                error = _classify_error(last_error)
+                error = self._classify_driver_error(last_error)
             except _playwright_error_type() as exc:
                 last_error = str(exc)
-                error = _classify_error(last_error)
+                error = self._classify_driver_error(last_error)
+            if error == BrowserErrorCode.RENDERER_CRASHED.value:
+                return self._fail(error, last_error)
             if error not in {
                 BrowserErrorCode.COLLECT_FAILED.value,
                 BrowserErrorCode.COMMAND_TIMEOUT.value,
@@ -171,10 +203,21 @@ class CodexUsagePlaywrightDriver:
         return self._fail(BrowserErrorCode.COLLECT_FAILED.value)
 
     def open_login(self) -> BrowserOperationResult:
+        probe: UsageProbePayload | None = None
         try:
             page = self._ensure_context(headless=False)
-            _ = page.goto(self._config.usage_url, timeout=self._config.navigation_timeout_ms, wait_until="domcontentloaded")
-            probe = self._evaluate_probe_until_ready(page)
+            _ = self._run_stage(
+                "navigation",
+                lambda: page.goto(
+                    self._config.usage_url,
+                    timeout=self._config.navigation_timeout_ms,
+                    wait_until="domcontentloaded",
+                ),
+            )
+            probe = self._run_stage(
+                "evaluate_probe",
+                lambda: self._evaluate_probe_until_ready(page),
+            )
             if probe is not None and self._probe_is_authenticated(probe):
                 self._close_context()
                 _ = self._ensure_context(headless=True)
@@ -202,7 +245,10 @@ class CodexUsagePlaywrightDriver:
             self._close_context()
             return self._fail(BrowserErrorCode.LOGIN_WINDOW_CLOSED.value)
         try:
-            probe = self._evaluate_probe_until_ready(page)
+            probe = self._run_stage(
+                "evaluate_probe",
+                lambda: self._evaluate_probe_until_ready(page),
+            )
             if probe is not None and self._probe_is_cloudflare(probe):
                 return self._fail(
                     BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
@@ -237,7 +283,8 @@ class CodexUsagePlaywrightDriver:
         self._close_context()
         if self._playwright is not None:
             try:
-                self._playwright.stop()
+                playwright = self._playwright
+                self._run_stage("playwright_stop", playwright.stop)
             except (OSError, RuntimeError):
                 self._log("playwright stop failed")
             except _playwright_error_type():
@@ -248,18 +295,34 @@ class CodexUsagePlaywrightDriver:
     def get_runtime_status(self) -> BrowserRuntimeStatus:
         return self._status
 
+    def export_session_cookies(self) -> list[dict[str, Any]]:
+        if self._context is not None:
+            self._snapshot_session_cookies(self._context)
+        return [dict(cookie) for cookie in self._session_cookies]
+
     def _ensure_context(self, *, headless: bool) -> PageLike:
         if self._playwright is None:
             started = self.start()
             if started.error:
                 raise DriverOperationError(started.error)
         if self._context is not None and self._headless == headless and self._page is not None and not self._page.is_closed():
+            if headless and self._page_success_count >= max(
+                1, int(self._config.page_recycle_success_count)
+            ):
+                self._log(
+                    "browser recycle requested "
+                    f"reason=page_success_count count={self._page_success_count}"
+                )
+                return self._replace_page()
             return self._page
         self._close_context()
         self._set_status(BrowserState.STARTING)
         page = self._launch_context(headless=headless)
         if headless and self._cached_user_agent is None:
-            user_agent = page.evaluate("() => navigator.userAgent")
+            user_agent = self._run_stage(
+                "evaluate_user_agent",
+                lambda: page.evaluate("() => navigator.userAgent"),
+            )
             if isinstance(user_agent, str) and user_agent:
                 self._cached_user_agent = user_agent.replace("HeadlessChrome", "Chrome")
                 if user_agent != self._cached_user_agent:
@@ -270,33 +333,66 @@ class CodexUsagePlaywrightDriver:
     def _launch_context(self, *, headless: bool) -> PageLike:
         if self._playwright is None:
             raise DriverOperationError("playwright unavailable")
-        context = self._playwright.chromium.launch_persistent_context(
-            self._config.profile_dir,
-            channel="chrome",
-            headless=headless,
-            chromium_sandbox=True,
-            args=["--disable-extensions", "--disable-notifications"],
-            user_agent=self._cached_user_agent,
-            timeout=float(self._config.navigation_timeout_ms),
+        context = self._run_stage(
+            "context_launch",
+            lambda: self._playwright.chromium.launch_persistent_context(
+                self._config.profile_dir,
+                channel="chrome",
+                headless=headless,
+                chromium_sandbox=True,
+                args=["--disable-extensions", "--disable-notifications"],
+                user_agent=self._cached_user_agent,
+                timeout=float(self._config.navigation_timeout_ms),
+            ),
         )
         self._context = context
         self._headless = headless
+        self._context_generation += 1
+        add_cookies = getattr(context, "add_cookies", None)
+        if self._session_cookies and callable(add_cookies):
+            self._run_stage(
+                "session_cookie_restore",
+                lambda: add_cookies(
+                    [dict(cookie) for cookie in self._session_cookies]
+                ),
+            )
+            self._log(
+                "browser session cookies restored "
+                f"count={len(self._session_cookies)} "
+                f"context_generation={self._context_generation}"
+            )
         self._page = context.pages[0] if context.pages else context.new_page()
+        self._register_page(self._page)
         return self._page
 
     def _replace_page(self) -> PageLike:
         if self._context is None:
             raise DriverOperationError("browser context is unavailable")
         if self._page is not None and not self._page.is_closed():
-            self._page.close()
+            page = self._page
+            self._run_stage("page_close", page.close)
         self._page = self._context.new_page()
+        self._register_page(self._page)
         return self._page
 
     def _navigate_for_collect(self, page: PageLike) -> None:
         if _canonical_usage_url(page.url) == _canonical_usage_url(self._config.usage_url):
-            _ = page.reload(timeout=self._config.navigation_timeout_ms, wait_until="domcontentloaded")
+            _ = self._run_stage(
+                "navigation",
+                lambda: page.reload(
+                    timeout=self._config.navigation_timeout_ms,
+                    wait_until="domcontentloaded",
+                ),
+            )
         else:
-            _ = page.goto(self._config.usage_url, timeout=self._config.navigation_timeout_ms, wait_until="domcontentloaded")
+            _ = self._run_stage(
+                "navigation",
+                lambda: page.goto(
+                    self._config.usage_url,
+                    timeout=self._config.navigation_timeout_ms,
+                    wait_until="domcontentloaded",
+                ),
+            )
 
     def _probe_is_authenticated(self, probe: UsageProbePayload) -> bool:
         main_text = str(probe.get("mainText", "")).lower()
@@ -358,18 +454,49 @@ class CodexUsagePlaywrightDriver:
 
     def _close_context(self) -> None:
         context = self._context
+        if context is not None:
+            self._snapshot_session_cookies(context)
         self._context = None
         self._page = None
         self._headless = None
+        self._page_success_count = 0
+        self._page_crashed = False
         if context is None:
             return
         try:
-            context.close()
+            self._run_stage("context_close", context.close)
         except (OSError, RuntimeError):
             self._log("browser context close failed")
         except _playwright_error_type():
             self._log("browser context close failed")
 
+    def _snapshot_session_cookies(self, context: ContextLike) -> None:
+        cookies = getattr(context, "cookies", None)
+        if not callable(cookies):
+            return
+        try:
+            raw_cookies = self._run_stage("session_cookie_snapshot", cookies)
+        except BaseException:
+            self._log("browser session cookie snapshot failed")
+            return
+        if not isinstance(raw_cookies, list):
+            return
+        session_cookies: list[dict[str, Any]] = []
+        for cookie in raw_cookies:
+            if not isinstance(cookie, dict):
+                continue
+            try:
+                expires = float(cookie.get("expires", -1))
+            except (TypeError, ValueError):
+                expires = -1
+            if expires <= 0:
+                session_cookies.append(dict(cookie))
+        self._session_cookies = session_cookies
+        self._log(
+            "browser session cookies captured "
+            f"count={len(session_cookies)} "
+            f"context_generation={self._context_generation}"
+        )
     def _fail(self, error: str, detail: str = "", *, state: BrowserState | None = None, login_window_open: bool = False) -> BrowserOperationResult:
         target_state = state or (BrowserState.PROFILE_IN_USE if error == BrowserErrorCode.PROFILE_IN_USE.value else BrowserState.FAILED)
         self._set_status(target_state, login_window_open=login_window_open, error=error)
@@ -378,6 +505,75 @@ class CodexUsagePlaywrightDriver:
 
     def _set_status(self, state: BrowserState, *, login_window_open: bool = False, error: str = "") -> None:
         self._status = BrowserRuntimeStatus(state, login_window_open, error)
+
+    def _register_page(self, page: PageLike) -> None:
+        self._page_generation += 1
+        self._page_success_count = 0
+        self._page_crashed = False
+        try:
+            page.on("crash", self._on_page_crash)
+        except (AttributeError, TypeError):
+            return
+
+    def _on_page_crash(self) -> None:
+        self._page_crashed = True
+        self._log(
+            "browser page crashed "
+            f"context_generation={self._context_generation} "
+            f"page_generation={self._page_generation}"
+        )
+
+    def _raise_if_page_crashed(self) -> None:
+        if self._page_crashed:
+            raise DriverOperationError("Page crashed")
+
+    def _classify_driver_error(self, message: str) -> str:
+        if self._page_crashed:
+            return BrowserErrorCode.RENDERER_CRASHED.value
+        return _classify_error(message)
+
+    def _probe_crash_after_navigation_abort(
+        self,
+        page: PageLike,
+        message: str,
+    ) -> str:
+        if "net::err_aborted" not in message.lower():
+            return message
+        try:
+            self._run_stage("crash_probe", lambda: page.evaluate("() => true"))
+        except BaseException as exc:
+            detail = str(exc)
+            if _classify_error(detail) == BrowserErrorCode.RENDERER_CRASHED.value:
+                self._page_crashed = True
+            return f"{message}; crash_probe={detail}"
+        return message
+
+    def _run_stage(self, stage: str, operation: Callable[[], _T]) -> _T:
+        started_at = time.monotonic()
+        self._log(
+            "browser stage start "
+            f"stage={stage} context_generation={self._context_generation} "
+            f"page_generation={self._page_generation}"
+        )
+        try:
+            result = operation()
+        except BaseException as exc:
+            elapsed_ms = int((time.monotonic() - started_at) * 1_000)
+            self._log(
+                "browser stage end "
+                f"stage={stage} elapsed_ms={elapsed_ms} outcome=error "
+                f"type={type(exc).__name__} context_generation={self._context_generation} "
+                f"page_generation={self._page_generation}"
+            )
+            raise
+        elapsed_ms = int((time.monotonic() - started_at) * 1_000)
+        self._log(
+            "browser stage end "
+            f"stage={stage} elapsed_ms={elapsed_ms} outcome=success "
+            f"context_generation={self._context_generation} "
+            f"page_generation={self._page_generation}"
+        )
+        return result
 
     def _log(self, message: str) -> None:
         if self._log_sink is not None:

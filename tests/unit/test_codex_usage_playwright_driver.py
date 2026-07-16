@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import TypedDict, final
 
 from src.apps.codex_usage_browser_types import (
+    BrowserErrorCode,
     BrowserState,
     ChromiumProtocol,
     PlaywrightProtocol,
@@ -45,6 +46,7 @@ class FakePage:
         probes: list[UsageProbePayload] | None = None,
         failures: int = 0,
         failure_message: str = "page navigation failed",
+        crash_on_navigate: bool = False,
     ) -> None:
         self.url: str = url
         self.user_agent: str = user_agent
@@ -52,8 +54,10 @@ class FakePage:
         self.probes: list[UsageProbePayload] = list(probes or [])
         self.failures: int = failures
         self.failure_message = failure_message
+        self.crash_on_navigate = crash_on_navigate
         self.closed: bool = False
         self.calls: list[tuple[str, str]] = []
+        self.event_handlers: dict[str, list[Callable[[], None]]] = {}
 
     def reload(self, *, timeout: int, wait_until: str) -> None:
         _ = timeout, wait_until
@@ -65,6 +69,10 @@ class FakePage:
 
     def _navigate(self, method: str, url: str) -> None:
         self.calls.append((method, url))
+        if self.crash_on_navigate:
+            for handler in self.event_handlers.get("crash", []):
+                handler()
+            raise OSError("Page crashed")
         if self.failures:
             self.failures -= 1
             raise OSError(self.failure_message)
@@ -82,6 +90,9 @@ class FakePage:
 
     def close(self) -> None:
         self.closed = True
+
+    def on(self, event: str, handler: Callable[[], None]) -> None:
+        self.event_handlers.setdefault(event, []).append(handler)
 
 
 @final
@@ -172,18 +183,53 @@ class FakeStarter:
 def make_driver(
     outcomes: list[FakeContext | OSError],
     *,
+    config: PlaywrightSessionConfig | None = None,
     event_log: list[str] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> tuple[CodexUsagePlaywrightDriver, FakeChromium, FakeStarter]:
     chromium = FakeChromium(outcomes, event_log)
     starter = FakeStarter(chromium)
-    config = PlaywrightSessionConfig("profile", USAGE_URL, "probe()")
-    driver = CodexUsagePlaywrightDriver(config, playwright_starter=starter, sleep=sleep)
+    driver = CodexUsagePlaywrightDriver(
+        config or PlaywrightSessionConfig("profile", USAGE_URL, "probe()"),
+        playwright_starter=starter,
+        sleep=sleep,
+    )
     _ = driver.start()
     return driver, chromium, starter
 
 
 class CodexUsagePlaywrightDriverTest(unittest.TestCase):
+    def test_renderer_crash_event_is_classified_without_reusing_the_context(self) -> None:
+        crashed_page = FakePage(crash_on_navigate=True)
+        crashed_context = FakeContext([crashed_page])
+        driver, chromium, _controller = make_driver([crashed_context])
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, BrowserErrorCode.RENDERER_CRASHED.value)
+        self.assertEqual(len(chromium.calls), 1)
+        self.assertEqual(driver.get_runtime_status().last_error, "renderer_crashed")
+
+    def test_headless_page_is_recycled_after_bounded_success_count(self) -> None:
+        first_page = FakePage()
+        replacement_page = FakePage(url="about:blank")
+        context = FakeContext([first_page, replacement_page])
+        config = PlaywrightSessionConfig(
+            "profile",
+            USAGE_URL,
+            "probe()",
+            page_recycle_success_count=2,
+        )
+        driver, chromium, _controller = make_driver([context], config=config)
+
+        self.assertIsNotNone(driver.collect().probe)
+        self.assertIsNotNone(driver.collect().probe)
+        self.assertIsNotNone(driver.collect().probe)
+
+        self.assertEqual(len(chromium.calls), 1, "page recycle must avoid a cold Chrome restart")
+        self.assertTrue(first_page.closed)
+        self.assertEqual([name for name, _url in replacement_page.calls], ["goto"])
+
     def test_start_classifies_missing_playwright_runtime(self) -> None:
         def unavailable_starter() -> PlaywrightProtocol:
             raise ImportError("No module named 'playwright'")

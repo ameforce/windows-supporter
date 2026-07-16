@@ -12,6 +12,10 @@ CODEX_BROWSER_SOURCES = (
     REPO_ROOT / "src" / "apps" / "codex_usage_playwright_driver.py",
     REPO_ROOT / "src" / "apps" / "codex_usage_playwright_session.py",
 )
+PROCESS_DRIVER_SOURCE = REPO_ROOT / "src" / "apps" / "codex_usage_playwright_process.py"
+WORKER_SOURCE = REPO_ROOT / "src" / "apps" / "codex_usage_playwright_worker.py"
+BOUNDARY_SOURCE = REPO_ROOT / "src" / "apps" / "codex_usage_process_boundary.py"
+MAIN_SOURCE = REPO_ROOT / "main.py"
 FORBIDDEN_DIRECT_BROWSER_PATTERNS = {
     "raw CDP lifecycle": re.compile(r"(?i)(?:\bcdp\b|_cdp|cdp_)"),
     "remote debugging flags": re.compile(r"remote-debugging", re.IGNORECASE),
@@ -25,6 +29,34 @@ FORBIDDEN_DIRECT_BROWSER_PATTERNS = {
 
 
 class CodexUsageBrowserArchitectureTest(unittest.TestCase):
+    def test_freeze_support_runs_before_gui_and_monitor_imports(self) -> None:
+        source = MAIN_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("multiprocessing.freeze_support()", source)
+        self.assertLess(
+            source.index("multiprocessing.freeze_support()"),
+            source.index("from src.apps.Monitor import Monitor"),
+        )
+
+    def test_worker_waits_for_parent_containment_before_driver_construction(self) -> None:
+        source = WORKER_SOURCE.read_text(encoding="utf-8")
+
+        self.assertLess(
+            source.index("connection.recv()"),
+            source.index("driver = CodexUsagePlaywrightDriver("),
+        )
+        self.assertIn('multiprocessing.get_context("spawn")', PROCESS_DRIVER_SOURCE.read_text(encoding="utf-8"))
+
+    def test_process_boundary_is_owned_and_has_no_global_chrome_control(self) -> None:
+        process_source = PROCESS_DRIVER_SOURCE.read_text(encoding="utf-8")
+        boundary_source = BOUNDARY_SOURCE.read_text(encoding="utf-8")
+        combined = process_source + "\n" + boundary_source
+
+        self.assertIn("AssignProcessToJobObject", boundary_source)
+        self.assertIn("TerminateJobObject", boundary_source)
+        self.assertNotRegex(combined, r"(?i)chrome\.exe|remote-debugging|process_iter|EnumWindows")
+        self.assertNotIn("Popen(", combined)
+
     def test_codex_usage_browser_transport_has_no_direct_chromium_or_cdp_control(self) -> None:
         violations: list[str] = []
 
