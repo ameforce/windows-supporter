@@ -409,6 +409,41 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         self.assertIn('taskkill /f /t /im "%exe_name%"', script)
 
+    def test_build_bat_treats_taskkill_128_as_not_running(self) -> None:
+        if os.name != "nt":
+            self.skipTest("build.bat is a Windows command path")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            (temp_dir / "taskkill.cmd").write_text(
+                "@echo off\r\nexit /b 128\r\n",
+                encoding="utf-8",
+            )
+            (temp_dir / "powershell.cmd").write_text(
+                "@echo off\r\nexit /b 1\r\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["PATH"] = f"{temp_dir}{os.pathsep}{env['PATH']}"
+            env["TEMP"] = str(temp_dir)
+            env["TMP"] = str(temp_dir)
+
+            result = subprocess.run(
+                ["cmd", "/d", "/c", "build.bat"],
+                cwd=Path.cwd(),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+
+        self.assertIn("[ Not running ]", result.stdout)
+        self.assertNotIn("Failed to stop the running windows-supporter.exe process.", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_build_bat_wait_loops_do_not_depend_on_timeout_stdin(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read()

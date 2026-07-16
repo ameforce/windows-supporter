@@ -35,16 +35,20 @@ if "%ARTIFACT_ONLY%"=="0" (
   echo | set /p="Shutting down the running %EXE_NAME% process..."
   call :clear_log
   taskkill /f /t /im "%EXE_NAME%" > "%STEP_LOG%" 2>&1
-  set "TASKKILL_ERROR=%ERRORLEVEL%"
-  if "%TASKKILL_ERROR%"=="0" (
-    echo [ Success !! ]
-  ) else if "%TASKKILL_ERROR%"=="128" (
-    echo [ Not running ]
-  ) else (
+  if errorlevel 129 (
     echo Failure
     echo Failed to stop the running %EXE_NAME% process.
     call :print_log
     exit /b 1
+  ) else if errorlevel 128 (
+    echo [ Not running ]
+  ) else if errorlevel 1 (
+    echo Failure
+    echo Failed to stop the running %EXE_NAME% process.
+    call :print_log
+    exit /b 1
+  ) else (
+    echo [ Success !! ]
   )
   call :wait_for_process_stop
   if errorlevel 1 (
