@@ -14,6 +14,11 @@ set "STEP_LOG=%TEMP%\%EXE_BASE%-build-%RANDOM%%RANDOM%.log"
 set "POST_BUILD_RUN_START_TIMEOUT_SECONDS=60"
 set "SKIP_POST_BUILD_RUN=0"
 if /I "%WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN%"=="1" set "SKIP_POST_BUILD_RUN=1"
+set "ARTIFACT_ONLY=0"
+if /I "%WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY%"=="1" (
+  set "ARTIFACT_ONLY=1"
+  set "SKIP_POST_BUILD_RUN=1"
+)
 set "EMIT_STEP_LOG=0"
 if /I "%WINDOWS_SUPPORTER_EMIT_STEP_LOG%"=="1" set "EMIT_STEP_LOG=1"
 if "%EMIT_STEP_LOG%"=="1" echo WINDOWS_SUPPORTER_STEP_LOG=%STEP_LOG%
@@ -26,25 +31,34 @@ if errorlevel 1 (
 )
 
 REM Stop the running executable before rebuilding
-echo | set /p="Shutting down the running %EXE_NAME% process..."
-call :clear_log
-taskkill /f /t /im "%EXE_NAME%" > "%STEP_LOG%" 2>&1
-set "TASKKILL_ERROR=%ERRORLEVEL%"
-if "%TASKKILL_ERROR%"=="0" (
-  echo [ Success !! ]
-) else if "%TASKKILL_ERROR%"=="128" (
-  echo [ Not running ]
-) else (
-  echo Failure
-  echo Failed to stop the running %EXE_NAME% process.
-  call :print_log
-  exit /b 1
+if "%ARTIFACT_ONLY%"=="0" (
+  echo | set /p="Shutting down the running %EXE_NAME% process..."
+  call :clear_log
+  taskkill /f /t /im "%EXE_NAME%" > "%STEP_LOG%" 2>&1
+  if errorlevel 129 (
+    echo Failure
+    echo Failed to stop the running %EXE_NAME% process.
+    call :print_log
+    exit /b 1
+  ) else if errorlevel 128 (
+    echo [ Not running ]
+  ) else if errorlevel 1 (
+    echo Failure
+    echo Failed to stop the running %EXE_NAME% process.
+    call :print_log
+    exit /b 1
+  ) else (
+    echo [ Success !! ]
+  )
+  call :wait_for_process_stop
+  if errorlevel 1 (
+    echo Failure
+    echo %EXE_NAME% is still running after taskkill.
+    exit /b 1
+  )
 )
-call :wait_for_process_stop
-if errorlevel 1 (
-  echo Failure
-  echo %EXE_NAME% is still running after taskkill.
-  exit /b 1
+if "%ARTIFACT_ONLY%"=="1" (
+  echo Artifact-only mode: skipping shutdown of the installed %EXE_NAME% process.
 )
 
 REM Stop leftover PyInstaller worker processes from previous failed builds
@@ -166,6 +180,14 @@ if errorlevel 1 (
   exit /b 1
 )
 echo [ Success !! ]
+
+if "%ARTIFACT_ONLY%"=="1" (
+  echo Artifact-only build complete: dist\%EXE_NAME%
+  echo The repo-root executable was not replaced and no application was launched.
+  call :clear_log
+  endlocal
+  exit /b 0
+)
 
 REM Promote the verified artifact to the repo root
 echo | set /p="Moving %EXE_NAME%..."

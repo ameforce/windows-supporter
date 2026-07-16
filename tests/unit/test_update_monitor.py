@@ -379,6 +379,22 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("SKIP_POST_BUILD_RUN", script)
         self.assertIn("Skipping post-build launch", script)
 
+    def test_build_bat_artifact_only_mode_avoids_global_process_and_root_exe_mutation(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        self.assertIn("WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY", script)
+        taskkill_guard = script.index('if "%ARTIFACT_ONLY%"=="0" (')
+        taskkill_index = script.index('taskkill /f /t /im "%EXE_NAME%"')
+        taskkill_guard_end = script.index("\n)", taskkill_index)
+        artifact_exit = script.index('if "%ARTIFACT_ONLY%"=="1" (')
+        move_index = script.index('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"')
+
+        self.assertLess(taskkill_guard, taskkill_index)
+        self.assertLess(taskkill_index, taskkill_guard_end)
+        self.assertLess(artifact_exit, move_index)
+        self.assertIn("dist\\%EXE_NAME%", script[artifact_exit:move_index])
+
     def test_build_bat_can_emit_step_log_for_updater_progress(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read()
@@ -392,6 +408,41 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             script = fp.read().lower()
 
         self.assertIn('taskkill /f /t /im "%exe_name%"', script)
+
+    def test_build_bat_treats_taskkill_128_as_not_running(self) -> None:
+        if os.name != "nt":
+            self.skipTest("build.bat is a Windows command path")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            (temp_dir / "taskkill.cmd").write_text(
+                "@echo off\r\nexit /b 128\r\n",
+                encoding="utf-8",
+            )
+            (temp_dir / "powershell.cmd").write_text(
+                "@echo off\r\nexit /b 1\r\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["PATH"] = f"{temp_dir}{os.pathsep}{env['PATH']}"
+            env["TEMP"] = str(temp_dir)
+            env["TMP"] = str(temp_dir)
+
+            result = subprocess.run(
+                ["cmd", "/d", "/c", "build.bat"],
+                cwd=Path.cwd(),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+
+        self.assertIn("[ Not running ]", result.stdout)
+        self.assertNotIn("Failed to stop the running windows-supporter.exe process.", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_build_bat_wait_loops_do_not_depend_on_timeout_stdin(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
@@ -476,7 +527,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(failed["labels"]["retry"], UPDATE_PROGRESS_RETRY_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["manual_action"], UPDATE_PROGRESS_MANUAL_ACTION_TEXT)
 
-    def test_update_handoff_progress_ui_uses_borderless_chrome(self) -> None:
+    def test_update_handoff_progress_ui_uses_borderless_shell_and_collapses_empty_activity(self) -> None:
         try:
             import tkinter as tk
         except ImportError as exc:
@@ -502,6 +553,262 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             self.assertIsNotNone(progress._root)
             assert progress._root is not None
             self.assertTrue(progress._root.overrideredirect())
+            self.assertEqual(str(progress._root.cget("bg")).upper(), "#FFFFFF")
+            self.assertIsNotNone(progress._drag_region)
+            self.assertTrue(progress._drag_region.bind("<ButtonPress-1>"))
+            self.assertTrue(progress._drag_region.bind("<B1-Motion>"))
+            self.assertTrue(progress._root.bind("<Alt-F4>"))
+            self.assertIsNotNone(progress._activity_shell)
+            self.assertEqual(progress._activity_shell.winfo_manager(), "")
+            self.assertTrue(progress._root.protocol("WM_DELETE_WINDOW"))
+            self.assertEqual(progress._handle_alt_f4(), "break")
+            self.assertIsNotNone(progress._root)
+            self.assertFalse(progress._closed)
+
+            progress.set_snapshot(build_update_progress_snapshot("complete", state="complete"))
+            self.assertEqual(progress._handle_alt_f4(), "break")
+            self.assertIsNone(progress._root)
+            self.assertTrue(progress._closed)
+        finally:
+            progress.close()
+
+    def test_update_handoff_progress_ui_drag_moves_borderless_window(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        try:
+            probe = tk.Tk()
+            probe.withdraw()
+            probe.destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi()
+        try:
+            progress.show(build_update_progress_snapshot("handoff_start", state="running"))
+            assert progress._root is not None
+            progress._root.update_idletasks()
+            start_x = int(progress._root.winfo_x())
+            start_y = int(progress._root.winfo_y())
+
+            progress._start_drag(types.SimpleNamespace(x_root=start_x + 20, y_root=start_y + 18))
+            progress._drag_window(types.SimpleNamespace(x_root=start_x + 22, y_root=start_y + 20))
+            progress._root.update_idletasks()
+            self.assertEqual(int(progress._root.winfo_x()), start_x)
+            self.assertEqual(int(progress._root.winfo_y()), start_y)
+
+            progress._drag_window(types.SimpleNamespace(x_root=start_x + 92, y_root=start_y + 66))
+            progress._root.update_idletasks()
+
+            self.assertEqual(int(progress._root.winfo_x()), start_x + 72)
+            self.assertEqual(int(progress._root.winfo_y()), start_y + 48)
+            progress._end_drag()
+            self.assertIsNone(progress._drag_offset)
+            self.assertIsNone(progress._drag_press)
+
+            moved_x = int(progress._root.winfo_x())
+            moved_y = int(progress._root.winfo_y())
+            pointer_x = moved_x + 20
+            pointer_y = moved_y + 18
+            progress._start_drag(types.SimpleNamespace(x_root=pointer_x, y_root=pointer_y))
+            progress._drag_window(
+                types.SimpleNamespace(
+                    x_root=pointer_x + (-10 - moved_x),
+                    y_root=pointer_y + (-20 - moved_y),
+                )
+            )
+            progress._root.update_idletasks()
+            self.assertEqual(int(progress._root.winfo_x()), -10)
+            self.assertEqual(int(progress._root.winfo_y()), -20)
+        finally:
+            progress.close()
+
+    def test_update_handoff_progress_ui_shows_only_real_activity_rows(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        try:
+            probe = tk.Tk()
+            probe.withdraw()
+            probe.destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi()
+        snapshot = build_update_progress_snapshot("build", state="running")
+        snapshot["activity"] = {
+            "id": "uv_sync",
+            "source": "build",
+            "line": "uv 환경 동기화를 완료했습니다.",
+        }
+        try:
+            progress.show(snapshot)
+
+            self.assertIsNotNone(progress._activity_shell)
+            self.assertEqual(progress._activity_shell.winfo_manager(), "pack")
+            visible_labels = [
+                label
+                for label in progress._activity_labels
+                if label.winfo_manager() and label.winfo_ismapped()
+            ]
+            self.assertEqual(len(progress._activity_labels), 3)
+            self.assertEqual(len(visible_labels), 1)
+            self.assertEqual(visible_labels[0].cget("text"), "uv 환경 동기화를 완료했습니다.")
+            self.assertIsNotNone(progress._activity_timeline)
+            self.assertGreater(len(progress._activity_timeline.find_all()), 0)
+            assert progress._root is not None
+            self.assertLessEqual(
+                progress._activity_shell.winfo_rooty() + progress._activity_shell.winfo_height(),
+                progress._root.winfo_rooty() + progress._root.winfo_height(),
+            )
+        finally:
+            progress.close()
+
+    def test_update_handoff_progress_ui_timeline_tracks_scaled_label_rows(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi()
+        try:
+            snapshot = build_update_progress_snapshot("build", state="running")
+            for index in range(3):
+                snapshot["activity"] = {
+                    "id": f"stage-{index}",
+                    "source": "build",
+                    "line": f"진행 단계 {index + 1}",
+                }
+                progress.show(snapshot) if index == 0 else progress.set_snapshot(snapshot)
+            assert progress._root is not None
+            assert progress._activity_timeline is not None
+            progress._root.update_idletasks()
+            progress._root.update()
+
+            oval_ids = [
+                item
+                for item in progress._activity_timeline.find_all()
+                if progress._activity_timeline.type(item) == "oval"
+            ]
+            self.assertEqual(len(oval_ids), 3)
+            last_oval = progress._activity_timeline.coords(oval_ids[-1])
+            actual_center_y = (float(last_oval[1]) + float(last_oval[3])) / 2
+            last_label = progress._activity_labels[2]
+            first_line_height = int(progress._activity_labels[0].winfo_height())
+            expected_center_y = (
+                int(last_label.winfo_rooty())
+                - int(progress._activity_timeline.winfo_rooty())
+                + (first_line_height / 2)
+            )
+            self.assertAlmostEqual(actual_center_y, expected_center_y, delta=3.0)
+        finally:
+            progress.close()
+
+    def test_update_handoff_progress_ui_limits_and_sanitizes_visible_text(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        try:
+            probe = tk.Tk()
+            probe.withdraw()
+            probe.destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi()
+        raw_detail = "C:\\Users\\someone\\build\x00\x1b[31m\u202e" + ("A" * 10000)
+        try:
+            progress.show(
+                build_update_progress_snapshot(
+                    "failed",
+                    state="failed",
+                    detail=raw_detail,
+                    can_manual_action=True,
+                )
+            )
+
+            visible_detail = str(progress._detail_label.cget("text"))
+            self.assertLessEqual(len(visible_detail), 320)
+            self.assertNotIn("\x00", visible_detail)
+            self.assertNotIn("\x1b", visible_detail)
+            self.assertNotIn("\u202e", visible_detail)
+            self.assertTrue(progress._manual_button.winfo_ismapped())
+            self.assertTrue(progress._close_button.winfo_ismapped())
+        finally:
+            progress.close()
+
+    def test_update_handoff_progress_ui_focuses_close_when_complete(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        try:
+            probe = tk.Tk()
+            probe.withdraw()
+            probe.destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi(log_path="update.log")
+        try:
+            progress.show(
+                build_update_progress_snapshot(
+                    "complete",
+                    state="complete",
+                    log_path="update.log",
+                )
+            )
+            progress.pump()
+
+            self.assertIs(progress._preferred_focus_button, progress._close_button)
+        finally:
+            progress.close()
+
+    def test_update_handoff_progress_ui_draws_full_track_at_zero_percent(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi()
+        try:
+            progress.show(build_update_progress_snapshot("handoff_start", state="running"))
+            progress.pump()
+            items = progress._progress_canvas.find_all()
+            self.assertGreaterEqual(len(items), 1)
+            track = progress._progress_canvas.coords(items[0])
+            self.assertGreater(track[2] - track[0], 500)
+        finally:
+            progress.close()
+
+    def test_update_handoff_progress_ui_uses_requested_height_at_equivalent_150_percent(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        original_tk = tk.Tk
+
+        def scaled_tk():
+            root = original_tk()
+            root.tk.call("tk", "scaling", 2.0)
+            return root
+
+        progress = UpdateHandoffProgressUi()
+        try:
+            with patch.object(tk, "Tk", side_effect=scaled_tk):
+                progress.show(build_update_progress_snapshot("build_prepare", state="running"))
+            progress.pump()
+            actual_height = progress._root.winfo_height()
+            requested_height = progress._root.winfo_reqheight()
+            self.assertLessEqual(actual_height - requested_height, 12)
         finally:
             progress.close()
 
@@ -522,11 +829,37 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         assert shutdown is not None
         assert uv_sync is not None
         assert build is not None
-        self.assertLessEqual(shutdown["percent"], 15)
+        self.assertLessEqual(shutdown["percent"], 20)
         self.assertLessEqual(uv_sync["percent"], 35)
         self.assertLess(build["percent"], 80)
         self.assertLess(shutdown["percent"], uv_sync["percent"])
         self.assertLess(uv_sync["percent"], build["percent"])
+
+    def test_build_output_progress_uses_korean_stage_copy_without_raw_build_line(self) -> None:
+        raw_line = "Shutting down the running windows-supporter.exe process...[ Not running ]"
+        snapshot = build_update_build_output_progress_snapshot(raw_line)
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        activity = snapshot.get("activity", {})
+        self.assertEqual(activity.get("id"), "shutdown")
+        self.assertEqual(activity.get("source"), "build")
+        self.assertIn("실행 중인 앱", snapshot["label"])
+        self.assertIn("다음 단계", snapshot["detail"])
+        self.assertNotIn("build.bat", snapshot["detail"])
+        self.assertNotIn("Not running", snapshot["detail"])
+        self.assertNotIn("Shutting down", str(activity.get("line") or ""))
+
+    def test_failed_progress_can_preserve_last_meaningful_percent(self) -> None:
+        snapshot = build_update_progress_snapshot(
+            "failed",
+            state="failed",
+            detail="업데이트를 완료하지 못했습니다.",
+            percent=72,
+        )
+
+        self.assertEqual(snapshot["percent"], 72)
+        self.assertEqual(snapshot["progressbar"]["value"], 72)
 
     def test_build_output_progress_advances_for_real_substep_logs(self) -> None:
         class FakeProgressUi:
@@ -562,13 +895,18 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             )
 
         details = [str(snapshot["detail"]) for snapshot in progress_ui.snapshots]
+        activities = [
+            str(snapshot.get("activity", {}).get("line") or "")
+            for snapshot in progress_ui.snapshots
+        ]
         percents = [int(snapshot["percent"]) for snapshot in progress_ui.snapshots]
-        self.assertGreaterEqual(len(progress_ui.snapshots), 5)
-        self.assertTrue(any("checking Analysis" in detail for detail in details))
-        self.assertTrue(any("Building PYZ" in detail for detail in details))
-        self.assertTrue(any("Building PKG" in detail for detail in details))
+        self.assertEqual(len(progress_ui.snapshots), 2)
+        self.assertFalse(any("checking Analysis" in detail for detail in details))
+        self.assertFalse(any("Building PYZ" in detail for detail in details))
+        self.assertFalse(any("Building PKG" in detail for detail in details))
+        self.assertFalse(any("checking Analysis" in activity for activity in activities))
         self.assertEqual(percents, sorted(percents))
-        self.assertGreater(percents[-2], percents[0])
+        self.assertGreater(percents[-1], percents[0])
 
     def test_process_descendant_cleanup_script_does_not_shadow_powershell_pid(self) -> None:
         if os.name != "nt":
@@ -1575,17 +1913,15 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         labels = [snapshot["label"] for snapshot in progress_instances[0].snapshots]
         details = [snapshot["detail"] for snapshot in progress_instances[0].snapshots]
         self.assertEqual(rc, 0)
-        self.assertIn("실행 중인 앱 종료 중", labels)
-        self.assertIn("uv 환경 동기화 중", labels)
-        self.assertIn("버전 메타데이터 생성 중", labels)
+        self.assertIn("실행 중인 앱 확인 중", labels)
+        self.assertIn("빌드 환경 동기화 중", labels)
+        self.assertIn("버전 정보 생성 중", labels)
         self.assertIn("실행 파일 빌드 중", labels)
         self.assertIn("실행 파일 배치 중", labels)
         self.assertIn("Windows Supporter 재실행 중", labels)
         self.assertTrue(progress_instances[0].streamed_before_exit)
-        self.assertTrue(
-            any("build.bat 단계" in detail for detail in details),
-            "progress detail should name the current build.bat stage",
-        )
+        self.assertFalse(any("build.bat 단계" in detail for detail in details))
+        self.assertFalse(any("[ Success !! ]" in detail for detail in details))
 
     def test_run_update_handoff_tails_emitted_build_step_log(self) -> None:
         class FakeStdout:
@@ -1691,7 +2027,13 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             with open(state_path, "w", encoding="utf-8") as fp:
                 import json
 
-                json.dump(build_update_handoff_payload(repo_root=repo), fp)
+                json.dump(
+                    build_update_handoff_payload(
+                        repo_root=repo,
+                        log_path=Path(tmp) / "update.log",
+                    ),
+                    fp,
+                )
 
             rc = run_update_handoff(
                 state_path,
@@ -1702,15 +2044,19 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 )
                 or progress_instances[-1],
             )
+            raw_log = (Path(tmp) / "update.log").read_text(encoding="utf-8")
 
         details = [str(snapshot["detail"]) for snapshot in progress_instances[0].snapshots]
         call_env = fake_subprocess.calls[0][1]["env"]
         self.assertEqual(rc, 0)
         self.assertEqual(call_env["WINDOWS_SUPPORTER_EMIT_STEP_LOG"], "1")
-        self.assertTrue(progress_instances[0].tailed_before_exit)
-        self.assertTrue(any("checking Analysis" in detail for detail in details))
-        self.assertTrue(any("Building PYZ" in detail for detail in details))
-        self.assertTrue(any("Building PKG" in detail for detail in details))
+        self.assertFalse(progress_instances[0].tailed_before_exit)
+        self.assertFalse(any("checking Analysis" in detail for detail in details))
+        self.assertFalse(any("Building PYZ" in detail for detail in details))
+        self.assertFalse(any("Building PKG" in detail for detail in details))
+        self.assertIn("checking Analysis", raw_log)
+        self.assertIn("Building PYZ", raw_log)
+        self.assertIn("Building PKG", raw_log)
 
     def test_approving_update_shows_handoff_ui_before_build_completes(self) -> None:
         snapshots_during_ack = []

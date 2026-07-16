@@ -32,13 +32,26 @@ and suppresses the same repeated prompt for the current tag.
 
 ## 4. Visual System
 
-- Use Segoe UI and a native Tk shell, but render the progress bar with an
-  application-owned canvas so Windows theme defaults do not force the old green
-  progress treatment.
+- Use Segoe UI inside a compact, application-owned borderless Tk shell. Keep the
+  1 px neutral boundary and 3 px blue accent; do not add a fake caption bar or
+  duplicate window controls. Render the progress bar with an application-owned
+  canvas so Windows theme defaults do not force the old green treatment.
 - Keep update dialogs compact, left-aligned, and readable.
+- Treat the title/subtitle header as the drag surface. Start moving only after a
+  4 px pointer threshold and clear drag state on release, focus loss, or unmap.
+  Configure the withdrawn root before the first borderless deiconify so native
+  chrome cannot flash during initial mapping. Escape, Alt+F4, and close requests
+  must use the same state guard: ignore them while work is running and allow
+  them only for failed, cancelled, or complete states.
+- The helper is intentionally a short-lived topmost surface. Removing native
+  chrome also removes native minimize, snap, system-menu, taskbar, and Alt+Tab
+  affordances; do not extend this borderless policy to long-lived app windows.
 - During normal progress, show the current stage, percent, detail, and log
   action only. Do not show disabled retry/manual/close controls while work is
   still running.
+- Show recent activity only when structured activity exists. Use at most three
+  Korean stage summaries with a lightweight dot-and-guide timeline, not a
+  permanently reserved bordered log card.
 - Keep progress in determinate mode with low early percentages for checking and
 preflight, mid-range percentages for Git sync, and later percentages for build.
 - Use clear stage labels instead of generic "working" text.
