@@ -49,6 +49,7 @@ class CodexUsageMultiMonitor:
         local_base_dir: str | None = None,
         monitor_factory: Callable[[str, str], Any] | None = None,
         taskbar_progress_factory: Callable[..., Any] | None = None,
+        unrecoverable_timeout_handler: Callable[[], bool] | None = None,
     ) -> None:
         self.__config_dir = self.__resolve_config_dir(config_dir)
         self.__local_base_dir = self.__resolve_local_base_dir(local_base_dir)
@@ -73,6 +74,7 @@ class CodexUsageMultiMonitor:
         self.__event_queue = None
         self.__taskbar_progress = None
         self.__taskbar_progress_factory = taskbar_progress_factory or CodexUsageTaskbarOverlay
+        self.__unrecoverable_timeout_handler = unrecoverable_timeout_handler
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
         self.__notification_events: list[dict[str, Any]] = []
@@ -894,6 +896,7 @@ class CodexUsageMultiMonitor:
             notification_sink=self.__handle_child_notification,
             suppress_normal_tooltips=True,
             local_usage_provider=find_latest_windows_codex_usage,
+            unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
         )
 
     def __handle_child_notification(self, event: dict[str, Any]) -> None:

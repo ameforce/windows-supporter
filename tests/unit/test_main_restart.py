@@ -6,6 +6,32 @@ import main
 
 
 class MainRestartUnitTest(unittest.TestCase):
+    def test_codex_timeout_restart_claim_is_limited_across_restart_environment(self) -> None:
+        environ: dict[str, str] = {}
+
+        first = main._claim_codex_timeout_recovery_restart(
+            environ=environ,
+            now=100.0,
+            cooldown_sec=900.0,
+        )
+        repeated = main._claim_codex_timeout_recovery_restart(
+            environ=environ,
+            now=200.0,
+            cooldown_sec=900.0,
+        )
+        after_cooldown = main._claim_codex_timeout_recovery_restart(
+            environ=environ,
+            now=1001.0,
+            cooldown_sec=900.0,
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(
+            repeated,
+            "a repeated stuck owner must not put the whole app into a restart loop",
+        )
+        self.assertTrue(after_cooldown)
+
     def test_build_restart_command_reuses_frozen_executable_and_args(self) -> None:
         command = main._build_restart_command(
             executable=r"C:\app\windows-supporter.exe",

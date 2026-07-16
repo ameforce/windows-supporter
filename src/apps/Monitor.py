@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 
 from src.utils.LibConnector import LibConnector
 import threading
@@ -11,13 +12,17 @@ from src.apps.codex_usage_multi_monitor import CodexUsageMultiMonitor
 
 
 class Monitor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        codex_timeout_recovery_handler: Callable[[], bool] | None = None,
+    ) -> None:
         self.__lib = LibConnector()
         self.__notion = None
         self.__wrike = None
         self.__kakao = None
         self.__lijamong = None
         self.__codex_usage = None
+        self.__codex_timeout_recovery_handler = codex_timeout_recovery_handler
 
         self.__root = None
         self.__event_queue = None
@@ -159,7 +164,9 @@ class Monitor:
             return self.__codex_usage
         with self.__component_lock:
             if self.__codex_usage is None:
-                self.__codex_usage = CodexUsageMultiMonitor()
+                self.__codex_usage = CodexUsageMultiMonitor(
+                    unrecoverable_timeout_handler=self.__codex_timeout_recovery_handler,
+                )
         return self.__codex_usage
 
     def __attach_features_on_ui_thread(self) -> None:

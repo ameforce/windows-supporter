@@ -1727,6 +1727,7 @@ class CodexUsageMonitor:
             [PlaywrightSessionConfig], CodexUsagePlaywrightSession
         ]
         | None = None,
+        unrecoverable_timeout_handler: Callable[[], bool] | None = None,
     ) -> None:
         self.__lib = LibConnector()
         self.__root = None
@@ -1736,6 +1737,7 @@ class CodexUsageMonitor:
         self.__external_scheduler = False
         self.__local_usage_provider = local_usage_provider
         self.__browser_session_factory = browser_session_factory
+        self.__unrecoverable_timeout_handler = unrecoverable_timeout_handler
 
         self.__monitor_after_id = None
         self.__monitor_running = False
@@ -1883,7 +1885,11 @@ class CodexUsageMonitor:
         factory = self.__browser_session_factory
         if factory is not None:
             return factory(config)
-        return CodexUsagePlaywrightSession(config, log_sink=self.__log)
+        return CodexUsagePlaywrightSession(
+            config,
+            log_sink=self.__log,
+            unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
+        )
 
     def get_settings_snapshot(self) -> dict[str, Any]:
         return {
