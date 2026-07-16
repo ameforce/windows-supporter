@@ -8,10 +8,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import tempfile
+import time
+import types
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.apps.update_settings_ui import UpdateSettingsView
 from src.utils.update_monitor import (
@@ -62,21 +69,6 @@ class SmokeUpdater:
 
 def _capture_window_screenshot(window: Any, output_path: Path) -> str:
     try:
-        import pyautogui
-
-        window.update_idletasks()
-        window.update()
-        x = int(window.winfo_rootx())
-        y = int(window.winfo_rooty())
-        width = int(window.winfo_width())
-        height = int(window.winfo_height())
-        image = pyautogui.screenshot(region=(x, y, width, height))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(output_path)
-        return str(output_path)
-    except Exception:
-        pass
-    try:
         import ctypes
         import struct
         import zlib
@@ -86,19 +78,31 @@ def _capture_window_screenshot(window: Any, output_path: Path) -> str:
         rect = wintypes.RECT()
         user32 = ctypes.windll.user32
         gdi32 = ctypes.windll.gdi32
+        top_level_hwnd = int(user32.GetAncestor(hwnd, 2) or hwnd)
+        hwnd = top_level_hwnd
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return "screenshot failed: GetWindowRect failed"
         width = int(rect.right - rect.left)
         height = int(rect.bottom - rect.top)
         if width <= 0 or height <= 0:
             return "screenshot failed: empty window bounds"
-        hdc_window = user32.GetWindowDC(hwnd)
+        hdc_window = user32.GetDC(0)
         hdc_mem = gdi32.CreateCompatibleDC(hdc_window)
         hbmp = gdi32.CreateCompatibleBitmap(hdc_window, width, height)
         old_obj = gdi32.SelectObject(hdc_mem, hbmp)
-        printed = user32.PrintWindow(hwnd, hdc_mem, 2)
-        if not printed:
-            gdi32.BitBlt(hdc_mem, 0, 0, width, height, hdc_window, 0, 0, 0x00CC0020)
+        copied = gdi32.BitBlt(
+            hdc_mem,
+            0,
+            0,
+            width,
+            height,
+            hdc_window,
+            int(rect.left),
+            int(rect.top),
+            0x40CC0020,
+        )
+        if not copied:
+            return "screenshot failed: BitBlt failed"
 
         class BitmapInfoHeader(ctypes.Structure):
             _fields_ = [
@@ -139,7 +143,7 @@ def _capture_window_screenshot(window: Any, output_path: Path) -> str:
         gdi32.SelectObject(hdc_mem, old_obj)
         gdi32.DeleteObject(hbmp)
         gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(hwnd, hdc_window)
+        user32.ReleaseDC(0, hdc_window)
         if int(read_rows) != height:
             return "screenshot failed: GetDIBits failed"
         rgb = bytearray()
@@ -184,6 +188,318 @@ def _capture_window_screenshot(window: Any, output_path: Path) -> str:
         return f"screenshot failed: {exc!r}"
 
 
+MATRIX_FIXTURES = (
+    "initial",
+    "middle-empty",
+    "middle-activity",
+    "failed",
+    "complete",
+    "long-text",
+)
+CAPTURE_FIXTURES = MATRIX_FIXTURES + ("shutdown",)
+MATRIX_SCALINGS = (("100", 1.3333333333), ("125", 1.6666666667), ("150", 2.0))
+
+
+def _walk_widgets(widget: Any) -> list[Any]:
+    descendants = [widget]
+    for child in widget.winfo_children():
+        descendants.extend(_walk_widgets(child))
+    return descendants
+
+
+def _window_dpi(window: Any) -> int:
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = int(user32.GetAncestor(int(window.winfo_id()), 2) or window.winfo_id())
+        get_dpi = getattr(user32, "GetDpiForWindow", None)
+        return int(get_dpi(hwnd)) if callable(get_dpi) else 0
+    except Exception:
+        return 0
+
+
+def _apply_fixture(progress: UpdateHandoffProgressUi, fixture: str, log_path: str) -> None:
+    progress.show(
+        build_update_progress_snapshot(
+            "handoff_start",
+            state="running",
+            detail="업데이트 전용 프로세스를 시작했습니다.",
+            log_path=log_path,
+        )
+    )
+    if fixture == "initial":
+        return
+    progress.set_snapshot(
+        build_update_progress_snapshot(
+            "build_prepare",
+            state="running",
+            detail="안전한 빌드 환경을 준비하고 있습니다.",
+            log_path=log_path,
+        )
+    )
+    if fixture == "shutdown":
+        snapshot = build_update_build_output_progress_snapshot(
+            "Shutting down the running windows-supporter.exe process...[ Not running ]",
+            log_path=log_path,
+        )
+        if snapshot is not None:
+            progress.set_snapshot(snapshot)
+        return
+    if fixture == "middle-empty":
+        return
+    for line in (
+        "Syncing uv environment...[ Success !! ]",
+        "Building main.py to windows-supporter.exe...[ Success !! ]",
+        "Validating PyInstaller archive...[ Success !! ]",
+    ):
+        snapshot = build_update_build_output_progress_snapshot(line, log_path=log_path)
+        if snapshot is not None:
+            progress.set_snapshot(snapshot)
+    if fixture == "middle-activity":
+        return
+    if fixture == "failed":
+        progress.set_snapshot(
+            build_update_progress_snapshot(
+                "failed",
+                state="failed",
+                detail=(
+                    "실행 파일 검증 단계에서 업데이트를 완료하지 못했습니다. "
+                    "이전 버전으로 안전하게 복구했습니다. 로그에서 오류 코드 WSU-UPD-001을 확인해 주세요."
+                ),
+                percent=80,
+                log_path=log_path,
+                failed_step="실행 파일 검증",
+                can_retry=True,
+                can_manual_action=True,
+            )
+        )
+        return
+    if fixture == "complete":
+        progress.set_snapshot(
+            build_update_progress_snapshot(
+                "complete",
+                state="complete",
+                log_path=log_path,
+            )
+        )
+        return
+    long_snapshot = build_update_progress_snapshot(
+        "build",
+        state="running",
+        detail=(
+            "긴 경로와 설명도 창 경계를 넘지 않아야 합니다: "
+            + "C:\\Users\\epapyrus\\AppData\\Local\\WindowsSupporter\\"
+            + ("매우긴업데이트상태문구" * 48)
+        ),
+        percent=74,
+        log_path=log_path,
+    )
+    long_snapshot["activity"] = {
+        "id": "long_text",
+        "source": "build",
+        "line": "긴 단계 설명 " + ("공백없는문자열" * 36),
+    }
+    progress.set_snapshot(long_snapshot)
+
+
+def run_fixture_capture(
+    fixture: str,
+    scaling: float,
+    output_path: Path,
+    screenshot_path: Path,
+) -> dict[str, Any]:
+    import tkinter as tk
+
+    original_tk = tk.Tk
+
+    def scaled_tk(*args: Any, **kwargs: Any):
+        root = original_tk(*args, **kwargs)
+        root.tk.call("tk", "scaling", float(scaling))
+        return root
+
+    tk.Tk = scaled_tk
+    progress = UpdateHandoffProgressUi(log_path=str(output_path.with_suffix(".log")))
+    try:
+        _apply_fixture(progress, fixture, str(output_path.with_suffix(".log")))
+        root = progress._root
+        if root is None:
+            raise RuntimeError("progress root was not created")
+        root.update_idletasks()
+        root.update()
+        drag_start = [int(root.winfo_x()), int(root.winfo_y())]
+        progress._start_drag(
+            types.SimpleNamespace(x_root=drag_start[0] + 20, y_root=drag_start[1] + 18)
+        )
+        progress._drag_window(
+            types.SimpleNamespace(x_root=drag_start[0] + 44, y_root=drag_start[1] + 34)
+        )
+        progress._end_drag()
+        root.update_idletasks()
+        root.update()
+        drag_end = [int(root.winfo_x()), int(root.winfo_y())]
+        drag_delta = [drag_end[0] - drag_start[0], drag_end[1] - drag_start[1]]
+        pointer_x = drag_end[0] + 20
+        pointer_y = drag_end[1] + 18
+        progress._start_drag(types.SimpleNamespace(x_root=pointer_x, y_root=pointer_y))
+        progress._drag_window(
+            types.SimpleNamespace(
+                x_root=pointer_x + (-10 - drag_end[0]),
+                y_root=pointer_y + (-20 - drag_end[1]),
+            )
+        )
+        progress._end_drag()
+        root.update_idletasks()
+        negative_drag_position = [int(root.winfo_x()), int(root.winfo_y())]
+        root.geometry(f"+{drag_end[0]}+{drag_end[1]}")
+        root.update_idletasks()
+        root.update()
+        time.sleep(0.6)
+        root.update_idletasks()
+        root.update()
+        screenshot = _capture_window_screenshot(root, screenshot_path)
+        root_left = int(root.winfo_rootx())
+        root_top = int(root.winfo_rooty())
+        root_right = root_left + int(root.winfo_width())
+        root_bottom = root_top + int(root.winfo_height())
+        clipped: list[str] = []
+        widget_metrics: list[dict[str, Any]] = []
+        for widget in _walk_widgets(root):
+            if widget is root or not widget.winfo_manager() or not widget.winfo_ismapped():
+                continue
+            left = int(widget.winfo_rootx())
+            top = int(widget.winfo_rooty())
+            width = int(widget.winfo_width())
+            height = int(widget.winfo_height())
+            right = left + width
+            bottom = top + height
+            path = str(widget)
+            widget_metrics.append(
+                {
+                    "path": path,
+                    "class": widget.winfo_class(),
+                    "rect": [left, top, width, height],
+                    "requested": [int(widget.winfo_reqwidth()), int(widget.winfo_reqheight())],
+                }
+            )
+            if left < root_left or top < root_top or right > root_right + 1 or bottom > root_bottom + 1:
+                clipped.append(path)
+        visible_activity = [
+            str(label.cget("text") or "")
+            for label in progress._activity_labels
+            if label.winfo_manager() and label.winfo_ismapped()
+        ]
+        visible_buttons = [
+            str(button.cget("text") or "")
+            for button in (
+                progress._retry_button,
+                progress._manual_button,
+                progress._log_button,
+                progress._close_button,
+            )
+            if button is not None and button.winfo_manager() and button.winfo_ismapped()
+        ]
+        activity_manager = (
+            progress._activity_shell.winfo_manager()
+            if progress._activity_shell is not None
+            else "missing"
+        )
+        detail_text = str(progress._detail_label.cget("text") or "")
+        empty_expected = fixture in {"initial", "middle-empty"}
+        result = {
+            "ok": all(
+                [
+                    Path(screenshot).exists(),
+                    not clipped,
+                    activity_manager == "" if empty_expected else activity_manager == "pack",
+                    bool(root.overrideredirect()),
+                    drag_delta == [24, 16],
+                    negative_drag_position == [-10, -20],
+                    bool(root.bind("<Alt-F4>")),
+                    not any(token in detail_text for token in ("build.bat 단계", "[ Success !! ]")),
+                    len(detail_text) <= 320,
+                ]
+            ),
+            "fixture": fixture,
+            "scaling_requested": scaling,
+            "tk_scaling": float(root.tk.call("tk", "scaling")),
+            "tk_fpixels_1i": float(root.winfo_fpixels("1i")),
+            "window_dpi": _window_dpi(root),
+            "geometry": root.geometry(),
+            "root_size": [int(root.winfo_width()), int(root.winfo_height())],
+            "root_requested": [int(root.winfo_reqwidth()), int(root.winfo_reqheight())],
+            "root_bg": str(root.cget("bg")),
+            "borderless_shell": bool(root.overrideredirect()),
+            "drag_start": drag_start,
+            "drag_end": drag_end,
+            "drag_delta": drag_delta,
+            "negative_drag_position": negative_drag_position,
+            "alt_f4_binding": bool(root.bind("<Alt-F4>")),
+            "activity_manager": activity_manager,
+            "activity_lines": visible_activity,
+            "visible_buttons": visible_buttons,
+            "detail": detail_text,
+            "clipped_widgets": clipped,
+            "widgets": widget_metrics,
+            "screenshot": screenshot,
+        }
+    finally:
+        progress.close()
+        tk.Tk = original_tk
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
+def run_matrix(output_path: Path, matrix_dir: Path) -> dict[str, Any]:
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any]] = []
+    for scale_name, scaling in MATRIX_SCALINGS:
+        for fixture in MATRIX_FIXTURES:
+            stem = f"{scale_name}-{fixture}"
+            metrics_path = matrix_dir / f"{stem}.json"
+            screenshot_path = matrix_dir / f"{stem}.png"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--fixture",
+                    fixture,
+                    "--scaling",
+                    str(scaling),
+                    "--output",
+                    str(metrics_path),
+                    "--screenshot",
+                    str(screenshot_path),
+                ],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=45,
+            )
+            if completed.returncode != 0:
+                results.append(
+                    {
+                        "ok": False,
+                        "fixture": fixture,
+                        "scale": scale_name,
+                        "stderr": completed.stderr,
+                    }
+                )
+                continue
+            results.append(json.loads(metrics_path.read_text(encoding="utf-8")))
+    result = {
+        "ok": len(results) == len(MATRIX_FIXTURES) * len(MATRIX_SCALINGS)
+        and all(item.get("ok") for item in results),
+        "capture_count": len(results),
+        "results": results,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
 def run_smoke(output_path: Path, screenshot_path: Path | None = None) -> dict[str, Any]:
     import tkinter as tk
 
@@ -224,9 +540,9 @@ def run_smoke(output_path: Path, screenshot_path: Path | None = None) -> dict[st
             labels.append("custom-canvas" if progress._progress_canvas is not None else "missing-canvas")
             borderless = progress._root.overrideredirect() if progress._root is not None else None
             labels.append(
-                "borderless-true"
-                if borderless is True or borderless == 1 or str(borderless).lower() == "true"
-                else f"borderless-{borderless!r}"
+                "borderless-shell"
+                if bool(borderless)
+                else f"unexpected-native-chrome-{borderless!r}"
             )
             labels.append(
                 "log-visible"
@@ -261,7 +577,7 @@ def run_smoke(output_path: Path, screenshot_path: Path | None = None) -> dict[st
             labels.append(
                 "activity-visible"
                 if any(
-                    str(label.cget("text") or "").strip()
+                    label.winfo_manager() and label.winfo_ismapped()
                     for label in list(getattr(progress, "_activity_labels", []))
                 )
                 else "activity-hidden"
@@ -298,17 +614,17 @@ def run_smoke(output_path: Path, screenshot_path: Path | None = None) -> dict[st
                 any("업데이트 프로세스 시작" in label for label in labels),
                 any(label == "0%" for label in labels),
                 any(label == "custom-canvas" for label in labels),
-                any(label == "borderless-true" for label in labels),
+                any(label == "borderless-shell" for label in labels),
                 any(label == "log-visible" for label in labels),
                 any("업데이트 사전 점검 중" in label for label in labels),
                 any("Fork.exe" in label and "종료 승인" in label for label in labels),
-                any("uv 환경 동기화 중" in label for label in labels),
-                any(label == "30%" for label in labels),
+                any("빌드 환경 동기화 중" in label for label in labels),
+                any(label == "74%" for label in labels),
                 any("실행 파일 빌드 중" in label for label in labels),
-                any("build.bat 단계" in label for label in labels),
-                any("checking Analysis" in label for label in labels),
-                any("Building PYZ" in label for label in labels),
-                any("Building PKG" in label for label in labels),
+                not any("build.bat 단계" in label for label in labels),
+                not any("checking Analysis" in label for label in labels),
+                not any("Building PYZ" in label for label in labels),
+                not any("Building PKG" in label for label in labels),
                 any(label == "activity-visible" for label in labels),
                 screenshot_path is None or Path(screenshot).exists(),
                 any("재실행" in label for label in labels),
@@ -328,11 +644,26 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--screenshot", default="")
+    parser.add_argument("--fixture", choices=CAPTURE_FIXTURES, default="")
+    parser.add_argument("--scaling", type=float, default=1.3333333333)
+    parser.add_argument("--matrix-dir", default="")
     args = parser.parse_args()
-    result = run_smoke(
-        Path(args.output),
-        Path(args.screenshot) if str(args.screenshot or "").strip() else None,
-    )
+    if str(args.matrix_dir or "").strip():
+        result = run_matrix(Path(args.output), Path(args.matrix_dir))
+    elif str(args.fixture or "").strip():
+        if not str(args.screenshot or "").strip():
+            parser.error("--fixture requires --screenshot")
+        result = run_fixture_capture(
+            str(args.fixture),
+            float(args.scaling),
+            Path(args.output),
+            Path(args.screenshot),
+        )
+    else:
+        result = run_smoke(
+            Path(args.output),
+            Path(args.screenshot) if str(args.screenshot or "").strip() else None,
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 1
 
