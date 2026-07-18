@@ -28,6 +28,12 @@ class BuildSubprocess:
         )
 
 
+class PreservingFailedBuildSubprocess:
+    def run(self, argv, **kwargs):
+        _ = argv, kwargs
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="failed")
+
+
 class StableProcess:
     """Fake process whose mutable wait history proves the health check ran."""
 
@@ -55,6 +61,34 @@ def write_handoff_state(state_path: Path, repo: Path, previous_executable: Path)
 
 
 class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
+    def test_build_failure_relaunches_same_file_without_copy_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"trusted-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"copy-fallback")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            stable_process = StableProcess()
+            launches = []
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=PreservingFailedBuildSubprocess(),
+                launch=lambda command, **kwargs: launches.append((list(command), dict(kwargs)))
+                or stable_process,
+                progress_ui_factory=None,
+                max_attempts=1,
+            )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(root_executable.read_bytes(), b"trusted-root")
+            self.assertEqual(len(launches), 1)
+            self.assertEqual(state["recovery_status"], "complete")
+
     def test_missing_recovery_executable_reports_failure_without_launching(self) -> None:
         # Given
         with tempfile.TemporaryDirectory() as tmp:

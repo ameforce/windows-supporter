@@ -387,12 +387,16 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         taskkill_guard = script.index('if "%ARTIFACT_ONLY%"=="0" (')
         taskkill_index = script.index('taskkill /f /t /im "%EXE_NAME%"')
         taskkill_guard_end = script.index("\n)", taskkill_index)
-        artifact_exit = script.index('if "%ARTIFACT_ONLY%"=="1" (')
+        staged_validation_index = script.index("tools\\verify_codex_usage_worker_smoke.py")
+        artifact_exit = script.index(
+            'if "%ARTIFACT_ONLY%"=="1" (', staged_validation_index
+        )
         move_index = script.index('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"')
 
         self.assertLess(taskkill_guard, taskkill_index)
         self.assertLess(taskkill_index, taskkill_guard_end)
         self.assertLess(artifact_exit, move_index)
+        self.assertLess(staged_validation_index, artifact_exit)
         self.assertIn("dist\\%EXE_NAME%", script[artifact_exit:move_index])
 
     def test_build_bat_can_emit_step_log_for_updater_progress(self) -> None:
@@ -466,6 +470,108 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertLess(validation_index, cleanup_index)
         self.assertLess(validation_index, launch_index)
         self.assertIn("playwright\\driver\\node.exe", script)
+
+    def test_build_bat_rolls_back_when_promoted_worker_boundary_is_blocked(self) -> None:
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+
+        staged_validation_index = script.index(
+            '"tools\\verify_codex_usage_worker_smoke.py" "dist\\%EXE_NAME%"'
+        )
+        backup_index = script.index("call :backup_root_executable")
+        move_index = script.index('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"')
+        promoted_validation_index = script.index(
+            '"tools\\verify_codex_usage_worker_smoke.py" "%ROOT_EXE%"'
+        )
+        rollback_index = script.index(
+            "call :restore_root_executable", promoted_validation_index
+        )
+        cleanup_index = script.index("Remove build byproducts")
+
+        self.assertLess(staged_validation_index, backup_index)
+        self.assertLess(backup_index, move_index)
+        self.assertLess(move_index, promoted_validation_index)
+        self.assertLess(promoted_validation_index, rollback_index)
+        self.assertLess(rollback_index, cleanup_index)
+        self.assertIn(":backup_root_executable", script)
+        self.assertIn(":restore_root_executable", script)
+        backup_helper_index = script.index("\n:backup_root_executable")
+        restore_helper_index = script.index("\n:restore_root_executable")
+        backup_helper = script[backup_helper_index:restore_helper_index]
+        self.assertIn('mklink /H "%ROOT_EXE_BACKUP%" "%ROOT_EXE%"', backup_helper)
+        self.assertIn('move /Y "%ROOT_EXE%" "%ROOT_EXE_BACKUP%"', backup_helper)
+        self.assertNotIn('copy /Y "%ROOT_EXE%" "%ROOT_EXE_BACKUP%"', backup_helper)
+
+    def test_build_bat_rollback_helpers_restore_the_previous_file(self) -> None:
+        if os.name != "nt":
+            self.skipTest("build.bat rollback helpers are a Windows command path")
+
+        with open("build.bat", "r", encoding="utf-8") as fp:
+            script = fp.read()
+        helper_start = script.index("\n:backup_root_executable") + 1
+        helper_end = script.index("\n:remove_pyinstaller_byproducts", helper_start) + 1
+        rollback_helpers = script[helper_start:helper_end]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            root_exe = temp_dir / "windows-supporter-rollback-test.exe"
+            expected_exe = temp_dir / "expected.exe"
+            candidate_exe = temp_dir / "candidate.exe"
+            backup_exe = temp_dir / "windows-supporter-rollback-test.previous.exe"
+            step_log = temp_dir / "rollback.log"
+            transaction = temp_dir / "windows-supporter-rollback-test.promotion-pending"
+            expected_exe.write_bytes(b"known-good")
+            root_exe.write_bytes(b"known-good")
+            original_file_index = root_exe.stat().st_ino
+            candidate_exe.write_bytes(b"blocked-candidate")
+            harness = temp_dir / "rollback-helper-test.bat"
+            harness.write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "setlocal EnableExtensions DisableDelayedExpansion",
+                        f'set "ROOT_EXE={root_exe}"',
+                        f'set "ROOT_EXE_BACKUP={backup_exe}"',
+                        'set "ROOT_BACKUP_CREATED=0"',
+                        'set "EXE_NAME=windows-supporter-rollback-test.exe"',
+                        f'set "STEP_LOG={step_log}"',
+                        f'set "ROOT_PROMOTION_TRANSACTION={transaction}"',
+                        "call :backup_root_executable",
+                        "if errorlevel 1 exit /b 10",
+                        f'move /Y "{candidate_exe}" "%ROOT_EXE%" > NUL',
+                        "if errorlevel 1 exit /b 11",
+                        "call :recover_interrupted_promotion",
+                        "if errorlevel 1 exit /b 12",
+                        f'fc /B "{expected_exe}" "%ROOT_EXE%" > NUL',
+                        "if errorlevel 1 exit /b 13",
+                        'if exist "%ROOT_EXE_BACKUP%" exit /b 14',
+                        'if exist "%ROOT_PROMOTION_TRANSACTION%" exit /b 15',
+                        "exit /b 0",
+                        rollback_helpers,
+                        ":clear_log",
+                        'if exist "%STEP_LOG%" del /F /Q "%STEP_LOG%" > NUL 2>&1',
+                        "exit /b 0",
+                        ":wait_for_process_stop",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["cmd", "/d", "/c", str(harness)],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+            restored_file_index = root_exe.stat().st_ino
+
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        self.assertEqual(restored_file_index, original_file_index)
 
     def test_build_bat_sleep_helper_runs_with_redirected_stdin(self) -> None:
         if os.name != "nt":
