@@ -2189,8 +2189,9 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             updater._latest_tag = "v0.5.7"
 
             self.assertTrue(updater.launch_update())
+            self.assertEqual(launches[0][0][-2], UPDATE_HANDOFF_ARG)
+            self.assertTrue(Path(launches[0][0][-1]).samefile(state_path))
 
-        self.assertEqual(launches[0][0][-2:], [UPDATE_HANDOFF_ARG, str(state_path)])
         self.assertEqual(snapshots_during_ack[0]["state"], "updating")
         self.assertEqual(snapshots_during_ack[0]["progress"]["step_key"], "handoff")
         self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 68)
@@ -2225,7 +2226,9 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             settings = updater.get_settings_snapshot()
             self.assertTrue(settings["auto_check_enabled"])
             self.assertEqual(settings["check_interval_minutes"], 10)
-            self.assertEqual(settings["settings_path"], str(settings_path))
+            resolved_settings_path = Path(settings["settings_path"])
+            self.assertEqual(resolved_settings_path.name, settings_path.name)
+            self.assertTrue(resolved_settings_path.parent.samefile(settings_path.parent))
 
             ok, error = updater.update_settings(
                 {"auto_check_enabled": True, "check_interval_minutes": 1}
