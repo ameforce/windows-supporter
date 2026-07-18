@@ -325,6 +325,17 @@ class PullRequestGateUnitTest(unittest.TestCase):
                     config_path=REPO_ROOT / ".github/pr-gate/active-release.json",
                 )
 
+    def test_controller_source_accepts_git_equivalent_lf_checkout(self) -> None:
+        def trusted_lf_bytes(_repository: str, _revision: str, path: str) -> bytes:
+            return (REPO_ROOT / path).read_bytes().replace(b"\r\n", b"\n")
+
+        with mock.patch.object(gate, "_remote_file_bytes", side_effect=trusted_lf_bytes):
+            gate.assert_trusted_controller_source(
+                repository=REPOSITORY,
+                base_sha=BASE_SHA,
+                config_path=REPO_ROOT / ".github/pr-gate/active-release.json",
+            )
+
     def test_merge_controller_rejects_post_validation_metadata_change(self) -> None:
         current = live_pull_request()
         changed = dict(current)

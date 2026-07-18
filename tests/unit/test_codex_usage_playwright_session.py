@@ -330,7 +330,7 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
 
     def test_command_timeout_recovers_connection_and_retries_on_a_fresh_owner(self) -> None:
         release = threading.Event()
-        first = BlockingDriver(release, release_after_sec=0.06)
+        first = TerminableBlockingDriver(release)
         second = FakeDriver()
         factory = SequenceDriverFactory([first, second])
         session = make_session(factory, command_timeout_sec=0.05)

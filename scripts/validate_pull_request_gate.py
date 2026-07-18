@@ -412,6 +412,10 @@ def _remote_file_bytes(repository: str, revision: str, path: str) -> bytes:
         raise PolicyError(f"trusted base의 {path} content가 base64가 아닙니다.") from exc
 
 
+def _canonical_trusted_text_bytes(value: bytes) -> bytes:
+    return value.replace(b"\r\n", b"\n")
+
+
 def assert_trusted_controller_source(
     *,
     repository: str,
@@ -427,7 +431,11 @@ def assert_trusted_controller_source(
         ".github/pr-gate/active-release.json": expected_config,
     }
     for remote_path, local_path in trusted_files.items():
-        if local_path.read_bytes() != _remote_file_bytes(repository, base_sha, remote_path):
+        local_bytes = _canonical_trusted_text_bytes(local_path.read_bytes())
+        remote_bytes = _canonical_trusted_text_bytes(
+            _remote_file_bytes(repository, base_sha, remote_path)
+        )
+        if local_bytes != remote_bytes:
             raise PolicyError(f"local {remote_path}가 trusted base SHA와 일치하지 않습니다.")
 
 
