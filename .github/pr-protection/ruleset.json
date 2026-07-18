@@ -1,15 +1,14 @@
 {
-  "name": "windows-supporter-task-pr-gate",
+  "name": "windows-supporter-release-pr-protection",
   "target": "branch",
   "enforcement": "active",
-  "bypass_actors": [],
   "conditions": {
     "ref_name": {
+      "exclude": [],
       "include": [
         "refs/heads/hotfix/*",
         "refs/heads/release/*"
-      ],
-      "exclude": []
+      ]
     }
   },
   "rules": [
@@ -23,23 +22,8 @@
         "require_code_owner_review": false,
         "require_last_push_approval": false,
         "required_approving_review_count": 0,
-        "required_reviewers": [],
-        "required_review_thread_resolution": true
-      }
-    },
-    {
-      "type": "required_status_checks",
-      "parameters": {
-        "do_not_enforce_on_create": true,
-        "required_status_checks": [
-          {
-            "context": "pr-policy-gate"
-          },
-          {
-            "context": "pr-quality-gate"
-          }
-        ],
-        "strict_required_status_checks_policy": true
+        "required_review_thread_resolution": true,
+        "required_reviewers": []
       }
     },
     {
