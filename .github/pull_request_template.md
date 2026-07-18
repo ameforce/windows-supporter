@@ -4,7 +4,7 @@
 
 ## exact-head 리뷰 기록
 
-> 아래 기록은 실제 GitHub review object와 독립 reviewer 결과를 찾기 위한 체크리스트입니다. 작성자가 체크하거나 0을 적은 사실 자체는 리뷰 증거가 아닙니다.
+> 아래 기록은 실제 GitHub review object 또는 zero-finding connector 결과와 독립 reviewer 결과를 찾기 위한 체크리스트입니다. 작성자가 체크하거나 0을 적은 사실 자체는 리뷰 증거가 아닙니다.
 
 - [ ] 최종 base ref/SHA와 head SHA: `<base ref> / <40자리 base SHA> / <40자리 head SHA>`
 - [ ] GitHub `@codex review` 요청 URL과 결과: `<URL> / review commit_id 또는 zero-finding 댓글의 유일한 Reviewed commit prefix>`
