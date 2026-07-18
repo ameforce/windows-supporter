@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "policy_version": "1.1.0",
+  "state": "active",
+  "lane": "hotfix",
+  "active_base": "hotfix/v0.8.1",
+  "source_main_sha": "27125d5241493641297bde10605ce3d766d8073b",
+  "expected_version": "0.8.1",
+  "bootstrap_local_source_allowed": true,
+  "repository_id": 1202717044,
+  "repository_full_name": "ameforce/windows-supporter",
+  "attestation_max_age_hours": 24,
+  "merge_freshness_safety_margin_seconds": 300,
+  "maintainer_policy_label": "pr-gate-policy-change",
+  "policy_head_prefix": "policy/",
+  "allowed_head_prefixes": [
+    "task/",
+    "feat/",
+    "fix/",
+    "chore/",
+    "refact/",
+    "policy/"
+  ],
+  "protected_paths": [
+    ".github/pr-gate/",
+    ".github/workflows/",
+    ".github/pull_request_template.md",
+    "AGENTS.md",
+    "scripts/validate_pull_request_gate.py",
+    "scripts/configure_github_pr_gate.ps1",
+    "tests/unit/test_pull_request_gate.py"
+  ],
+  "ui_path_patterns": [
+    "main.py",
+    "src/apps/*_ui.py",
+    "src/apps/dashboard_ui.py",
+    "src/apps/main_ui.py",
+    "src/apps/codex_usage_taskbar_overlay.py",
+    "src/apps/startup_apps_ui.py",
+    "src/apps/update_settings_ui.py",
+    "src/apps/wrike_ui.py",
+    "src/utils/tray_icon.py"
+  ]
+}
