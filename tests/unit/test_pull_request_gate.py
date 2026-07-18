@@ -325,6 +325,17 @@ class PullRequestGateUnitTest(unittest.TestCase):
                     config_path=REPO_ROOT / ".github/pr-gate/active-release.json",
                 )
 
+    def test_controller_source_accepts_git_equivalent_lf_checkout(self) -> None:
+        def trusted_lf_bytes(_repository: str, _revision: str, path: str) -> bytes:
+            return (REPO_ROOT / path).read_bytes().replace(b"\r\n", b"\n")
+
+        with mock.patch.object(gate, "_remote_file_bytes", side_effect=trusted_lf_bytes):
+            gate.assert_trusted_controller_source(
+                repository=REPOSITORY,
+                base_sha=BASE_SHA,
+                config_path=REPO_ROOT / ".github/pr-gate/active-release.json",
+            )
+
     def test_merge_controller_rejects_post_validation_metadata_change(self) -> None:
         current = live_pull_request()
         changed = dict(current)
@@ -468,10 +479,19 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertIn("-cnotmatch", configure_script)
         self.assertIn("repository numeric identity", configure_script)
         self.assertNotIn("[Security.Cryptography.SHA256]::HashData", configure_script)
+        self.assertIn("[AllowEmptyCollection()]$Value", configure_script)
+        self.assertIn("$allBefore = @(Get-RepositoryRulesets)", configure_script)
         validator_source = SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertGreaterEqual(validator_source.count('encoding="utf-8"'), 3)
         self.assertIn("restored canonical protection", configure_script)
         self.assertIn("actions/upload-artifact@", quality_workflow)
+        self.assertIn("name: Prepare pinned uv environment", quality_workflow)
+        self.assertIn("timeout-minutes: 5", quality_workflow)
+        self.assertIn("timeout-minutes: 30", quality_workflow)
+        self.assertIn('PYTHONUNBUFFERED: "1"', quality_workflow)
+        self.assertIn('-p "test_*.py" -v -f', quality_workflow)
+        self.assertIn('tzutil /s "Korea Standard Time"', quality_workflow)
+        self.assertIn("fetch-depth: 0", quality_workflow)
         self.assertNotIn("actions/checkout@v", policy_workflow + quality_workflow)
 
         status_rule = next(rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks")

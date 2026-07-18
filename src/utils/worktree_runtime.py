@@ -23,6 +23,10 @@ def _has_git_metadata(repo_root: Path) -> bool:
 
 
 def _same_path(left: str | os.PathLike[str], right: str | os.PathLike[str]) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except (OSError, TypeError, ValueError):
+        pass
     return os.path.normcase(os.path.abspath(os.path.normpath(str(left)))) == os.path.normcase(
         os.path.abspath(os.path.normpath(str(right)))
     )

@@ -25,19 +25,35 @@ jobs:
       - name: Checkout untrusted PR head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Set up Python 3.14
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: "3.14"
-      - name: Run unit and integration tests
+      - name: Prepare pinned uv environment
         shell: cmd
+        timeout-minutes: 5
         run: |
           call tools\ensure_uv_ready.bat "%RUNNER_TEMP%\windows-supporter-uv.log"
           if errorlevel 1 exit /b 1
           "%WINDOWS_SUPPORTER_UV_EXE%" sync --locked --extra build
           if errorlevel 1 exit /b 1
-          "%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m unittest discover -s tests -p "test_*.py"
+      - name: Configure target timezone
+        shell: cmd
+        run: |
+          tzutil /s "Korea Standard Time"
+          if errorlevel 1 exit /b 1
+          tzutil /g
+      - name: Run unit and integration tests
+        shell: cmd
+        timeout-minutes: 30
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          call tools\ensure_uv_ready.bat "%RUNNER_TEMP%\windows-supporter-uv.log"
+          if errorlevel 1 exit /b 1
+          "%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m unittest discover -s tests -p "test_*.py" -v -f
       - name: Build artifact without launching it
         shell: cmd
         env:

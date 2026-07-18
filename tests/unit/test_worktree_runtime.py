@@ -1,19 +1,41 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.utils.subprocess_utils import build_no_window_subprocess_kwargs
 from src.utils.worktree_runtime import (
     is_codex_temporary_worktree_path,
+    is_primary_worktree,
     resolve_persistent_executable_path,
 )
 
 
 class WorktreeRuntimeUnitTest(unittest.TestCase):
+    def test_primary_worktree_accepts_filesystem_alias_path(self) -> None:
+        porcelain = "\n".join(
+            [
+                "worktree C:/Users/RUNNER~1/project",
+                "HEAD 9cc7cc8",
+                "branch refs/heads/main",
+                "",
+            ]
+        )
+
+        def runner(_argv, **_kwargs):
+            return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
+
+        with patch("src.utils.worktree_runtime.os.path.samefile", return_value=True):
+            self.assertTrue(
+                is_primary_worktree(
+                    r"C:\Users\runneradmin\project",
+                    runner=runner,
+                )
+            )
+
     def test_codex_temporary_worktree_path_is_detected_case_insensitively(self) -> None:
         self.assertTrue(
             is_codex_temporary_worktree_path(
@@ -66,9 +88,8 @@ class WorktreeRuntimeUnitTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
 
             resolved = resolve_persistent_executable_path(str(primary_exe), runner=runner)
-
-        assert resolved is not None
-        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(primary_exe)))
+            assert resolved is not None
+            self.assertTrue(Path(resolved).samefile(primary_exe))
 
     def test_temporary_executable_resolves_to_primary_worktree_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,9 +124,9 @@ class WorktreeRuntimeUnitTest(unittest.TestCase):
                 str(temporary_exe),
                 runner=runner,
             )
+            assert resolved is not None
+            self.assertTrue(Path(resolved).samefile(primary_exe))
 
-        assert resolved is not None
-        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(primary_exe)))
         self.assertEqual(commands[0][0][:4], ["git", "-C", str(temporary), "worktree"])
         expected_no_window = build_no_window_subprocess_kwargs()
         if "creationflags" in expected_no_window:
@@ -148,9 +169,8 @@ class WorktreeRuntimeUnitTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
 
             resolved = resolve_persistent_executable_path(str(linked_exe), runner=runner)
-
-        assert resolved is not None
-        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(primary_exe)))
+            assert resolved is not None
+            self.assertTrue(Path(resolved).samefile(primary_exe))
 
     def test_temporary_executable_fails_closed_when_primary_executable_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
