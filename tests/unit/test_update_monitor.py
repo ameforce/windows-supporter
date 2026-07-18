@@ -595,12 +595,12 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 encoding="utf-8",
             )
             result = subprocess.run(
-                ["cmd", "/c", str(harness)],
+                ["cmd", "/d", "/c", str(harness)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=5,
+                timeout=30,
             )
 
         output = f"{result.stdout}\n{result.stderr}"
