@@ -61,10 +61,12 @@ class PullRequestReviewContractTest(unittest.TestCase):
 
     def test_pull_request_template_is_non_authoritative(self) -> None:
         template = (REPO_ROOT / ".github/pull_request_template.md").read_text(encoding="utf-8")
+        self.assertIn("URL: `<URL>`; review `commit_id`", template)
         self.assertIn("review `commit_id`", template)
         self.assertIn("작성자가 체크하거나 0을 적은 사실 자체는 리뷰 증거가 아닙니다", template)
         self.assertNotIn("reviewer_source", template)
         self.assertNotIn("review_evidence_digest", template)
+        self.assertNotIn("`<URL> / review `", template)
 
     def test_agents_contract_requires_two_exact_head_reviews(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
