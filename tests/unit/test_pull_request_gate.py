@@ -349,6 +349,10 @@ class PullRequestGateUnitTest(unittest.TestCase):
         )
         with mock.patch.object(
             gate,
+            "load_json",
+            return_value=config(),
+        ), mock.patch.object(
+            gate,
             "validate_live_pull_request",
             return_value={
                 "pull_request": current,
@@ -377,6 +381,10 @@ class PullRequestGateUnitTest(unittest.TestCase):
             allow_bootstrap_local_source=False,
         )
         with mock.patch.object(
+            gate,
+            "load_json",
+            return_value=config(),
+        ), mock.patch.object(
             gate,
             "validate_live_pull_request",
             return_value={
@@ -416,6 +424,10 @@ class PullRequestGateUnitTest(unittest.TestCase):
             allow_bootstrap_local_source=False,
         )
         with mock.patch.object(
+            gate,
+            "load_json",
+            return_value=config(),
+        ), mock.patch.object(
             gate,
             "validate_live_pull_request",
             return_value={
