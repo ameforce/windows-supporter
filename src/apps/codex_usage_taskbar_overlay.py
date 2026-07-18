@@ -200,16 +200,34 @@ _SNAPSHOT_ON_TRACK_MAX_PROJECTED_REMAINING_PERCENT = 10.0
 # the same way while keeping local overlay "now" out of tag decisions.
 _SNAPSHOT_CAPTURED_AT_FALLBACK_TZ = timezone(timedelta(hours=9))
 _BAR_RENDER_SIGNATURE_KEYS = (
+    "id",
+    "profile_id",
+    "provider",
     "enabled",
+    "taskbar_selected",
     "label",
+    "freshness",
+    "provider_status",
+    "status_state",
     "status_text",
     "status_color",
-)
-_METRIC_RENDER_SIGNATURE_KEYS = (
-    "metric_key",
-    "key",
+    "state",
+    "color",
     "percent",
     "value_text",
+)
+_METRIC_RENDER_SIGNATURE_KEYS = (
+    "id",
+    "provider",
+    "profile_id",
+    "freshness",
+    "provider_status",
+    "metric_key",
+    "key",
+    "short_label",
+    "percent",
+    "value_text",
+    "reset_at",
     "color",
     "state",
     "reset_text",
@@ -238,6 +256,29 @@ class _MetricRowLayout:
     visible_metrics: tuple[dict[str, Any], ...]
 
 
+def _taskbar_profile_source(runtime: dict[str, Any]) -> list[Any]:
+    profiles = runtime.get("profiles")
+    if isinstance(profiles, list):
+        return profiles
+    accounts = runtime.get("accounts")
+    if isinstance(accounts, list):
+        return accounts
+    return []
+
+
+def _selected_taskbar_profiles(profiles: list[Any]) -> list[dict[str, Any]]:
+    selected = []
+    for raw in profiles:
+        if not isinstance(raw, dict):
+            continue
+        if not bool(raw.get("taskbar_selected", True)):
+            continue
+        selected.append(raw)
+        if len(selected) >= 2:
+            break
+    return selected
+
+
 def build_codex_usage_taskbar_overlay_model(
     runtime_status: dict[str, Any],
     geometry: dict[str, int | str] | None = None,
@@ -245,52 +286,92 @@ def build_codex_usage_taskbar_overlay_model(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     runtime = runtime_status if isinstance(runtime_status, dict) else {}
-    accounts = runtime.get("accounts")
-    if not isinstance(accounts, list):
-        accounts = []
+    profiles = _taskbar_profile_source(runtime)
+    selected_profiles = _selected_taskbar_profiles(profiles)
 
     bars = []
     manager_enabled = bool(runtime.get("enabled", True))
-    for index, raw in enumerate(accounts[:2], start=1):
-        if not isinstance(raw, dict):
-            continue
-        account_enabled = bool(raw.get("enabled", True))
+    for index, raw in enumerate(selected_profiles, start=1):
+        profile_enabled = bool(raw.get("enabled", True))
+        provider = str(raw.get("provider") or "codex").strip().lower() or "codex"
+        profile_id = str(raw.get("id") or raw.get("profile_id") or f"profile_{index}")
+        freshness = str(raw.get("freshness") or "").strip().lower()
+        provider_status = raw.get("provider_status", "")
         snapshot = raw.get("last_snapshot", {})
         if not isinstance(snapshot, dict):
             snapshot = {}
         runtime_info = raw.get("runtime", {})
         if not isinstance(runtime_info, dict):
             runtime_info = {}
-        status = _account_status(account_enabled, runtime_info, snapshot)
-        metrics = []
-        for metric_key, short_label in _TASKBAR_METRICS:
-            reset_key = _RESET_KEY_BY_METRIC.get(metric_key, "")
-            metrics.append(
-                _build_metric(
-                    key=metric_key,
-                    short_label=short_label,
-                    raw_value=snapshot.get(metric_key),
-                    reset_at_value=snapshot.get(reset_key),
-                    captured_at_value=snapshot.get("captured_at"),
-                    account_state=status["state"],
-                    now=now,
+        raw_metrics = raw.get("metrics")
+        status = _profile_status(
+            profile_enabled,
+            runtime_info,
+            snapshot,
+            provider_status=provider_status,
+            freshness=freshness,
+            metric_descriptors=raw_metrics,
+        )
+        metrics: list[dict[str, Any]] = []
+        if isinstance(raw_metrics, list):
+            for metric_index, descriptor in enumerate(raw_metrics, start=1):
+                if not isinstance(descriptor, dict):
+                    continue
+                metrics.append(
+                    _build_provider_metric(
+                        descriptor,
+                        provider=provider,
+                        profile_id=profile_id,
+                        freshness=freshness,
+                        provider_status=provider_status,
+                        account_state=status["state"],
+                        captured_at_value=snapshot.get("captured_at"),
+                        fallback_index=metric_index,
+                        now=now,
+                    )
                 )
-            )
-        five_hour_metric = metrics[0]
+                if len(metrics) >= 2:
+                    break
+        else:
+            for metric_key, short_label in _TASKBAR_METRICS:
+                reset_key = _RESET_KEY_BY_METRIC.get(metric_key, "")
+                metrics.append(
+                    _build_metric(
+                        key=metric_key,
+                        short_label=short_label,
+                        raw_value=snapshot.get(metric_key),
+                        reset_at_value=snapshot.get(reset_key),
+                        captured_at_value=snapshot.get("captured_at"),
+                        account_state=status["state"],
+                        now=now,
+                    )
+                )
+        primary_metric = metrics[0] if metrics else {
+            "percent": None,
+            "value_text": "--",
+            "state": "unknown",
+            "color": _bar_color(profile_enabled, None),
+        }
         row_state = (
-            str(five_hour_metric["state"])
+            str(primary_metric["state"])
             if status["state"] == "ready"
             else str(status["state"])
         )
         bars.append(
             {
-                "id": str(raw.get("id") or f"account_{index}"),
-                "label": str(raw.get("label") or f"Codex {index}"),
-                "enabled": bool(account_enabled),
-                "percent": int(five_hour_metric["percent"]),
-                "value_text": str(five_hour_metric["value_text"]),
+                "id": profile_id,
+                "profile_id": profile_id,
+                "provider": provider,
+                "label": str(raw.get("label") or f"{provider.title()} {index}"),
+                "enabled": bool(profile_enabled),
+                "taskbar_selected": True,
+                "freshness": freshness,
+                "provider_status": provider_status,
+                "status_state": status["state"],
+                "percent": int(primary_metric.get("percent") or 0),
+                "value_text": str(primary_metric.get("value_text") or "--"),
                 "state": row_state,
-                "color": str(five_hour_metric["color"]),
+                "color": str(primary_metric.get("color") or "#6b7280"),
                 "status_text": status["text"],
                 "status_color": status["color"],
                 "metrics": metrics,
@@ -303,7 +384,7 @@ def build_codex_usage_taskbar_overlay_model(
         geometry_visible and manager_enabled and any(bool(bar["enabled"]) for bar in bars)
     )
     collecting = bool(runtime.get("collect_inflight", False)) or any(
-        _account_collecting(account) for account in accounts if isinstance(account, dict)
+        _account_collecting(profile) for profile in profiles if isinstance(profile, dict)
     )
     return {
         "visible": visible,
@@ -755,8 +836,26 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
     return _wide_slot_preferred_width(model, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
 
 
+def _render_signature_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (str(key), _render_signature_value(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_render_signature_value(item) for item in value)
+    if isinstance(value, set):
+        return tuple(sorted(_render_signature_value(item) for item in value))
+    return value
+
+
 def _metric_render_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(metric.get(key) for key in _METRIC_RENDER_SIGNATURE_KEYS)
+    return tuple(
+        _render_signature_value(metric.get(key))
+        for key in _METRIC_RENDER_SIGNATURE_KEYS
+    )
 
 
 def _bar_render_signature(bar: dict[str, Any]) -> tuple[Any, ...]:
@@ -764,7 +863,10 @@ def _bar_render_signature(bar: dict[str, Any]) -> tuple[Any, ...]:
         _metric_render_signature(metric)
         for metric in _visible_metrics_for_taskbar_bar(bar)
     )
-    bar_fields = tuple(bar.get(key) for key in _BAR_RENDER_SIGNATURE_KEYS)
+    bar_fields = tuple(
+        _render_signature_value(bar.get(key))
+        for key in _BAR_RENDER_SIGNATURE_KEYS
+    )
     return bar_fields + (metrics,)
 
 
@@ -1037,6 +1139,53 @@ class CodexUsageTaskbarOverlay:
         self._clear_pending_regression_geometry()
         self._clear_pending_side_transition()
         return
+
+    def invalidate_native_owner(self) -> None:
+        self._active_taskbar_hwnd = self._native_owner_taskbar_hwnd_for_rebind()
+        window = self._window
+        if window is None:
+            return
+        self._prepare_native_window(window)
+        return
+
+    def rebind_native_owner(self) -> None:
+        self.invalidate_native_owner()
+        return
+
+    def _native_owner_taskbar_hwnd_for_rebind(self) -> int:
+        model_geometry = _model_geometry(self._last_model)
+        selected_target = (
+            model_geometry.get("selected_target")
+            if isinstance(model_geometry, dict)
+            else None
+        )
+        monitor_rect = None
+        if isinstance(selected_target, dict):
+            monitor_rect = normalize_rect(selected_target.get("monitor_rect"))
+        if monitor_rect is None and isinstance(model_geometry, dict):
+            try:
+                overlay_rect = (
+                    int(model_geometry.get("x", 0) or 0),
+                    int(model_geometry.get("y", 0) or 0),
+                    int(model_geometry.get("x", 0) or 0)
+                    + max(1, int(model_geometry.get("width", 0) or 0)),
+                    int(model_geometry.get("y", 0) or 0)
+                    + max(1, int(model_geometry.get("height", 0) or 0)),
+                )
+            except (TypeError, ValueError):
+                overlay_rect = None
+        else:
+            overlay_rect = None
+        for target in self._collect_taskbar_targets_for_geometry():
+            taskbar_hwnd = int(target.taskbar_hwnd or 0)
+            if taskbar_hwnd <= 0:
+                continue
+            target_monitor_rect = tuple(target.monitor.monitor)
+            if monitor_rect is not None and target_monitor_rect == tuple(monitor_rect):
+                return taskbar_hwnd
+            if overlay_rect is not None and _rects_overlap(overlay_rect, target_monitor_rect):
+                return taskbar_hwnd
+        return 0
 
     def _update_metric_change_flash(self, model: dict[str, Any]) -> None:
         active_keys: set[str] = set()
@@ -2158,6 +2307,7 @@ class CodexUsageTaskbarOverlay:
                 taskbar_hwnd = 0
         if taskbar_hwnd <= 0 or taskbar_hwnd == int(hwnd):
             return
+        self._active_taskbar_hwnd = int(taskbar_hwnd)
         try:
             setter = getattr(ctypes.windll.user32, "SetWindowLongPtrW", None)
             if setter is None:
@@ -4201,6 +4351,87 @@ def _normalize_work_area_with_metadata(
     return normalized, metadata
 
 
+def _descriptor_percent(descriptor: dict[str, Any]) -> int | None:
+    if "percent" in descriptor:
+        value = descriptor.get("percent")
+    elif "remaining_percent" in descriptor:
+        value = descriptor.get("remaining_percent")
+    else:
+        value = descriptor.get("value_text")
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, min(100, int(round(float(value)))))
+    return _parse_percent(value)
+
+
+def _build_provider_metric(
+    descriptor: dict[str, Any],
+    *,
+    provider: str,
+    profile_id: str,
+    freshness: str,
+    provider_status: Any,
+    account_state: str,
+    captured_at_value: Any,
+    fallback_index: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    metric_key = str(
+        descriptor.get("key")
+        or descriptor.get("metric_key")
+        or descriptor.get("id")
+        or f"metric_{int(fallback_index)}"
+    )
+    short_label = str(
+        descriptor.get("short_label")
+        or descriptor.get("label")
+        or descriptor.get("display_label")
+        or metric_key
+    )
+    percent = _descriptor_percent(descriptor)
+    reset_at = descriptor.get("reset_at")
+    if reset_at is None:
+        reset_at = descriptor.get("reset_at_value", descriptor.get("reset", ""))
+    descriptor_captured_at = descriptor.get("captured_at", captured_at_value)
+    metric = _build_metric(
+        key=metric_key,
+        short_label=short_label,
+        raw_value="" if percent is None else f"{int(percent)}%",
+        reset_at_value=reset_at,
+        captured_at_value=descriptor_captured_at,
+        account_state=account_state,
+        now=now,
+    )
+    explicit_value_text = descriptor.get("value_text")
+    explicit_state = str(descriptor.get("state") or "").strip()
+    explicit_color = str(descriptor.get("color") or "").strip()
+    metric.update(
+        {
+            "id": str(descriptor.get("id") or metric_key),
+            "provider": str(provider),
+            "profile_id": str(profile_id),
+            "freshness": str(freshness),
+            "provider_status": provider_status,
+            "metric_key": metric_key,
+            "key": short_label,
+            "short_label": short_label,
+            "percent": percent,
+            "value_text": (
+                str(explicit_value_text)
+                if explicit_value_text is not None
+                else str(metric.get("value_text") or "--")
+            ),
+            "reset_at": str(reset_at or ""),
+        }
+    )
+    if explicit_state:
+        metric["state"] = explicit_state
+    if explicit_color:
+        metric["color"] = explicit_color
+    return metric
+
+
 def _build_metric(
     *,
     key: str,
@@ -4889,6 +5120,149 @@ def _reset_color(state: str) -> str:
     return "#6b7280"
 
 
+def _metric_descriptors_have_data(metric_descriptors: Any) -> bool:
+    if not isinstance(metric_descriptors, list):
+        return False
+    for descriptor in metric_descriptors:
+        if not isinstance(descriptor, dict):
+            continue
+        if _descriptor_percent(descriptor) is not None:
+            return True
+        metric_state = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            str(descriptor.get("state") or "").strip().lower(),
+        ).strip("_")
+        if metric_state in {
+            "unknown",
+            "unavailable",
+            "unsupported",
+            "unsupported_contract",
+            "logged_out",
+            "login_required",
+            "dom_drift",
+            "timeout",
+            "crash",
+            "recycle",
+            "error",
+            "failed",
+        }:
+            continue
+        value_text = str(descriptor.get("value_text") or "").strip()
+        if value_text.lower() in {"", "-", "--", "n/a", "unavailable", "조회 불가"}:
+            continue
+        if value_text:
+            return True
+    return False
+
+
+def _profile_status(
+    enabled: bool,
+    runtime: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    provider_status: Any,
+    freshness: str,
+    metric_descriptors: Any,
+) -> dict[str, str]:
+    base = _account_status(enabled, runtime, snapshot)
+    if not bool(enabled):
+        return base
+    if base["state"] == "nodata" and _metric_descriptors_have_data(metric_descriptors):
+        base = {"state": "ready", "text": "OK", "color": "#22c55e"}
+
+    status_text_override = ""
+    status_color_override = ""
+    if isinstance(provider_status, dict):
+        raw_state = (
+            provider_status.get("state")
+            or provider_status.get("status")
+            or provider_status.get("key")
+            or ""
+        )
+        status_text_override = str(provider_status.get("text") or "").strip()
+        status_color_override = str(provider_status.get("color") or "").strip()
+    else:
+        raw_state = provider_status
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(raw_state or "").strip().lower()).strip("_")
+    if normalized in {"", "idle", "unknown"} and base["state"] == "nodata":
+        for descriptor in metric_descriptors if isinstance(metric_descriptors, list) else ():
+            if not isinstance(descriptor, dict):
+                continue
+            metric_state = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                str(descriptor.get("state") or "").strip().lower(),
+            ).strip("_")
+            if metric_state in {
+                "unavailable",
+                "unsupported",
+                "unsupported_contract",
+                "logged_out",
+                "login_required",
+                "dom_drift",
+                "timeout",
+                "stale",
+                "crash",
+                "recycle",
+                "error",
+                "failed",
+            }:
+                normalized = metric_state
+                break
+
+    status_by_state = {
+        "ready": {"state": "ready", "text": "OK", "color": "#22c55e"},
+        "ok": {"state": "ready", "text": "OK", "color": "#22c55e"},
+        "success": {"state": "ready", "text": "OK", "color": "#22c55e"},
+        "running": {"state": "sync", "text": "SYNC", "color": "#38bdf8"},
+        "collecting": {"state": "sync", "text": "SYNC", "color": "#38bdf8"},
+        "sync": {"state": "sync", "text": "SYNC", "color": "#38bdf8"},
+        "cancelling": {"state": "sync", "text": "SYNC", "color": "#38bdf8"},
+        "logged_out": {"state": "login", "text": "OUT", "color": "#f59e0b"},
+        "login_required": {"state": "login", "text": "OUT", "color": "#f59e0b"},
+        "not_authenticated": {"state": "login", "text": "OUT", "color": "#f59e0b"},
+        "auth_required": {"state": "login", "text": "OUT", "color": "#f59e0b"},
+        "unauthorized": {"state": "login", "text": "OUT", "color": "#f59e0b"},
+        "paused_auth_required": {"state": "login", "text": "OUT", "color": "#f59e0b"},
+        "profile_busy": {"state": "profile_busy", "text": "WAIT", "color": "#f59e0b"},
+        "paused_profile_in_use": {"state": "profile_busy", "text": "WAIT", "color": "#f59e0b"},
+        "rate_limited": {"state": "rate_limited", "text": "RATE", "color": "#f59e0b"},
+        "rate_limit": {"state": "rate_limited", "text": "RATE", "color": "#f59e0b"},
+        "stale": {"state": "stale", "text": "OLD", "color": "#f59e0b"},
+        "cache_stale": {"state": "stale", "text": "OLD", "color": "#f59e0b"},
+        "expired_cache": {"state": "stale", "text": "OLD", "color": "#f59e0b"},
+        "timeout": {"state": "timeout", "text": "TIME", "color": "#f59e0b"},
+        "command_timeout": {"state": "timeout", "text": "TIME", "color": "#f59e0b"},
+        "navigation_timeout": {"state": "timeout", "text": "TIME", "color": "#f59e0b"},
+        "unsupported": {"state": "unsupported", "text": "N/A", "color": "#94a3b8"},
+        "unavailable": {"state": "unsupported", "text": "N/A", "color": "#94a3b8"},
+        "unsupported_contract": {"state": "unsupported", "text": "N/A", "color": "#94a3b8"},
+        "error": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "failed": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "dom_drift": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "parse_failed": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "schema_incompatible": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "crash": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "renderer_crashed": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "transport_closed": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "recycle": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "worker_recycle": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+        "page_recycling": {"state": "error", "text": "ERR", "color": "#f59e0b"},
+    }
+    if normalized == "idle":
+        status = dict(base)
+    else:
+        status = dict(status_by_state.get(normalized, base))
+    if str(freshness or "").strip().lower() == "stale" and status["state"] == "ready":
+        status = dict(status_by_state["stale"])
+    if status_text_override:
+        status["text"] = status_text_override
+    if status_color_override:
+        status["color"] = status_color_override
+    return status
+
+
 def _account_status(
     enabled: bool,
     runtime: dict[str, Any],
@@ -5038,3 +5412,7 @@ def _get_window_handle(window: Any) -> int:
     except Exception:
         pass
     return int(hwnd)
+
+
+AiUsageTaskbarOverlay = CodexUsageTaskbarOverlay
+build_ai_usage_taskbar_overlay_model = build_codex_usage_taskbar_overlay_model

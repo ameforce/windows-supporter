@@ -172,6 +172,9 @@ class _FakeMonitor:
     def get_codex_usage_monitor(self):
         return self.codex
 
+    def get_ai_usage_monitor(self):
+        return self.codex
+
     def get_kakao_manager(self):
         return self.kakao
 
@@ -264,6 +267,26 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertEqual(load_last_tab(valid_tabs=valid, path=path), "dashboard")
             self.assertFalse(save_last_tab("missing", valid_tabs=valid, path=path))
 
+    def test_state_maps_legacy_codex_usage_tab_to_primary_ai_usage_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump({"last_tab": "codex_usage"}, fp)
+
+            self.assertEqual(
+                load_last_tab(valid_tabs=("dashboard", "ai_usage"), path=path),
+                "ai_usage",
+            )
+            self.assertTrue(
+                save_last_tab(
+                    "codex_usage",
+                    valid_tabs=("dashboard", "ai_usage"),
+                    path=path,
+                )
+            )
+            with open(path, encoding="utf-8") as fp:
+                self.assertEqual(json.load(fp)["last_tab"], "ai_usage")
+
     def test_first_show_defaults_to_dashboard_and_persists_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
@@ -295,12 +318,12 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             )
             ui, _, _, _, _ = self._build_ui(path)
 
-            with patch.object(ui, "_ensure_codex_built") as ensure_codex:
+            with patch.object(ui, "_ensure_ai_usage_built") as ensure_ai_usage:
                 ui.show()
 
             self.assertEqual(ui._notebook.select_calls, ["tab-codex"])
-            self.assertEqual(ui._current_tab, ui._TAB_CODEX)
-            ensure_codex.assert_called_once()
+            self.assertEqual(ui._current_tab, ui._TAB_AI_USAGE)
+            ensure_ai_usage.assert_called_once()
 
     def test_hide_withdraws_main_window_without_taskbar_thumbnail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,6 +393,8 @@ class MainUiDashboardUnitTest(unittest.TestCase):
                 {
                     "startup.toggle",
                     "startup.settings",
+                    "ai_usage.toggle",
+                    "ai_usage.settings",
                     "codex.toggle",
                     "codex.settings",
                     "kakao.toggle",
@@ -418,7 +443,9 @@ class MainUiDashboardUnitTest(unittest.TestCase):
 
             self.assertEqual(snapshot["startup"]["total_count"], 2)
             self.assertEqual(snapshot["startup"]["running_count"], 1)
+            self.assertEqual(snapshot["ai_usage"]["monitor_state"], "idle")
             self.assertEqual(snapshot["codex"]["monitor_state"], "idle")
+            self.assertIs(snapshot["ai_usage"], snapshot["codex"])
             self.assertEqual(snapshot["kakao"]["target_display_num"], 2)
             self.assertTrue(snapshot["kakao"]["tick_active"])
             self.assertTrue(snapshot["wrike"]["api_token_configured"])
@@ -428,6 +455,49 @@ class MainUiDashboardUnitTest(unittest.TestCase):
 
 
 class DashboardViewFormattingUnitTest(unittest.TestCase):
+    def test_ai_usage_callback_prefers_primary_and_falls_back_to_codex(self):
+        calls = []
+        view = DashboardView(
+            object(),
+            status_provider=lambda: {},
+            callbacks={
+                "ai_usage.toggle": lambda: calls.append("primary"),
+                "codex.toggle": lambda: calls.append("legacy"),
+            },
+        )
+        view._schedule_refresh = lambda: None
+
+        view._invoke("ai_usage.toggle")
+        self.assertEqual(calls, ["primary"])
+
+        calls.clear()
+        view._callbacks.pop("ai_usage.toggle")
+        view._invoke("ai_usage.toggle")
+        self.assertEqual(calls, ["legacy"])
+
+    def test_ai_usage_status_prefers_primary_key_and_falls_back_to_codex(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        captured = []
+        view._set_feature_status = lambda key, value: captured.append((key, value))
+        view._format_ai_usage = lambda data: (True, [(str(data["source"]), "normal")])
+        view._format_startup = lambda _data: (False, [])
+        view._format_kakao = lambda _data: (False, [])
+        view._format_wrike = lambda _data: (False, [])
+        view._format_background = lambda _data: (False, [])
+        view._format_update = lambda _data: (False, [])
+
+        view._status_provider = lambda: {
+            "ai_usage": {"source": "primary"},
+            "codex": {"source": "legacy"},
+        }
+        view.refresh()
+        self.assertIn(("ai_usage", (True, [("primary", "normal")])), captured)
+
+        captured.clear()
+        view._status_provider = lambda: {"codex": {"source": "legacy"}}
+        view.refresh()
+        self.assertIn(("ai_usage", (True, [("legacy", "normal")])), captured)
+
     def test_status_formatters_put_enabled_state_first(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 
@@ -461,6 +531,20 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertTrue(all(parts[0][0] in {"활성화", "비활성화"} for _, parts in formatted))
         self.assertTrue(all(parts[0][1] in {"enabled", "disabled"} for _, parts in formatted))
 
+    def test_background_formatter_deduplicates_ai_usage_legacy_alias(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        _, parts = view._format_background(
+            {
+                "enabled": True,
+                "ai_usage_attached": True,
+                "codex_attached": True,
+            }
+        )
+
+        attached_text = next(text for text, _style in parts if text.startswith("연결된 기능:"))
+        self.assertEqual(attached_text, "연결된 기능: AI 사용량")
+
     def test_minutes_are_displayed_as_hours_and_minutes(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 
@@ -492,8 +576,8 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         )
 
         labels = [text for text, _style in parts]
-        self.assertIn("Codex 1: logged_in / idle", labels)
-        self.assertIn("Codex 2: 비활성 / logged_out", labels)
+        self.assertIn("Codex 1 (Codex): logged_in / idle", labels)
+        self.assertIn("Codex 2 (Codex): 비활성 / logged_out", labels)
 
     def test_update_formatter_shows_available_version(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})

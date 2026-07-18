@@ -182,6 +182,30 @@ class _FakeTtk:
 
 
 class CodexUsageUiUnitTest(unittest.TestCase):
+    def test_runtime_refresh_keeps_only_one_scheduled_callback(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        win = _FakeWidget()
+        view._win = win
+
+        view._schedule_runtime_refresh(1000)
+        first_after_id = view._runtime_after_id
+        view._schedule_runtime_refresh(1000)
+
+        self.assertEqual(len(win.after_calls), 2)
+        self.assertEqual(win.after_cancel_calls, [first_after_id])
+
+    def test_rate_limit_status_uses_user_facing_retry_countdown(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        text = view._runtime_state_text(
+            {
+                "provider_state": "rate_limited",
+                "next_collect_in_sec": 120,
+            }
+        )
+
+        self.assertEqual(text, "요청 제한 · 120초 후 재시도")
+
     def test_add_value_row_uses_wrapping_without_forcing_wide_columns(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         fake_tk = _FakeTk()
@@ -221,6 +245,35 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         captured_display = fake_tk.labels[0].kwargs.get("textvariable")
         metric_vars["captured_at"].set("2026-06-25 09:07:55")
         self.assertEqual(captured_display.get(), "최근 확인 시각: 2026-06-25 09:07:55")
+
+    def test_cursor_metric_rows_use_included_reset_and_on_demand_contract(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        fake_tk = _FakeTk()
+        view._tk = fake_tk
+
+        metric_vars, display_vars = view._build_account_metric_rows(
+            parent=object(),
+            bg="#FFFFFF",
+            provider="cursor",
+        )
+
+        self.assertEqual(
+            set(metric_vars),
+            {"captured_at", "included_usage", "billing_reset_at", "on_demand_status"},
+        )
+        self.assertEqual(display_vars["included_usage"].get(), "포함 사용량: -")
+        self.assertEqual(display_vars["billing_reset_at"].get(), "결제 주기 초기화: -")
+        self.assertEqual(display_vars["on_demand_status"].get(), "온디맨드: -")
+
+    def test_usage_metric_values_are_localized_without_changing_amounts(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        self.assertEqual(view._localize_usage_metric_value("68% left"), "68% 남음")
+        self.assertEqual(view._localize_usage_metric_value("42% used"), "42% 사용")
+        self.assertEqual(
+            view._localize_usage_metric_value("Enabled · US$8.20 used"),
+            "활성화 · US$8.20 사용",
+        )
 
     def test_on_release_profile_calls_monitor_and_sets_ok_status(self) -> None:
         class _FakeMonitor:
@@ -319,7 +372,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(len(fake_ttk.scrollbars), 0)
         texts = [label.kwargs.get("text") for label in fake_tk.labels]
         self.assertIn("작업표시줄 표시", texts)
-        self.assertIn("계정", texts)
+        self.assertIn("사용량 프로필 (전체 최대 2개)", texts)
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
 
@@ -523,9 +576,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("저장", button_texts)
         self.assertNotIn("로드하기", button_texts)
         self.assertNotIn("툴팁(초)", [label.kwargs.get("text") for label in fake_tk.labels])
-        self.assertEqual(button_texts.count("로그인"), 2)
-        self.assertEqual(button_texts.count("로그아웃"), 2)
-        self.assertEqual(button_texts.count("조회"), 2)
+        self.assertEqual(button_texts.count("연결"), 2)
+        self.assertEqual(button_texts.count("연결 해제"), 2)
+        self.assertEqual(button_texts.count("새로고침"), 2)
         self.assertIn("아래로", button_texts)
         self.assertIn("위로", button_texts)
 
@@ -733,6 +786,55 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in payload["accounts"]], ["account_2", "account_1"])
         self.assertEqual([item["profile_dir"] for item in payload["accounts"]], ["profile-2", "profile-1"])
 
+    def test_save_emits_provider_neutral_profiles_and_taskbar_selection(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.payload = None
+
+            def get_settings_snapshot(self):
+                return {
+                    "profiles": [
+                        {"id": "account_1", "provider": "codex", "enabled": True},
+                        {"id": "account_2", "provider": "codex", "enabled": True},
+                    ]
+                }
+
+            def update_settings(self, payload):
+                self.payload = dict(payload)
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._account_order = ["account_1", "account_2"]
+        view._account_enabled_vars = {
+            "account_1": _FakeVar(value=True),
+            "account_2": _FakeVar(value=True),
+        }
+        view._account_provider_vars = {
+            "account_1": _FakeVar(value="codex"),
+            "account_2": _FakeVar(value="cursor"),
+        }
+        view._account_taskbar_selected_vars = {
+            "account_1": _FakeVar(value=False),
+            "account_2": _FakeVar(value=True),
+        }
+        view._set_status = lambda *_args, **_kwargs: None
+
+        self.assertTrue(view._save_settings())
+
+        assert monitor.payload is not None
+        self.assertEqual(
+            [item["provider"] for item in monitor.payload["profiles"]],
+            ["codex", "cursor"],
+        )
+        self.assertEqual(monitor.payload["selected_profile_ids"], ["account_2"])
+        self.assertEqual(monitor.payload["profile_order"], ["account_1", "account_2"])
+
     def test_account_login_and_release_call_account_specific_manager_methods(self) -> None:
         class _FakeMonitor:
             def __init__(self):
@@ -782,6 +884,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         monitor = _FakeMonitor()
         view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._account_labels = {"account_2": "Cursor 개발"}
         statuses: list[tuple[str, str]] = []
         view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
 
@@ -789,6 +892,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(monitor.show_calls, [("account_2", True, "manual_query")])
         self.assertTrue(statuses)
+        self.assertEqual(statuses[-1][0], "Cursor 개발 사용량 조회를 시작했습니다.")
         self.assertEqual(statuses[-1][1], "info")
 
     def test_on_login_triggers_show_current_status(self) -> None:
@@ -811,7 +915,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(monitor.args, [(True, "manual_login")])
         self.assertTrue(statuses)
-        self.assertEqual(statuses[-1][0], "로그인 창을 여는 중입니다...")
+        self.assertEqual(statuses[-1][0], "연결 창을 여는 중입니다...")
         self.assertEqual(statuses[-1][1], "info")
 
     def test_refresh_action_buttons_applies_runtime_permissions(self) -> None:
@@ -1208,7 +1312,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "로그인 완료 대기 중")
+        self.assertEqual(view._collect_state_var.value, "연결 완료 대기 중")
         self.assertEqual(view._next_collect_var.value, "최대 482초")
 
     def test_refresh_runtime_status_shows_open_login_window_wait_state(self) -> None:
@@ -1254,7 +1358,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "로그인 완료 대기 중")
+        self.assertEqual(view._collect_state_var.value, "연결 완료 대기 중")
         self.assertEqual(view._next_collect_var.value, "최대 321초")
 
     def test_refresh_runtime_status_shows_missing_chrome_channel_state(self) -> None:
@@ -1436,7 +1540,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "조회 중 (manual_query)")
+        self.assertEqual(view._collect_state_var.value, "수동 조회 중")
         self.assertEqual(view._next_collect_var.value, "-")
 
     def test_refresh_runtime_status_shows_manual_login_window_opening_state(self) -> None:
@@ -1475,7 +1579,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "로그인 창 여는 중")
+        self.assertEqual(view._collect_state_var.value, "연결 창 여는 중")
         self.assertEqual(view._next_collect_var.value, "-")
 
     def test_refresh_runtime_status_preserves_last_values_while_collecting(self) -> None:
@@ -1561,7 +1665,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "조회 중 (monitor_tick)")
+        self.assertEqual(view._collect_state_var.value, "자동 조회 중")
         self.assertEqual(view._next_collect_var.value, "-")
         self.assertEqual(view._live_time_var.value, "2026-03-30 12:58:00")
         self.assertEqual(view._live_five_hour_var.value, "24%")
@@ -1636,7 +1740,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "조회 중 (manual_query)")
+        self.assertEqual(view._collect_state_var.value, "수동 조회 중")
         self.assertEqual(view._next_collect_var.value, "-")
         self.assertEqual(view._live_time_var.value, "-")
         self.assertEqual(view._live_five_hour_var.value, "-")
