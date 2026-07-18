@@ -59,7 +59,7 @@ jobs:
       - name: Upload release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: windows-supporter-${{ github.ref_name }}-${{ github.sha }}
+          name: windows-supporter-${{ github.run_id }}-${{ github.sha }}
           path: dist/windows-supporter.exe
           if-no-files-found: error
           retention-days: 30
