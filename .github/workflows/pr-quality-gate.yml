@@ -38,6 +38,12 @@ jobs:
           if errorlevel 1 exit /b 1
           "%WINDOWS_SUPPORTER_UV_EXE%" sync --locked --extra build
           if errorlevel 1 exit /b 1
+      - name: Configure target timezone
+        shell: cmd
+        run: |
+          tzutil /s "Korea Standard Time"
+          if errorlevel 1 exit /b 1
+          tzutil /g
       - name: Run unit and integration tests
         shell: cmd
         timeout-minutes: 30
