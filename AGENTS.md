@@ -11,7 +11,7 @@
 ## PR 검토 및 보호 규칙
 
 - 일반 구현은 `hotfix/vX.Y.Z` 또는 `release/vX.Y.Z`에서 task branch를 만들고, 해당 버전형 branch를 base로 하는 PR을 통해서만 합친다. 일반 task branch는 `task/`, `feat/`, `fix/`, `chore/`, `refact/` 중 하나의 prefix를 사용하고, 리뷰·릴리스 정책 변경에는 `policy/`를 사용할 수 있다.
-- PR을 연 뒤 정확한 base ref, 최신 base SHA와 head SHA를 기록하고, 그 base/head 쌍을 명시한 `@codex review`를 GitHub PR에 요청한다. `chatgpt-codex-connector`가 남긴 GitHub review object의 `commit_id`가 최신 40자리 head SHA와 일치해야 한다.
+- PR을 연 뒤 정확한 base ref, 최신 base SHA와 head SHA를 기록하고, 그 base/head 쌍을 명시한 `@codex review`를 GitHub PR에 요청한다. finding이 있으면 `chatgpt-codex-connector` GitHub review object의 `commit_id`가 최신 40자리 head SHA와 일치해야 한다. finding이 없어 connector가 top-level zero-finding 댓글만 남기면 그 댓글의 `Reviewed commit` prefix가 최신 head에 유일하게 해석되고, 바로 앞 review 요청에 full base/head SHA가 기록돼 있으며 응답 전후 head가 바뀌지 않았음을 확인한다.
 - 같은 exact base/head diff를 native Codex subagent 또는 별도 Codex task가 독립적으로 read-only 리뷰한다. GitHub Codex 리뷰와 독립 리뷰는 서로의 결론을 전달받기 전에 수행한다.
 - 두 리뷰의 finding은 `P0/P1/P2/P3`로 정규화하고 모든 등급을 0으로 만든다. GitHub review thread도 unresolved 0이어야 한다. 작성자가 PR 본문에 적은 finding 수, reviewer 이름, digest 또는 Actions status는 실제 리뷰 증거를 대신하지 않는다.
 - 리뷰 뒤 push로 head SHA가 바뀌거나 base SHA가 이동하면 이전 GitHub Codex 리뷰와 독립 리뷰를 모두 stale로 처리하고, 새 exact base/head에서 두 리뷰를 다시 수행한다. 최종 두 리뷰가 같은 최신 base/head 쌍을 검토하지 않았다면 merge하지 않는다.

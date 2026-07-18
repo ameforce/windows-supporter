@@ -73,6 +73,8 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "@codex review",
             "chatgpt-codex-connector",
             "review object의 `commit_id`",
+            "top-level zero-finding 댓글",
+            "`Reviewed commit` prefix",
             "base ref, 최신 base SHA와 head SHA",
             "native Codex subagent",
             "P0/P1/P2/P3",

@@ -16,7 +16,7 @@
 
 1. 버전형 hotfix/release branch를 base로 task PR을 연다.
 2. PR의 정확한 base ref, 최신 40자리 base SHA와 head SHA를 기록한다.
-3. PR에서 그 base/head 쌍을 명시해 `@codex review`를 요청하고, `chatgpt-codex-connector`가 남긴 GitHub review object의 `commit_id`가 정확한 head와 일치하는지 확인한다.
+3. PR에서 그 base/head 쌍을 명시해 `@codex review`를 요청한다. finding이 있는 review는 GitHub review object의 `commit_id`를 exact head와 비교한다. zero-finding top-level connector 댓글은 `Reviewed commit` prefix가 최신 head에 유일하게 해석되는지, 요청의 full base/head와 응답 전후 head가 같은지 확인한다.
 4. 동시에 native Codex subagent 또는 별도 Codex task가 같은 exact base/head diff를 독립적으로 read-only 리뷰한다. 두 reviewer에게 상대 리뷰 결과를 미리 전달하지 않는다.
 5. finding을 `P0/P1/P2/P3`로 정규화해 모든 등급을 0으로 만들고 unresolved review thread도 0으로 만든다.
 6. 수정 push 또는 base 이동이 발생하면 두 리뷰와 검증을 모두 stale로 처리하고 새 base/head에서 3~5단계를 반복한다.
