@@ -53,9 +53,9 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertIn("$parts.Count -ne 3", workflow)
         self.assertIn("$baseSha -ne $eventBaseSha", workflow)
         self.assertIn("$headSha -ne $eventHeadSha", workflow)
-        self.assertIn("base_sha=${{ github.event.pull_request.base.sha }}", workflow)
-        self.assertIn("head_sha=${{ github.event.pull_request.head.sha }}", workflow)
-        self.assertIn("merge_candidate_sha=${{ github.sha }}", workflow)
+        self.assertIn('"base_sha=$baseSha"', workflow)
+        self.assertIn('"head_sha=$headSha"', workflow)
+        self.assertIn('"merge_candidate_sha=$mergeSha"', workflow)
         self.assertIn("It does not perform or prove PR review.", workflow)
         self.assertNotIn("pr-quality-gate", workflow)
 
@@ -84,6 +84,7 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "`creation`과 `update` freeze",
             "creation/update/deletion을 모두 차단",
             "remote ref 부재를 최종 확인",
+            "임시 freeze ruleset의 ID와 이름이 live 목록에 없음을 확인",
             "`reviews-complete` label",
             "GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다",
         ):
