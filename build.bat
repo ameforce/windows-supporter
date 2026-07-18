@@ -416,5 +416,5 @@ if not errorlevel 1 exit /b 0
 exit /b 1
 
 :sleep_one_second
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 1" > NUL 2>&1
+"%SystemRoot%\System32\ping.exe" 127.0.0.1 -n 2 -w 1000 > NUL 2>&1
 exit /b %ERRORLEVEL%

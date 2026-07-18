@@ -455,7 +455,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertNotIn("timeout /t", script.lower())
         self.assertIn("call :sleep_one_second", script)
         self.assertIn(":sleep_one_second", script)
-        self.assertIn("Start-Sleep -Seconds 1", script)
+        self.assertIn("ping.exe", script.lower())
 
     def test_build_bat_validates_pyinstaller_archive_before_launch(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
@@ -586,7 +586,9 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             if line.strip().lower() == ":sleep_one_second"
         )
         sleep_command = lines[helper_index + 1].strip()
-        self.assertIn("Start-Sleep -Seconds 1", sleep_command)
+        self.assertIn("ping.exe", sleep_command.lower())
+        self.assertIn("127.0.0.1", sleep_command)
+        self.assertNotIn("powershell", sleep_command.lower())
 
         with tempfile.TemporaryDirectory() as tmp:
             harness = Path(tmp) / "sleep-helper.bat"
@@ -600,7 +602,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=30,
+                timeout=10,
             )
 
         output = f"{result.stdout}\n{result.stderr}"
