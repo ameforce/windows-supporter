@@ -36,7 +36,8 @@ jobs:
         run: |
           tzutil /s "Korea Standard Time"
           if errorlevel 1 exit /b 1
-          tzutil /g
+          tzutil /g | findstr /x /c:"Korea Standard Time"
+          if errorlevel 1 exit /b 1
       - name: Run release tests
         shell: cmd
         run: |

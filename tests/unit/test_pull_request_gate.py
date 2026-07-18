@@ -535,6 +535,7 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertIn(timezone_step, release_workflow)
         self.assertIn('tzutil /s "Korea Standard Time"', release_workflow)
         self.assertIn("tzutil /g", release_workflow)
+        self.assertIn('findstr /x /c:"Korea Standard Time"', release_workflow)
         self.assertLess(release_workflow.index(timezone_step), release_workflow.index(test_step))
 
 
