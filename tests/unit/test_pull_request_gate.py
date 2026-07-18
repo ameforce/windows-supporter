@@ -494,6 +494,8 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertIn("fetch-depth: 0", quality_workflow)
         self.assertNotIn("actions/checkout@v", policy_workflow + quality_workflow)
 
+        pull_request_rule = next(rule for rule in ruleset["rules"] if rule["type"] == "pull_request")
+        self.assertEqual(pull_request_rule["parameters"]["required_reviewers"], [])
         status_rule = next(rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks")
         contexts = [item["context"] for item in status_rule["parameters"]["required_status_checks"]]
         self.assertEqual(contexts, ["pr-policy-gate", "pr-quality-gate"])
