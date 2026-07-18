@@ -197,7 +197,13 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             manager, children = self._build_manager(tmp)
             snapshot = manager.get_settings_snapshot()
 
-            self.assertEqual(snapshot["settings_version"], 2)
+            self.assertEqual(snapshot["settings_version"], 3)
+            self.assertEqual(snapshot["profile_order"], ["account_1", "account_2"])
+            self.assertEqual(snapshot["selected_profile_ids"], ["account_1", "account_2"])
+            self.assertEqual(
+                [profile["provider"] for profile in snapshot["profiles"]],
+                ["codex", "codex"],
+            )
             self.assertEqual(snapshot["default_account_id"], "account_1")
             self.assertEqual([a["id"] for a in snapshot["accounts"]], ["account_1", "account_2"])
             self.assertEqual([a["label"] for a in snapshot["accounts"]], ["Codex 1", "Codex 2"])
@@ -224,6 +230,162 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             with open(again["accounts"][0]["settings_path"], encoding="utf-8") as fp:
                 copied = json.load(fp)
             self.assertEqual(copied["interval_sec"], 33.0)
+
+    def test_v2_manager_settings_migrate_atomically_to_v3_and_keep_rollback_mirror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            legacy_manager_path = os.path.join(config_dir, "codex_usage_multi_settings.json")
+            with open(legacy_manager_path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "settings_version": 2,
+                        "enabled": True,
+                        "account_order": ["account_2", "account_1"],
+                        "default_account_id": "account_2",
+                        "accounts": [
+                            {"id": "account_2", "label": "기존 B", "enabled": False},
+                            {"id": "account_1", "label": "기존 A", "enabled": True},
+                        ],
+                    },
+                    fp,
+                    ensure_ascii=False,
+                )
+
+            manager, _ = self._build_manager(tmp)
+            snapshot = manager.get_settings_snapshot()
+
+            self.assertEqual(snapshot["settings_version"], 3)
+            self.assertEqual(snapshot["profile_order"], ["account_2", "account_1"])
+            self.assertEqual(snapshot["selected_profile_ids"], ["account_1"])
+            self.assertEqual(
+                [(item["id"], item["provider"], item["label"]) for item in snapshot["profiles"]],
+                [("account_2", "codex", "기존 B"), ("account_1", "codex", "기존 A")],
+            )
+            ai_settings_path = os.path.join(config_dir, "ai_usage_settings.json")
+            self.assertTrue(os.path.isfile(ai_settings_path))
+            with open(ai_settings_path, encoding="utf-8") as fp:
+                persisted = json.load(fp)
+            self.assertEqual(persisted["settings_version"], 3)
+
+            ok, error = manager.update_settings(
+                {
+                    "profiles": [
+                        {
+                            "id": "account_2",
+                            "provider": "cursor",
+                            "label": "Cursor 개인",
+                            "enabled": True,
+                            "taskbar_selected": True,
+                        },
+                        {
+                            "id": "account_1",
+                            "provider": "codex",
+                            "label": "새 Codex",
+                            "enabled": True,
+                            "taskbar_selected": True,
+                        },
+                    ]
+                }
+            )
+            self.assertTrue(ok, error)
+            with open(legacy_manager_path, encoding="utf-8") as fp:
+                rollback = json.load(fp)
+            rollback_by_id = {item["id"]: item for item in rollback["accounts"]}
+            self.assertEqual(rollback["settings_version"], 2)
+            self.assertEqual(rollback_by_id["account_2"]["label"], "기존 B")
+            self.assertEqual(rollback_by_id["account_1"]["label"], "새 Codex")
+
+            manager_again, _ = self._build_manager(tmp)
+            self.assertEqual(manager_again.get_settings_snapshot()["profiles"][0]["provider"], "cursor")
+
+    def test_profiles_allow_all_provider_combinations_and_reject_a_third_slot_or_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for providers in (
+                ("codex", "codex"),
+                ("codex", "cursor"),
+                ("cursor", "codex"),
+                ("cursor", "cursor"),
+            ):
+                manager, _ = self._build_manager(os.path.join(tmp, "-".join(providers)))
+                ok, error = manager.update_settings(
+                    {
+                        "profiles": [
+                            {
+                                "id": "account_1",
+                                "provider": providers[0],
+                                "enabled": True,
+                                "taskbar_selected": True,
+                            },
+                            {
+                                "id": "account_2",
+                                "provider": providers[1],
+                                "enabled": True,
+                                "taskbar_selected": True,
+                            },
+                        ]
+                    }
+                )
+                self.assertTrue(ok, error)
+                snapshot = manager.get_settings_snapshot()
+                self.assertEqual([item["provider"] for item in snapshot["profiles"]], list(providers))
+                self.assertEqual(len(snapshot["selected_profile_ids"]), 2)
+
+            manager, _ = self._build_manager(os.path.join(tmp, "reject"))
+            before = manager.get_settings_snapshot()
+            ok, error = manager.update_settings(
+                {
+                    "profiles": [
+                        {"id": "account_1", "provider": "codex"},
+                        {"id": "account_2", "provider": "cursor"},
+                        {"id": "account_3", "provider": "cursor"},
+                    ]
+                }
+            )
+            self.assertFalse(ok)
+            self.assertEqual(error, "profile_limit")
+            self.assertEqual(manager.get_settings_snapshot(), before)
+
+            ok, error = manager.update_settings(
+                {"selected_profile_ids": ["account_1", "account_2", "account_3"]}
+            )
+            self.assertFalse(ok)
+            self.assertEqual(error, "taskbar_profile_limit")
+
+    def test_runtime_exposes_provider_neutral_profiles_and_legacy_accounts_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].last_snapshot.update(
+                {"five_hour_limit": "80%", "five_hour_reset_at": "2026-07-18T10:00:00+00:00"}
+            )
+
+            ok, error = manager.update_settings(
+                {
+                    "profiles": [
+                        {
+                            "id": "account_1",
+                            "provider": "codex",
+                            "enabled": True,
+                            "taskbar_selected": True,
+                        },
+                        {
+                            "id": "account_2",
+                            "provider": "cursor",
+                            "enabled": False,
+                            "taskbar_selected": False,
+                        },
+                    ]
+                }
+            )
+            self.assertTrue(ok, error)
+
+            runtime = manager.get_runtime_status()
+
+            self.assertIs(runtime["accounts"], runtime["profiles"])
+            self.assertEqual(runtime["profiles"][0]["provider"], "codex")
+            self.assertEqual(runtime["profiles"][0]["profile_id"], "account_1")
+            self.assertTrue(runtime["profiles"][0]["taskbar_selected"])
+            self.assertEqual(runtime["profiles"][0]["metrics"][0]["key"], "five_hour_limit")
 
     def test_runtime_snapshot_aggregates_enabled_accounts_and_routes_account_actions(self):
         with tempfile.TemporaryDirectory() as tmp:

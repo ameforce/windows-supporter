@@ -90,6 +90,8 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
                 codex = monitor.get_codex_usage_monitor()
 
         self.assertIsInstance(codex, CodexUsageMultiMonitor)
+        self.assertIs(monitor.get_ai_usage_manager(), codex)
+        self.assertIs(monitor.get_ai_usage_monitor(), codex)
         self.assertEqual(
             [account["id"] for account in codex.get_settings_snapshot()["accounts"]],
             ["account_1", "account_2"],
