@@ -90,6 +90,17 @@ class SystemTrayIconRestartUnitTest(unittest.TestCase):
 
         self.assertEqual(calls, ["dpi_change", "device_change", "setting_change"])
 
+    def test_taskbar_created_restores_icon_and_rebinds_overlay_owner(self) -> None:
+        calls: list[str] = []
+        tray = self._build_tray(on_display_topology_change=calls.append)
+
+        with patch.object(tray, "_add_icon") as add_icon:
+            result = tray._on_taskbar_restart(200, tray._taskbar_created, 0, 0)
+
+        self.assertEqual(result, 0)
+        add_icon.assert_called_once_with()
+        self.assertEqual(calls, ["taskbar_created"])
+
 
 if __name__ == "__main__":
     unittest.main()

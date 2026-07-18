@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 import threading
 from typing import Any
 
@@ -26,9 +27,12 @@ class CodexUsageSettingsView:
         self._login_button = None
         self._logout_button = None
         self._account_enabled_vars = {}
+        self._account_provider_vars = {}
+        self._account_taskbar_selected_vars = {}
         self._account_query_buttons = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
+        self._account_labels: dict[str, str] = {}
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
@@ -80,17 +84,22 @@ class CodexUsageSettingsView:
         border = "#E5E7EB"
         text_muted = "#6B7280"
         settings = self._safe_get_settings()
-        accounts = settings.get("accounts")
+        accounts = settings.get("profiles")
+        if not isinstance(accounts, list):
+            accounts = settings.get("accounts")
         has_multi_accounts = isinstance(accounts, list) and bool(accounts)
         self._login_button = None
         self._logout_button = None
         self._account_query_buttons = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
+        self._account_labels = {}
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
         self._account_metric_display_vars = {}
+        self._account_provider_vars = {}
+        self._account_taskbar_selected_vars = {}
 
         container = tk.Frame(parent, bg=bg)
         try:
@@ -117,7 +126,7 @@ class CodexUsageSettingsView:
 
         tk.Label(
             title_row,
-            text="Codex Usage Monitoring 설정",
+            text="AI 사용량 설정",
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 13, "bold"),
@@ -128,20 +137,20 @@ class CodexUsageSettingsView:
         if not has_multi_accounts:
             self._logout_button = ttk.Button(
                 btn_row,
-                text="로그아웃",
+                text="연결 해제",
                 command=self._on_release_profile,
             )
             self._logout_button.pack(
                 side="right", padx=(0, 8)
             )
-            self._login_button = ttk.Button(btn_row, text="로그인", command=self._on_login)
+            self._login_button = ttk.Button(btn_row, text="연결", command=self._on_login)
             self._login_button.pack(
                 side="right", padx=(0, 8)
             )
 
         tk.Label(
             header_inner,
-            text="Codex 사용량 자동 모니터링 동작을 설정합니다.",
+            text="작업표시줄에 표시할 AI 사용량 프로필과 조회 주기를 설정합니다.",
             bg=card_bg,
             fg=text_muted,
             font=("Segoe UI", 9),
@@ -242,7 +251,7 @@ class CodexUsageSettingsView:
 
         tk.Label(
             body,
-            text="Usage URL",
+            text="Codex 조회 URL",
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 9),
@@ -315,7 +324,7 @@ class CodexUsageSettingsView:
         row += 1
         tk.Label(
             body,
-            text="계정",
+            text="사용량 프로필 (전체 최대 2개)",
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 10, "bold"),
@@ -344,8 +353,14 @@ class CodexUsageSettingsView:
             if not account_id:
                 continue
             label = str(raw.get("label", "") or account_id).strip()
+            self._account_labels[account_id] = label
+            provider = str(raw.get("provider", "codex") or "codex").strip().lower()
             enabled_var = tk.BooleanVar(value=bool(raw.get("enabled", True)))
+            provider_var = tk.StringVar(value=provider if provider in {"codex", "cursor"} else "codex")
+            selected_var = tk.BooleanVar(value=bool(raw.get("taskbar_selected", True)))
             self._account_enabled_vars[account_id] = enabled_var
+            self._account_provider_vars[account_id] = provider_var
+            self._account_taskbar_selected_vars[account_id] = selected_var
             card = tk.Frame(
                 cards,
                 bg=card_bg,
@@ -365,15 +380,39 @@ class CodexUsageSettingsView:
                 pass
             header = tk.Frame(card, bg=card_bg)
             header.grid(row=0, column=0, sticky="we", padx=8, pady=(4, 1))
-            tk.Label(
+            try:
+                header.columnconfigure(0, weight=1)
+            except Exception:
+                pass
+            profile_label = tk.Label(
                 header,
                 text=label,
                 bg=card_bg,
                 fg="#111827",
                 font=("Segoe UI", 9, "bold"),
-            ).pack(side="left")
+                anchor="w",
+                justify="left",
+                wraplength=360,
+            )
+            profile_label.grid(row=0, column=0, sticky="we", pady=(0, 2))
+
+            controls = tk.Frame(header, bg=card_bg)
+            controls.grid(row=1, column=0, sticky="w", pady=(0, 2))
+            provider_box_factory = getattr(ttk, "Combobox", None)
+            if callable(provider_box_factory):
+                provider_box = provider_box_factory(
+                    controls,
+                    textvariable=provider_var,
+                    values=("codex", "cursor"),
+                    state="readonly",
+                    width=8,
+                )
+            else:
+                provider_box = ttk.Entry(controls, textvariable=provider_var, width=8)
+            provider_box.pack(side="left", padx=(5, 2))
             tk.Checkbutton(
-                header,
+                controls,
+                text="수집",
                 variable=enabled_var,
                 bg=card_bg,
                 activebackground=card_bg,
@@ -382,37 +421,51 @@ class CodexUsageSettingsView:
                 activeforeground="#111827",
                 font=("Segoe UI", 9),
             ).pack(side="left", padx=(5, 3))
+            tk.Checkbutton(
+                controls,
+                text="표시",
+                variable=selected_var,
+                bg=card_bg,
+                activebackground=card_bg,
+                selectcolor=card_bg,
+                fg="#111827",
+                activeforeground="#111827",
+                font=("Segoe UI", 9),
+            ).pack(side="left", padx=(2, 3))
+
+            actions = tk.Frame(header, bg=card_bg)
+            actions.grid(row=2, column=0, sticky="w", pady=(0, 2))
             if len(ordered_accounts) > 1:
                 if index > 0:
                     ttk.Button(
-                        header,
+                        actions,
                         text="위로",
                         command=lambda aid=account_id: self._on_move_account(aid, -1),
-                    ).pack(side="right", padx=(4, 0))
+                    ).pack(side="left", padx=(4, 0))
                 if index < len(ordered_accounts) - 1:
                     ttk.Button(
-                        header,
+                        actions,
                         text="아래로",
                         command=lambda aid=account_id: self._on_move_account(aid, 1),
-                    ).pack(side="right", padx=(4, 0))
+                    ).pack(side="left", padx=(4, 0))
             query_button = ttk.Button(
-                header,
-                text="조회",
+                actions,
+                text="새로고침",
                 command=lambda aid=account_id: self._on_account_query(aid),
             )
-            query_button.pack(side="right", padx=(4, 0))
+            query_button.pack(side="left", padx=(4, 0))
             login_button = ttk.Button(
-                header,
-                text="로그인",
+                actions,
+                text="연결",
                 command=lambda aid=account_id: self._on_account_login(aid),
             )
-            login_button.pack(side="right", padx=(4, 0))
+            login_button.pack(side="left", padx=(4, 0))
             logout_button = ttk.Button(
-                header,
-                text="로그아웃",
+                actions,
+                text="연결 해제",
                 command=lambda aid=account_id: self._on_account_release_profile(aid),
             )
-            logout_button.pack(side="right")
+            logout_button.pack(side="left")
             self._account_query_buttons[account_id] = query_button
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
@@ -452,7 +505,11 @@ class CodexUsageSettingsView:
                 metric_grid.columnconfigure(1, weight=1)
             except Exception:
                 pass
-            metric_vars, display_vars = self._build_account_metric_rows(metric_grid, card_bg)
+            metric_vars, display_vars = self._build_account_metric_rows(
+                metric_grid,
+                card_bg,
+                provider=provider,
+            )
             self._account_metric_vars[account_id] = metric_vars
             self._account_metric_display_vars[account_id] = display_vars
             detail_row += 1
@@ -593,23 +650,35 @@ class CodexUsageSettingsView:
         )
         return row + 1
 
-    def _build_account_metric_rows(self, parent: Any, bg: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _build_account_metric_rows(
+        self,
+        parent: Any,
+        bg: str,
+        *,
+        provider: str = "codex",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         tk = self._tk
         if tk is None:
             return {}, {}
-        rows = (
-            (("captured_at", "최근 확인 시각"), ("remaining_credit", "남은 크레딧")),
-            (("five_hour_limit", "5시간 사용 한도"), ("five_hour_limit_reset_at", "5시간 한도 초기화")),
-            (("weekly_limit", "주간 사용 한도"), ("weekly_limit_reset_at", "주간 한도 초기화")),
-            (
-                ("gpt_5_3_codex_spark_five_hour_limit", "Spark 5시간 한도"),
-                ("gpt_5_3_codex_spark_five_hour_limit_reset_at", "Spark 5시간 초기화"),
-            ),
-            (
-                ("gpt_5_3_codex_spark_weekly_limit", "Spark 주간 한도"),
-                ("gpt_5_3_codex_spark_weekly_limit_reset_at", "Spark 주간 초기화"),
-            ),
-        )
+        if str(provider or "").lower() == "cursor":
+            rows = (
+                (("captured_at", "최근 확인 시각"), ("included_usage", "포함 사용량")),
+                (("billing_reset_at", "결제 주기 초기화"), ("on_demand_status", "온디맨드")),
+            )
+        else:
+            rows = (
+                (("captured_at", "최근 확인 시각"), ("remaining_credit", "남은 크레딧")),
+                (("five_hour_limit", "5시간 사용 한도"), ("five_hour_limit_reset_at", "5시간 한도 초기화")),
+                (("weekly_limit", "주간 사용 한도"), ("weekly_limit_reset_at", "주간 한도 초기화")),
+                (
+                    ("gpt_5_3_codex_spark_five_hour_limit", "Spark 5시간 한도"),
+                    ("gpt_5_3_codex_spark_five_hour_limit_reset_at", "Spark 5시간 초기화"),
+                ),
+                (
+                    ("gpt_5_3_codex_spark_weekly_limit", "Spark 주간 한도"),
+                    ("gpt_5_3_codex_spark_weekly_limit_reset_at", "Spark 주간 초기화"),
+                ),
+            )
         metric_vars: dict[str, Any] = {}
         display_vars: dict[str, Any] = {}
         for row_index, row in enumerate(rows):
@@ -774,7 +843,9 @@ class CodexUsageSettingsView:
                 self._usage_url_var.set(str(settings.get("usage_url", "") or ""))
             except Exception:
                 pass
-            accounts = settings.get("accounts")
+            accounts = settings.get("profiles")
+            if not isinstance(accounts, list):
+                accounts = settings.get("accounts")
             if isinstance(accounts, list):
                 loaded_order = []
                 for raw in accounts:
@@ -784,12 +855,23 @@ class CodexUsageSettingsView:
                     if account_id:
                         loaded_order.append(account_id)
                     var = self._account_enabled_vars.get(account_id)
-                    if var is None:
-                        continue
-                    try:
-                        var.set(bool(raw.get("enabled", True)))
-                    except Exception:
-                        pass
+                    if var is not None:
+                        try:
+                            var.set(bool(raw.get("enabled", True)))
+                        except Exception:
+                            pass
+                    provider_var = self._account_provider_vars.get(account_id)
+                    if provider_var is not None:
+                        try:
+                            provider_var.set(str(raw.get("provider", "codex") or "codex"))
+                        except Exception:
+                            pass
+                    selected_var = self._account_taskbar_selected_vars.get(account_id)
+                    if selected_var is not None:
+                        try:
+                            selected_var.set(bool(raw.get("taskbar_selected", True)))
+                        except Exception:
+                            pass
                 if loaded_order:
                     self._account_order = loaded_order
             self._set_status("", level="info")
@@ -804,28 +886,29 @@ class CodexUsageSettingsView:
 
     def _on_login(self) -> None:
         if not hasattr(self._codex, "show_current_status"):
-            self._set_status("로그인 기능을 사용할 수 없습니다.", level="error")
+            self._set_status("연결 기능을 사용할 수 없습니다.", level="error")
             return
         try:
             runtime = self._safe_get_runtime()
             if bool(runtime.get("logout_in_progress", False)):
-                self._set_status("로그아웃 진행 중입니다. 완료 후 다시 시도해 주세요.", level="info")
+                self._set_status("연결 해제 진행 중입니다. 완료 후 다시 시도해 주세요.", level="info")
                 return
             can_login = bool(runtime.get("can_login", True))
             if not can_login:
-                self._set_status("현재 상태에서는 로그인 요청을 시작할 수 없습니다.", level="info")
+                self._set_status("현재 상태에서는 연결 요청을 시작할 수 없습니다.", level="info")
                 return
         except Exception:
             pass
-        self._set_status("로그인 창을 여는 중입니다...", level="info")
+        self._set_status("연결 창을 여는 중입니다...", level="info")
         try:
             self._codex.show_current_status(force_refresh=True, source="manual_login")
         except Exception:
-            self._set_status("로그인 요청 중 오류가 발생했습니다.", level="error")
+            self._set_status("연결 요청 중 오류가 발생했습니다.", level="error")
             return
         return
 
     def _on_account_login(self, account_id: str) -> None:
+        account_label = self._account_display_label(account_id)
         try:
             runtime = self._safe_get_runtime()
             entry = self._find_account_runtime_entry(runtime, account_id)
@@ -833,7 +916,7 @@ class CodexUsageSettingsView:
                 can_login, _can_logout = self._account_action_permissions(entry)
                 if not can_login:
                     self._set_status(
-                        "현재 상태에서는 해당 계정 로그인 요청을 시작할 수 없습니다.",
+                        "현재 상태에서는 해당 프로필 연결 요청을 시작할 수 없습니다.",
                         level="info",
                     )
                     return
@@ -841,33 +924,34 @@ class CodexUsageSettingsView:
             pass
         login = getattr(self._codex, "login_account", None)
         if callable(login):
-            self._set_status(f"{account_id} 로그인 창을 여는 중입니다...", level="info")
+            self._set_status(f"{account_label} 연결 창을 여는 중입니다...", level="info")
             try:
                 login(str(account_id))
             except Exception:
-                self._set_status("로그인 요청 중 오류가 발생했습니다.", level="error")
+                self._set_status("연결 요청 중 오류가 발생했습니다.", level="error")
             return
         show = getattr(self._codex, "show_account_status", None)
         if callable(show):
             try:
                 show(str(account_id), force_refresh=True, source="manual_login")
-                self._set_status(f"{account_id} 로그인 창을 여는 중입니다...", level="info")
+                self._set_status(f"{account_label} 연결 창을 여는 중입니다...", level="info")
             except Exception:
-                self._set_status("로그인 요청 중 오류가 발생했습니다.", level="error")
+                self._set_status("연결 요청 중 오류가 발생했습니다.", level="error")
             return
-        self._set_status("계정별 로그인 기능을 사용할 수 없습니다.", level="error")
+        self._set_status("프로필별 연결 기능을 사용할 수 없습니다.", level="error")
         return
 
     def _on_account_query(self, account_id: str) -> None:
+        account_label = self._account_display_label(account_id)
         show = getattr(self._codex, "show_account_status", None)
         if callable(show):
             try:
                 show(str(account_id), force_refresh=True, source="manual_query")
-                self._set_status(f"{account_id} 사용량 조회를 시작했습니다.", level="info")
+                self._set_status(f"{account_label} 사용량 조회를 시작했습니다.", level="info")
             except Exception:
                 self._set_status("사용량 조회 요청 중 오류가 발생했습니다.", level="error")
             return
-        self._set_status("계정별 조회 기능을 사용할 수 없습니다.", level="error")
+        self._set_status("프로필별 조회 기능을 사용할 수 없습니다.", level="error")
         return
 
     def _on_release_profile(self) -> None:
@@ -875,7 +959,7 @@ class CodexUsageSettingsView:
         if tk is None:
             return
         if not hasattr(self._codex, "release_profile_session"):
-            self._set_status("로그아웃 기능을 사용할 수 없습니다.", level="error")
+            self._set_status("연결 해제 기능을 사용할 수 없습니다.", level="error")
             return
         confirmed = True
         try:
@@ -883,9 +967,9 @@ class CodexUsageSettingsView:
 
             confirmed = bool(
                 messagebox.askyesno(
-                    "로그아웃",
-                    "현재 Codex 로그인 세션에서 로그아웃하시겠습니까?\n"
-                    "로그아웃 후에는 로그인 버튼 또는 Ctrl+Alt+C로 다시 로그인할 수 있습니다.",
+                    "연결 해제",
+                    "현재 AI 사용량 연결을 해제하시겠습니까?\n"
+                    "연결 해제 후에는 연결 버튼 또는 Ctrl+Alt+C로 다시 연결할 수 있습니다.",
                     parent=self._win,
                 )
             )
@@ -894,7 +978,7 @@ class CodexUsageSettingsView:
         if not confirmed:
             return
 
-        self._set_status("로그아웃 중...", level="info")
+        self._set_status("연결 해제 중...", level="info")
 
         def worker() -> None:
             ok = False
@@ -903,9 +987,9 @@ class CodexUsageSettingsView:
                 ok, message = self._codex.release_profile_session()
             except Exception:
                 ok = False
-                message = "로그아웃 중 오류가 발생했습니다."
+                message = "연결 해제 중 오류가 발생했습니다."
             if not message:
-                message = "로그아웃이 완료되었습니다." if ok else "로그아웃에 실패했습니다."
+                message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
                 if ok:
@@ -922,10 +1006,11 @@ class CodexUsageSettingsView:
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            self._set_status("로그아웃 작업을 시작하지 못했습니다.", level="error")
+            self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
         return
 
     def _on_account_release_profile(self, account_id: str) -> None:
+        account_label = self._account_display_label(account_id)
         tk = self._tk
         if tk is None:
             return
@@ -936,7 +1021,7 @@ class CodexUsageSettingsView:
                 _can_login, can_logout = self._account_action_permissions(entry)
                 if not can_logout:
                     self._set_status(
-                        "현재 상태에서는 해당 계정 로그아웃을 시작할 수 없습니다.",
+                        "현재 상태에서는 해당 프로필 연결 해제를 시작할 수 없습니다.",
                         level="info",
                     )
                     return
@@ -944,7 +1029,7 @@ class CodexUsageSettingsView:
             pass
         release = getattr(self._codex, "release_account_profile_session", None)
         if not callable(release):
-            self._set_status("계정별 로그아웃 기능을 사용할 수 없습니다.", level="error")
+            self._set_status("프로필별 연결 해제 기능을 사용할 수 없습니다.", level="error")
             return
         confirmed = True
         try:
@@ -952,8 +1037,8 @@ class CodexUsageSettingsView:
 
             confirmed = bool(
                 messagebox.askyesno(
-                    "로그아웃",
-                    f"{account_id} Codex 로그인 세션에서 로그아웃하시겠습니까?",
+                    "연결 해제",
+                    f"{account_label} AI 사용량 연결을 해제하시겠습니까?",
                     parent=self._win,
                 )
             )
@@ -961,7 +1046,7 @@ class CodexUsageSettingsView:
             confirmed = False
         if not confirmed:
             return
-        self._set_status(f"{account_id} 로그아웃 중...", level="info")
+        self._set_status(f"{account_label} 연결 해제 중...", level="info")
 
         def worker() -> None:
             ok = False
@@ -970,9 +1055,9 @@ class CodexUsageSettingsView:
                 ok, message = release(str(account_id))
             except Exception:
                 ok = False
-                message = "로그아웃 중 오류가 발생했습니다."
+                message = "연결 해제 중 오류가 발생했습니다."
             if not message:
-                message = "로그아웃이 완료되었습니다." if ok else "로그아웃에 실패했습니다."
+                message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
                 if ok:
@@ -989,7 +1074,7 @@ class CodexUsageSettingsView:
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            self._set_status("로그아웃 작업을 시작하지 못했습니다.", level="error")
+            self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
         return
 
     def _post_ui(self, fn) -> bool:
@@ -1027,6 +1112,8 @@ class CodexUsageSettingsView:
             self._interval_var,
             self._usage_url_var,
             *self._account_enabled_vars.values(),
+            *self._account_provider_vars.values(),
+            *self._account_taskbar_selected_vars.values(),
         ):
             self._bind_autosave_var(var)
         return
@@ -1089,13 +1176,24 @@ class CodexUsageSettingsView:
         tooltip_sec = self._parse_seconds(self._tooltip_var.get(), default=7.0)
         usage_url = str(self._usage_url_var.get() or "").strip()
         accounts = self._build_account_settings_payload()
+        selected_profile_ids = [
+            str(item.get("id") or "")
+            for item in accounts
+            if bool(item.get("taskbar_selected"))
+        ]
+        if len(selected_profile_ids) > 2:
+            self._set_status("저장 실패: 작업표시줄 표시 프로필은 최대 2개입니다.", level="error")
+            return False
         payload = {
             "enabled": enabled,
             "taskbar_overlay_enabled": bool(self._taskbar_overlay_var.get()),
             "interval_sec": interval_sec,
             "tooltip_duration_ms": int(round(tooltip_sec * 1000.0)),
             "usage_url": usage_url,
+            "profiles": accounts,
             "accounts": accounts,
+            "profile_order": [str(item.get("id") or "") for item in accounts],
+            "selected_profile_ids": selected_profile_ids,
         }
         if accounts:
             payload["default_account_id"] = str(accounts[0].get("id") or "")
@@ -1109,7 +1207,9 @@ class CodexUsageSettingsView:
 
     def _build_account_settings_payload(self) -> list[dict[str, Any]]:
         settings = self._safe_get_settings()
-        accounts = settings.get("accounts")
+        accounts = settings.get("profiles")
+        if not isinstance(accounts, list):
+            accounts = settings.get("accounts")
         if not isinstance(accounts, list):
             return []
         accounts_by_id = {
@@ -1133,6 +1233,19 @@ class CodexUsageSettingsView:
             if var is not None:
                 try:
                     item["enabled"] = bool(var.get())
+                except Exception:
+                    pass
+            provider_var = self._account_provider_vars.get(account_id)
+            if provider_var is not None:
+                try:
+                    provider = str(provider_var.get() or "codex").strip().lower()
+                    item["provider"] = provider if provider in {"codex", "cursor"} else "codex"
+                except Exception:
+                    pass
+            selected_var = self._account_taskbar_selected_vars.get(account_id)
+            if selected_var is not None:
+                try:
+                    item["taskbar_selected"] = bool(selected_var.get())
                 except Exception:
                     pass
             payload.append(item)
@@ -1239,18 +1352,34 @@ class CodexUsageSettingsView:
         except Exception:
             inflight = False
         source = str(runtime.get("collect_source", "") or "")
+        provider_state = str(runtime.get("provider_state") or runtime.get("state") or "")
         if logout_in_progress or monitor_state == "cancelling":
-            return "로그아웃 중"
+            return "연결 해제 중"
+        if provider_state in {"rate_limited", "rate_limit"} or monitor_state == "rate_limited":
+            try:
+                retry_after = int(float(runtime.get("next_collect_in_sec")))
+            except (TypeError, ValueError):
+                retry_after = 0
+            if retry_after > 0:
+                return f"요청 제한 · {retry_after}초 후 재시도"
+            return "요청 제한 · 재시도 대기"
+        if provider_state in {"schema_incompatible", "dom_drift"}:
+            return "페이지 형식 변경 · 조회 불가"
+        if provider_state in {"stale", "cache_stale"}:
+            return "이전 값 · 갱신 대기"
         if browser_last_error == "command_timeout":
             if browser_state == "recovering" or inflight:
                 progress = f" ({retry_attempt}/{retry_max})" if retry_max > 0 else ""
                 return f"조회 시간 초과 · 연결 복구 중{progress}"
             return "조회 시간 초과 · 자동 재시도 종료"
         if inflight:
-            state = "로그인 창 여는 중" if source == "manual_login" else "조회 중"
-            if source and source != "manual_login":
-                state = f"{state} ({source})"
-            return state
+            if source == "manual_login":
+                return "연결 창 여는 중"
+            if source == "manual_query":
+                return "수동 조회 중"
+            if source in {"auto_monitor", "monitor_tick"}:
+                return "자동 조회 중"
+            return "조회 중"
         if profile_in_use or monitor_state == "paused_profile_in_use" or browser_state == "profile_in_use":
             return "프로필 사용 중 (자동 일시중지)"
         if pending_login_poll or login_window_open:
@@ -1258,7 +1387,7 @@ class CodexUsageSettingsView:
                 auth_attention_reason == "cloudflare_challenge"
                 or pending_login_reason == "cloudflare_challenge"
             )
-            return "인증 완료 대기 중" if is_cloudflare_auth else "로그인 완료 대기 중"
+            return "인증 완료 대기 중" if is_cloudflare_auth else "연결 완료 대기 중"
         if browser_state == "starting":
             return "브라우저 시작 중"
         if browser_state == "recovering":
@@ -1268,7 +1397,7 @@ class CodexUsageSettingsView:
         if auth_attention_required or monitor_state == "paused_auth_required":
             return "브라우저 인증 필요"
         if session_state == "logged_out":
-            return "로그인 필요"
+            return "연결 필요"
         return "대기 중"
 
     def _captured_at_is_stale(self, value: Any, stale_after_sec: float) -> bool:
@@ -1394,6 +1523,18 @@ class CodexUsageSettingsView:
         )
         return f"값 상태: {prefix}"
 
+    def _account_display_label(self, account_id: str) -> str:
+        normalized = str(account_id or "").strip()
+        return str(self._account_labels.get(normalized) or normalized or "프로필")
+
+    def _localize_usage_metric_value(self, value: str) -> str:
+        localized = str(value or "").strip()
+        localized = re.sub(r"\bEnabled\b", "활성화", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bDisabled\b", "비활성화", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\bused\b", "사용", localized, flags=re.IGNORECASE)
+        localized = re.sub(r"\b(?:left|remaining)\b", "남음", localized, flags=re.IGNORECASE)
+        return localized
+
     def _format_account_metric_value(self, key: str, payload: dict[str, Any]) -> str:
         raw = str(payload.get(key, "") or "").strip()
         if not raw:
@@ -1411,10 +1552,12 @@ class CodexUsageSettingsView:
                     return rendered if rendered else "-"
             except Exception:
                 pass
-        return raw
+        return self._localize_usage_metric_value(raw)
 
     def _refresh_account_runtime_summaries(self, runtime: dict[str, Any]) -> None:
-        accounts = runtime.get("accounts") if isinstance(runtime, dict) else None
+        accounts = runtime.get("profiles") if isinstance(runtime, dict) else None
+        if not isinstance(accounts, list) and isinstance(runtime, dict):
+            accounts = runtime.get("accounts")
         if not isinstance(accounts, list):
             accounts = []
         seen: set[str] = set()
@@ -1447,6 +1590,17 @@ class CodexUsageSettingsView:
             metric_vars = self._account_metric_vars.get(account_id)
             if isinstance(metric_vars, dict):
                 payload = self._snapshot_payload_from_any(raw.get("last_snapshot"))
+                descriptors = raw.get("metrics")
+                if isinstance(descriptors, list):
+                    for descriptor in descriptors:
+                        if not isinstance(descriptor, dict):
+                            continue
+                        key = str(descriptor.get("key") or "")
+                        if not key:
+                            continue
+                        payload.setdefault(key, descriptor.get("value_text", ""))
+                        if key == "included_usage":
+                            payload.setdefault("billing_reset_at", descriptor.get("reset_at", ""))
                 for key, value_var in metric_vars.items():
                     try:
                         value_var.set(self._format_account_metric_value(key, payload))
@@ -1495,6 +1649,7 @@ class CodexUsageSettingsView:
         return
 
     def _schedule_runtime_refresh(self, delay_ms: int = 1000) -> None:
+        self._stop_runtime_refresh()
         win = self._win
         if win is None:
             return
@@ -1639,7 +1794,9 @@ class CodexUsageSettingsView:
         runtime: dict[str, Any],
         account_id: str,
     ) -> dict[str, Any] | None:
-        accounts = runtime.get("accounts") if isinstance(runtime, dict) else None
+        accounts = runtime.get("profiles") if isinstance(runtime, dict) else None
+        if not isinstance(accounts, list) and isinstance(runtime, dict):
+            accounts = runtime.get("accounts")
         if not isinstance(accounts, list):
             return None
         normalized = str(account_id or "")

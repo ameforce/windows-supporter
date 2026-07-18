@@ -291,6 +291,7 @@ class SystemTrayIcon:
 
     def _on_taskbar_restart(self, hwnd: int, msg: int, wparam: int, lparam: int):
         self._add_icon()
+        self._notify_display_topology_change("taskbar_created")
         return 0
 
     def _on_close(self, hwnd: int, msg: int, wparam: int, lparam: int):

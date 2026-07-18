@@ -6,6 +6,13 @@ from src.utils.update_monitor import format_update_status_parts
 
 
 class DashboardView:
+    _CALLBACK_ALIASES = {
+        "ai_usage.settings": "codex.settings",
+        "ai_usage.toggle": "codex.toggle",
+        "codex.settings": "ai_usage.settings",
+        "codex.toggle": "ai_usage.toggle",
+    }
+
     def __init__(
         self,
         root: Any,
@@ -90,7 +97,7 @@ class DashboardView:
 
         self._add_startup_section(body, text=text, bg=card_bg, border=border)
         self._add_separator(body, border=border, bg=card_bg)
-        self._add_codex_section(body, text=text, bg=card_bg, border=border)
+        self._add_ai_usage_section(body, text=text, bg=card_bg, border=border)
         self._add_separator(body, border=border, bg=card_bg)
         self._add_kakao_section(body, text=text, bg=card_bg, border=border)
         self._add_separator(body, border=border, bg=card_bg)
@@ -112,7 +119,10 @@ class DashboardView:
             snapshot = {}
 
         self._set_feature_status("startup", self._format_startup(snapshot.get("startup")))
-        self._set_feature_status("codex", self._format_codex(snapshot.get("codex")))
+        ai_usage = snapshot.get("ai_usage")
+        if ai_usage is None:
+            ai_usage = snapshot.get("codex")
+        self._set_feature_status("ai_usage", self._format_ai_usage(ai_usage))
         self._set_feature_status("kakao", self._format_kakao(snapshot.get("kakao")))
         self._set_feature_status("wrike", self._format_wrike(snapshot.get("wrike")))
         self._set_feature_status("background", self._format_background(snapshot.get("background")))
@@ -153,7 +163,7 @@ class DashboardView:
         )
         return
 
-    def _add_codex_section(
+    def _add_ai_usage_section(
         self,
         parent: Any,
         *,
@@ -163,14 +173,25 @@ class DashboardView:
     ) -> None:
         self._add_section(
             parent,
-            key="codex",
-            title="Codex",
+            key="ai_usage",
+            title="AI 사용량",
             text=text,
             bg=bg,
             border=border,
-            settings_callback="codex.settings",
-            toggle_callback="codex.toggle",
+            settings_callback="ai_usage.settings",
+            toggle_callback="ai_usage.toggle",
         )
+        return
+
+    def _add_codex_section(
+        self,
+        parent: Any,
+        *,
+        text: str,
+        bg: str,
+        border: str,
+    ) -> None:
+        self._add_ai_usage_section(parent, text=text, bg=bg, border=border)
         return
 
     def _add_kakao_section(
@@ -397,7 +418,7 @@ class DashboardView:
                 side="left",
             )
             callback_name = f"{key}.settings"
-            if callback_name in self._callbacks:
+            if callable(self._get_callback(callback_name)):
                 try:
                     label.configure(cursor="hand2")
                 except Exception:
@@ -405,8 +426,20 @@ class DashboardView:
                 self._bind_click(label, callback_name)
         return
 
+    def _get_callback(self, name: str) -> Callable[[], Any] | None:
+        callback_name = str(name)
+        callback = self._callbacks.get(callback_name)
+        if callable(callback):
+            return callback
+        alias = self._CALLBACK_ALIASES.get(callback_name)
+        if alias:
+            callback = self._callbacks.get(alias)
+            if callable(callback):
+                return callback
+        return None
+
     def _invoke(self, name: str) -> None:
-        cb = self._callbacks.get(str(name))
+        cb = self._get_callback(name)
         if not callable(cb):
             return
         try:
@@ -436,7 +469,7 @@ class DashboardView:
             parts.append((f"실행 중: {running}/{total}", "normal"))
         return is_enabled, parts
 
-    def _format_codex(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
+    def _format_ai_usage(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
         if not isinstance(data, dict):
             return False, [("비활성화", "disabled"), ("상태 확인 불가", "normal")]
         is_enabled = bool(data.get("enabled", True))
@@ -447,23 +480,33 @@ class DashboardView:
             (f"상태: {runtime}", "normal"),
             (f"세션: {session}", "normal"),
         ]
-        accounts = data.get("accounts")
+        accounts = data.get("profiles")
+        if not isinstance(accounts, list):
+            accounts = data.get("accounts")
         if isinstance(accounts, list):
             for raw in accounts[:2]:
                 if not isinstance(raw, dict):
                     continue
-                label = str(raw.get("label") or raw.get("id") or "Codex").strip()
+                label = str(raw.get("label") or raw.get("id") or "프로필").strip()
+                provider = str(raw.get("provider") or "codex").strip().title()
                 account_enabled = bool(raw.get("enabled", True))
+                selected = bool(raw.get("taskbar_selected", True))
                 account_runtime = raw.get("runtime", {})
                 if not isinstance(account_runtime, dict):
                     account_runtime = {}
                 account_session = str(account_runtime.get("session_state", "unknown") or "unknown")
                 account_state = str(account_runtime.get("monitor_state", "unknown") or "unknown")
                 if account_enabled:
-                    parts.append((f"{label}: {account_session} / {account_state}", "normal"))
+                    display_state = f"{account_session} / {account_state}"
+                    if not selected:
+                        display_state += " / 표시 안 함"
+                    parts.append((f"{label} ({provider}): {display_state}", "normal"))
                 else:
-                    parts.append((f"{label}: 비활성 / {account_session}", "disabled"))
+                    parts.append((f"{label} ({provider}): 비활성 / {account_session}", "disabled"))
         return is_enabled, parts
+
+    def _format_codex(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
+        return self._format_ai_usage(data)
 
     def _format_kakao(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
         if not isinstance(data, dict):
@@ -499,13 +542,14 @@ class DashboardView:
         warmup = "완료" if bool(data.get("features_warmup_done", False)) else "진행/대기"
         profile = str(data.get("foreground_hotkey_profile", "") or "없음")
         attached = []
-        for key, label in (
-            ("wrike_attached", "Wrike"),
-            ("codex_attached", "Codex"),
-            ("lijamong_attached", "LiJaMong"),
+        if bool(data.get("wrike_attached", False)):
+            attached.append("Wrike")
+        if bool(data.get("ai_usage_attached", False)) or bool(
+            data.get("codex_attached", False)
         ):
-            if bool(data.get(key, False)):
-                attached.append(label)
+            attached.append("AI 사용량")
+        if bool(data.get("lijamong_attached", False)):
+            attached.append("LiJaMong")
         attached_text = ", ".join(attached) if attached else "없음"
         return is_enabled, [
             self._enabled_part(is_enabled),

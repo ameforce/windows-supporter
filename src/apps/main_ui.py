@@ -12,6 +12,7 @@ class WindowsSupporterMainUI:
     _TAB_STARTUP = "startup_apps"
     _TAB_KAKAO = "kakao_monitor"
     _TAB_WRIKE = "wrike"
+    _TAB_AI_USAGE = "ai_usage"
     _TAB_CODEX = "codex_usage"
     _TAB_UPDATE = "update"
     _KAKAO_RETRY_DELAY_MS = 500
@@ -43,6 +44,7 @@ class WindowsSupporterMainUI:
         self._tab_startup = None
         self._tab_kakao = None
         self._tab_wrike = None
+        self._tab_ai_usage = None
         self._tab_codex = None
         self._tab_update = None
 
@@ -54,6 +56,8 @@ class WindowsSupporterMainUI:
         self._kakao_retry_after_id = None
         self._wrike_view = None
         self._wrike_built = False
+        self._ai_usage_view = None
+        self._ai_usage_built = False
         self._codex_view = None
         self._codex_built = False
         self._update_view = None
@@ -64,7 +68,7 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP: (1000, 560),
             self._TAB_KAKAO: (700, 340),
             self._TAB_WRIKE: (840, 580),
-            self._TAB_CODEX: (1000, 560),
+            self._TAB_AI_USAGE: (1000, 560),
             self._TAB_UPDATE: (760, 420),
         }
         self._tab_minsizes = {
@@ -72,7 +76,7 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP: (940, 520),
             self._TAB_KAKAO: (620, 300),
             self._TAB_WRIKE: (800, 520),
-            self._TAB_CODEX: (960, 540),
+            self._TAB_AI_USAGE: (960, 540),
             self._TAB_UPDATE: (720, 380),
         }
 
@@ -146,8 +150,12 @@ class WindowsSupporterMainUI:
         self.show(self._TAB_WRIKE)
         return
 
+    def show_ai_usage(self) -> None:
+        self.show(self._TAB_AI_USAGE)
+        return
+
     def show_codex_usage(self) -> None:
-        self.show(self._TAB_CODEX)
+        self.show_ai_usage()
         return
 
     def show_update_settings(self) -> None:
@@ -233,20 +241,21 @@ class WindowsSupporterMainUI:
         tab_startup = ttk.Frame(notebook)
         tab_kakao = ttk.Frame(notebook)
         tab_wrike = ttk.Frame(notebook)
-        tab_codex = ttk.Frame(notebook)
+        tab_ai_usage = ttk.Frame(notebook)
         tab_update = ttk.Frame(notebook)
         self._tab_dashboard = tab_dashboard
         self._tab_startup = tab_startup
         self._tab_kakao = tab_kakao
         self._tab_wrike = tab_wrike
-        self._tab_codex = tab_codex
+        self._tab_ai_usage = tab_ai_usage
+        self._tab_codex = tab_ai_usage
         self._tab_update = tab_update
 
         notebook.add(tab_dashboard, text="Dashboard")
         notebook.add(tab_startup, text="Startup Apps")
         notebook.add(tab_kakao, text="KakaoTalk")
         notebook.add(tab_wrike, text="Wrike")
-        notebook.add(tab_codex, text="Codex")
+        notebook.add(tab_ai_usage, text="AI 사용량")
         notebook.add(tab_update, text="Update")
 
         try:
@@ -259,7 +268,7 @@ class WindowsSupporterMainUI:
             ttk.Label(tab_startup, text="Startup Apps 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_kakao, text="KakaoTalk 모니터 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_wrike, text="Wrike 설정을 여는 중...").pack(padx=12, pady=12)
-            ttk.Label(tab_codex, text="Codex 사용량 설정을 여는 중...").pack(padx=12, pady=12)
+            ttk.Label(tab_ai_usage, text="AI 사용량 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_update, text="Update 설정을 여는 중...").pack(padx=12, pady=12)
         except Exception:
             pass
@@ -294,9 +303,16 @@ class WindowsSupporterMainUI:
             except Exception:
                 pass
             return
-        if t in {"codex", "codex_usage", "codex_usage_monitor"}:
+        if t in {
+            "ai",
+            "ai_usage",
+            "ai_usage_monitor",
+            "codex",
+            "codex_usage",
+            "codex_usage_monitor",
+        }:
             try:
-                nb.select(self._tab_codex)
+                nb.select(self._tab_ai_usage or self._tab_codex)
             except Exception:
                 pass
             return
@@ -314,7 +330,7 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP,
             self._TAB_KAKAO,
             self._TAB_WRIKE,
-            self._TAB_CODEX,
+            self._TAB_AI_USAGE,
             self._TAB_UPDATE,
         )
 
@@ -396,8 +412,10 @@ class WindowsSupporterMainUI:
                 new_tab = self._TAB_KAKAO
             elif self._tab_wrike is not None and cur == str(self._tab_wrike):
                 new_tab = self._TAB_WRIKE
+            elif self._tab_ai_usage is not None and cur == str(self._tab_ai_usage):
+                new_tab = self._TAB_AI_USAGE
             elif self._tab_codex is not None and cur == str(self._tab_codex):
-                new_tab = self._TAB_CODEX
+                new_tab = self._TAB_AI_USAGE
             elif self._tab_update is not None and cur == str(self._tab_update):
                 new_tab = self._TAB_UPDATE
 
@@ -427,8 +445,8 @@ class WindowsSupporterMainUI:
                 self._ensure_kakao_built()
             elif new_tab == self._TAB_WRIKE:
                 self._ensure_wrike_built()
-            elif new_tab == self._TAB_CODEX:
-                self._ensure_codex_built()
+            elif new_tab == self._TAB_AI_USAGE:
+                self._ensure_ai_usage_built()
             elif new_tab == self._TAB_UPDATE:
                 self._ensure_update_built()
 
@@ -500,7 +518,9 @@ class WindowsSupporterMainUI:
         return {
             "startup.toggle": self._dashboard_startup_toggle,
             "startup.settings": self.show_startup_apps,
-            "codex.toggle": self._dashboard_codex_toggle_enabled,
+            "ai_usage.toggle": self._dashboard_ai_usage_toggle_enabled,
+            "ai_usage.settings": self.show_ai_usage,
+            "codex.toggle": self._dashboard_ai_usage_toggle_enabled,
             "codex.settings": self.show_codex_usage,
             "kakao.toggle": self._dashboard_kakao_toggle_enabled,
             "kakao.settings": self.show_kakao_monitor,
@@ -548,28 +568,43 @@ class WindowsSupporterMainUI:
         self._run_bg(task)
         return
 
-    def _get_codex_usage_monitor(self):
+    def _get_ai_usage_monitor(self):
+        getter = getattr(self._monitor, "get_ai_usage_monitor", None)
+        if callable(getter):
+            try:
+                monitor = getter()
+                if monitor is not None:
+                    return monitor
+            except Exception:
+                pass
         try:
             return self._monitor.get_codex_usage_monitor()
         except Exception:
             return None
 
-    def _dashboard_codex_toggle_enabled(self) -> None:
-        codex = self._get_codex_usage_monitor()
-        if codex is None:
+    def _get_codex_usage_monitor(self):
+        return self._get_ai_usage_monitor()
+
+    def _dashboard_ai_usage_toggle_enabled(self) -> None:
+        usage = self._get_ai_usage_monitor()
+        if usage is None:
             return
         try:
-            settings = codex.get_settings_snapshot()
+            settings = usage.get_settings_snapshot()
             if not isinstance(settings, dict):
                 settings = {}
             settings["enabled"] = not bool(settings.get("enabled", True))
-            codex.update_settings(settings)
+            usage.update_settings(settings)
         except Exception:
             pass
         return
 
+    def _dashboard_codex_toggle_enabled(self) -> None:
+        self._dashboard_ai_usage_toggle_enabled()
+        return
+
     def _dashboard_codex_current_usage(self) -> None:
-        codex = self._get_codex_usage_monitor()
+        codex = self._get_ai_usage_monitor()
         if codex is None:
             return
         try:
@@ -579,7 +614,7 @@ class WindowsSupporterMainUI:
         return
 
     def _dashboard_codex_login(self) -> None:
-        codex = self._get_codex_usage_monitor()
+        codex = self._get_ai_usage_monitor()
         if codex is None:
             return
         try:
@@ -668,9 +703,11 @@ class WindowsSupporterMainUI:
         return
 
     def _get_dashboard_status_snapshot(self) -> dict[str, Any]:
+        ai_usage = self._get_ai_usage_dashboard_status()
         return {
             "startup": self._get_startup_dashboard_status(),
-            "codex": self._get_codex_dashboard_status(),
+            "ai_usage": ai_usage,
+            "codex": ai_usage,
             "kakao": self._get_kakao_dashboard_status(),
             "wrike": self._get_wrike_dashboard_status(),
             "background": self._get_background_dashboard_status(),
@@ -704,24 +741,27 @@ class WindowsSupporterMainUI:
             pass
         return out
 
-    def _get_codex_dashboard_status(self) -> dict[str, Any]:
-        codex = self._get_codex_usage_monitor()
-        if codex is None:
+    def _get_ai_usage_dashboard_status(self) -> dict[str, Any]:
+        usage = self._get_ai_usage_monitor()
+        if usage is None:
             return {}
         out: dict[str, Any] = {}
         try:
-            settings = codex.get_settings_snapshot()
+            settings = usage.get_settings_snapshot()
             if isinstance(settings, dict):
                 out.update(settings)
         except Exception:
             pass
         try:
-            runtime = codex.get_runtime_status()
+            runtime = usage.get_runtime_status()
             if isinstance(runtime, dict):
                 out.update(runtime)
         except Exception:
             pass
         return out
+
+    def _get_codex_dashboard_status(self) -> dict[str, Any]:
+        return self._get_ai_usage_dashboard_status()
 
     def _get_kakao_dashboard_status(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -893,35 +933,35 @@ class WindowsSupporterMainUI:
                 pass
         return
 
-    def _ensure_codex_built(self) -> None:
-        if self._codex_built or self._tab_codex is None:
+    def _ensure_ai_usage_built(self) -> None:
+        tab = self._tab_ai_usage or self._tab_codex
+        if self._ai_usage_built or tab is None:
             return
 
-        codex = None
-        try:
-            codex = self._monitor.get_codex_usage_monitor()
-        except Exception:
-            codex = None
-        if codex is None:
+        usage = self._get_ai_usage_monitor()
+        if usage is None:
             return
 
         try:
-            from src.apps.codex_usage_ui import CodexUsageSettingsView
+            from src.apps.ai_usage_ui import AIUsageSettingsView
         except Exception:
             return
 
         try:
-            self._codex_view = CodexUsageSettingsView(
+            self._ai_usage_view = AIUsageSettingsView(
                 self._root,
-                codex,
+                usage,
                 ui_post=self._ui_post,
             )
-            self._codex_view.mount(self._tab_codex)
+            self._ai_usage_view.mount(tab)
+            self._ai_usage_built = True
+            self._codex_view = self._ai_usage_view
             self._codex_built = True
         except Exception:
+            self._ai_usage_built = False
             self._codex_built = False
             try:
-                for w in list(self._tab_codex.winfo_children()):
+                for w in list(tab.winfo_children()):
                     try:
                         w.destroy()
                     except Exception:
@@ -932,9 +972,13 @@ class WindowsSupporterMainUI:
                 ttk = self._ttk
                 if ttk is not None:
                     ttk.Label(
-                        self._tab_codex,
-                        text="Codex 설정 UI 로딩 실패",
+                        tab,
+                        text="AI 사용량 설정 UI 로딩 실패",
                     ).pack(padx=12, pady=12)
             except Exception:
                 pass
+        return
+
+    def _ensure_codex_built(self) -> None:
+        self._ensure_ai_usage_built()
         return
