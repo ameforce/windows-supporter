@@ -22,15 +22,52 @@ class PullRequestReviewContractTest(unittest.TestCase):
             with self.subTest(path=relative_path):
                 self.assertFalse((REPO_ROOT / relative_path).exists())
 
+    def test_server_protection_has_no_fake_review_status_checks(self) -> None:
+        import json
+
+        ruleset = json.loads(
+            (REPO_ROOT / ".github/pr-protection/ruleset.json").read_text(encoding="utf-8")
+        )
+        rule_types = [rule["type"] for rule in ruleset["rules"]]
+        self.assertEqual(rule_types, ["pull_request", "non_fast_forward", "deletion"])
+        self.assertNotIn("required_status_checks", rule_types)
+
+        pull_request_rule = ruleset["rules"][0]["parameters"]
+        self.assertTrue(pull_request_rule["dismiss_stale_reviews_on_push"])
+        self.assertTrue(pull_request_rule["required_review_thread_resolution"])
+        self.assertEqual(pull_request_rule["allowed_merge_methods"], ["merge"])
+
+    def test_pull_request_validation_is_exact_head_non_review_ci(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/pull-request-validation.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("name: Pull request validation", workflow)
+        self.assertIn("name: pull-request-validation", workflow)
+        self.assertIn("github.event.pull_request.draft == false", workflow)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha }}", workflow)
+        self.assertIn("It does not perform or prove PR review.", workflow)
+        self.assertNotIn("pr-quality-gate", workflow)
+
+    def test_pull_request_template_is_non_authoritative(self) -> None:
+        template = (REPO_ROOT / ".github/pull_request_template.md").read_text(encoding="utf-8")
+        self.assertIn("review `commit_id`", template)
+        self.assertIn("작성자가 체크하거나 0을 적은 사실 자체는 리뷰 증거가 아닙니다", template)
+        self.assertNotIn("reviewer_source", template)
+        self.assertNotIn("review_evidence_digest", template)
+
     def test_agents_contract_requires_two_exact_head_reviews(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
         for required_text in (
             "@codex review",
+            "chatgpt-codex-connector",
+            "review object의 `commit_id`",
             "native Codex subagent",
             "P0/P1/P2/P3",
             "unresolved 0",
             "stale",
+            "--match-head-commit <FINAL_HEAD_SHA>",
+            "--force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA>",
             "GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다",
         ):
             with self.subTest(required_text=required_text):

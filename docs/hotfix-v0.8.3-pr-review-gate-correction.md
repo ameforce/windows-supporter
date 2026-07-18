@@ -2,7 +2,7 @@
 
 ## 결론
 
-`v0.8.1`에서 도입한 `pr-policy-gate`와 `pr-quality-gate`는 실제 PR 리뷰를 실행하거나 검증하지 않았다. 이 구현은 릴리스 lane과 PR 메타데이터를 검사하는 CI를 리뷰 게이트로 잘못 표현했다. `v0.8.3`은 해당 Actions, ruleset, validator, self-attestation을 제거하고 실제 exact-head 이중 리뷰 절차로 복구한다.
+`v0.8.1`에서 도입한 `pr-policy-gate`와 self-attestation은 실제 PR 리뷰를 실행하거나 검증하지 않았다. 이 구현은 릴리스 lane과 PR 메타데이터를 검사하는 CI를 리뷰 게이트로 잘못 표현했다. `v0.8.3`은 해당 리뷰 흉내를 제거하고 실제 exact-head 이중 리뷰 절차로 복구한다. 테스트·빌드는 명확히 비리뷰인 `pull-request-validation`으로 유지하고, server-side ruleset은 status check 없는 branch 보호로 축소한다.
 
 ## RCA
 
@@ -26,7 +26,9 @@ PR 본문에 작성자가 넣은 reviewer 이름, finding 0, digest 또는 Actio
 
 ## 변경 범위
 
-- 제거: `pr-policy-gate`, `pr-quality-gate`, 관련 ruleset/config, validator/controller, self-attestation PR template와 단위 테스트.
+- 제거: `pr-policy-gate`, `pr-quality-gate` 이름, 관련 lane config, validator/controller, self-attestation 형식과 단위 테스트.
+- 재설계: `pull-request-validation`은 exact PR head의 테스트·artifact 빌드만 수행하며 draft PR에서는 실패하지 않는다. `windows-supporter-release-pr-protection` ruleset은 PR-only merge, stale review dismiss, unresolved thread, force-push·deletion 보호만 유지하고 required status check는 두지 않는다.
+- 교체: PR template은 실제 review object와 독립 reviewer 결과를 찾기 위한 비권위 체크리스트만 제공한다.
 - 유지: `release-chain-gate`. 이는 `main`, `develop`, tag의 테스트·artifact 빌드를 수행하는 릴리스 CI이며 리뷰 게이트가 아니다.
 - 이전 release-chain 시간대·artifact 이름 contract test는 별도 `test_release_chain_gate.py`로 이동한다.
 - `AGENTS.md`는 exact-head 이중 리뷰와 stale-on-push 반복을 권위 있는 절차로 명시한다.
@@ -36,3 +38,9 @@ PR 본문에 작성자가 넣은 reviewer 이름, finding 0, digest 또는 Actio
 - 공개된 `v0.8.2` annotated tag object `42665d1061e208d195d41d16e499e55307199f1e`는 `main` commit `dfb36e407c55e01d83f236faef9cb9521f134a72`를 가리킨다.
 - `v0.8.2` GitHub Release는 생성되지 않았다.
 - 공개 branch와 tag는 force push, 재작성, 삭제하지 않는다. 교정 코드는 다음 patch인 `v0.8.3`으로 배포한다.
+
+## 라이브 원격 상태 교정
+
+- 기존 ruleset `19143432`와 그 required status checks는 코드 교정 전에 제거했다.
+- 기존 `PR policy gate`와 `PR quality gate` workflow는 코드 교정 PR이 열리기 전에 수동 비활성화해 draft 실패 메일과 잘못된 gate 사용을 중단했다.
+- 이 PR의 교정된 ruleset을 동일 exact head에서 read-back 검증한 뒤 적용한다. 이는 branch 보호 설정이며 실제 이중 리뷰 증거로 계산하지 않는다.

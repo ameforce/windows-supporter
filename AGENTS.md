@@ -16,8 +16,9 @@
 - 두 리뷰의 finding은 `P0/P1/P2/P3`로 정규화하고 모든 등급을 0으로 만든다. GitHub review thread도 unresolved 0이어야 한다. 작성자가 PR 본문에 적은 finding 수, reviewer 이름, digest 또는 Actions status는 실제 리뷰 증거를 대신하지 않는다.
 - 리뷰 뒤 push로 head SHA가 바뀌면 이전 GitHub Codex 리뷰와 독립 리뷰를 모두 stale로 처리하고, 새 exact head에서 두 리뷰를 다시 수행한다. 최종 두 리뷰가 같은 최신 head SHA를 검토하지 않았다면 merge하지 않는다.
 - 테스트, 정적 검사, 빌드, Windows 실제 실행, `release-chain-gate`는 리뷰와 별개의 검증 증거다. GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다.
-- merge 직전에 PR의 최신 head SHA, 두 리뷰 대상 SHA, `P0/P1/P2/P3 = 0`, unresolved thread 0을 다시 확인한다. 이어 exact head 조건을 걸어 merge commit 방식으로 병합하고, `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
+- merge 직전에 PR의 최신 head SHA, 두 리뷰 대상 SHA, `P0/P1/P2/P3 = 0`, unresolved thread 0을 다시 확인한다. 이어 `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>` 또는 동등한 API precondition으로 exact head 조건을 걸어 병합하고, `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
 - `AGENTS.md`, 리뷰 절차, workflow, ruleset을 바꾸는 PR에도 같은 이중 리뷰 절차를 적용한다. 리뷰를 실제로 수행하지 않는 workflow나 self-attestation validator를 리뷰 gate라는 이름으로 도입하지 않는다.
+- `.github/pr-protection/ruleset.json`은 `hotfix/*`와 `release/*`에 PR-only merge, stale review dismiss, unresolved thread 해소, force-push·deletion 보호만 적용한다. 이 ruleset은 이중 리뷰를 실행하거나 증명하지 않으며 required status check를 두지 않는다.
 - 공개된 `main`, `develop`, tag의 잘못된 이력은 revert 또는 다음 patch release로 교정한다. 정상 release 절차에서 `--force-with-lease`로 공개 ref를 다시 쓰지 않는다.
 
 이 레포에서 수정사항이 생기면 아래 순서를 항상 지킨다.
@@ -67,7 +68,7 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
    - 이미 잘못된 release graph를 push했다면 공개 ref를 force rewrite하지 않는다. revert 또는 다음 patch release로 복구한다.
 7. merge된 hotfix 브랜치를 정리한다.
    - 로컬 브랜치: `git branch -d hotfix/vX.Y.Z`
-   - 원격 branch는 main/develop push와 release-chain 성공 뒤 exact remote tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한 후 삭제한다.
+   - 원격 branch는 main/develop push와 release-chain 성공 뒤 exact remote tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다. 이어 `git push origin --force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA> :refs/heads/hotfix/vX.Y.Z`처럼 검증한 SHA에 lease를 건 compare-and-delete만 사용한다.
 8. 최종 영구 런타임 기준을 다시 확인한다.
    - 현재 branch를 `main`으로 돌려둔다.
    - main 태그 기준으로 `cmd /c build.bat`를 한 번 더 실행해 영구 실행 파일을 release 버전으로 둔다.
