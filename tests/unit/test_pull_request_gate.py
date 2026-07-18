@@ -530,13 +530,17 @@ class PullRequestGateUnitTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-        timezone_step = '      - name: Configure target timezone\n'
-        test_step = '      - name: Run release tests\n'
-        self.assertIn(timezone_step, release_workflow)
-        self.assertIn('tzutil /s "Korea Standard Time"', release_workflow)
-        self.assertIn("tzutil /g", release_workflow)
-        self.assertIn('findstr /x /c:"Korea Standard Time"', release_workflow)
-        self.assertLess(release_workflow.index(timezone_step), release_workflow.index(test_step))
+        expected_sequence = (
+            '      - name: Configure target timezone\n'
+            '        shell: cmd\n'
+            '        run: |\n'
+            '          tzutil /s "Korea Standard Time"\n'
+            '          if errorlevel 1 exit /b 1\n'
+            '          tzutil /g | findstr /x /c:"Korea Standard Time"\n'
+            '          if errorlevel 1 exit /b 1\n'
+            '      - name: Run release tests\n'
+        )
+        self.assertIn(expected_sequence, release_workflow)
 
 
 if __name__ == "__main__":
