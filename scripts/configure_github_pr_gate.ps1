@@ -28,6 +28,41 @@ function Invoke-GhJson {
     return $text | ConvertFrom-Json
 }
 
+function ConvertTo-CanonicalRulesetValue {
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -is [string] -or $Value -is [ValueType]) {
+        return $Value
+    }
+    if ($Value -is [Collections.IDictionary]) {
+        $ordered = [ordered]@{}
+        foreach ($key in @($Value.Keys | ForEach-Object { [string]$_ }) | Sort-Object -CaseSensitive) {
+            $ordered[$key] = ConvertTo-CanonicalRulesetValue -Value $Value[$key]
+        }
+        return $ordered
+    }
+    if ($Value -is [PSCustomObject]) {
+        $ordered = [ordered]@{}
+        $propertyNames = @($Value.PSObject.Properties | ForEach-Object { $_.Name })
+        foreach ($name in @($propertyNames | Sort-Object -CaseSensitive)) {
+            $ordered[$name] = ConvertTo-CanonicalRulesetValue -Value $Value.$name
+        }
+        return $ordered
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        $items = @()
+        foreach ($item in $Value) {
+            $items += ,(ConvertTo-CanonicalRulesetValue -Value $item)
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    return $Value
+}
+
 function Get-CanonicalRulesetJson {
     param([Parameter(Mandatory = $true)]$Ruleset)
 
@@ -39,7 +74,8 @@ function Get-CanonicalRulesetJson {
         conditions = $Ruleset.conditions
         rules = @($Ruleset.rules)
     }
-    return $canonical | ConvertTo-Json -Depth 100 -Compress
+    $normalized = ConvertTo-CanonicalRulesetValue -Value $canonical
+    return $normalized | ConvertTo-Json -Depth 100 -Compress
 }
 
 function Get-TextSha256 {
@@ -99,28 +135,62 @@ function Assert-EffectiveRules {
     param([Parameter(Mandatory = $true)][string[]]$BranchNames)
 
     foreach ($branchName in $BranchNames) {
-        $encodedBranch = [Uri]::EscapeDataString($branchName)
-        $rules = @(Invoke-GhJson -Arguments @("api", "repos/$Repository/rules/branches/$encodedBranch"))
-        $types = @($rules | ForEach-Object { $_.type })
-        foreach ($requiredType in @("pull_request", "required_status_checks", "non_fast_forward", "deletion")) {
-            if ($requiredType -notin $types) {
-                throw "Effective rules for '$branchName' do not include '$requiredType'."
+        $lastFailure = $null
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                $encodedBranch = [Uri]::EscapeDataString($branchName)
+                $rawRules = Invoke-GhJson -Arguments @(
+                    "api", "repos/$Repository/rules/branches/$encodedBranch"
+                )
+                $rules = @($rawRules | ForEach-Object { $_ })
+                $types = @($rules | ForEach-Object { $_.type })
+                foreach ($requiredType in @("pull_request", "required_status_checks", "non_fast_forward", "deletion")) {
+                    if ($requiredType -notin $types) {
+                        throw "Effective rules for '$branchName' do not include '$requiredType'."
+                    }
+                }
+                $statusRules = @($rules | Where-Object { $_.type -eq "required_status_checks" })
+                if ($statusRules.Count -ne 1) {
+                    throw "Effective rules for '$branchName' do not expose exactly one required status rule."
+                }
+                $parametersProperty = @(
+                    $statusRules[0].PSObject.Properties |
+                        Where-Object { $_.Name -eq "parameters" }
+                ) | Select-Object -First 1
+                if ($null -eq $parametersProperty -or $null -eq $parametersProperty.Value) {
+                    throw "Effective required status rule for '$branchName' has no parameters."
+                }
+                $statusParameters = $parametersProperty.Value
+                $contexts = @($statusParameters.required_status_checks | ForEach-Object { $_.context })
+                foreach ($context in @("pr-policy-gate", "pr-quality-gate")) {
+                    if ($context -notin $contexts) {
+                        throw "Effective rules for '$branchName' do not require '$context'."
+                    }
+                }
+                if (-not $statusParameters.strict_required_status_checks_policy) {
+                    throw "Effective rules for '$branchName' do not use strict required status checks."
+                }
+                if (-not $statusParameters.do_not_enforce_on_create) {
+                    throw "Effective rules for '$branchName' do not preserve initial lane creation."
+                }
+                $lastFailure = $null
+                break
+            } catch {
+                $lastFailure = $_.Exception.Message
+                if ($attempt -lt 5) {
+                    Start-Sleep -Seconds 1
+                }
             }
         }
-        $statusRule = $rules | Where-Object { $_.type -eq "required_status_checks" } | Select-Object -First 1
-        $contexts = @($statusRule.parameters.required_status_checks | ForEach-Object { $_.context })
-        foreach ($context in @("pr-policy-gate", "pr-quality-gate")) {
-            if ($context -notin $contexts) {
-                throw "Effective rules for '$branchName' do not require '$context'."
-            }
-        }
-        if (-not $statusRule.parameters.strict_required_status_checks_policy) {
-            throw "Effective rules for '$branchName' do not use strict required status checks."
-        }
-        if (-not $statusRule.parameters.do_not_enforce_on_create) {
-            throw "Effective rules for '$branchName' do not preserve initial lane creation."
+        if ($null -ne $lastFailure) {
+            throw "Effective rules for '$branchName' did not converge after 5 attempts: $lastFailure"
         }
     }
+}
+
+function Get-EffectiveRuleProbeBranchNames {
+    $suffix = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    return @("hotfix/v9.9.$suffix", "release/v9.9.$suffix")
 }
 
 function Get-RemoteBranchRef {
@@ -208,7 +278,7 @@ if ($Mode -eq "Verify") {
     if ($desiredCanonical -ne $existingCanonical) {
         throw "Remote ruleset differs from the checked-in desired state."
     }
-    Assert-EffectiveRules -BranchNames @("hotfix/v9.9.9", "release/v9.9.9")
+    Assert-EffectiveRules -BranchNames @(Get-EffectiveRuleProbeBranchNames)
     Write-Output "Verified desired and effective rules for $Repository."
     exit 0
 }
@@ -429,7 +499,7 @@ if ($Mode -eq "DeleteLane") {
         } else {
             throw "Ruleset state changed outside DeleteLane before canonical restore."
         }
-        Assert-EffectiveRules -BranchNames @("hotfix/v9.9.9", "release/v9.9.9")
+        Assert-EffectiveRules -BranchNames @(Get-EffectiveRuleProbeBranchNames)
     } catch {
         $restoreFailure = $_
     }
@@ -514,7 +584,7 @@ try {
     if ($null -eq $appliedRuleset -or (Get-CanonicalRulesetJson -Ruleset $appliedRuleset) -ne $desiredCanonical) {
         throw "GitHub did not persist the canonical desired ruleset."
     }
-    Assert-EffectiveRules -BranchNames @("hotfix/v9.9.9", "release/v9.9.9")
+    Assert-EffectiveRules -BranchNames @(Get-EffectiveRuleProbeBranchNames)
     Write-Output "Applied and verified '$($desired.name)'. Pre-apply snapshot: $allBeforePath"
 } catch {
     $applyFailure = $_
