@@ -8,7 +8,7 @@ from src.apps.Notion import Notion
 from src.apps.Wrike import Wrike
 from src.apps.KakaoManager import KakaoManager
 from src.apps.LiJaMong import LiJaMong
-from src.apps.codex_usage_multi_monitor import CodexUsageMultiMonitor
+from src.apps.ai_usage_monitor import AiUsageProfileManager
 
 
 class Monitor:
@@ -164,7 +164,7 @@ class Monitor:
             return self.__codex_usage
         with self.__component_lock:
             if self.__codex_usage is None:
-                self.__codex_usage = CodexUsageMultiMonitor(
+                self.__codex_usage = AiUsageProfileManager(
                     unrecoverable_timeout_handler=self.__codex_timeout_recovery_handler,
                 )
         return self.__codex_usage
@@ -662,4 +662,10 @@ class Monitor:
         return self.__ensure_wrike()
 
     def get_codex_usage_monitor(self):
+        return self.get_ai_usage_manager()
+
+    def get_ai_usage_manager(self):
         return self.__ensure_codex_usage()
+
+    def get_ai_usage_monitor(self):
+        return self.get_ai_usage_manager()

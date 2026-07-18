@@ -302,6 +302,44 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
         self.assertEqual(geometry["coordinate_basis"], "physical_px")
         self.assertEqual(geometry["_geometry_basis"], "global_physical_px")
 
+    def test_taskbar_created_rebinds_secondary_overlay_to_recreated_secondary_owner(self):
+        desktop = _Desktop()
+        overlay, _root, _window = _refresh_with_desktop(desktop)
+        desktop.taskbars.pop(20)
+        desktop.taskbars[21] = (
+            "Shell_SecondaryTrayWnd",
+            (1920, 1040, 3840, 1080),
+            True,
+        )
+
+        class RecordingUser32(_FakeUser32):
+            def __init__(self):
+                self.owner_calls = []
+
+            def SetWindowLongPtrW(self, hwnd, index, value):
+                self.owner_calls.append((int(hwnd), int(index), int(value)))
+                return 0
+
+        recording_user32 = RecordingUser32()
+
+        class RecordingWindll:
+            user32 = recording_user32
+
+        with patch.object(taskbar_overlay, "win32gui", _FakeWin32Gui(desktop)), patch.object(
+            taskbar_overlay,
+            "win32api",
+            _FakeWin32Api(desktop),
+        ), patch.object(taskbar_overlay, "win32con", _FakeWin32Con), patch.object(
+            taskbar_overlay.ctypes,
+            "windll",
+            RecordingWindll(),
+            create=True,
+        ):
+            overlay.invalidate_native_owner()
+
+        self.assertEqual(overlay._active_taskbar_hwnd, 21)
+        self.assertEqual(recording_user32.owner_calls[-1], (200, -8, 21))
+
     def test_geometry_monitor_relocates_existing_primary_overlay_when_fullscreen_starts(self):
         desktop = _Desktop()
         desktop.primary_fullscreen = False

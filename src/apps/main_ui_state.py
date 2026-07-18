@@ -7,6 +7,21 @@ from typing import Iterable
 
 DEFAULT_TAB = "dashboard"
 STATE_FILENAME = "main_ui_state.json"
+_TAB_KEY_EQUIVALENTS = {
+    "ai_usage": ("ai_usage", "codex_usage"),
+    "codex_usage": ("ai_usage", "codex_usage"),
+}
+
+
+def _resolve_tab_key(tab_key: str, valid_tabs: Iterable[str]) -> str:
+    tab = str(tab_key or "").strip()
+    valid = {str(value) for value in valid_tabs}
+    if tab in valid:
+        return tab
+    for candidate in _TAB_KEY_EQUIVALENTS.get(tab, ()):
+        if candidate in valid:
+            return candidate
+    return ""
 
 
 def get_state_path(environ: dict[str, str] | None = None) -> str:
@@ -36,8 +51,8 @@ def load_last_tab(
         return default_key
     if not isinstance(data, dict):
         return default_key
-    tab = str(data.get("last_tab", "")).strip()
-    if tab in valid:
+    tab = _resolve_tab_key(data.get("last_tab", ""), valid)
+    if tab:
         return tab
     return default_key
 
@@ -48,8 +63,9 @@ def save_last_tab(
     valid_tabs: Iterable[str],
     path: str | None = None,
 ) -> bool:
-    tab = str(tab_key or "").strip()
-    if tab not in {str(x) for x in valid_tabs}:
+    valid = {str(x) for x in valid_tabs}
+    tab = _resolve_tab_key(tab_key, valid)
+    if not tab:
         return False
     state_path = str(path or get_state_path())
     try:

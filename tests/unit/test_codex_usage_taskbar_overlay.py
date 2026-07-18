@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
@@ -126,6 +127,192 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual([bar["state"] for bar in model["bars"]], ["warning", "normal"])
         self.assertEqual(model["bars"][0]["color"], "#f59e0b")
         self.assertEqual(model["bars"][1]["color"], "#22c55e")
+
+    def test_model_prefers_selected_provider_profiles_before_applying_total_limit(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "codex-hidden",
+                    "provider": "codex",
+                    "label": "Hidden Codex",
+                    "enabled": True,
+                    "taskbar_selected": False,
+                    "metrics": [
+                        {
+                            "key": "five_hour_limit",
+                            "short_label": "5h",
+                            "percent": 99,
+                            "value_text": "99%",
+                            "reset_at": "2026-07-18T12:00:00+09:00",
+                            "state": "normal",
+                        }
+                    ],
+                },
+                {
+                    "id": "cursor-selected",
+                    "provider": "cursor",
+                    "label": "Cursor",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "fresh",
+                    "provider_status": "ready",
+                    "runtime": {"session_state": "logged_in"},
+                    "last_snapshot": {"captured_at": "2026-07-18T10:00:00+09:00"},
+                    "metrics": [
+                        {
+                            "key": "monthly_limit",
+                            "short_label": "30d",
+                            "percent": 37,
+                            "value_text": "37% left",
+                            "reset_at": "2026-08-01T00:00:00+09:00",
+                            "state": "warning",
+                        }
+                    ],
+                },
+                {
+                    "id": "codex-selected",
+                    "provider": "codex",
+                    "label": "Codex",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "stale",
+                    "provider_status": "stale",
+                    "metrics": [
+                        {
+                            "key": "five_hour_limit",
+                            "short_label": "5h",
+                            "percent": None,
+                            "value_text": "--",
+                            "reset_at": "",
+                            "state": "stale",
+                        }
+                    ],
+                },
+                {
+                    "id": "cursor-over-limit",
+                    "provider": "cursor",
+                    "label": "Cursor 2",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "metrics": [],
+                },
+            ],
+            "accounts": self._runtime()["accounts"],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        self.assertEqual(
+            [bar["id"] for bar in model["bars"]],
+            ["cursor-selected", "codex-selected"],
+        )
+        self.assertEqual([bar["provider"] for bar in model["bars"]], ["cursor", "codex"])
+        self.assertEqual(model["bars"][0]["profile_id"], "cursor-selected")
+        self.assertEqual(model["bars"][0]["freshness"], "fresh")
+        self.assertEqual(model["bars"][0]["provider_status"], "ready")
+        first_metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["metric_key"], "monthly_limit")
+        self.assertEqual(first_metric["key"], "30d")
+        self.assertEqual(first_metric["short_label"], "30d")
+        self.assertEqual(first_metric["percent"], 37)
+        self.assertEqual(first_metric["value_text"], "37% left")
+        self.assertEqual(first_metric["reset_at"], "2026-08-01T00:00:00+09:00")
+        self.assertEqual(first_metric["state"], "warning")
+        self.assertIsNone(model["bars"][1]["metrics"][0]["percent"])
+
+    def test_render_signature_tracks_profile_provider_metric_freshness_and_status(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "cursor-1",
+                    "provider": "cursor",
+                    "label": "Cursor",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "fresh",
+                    "provider_status": {"state": "ready", "text": "OK"},
+                    "metrics": [
+                        {
+                            "key": "monthly_limit",
+                            "short_label": "30d",
+                            "percent": 37,
+                            "value_text": "37%",
+                            "reset_at": "2026-08-01T00:00:00+09:00",
+                            "state": "warning",
+                        }
+                    ],
+                }
+            ],
+        }
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        baseline = taskbar_overlay._overlay_render_signature(model)
+        mutations = (
+            ("profile", lambda item: item["bars"][0].__setitem__("profile_id", "cursor-2")),
+            ("provider", lambda item: item["bars"][0].__setitem__("provider", "codex")),
+            ("freshness", lambda item: item["bars"][0].__setitem__("freshness", "stale")),
+            (
+                "status",
+                lambda item: item["bars"][0].__setitem__(
+                    "provider_status", {"state": "rate_limited", "text": "RATE"}
+                ),
+            ),
+            (
+                "metric",
+                lambda item: item["bars"][0]["metrics"][0].__setitem__(
+                    "reset_at", "2026-08-02T00:00:00+09:00"
+                ),
+            ),
+        )
+
+        for field, mutate in mutations:
+            with self.subTest(field=field):
+                changed = deepcopy(model)
+                mutate(changed)
+                self.assertNotEqual(
+                    taskbar_overlay._overlay_render_signature(changed),
+                    baseline,
+                )
+
+    def test_model_maps_provider_failure_status_without_fabricating_ready_state(self):
+        profile = {
+            "id": "cursor-1",
+            "provider": "cursor",
+            "label": "Cursor",
+            "enabled": True,
+            "taskbar_selected": True,
+            "freshness": "unavailable",
+            "provider_status": "unsupported_contract",
+            "metrics": [
+                {
+                    "key": "included_usage",
+                    "short_label": "INC",
+                    "percent": None,
+                    "value_text": "조회 불가",
+                    "reset_at": "",
+                    "state": "unsupported_contract",
+                }
+            ],
+        }
+        cases = {
+            "idle": "N/A",
+            "unsupported_contract": "N/A",
+            "logged_out": "OUT",
+            "navigation_timeout": "TIME",
+            "dom_drift": "ERR",
+            "stale": "OLD",
+        }
+
+        for provider_status, status_text in cases.items():
+            with self.subTest(provider_status=provider_status):
+                profile["provider_status"] = provider_status
+                profile["freshness"] = "stale" if provider_status == "stale" else "unavailable"
+                model = build_codex_usage_taskbar_overlay_model(
+                    {"enabled": True, "profiles": [profile]}
+                )
+                self.assertEqual(model["bars"][0]["status_text"], status_text)
+                self.assertNotEqual(model["bars"][0]["status_text"], "OK")
 
     def test_model_colors_remaining_percent_with_wide_safe_boundary(self):
         runtime = self._runtime()
@@ -1717,6 +1904,61 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(fake_win32gui.find_calls, [("Shell_TrayWnd", None)])
         self.assertEqual(fake_user32.owner_calls, [(111, -8, 555)])
+
+    def test_invalidate_native_owner_rebinds_existing_window_after_taskbar_created(self):
+        class FakeWindow:
+            def winfo_id(self):
+                return 222
+
+        class FakeUser32:
+            def __init__(self):
+                self.owner_calls = []
+
+            def GetAncestor(self, hwnd, _flag):
+                return 111
+
+            def SetWindowLongPtrW(self, hwnd, index, value):
+                self.owner_calls.append((int(hwnd), int(index), int(value)))
+                return 0
+
+        fake_user32 = FakeUser32()
+
+        class FakeWindll:
+            user32 = fake_user32
+
+        class FakeWin32Gui:
+            def GetWindowLong(self, _hwnd, _index):
+                return 0
+
+            def SetWindowLong(self, _hwnd, _index, _value):
+                return 0
+
+            def FindWindow(self, class_name, title):
+                self.find_call = (str(class_name), title)
+                return 777
+
+        class FakeWin32Con:
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+
+        fake_win32gui = FakeWin32Gui()
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        overlay._window = FakeWindow()
+        overlay._active_taskbar_hwnd = 555
+
+        with patch.object(taskbar_overlay, "win32gui", fake_win32gui), patch.object(
+            taskbar_overlay,
+            "win32con",
+            FakeWin32Con,
+        ):
+            with patch.object(taskbar_overlay.ctypes, "windll", FakeWindll()):
+                overlay.invalidate_native_owner()
+
+        self.assertEqual(overlay._active_taskbar_hwnd, 777)
+        self.assertEqual(fake_win32gui.find_call, ("Shell_TrayWnd", None))
+        self.assertEqual(fake_user32.owner_calls, [(111, -8, 777)])
 
     def test_refresh_updates_changed_metric_with_flash_timer(self):
         root = _FakeRoot()
@@ -3673,6 +3915,64 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(window.draw_calls, draw_calls_before)
         self.assertEqual(window.deiconify_calls, deiconify_calls_before)
         self.assertEqual(window.lift_calls, lift_calls_before)
+        self.assertEqual(repaint_calls, [])
+
+    def test_refresh_repaints_once_when_provider_status_changes_then_stays_still(self):
+        window = _FakeWindow()
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "cursor-1",
+                    "provider": "cursor",
+                    "label": "Cursor",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "fresh",
+                    "provider_status": "ready",
+                    "runtime": {"session_state": "logged_in"},
+                    "metrics": [
+                        {
+                            "key": "monthly_limit",
+                            "short_label": "30d",
+                            "percent": 37,
+                            "value_text": "37%",
+                            "reset_at": "2026-08-01T00:00:00+09:00",
+                            "state": "warning",
+                        }
+                    ],
+                }
+            ],
+        }
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        repaint_calls = []
+        overlay._force_native_repaint = lambda target: repaint_calls.append(target)
+
+        overlay.refresh()
+        repaint_calls.clear()
+        baseline_draw_count = len(window.draw_calls)
+
+        overlay.refresh()
+        self.assertEqual(len(window.draw_calls), baseline_draw_count)
+        self.assertEqual(repaint_calls, [])
+
+        runtime["profiles"][0]["provider_status"] = "rate_limited"
+        runtime["profiles"][0]["freshness"] = "stale"
+        overlay.refresh()
+
+        self.assertEqual(len(window.draw_calls), baseline_draw_count + 1)
+        self.assertEqual(len(repaint_calls), 1)
+        self.assertEqual(window.draw_calls[-1]["bars"][0]["status_text"], "RATE")
+
+        repaint_calls.clear()
+        overlay.refresh()
+        self.assertEqual(len(window.draw_calls), baseline_draw_count + 1)
         self.assertEqual(repaint_calls, [])
 
     def test_refresh_builds_preferred_and_final_model_from_one_runtime_snapshot_and_now(self):
