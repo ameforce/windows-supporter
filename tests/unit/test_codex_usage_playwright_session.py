@@ -372,7 +372,7 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
     def test_command_timeout_retries_are_bounded_and_remain_visible(self) -> None:
         releases = [threading.Event() for _ in range(3)]
         drivers = [
-            BlockingDriver(release, release_after_sec=0.04)
+            TerminableBlockingDriver(release)
             for release in releases
         ]
         factory = SequenceDriverFactory(drivers)

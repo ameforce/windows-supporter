@@ -1760,16 +1760,18 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 or progress_instances[-1],
             )
             state = read_update_handoff_state(state_path)
+            self.assertTrue(Path(fake_subprocess.calls[0][1]["cwd"]).samefile(repo))
+            self.assertTrue(
+                Path(launches[0][0][0]).samefile(repo / "windows-supporter.exe")
+            )
+            self.assertTrue(Path(launches[0][1]["cwd"]).samefile(repo))
 
         self.assertEqual(rc, 0)
         self.assertEqual(fake_subprocess.calls[0][0], ["cmd", "/c", "build.bat"])
-        self.assertEqual(fake_subprocess.calls[0][1]["cwd"], str(repo))
         self.assertEqual(
             fake_subprocess.calls[0][1]["env"]["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"],
             "1",
         )
-        self.assertEqual(launches[0][0], [str(repo / "windows-supporter.exe")])
-        self.assertEqual(launches[0][1]["cwd"], str(repo))
         self.assertEqual(
             launches[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"],
             "1",
@@ -1828,15 +1830,18 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 or StablePopen(),
                 progress_ui_factory=lambda **_kwargs: None,
             )
+            self.assertTrue(
+                Path(launches[0][0][0]).samefile(repo / "windows-supporter.exe")
+            )
+            self.assertTrue(Path(launches[0][1]["cwd"]).samefile(repo))
+            self.assertTrue(Path(launches[1][1]["cwd"]).samefile(repo))
 
         self.assertEqual(rc, 0)
-        self.assertEqual(launches[0][0], [str(repo / "windows-supporter.exe")])
-        self.assertEqual(launches[0][1]["cwd"], str(repo))
         self.assertEqual(
             launches[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"],
             "1",
         )
-        self.assertEqual(launches[1], (["C:/Apps/Fork/Fork.exe"], {"cwd": str(repo)}))
+        self.assertEqual(launches[1][0], ["C:/Apps/Fork/Fork.exe"])
 
     def test_run_no_window_with_progress_pumps_ui_while_waiting_for_build_output(self) -> None:
         class SlowStdout:
@@ -2318,12 +2323,12 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 or progress_instances[-1],
                 max_attempts=2,
             )
+            self.assertTrue(Path(launches[0][1]["cwd"]).samefile(repo))
 
         self.assertEqual(rc, 0)
         self.assertEqual(len(fake_subprocess.calls), 2)
         self.assertEqual(progress_instances[0].retry_waits, 1)
         self.assertIn("업데이트 실패", [item["label"] for item in progress_instances[0].snapshots])
-        self.assertEqual(launches[0][1]["cwd"], str(repo))
 
     def test_update_handoff_argv_exits_with_handoff_result_code(self) -> None:
         with patch.object(update_monitor_module, "run_update_handoff", return_value=7):
@@ -2373,29 +2378,21 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
             self.assertTrue(updater.launch_update())
             state = read_update_handoff_state(state_path)
+            self.assertTrue(Path(launches[0][1]["cwd"]).samefile(tmp))
+            self.assertTrue(Path(state["repo_root"]).samefile(tmp))
 
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "updating")
         self.assertEqual(snapshot["progress"]["label"], "업데이트 실행 준비 중")
         self.assertEqual(snapshot["progress"]["percent"], 68)
+        self.assertEqual(len(launches), 1)
         self.assertEqual(
-            launches,
-            [
-                (
-                    [
-                        "python",
-                        "main.py",
-                        UPDATE_HANDOFF_ARG,
-                        str(state_path),
-                    ],
-                    {"cwd": str(Path(tmp).resolve())},
-                )
-            ],
+            launches[0][0],
+            ["python", "main.py", UPDATE_HANDOFF_ARG, str(state_path)],
         )
         self.assertEqual(acked_paths, [str(state_path)])
         self.assertEqual(quit_calls, [True])
         self.assertEqual(state["status"], "pending")
-        self.assertEqual(state["repo_root"], str(Path(tmp).resolve()))
         self.assertEqual(state["target_tag"], "v0.5.7")
         self.assertEqual(
             state["recovery_executable_path"],
@@ -2500,16 +2497,13 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             )
 
             self.assertFalse(updater.launch_update())
+            self.assertTrue(Path(launches[0][1]["cwd"]).samefile(tmp))
 
         snapshot = updater.get_status_snapshot()
+        self.assertEqual(len(launches), 1)
         self.assertEqual(
-            launches,
-            [
-                (
-                    ["python", "main.py", UPDATE_HANDOFF_ARG, str(state_path)],
-                    {"cwd": str(Path(tmp).resolve())},
-                )
-            ],
+            launches[0][0],
+            ["python", "main.py", UPDATE_HANDOFF_ARG, str(state_path)],
         )
         self.assertEqual(quit_calls, [True])
         self.assertEqual(snapshot["state"], "error")

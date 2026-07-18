@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import types
 import unittest
@@ -89,9 +88,8 @@ class WorktreeRuntimeUnitTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
 
             resolved = resolve_persistent_executable_path(str(primary_exe), runner=runner)
-
-        assert resolved is not None
-        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(primary_exe)))
+            assert resolved is not None
+            self.assertTrue(Path(resolved).samefile(primary_exe))
 
     def test_temporary_executable_resolves_to_primary_worktree_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,9 +124,9 @@ class WorktreeRuntimeUnitTest(unittest.TestCase):
                 str(temporary_exe),
                 runner=runner,
             )
+            assert resolved is not None
+            self.assertTrue(Path(resolved).samefile(primary_exe))
 
-        assert resolved is not None
-        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(primary_exe)))
         self.assertEqual(commands[0][0][:4], ["git", "-C", str(temporary), "worktree"])
         expected_no_window = build_no_window_subprocess_kwargs()
         if "creationflags" in expected_no_window:
@@ -171,9 +169,8 @@ class WorktreeRuntimeUnitTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
 
             resolved = resolve_persistent_executable_path(str(linked_exe), runner=runner)
-
-        assert resolved is not None
-        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(primary_exe)))
+            assert resolved is not None
+            self.assertTrue(Path(resolved).samefile(primary_exe))
 
     def test_temporary_executable_fails_closed_when_primary_executable_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
