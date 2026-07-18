@@ -42,6 +42,7 @@
 
 ## 완료 evidence
 
+- 정상 문서 변경 양성 canary는 이 문서의 변경만 포함하고, green 이후 PR body 변조 차단과 원복 후 trusted-controller 병합까지 검증한다.
 - bootstrap PR, 보호 파일 변경 음성 canary PR, 정상 변경 양성 canary PR, 동일 이름 check 음성 canary PR, post-green evidence 만료/metadata 변경 canary, lane 종료 PR 번호와 각 status check 결과
 - ruleset apply/export/verify 출력
 - main merge commit, annotated `v0.8.1` tag, develop back-merge commit
