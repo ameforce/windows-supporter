@@ -57,16 +57,21 @@ function Get-TextSha256 {
 
 function Save-JsonSnapshot {
     param(
-        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
         [Parameter(Mandatory = $true)][string]$Label
     )
 
     [IO.Directory]::CreateDirectory($StateDirectory) | Out-Null
     $timestamp = [DateTimeOffset]::UtcNow.ToString("yyyyMMddTHHmmssZ")
     $path = Join-Path $StateDirectory "$timestamp-$Label.json"
+    $json = if ($Value -is [Array] -and $Value.Count -eq 0) {
+        "[]"
+    } else {
+        $Value | ConvertTo-Json -Depth 100
+    }
     [IO.File]::WriteAllText(
         $path,
-        ($Value | ConvertTo-Json -Depth 100),
+        $json,
         [Text.UTF8Encoding]::new($false)
     )
     return $path
@@ -468,7 +473,7 @@ if ($Mode -eq "DeleteLane") {
     exit 0
 }
 
-$allBefore = Get-RepositoryRulesets
+$allBefore = @(Get-RepositoryRulesets)
 $allBeforePath = Save-JsonSnapshot -Value $allBefore -Label "all-rulesets-before-apply"
 $createdId = $null
 $previousPath = $null

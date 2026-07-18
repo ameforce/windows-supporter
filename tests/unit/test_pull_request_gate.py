@@ -468,6 +468,8 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertIn("-cnotmatch", configure_script)
         self.assertIn("repository numeric identity", configure_script)
         self.assertNotIn("[Security.Cryptography.SHA256]::HashData", configure_script)
+        self.assertIn("[AllowEmptyCollection()]$Value", configure_script)
+        self.assertIn("$allBefore = @(Get-RepositoryRulesets)", configure_script)
         validator_source = SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertGreaterEqual(validator_source.count('encoding="utf-8"'), 3)
         self.assertIn("restored canonical protection", configure_script)
