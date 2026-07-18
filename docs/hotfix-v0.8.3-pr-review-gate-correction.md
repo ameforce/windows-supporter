@@ -27,7 +27,7 @@ PR 본문에 작성자가 넣은 reviewer 이름, finding 0, digest 또는 Actio
 ## 변경 범위
 
 - 제거: `pr-policy-gate`, `pr-quality-gate` 이름, 관련 lane config, validator/controller, self-attestation 형식과 단위 테스트.
-- 재설계: `pull-request-validation`은 exact PR head의 테스트·artifact 빌드만 수행하며 draft PR에서는 실패하지 않는다. `windows-supporter-release-pr-protection` ruleset은 PR-only merge, stale review dismiss, unresolved thread, force-push·deletion 보호만 유지하고 required status check는 두지 않는다.
+- 재설계: `pull-request-validation`은 exact PR head의 테스트·artifact 빌드만 수행하며 draft PR에서는 실패하지 않는다. 최종 이중 리뷰 all-zero 뒤 붙이는 `reviews-complete` label이 있을 때만 실행해 리뷰→검증 순서를 지킨다. `windows-supporter-release-pr-protection` ruleset은 PR-only merge, stale review dismiss, unresolved thread, force-push·deletion 보호만 유지하고 required status check는 두지 않는다.
 - 교체: PR template은 실제 review object와 독립 reviewer 결과를 찾기 위한 비권위 체크리스트만 제공한다.
 - 유지: `release-chain-gate`. 이는 `main`, `develop`, tag의 테스트·artifact 빌드를 수행하는 릴리스 CI이며 리뷰 게이트가 아니다.
 - 이전 release-chain 시간대·artifact 이름 contract test는 별도 `test_release_chain_gate.py`로 이동한다.

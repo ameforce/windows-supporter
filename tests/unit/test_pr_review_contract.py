@@ -44,6 +44,8 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertIn("name: Pull request validation", workflow)
         self.assertIn("name: pull-request-validation", workflow)
         self.assertIn("github.event.pull_request.draft == false", workflow)
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'reviews-complete')", workflow)
+        self.assertIn("- labeled", workflow)
         self.assertIn("ref: ${{ github.event.pull_request.head.sha }}", workflow)
         self.assertIn("It does not perform or prove PR review.", workflow)
         self.assertNotIn("pr-quality-gate", workflow)
@@ -68,6 +70,7 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "stale",
             "--match-head-commit <FINAL_HEAD_SHA>",
             "--force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA>",
+            "`reviews-complete` label",
             "GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다",
         ):
             with self.subTest(required_text=required_text):

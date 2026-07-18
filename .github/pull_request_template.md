@@ -12,6 +12,7 @@
 - [ ] 두 실제 리뷰의 정규화 결과: `P0=0, P1=0, P2=0, P3=0`
 - [ ] GitHub unresolved review thread: `0`
 - [ ] 위 기록 이후 push가 없으며 두 리뷰가 동일한 최신 head를 검토함
+- [ ] 위 조건을 확인한 뒤에만 `reviews-complete` label을 붙여 별도 테스트·빌드 CI를 실행함
 
 ## 별도 검증
 

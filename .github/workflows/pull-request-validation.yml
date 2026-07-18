@@ -7,6 +7,7 @@ on:
       - reopened
       - synchronize
       - ready_for_review
+      - labeled
 
 permissions:
   contents: read
@@ -18,7 +19,9 @@ concurrency:
 jobs:
   validate-pr-head:
     name: pull-request-validation
-    if: ${{ github.event.pull_request.draft == false }}
+    if: >-
+      ${{ github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'reviews-complete') }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
