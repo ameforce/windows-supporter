@@ -88,6 +88,10 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "remote ref 부재를 최종 확인",
             "임시 freeze ruleset의 ID와 이름이 live 목록에 없음을 확인",
             "`reviews-complete` label",
+            "potentialMergeCommit",
+            "refs/pull/<N>/merge",
+            "git rev-list --parents -n 1 FETCH_HEAD",
+            "workflow가 default branch에 들어간 뒤 새 PR에는 bootstrap 예외를 사용하지 않는다",
             "GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다",
         ):
             with self.subTest(required_text=required_text):

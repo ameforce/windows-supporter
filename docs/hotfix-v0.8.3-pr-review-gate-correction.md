@@ -28,6 +28,7 @@ PR 본문에 작성자가 넣은 reviewer 이름, finding 0, digest 또는 Actio
 
 - 제거: `pr-policy-gate`, `pr-quality-gate` 이름, 관련 lane config, validator/controller, self-attestation 형식과 단위 테스트.
 - 재설계: `pull-request-validation`은 `reviews-complete` label 추가 이벤트에서 현재 PR merge candidate의 테스트·artifact 빌드만 수행하며 draft PR에서는 실패하지 않는다. base/head/merge-candidate SHA를 기록해 리뷰→검증 순서와 대상 revision을 분리한다. `windows-supporter-release-pr-protection` ruleset은 PR-only merge, stale review dismiss, unresolved thread, force-push·deletion 보호만 유지하고 required status check는 두지 않는다.
+- bootstrap: 새 workflow가 default branch에 없는 이 교정 PR은 최종 이중 리뷰 뒤 GitHub `potentialMergeCommit`과 fetched PR merge ref의 SHA·두 부모를 exact 비교하고, 그 detached merge candidate에서 동일 테스트·artifact-only build를 수행한다. 검증 뒤 PR의 base/head/candidate가 모두 불변인지 재확인한다. workflow가 main에 들어간 뒤에는 이 예외를 사용하지 않는다.
 - 정리: 보호된 remote hotfix/release branch 삭제 전 exact ref에 creation/update freeze를 적용한다. canonical ruleset에서는 exact ref만 일시 exclude하고 leased compare-and-delete를 수행한다. `finally`에서 canonical 보호를 먼저 복원한 뒤 freeze 상태에서 remote ref 부재를 재확인하고, freeze 제거 후 ID/name 부재, canonical 일치와 ref 부재를 최종 확인한다.
 - 실패 안전: canonical 보호 복원이 실패하면 임시 freeze를 creation/update/deletion 비상 보호로 승격하고 read-back한다. canonical 복구 전에는 이 freeze를 제거하지 않는다.
 - 교체: PR template은 실제 review object 또는 zero-finding connector 결과와 독립 reviewer 결과를 찾기 위한 비권위 체크리스트만 제공한다.
