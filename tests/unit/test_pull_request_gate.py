@@ -451,7 +451,7 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertNotIn("paths:", policy_workflow)
         self.assertNotIn("paths:", quality_workflow)
         self.assertIn("name: pr-policy-gate", policy_workflow)
-        self.assertIn("name: pr-quality-gate", quality_workflow)
+        self.assertIn("name: pr-quality-gate-canary", quality_workflow)
         self.assertIn("- converted_to_draft", policy_workflow)
         self.assertIn("- edited", quality_workflow)
         self.assertIn(
