@@ -525,6 +525,18 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertIn({"type": "non_fast_forward"}, ruleset["rules"])
         self.assertIn({"type": "deletion"}, ruleset["rules"])
 
+    def test_release_chain_sets_korea_timezone_before_running_tests(self) -> None:
+        release_workflow = (REPO_ROOT / ".github/workflows/release-chain-gate.yml").read_text(
+            encoding="utf-8"
+        )
+
+        timezone_step = '      - name: Configure target timezone\n'
+        test_step = '      - name: Run release tests\n'
+        self.assertIn(timezone_step, release_workflow)
+        self.assertIn('tzutil /s "Korea Standard Time"', release_workflow)
+        self.assertIn("tzutil /g", release_workflow)
+        self.assertLess(release_workflow.index(timezone_step), release_workflow.index(test_step))
+
 
 if __name__ == "__main__":
     unittest.main()
