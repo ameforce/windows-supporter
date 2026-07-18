@@ -1,5 +1,7 @@
 # v0.8.2 release-chain 시간대 hotfix
 
+> `v0.8.3` 교정: 아래의 `pr-policy-gate`와 `pr-quality-gate` 성공은 CI 결과일 뿐 실제 PR 리뷰 증거가 아니었다. PR #19와 #20에는 `chatgpt-codex-connector` review가 없었다. 관련 Actions 리뷰 흉내와 self-attestation은 `v0.8.3`에서 제거한다.
+
 ## 목적
 
 v0.8.1의 애플리케이션 기능과 공개 ref는 유지하면서, GitHub `release-chain-gate`가 Windows runner의 로컬 시간대 차이 때문에 실패한 문제를 다음 patch release에서 교정한다.
@@ -25,7 +27,7 @@ v0.8.1의 애플리케이션 기능과 공개 ref는 유지하면서, GitHub `re
 - 수정 전 timezone contract test가 실패하고 수정 후 통과했다.
 - exact read-back 비교와 slash branch artifact 이름 contract도 각각 red에서 green으로 전환했다.
 - 로컬 전체 suite: 777 tests, OK.
-- PR #19의 `pr-policy-gate`와 `pr-quality-gate`: 모두 통과.
+- PR #19의 `pr-policy-gate`와 `pr-quality-gate`: 모두 통과했지만, 이는 실제 리뷰를 수행하거나 증명하지 않았다.
 - exact-head 수동 release-chain run `29648696752`:
   - head SHA `3483ff1569d39718b064cca9ce4751178abb43fe`
   - `Korea Standard Time` exact read-back 통과
@@ -36,7 +38,7 @@ v0.8.1의 애플리케이션 기능과 공개 ref는 유지하면서, GitHub `re
 
 ## 릴리스 순서와 중단 조건
 
-1. 이 lane 종료 PR에서 `active-release.json`을 inactive template로 되돌린다.
+1. 당시 lane 종료 PR에서 `active-release.json`을 inactive template로 되돌린다.
 2. hotfix tip을 `main`에 `--no-ff`로 통합하고 main release-chain 성공을 확인한다.
 3. 성공한 main SHA에 annotated `v0.8.2` tag를 만들고 tag release-chain 성공을 확인한다.
 4. 같은 hotfix tip을 `develop`에 `--no-ff`로 통합하고 develop release-chain 성공을 확인한다.
