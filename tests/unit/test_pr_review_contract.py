@@ -47,7 +47,9 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertIn("github.event.label.name == 'reviews-complete'", workflow)
         self.assertIn("- labeled", workflow)
         self.assertNotIn("- synchronize", workflow)
-        self.assertIn("ref: refs/pull/${{ github.event.pull_request.number }}/merge", workflow)
+        self.assertIn("ref: ${{ github.sha }}", workflow)
+        self.assertIn("Verify immutable merge candidate checkout", workflow)
+        self.assertIn("git rev-parse HEAD", workflow)
         self.assertIn("base_sha=${{ github.event.pull_request.base.sha }}", workflow)
         self.assertIn("head_sha=${{ github.event.pull_request.head.sha }}", workflow)
         self.assertIn("merge_candidate_sha=${{ github.sha }}", workflow)
@@ -76,6 +78,8 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "--match-head-commit <FINAL_HEAD_SHA>",
             "--force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA>",
             "원래 exclude 목록을 복원",
+            "`creation`과 `update` freeze",
+            "remote ref 부재를 최종 확인",
             "`reviews-complete` label",
             "GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다",
         ):
