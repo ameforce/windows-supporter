@@ -475,7 +475,10 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertIn("restored canonical protection", configure_script)
         self.assertIn("actions/upload-artifact@", quality_workflow)
         self.assertIn("name: Prepare pinned uv environment", quality_workflow)
-        self.assertGreaterEqual(quality_workflow.count("timeout-minutes: 15"), 2)
+        self.assertIn("timeout-minutes: 5", quality_workflow)
+        self.assertIn("timeout-minutes: 30", quality_workflow)
+        self.assertIn('PYTHONUNBUFFERED: "1"', quality_workflow)
+        self.assertIn('-p "test_*.py" -v -f', quality_workflow)
         self.assertNotIn("actions/checkout@v", policy_workflow + quality_workflow)
 
         status_rule = next(rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks")
