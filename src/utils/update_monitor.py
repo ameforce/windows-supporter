@@ -860,6 +860,14 @@ def get_update_handoff_executable_path(
     return get_update_state_dir(base_dir) / UPDATE_HANDOFF_EXECUTABLE_NAME
 
 
+def _executable_file_identity(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+
 def is_git_checkout_root(repo_root: str | os.PathLike[str]) -> bool:
     return (Path(repo_root) / ".git").exists()
 
@@ -1909,6 +1917,7 @@ def run_update_handoff(
     progress_ui = progress_ui_factory(log_path=log_path) if callable(progress_ui_factory) else None
     attempts = max(1, int(max_attempts or 1))
     for attempt in range(1, attempts + 1):
+        root_identity_before_build = _executable_file_identity(root_executable)
         published_build_labels: set[str] = set()
         publish_build_lock = threading.Lock()
         step_log_tailer: _BuildStepLogTailer | None = None
@@ -2064,32 +2073,79 @@ def run_update_handoff(
             recovery_status = "failed"
             recovery_error = ""
             recovered_at = None
-            try:
-                restore_previous_executable(recovery_executable, root_executable)
-                recovery_proc = launch(
-                    [str(root_executable)],
-                    cwd=repo_root,
-                    env=relaunch_environment,
-                )
-                if recovery_proc is None:
-                    raise UpdateHandoffError(
-                        "failed to relaunch the previous windows-supporter.exe"
+            preserved_launch_error = ""
+            root_identity_after_build = _executable_file_identity(root_executable)
+            if (
+                root_identity_before_build is not None
+                and root_identity_after_build == root_identity_before_build
+            ):
+                try:
+                    recovery_proc = launch(
+                        [str(root_executable)],
+                        cwd=repo_root,
+                        env=relaunch_environment,
                     )
-                recovery_stable, recovery_returncode = wait_for_process_stability(
-                    recovery_proc,
-                    timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
-                )
-                if not recovery_stable:
-                    raise UpdateHandoffError(
-                        "previous windows-supporter.exe exited during startup "
-                        f"with code {recovery_returncode}"
+                    if recovery_proc is None:
+                        raise UpdateHandoffError(
+                            "failed to relaunch the preserved windows-supporter.exe"
+                        )
+                    recovery_stable, recovery_returncode = wait_for_process_stability(
+                        recovery_proc,
+                        timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
                     )
-                recovery_status = "complete"
-                recovered_at = time.time()
-                append_update_log(log_path, "previous executable restored and relaunched")
-            except (OSError, UpdateHandoffError) as recovery_exc:
-                recovery_error = str(recovery_exc)
-                append_update_log(log_path, f"previous executable recovery failed: {recovery_error}")
+                    if not recovery_stable:
+                        raise UpdateHandoffError(
+                            "preserved windows-supporter.exe exited during startup "
+                            f"with code {recovery_returncode}"
+                        )
+                    recovery_status = "complete"
+                    recovered_at = time.time()
+                    append_update_log(
+                        log_path,
+                        "preserved executable relaunched without copying",
+                    )
+                except (OSError, UpdateHandoffError) as preserved_exc:
+                    preserved_launch_error = str(preserved_exc)
+                    append_update_log(
+                        log_path,
+                        f"preserved executable relaunch failed: {preserved_launch_error}",
+                    )
+
+            if recovery_status != "complete":
+                try:
+                    restore_previous_executable(recovery_executable, root_executable)
+                    recovery_proc = launch(
+                        [str(root_executable)],
+                        cwd=repo_root,
+                        env=relaunch_environment,
+                    )
+                    if recovery_proc is None:
+                        raise UpdateHandoffError(
+                            "failed to relaunch the previous windows-supporter.exe"
+                        )
+                    recovery_stable, recovery_returncode = wait_for_process_stability(
+                        recovery_proc,
+                        timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
+                    )
+                    if not recovery_stable:
+                        raise UpdateHandoffError(
+                            "previous windows-supporter.exe exited during startup "
+                            f"with code {recovery_returncode}"
+                        )
+                    recovery_status = "complete"
+                    recovered_at = time.time()
+                    append_update_log(log_path, "previous executable restored and relaunched")
+                except (OSError, UpdateHandoffError) as recovery_exc:
+                    recovery_error = str(recovery_exc)
+                    if preserved_launch_error:
+                        recovery_error = (
+                            f"preserved relaunch failed: {preserved_launch_error}; "
+                            f"copy restore failed: {recovery_error}"
+                        )
+                    append_update_log(
+                        log_path,
+                        f"previous executable recovery failed: {recovery_error}",
+                    )
 
             recovery_detail = (
                 "이전 버전으로 안전하게 복구했습니다."

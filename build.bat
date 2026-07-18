@@ -7,6 +7,9 @@ set "EXE_NAME=%EXE_BASE%.exe"
 set "MAIN_SOURCE=main.py"
 set "CURRENT_DIR=%~dp0"
 set "ROOT_EXE=%CURRENT_DIR%%EXE_NAME%"
+set "ROOT_EXE_BACKUP=%CURRENT_DIR%%EXE_BASE%.previous.exe"
+set "ROOT_PROMOTION_TRANSACTION=%CURRENT_DIR%%EXE_BASE%.promotion-pending"
+set "ROOT_BACKUP_CREATED=0"
 set "BUILD_GENERATED_DIR=build\generated"
 set "BUILD_INFO_MODULE=%BUILD_GENERATED_DIR%\windows_supporter_build_info.py"
 set "VERSION_FILE=%BUILD_GENERATED_DIR%\%EXE_BASE%-version-info.txt"
@@ -56,6 +59,16 @@ if "%ARTIFACT_ONLY%"=="0" (
     echo %EXE_NAME% is still running after taskkill.
     exit /b 1
   )
+  echo | set /p="Recovering an interrupted executable promotion..."
+  call :clear_log
+  call :recover_interrupted_promotion
+  if errorlevel 1 (
+    echo Failure
+    echo Failed to recover the interrupted executable promotion.
+    call :print_log
+    exit /b 1
+  )
+  echo [ Success !! ]
 )
 if "%ARTIFACT_ONLY%"=="1" (
   echo Artifact-only mode: skipping shutdown of the installed %EXE_NAME% process.
@@ -189,6 +202,22 @@ if "%ARTIFACT_ONLY%"=="1" (
   exit /b 0
 )
 
+REM Preserve the last known executable until the promoted path passes its worker smoke
+echo | set /p="Backing up the current %EXE_NAME%..."
+call :clear_log
+call :backup_root_executable
+if errorlevel 1 (
+  echo Failure
+  echo Failed to preserve the current %EXE_NAME% before promotion.
+  call :print_log
+  exit /b 1
+)
+if "%ROOT_BACKUP_CREATED%"=="1" (
+  echo [ Success !! ]
+) else (
+  echo [ Not present ]
+)
+
 REM Promote the verified artifact to the repo root
 echo | set /p="Moving %EXE_NAME%..."
 call :clear_log
@@ -197,9 +226,35 @@ if errorlevel 1 (
   echo Failure
   echo Built artifact move failed.
   call :print_log
+  call :restore_root_executable
   exit /b 1
 )
 echo [ Success !! ]
+
+REM Re-check the frozen child-process boundary from the permanent execution path.
+REM Smart App Control can make a different decision after the artifact is promoted.
+echo | set /p="Validating promoted worker boundary..."
+call :clear_log
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\verify_codex_usage_worker_smoke.py" "%ROOT_EXE%" > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo Promoted worker boundary validation failed. Restoring the previous executable.
+  call :print_log
+  call :restore_root_executable
+  if errorlevel 1 (
+    echo Failed to restore the previous %EXE_NAME%.
+    call :print_log
+  )
+  exit /b 1
+)
+echo [ Success !! ]
+call :discard_root_executable_backup
+if errorlevel 1 (
+  echo Failure
+  echo Failed to remove the previous executable backup.
+  call :print_log
+  exit /b 1
+)
 
 REM Remove build byproducts
 echo | set /p="Remove build byproducts..."
@@ -235,6 +290,61 @@ echo [ Success !! ]
 call :clear_log
 endlocal
 exit /b 0
+
+:backup_root_executable
+set "ROOT_BACKUP_CREATED=0"
+if exist "%ROOT_EXE_BACKUP%" del /F /Q "%ROOT_EXE_BACKUP%" > "%STEP_LOG%" 2>&1
+if exist "%ROOT_EXE_BACKUP%" exit /b 1
+if not exist "%ROOT_EXE%" exit /b 0
+mklink /H "%ROOT_EXE_BACKUP%" "%ROOT_EXE%" > "%STEP_LOG%" 2>&1
+if not exist "%ROOT_EXE_BACKUP%" (
+  move /Y "%ROOT_EXE%" "%ROOT_EXE_BACKUP%" >> "%STEP_LOG%" 2>&1
+  if errorlevel 1 exit /b 1
+)
+if not exist "%ROOT_EXE_BACKUP%" exit /b 1
+set "ROOT_BACKUP_CREATED=1"
+> "%ROOT_PROMOTION_TRANSACTION%" echo pending
+if not exist "%ROOT_PROMOTION_TRANSACTION%" (
+  call :restore_root_executable
+  exit /b 1
+)
+exit /b 0
+
+:restore_root_executable
+call :clear_log
+taskkill /f /t /im "%EXE_NAME%" > "%STEP_LOG%" 2>&1
+call :wait_for_process_stop
+if errorlevel 1 exit /b 1
+if exist "%ROOT_EXE%" del /F /Q "%ROOT_EXE%" >> "%STEP_LOG%" 2>&1
+if exist "%ROOT_EXE%" exit /b 1
+if "%ROOT_BACKUP_CREATED%"=="1" (
+  move /Y "%ROOT_EXE_BACKUP%" "%ROOT_EXE%" >> "%STEP_LOG%" 2>&1
+  if errorlevel 1 exit /b 1
+  if not exist "%ROOT_EXE%" exit /b 1
+)
+if exist "%ROOT_PROMOTION_TRANSACTION%" del /F /Q "%ROOT_PROMOTION_TRANSACTION%" >> "%STEP_LOG%" 2>&1
+if exist "%ROOT_PROMOTION_TRANSACTION%" exit /b 1
+set "ROOT_BACKUP_CREATED=0"
+exit /b 0
+
+:discard_root_executable_backup
+call :clear_log
+if exist "%ROOT_PROMOTION_TRANSACTION%" del /F /Q "%ROOT_PROMOTION_TRANSACTION%" > "%STEP_LOG%" 2>&1
+if exist "%ROOT_PROMOTION_TRANSACTION%" exit /b 1
+if exist "%ROOT_EXE_BACKUP%" del /F /Q "%ROOT_EXE_BACKUP%" > "%STEP_LOG%" 2>&1
+if exist "%ROOT_EXE_BACKUP%" exit /b 1
+set "ROOT_BACKUP_CREATED=0"
+exit /b 0
+
+:recover_interrupted_promotion
+if not exist "%ROOT_PROMOTION_TRANSACTION%" exit /b 0
+if not exist "%ROOT_EXE_BACKUP%" (
+  > "%STEP_LOG%" echo Promotion transaction exists without a rollback executable.
+  exit /b 1
+)
+set "ROOT_BACKUP_CREATED=1"
+call :restore_root_executable
+exit /b %ERRORLEVEL%
 
 :remove_pyinstaller_byproducts
 set "FAILURE_SUFFIX=%~1"
