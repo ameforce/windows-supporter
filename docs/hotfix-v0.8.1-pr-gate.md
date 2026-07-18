@@ -42,8 +42,12 @@
 
 ## 완료 evidence
 
-- 정상 문서 변경 양성 canary는 이 문서의 변경만 포함하고, green 이후 PR body 변조 차단과 원복 후 trusted-controller 병합까지 검증한다.
-- bootstrap PR, 보호 파일 변경 음성 canary PR, 정상 변경 양성 canary PR, 동일 이름 check 음성 canary PR, post-green evidence 만료/metadata 변경 canary, lane 종료 PR 번호와 각 status check 결과
+- bootstrap PR #1과 gate 보강 PR #2, #13, #14를 trusted controller로 병합했다.
+- 정상 문서 변경 양성 canary PR #15는 두 gate green, green 이후 PR body 변조 시 차단, evidence 원복 후 exact head 병합을 확인했다.
+- 동일 이름 check 음성 canary PR #16은 `pr-quality-gate-canary`가 성공해도 필수 `pr-quality-gate`가 없어 병합이 차단되는 것을 확인하고 closed-unmerged 처리했다.
+- 보호 파일 변경 음성 canary PR #17은 label과 attestation이 없을 때 `pr-policy-gate`가 실패하고 병합이 차단되는 것을 확인하고 closed-unmerged 처리했다.
+- post-green metadata 변경은 PR #15의 body 변조로 `pr-policy-gate` 재실행과 차단을 확인했다. 시간 만료는 GitHub 서버 시각과 300초 merge safety margin을 검증하는 unit/controller 테스트로 보완했다.
+- 이 lane 종료 PR은 `active-release.json`의 lane 식별자와 bootstrap 예외를 제거하고 inactive template로 되돌린다.
 - ruleset apply/export/verify 출력
 - main merge commit, annotated `v0.8.1` tag, develop back-merge commit
 - main/tag/develop `release-chain-gate`, 로컬 전체 테스트, clean main 빌드, 실행 파일 버전 및 실제 시작 evidence
