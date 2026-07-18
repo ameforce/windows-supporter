@@ -26,26 +26,31 @@ jobs:
         run: |
           "This workflow validates tests and build output. It does not perform or prove PR review." |
             Tee-Object -FilePath "$env:GITHUB_STEP_SUMMARY" -Append
-          "base_sha=${{ github.event.pull_request.base.sha }}" |
-            Tee-Object -FilePath "$env:GITHUB_STEP_SUMMARY" -Append
-          "head_sha=${{ github.event.pull_request.head.sha }}" |
-            Tee-Object -FilePath "$env:GITHUB_STEP_SUMMARY" -Append
-          "merge_candidate_sha=${{ github.sha }}" |
-            Tee-Object -FilePath "$env:GITHUB_STEP_SUMMARY" -Append
       - name: Checkout current PR merge candidate
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify immutable merge candidate checkout
+      - name: Verify immutable merge candidate identity
         shell: pwsh
         run: |
-          $actualSha = (git rev-parse HEAD).Trim().ToLowerInvariant()
-          $expectedSha = "${{ github.sha }}".ToLowerInvariant()
-          if ($actualSha -ne $expectedSha) {
-            throw "Checked out $actualSha but event merge candidate is $expectedSha"
+          $parts = @((git rev-list --parents -n 1 HEAD).Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries))
+          if ($parts.Count -ne 3) {
+            throw "Expected a two-parent PR merge candidate, got: $($parts -join ' ')"
           }
+          $mergeSha = $parts[0].ToLowerInvariant()
+          $baseSha = $parts[1].ToLowerInvariant()
+          $headSha = $parts[2].ToLowerInvariant()
+          $eventMergeSha = "${{ github.sha }}".ToLowerInvariant()
+          $eventBaseSha = "${{ github.event.pull_request.base.sha }}".ToLowerInvariant()
+          $eventHeadSha = "${{ github.event.pull_request.head.sha }}".ToLowerInvariant()
+          if ($mergeSha -ne $eventMergeSha -or $baseSha -ne $eventBaseSha -or $headSha -ne $eventHeadSha) {
+            throw "Merge identity mismatch: actual=$mergeSha/$baseSha/$headSha event=$eventMergeSha/$eventBaseSha/$eventHeadSha"
+          }
+          "base_sha=$baseSha" | Tee-Object -FilePath "$env:GITHUB_STEP_SUMMARY" -Append
+          "head_sha=$headSha" | Tee-Object -FilePath "$env:GITHUB_STEP_SUMMARY" -Append
+          "merge_candidate_sha=$mergeSha" | Tee-Object -FilePath "$env:GITHUB_STEP_SUMMARY" -Append
       - name: Set up Python 3.14
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:

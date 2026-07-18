@@ -73,7 +73,8 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
    - 원격 branch는 main/develop push와 release-chain 성공 뒤 exact remote tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다.
    - 삭제 전에 별도 임시 ruleset으로 exact `refs/heads/hotfix/vX.Y.Z`에 `creation`과 `update` freeze를 적용하고 effective read-back한다. 이 freeze는 branch tip 이동과 삭제 뒤 같은 이름의 재생성을 막되 deletion은 막지 않아야 한다.
    - 이어 `.github/pr-protection/ruleset.json`의 live ruleset을 읽어 다른 규칙과 기존 exclude를 보존한 채 삭제할 exact ref만 일시 exclude하고 read-back한다. `git push origin --force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA> :refs/heads/hotfix/vX.Y.Z`로 compare-and-delete하고 remote exact ref 부재를 확인한다.
-   - 성공 여부와 관계없이 canonical protection의 원래 exclude를 먼저 복원하고 live read-back한다. 삭제가 성공했다면 freeze를 유지한 상태에서 remote ref 부재를 다시 확인한 뒤에만 임시 freeze ruleset을 제거하고, canonical ruleset 일치와 remote ref 부재를 최종 확인한다. canonical 복원이나 read-back이 실패하면 freeze를 유지하고 cleanup 미완료로 보고한다. 삭제가 실패해 ref가 남아 있으면 canonical 보호 복원 후 freeze를 제거하되 cleanup 미완료로 보고한다.
+   - 성공 여부와 관계없이 canonical protection의 원래 exclude 목록을 먼저 복원하고 live read-back한다. 삭제가 성공했다면 freeze를 유지한 상태에서 remote ref 부재를 다시 확인한 뒤에만 임시 freeze ruleset을 제거하고, canonical ruleset 일치와 remote ref 부재를 최종 확인한다.
+   - canonical 복원이나 read-back이 실패하면 임시 freeze에 `deletion`도 추가해 exact ref의 creation/update/deletion을 모두 차단하고 effective read-back한 뒤 freeze를 유지한다. 이 비상 보호까지 확인되지 않으면 즉시 중단하고 cleanup 미완료와 live ruleset/ref 상태를 보고한다. canonical 보호가 복구되기 전에는 비상 freeze를 제거하지 않는다. 삭제가 실패해 ref가 남아 있지만 canonical 복원은 성공했다면 freeze를 제거하되 cleanup 미완료로 보고한다.
 8. 최종 영구 런타임 기준을 다시 확인한다.
    - 현재 branch를 `main`으로 돌려둔다.
    - main 태그 기준으로 `cmd /c build.bat`를 한 번 더 실행해 영구 실행 파일을 release 버전으로 둔다.
