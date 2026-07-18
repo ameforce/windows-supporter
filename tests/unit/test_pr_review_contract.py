@@ -44,9 +44,13 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertIn("name: Pull request validation", workflow)
         self.assertIn("name: pull-request-validation", workflow)
         self.assertIn("github.event.pull_request.draft == false", workflow)
-        self.assertIn("contains(github.event.pull_request.labels.*.name, 'reviews-complete')", workflow)
+        self.assertIn("github.event.label.name == 'reviews-complete'", workflow)
         self.assertIn("- labeled", workflow)
-        self.assertIn("ref: ${{ github.event.pull_request.head.sha }}", workflow)
+        self.assertNotIn("- synchronize", workflow)
+        self.assertIn("ref: refs/pull/${{ github.event.pull_request.number }}/merge", workflow)
+        self.assertIn("base_sha=${{ github.event.pull_request.base.sha }}", workflow)
+        self.assertIn("head_sha=${{ github.event.pull_request.head.sha }}", workflow)
+        self.assertIn("merge_candidate_sha=${{ github.sha }}", workflow)
         self.assertIn("It does not perform or prove PR review.", workflow)
         self.assertNotIn("pr-quality-gate", workflow)
 
@@ -64,12 +68,14 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "@codex review",
             "chatgpt-codex-connector",
             "review object의 `commit_id`",
+            "base ref, 최신 base SHA와 head SHA",
             "native Codex subagent",
             "P0/P1/P2/P3",
             "unresolved 0",
             "stale",
             "--match-head-commit <FINAL_HEAD_SHA>",
             "--force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA>",
+            "원래 exclude 목록을 복원",
             "`reviews-complete` label",
             "GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다",
         ):

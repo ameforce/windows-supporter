@@ -15,19 +15,20 @@
 ## 복구된 리뷰 절차
 
 1. 버전형 hotfix/release branch를 base로 task PR을 연다.
-2. PR의 정확한 최신 40자리 head SHA를 기록한다.
-3. PR에서 그 SHA를 명시해 `@codex review`를 요청하고, `chatgpt-codex-connector`가 남긴 GitHub review object의 `commit_id`가 정확히 일치하는지 확인한다.
-4. 동시에 native Codex subagent 또는 별도 Codex task가 같은 exact-head diff를 독립적으로 read-only 리뷰한다. 두 reviewer에게 상대 리뷰 결과를 미리 전달하지 않는다.
+2. PR의 정확한 base ref, 최신 40자리 base SHA와 head SHA를 기록한다.
+3. PR에서 그 base/head 쌍을 명시해 `@codex review`를 요청하고, `chatgpt-codex-connector`가 남긴 GitHub review object의 `commit_id`가 정확한 head와 일치하는지 확인한다.
+4. 동시에 native Codex subagent 또는 별도 Codex task가 같은 exact base/head diff를 독립적으로 read-only 리뷰한다. 두 reviewer에게 상대 리뷰 결과를 미리 전달하지 않는다.
 5. finding을 `P0/P1/P2/P3`로 정규화해 모든 등급을 0으로 만들고 unresolved review thread도 0으로 만든다.
-6. 수정 push가 발생하면 두 리뷰를 모두 stale로 처리하고 새 head에서 3~5단계를 반복한다.
-7. 두 리뷰가 동일한 최종 head를 검토했고 finding과 unresolved thread가 모두 0인 뒤에만 테스트, 빌드, 실행 검증과 릴리스 통합을 진행한다.
+6. 수정 push 또는 base 이동이 발생하면 두 리뷰와 검증을 모두 stale로 처리하고 새 base/head에서 3~5단계를 반복한다.
+7. 두 리뷰가 동일한 최종 base/head를 검토했고 finding과 unresolved thread가 모두 0인 뒤에만 `reviews-complete` label을 새로 붙여 merge candidate 테스트·빌드, 실행 검증과 릴리스 통합을 진행한다.
 
 PR 본문에 작성자가 넣은 reviewer 이름, finding 0, digest 또는 Actions 결과는 리뷰 실행 증거가 아니다. 실제 GitHub review object와 독립 reviewer 결과가 증거다.
 
 ## 변경 범위
 
 - 제거: `pr-policy-gate`, `pr-quality-gate` 이름, 관련 lane config, validator/controller, self-attestation 형식과 단위 테스트.
-- 재설계: `pull-request-validation`은 exact PR head의 테스트·artifact 빌드만 수행하며 draft PR에서는 실패하지 않는다. 최종 이중 리뷰 all-zero 뒤 붙이는 `reviews-complete` label이 있을 때만 실행해 리뷰→검증 순서를 지킨다. `windows-supporter-release-pr-protection` ruleset은 PR-only merge, stale review dismiss, unresolved thread, force-push·deletion 보호만 유지하고 required status check는 두지 않는다.
+- 재설계: `pull-request-validation`은 `reviews-complete` label 추가 이벤트에서 현재 PR merge candidate의 테스트·artifact 빌드만 수행하며 draft PR에서는 실패하지 않는다. base/head/merge-candidate SHA를 기록해 리뷰→검증 순서와 대상 revision을 분리한다. `windows-supporter-release-pr-protection` ruleset은 PR-only merge, stale review dismiss, unresolved thread, force-push·deletion 보호만 유지하고 required status check는 두지 않는다.
+- 정리: 보호된 remote hotfix/release branch 삭제 시 exact ref만 ruleset에서 일시 exclude하고 leased compare-and-delete를 수행한 뒤, `finally`에서 원래 exclude를 복원·read-back한다.
 - 교체: PR template은 실제 review object와 독립 reviewer 결과를 찾기 위한 비권위 체크리스트만 제공한다.
 - 유지: `release-chain-gate`. 이는 `main`, `develop`, tag의 테스트·artifact 빌드를 수행하는 릴리스 CI이며 리뷰 게이트가 아니다.
 - 이전 release-chain 시간대·artifact 이름 contract test는 별도 `test_release_chain_gate.py`로 이동한다.

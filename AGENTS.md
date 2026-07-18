@@ -11,13 +11,14 @@
 ## PR 검토 및 보호 규칙
 
 - 일반 구현은 `hotfix/vX.Y.Z` 또는 `release/vX.Y.Z`에서 task branch를 만들고, 해당 버전형 branch를 base로 하는 PR을 통해서만 합친다. 일반 task branch는 `task/`, `feat/`, `fix/`, `chore/`, `refact/` 중 하나의 prefix를 사용하고, 리뷰·릴리스 정책 변경에는 `policy/`를 사용할 수 있다.
-- PR을 연 뒤 정확한 최신 head SHA를 기록하고, 그 SHA를 명시한 `@codex review`를 GitHub PR에 요청한다. `chatgpt-codex-connector`가 남긴 GitHub review object의 `commit_id`가 최신 40자리 head SHA와 일치해야 한다.
-- 같은 exact head diff를 native Codex subagent 또는 별도 Codex task가 독립적으로 read-only 리뷰한다. GitHub Codex 리뷰와 독립 리뷰는 서로의 결론을 전달받기 전에 수행한다.
+- PR을 연 뒤 정확한 base ref, 최신 base SHA와 head SHA를 기록하고, 그 base/head 쌍을 명시한 `@codex review`를 GitHub PR에 요청한다. `chatgpt-codex-connector`가 남긴 GitHub review object의 `commit_id`가 최신 40자리 head SHA와 일치해야 한다.
+- 같은 exact base/head diff를 native Codex subagent 또는 별도 Codex task가 독립적으로 read-only 리뷰한다. GitHub Codex 리뷰와 독립 리뷰는 서로의 결론을 전달받기 전에 수행한다.
 - 두 리뷰의 finding은 `P0/P1/P2/P3`로 정규화하고 모든 등급을 0으로 만든다. GitHub review thread도 unresolved 0이어야 한다. 작성자가 PR 본문에 적은 finding 수, reviewer 이름, digest 또는 Actions status는 실제 리뷰 증거를 대신하지 않는다.
-- 리뷰 뒤 push로 head SHA가 바뀌면 이전 GitHub Codex 리뷰와 독립 리뷰를 모두 stale로 처리하고, 새 exact head에서 두 리뷰를 다시 수행한다. 최종 두 리뷰가 같은 최신 head SHA를 검토하지 않았다면 merge하지 않는다.
+- 리뷰 뒤 push로 head SHA가 바뀌거나 base SHA가 이동하면 이전 GitHub Codex 리뷰와 독립 리뷰를 모두 stale로 처리하고, 새 exact base/head에서 두 리뷰를 다시 수행한다. 최종 두 리뷰가 같은 최신 base/head 쌍을 검토하지 않았다면 merge하지 않는다.
 - 테스트, 정적 검사, 빌드, Windows 실제 실행, `release-chain-gate`는 리뷰와 별개의 검증 증거다. GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다.
-- 최종 이중 리뷰가 같은 head에서 all-zero가 된 뒤에만 PR에 `reviews-complete` label을 붙여 `pull-request-validation`을 실행한다. label은 리뷰 완료를 증명하지 않고, 이미 검증한 head의 테스트·artifact 빌드를 시작하는 순서 제어 신호일 뿐이다.
-- merge 직전에 PR의 최신 head SHA, 두 리뷰 대상 SHA, `P0/P1/P2/P3 = 0`, unresolved thread 0을 다시 확인한다. 이어 `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>` 또는 동등한 API precondition으로 exact head 조건을 걸어 병합하고, `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
+- 최종 이중 리뷰가 같은 base/head에서 all-zero가 된 뒤에만 PR에 `reviews-complete` label을 새로 붙여 `pull-request-validation`을 실행한다. workflow는 label 추가 이벤트에서 현재 PR merge candidate를 테스트하고 base/head/merge-candidate SHA를 기록한다. label은 리뷰 완료를 증명하지 않고 검증 시작 순서 제어 신호일 뿐이다.
+- push 또는 base 이동이 발생하면 `reviews-complete` label과 기존 CI 결과도 stale다. 두 리뷰를 새 base/head에서 반복한 뒤 label이 남아 있으면 제거하고 다시 붙여 새 merge candidate를 검증한다.
+- merge 직전에 PR의 base ref/SHA와 head SHA, 두 리뷰 대상 base/head, `P0/P1/P2/P3 = 0`, unresolved thread 0, `pull-request-validation`에 기록된 base/head를 다시 확인한다. base와 head가 모두 기대값일 때만 `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>` 또는 동등한 API precondition으로 병합한다. 최종 확인과 merge 사이에는 같은 base에 다른 PR을 merge하지 않는다. 이어 `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
 - `AGENTS.md`, 리뷰 절차, workflow, ruleset을 바꾸는 PR에도 같은 이중 리뷰 절차를 적용한다. 리뷰를 실제로 수행하지 않는 workflow나 self-attestation validator를 리뷰 gate라는 이름으로 도입하지 않는다.
 - `.github/pr-protection/ruleset.json`은 `hotfix/*`와 `release/*`에 PR-only merge, stale review dismiss, unresolved thread 해소, force-push·deletion 보호만 적용한다. 이 ruleset은 이중 리뷰를 실행하거나 증명하지 않으며 required status check를 두지 않는다.
 - 공개된 `main`, `develop`, tag의 잘못된 이력은 revert 또는 다음 patch release로 교정한다. 정상 release 절차에서 `--force-with-lease`로 공개 ref를 다시 쓰지 않는다.
@@ -69,7 +70,8 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
    - 이미 잘못된 release graph를 push했다면 공개 ref를 force rewrite하지 않는다. revert 또는 다음 patch release로 복구한다.
 7. merge된 hotfix 브랜치를 정리한다.
    - 로컬 브랜치: `git branch -d hotfix/vX.Y.Z`
-   - 원격 branch는 main/develop push와 release-chain 성공 뒤 exact remote tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다. 이어 `git push origin --force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA> :refs/heads/hotfix/vX.Y.Z`처럼 검증한 SHA에 lease를 건 compare-and-delete만 사용한다.
+   - 원격 branch는 main/develop push와 release-chain 성공 뒤 exact remote tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다.
+   - `.github/pr-protection/ruleset.json`의 live ruleset을 읽어 다른 규칙과 기존 exclude를 보존한 채 삭제할 exact `refs/heads/hotfix/vX.Y.Z`만 일시 exclude하고 read-back한다. 이어 `git push origin --force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA> :refs/heads/hotfix/vX.Y.Z`로 compare-and-delete한 뒤, 성공 여부와 관계없이 `finally` 절차로 원래 exclude 목록을 복원하고 canonical ruleset과 live read-back 일치를 확인한다. exclude 적용·복원 또는 read-back이 실패하면 cleanup 완료로 보고하지 않는다.
 8. 최종 영구 런타임 기준을 다시 확인한다.
    - 현재 branch를 `main`으로 돌려둔다.
    - main 태그 기준으로 `cmd /c build.bat`를 한 번 더 실행해 영구 실행 파일을 release 버전으로 둔다.
