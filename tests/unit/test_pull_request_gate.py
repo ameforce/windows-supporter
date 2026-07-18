@@ -474,6 +474,8 @@ class PullRequestGateUnitTest(unittest.TestCase):
         self.assertGreaterEqual(validator_source.count('encoding="utf-8"'), 3)
         self.assertIn("restored canonical protection", configure_script)
         self.assertIn("actions/upload-artifact@", quality_workflow)
+        self.assertIn("name: Prepare pinned uv environment", quality_workflow)
+        self.assertGreaterEqual(quality_workflow.count("timeout-minutes: 15"), 2)
         self.assertNotIn("actions/checkout@v", policy_workflow + quality_workflow)
 
         status_rule = next(rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks")
