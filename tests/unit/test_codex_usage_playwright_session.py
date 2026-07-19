@@ -524,6 +524,34 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertIn("force_terminate:command_timeout", driver.calls)
         session.shutdown()
 
+    def test_request_cancel_during_factory_start_never_dispatches_queued_collect(self) -> None:
+        factory_started = threading.Event()
+        release_factory = threading.Event()
+        driver = FakeDriver()
+
+        def gated_factory(
+            _config: PlaywrightSessionConfig,
+            _log_sink: LogSink | None,
+            _playwright_starter: PlaywrightStarter | None,
+        ) -> FakeDriver:
+            factory_started.set()
+            release_factory.wait(2.0)
+            return driver
+
+        session = make_session(gated_factory)
+        collect_thread = threading.Thread(target=session.collect, daemon=True)
+        collect_thread.start()
+        self.assertTrue(factory_started.wait(1.0))
+
+        cancel_result = session.request_cancel()
+        release_factory.set()
+        collect_thread.join(1.0)
+
+        self.assertTrue(cancel_result)
+        self.assertFalse(collect_thread.is_alive())
+        self.assertNotIn("collect", driver.calls)
+        session.shutdown()
+
     def test_concurrent_shutdown_never_reports_stopped_with_poisoned_owner_alive(self) -> None:
         collect_release = threading.Event()
         terminate_started = threading.Event()

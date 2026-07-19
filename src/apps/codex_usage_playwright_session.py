@@ -394,9 +394,17 @@ class CodexUsagePlaywrightSession:
         with self._lock:
             if generation == self._worker_generation:
                 self._driver = driver
+            cancel_before_start = bool(
+                generation == self._worker_generation and self._cancel_requested
+            )
         try:
-            started = driver.start()
-            self._update_status(driver.get_runtime_status())
+            if bool(cancel_before_start):
+                started = BrowserOperationResult(
+                    error=BrowserErrorCode.COMMAND_TIMEOUT.value
+                )
+            else:
+                started = driver.start()
+                self._update_status(driver.get_runtime_status())
             while True:
                 envelope = queue.get()
                 command = envelope.command
@@ -404,6 +412,13 @@ class CodexUsagePlaywrightSession:
                     driver.shutdown()
                     self._update_status(driver.get_runtime_status())
                     envelope.completed.set()
+                    return
+                if self._is_cancel_requested_for_generation(generation):
+                    envelope.result = BrowserOperationResult(
+                        error=BrowserErrorCode.COMMAND_TIMEOUT.value
+                    )
+                    envelope.completed.set()
+                    self._shutdown_driver(driver)
                     return
                 if envelope.retry_attempt > 0:
                     self._update_status(
@@ -470,6 +485,12 @@ class CodexUsagePlaywrightSession:
         with self._lock:
             return bool(
                 generation == self._worker_generation and self._worker_poisoned
+            )
+
+    def _is_cancel_requested_for_generation(self, generation: int) -> bool:
+        with self._lock:
+            return bool(
+                generation == self._worker_generation and self._cancel_requested
             )
 
     def _recover_poisoned_worker(self) -> bool:

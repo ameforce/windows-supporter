@@ -1096,20 +1096,24 @@ class CodexUsageMultiMonitor:
         child: Any | None,
         recovery_was_pending: bool,
     ) -> None:
+        shutdown_succeeded = child is None
         shutdown = getattr(child, "shutdown", None)
         if callable(shutdown):
             try:
-                shutdown()
+                result = shutdown()
             except Exception:
                 self.__track_unsettled_child(profile_id, child)
+            else:
+                shutdown_succeeded = result is not False
         quiesced = self.__wait_for_refreshes_quiesced(
             profile_id=profile_id,
             timeout_sec=60.0,
         )
         self.__discard_cleanup_transaction(transaction_id)
-        if bool(quiesced) and not bool(recovery_was_pending):
+        can_publish_fresh_child = bool(quiesced and shutdown_succeeded)
+        if can_publish_fresh_child and not bool(recovery_was_pending):
             self.__complete_settings_recovery({profile_id})
-        if bool(quiesced):
+        if can_publish_fresh_child:
             self.__restore_child_monitor_or_mark_recovery_pending(profile_id)
         else:
             self.__track_unsettled_child(profile_id, child)
