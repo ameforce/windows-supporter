@@ -795,6 +795,44 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(switched["label"], "내 업무")
             self.assertFalse(switched["enabled"])
 
+    def test_partial_provider_switch_preserves_omitted_custom_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error = manager.update_settings(
+                {
+                    "profiles": [
+                        {
+                            "id": "account_1",
+                            "provider": "codex",
+                            "label": "자동화 계정",
+                            "enabled": False,
+                        },
+                        {
+                            "id": "account_2",
+                            "provider": "codex",
+                            "enabled": False,
+                        },
+                    ]
+                }
+            )
+            self.assertTrue(ok, error)
+
+            ok, error = manager.update_settings(
+                {
+                    "profiles": [
+                        {"id": "account_1", "provider": "cursor"},
+                        {"id": "account_2", "provider": "cursor"},
+                    ]
+                }
+            )
+
+            self.assertTrue(ok, error)
+            profiles = manager.get_settings_snapshot()["profiles"]
+            self.assertEqual(profiles[0]["label"], "자동화 계정")
+            self.assertFalse(profiles[0]["enabled"])
+            self.assertEqual(profiles[1]["label"], "Cursor 2")
+            self.assertFalse(profiles[1]["enabled"])
+
     def test_delete_profile_rejects_path_outside_app_owned_boundaries(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, _ = self._build_manager(tmp)

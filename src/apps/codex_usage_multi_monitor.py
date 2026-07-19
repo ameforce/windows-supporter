@@ -304,6 +304,10 @@ class CodexUsageMultiMonitor:
                     previous_label = current.label
                     previous_enabled = current.enabled
                     previous_provider = current.provider
+                    previous_label_was_default = previous_label == _default_profile_label(
+                        previous_provider,
+                        len(requested_order),
+                    )
                     current.provider_settings[current.provider] = {
                         "label": current.label,
                         "enabled": bool(current.enabled),
@@ -321,14 +325,14 @@ class CodexUsageMultiMonitor:
                             )
                             current.enabled = bool(saved_provider.get("enabled", True))
                         else:
-                            current.label = _default_profile_label(provider, len(requested_order))
-                            current.enabled = True
+                            current.label = (
+                                _default_profile_label(provider, len(requested_order))
+                                if previous_label_was_default
+                                else previous_label
+                            )
+                            current.enabled = previous_enabled
                 if "label" in raw:
                     label = str(raw.get("label", "") or "").strip()
-                    previous_label_was_default = previous_label == _default_profile_label(
-                        previous_provider,
-                        len(requested_order),
-                    )
                     if label and (
                         not provider_changed
                         or label != previous_label
