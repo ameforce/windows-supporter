@@ -228,6 +228,8 @@ class _LazyCursorBrowserSession:
             if session is self._session:
                 self._terminal_cleanup_complete = True
                 self._terminal_cleanup_succeeded = bool(succeeded)
+                if succeeded:
+                    self._session = None
         return bool(succeeded)
 
     def request_cancel(self) -> bool:
@@ -316,6 +318,8 @@ class _LazyCursorBrowserSession:
             self._creating = False
             self._terminal_cleanup_complete = True
             self._terminal_cleanup_succeeded = bool(cleanup_succeeded)
+            if not cleanup_succeeded:
+                self._session = created
             self._condition.notify_all()
         return None
 

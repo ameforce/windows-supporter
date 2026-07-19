@@ -123,6 +123,63 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertEqual(inner.calls, ["request_cancel", "shutdown"])
         self.assertTrue(lazy.shutdown())
 
+    def test_lazy_session_retains_failed_terminal_cleanup_for_shutdown_retry(self) -> None:
+        constructor_started = threading.Event()
+        release_constructor = threading.Event()
+
+        class _RetryableInnerSession:
+            def __init__(self) -> None:
+                self.calls = []
+                self.shutdown_results = [False, True]
+
+            def collect(self) -> BrowserOperationResult:
+                self.calls.append("collect")
+                return BrowserOperationResult()
+
+            def request_cancel(self) -> bool:
+                self.calls.append("request_cancel")
+                return False
+
+            def shutdown(self) -> bool:
+                self.calls.append("shutdown")
+                return self.shutdown_results.pop(0)
+
+        inner = _RetryableInnerSession()
+
+        def blocking_constructor(*_args, **_kwargs):
+            constructor_started.set()
+            release_constructor.wait(2.0)
+            return inner
+
+        lazy = _LazyCursorBrowserSession(
+            PlaywrightSessionConfig(
+                profile_dir="profile",
+                usage_url="https://cursor.com/dashboard/usage",
+                probe_script="probe()",
+            ),
+            None,
+        )
+        result = []
+        collect_thread = threading.Thread(
+            target=lambda: result.append(lazy.collect()),
+            daemon=True,
+        )
+
+        with patch(
+            "src.apps.codex_usage_playwright_session.CodexUsagePlaywrightSession",
+            side_effect=blocking_constructor,
+        ):
+            collect_thread.start()
+            self.assertTrue(constructor_started.wait(1.0))
+            self.assertFalse(lazy.shutdown())
+            release_constructor.set()
+            collect_thread.join(1.0)
+
+        self.assertFalse(collect_thread.is_alive())
+        self.assertEqual(result[0].error, BrowserErrorCode.COLLECT_FAILED.value)
+        self.assertTrue(lazy.shutdown())
+        self.assertEqual(inner.calls, ["request_cancel", "shutdown", "shutdown"])
+
     @staticmethod
     def _probe(text: str) -> dict[str, object]:
         return {
