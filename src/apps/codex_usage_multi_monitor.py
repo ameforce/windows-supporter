@@ -274,10 +274,26 @@ class CodexUsageMultiMonitor:
                 ],
             ]
             self.__unsettled_children = {}
+        pre_shutdown_child_ids: set[int] = set()
+        cancel_request_failed = False
         for child in shutdown_children:
-            self.__request_child_collect_cancel(child)
-        self.__wait_for_refreshes_quiesced(timeout_sec=None)
+            if self.__request_child_collect_cancel(child):
+                continue
+            cancel_request_failed = True
+            shutdown = getattr(child, "shutdown", None)
+            if not callable(shutdown):
+                continue
+            try:
+                shutdown()
+            except Exception:
+                continue
+            pre_shutdown_child_ids.add(id(child))
+        self.__wait_for_refreshes_quiesced(
+            timeout_sec=60.0 if cancel_request_failed else None
+        )
         for child in shutdown_children:
+            if id(child) in pre_shutdown_child_ids:
+                continue
             shutdown = getattr(child, "shutdown", None)
             if callable(shutdown):
                 try:
@@ -936,11 +952,6 @@ class CodexUsageMultiMonitor:
             return False, "confirmation_required"
         if not self.__shutdown_unsettled_children(normalized):
             return False, "profile_delete_failed"
-        child = self.__children.get(normalized)
-        if not self.__request_child_collect_cancel(child):
-            return False, "profile_delete_failed"
-        if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
-            return False, "profile_delete_failed"
         local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
         transaction_id = uuid.uuid4().hex
         deletion_entries: list[dict[str, Any]] = []
@@ -983,6 +994,21 @@ class CodexUsageMultiMonitor:
             self.__prepare_settings_recovery([normalized])
         except Exception:
             self.__discard_cleanup_transaction(transaction_id)
+            return False, "profile_delete_failed"
+        child = self.__children.get(normalized)
+        if not self.__request_child_collect_cancel(child):
+            self.__rollback_cancelled_profile_delete(
+                normalized,
+                transaction_id,
+                recovery_was_pending=recovery_was_pending,
+            )
+            return False, "profile_delete_failed"
+        if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
+            self.__rollback_cancelled_profile_delete(
+                normalized,
+                transaction_id,
+                recovery_was_pending=recovery_was_pending,
+            )
             return False, "profile_delete_failed"
         shutdown = getattr(child, "shutdown", None)
         if callable(shutdown):
@@ -1059,6 +1085,21 @@ class CodexUsageMultiMonitor:
         self.__retry_pending_profile_cleanup()
         self.__set_settings_recovery_pending(normalized, False)
         return True, None
+
+    def __rollback_cancelled_profile_delete(
+        self,
+        profile_id: str,
+        transaction_id: str,
+        *,
+        recovery_was_pending: bool,
+    ) -> None:
+        self.__discard_cleanup_transaction(transaction_id)
+        if not bool(recovery_was_pending):
+            self.__complete_settings_recovery({profile_id})
+        self.__restore_child_monitor_or_mark_recovery_pending(profile_id)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
+        self.__refresh_taskbar_progress()
+        return
 
     def get_runtime_status(self) -> dict[str, Any]:
         with self.__settings_mutation_lock:

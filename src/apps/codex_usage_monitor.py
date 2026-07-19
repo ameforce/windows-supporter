@@ -1904,7 +1904,6 @@ class CodexUsageMonitor:
         except Exception:
             self.__worker_epoch = 1
         self.__hide_active_tooltip()
-        self.__browser_session.shutdown()
         self.__root = None
         self.__event_queue = None
         self.__ui_thread_id = None
@@ -1914,6 +1913,7 @@ class CodexUsageMonitor:
         self.__request_collect_cancel()
         self.__pause_background_monitor()
         self.__cancel_pending_login_poll()
+        self.__browser_session.shutdown()
         return
 
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:

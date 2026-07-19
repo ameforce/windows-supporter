@@ -76,6 +76,63 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
 
             self.assertEqual(session.shutdown_calls, 1)
 
+    def test_collect_cancel_interrupts_active_browser_session(self) -> None:
+        class _BlockingBrowserSession:
+            def __init__(self) -> None:
+                self.collect_started = threading.Event()
+                self.collect_release = threading.Event()
+                self.shutdown_calls = 0
+
+            def collect(self) -> BrowserOperationResult:
+                self.collect_started.set()
+                self.collect_release.wait(2.0)
+                return BrowserOperationResult(error="collect_failed")
+
+            def open_login(self) -> BrowserOperationResult:
+                return BrowserOperationResult()
+
+            def poll_login(self) -> BrowserOperationResult:
+                return BrowserOperationResult()
+
+            def close_session(self) -> None:
+                return None
+
+            def shutdown(self) -> None:
+                self.shutdown_calls += 1
+                self.collect_release.set()
+
+            def get_runtime_status(self) -> BrowserRuntimeStatus:
+                return BrowserRuntimeStatus(BrowserState.HEADLESS_READY, False, "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _BlockingBrowserSession()
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+            monitor.attach(object(), None, start_monitor=False)
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            collect_thread = threading.Thread(
+                target=lambda: monitor.show_current_status(
+                    force_refresh=True,
+                    source="auto_monitor",
+                ),
+                daemon=True,
+            )
+            collect_thread.start()
+            self.assertTrue(session.collect_started.wait(1.0))
+
+            monitor.request_collect_cancel()
+            collect_thread.join(1.0)
+            completed_after_cancel = not collect_thread.is_alive()
+            if not completed_after_cancel:
+                session.collect_release.set()
+                collect_thread.join(2.0)
+
+            self.assertTrue(completed_after_cancel)
+            self.assertEqual(session.shutdown_calls, 1)
+
     def test_ui_thread_monitor_pause_cancels_timer_without_requeueing_cleanup(self) -> None:
         class _Root:
             def __init__(self) -> None:

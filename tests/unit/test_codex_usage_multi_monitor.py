@@ -18,6 +18,7 @@ class _FakeChildMonitor:
         self.update_calls: list[dict] = []
         self.show_calls: list[dict] = []
         self.release_calls = 0
+        self.cancel_calls = 0
         self.shutdown_calls = 0
         self.attach_calls = []
         self.tooltip_duration_ms = 7000
@@ -85,6 +86,10 @@ class _FakeChildMonitor:
 
     def shutdown(self):
         self.shutdown_calls += 1
+        return None
+
+    def request_collect_cancel(self):
+        self.cancel_calls += 1
         return None
 
 
@@ -1964,6 +1969,59 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 ["refresh_started", "cancel_requested", "refresh_finished", "shutdown"],
             )
 
+    def test_shutdown_uses_final_shutdown_when_cancel_request_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+            shutdown_finished = threading.Event()
+            children = []
+
+            class _CancelFailureChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_refresh.wait(2.0)
+                    return super().show_current_status(force_refresh=force_refresh, source=source)
+
+                def request_collect_cancel(self):
+                    self.cancel_calls += 1
+                    raise RuntimeError("cancel boundary unavailable")
+
+                def shutdown(self):
+                    release_refresh.set()
+                    return super().shutdown()
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _CancelFailureChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            manager.show_current_status(force_refresh=True)
+            self.assertTrue(refresh_started.wait(1.0))
+
+            shutdown_thread = threading.Thread(
+                target=lambda: (manager.shutdown(), shutdown_finished.set()),
+                daemon=True,
+            )
+            shutdown_thread.start()
+            completed_with_fallback = shutdown_finished.wait(1.0)
+            if not completed_with_fallback:
+                release_refresh.set()
+                shutdown_thread.join(2.0)
+
+            self.assertTrue(completed_with_fallback)
+            self.assertEqual(children[0].cancel_calls, 1)
+            self.assertEqual(children[0].shutdown_calls, 1)
+
     def test_shutdown_releases_settings_lock_before_waiting_for_refresh_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             worker_waiting = threading.Event()
@@ -2083,6 +2141,48 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(
                 children[0].events,
                 ["refresh_started", "cancel_requested", "refresh_finished", "shutdown"],
+            )
+
+    def test_delete_cleanup_journal_failure_does_not_cancel_retained_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            retained_child = children[0]
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__persist_pending_profile_cleanup",
+                side_effect=OSError("cleanup journal unavailable"),
+            ):
+                result = manager.delete_profile("account_1", confirmed=True)
+
+            self.assertEqual(result, (False, "profile_delete_failed"))
+            self.assertEqual(retained_child.cancel_calls, 0)
+            self.assertIs(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                retained_child,
+            )
+            self.assertIn(
+                "account_1",
+                manager.get_settings_snapshot()["profile_order"],
+            )
+
+    def test_delete_recovery_marker_failure_does_not_cancel_retained_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            retained_child = children[0]
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__prepare_settings_recovery",
+                side_effect=OSError("recovery marker unavailable"),
+            ):
+                result = manager.delete_profile("account_1", confirmed=True)
+
+            self.assertEqual(result, (False, "profile_delete_failed"))
+            self.assertEqual(retained_child.cancel_calls, 0)
+            self.assertIs(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                retained_child,
             )
 
     def test_snapshot_readers_share_provider_publish_mutation_boundary(self):
