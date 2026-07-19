@@ -431,16 +431,40 @@ class CodexUsageMultiMonitor:
         old_ids = set(old_settings)
         changed_providers = [
             profile_id
-            for profile_id in set(candidate_settings) & old_ids
+            for profile_id in candidate_order
+            if profile_id in old_ids
             if candidate_settings[profile_id].provider != old_settings[profile_id].provider
         ]
-        old_order = list(self.__account_order)
-        old_default = self.__default_account_id
-        old_enabled = self.__enabled
-        old_taskbar_overlay_enabled = self.__taskbar_overlay_enabled
-        old_interval_sec = self.__interval_sec
-        old_tooltip_duration_ms = self.__tooltip_duration_ms
-        old_usage_url = self.__usage_url
+        staged_children: dict[str, tuple[_AccountPaths, Any]] = {}
+        try:
+            for profile_id in changed_providers:
+                staged_children[profile_id] = self.__stage_child_monitor(
+                    profile_id,
+                    candidate_settings[profile_id],
+                )
+            self.__save_manager_settings(
+                account_settings=candidate_settings,
+                account_order=candidate_order,
+                default_account_id=candidate_default,
+                enabled=candidate_enabled,
+                taskbar_overlay_enabled=candidate_taskbar_overlay_enabled,
+                interval_sec=candidate_interval_sec,
+                tooltip_duration_ms=candidate_tooltip_duration_ms,
+                usage_url=candidate_usage_url,
+            )
+        except Exception:
+            for _paths, child in staged_children.values():
+                shutdown = getattr(child, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        pass
+            return False, "settings_save_failed"
+        old_children = {
+            profile_id: self.__children.get(profile_id)
+            for profile_id in changed_providers
+        }
         self.__enabled = candidate_enabled
         self.__taskbar_overlay_enabled = candidate_taskbar_overlay_enabled
         self.__interval_sec = candidate_interval_sec
@@ -449,27 +473,16 @@ class CodexUsageMultiMonitor:
         self.__account_settings = candidate_settings
         self.__account_order = candidate_order
         self.__default_account_id = candidate_default
-        replaced_profile_ids: list[str] = []
-        try:
-            for profile_id in changed_providers:
-                self.__replace_child_monitor(profile_id)
-                replaced_profile_ids.append(profile_id)
-            self.__save_manager_settings()
-        except Exception:
-            self.__account_settings = old_settings
-            self.__account_order = old_order
-            self.__default_account_id = old_default
-            self.__enabled = old_enabled
-            self.__taskbar_overlay_enabled = old_taskbar_overlay_enabled
-            self.__interval_sec = old_interval_sec
-            self.__tooltip_duration_ms = old_tooltip_duration_ms
-            self.__usage_url = old_usage_url
-            for profile_id in reversed(replaced_profile_ids):
+        for profile_id, (paths, child) in staged_children.items():
+            self.__account_paths[profile_id] = paths
+            self.__children[profile_id] = child
+        for profile_id, old_child in old_children.items():
+            shutdown = getattr(old_child, "shutdown", None)
+            if callable(shutdown):
                 try:
-                    self.__replace_child_monitor(profile_id)
+                    shutdown()
                 except Exception:
-                    self.__mark_profile_recovery_pending(profile_id)
-            return False, "settings_save_failed"
+                    pass
         self.__sync_child_settings()
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
@@ -1409,39 +1422,65 @@ class CodexUsageMultiMonitor:
             self.__default_account_id = ordered_ids[0] if ordered_ids else ""
         return
 
-    def __save_manager_settings(self) -> None:
+    def __save_manager_settings(
+        self,
+        *,
+        account_settings: dict[str, _AccountSettings] | None = None,
+        account_order: list[str] | None = None,
+        default_account_id: str | None = None,
+        enabled: bool | None = None,
+        taskbar_overlay_enabled: bool | None = None,
+        interval_sec: float | None = None,
+        tooltip_duration_ms: int | None = None,
+        usage_url: str | None = None,
+    ) -> None:
+        settings = account_settings if account_settings is not None else self.__account_settings
+        requested_order = account_order if account_order is not None else self.__ordered_account_ids()
+        ordered_ids: list[str] = []
+        for account_id in requested_order:
+            if account_id in settings and account_id not in ordered_ids:
+                ordered_ids.append(account_id)
+        ordered_ids.extend(account_id for account_id in settings if account_id not in ordered_ids)
         profiles = [
             {
                 "id": account_id,
-                "provider": self.__account_settings[account_id].provider,
-                "label": self.__account_settings[account_id].label,
-                "enabled": bool(self.__account_settings[account_id].enabled),
-                "taskbar_selected": bool(
-                    self.__account_settings[account_id].taskbar_selected
-                ),
+                "provider": settings[account_id].provider,
+                "label": settings[account_id].label,
+                "enabled": bool(settings[account_id].enabled),
+                "taskbar_selected": bool(settings[account_id].taskbar_selected),
                 "provider_settings": {
                     provider: dict(provider_data)
-                    for provider, provider_data in self.__account_settings[
-                        account_id
-                    ].provider_settings.items()
+                    for provider, provider_data in settings[account_id].provider_settings.items()
                 },
             }
-            for account_id in self.__ordered_account_ids()
+            for account_id in ordered_ids
         ]
         payload = {
             "settings_version": AI_USAGE_SETTINGS_VERSION,
-            "enabled": bool(self.__enabled),
-            "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
-            "interval_sec": float(self.__interval_sec),
-            "tooltip_duration_ms": int(self.__tooltip_duration_ms),
-            "usage_url": str(self.__usage_url),
-            "default_account_id": str(self.__default_account_id),
-            "account_order": list(self.__ordered_account_ids()),
-            "profile_order": list(self.__ordered_account_ids()),
+            "enabled": bool(self.__enabled if enabled is None else enabled),
+            "taskbar_overlay_enabled": bool(
+                self.__taskbar_overlay_enabled
+                if taskbar_overlay_enabled is None
+                else taskbar_overlay_enabled
+            ),
+            "interval_sec": float(self.__interval_sec if interval_sec is None else interval_sec),
+            "tooltip_duration_ms": int(
+                self.__tooltip_duration_ms
+                if tooltip_duration_ms is None
+                else tooltip_duration_ms
+            ),
+            "usage_url": str(self.__usage_url if usage_url is None else usage_url),
+            "default_account_id": str(
+                self.__default_account_id
+                if default_account_id is None
+                else default_account_id
+            ),
+            "account_order": list(ordered_ids),
+            "profile_order": list(ordered_ids),
             "selected_profile_ids": [
                 account_id
-                for account_id in self.__ordered_account_ids()
-                if bool(self.__account_settings[account_id].taskbar_selected)
+                for account_id in ordered_ids
+                if bool(settings[account_id].taskbar_selected)
             ],
             "profiles": profiles,
             "accounts": profiles,
@@ -1844,8 +1883,26 @@ class CodexUsageMultiMonitor:
 
     def __replace_child_monitor(self, account_id: str) -> None:
         old_child = self.__children.get(account_id)
-        paths = self.__build_account_paths()[account_id]
-        account = self.__account_settings[account_id]
+        paths, child = self.__stage_child_monitor(
+            account_id,
+            self.__account_settings[account_id],
+        )
+        self.__account_paths[account_id] = paths
+        self.__children[account_id] = child
+        shutdown_old = getattr(old_child, "shutdown", None)
+        if callable(shutdown_old):
+            try:
+                shutdown_old()
+            except Exception:
+                pass
+        return
+
+    def __stage_child_monitor(
+        self,
+        account_id: str,
+        account: _AccountSettings,
+    ) -> tuple[_AccountPaths, Any]:
+        paths = self.__build_profile_paths(account_id, account.provider)
         child = None
         try:
             child = (
@@ -1868,15 +1925,7 @@ class CodexUsageMultiMonitor:
                 except Exception:
                     pass
             raise
-        self.__account_paths[account_id] = paths
-        self.__children[account_id] = child
-        shutdown_old = getattr(old_child, "shutdown", None)
-        if callable(shutdown_old):
-            try:
-                shutdown_old()
-            except Exception:
-                pass
-        return
+        return paths, child
 
     def __create_child_monitor(
         self,

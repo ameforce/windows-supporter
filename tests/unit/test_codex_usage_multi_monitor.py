@@ -539,7 +539,49 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
             self.assertEqual(original.shutdown_calls, 0)
 
-    def test_provider_save_rollback_factory_failure_uses_recovery_child(self):
+    def test_multi_provider_factory_failure_keeps_every_original_child_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            factory_calls = 0
+            created = []
+
+            def factory(provider, config_dir, profile_dir):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls == 4:
+                    raise RuntimeError("second replacement unavailable")
+                child = _FakeChildMonitor(config_dir, profile_dir)
+                child.provider = provider
+                created.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            original_1 = manager._CodexUsageMultiMonitor__children["account_1"]
+            original_2 = manager._CodexUsageMultiMonitor__children["account_2"]
+            profiles = manager.get_settings_snapshot()["profiles"]
+            for profile in profiles:
+                profile["provider"] = "cursor"
+
+            ok, error = manager.update_settings({"profiles": profiles})
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            self.assertIs(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                original_1,
+            )
+            self.assertIs(
+                manager._CodexUsageMultiMonitor__children["account_2"],
+                original_2,
+            )
+            self.assertEqual(original_1.shutdown_calls, 0)
+            self.assertEqual(original_2.shutdown_calls, 0)
+            self.assertEqual(created[2].shutdown_calls, 1)
+
+    def test_provider_save_failure_keeps_original_without_rollback_factory(self):
         with tempfile.TemporaryDirectory() as tmp:
             factory_calls = 0
 
@@ -555,6 +597,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 local_base_dir=os.path.join(tmp, "local"),
                 monitor_factory=factory,
             )
+            original = manager._CodexUsageMultiMonitor__children["account_1"]
             profiles = manager.get_settings_snapshot()["profiles"]
             profiles[0]["provider"] = "cursor"
 
@@ -567,12 +610,12 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             self.assertFalse(ok)
             self.assertEqual(error, "settings_save_failed")
-            runtime = next(
-                item
-                for item in manager.get_runtime_status()["profiles"]
-                if item["id"] == "account_1"
+            self.assertIs(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                original,
             )
-            self.assertEqual(runtime["runtime"]["monitor_state"], "recovery_pending")
+            self.assertEqual(original.shutdown_calls, 0)
+            self.assertEqual(factory_calls, 3)
 
     def test_invalid_interval_rejects_all_scalar_changes_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
