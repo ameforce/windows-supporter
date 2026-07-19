@@ -5,9 +5,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
@@ -15,19 +16,15 @@ from src.apps.codex_usage_monitor import CURRENT_CODEX_USAGE_URL, CodexUsageMoni
 from src.apps.codex_usage_taskbar_overlay import AiUsageTaskbarOverlay
 
 
-ACCOUNT_IDS = ("account_1", "account_2")
+LEGACY_ACCOUNT_IDS = ("account_1", "account_2")
 SUPPORTED_PROVIDERS = ("codex", "cursor")
-AI_USAGE_SETTINGS_VERSION = 3
+AI_USAGE_SETTINGS_VERSION = 4
+TASKBAR_PROFILE_LIMIT = 2
+PROFILE_ID_PATTERN = re.compile(r"^(?:account_[12]|profile_[0-9a-f]{32})$")
 DEFAULT_LABELS = {
     "account_1": "Codex 1",
     "account_2": "Codex 2",
 }
-DEFAULT_PROVIDER_LABELS = {
-    "codex": {"account_1": "Codex 1", "account_2": "Codex 2"},
-    "cursor": {"account_1": "Cursor 1", "account_2": "Cursor 2"},
-}
-
-
 @dataclass(frozen=True)
 class _AccountPaths:
     account_id: str
@@ -79,7 +76,7 @@ class CodexUsageMultiMonitor:
             "codex_usage_multi_state.json",
         )
         self.__default_account_id = "account_1"
-        self.__account_order = list(ACCOUNT_IDS)
+        self.__account_order = list(LEGACY_ACCOUNT_IDS)
         self.__enabled = True
         self.__taskbar_overlay_enabled = True
         self.__interval_sec = 90.0
@@ -101,25 +98,35 @@ class CodexUsageMultiMonitor:
                 label=DEFAULT_LABELS[account_id],
                 enabled=True,
             )
-            for account_id in ACCOUNT_IDS
-        }
-        self.__legacy_codex_accounts = {
-            account_id: {
-                "id": account_id,
-                "label": DEFAULT_LABELS[account_id],
-                "enabled": True,
-            }
-            for account_id in ACCOUNT_IDS
+            for account_id in LEGACY_ACCOUNT_IDS
         }
         manager_settings = self.__read_json_file(self.__settings_path)
         has_manager_settings = isinstance(manager_settings, dict)
+        manager_settings_version = (
+            _safe_int(manager_settings.get("settings_version", 0), 0)
+            if isinstance(manager_settings, dict)
+            else 0
+        )
+        if has_manager_settings and manager_settings_version == 3:
+            self.__backup_file_once(
+                self.__settings_path,
+                os.path.join(self.__config_dir, "ai_usage_settings.v3.backup.json"),
+            )
         if not isinstance(manager_settings, dict):
             manager_settings = self.__read_json_file(self.__legacy_manager_settings_path)
+            if isinstance(manager_settings, dict):
+                self.__backup_file_once(
+                    self.__legacy_manager_settings_path,
+                    os.path.join(
+                        self.__config_dir,
+                        "codex_usage_multi_settings.v2.backup.json",
+                    ),
+                )
         self.__load_manager_settings(manager_settings)
         self.__account_paths = self.__build_account_paths()
         legacy_settings = self.__read_legacy_settings()
         self.__migrate_legacy_single_account_files_if_needed()
-        if not has_manager_settings:
+        if not has_manager_settings or manager_settings_version < AI_USAGE_SETTINGS_VERSION:
             if not isinstance(manager_settings, dict):
                 self.__apply_legacy_manager_settings(legacy_settings)
             self.__save_manager_settings()
@@ -190,29 +197,63 @@ class CodexUsageMultiMonitor:
         profiles = data.get("profiles")
         legacy_accounts = data.get("accounts")
         raw_profiles = profiles if isinstance(profiles, list) else legacy_accounts
+        candidate_settings = {
+            profile_id: replace(settings)
+            for profile_id, settings in self.__account_settings.items()
+        }
+        candidate_order = list(self.__ordered_account_ids())
         if isinstance(raw_profiles, list):
-            if len(raw_profiles) > len(ACCOUNT_IDS):
-                return False, "profile_limit"
             seen_ids: set[str] = set()
+            requested_order: list[str] = []
             for raw in raw_profiles:
                 if not isinstance(raw, dict):
                     return False, "invalid_profile"
                 profile_id = str(raw.get("id", "") or "")
-                if profile_id not in self.__account_settings or profile_id in seen_ids:
+                if not _is_valid_profile_id(profile_id) or profile_id in seen_ids:
                     return False, "invalid_profile"
                 seen_ids.add(profile_id)
-                provider = str(raw.get("provider", self.__account_settings[profile_id].provider) or "").lower()
+                requested_order.append(profile_id)
+                current = candidate_settings.get(profile_id)
+                provider = str(
+                    raw.get("provider", current.provider if current is not None else "codex")
+                    or ""
+                ).lower()
                 if provider not in SUPPORTED_PROVIDERS:
                     return False, "provider"
+                if current is None:
+                    current = _AccountSettings(
+                        account_id=profile_id,
+                        label=_default_profile_label(provider, len(candidate_settings) + 1),
+                        enabled=True,
+                        provider=provider,
+                        taskbar_selected=False,
+                    )
+                    candidate_settings[profile_id] = current
+                else:
+                    current.provider = provider
+                if "label" in raw:
+                    label = str(raw.get("label", "") or "").strip()
+                    if label:
+                        current.label = label
+                if "enabled" in raw:
+                    current.enabled = bool(raw.get("enabled"))
+                if "taskbar_selected" in raw:
+                    current.taskbar_selected = bool(raw.get("taskbar_selected"))
+            candidate_order = requested_order + [
+                profile_id for profile_id in candidate_order if profile_id not in seen_ids
+            ]
         selected_profile_ids = data.get("selected_profile_ids")
         if isinstance(selected_profile_ids, list):
-            if len(selected_profile_ids) > len(ACCOUNT_IDS):
+            if len(selected_profile_ids) > TASKBAR_PROFILE_LIMIT:
                 return False, "taskbar_profile_limit"
             normalized_selected = [str(item or "") for item in selected_profile_ids]
             if len(set(normalized_selected)) != len(normalized_selected) or any(
-                item not in self.__account_settings for item in normalized_selected
+                item not in candidate_settings for item in normalized_selected
             ):
                 return False, "invalid_taskbar_profile"
+            selected = set(normalized_selected)
+            for profile_id, settings in candidate_settings.items():
+                settings.taskbar_selected = profile_id in selected
         else:
             normalized_selected = None
         requested_profile_order = data.get("profile_order")
@@ -220,11 +261,27 @@ class CodexUsageMultiMonitor:
             normalized_profile_order = [str(item or "") for item in requested_profile_order]
             if (
                 len(normalized_profile_order) != len(set(normalized_profile_order))
-                or any(item not in self.__account_settings for item in normalized_profile_order)
+                or set(normalized_profile_order) != set(candidate_settings)
             ):
                 return False, "invalid_profile_order"
+            candidate_order = normalized_profile_order
         else:
             normalized_profile_order = None
+        if sum(bool(item.taskbar_selected) for item in candidate_settings.values()) > TASKBAR_PROFILE_LIMIT:
+            return False, "taskbar_profile_limit"
+
+        candidate_default = str(data.get("default_account_id", self.__default_account_id) or "")
+        if candidate_default not in candidate_settings:
+            candidate_default = candidate_order[0] if candidate_order else ""
+
+        old_settings = self.__account_settings
+        old_ids = set(old_settings)
+        added_ids = set(candidate_settings) - old_ids
+        changed_providers = [
+            profile_id
+            for profile_id in set(candidate_settings) & old_ids
+            if candidate_settings[profile_id].provider != old_settings[profile_id].provider
+        ]
         if "enabled" in data:
             self.__enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
@@ -245,64 +302,83 @@ class CodexUsageMultiMonitor:
         usage_url = data.get("usage_url")
         if isinstance(usage_url, str) and usage_url.strip():
             self.__usage_url = usage_url.strip()
-        changed_providers: list[str] = []
-        if isinstance(raw_profiles, list):
-            requested_order: list[str] = []
-            for raw in raw_profiles:
-                account_id = str(raw.get("id", "") or "")
-                if account_id not in requested_order:
-                    requested_order.append(account_id)
-                current = self.__account_settings[account_id]
-                provider = str(raw.get("provider", current.provider) or current.provider).lower()
-                if provider != current.provider:
-                    if provider == "codex":
-                        mirror = self.__legacy_codex_accounts[account_id]
-                        current.label = str(mirror.get("label") or DEFAULT_LABELS[account_id])
-                        current.enabled = bool(mirror.get("enabled", True))
-                    elif current.label == DEFAULT_PROVIDER_LABELS["codex"][account_id]:
-                        current.label = DEFAULT_PROVIDER_LABELS["cursor"][account_id]
-                    current.provider = provider
-                    changed_providers.append(account_id)
-                if "label" in raw:
-                    label = str(raw.get("label", "") or "").strip()
-                    if label:
-                        current.label = label
-                if "enabled" in raw:
-                    current.enabled = bool(raw.get("enabled"))
-                if "taskbar_selected" in raw:
-                    current.taskbar_selected = bool(raw.get("taskbar_selected"))
-                if current.provider == "codex":
-                    self.__legacy_codex_accounts[account_id] = {
-                        "id": account_id,
-                        "label": current.label,
-                        "enabled": bool(current.enabled),
-                    }
-            if requested_order:
-                self.__account_order = requested_order + [
-                    account_id for account_id in ACCOUNT_IDS if account_id not in requested_order
-                ]
-        if normalized_profile_order is not None:
-            self.__account_order = normalized_profile_order + [
-                account_id for account_id in ACCOUNT_IDS if account_id not in normalized_profile_order
-            ]
-        if normalized_selected is not None:
-            selected = set(normalized_selected)
-            for account_id in ACCOUNT_IDS:
-                self.__account_settings[account_id].taskbar_selected = account_id in selected
-        selected_count = sum(
-            1 for item in self.__account_settings.values() if bool(item.taskbar_selected)
-        )
-        if selected_count > len(ACCOUNT_IDS):
-            return False, "taskbar_profile_limit"
-        default_account_id = str(data.get("default_account_id", "") or "")
-        if default_account_id in self.__account_settings:
-            self.__default_account_id = default_account_id
-        elif isinstance(raw_profiles, list) and self.__account_order:
-            self.__default_account_id = self.__account_order[0]
-        for account_id in changed_providers:
-            self.__replace_child_monitor(account_id)
+        self.__account_settings = candidate_settings
+        self.__account_order = candidate_order
+        self.__default_account_id = candidate_default
+        for profile_id in [*changed_providers, *sorted(added_ids)]:
+            self.__replace_child_monitor(profile_id)
         self.__save_manager_settings()
         self.__sync_child_settings()
+        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__refresh_taskbar_progress()
+        return True, None
+
+    def add_profile(
+        self,
+        provider: str = "codex",
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        provider_id = str(provider or "").strip().lower()
+        if provider_id not in SUPPORTED_PROVIDERS:
+            return False, "provider", None
+        profile_id = f"profile_{uuid.uuid4().hex}"
+        while profile_id in self.__account_settings:
+            profile_id = f"profile_{uuid.uuid4().hex}"
+        settings = _AccountSettings(
+            account_id=profile_id,
+            label=_default_profile_label(provider_id, len(self.__account_settings) + 1),
+            enabled=True,
+            provider=provider_id,
+            taskbar_selected=False,
+        )
+        self.__account_settings[profile_id] = settings
+        self.__account_order.append(profile_id)
+        if not self.__default_account_id:
+            self.__default_account_id = profile_id
+        self.__replace_child_monitor(profile_id)
+        self.__save_manager_settings()
+        self.__sync_child_settings()
+        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__refresh_taskbar_progress()
+        return True, None, self.__build_account_settings_snapshot(profile_id)
+
+    def delete_profile(self, profile_id: str, *, confirmed: bool = False) -> tuple[bool, str | None]:
+        normalized = str(profile_id or "")
+        if normalized not in self.__account_settings:
+            return False, "invalid_profile"
+        if not bool(confirmed):
+            return False, "confirmation_required"
+        paths = self.__account_paths[normalized]
+        owned_roots = (
+            (paths.config_dir, self.__config_dir),
+            (
+                paths.profile_dir,
+                os.path.join(self.__local_base_dir, "windows-supporter"),
+            ),
+        )
+        if any(not self.__is_owned_deletion_path(path, root) for path, root in owned_roots):
+            return False, "unsafe_profile_path"
+        child = self.__children.get(normalized)
+        shutdown = getattr(child, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
+        try:
+            for path, _root in owned_roots:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.exists(path):
+                    os.remove(path)
+        except Exception:
+            return False, "profile_delete_failed"
+        self.__children.pop(normalized, None)
+        self.__account_paths.pop(normalized, None)
+        self.__account_settings.pop(normalized, None)
+        self.__account_order = [item for item in self.__account_order if item != normalized]
+        if self.__default_account_id == normalized:
+            self.__default_account_id = self.__account_order[0] if self.__account_order else ""
+        self.__save_manager_settings()
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None
@@ -349,6 +425,8 @@ class CodexUsageMultiMonitor:
     def get_last_snapshot(self) -> Any:
         # Compatibility API for legacy single-account callers. Aggregate and
         # per-account consumers should use get_runtime_status()["accounts"].
+        if not self.__default_account_id:
+            return None
         return self.__child(self.__default_account_id).get_last_snapshot()
 
     def on_display_topology_changed(self, reason: str = "display_change") -> None:
@@ -361,7 +439,8 @@ class CodexUsageMultiMonitor:
     def show_current_status(self, force_refresh: bool = True, source: str = "manual_query") -> None:
         source_key = str(source or "manual_query")
         if source_key == "manual_login":
-            self.login_account(self.__default_account_id)
+            if self.__default_account_id:
+                self.login_account(self.__default_account_id)
             return
         if bool(force_refresh):
             if self.__dispatch_refresh_worker(
@@ -396,6 +475,8 @@ class CodexUsageMultiMonitor:
         return child.release_profile_session()
 
     def format_captured_at_for_display(self, value: str) -> str:
+        if not self.__default_account_id:
+            return str(value or "")
         child = self.__child(self.__default_account_id)
         formatter = getattr(child, "format_captured_at_for_display", None)
         if callable(formatter):
@@ -403,6 +484,8 @@ class CodexUsageMultiMonitor:
         return str(value or "")
 
     def format_reset_at_for_display(self, value: str, key: str = "") -> str:
+        if not self.__default_account_id:
+            return str(value or "")
         child = self.__child(self.__default_account_id)
         formatter = getattr(child, "format_reset_at_for_display", None)
         if callable(formatter):
@@ -741,6 +824,7 @@ class CodexUsageMultiMonitor:
             "enabled": bool(account.enabled),
             "taskbar_selected": bool(account.taskbar_selected),
             "collection_supported": bool(child_settings.get("collection_supported", True)),
+            "config_dir": str(paths.config_dir),
             "settings_path": str(child_settings.get("settings_path") or paths.settings_path),
             "state_path": str(child_settings.get("state_path") or paths.state_path),
             "profile_dir": str(child_settings.get("profile_dir") or paths.profile_dir),
@@ -877,28 +961,50 @@ class CodexUsageMultiMonitor:
     def __ordered_account_ids(self) -> list[str]:
         ordered = []
         for account_id in self.__account_order:
-            if account_id in ACCOUNT_IDS and account_id not in ordered:
+            if account_id in self.__account_settings and account_id not in ordered:
                 ordered.append(account_id)
-        ordered.extend(account_id for account_id in ACCOUNT_IDS if account_id not in ordered)
+        ordered.extend(
+            account_id for account_id in self.__account_settings if account_id not in ordered
+        )
         return ordered
 
     def __build_account_paths(self) -> dict[str, _AccountPaths]:
         local_app_base = os.path.join(self.__local_base_dir, "windows-supporter")
         result: dict[str, _AccountPaths] = {}
-        for account_id in ACCOUNT_IDS:
+        for account_id in self.__ordered_account_ids():
             provider = self.__account_settings[account_id].provider
-            slot_number = account_id.rsplit("_", 1)[-1]
-            if provider == "codex":
-                config_name = f"codex-account-{slot_number}"
-                profile_name = f"chatgpt-profile-account-{slot_number}"
+            if account_id in LEGACY_ACCOUNT_IDS:
+                slot_number = account_id.rsplit("_", 1)[-1]
+                if provider == "codex":
+                    config_dir = os.path.join(self.__config_dir, f"codex-account-{slot_number}")
+                    profile_dir = os.path.join(
+                        local_app_base,
+                        f"chatgpt-profile-account-{slot_number}",
+                    )
+                else:
+                    config_dir = os.path.join(self.__config_dir, f"cursor-account-{slot_number}")
+                    profile_dir = os.path.join(
+                        local_app_base,
+                        f"cursor-profile-account-{slot_number}",
+                    )
             else:
-                config_name = f"cursor-account-{slot_number}"
-                profile_name = f"cursor-profile-account-{slot_number}"
+                config_dir = os.path.join(
+                    self.__config_dir,
+                    "ai-profiles",
+                    account_id,
+                    provider,
+                )
+                profile_dir = os.path.join(
+                    local_app_base,
+                    "ai-profiles",
+                    account_id,
+                    provider,
+                )
             result[account_id] = _AccountPaths(
                 account_id=account_id,
                 provider=provider,
-                config_dir=os.path.join(self.__config_dir, config_name),
-                profile_dir=os.path.join(local_app_base, profile_name),
+                config_dir=config_dir,
+                profile_dir=profile_dir,
             )
         return result
 
@@ -920,23 +1026,10 @@ class CodexUsageMultiMonitor:
         usage_url = data.get("usage_url")
         if isinstance(usage_url, str) and usage_url.strip():
             self.__usage_url = usage_url.strip()
-        account_order = data.get("profile_order", data.get("account_order"))
-        if isinstance(account_order, list):
-            ordered = [
-                str(account_id)
-                for account_id in account_order
-                if str(account_id) in self.__account_settings
-            ]
-            if ordered:
-                self.__account_order = ordered + [
-                    account_id for account_id in ACCOUNT_IDS if account_id not in ordered
-                ]
-        default_account_id = str(data.get("default_account_id", "") or "")
-        if default_account_id in self.__account_settings:
-            self.__default_account_id = default_account_id
         profiles = data.get("profiles")
         accounts = profiles if isinstance(profiles, list) else data.get("accounts")
-        is_v3 = int(data.get("settings_version", 0) or 0) >= AI_USAGE_SETTINGS_VERSION
+        settings_version = _safe_int(data.get("settings_version", 0), 0)
+        is_v4 = settings_version >= AI_USAGE_SETTINGS_VERSION
         selected_profile_ids = data.get("selected_profile_ids")
         selected_ids = (
             {str(item or "") for item in selected_profile_ids}
@@ -944,46 +1037,61 @@ class CodexUsageMultiMonitor:
             else None
         )
         if isinstance(accounts, list):
-            for raw in accounts[: len(ACCOUNT_IDS)]:
+            loaded_settings: dict[str, _AccountSettings] = {}
+            for index, raw in enumerate(accounts):
                 if not isinstance(raw, dict):
                     continue
                 account_id = str(raw.get("id", "") or "")
-                if account_id not in self.__account_settings:
+                if not _is_valid_profile_id(account_id) or account_id in loaded_settings:
                     continue
-                account = self.__account_settings[account_id]
                 provider = str(raw.get("provider", "codex") or "codex").lower()
-                if provider in SUPPORTED_PROVIDERS:
-                    account.provider = provider
-                label = str(raw.get("label", "") or "").strip()
-                if label:
-                    account.label = label
-                if "enabled" in raw:
-                    account.enabled = bool(raw.get("enabled"))
+                if provider not in SUPPORTED_PROVIDERS:
+                    provider = "codex"
+                enabled = bool(raw.get("enabled", True))
                 if selected_ids is not None:
-                    account.taskbar_selected = account_id in selected_ids
+                    taskbar_selected = account_id in selected_ids
                 elif "taskbar_selected" in raw:
-                    account.taskbar_selected = bool(raw.get("taskbar_selected"))
+                    taskbar_selected = bool(raw.get("taskbar_selected"))
                 else:
-                    account.taskbar_selected = bool(account.enabled)
-                if not is_v3 or account.provider == "codex":
-                    self.__legacy_codex_accounts[account_id] = {
-                        "id": account_id,
-                        "label": account.label,
-                        "enabled": bool(account.enabled),
-                    }
-        legacy_codex_accounts = data.get("legacy_codex_accounts")
-        if isinstance(legacy_codex_accounts, list):
-            for raw in legacy_codex_accounts:
-                if not isinstance(raw, dict):
-                    continue
-                account_id = str(raw.get("id", "") or "")
-                if account_id not in self.__legacy_codex_accounts:
-                    continue
-                self.__legacy_codex_accounts[account_id] = {
-                    "id": account_id,
-                    "label": str(raw.get("label") or DEFAULT_LABELS[account_id]),
-                    "enabled": bool(raw.get("enabled", True)),
-                }
+                    taskbar_selected = bool(enabled and not is_v4)
+                loaded_settings[account_id] = _AccountSettings(
+                    account_id=account_id,
+                    label=str(raw.get("label") or _default_profile_label(provider, index + 1)),
+                    enabled=enabled,
+                    provider=provider,
+                    taskbar_selected=taskbar_selected,
+                )
+            if is_v4 or loaded_settings:
+                self.__account_settings = loaded_settings
+
+        account_order = data.get("profile_order", data.get("account_order"))
+        if isinstance(account_order, list):
+            ordered = []
+            for account_id in account_order:
+                normalized = str(account_id or "")
+                if normalized in self.__account_settings and normalized not in ordered:
+                    ordered.append(normalized)
+            self.__account_order = ordered + [
+                account_id for account_id in self.__account_settings if account_id not in ordered
+            ]
+        else:
+            self.__account_order = list(self.__account_settings)
+
+        selected_count = 0
+        for profile_id in self.__ordered_account_ids():
+            settings = self.__account_settings[profile_id]
+            if not settings.taskbar_selected:
+                continue
+            selected_count += 1
+            if selected_count > TASKBAR_PROFILE_LIMIT:
+                settings.taskbar_selected = False
+
+        default_account_id = str(data.get("default_account_id", "") or "")
+        if default_account_id in self.__account_settings:
+            self.__default_account_id = default_account_id
+        else:
+            ordered_ids = self.__ordered_account_ids()
+            self.__default_account_id = ordered_ids[0] if ordered_ids else ""
         return
 
     def __save_manager_settings(self) -> None:
@@ -1016,27 +1124,8 @@ class CodexUsageMultiMonitor:
             ],
             "profiles": profiles,
             "accounts": profiles,
-            "legacy_codex_accounts": [
-                dict(self.__legacy_codex_accounts[account_id])
-                for account_id in self.__ordered_account_ids()
-            ],
         }
         self.__write_json_file(self.__settings_path, payload)
-        rollback_payload = {
-            "settings_version": 2,
-            "enabled": bool(self.__enabled),
-            "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
-            "interval_sec": float(self.__interval_sec),
-            "tooltip_duration_ms": int(self.__tooltip_duration_ms),
-            "usage_url": str(self.__usage_url),
-            "default_account_id": str(self.__default_account_id),
-            "account_order": list(self.__ordered_account_ids()),
-            "accounts": [
-                dict(self.__legacy_codex_accounts[account_id])
-                for account_id in self.__ordered_account_ids()
-            ],
-        }
-        self.__write_json_file(self.__legacy_manager_settings_path, rollback_payload)
         return
 
     def __read_legacy_settings(self) -> dict | None:
@@ -1087,6 +1176,55 @@ class CodexUsageMultiMonitor:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copy2(source, target)
         return
+
+    def __backup_file_once(self, source: str, target: str) -> None:
+        if not os.path.isfile(source) or os.path.exists(target):
+            return
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        temp_path = f"{target}.{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copy2(source, temp_path)
+            if not os.path.exists(target):
+                os.replace(temp_path, target)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+        return
+
+    def __is_owned_deletion_path(self, path: str, root: str) -> bool:
+        candidate = os.path.abspath(path)
+        boundary = os.path.abspath(root)
+        try:
+            if os.path.normcase(os.path.commonpath((candidate, boundary))) != os.path.normcase(boundary):
+                return False
+            if os.path.normcase(candidate) == os.path.normcase(boundary):
+                return False
+            real_candidate = os.path.realpath(candidate)
+            real_boundary = os.path.realpath(boundary)
+            if os.path.normcase(os.path.commonpath((real_candidate, real_boundary))) != os.path.normcase(
+                real_boundary
+            ):
+                return False
+            relative = os.path.relpath(candidate, boundary)
+        except (OSError, ValueError):
+            return False
+        current = boundary
+        for part in relative.split(os.sep):
+            current = os.path.join(current, part)
+            if not os.path.lexists(current):
+                continue
+            try:
+                info = os.lstat(current)
+            except OSError:
+                return False
+            attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+            reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+            if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+                return False
+        return True
 
     def __read_json_file(self, path: str) -> dict | None:
         try:
@@ -1257,6 +1395,22 @@ def _normalize_tooltip_duration_ms(value: Any, fallback: int) -> int:
     if duration < 1200:
         duration = 1200
     return int(duration)
+
+
+def _safe_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(fallback)
+
+
+def _is_valid_profile_id(value: str) -> bool:
+    return PROFILE_ID_PATTERN.fullmatch(str(value or "")) is not None
+
+
+def _default_profile_label(provider: str, index: int) -> str:
+    provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
+    return f"{provider_name} {max(1, int(index))}"
 
 
 def _optional_percent(value: Any) -> float | None:

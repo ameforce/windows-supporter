@@ -197,7 +197,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             manager, children = self._build_manager(tmp)
             snapshot = manager.get_settings_snapshot()
 
-            self.assertEqual(snapshot["settings_version"], 3)
+            self.assertEqual(snapshot["settings_version"], 4)
             self.assertEqual(snapshot["profile_order"], ["account_1", "account_2"])
             self.assertEqual(snapshot["selected_profile_ids"], ["account_1", "account_2"])
             self.assertEqual(
@@ -231,7 +231,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 copied = json.load(fp)
             self.assertEqual(copied["interval_sec"], 33.0)
 
-    def test_v2_manager_settings_migrate_atomically_to_v3_and_keep_rollback_mirror(self):
+    def test_v2_manager_settings_migrate_atomically_to_v4_and_keep_rollback_files_immutable(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = os.path.join(tmp, "config")
             os.makedirs(config_dir, exist_ok=True)
@@ -255,7 +255,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             manager, _ = self._build_manager(tmp)
             snapshot = manager.get_settings_snapshot()
 
-            self.assertEqual(snapshot["settings_version"], 3)
+            self.assertEqual(snapshot["settings_version"], 4)
             self.assertEqual(snapshot["profile_order"], ["account_2", "account_1"])
             self.assertEqual(snapshot["selected_profile_ids"], ["account_1"])
             self.assertEqual(
@@ -266,7 +266,10 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(ai_settings_path))
             with open(ai_settings_path, encoding="utf-8") as fp:
                 persisted = json.load(fp)
-            self.assertEqual(persisted["settings_version"], 3)
+            self.assertEqual(persisted["settings_version"], 4)
+
+            with open(legacy_manager_path, encoding="utf-8") as fp:
+                rollback_before = json.load(fp)
 
             ok, error = manager.update_settings(
                 {
@@ -291,15 +294,13 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertTrue(ok, error)
             with open(legacy_manager_path, encoding="utf-8") as fp:
                 rollback = json.load(fp)
-            rollback_by_id = {item["id"]: item for item in rollback["accounts"]}
-            self.assertEqual(rollback["settings_version"], 2)
-            self.assertEqual(rollback_by_id["account_2"]["label"], "기존 B")
-            self.assertEqual(rollback_by_id["account_1"]["label"], "새 Codex")
+            self.assertEqual(rollback, rollback_before)
+            self.assertTrue(os.path.isfile(os.path.join(config_dir, "codex_usage_multi_settings.v2.backup.json")))
 
             manager_again, _ = self._build_manager(tmp)
             self.assertEqual(manager_again.get_settings_snapshot()["profiles"][0]["provider"], "cursor")
 
-    def test_profiles_allow_all_provider_combinations_and_reject_a_third_slot_or_selection(self):
+    def test_profiles_allow_all_provider_combinations_and_more_than_two_saved_profiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             for providers in (
                 ("codex", "codex"),
@@ -331,26 +332,199 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 self.assertEqual([item["provider"] for item in snapshot["profiles"]], list(providers))
                 self.assertEqual(len(snapshot["selected_profile_ids"]), 2)
 
-            manager, _ = self._build_manager(os.path.join(tmp, "reject"))
-            before = manager.get_settings_snapshot()
+            manager, _ = self._build_manager(os.path.join(tmp, "dynamic"))
             ok, error = manager.update_settings(
                 {
                     "profiles": [
-                        {"id": "account_1", "provider": "codex"},
-                        {"id": "account_2", "provider": "cursor"},
-                        {"id": "account_3", "provider": "cursor"},
+                        {"id": "account_1", "provider": "codex", "taskbar_selected": True},
+                        {"id": "account_2", "provider": "cursor", "taskbar_selected": True},
+                        {"id": "profile_00000000000000000000000000000003", "provider": "cursor"},
+                    ]
+                }
+            )
+            self.assertTrue(ok, error)
+            self.assertEqual(len(manager.get_settings_snapshot()["profiles"]), 3)
+
+            before = manager.get_settings_snapshot()
+
+            ok, error = manager.update_settings(
+                {
+                    "selected_profile_ids": [
+                        "account_1",
+                        "account_2",
+                        "profile_00000000000000000000000000000003",
                     ]
                 }
             )
             self.assertFalse(ok)
-            self.assertEqual(error, "profile_limit")
+            self.assertEqual(error, "taskbar_profile_limit")
             self.assertEqual(manager.get_settings_snapshot(), before)
 
-            ok, error = manager.update_settings(
-                {"selected_profile_ids": ["account_1", "account_2", "account_3"]}
-            )
+    def test_v3_settings_migrate_once_to_v4_and_preserve_raw_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            source = {
+                "settings_version": 3,
+                "default_account_id": "account_2",
+                "profile_order": ["account_2", "account_1"],
+                "selected_profile_ids": ["account_1"],
+                "profiles": [
+                    {"id": "account_2", "provider": "cursor", "label": "Cursor 기존", "enabled": True},
+                    {"id": "account_1", "provider": "codex", "label": "Codex 기존", "enabled": False},
+                ],
+            }
+            settings_path = os.path.join(config_dir, "ai_usage_settings.json")
+            with open(settings_path, "w", encoding="utf-8") as fp:
+                json.dump(source, fp, ensure_ascii=False)
+
+            manager, _ = self._build_manager(tmp)
+            snapshot = manager.get_settings_snapshot()
+
+            self.assertEqual(snapshot["settings_version"], 4)
+            self.assertEqual(snapshot["profile_order"], ["account_2", "account_1"])
+            self.assertEqual(snapshot["default_account_id"], "account_2")
+            backup_path = os.path.join(config_dir, "ai_usage_settings.v3.backup.json")
+            with open(backup_path, encoding="utf-8") as fp:
+                self.assertEqual(json.load(fp), source)
+
+            manager.update_settings({"profiles": snapshot["profiles"]})
+            with open(backup_path, encoding="utf-8") as fp:
+                self.assertEqual(json.load(fp), source)
+
+    def test_profiles_support_zero_one_three_and_twenty_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for count in (0, 1, 3, 20):
+                case_dir = os.path.join(tmp, str(count))
+                config_dir = os.path.join(case_dir, "config")
+                os.makedirs(config_dir, exist_ok=True)
+                profiles = []
+                for index in range(count):
+                    profile_id = (
+                        f"account_{index + 1}"
+                        if index < 2
+                        else f"profile_{index:032x}"
+                    )
+                    profiles.append(
+                        {
+                            "id": profile_id,
+                            "provider": "cursor" if index % 2 else "codex",
+                            "label": f"Profile {index + 1}",
+                            "enabled": True,
+                            "taskbar_selected": index < 2,
+                        }
+                    )
+                with open(os.path.join(config_dir, "ai_usage_settings.json"), "w", encoding="utf-8") as fp:
+                    json.dump(
+                        {
+                            "settings_version": 4,
+                            "profiles": profiles,
+                            "profile_order": [item["id"] for item in profiles],
+                            "selected_profile_ids": [item["id"] for item in profiles[:2]],
+                            "default_account_id": profiles[0]["id"] if profiles else "",
+                        },
+                        fp,
+                    )
+                manager, _ = self._build_manager(case_dir)
+                snapshot = manager.get_settings_snapshot()
+                self.assertEqual(len(snapshot["profiles"]), count)
+                self.assertEqual(snapshot["profile_order"], [item["id"] for item in profiles])
+                self.assertLessEqual(len(snapshot["selected_profile_ids"]), 2)
+                if count == 0:
+                    self.assertEqual(snapshot["default_account_id"], "")
+                if count >= 1:
+                    self.assertTrue(snapshot["profiles"][0]["config_dir"].endswith("codex-account-1"))
+
+    def test_add_delete_profile_uses_opaque_id_and_removes_only_owned_profile_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+
+            ok, error, profile = manager.add_profile("cursor")
+
+            self.assertTrue(ok, error)
+            self.assertIsNotNone(profile)
+            profile_id = profile["id"]
+            self.assertRegex(profile_id, r"^profile_[0-9a-f]{32}$")
+            self.assertTrue(profile["enabled"])
+            self.assertFalse(profile["taskbar_selected"])
+            self.assertEqual(manager.get_settings_snapshot()["profile_order"][-1], profile_id)
+
+            for key in ("config_dir", "profile_dir"):
+                os.makedirs(profile[key], exist_ok=True)
+                with open(os.path.join(profile[key], "owned.txt"), "w", encoding="utf-8") as fp:
+                    fp.write("owned")
+            unrelated = os.path.join(tmp, "unrelated")
+            os.makedirs(unrelated, exist_ok=True)
+
+            ok, error = manager.delete_profile(profile_id, confirmed=False)
             self.assertFalse(ok)
-            self.assertEqual(error, "taskbar_profile_limit")
+            self.assertEqual(error, "confirmation_required")
+            self.assertTrue(os.path.isdir(profile["config_dir"]))
+
+            ok, error = manager.delete_profile(profile_id, confirmed=True)
+            self.assertTrue(ok, error)
+            self.assertFalse(os.path.exists(profile["config_dir"]))
+            self.assertFalse(os.path.exists(profile["profile_dir"]))
+            self.assertTrue(os.path.isdir(unrelated))
+            self.assertNotIn(profile_id, manager.get_settings_snapshot()["profile_order"])
+
+    def test_provider_round_trip_preserves_dynamic_profile_id_and_provider_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            codex_paths = (created["config_dir"], created["profile_dir"])
+
+            payload = manager.get_settings_snapshot()["profiles"]
+            for item in payload:
+                if item["id"] == profile_id:
+                    item["provider"] = "cursor"
+            ok, error = manager.update_settings({"profiles": payload})
+            self.assertTrue(ok, error)
+            cursor_profile = next(
+                item for item in manager.get_settings_snapshot()["profiles"] if item["id"] == profile_id
+            )
+            self.assertNotEqual((cursor_profile["config_dir"], cursor_profile["profile_dir"]), codex_paths)
+
+            payload = manager.get_settings_snapshot()["profiles"]
+            for item in payload:
+                if item["id"] == profile_id:
+                    item["provider"] = "codex"
+            ok, error = manager.update_settings({"profiles": payload})
+            self.assertTrue(ok, error)
+            restored = next(
+                item for item in manager.get_settings_snapshot()["profiles"] if item["id"] == profile_id
+            )
+            self.assertEqual(restored["id"], profile_id)
+            self.assertEqual((restored["config_dir"], restored["profile_dir"]), codex_paths)
+
+    def test_delete_profile_rejects_path_outside_app_owned_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            outside = os.path.join(tmp, "outside")
+            os.makedirs(outside, exist_ok=True)
+            marker = os.path.join(outside, "keep.txt")
+            with open(marker, "w", encoding="utf-8") as fp:
+                fp.write("keep")
+
+            paths = manager._CodexUsageMultiMonitor__account_paths[profile_id]
+            manager._CodexUsageMultiMonitor__account_paths[profile_id] = type(paths)(
+                account_id=profile_id,
+                provider=paths.provider,
+                config_dir=outside,
+                profile_dir=paths.profile_dir,
+            )
+
+            ok, error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "unsafe_profile_path")
+            self.assertTrue(os.path.isfile(marker))
+            self.assertIn(profile_id, manager.get_settings_snapshot()["profile_order"])
 
     def test_runtime_exposes_provider_neutral_profiles_and_legacy_accounts_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
