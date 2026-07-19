@@ -1363,11 +1363,13 @@ class CodexUsageMultiMonitor:
             if bool(self.__closing):
                 return False
             self.__refresh_queue.append((fn, bool(refresh_taskbar)))
-            if bool(self.__refresh_inflight):
-                if bool(refresh_taskbar):
-                    self.__refresh_taskbar_progress()
-                return True
-            self.__refresh_inflight = True
+            already_inflight = bool(self.__refresh_inflight)
+            if not already_inflight:
+                self.__refresh_inflight = True
+        if already_inflight:
+            if bool(refresh_taskbar):
+                self.__refresh_taskbar_progress()
+            return True
 
         def worker() -> None:
             refresh_after = False
