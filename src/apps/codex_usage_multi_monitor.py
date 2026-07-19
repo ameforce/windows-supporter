@@ -138,6 +138,8 @@ class CodexUsageMultiMonitor:
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__refresh_inflight = False
         self.__refresh_lock = threading.Lock()
+        self.__unsettled_children: list[Any] = []
+        self.__deferred_cleanup_transaction_ids: set[str] = set()
         self.__root = None
         self.__event_queue = None
         self.__taskbar_progress = None
@@ -230,7 +232,9 @@ class CodexUsageMultiMonitor:
 
     def shutdown(self) -> None:
         self.__clear_monitor_schedule()
-        for child in self.__children.values():
+        shutdown_children = [*self.__children.values(), *self.__unsettled_children]
+        self.__unsettled_children = []
+        for child in shutdown_children:
             shutdown = getattr(child, "shutdown", None)
             if callable(shutdown):
                 try:
@@ -457,7 +461,14 @@ class CodexUsageMultiMonitor:
         staged_children: dict[str, tuple[_AccountPaths, Any]] = {}
         staged_rollback_settings: dict[str, dict[str, Any]] = {}
         updated_existing_ids: list[str] = []
+        existing_update_ids = [
+            profile_id
+            for profile_id in candidate_order
+            if profile_id not in changed_providers
+        ]
+        preexisting_recovery_ids = set(self.__settings_recovery_profile_ids)
         try:
+            self.__prepare_settings_recovery(existing_update_ids)
             for profile_id in changed_providers:
                 staged_children[profile_id] = self.__stage_child_monitor(
                     profile_id,
@@ -504,6 +515,7 @@ class CodexUsageMultiMonitor:
                 usage_url=candidate_usage_url,
             )
         except Exception:
+            rollback_failed_ids: set[str] = set()
             for profile_id in reversed(updated_existing_ids):
                 try:
                     self.__apply_child_settings(
@@ -515,7 +527,7 @@ class CodexUsageMultiMonitor:
                         usage_url=old_usage_url,
                     )
                 except Exception:
-                    self.__replace_child_after_failed_settings_rollback(
+                    recovered = self.__replace_child_after_failed_settings_rollback(
                         profile_id,
                         old_settings[profile_id],
                         enabled=old_enabled,
@@ -523,6 +535,8 @@ class CodexUsageMultiMonitor:
                         tooltip_duration_ms=old_tooltip_duration_ms,
                         usage_url=old_usage_url,
                     )
+                    if not recovered:
+                        rollback_failed_ids.add(profile_id)
             for profile_id, (_paths, child) in staged_children.items():
                 rollback = staged_rollback_settings.get(profile_id)
                 updater = getattr(child, "update_settings", None)
@@ -537,6 +551,12 @@ class CodexUsageMultiMonitor:
                         shutdown()
                     except Exception:
                         pass
+            clear_ids = (
+                set(existing_update_ids)
+                - preexisting_recovery_ids
+                - rollback_failed_ids
+            )
+            self.__complete_settings_recovery(clear_ids)
             return False, "settings_save_failed"
         old_children = {
             profile_id: self.__children.get(profile_id)
@@ -560,6 +580,9 @@ class CodexUsageMultiMonitor:
                     shutdown()
                 except Exception:
                     pass
+        self.__complete_settings_recovery(
+            set(existing_update_ids) - preexisting_recovery_ids
+        )
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None
@@ -595,6 +618,34 @@ class CodexUsageMultiMonitor:
         candidate_order = [*self.__account_order, profile_id]
         candidate_default = self.__default_account_id or profile_id
         planned_paths = self.__build_profile_paths(profile_id, provider_id)
+        add_transaction_id = uuid.uuid4().hex
+        local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
+        add_cleanup_entries = [
+            {
+                "transaction_id": add_transaction_id,
+                "profile_id": profile_id,
+                "provider": provider_id,
+                "path_kind": path_kind,
+                "original": path,
+                "path": f"{path}.delete-{uuid.uuid4().hex}",
+                "root": root,
+            }
+            for path_kind, path, root in (
+                ("config", planned_paths.config_dir, self.__config_dir),
+                ("profile", planned_paths.profile_dir, local_app_root),
+            )
+        ]
+        if any(
+            self.__normalize_cleanup_entry(entry) is None
+            for entry in add_cleanup_entries
+        ):
+            return False, "profile_add_failed", None
+        try:
+            self.__persist_pending_profile_cleanup(
+                [*self.__read_valid_cleanup_entries(), *add_cleanup_entries]
+            )
+        except Exception:
+            return False, "profile_add_failed", None
         path_existed_before = {
             os.path.normcase(os.path.abspath(path)): os.path.lexists(path)
             for path in (planned_paths.config_dir, planned_paths.profile_dir)
@@ -617,24 +668,31 @@ class CodexUsageMultiMonitor:
                 default_account_id=candidate_default,
             )
         except Exception:
+            shutdown_succeeded = True
             shutdown = getattr(staged_child, "shutdown", None)
             if callable(shutdown):
                 try:
                     shutdown()
                 except Exception:
-                    pass
-            self.__cleanup_failed_add_paths(
-                profile_id,
-                staged_paths or planned_paths,
-                planned_paths,
-                path_existed_before,
-            )
+                    shutdown_succeeded = False
+            if shutdown_succeeded:
+                self.__cleanup_failed_add_paths(
+                    profile_id,
+                    staged_paths or planned_paths,
+                    planned_paths,
+                    path_existed_before,
+                )
+                self.__discard_cleanup_transaction(add_transaction_id)
+            elif staged_child is not None:
+                self.__unsettled_children.append(staged_child)
+                self.__deferred_cleanup_transaction_ids.add(add_transaction_id)
             return False, "profile_add_failed", None
         self.__account_settings = candidate_settings
         self.__account_order = candidate_order
         self.__default_account_id = candidate_default
         self.__account_paths[profile_id] = staged_paths
         self.__children[profile_id] = staged_child
+        self.__discard_cleanup_transaction(add_transaction_id)
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None, self.__build_account_settings_snapshot(profile_id)
@@ -682,13 +740,33 @@ class CodexUsageMultiMonitor:
         except Exception:
             return False, "profile_delete_failed"
         child = self.__children.get(normalized)
+        recovery_was_pending = normalized in self.__settings_recovery_profile_ids
+        try:
+            self.__prepare_settings_recovery([normalized])
+        except Exception:
+            self.__discard_cleanup_transaction(transaction_id)
+            return False, "profile_delete_failed"
         shutdown = getattr(child, "shutdown", None)
         if callable(shutdown):
             try:
                 shutdown()
             except Exception:
                 self.__discard_cleanup_transaction(transaction_id)
+                if child is not None:
+                    self.__unsettled_children.append(child)
+                paths = self.__account_paths.get(normalized)
+                if paths is not None:
+                    recovery_child = _RecoveryPendingChild(paths)
+                    self.__children[normalized] = recovery_child
+                    if self.__root is not None:
+                        self.__attach_child(
+                            recovery_child,
+                            self.__root,
+                            self.__event_queue,
+                        )
                 return False, "profile_delete_failed"
+        if not recovery_was_pending:
+            self.__complete_settings_recovery({normalized})
         quarantined: list[dict[str, str]] = []
         try:
             for entry in deletion_entries:
@@ -1717,6 +1795,9 @@ class CodexUsageMultiMonitor:
         for entry in self.__read_valid_cleanup_entries():
             path = entry["path"]
             original = entry["original"]
+            if entry["transaction_id"] in self.__deferred_cleanup_transaction_ids:
+                pending.append(entry)
+                continue
             try:
                 if entry["profile_id"] in self.__account_settings:
                     if os.path.lexists(path) and not os.path.lexists(original):
@@ -1740,6 +1821,8 @@ class CodexUsageMultiMonitor:
         except Exception:
             pass
         self.__reconcile_recovery_children(previous_recovery_pending)
+        if isinstance(getattr(self, "_CodexUsageMultiMonitor__children", None), dict):
+            self.__retry_pending_settings_recovery()
         return
 
     def __reconcile_recovery_children(self, previous_profile_ids: set[str]) -> None:
@@ -1839,6 +1922,29 @@ class CodexUsageMultiMonitor:
             pass
         return
 
+    def __prepare_settings_recovery(self, profile_ids: list[str]) -> None:
+        previous = set(self.__settings_recovery_profile_ids)
+        self.__settings_recovery_profile_ids.update(
+            profile_id for profile_id in profile_ids if _is_valid_profile_id(profile_id)
+        )
+        try:
+            self.__persist_settings_recovery_profile_ids()
+        except Exception:
+            self.__settings_recovery_profile_ids = previous
+            raise
+        return
+
+    def __complete_settings_recovery(self, profile_ids: set[str]) -> None:
+        if not profile_ids:
+            return
+        previous = set(self.__settings_recovery_profile_ids)
+        self.__settings_recovery_profile_ids.difference_update(profile_ids)
+        try:
+            self.__persist_settings_recovery_profile_ids()
+        except Exception:
+            self.__settings_recovery_profile_ids = previous
+        return
+
     def __retry_pending_settings_recovery(self) -> None:
         for profile_id in list(self.__settings_recovery_profile_ids):
             account = self.__account_settings.get(profile_id)
@@ -1846,6 +1952,11 @@ class CodexUsageMultiMonitor:
             paths = self.__account_paths.get(profile_id)
             if account is None or child is None or paths is None:
                 self.__settings_recovery_profile_ids.discard(profile_id)
+                continue
+            if (
+                profile_id in self.__recovery_pending_profile_ids
+                or isinstance(child, _RecoveryPendingChild)
+            ):
                 continue
             try:
                 self.__apply_child_settings(
@@ -2141,7 +2252,7 @@ class CodexUsageMultiMonitor:
         interval_sec: float,
         tooltip_duration_ms: int,
         usage_url: str,
-    ) -> None:
+    ) -> bool:
         original_child = self.__children.get(account_id)
         original_paths = self.__account_paths[account_id]
         replacement_paths = original_paths
@@ -2170,9 +2281,9 @@ class CodexUsageMultiMonitor:
             replacement_child = _RecoveryPendingChild(original_paths)
             if self.__root is not None:
                 self.__attach_child(replacement_child, self.__root, self.__event_queue)
-            self.__set_settings_recovery_pending(account_id, True)
+            recovered = False
         else:
-            self.__set_settings_recovery_pending(account_id, False)
+            recovered = True
         self.__account_paths[account_id] = replacement_paths
         self.__children[account_id] = replacement_child
         shutdown_original = getattr(original_child, "shutdown", None)
@@ -2181,7 +2292,7 @@ class CodexUsageMultiMonitor:
                 shutdown_original()
             except Exception:
                 pass
-        return
+        return recovered
 
     def __stage_child_monitor(
         self,
