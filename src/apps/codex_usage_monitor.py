@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import shutil
+import stat
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -17,6 +19,40 @@ from src.apps.codex_usage_playwright_session import (
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
+
+
+def _is_non_reparse_descendant(candidate: str, boundary: str) -> bool:
+    target = os.path.abspath(candidate)
+    root = os.path.abspath(boundary)
+    try:
+        if os.path.normcase(os.path.commonpath((target, root))) != os.path.normcase(root):
+            return False
+        if os.path.normcase(target) == os.path.normcase(root):
+            return False
+        real_target = os.path.realpath(target)
+        real_root = os.path.realpath(root)
+        if os.path.normcase(os.path.commonpath((real_target, real_root))) != os.path.normcase(
+            real_root
+        ):
+            return False
+        relative = os.path.relpath(target, root)
+    except (OSError, ValueError):
+        return False
+    current = root
+    for part in ("", *relative.split(os.sep)):
+        if part:
+            current = os.path.join(current, part)
+        if not os.path.lexists(current):
+            continue
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+        if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+            return False
+    return True
 
 
 USAGE_METRIC_KEYS = (
@@ -2077,7 +2113,7 @@ class CodexUsageMonitor:
                 and re.fullmatch(r"profile_[0-9a-f]{32}", relative_parts[1])
                 and relative_parts[2] == "codex"
             ):
-                return True
+                return _is_non_reparse_descendant(target, default_parent)
             parent = self.__lib.os.path.basename(parent_dir)
             allowed_leafs = {
                 "chatgpt-profile",
@@ -2092,7 +2128,7 @@ class CodexUsageMonitor:
                 return False
         except Exception:
             return False
-        return True
+        return _is_non_reparse_descendant(target, default_parent)
 
     def __normalize_local_path(self, value: str) -> str:
         raw = str(value or "").strip()

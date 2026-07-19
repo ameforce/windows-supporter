@@ -558,6 +558,46 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertTrue(ok, message)
             self.assertFalse(profile_dir.exists())
 
+    def test_release_rejects_dynamic_profile_resolving_outside_app_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            profile_id = f"profile_{'d' * 32}"
+            profile_dir = (
+                Path(tmp)
+                / "windows-supporter"
+                / "ai-profiles"
+                / profile_id
+                / "cursor"
+            )
+            profile_dir.mkdir(parents=True)
+            marker = profile_dir / "preserve.txt"
+            marker.write_text("outside-backed", encoding="utf-8")
+            outside = Path(tmp) / "outside" / "cursor"
+            real_realpath = os.path.realpath
+
+            def junction_realpath(path):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+                    os.path.abspath(profile_dir)
+                ):
+                    return str(outside)
+                return real_realpath(path)
+
+            monitor = CursorUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                profile_id=profile_id,
+                browser_session_factory=lambda _config: self._Session([]),
+            )
+
+            with patch(
+                "src.apps.cursor_usage_monitor.os.path.realpath",
+                side_effect=junction_realpath,
+            ):
+                ok, _message = monitor.release_profile_session()
+
+            self.assertFalse(ok)
+            self.assertTrue(marker.is_file())
+
     def test_release_rejects_profile_outside_windows_supporter_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             profile_dir = Path(tmp) / "external-browser-profile"

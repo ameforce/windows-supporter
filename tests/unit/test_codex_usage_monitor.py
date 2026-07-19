@@ -257,6 +257,46 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertTrue(ok, message)
             self.assertFalse(os.path.exists(profile_dir))
 
+    def test_logout_rejects_dynamic_profile_resolving_outside_app_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = os.path.join(
+                tmp,
+                "windows-supporter",
+                "ai-profiles",
+                f"profile_{'c' * 32}",
+                "codex",
+            )
+            os.makedirs(profile_dir, exist_ok=True)
+            marker = os.path.join(profile_dir, "preserve.txt")
+            with open(marker, "w", encoding="utf-8") as fp:
+                fp.write("outside-backed")
+            outside = os.path.join(tmp, "outside", "codex")
+            real_realpath = os.path.realpath
+
+            def junction_realpath(path):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+                    os.path.abspath(profile_dir)
+                ):
+                    return outside
+                return real_realpath(path)
+
+            session = self._BrowserSession()
+            with patch.dict(os.environ, {"LOCALAPPDATA": tmp}):
+                monitor = CodexUsageMonitor(
+                    config_dir=os.path.join(tmp, "config"),
+                    profile_dir=profile_dir,
+                    browser_session_factory=lambda _config: session,
+                )
+
+            with patch(
+                "src.apps.codex_usage_monitor.os.path.realpath",
+                side_effect=junction_realpath,
+            ):
+                ok, _message = monitor.release_profile_session()
+
+            self.assertFalse(ok)
+            self.assertTrue(os.path.isfile(marker))
+
     def test_pending_login_timeout_closes_headed_session_after_fifteen_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session = self._BrowserSession()

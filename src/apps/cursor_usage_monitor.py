@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import threading
 from typing import Any, Protocol
 import uuid
@@ -33,6 +34,40 @@ from src.apps.cursor_usage_playwright_worker import run_cursor_playwright_worker
 
 
 CURSOR_USAGE_URL = "https://cursor.com/dashboard/usage"
+
+
+def _is_non_reparse_descendant(candidate: str, boundary: str) -> bool:
+    target = os.path.abspath(candidate)
+    root = os.path.abspath(boundary)
+    try:
+        if os.path.normcase(os.path.commonpath((target, root))) != os.path.normcase(root):
+            return False
+        if os.path.normcase(target) == os.path.normcase(root):
+            return False
+        real_target = os.path.realpath(target)
+        real_root = os.path.realpath(root)
+        if os.path.normcase(os.path.commonpath((real_target, real_root))) != os.path.normcase(
+            real_root
+        ):
+            return False
+        relative = os.path.relpath(target, root)
+    except (OSError, ValueError):
+        return False
+    current = root
+    for part in ("", *relative.split(os.sep)):
+        if part:
+            current = os.path.join(current, part)
+        if not os.path.lexists(current):
+            continue
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+        if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+            return False
+    return True
 CURSOR_COLLECTION_MODE = "visible_dashboard_summary"
 MIN_CURSOR_REFRESH_INTERVAL_SEC = 300.0
 
@@ -651,10 +686,23 @@ class CursorUsageMonitor:
             and os.path.basename(grandparent_dir).lower() == "ai-profiles"
             and os.path.basename(great_grandparent_dir).lower() == "windows-supporter"
         )
-        managed_name = basename.startswith("cursor-profile-") or (
-            parent_basename == "cursor-usage-profiles" and bool(basename)
-        ) or dynamic_managed
+        managed_name = (
+            basename.startswith("cursor-profile-")
+            or (parent_basename == "cursor-usage-profiles" and bool(basename))
+            or dynamic_managed
+        )
         if "windows-supporter" not in components or not managed_name:
+            return False, "Windows Supporter가 관리하는 Cursor 전용 프로필만 연결 해제할 수 있습니다."
+        if dynamic_managed:
+            app_root = great_grandparent_dir
+        elif parent_basename == "cursor-usage-profiles":
+            app_root = os.path.dirname(os.path.dirname(profile_dir))
+        else:
+            app_root = os.path.dirname(profile_dir)
+        if (
+            os.path.basename(app_root).lower() != "windows-supporter"
+            or not _is_non_reparse_descendant(profile_dir, app_root)
+        ):
             return False, "Windows Supporter가 관리하는 Cursor 전용 프로필만 연결 해제할 수 있습니다."
         if not os.path.isdir(profile_dir):
             return True, "이미 연결 해제된 상태입니다."
