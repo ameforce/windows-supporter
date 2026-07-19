@@ -1313,7 +1313,7 @@ class CodexUsageSettingsView:
         except Exception:
             return
 
-    def _schedule_autosave(self) -> None:
+    def _schedule_autosave(self, *, immediate_fallback: bool = True) -> None:
         if bool(self._loading_settings):
             return
         if self._profile_settings_mutation_blocked():
@@ -1327,7 +1327,8 @@ class CodexUsageSettingsView:
                 return
             except Exception:
                 self._autosave_after_id = None
-        self._autosave_now()
+        if bool(immediate_fallback):
+            self._autosave_now()
         return
 
     def _cancel_pending_autosave(self) -> None:
@@ -1455,7 +1456,7 @@ class CodexUsageSettingsView:
             return False
         ok, error, _provider_changed = self._apply_settings_update(prepared)
         if not ok and bool(reschedule_transient) and error == "profile_refresh_busy":
-            self._schedule_autosave()
+            self._schedule_autosave(immediate_fallback=False)
         return bool(ok)
 
     def _build_account_settings_payload(self) -> list[dict[str, Any]]:

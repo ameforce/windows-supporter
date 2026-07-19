@@ -1355,6 +1355,38 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(len(monitor.update_payloads), 2)
         self.assertIsNone(view._autosave_after_id)
 
+    def test_autosave_busy_retry_does_not_recurse_when_after_registration_fails(self) -> None:
+        class _AlwaysBusyMonitor:
+            def __init__(self):
+                self.update_payloads = []
+
+            def get_settings_snapshot(self):
+                return {"accounts": []}
+
+            def update_settings(self, payload):
+                self.update_payloads.append(dict(payload))
+                return False, "profile_refresh_busy"
+
+        class _AfterFailureWidget:
+            def after(self, _delay_ms, _callback):
+                raise RuntimeError("window already destroyed")
+
+        monitor = _AlwaysBusyMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._win = _AfterFailureWidget()
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._set_status = lambda *_args, **_kwargs: None
+
+        result = view._autosave_now()
+
+        self.assertFalse(result)
+        self.assertEqual(len(monitor.update_payloads), 1)
+        self.assertIsNone(view._autosave_after_id)
+
     def test_mount_hides_legacy_global_login_logout_buttons_for_multi_account_settings(self) -> None:
         class _FakeMonitor:
             def get_settings_snapshot(self):
