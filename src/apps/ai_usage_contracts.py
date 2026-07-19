@@ -27,6 +27,21 @@ class UsageState(StrEnum):
     RECYCLE = "recycle"
 
 
+@unique
+class UsageErrorType(StrEnum):
+    NONE = ""
+    AUTH = "auth"
+    PROFILE_IN_USE = "profile_in_use"
+    TIMEOUT = "timeout"
+    RATE_LIMITED = "rate_limited"
+    CRASH = "crash"
+    RECYCLE = "recycle"
+    DOM_DRIFT = "dom_drift"
+    UNSUPPORTED_CONTRACT = "unsupported_contract"
+    TRANSIENT = "transient"
+    UNKNOWN = "unknown"
+
+
 _STATE_ALIASES: dict[str, UsageState] = {
     "ready": UsageState.READY,
     "unknown": UsageState.UNKNOWN,
@@ -79,6 +94,80 @@ def usage_state_message(state: UsageState | str | None) -> str:
         UsageState.CRASH: "사용량 조회 브라우저가 비정상 종료되었습니다.",
         UsageState.RECYCLE: "사용량 조회 브라우저를 안전하게 재시작하고 있습니다.",
     }[normalized]
+
+
+def normalize_usage_error_type(value: object) -> UsageErrorType:
+    key = str(value or "").strip().lower().replace("-", "_")
+    if key in {"", "none"}:
+        return UsageErrorType.NONE
+    if key in {
+        "auth",
+        "logged_out",
+        "login_required",
+        "login_window_closed",
+        "not_authenticated",
+        "cloudflare_challenge",
+        "unauthorized",
+    }:
+        return UsageErrorType.AUTH
+    if key in {"profile_in_use", "profile_busy", "paused_profile_in_use"}:
+        return UsageErrorType.PROFILE_IN_USE
+    if key in {"timeout", "command_timeout", "navigation_timeout"}:
+        return UsageErrorType.TIMEOUT
+    if key in {"rate_limited", "rate_limit", "too_many_requests", "429"}:
+        return UsageErrorType.RATE_LIMITED
+    if key in {"crash", "renderer_crashed", "transport_closed"}:
+        return UsageErrorType.CRASH
+    if key in {"recycle", "worker_recycle", "page_recycling"}:
+        return UsageErrorType.RECYCLE
+    if key in {"dom_drift", "parse_failed", "schema_incompatible"}:
+        return UsageErrorType.DOM_DRIFT
+    if key in {
+        "unsupported",
+        "unsupported_contract",
+        "playwright_unavailable",
+        "browser_channel_unavailable",
+    }:
+        return UsageErrorType.UNSUPPORTED_CONTRACT
+    if key in {"collect_failed", "unknown_error", "network_error"}:
+        return UsageErrorType.TRANSIENT
+    return UsageErrorType.UNKNOWN
+
+
+def project_usage_provider_status(
+    *,
+    has_usable_cache: bool,
+    error_type: UsageErrorType | str | None,
+    failure_count: int = 0,
+    retry_limit: int = 3,
+    collect_inflight: bool = False,
+) -> str:
+    if bool(collect_inflight) and not bool(has_usable_cache):
+        return "running"
+    normalized = normalize_usage_error_type(error_type)
+    if normalized == UsageErrorType.NONE:
+        return "ready" if bool(has_usable_cache) else "unknown"
+    if normalized == UsageErrorType.AUTH:
+        return "login"
+    if normalized == UsageErrorType.PROFILE_IN_USE:
+        return "paused"
+    if normalized == UsageErrorType.RATE_LIMITED:
+        if (
+            not bool(has_usable_cache)
+            and max(0, int(failure_count)) >= max(1, int(retry_limit))
+        ):
+            return "error"
+        return "rate_limited"
+    if bool(has_usable_cache):
+        return "stale"
+    if normalized in {
+        UsageErrorType.DOM_DRIFT,
+        UsageErrorType.UNSUPPORTED_CONTRACT,
+    }:
+        return "error"
+    if max(0, int(failure_count)) >= max(1, int(retry_limit)):
+        return "error"
+    return "retrying"
 
 
 def _optional_percent(value: float | int | None) -> float | None:

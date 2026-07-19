@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import inspect
 import json
 import os
@@ -7,6 +8,7 @@ import re
 import shutil
 import stat
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
@@ -141,6 +143,8 @@ class CodexUsageMultiMonitor:
         self.__refresh_lock = threading.Lock()
         self.__unsettled_children: dict[str, list[Any]] = {}
         self.__deferred_cleanup_transaction_ids: set[str] = set()
+        self.__refresh_queue: deque[tuple[Callable[[], None], bool]] = deque()
+        self.__profile_next_collect_due_ts: dict[str, float] = {}
         self.__root = None
         self.__event_queue = None
         self.__taskbar_progress = None
@@ -233,6 +237,9 @@ class CodexUsageMultiMonitor:
 
     def shutdown(self) -> None:
         self.__clear_monitor_schedule()
+        with self.__refresh_lock:
+            self.__refresh_queue.clear()
+        self.__profile_next_collect_due_ts.clear()
         shutdown_children = [
             *self.__children.values(),
             *[
@@ -1093,9 +1100,10 @@ class CodexUsageMultiMonitor:
             return False
 
     def __dispatch_refresh_worker(self, fn, *, refresh_taskbar: bool) -> bool:
-        if self.__event_queue is None or not callable(fn):
+        if not callable(fn):
             return False
         with self.__refresh_lock:
+            self.__refresh_queue.append((fn, bool(refresh_taskbar)))
             if bool(self.__refresh_inflight):
                 if bool(refresh_taskbar):
                     self.__refresh_taskbar_progress()
@@ -1103,30 +1111,58 @@ class CodexUsageMultiMonitor:
             self.__refresh_inflight = True
 
         def worker() -> None:
-            try:
-                fn()
-            finally:
+            refresh_after = False
+            while True:
                 with self.__refresh_lock:
-                    self.__refresh_inflight = False
-                if bool(refresh_taskbar):
+                    if not self.__refresh_queue:
+                        self.__refresh_inflight = False
+                        break
+                    queued_fn, queued_refresh = self.__refresh_queue.popleft()
+                try:
+                    queued_fn()
+                except Exception as exc:
+                    self.__notification_events.append(
+                        {
+                            "type": "manager_collection_error",
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+                    if len(self.__notification_events) > 20:
+                        self.__notification_events = self.__notification_events[-20:]
+                refresh_after = bool(refresh_after or queued_refresh)
+                if bool(queued_refresh):
                     self.__refresh_taskbar_progress()
+            if bool(refresh_after):
+                self.__refresh_taskbar_progress()
+            if not self.__post_ui(self.__schedule_monitor_tick):
+                self.__schedule_monitor_tick()
             return
 
-        try:
-            threading.Thread(target=worker, daemon=True).start()
-        except Exception:
-            with self.__refresh_lock:
-                self.__refresh_inflight = False
-            return False
+        if self.__event_queue is None:
+            worker()
+        else:
+            try:
+                threading.Thread(target=worker, daemon=True).start()
+            except Exception:
+                with self.__refresh_lock:
+                    self.__refresh_inflight = False
+                    self.__refresh_queue.clear()
+                return False
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
         return True
 
     def __restart_monitor_scheduler(self, initial_delay_sec: float | None = None) -> None:
         self.__clear_monitor_schedule()
-        if not self.__should_run_background_collection():
+        account_ids = self.__background_account_ids()
+        self.__profile_next_collect_due_ts = {
+            account_id: float(time.monotonic())
+            + self.__initial_profile_collect_delay_sec(account_id, initial_delay_sec)
+            for account_id in account_ids
+        }
+        if not account_ids:
             return
-        self.__schedule_monitor_tick(initial_delay_sec=initial_delay_sec)
+        self.__schedule_monitor_tick()
         return
 
     def __clear_monitor_schedule(self) -> None:
@@ -1143,22 +1179,46 @@ class CodexUsageMultiMonitor:
         return
 
     def __schedule_monitor_tick(self, initial_delay_sec: float | None = None) -> None:
-        if not self.__should_run_background_collection():
+        account_ids = self.__background_account_ids()
+        if not bool(self.__enabled and account_ids):
             self.__monitor_after_id = None
             self.__next_collect_due_ts = 0.0
+            self.__profile_next_collect_due_ts.clear()
             return
         root = self.__root
         if root is None:
             return
-        delay_sec = float(self.__interval_sec if initial_delay_sec is None else initial_delay_sec)
-        if delay_sec < 1.0:
-            delay_sec = 1.0
-        try:
-            import time
-
-            self.__next_collect_due_ts = float(time.monotonic()) + delay_sec
-        except Exception:
-            self.__next_collect_due_ts = 0.0
+        existing_after_id = self.__monitor_after_id
+        self.__monitor_after_id = None
+        if existing_after_id is not None:
+            try:
+                root.after_cancel(existing_after_id)
+            except Exception:
+                pass
+        now = float(time.monotonic())
+        account_set = set(account_ids)
+        self.__profile_next_collect_due_ts = {
+            account_id: due
+            for account_id, due in self.__profile_next_collect_due_ts.items()
+            if account_id in account_set
+        }
+        for account_id in account_ids:
+            if account_id not in self.__profile_next_collect_due_ts:
+                delay = (
+                    self.__profile_collect_delay_sec(account_id)
+                    if initial_delay_sec is None
+                    else max(1.0, float(initial_delay_sec))
+                )
+                self.__profile_next_collect_due_ts[account_id] = now + float(delay)
+        due_values = [
+            float(self.__profile_next_collect_due_ts[account_id])
+            for account_id in account_ids
+            if self.__profile_next_collect_due_ts[account_id] != float("inf")
+        ]
+        if not due_values:
+            return
+        self.__next_collect_due_ts = min(due_values)
+        delay_sec = max(0.05, self.__next_collect_due_ts - now)
         try:
             self.__monitor_after_id = root.after(int(delay_sec * 1000), self.__monitor_tick)
         except Exception:
@@ -1169,35 +1229,84 @@ class CodexUsageMultiMonitor:
     def __monitor_tick(self) -> None:
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
-        if not self.__should_run_background_collection():
+        account_ids = self.__background_account_ids()
+        if not bool(self.__enabled and account_ids):
+            self.__profile_next_collect_due_ts.clear()
             return
+        now = float(time.monotonic())
+        due_account_ids = [
+            account_id
+            for account_id in account_ids
+            if float(self.__profile_next_collect_due_ts.get(account_id, now)) <= now
+        ]
+        if not due_account_ids:
+            self.__schedule_monitor_tick()
+            return
+        for account_id in due_account_ids:
+            self.__profile_next_collect_due_ts[account_id] = float("inf")
         if not self.__dispatch_refresh_worker(
-            lambda: self.__refresh_background_accounts(
+            lambda account_ids=tuple(due_account_ids): self.__refresh_background_accounts(
                 source="auto_monitor",
                 manage_inflight=False,
+                account_ids=account_ids,
             ),
             refresh_taskbar=True,
         ):
-            self.__refresh_background_accounts(source="auto_monitor")
+            self.__refresh_background_accounts(
+                source="auto_monitor",
+                account_ids=tuple(due_account_ids),
+            )
             self.__refresh_taskbar_progress()
-        self.__schedule_monitor_tick(initial_delay_sec=self.__interval_sec)
         return
 
-    def __refresh_background_accounts(self, source: str, *, manage_inflight: bool = True) -> None:
+    def __refresh_background_accounts(
+        self,
+        source: str,
+        *,
+        manage_inflight: bool = True,
+        account_ids: tuple[str, ...] | None = None,
+    ) -> None:
         if not bool(self.__enabled):
             return
         if bool(manage_inflight):
             with self.__refresh_lock:
                 self.__refresh_inflight = True
         try:
-            for account_id in self.__background_account_ids():
-                self.__show_account_status(
-                    account_id,
-                    force_refresh=True,
-                    source=source,
-                    refresh_taskbar=False,
-                    allow_async_dispatch=False,
-                )
+            selected_account_ids = (
+                tuple(self.__background_account_ids())
+                if account_ids is None
+                else tuple(account_ids)
+            )
+            for account_id in selected_account_ids:
+                if account_id not in self.__background_account_ids():
+                    self.__profile_next_collect_due_ts.pop(account_id, None)
+                    continue
+                try:
+                    self.__show_account_status(
+                        account_id,
+                        force_refresh=True,
+                        source=source,
+                        refresh_taskbar=False,
+                        allow_async_dispatch=False,
+                    )
+                except Exception as exc:
+                    self.__notification_events.append(
+                        {
+                            "type": "manager_collection_error",
+                            "profile_id": account_id,
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+                    if len(self.__notification_events) > 20:
+                        self.__notification_events = self.__notification_events[-20:]
+                finally:
+                    if account_id in self.__background_account_ids():
+                        self.__profile_next_collect_due_ts[account_id] = (
+                            float(time.monotonic())
+                            + self.__profile_collect_delay_sec(account_id)
+                        )
+                    else:
+                        self.__profile_next_collect_due_ts.pop(account_id, None)
         finally:
             if bool(manage_inflight):
                 with self.__refresh_lock:
@@ -1205,18 +1314,7 @@ class CodexUsageMultiMonitor:
         return
 
     def __should_run_background_collection(self) -> bool:
-        return bool(self.__enabled and self.__background_scheduler_account_ids())
-
-    def __background_scheduler_account_ids(self) -> list[str]:
-        account_ids = []
-        for account_id in self.__ordered_account_ids():
-            if not bool(self.__account_settings[account_id].enabled):
-                continue
-            runtime = self.__safe_child_runtime(account_id)
-            session_state = str(runtime.get("session_state") or "logged_out")
-            if session_state == "logged_in" or bool(runtime.get("collect_inflight")):
-                account_ids.append(account_id)
-        return account_ids
+        return bool(self.__enabled and self.__background_account_ids())
 
     def __background_account_ids(self) -> list[str]:
         account_ids = []
@@ -1224,10 +1322,22 @@ class CodexUsageMultiMonitor:
             if not bool(self.__account_settings[account_id].enabled):
                 continue
             runtime = self.__safe_child_runtime(account_id)
+            if bool(runtime.get("retry_exhausted")) and not bool(
+                runtime.get("collect_inflight")
+            ):
+                continue
             if self.__is_background_account_paused(runtime):
                 continue
             session_state = str(runtime.get("session_state") or "logged_out")
-            if session_state == "logged_in" or bool(runtime.get("collect_inflight")):
+            provider_status = str(runtime.get("provider_status") or "")
+            if (
+                session_state == "logged_in"
+                or (
+                    provider_status == "retrying"
+                    and session_state != "logged_out"
+                )
+                or bool(runtime.get("collect_inflight"))
+            ):
                 account_ids.append(account_id)
         return account_ids
 
@@ -1242,18 +1352,47 @@ class CodexUsageMultiMonitor:
         return monitor_state in {"paused_auth_required", "paused_profile_in_use"}
 
     def __get_next_collect_remaining_sec(self) -> float | None:
-        due_ts = float(self.__next_collect_due_ts or 0.0)
-        if due_ts <= 0.0:
+        due_values = [
+            float(value)
+            for value in self.__profile_next_collect_due_ts.values()
+            if value != float("inf")
+        ]
+        if not due_values:
             return None
         try:
-            import time
-
-            remaining = due_ts - float(time.monotonic())
+            remaining = min(due_values) - float(time.monotonic())
         except Exception:
             return None
         if remaining < 0.0:
             remaining = 0.0
         return remaining
+
+    def __profile_collect_delay_sec(self, account_id: str) -> float:
+        settings = self.__safe_child_settings(account_id)
+        try:
+            interval_sec = float(settings.get("interval_sec", self.__interval_sec))
+        except (TypeError, ValueError):
+            interval_sec = float(self.__interval_sec)
+        runtime = self.__safe_child_runtime(account_id)
+        try:
+            retry_after_sec = float(runtime.get("retry_after_sec") or 0.0)
+        except (TypeError, ValueError):
+            retry_after_sec = 0.0
+        if retry_after_sec > 0.0:
+            return max(1.0, retry_after_sec)
+        return max(1.0, interval_sec)
+
+    def __initial_profile_collect_delay_sec(
+        self,
+        account_id: str,
+        initial_delay_sec: float | None,
+    ) -> float:
+        runtime = self.__safe_child_runtime(account_id)
+        if str(runtime.get("provider_status") or "") == "retrying":
+            return self.__profile_collect_delay_sec(account_id)
+        if initial_delay_sec is None:
+            return self.__profile_collect_delay_sec(account_id)
+        return max(1.0, float(initial_delay_sec))
 
     def __refresh_accounts(self, source: str, *, manage_inflight: bool = True) -> None:
         if not bool(self.__enabled):
@@ -1287,43 +1426,25 @@ class CodexUsageMultiMonitor:
         refresh_taskbar: bool,
         allow_async_dispatch: bool = True,
     ) -> None:
-        child = self.__child(account_id)
         source_key = str(source or "manual_query")
-        if (
-            bool(allow_async_dispatch)
-            and bool(force_refresh)
-            and source_key == "manual_login"
-            and self.__event_queue is not None
-        ):
-            with self.__refresh_lock:
-                refresh_inflight = bool(self.__refresh_inflight)
-            if bool(refresh_inflight):
-                def manual_login_worker() -> None:
-                    try:
-                        child.show_current_status(
-                            force_refresh=True,
-                            source="manual_login",
-                        )
-                    finally:
-                        if bool(refresh_taskbar):
-                            self.__refresh_taskbar_progress()
+        if bool(allow_async_dispatch) and bool(force_refresh):
+            def refresh_current_child() -> None:
+                if account_id not in self.__children:
                     return
+                self.__show_account_status(
+                    account_id,
+                    force_refresh=True,
+                    source=source_key,
+                    refresh_taskbar=False,
+                    allow_async_dispatch=False,
+                )
 
-                try:
-                    threading.Thread(target=manual_login_worker, daemon=True).start()
-                except Exception:
-                    child.show_current_status(force_refresh=True, source="manual_login")
-                if bool(refresh_taskbar):
-                    self.__refresh_taskbar_progress()
+            if self.__dispatch_refresh_worker(
+                refresh_current_child,
+                refresh_taskbar=bool(refresh_taskbar),
+            ):
                 return
-        if bool(allow_async_dispatch) and bool(force_refresh) and self.__dispatch_refresh_worker(
-            lambda: child.show_current_status(
-                force_refresh=True,
-                source=source_key,
-            ),
-            refresh_taskbar=bool(refresh_taskbar),
-        ):
-            return
+        child = self.__child(account_id)
         child.show_current_status(force_refresh=bool(force_refresh), source=source_key)
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()

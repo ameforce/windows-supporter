@@ -16,8 +16,11 @@ import uuid
 from src.apps.ai_usage_contracts import (
     AiUsageProvider,
     AiUsageReading,
+    UsageErrorType,
     UsageState,
+    normalize_usage_error_type,
     normalize_usage_state,
+    project_usage_provider_status,
     usage_state_message,
 )
 from src.apps.codex_usage_browser_types import (
@@ -385,6 +388,7 @@ def _browser_error_state(error: object) -> UsageState:
     if key in {
         BrowserErrorCode.LOGIN_REQUIRED.value,
         BrowserErrorCode.LOGIN_WINDOW_CLOSED.value,
+        BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
     }:
         return UsageState.LOGGED_OUT
     if key in {
@@ -401,6 +405,8 @@ def _browser_error_state(error: object) -> UsageState:
         return UsageState.CRASH
     if key in {"worker_recycle", "page_recycling"}:
         return UsageState.RECYCLE
+    if key == BrowserErrorCode.PROFILE_IN_USE.value:
+        return UsageState.UNKNOWN
     if key == BrowserErrorCode.COLLECT_FAILED.value:
         return UsageState.DOM_DRIFT
     return normalize_usage_state(key)
@@ -443,6 +449,7 @@ class CursorUsageMonitor:
         )
         self._settings_path = os.path.join(self.config_dir, "cursor_usage_settings.json")
         self._state_path = os.path.join(self.config_dir, "cursor_usage_state.json")
+        self._event_log_path = os.path.join(self.config_dir, "cursor_usage_events.jsonl")
         self._persistence_enabled = bool(
             config_dir is not None or browser_session_factory is None
         )
@@ -462,6 +469,9 @@ class CursorUsageMonitor:
         self._collect_lock = threading.Lock()
         self._collect_inflight = False
         self._last_attempt_at: datetime | None = None
+        self._failure_count = 0
+        self._retry_failure_limit = 3
+        self._last_error_type = UsageErrorType.NONE
         self._login_poll_interval_sec = max(0.01, float(login_poll_interval_sec))
         self._login_poll_max_attempts = max(1, int(login_poll_max_attempts))
         self._login_poll_stop = threading.Event()
@@ -472,6 +482,8 @@ class CursorUsageMonitor:
             state=UsageState.UNKNOWN,
         )
         self._restore_last_success()
+        if self._last_reading.state == UsageState.STALE:
+            self._last_error_type = UsageErrorType.TRANSIENT
         config = PlaywrightSessionConfig(
             profile_dir=self.profile_dir,
             usage_url=CURSOR_USAGE_URL,
@@ -517,7 +529,13 @@ class CursorUsageMonitor:
                 reading = self._reading_from_result(result, now)
                 self._last_reading = reading
                 if reading.state == UsageState.READY:
+                    self._failure_count = 0
+                    self._last_error_type = UsageErrorType.NONE
                     self._save_last_success(reading)
+                else:
+                    self._failure_count = min(self._failure_count + 1, 999)
+                    self._last_error_type = self._error_type_from_result(result, reading)
+                self._append_collection_event(source="collect")
                 return reading
             finally:
                 self._collect_inflight = False
@@ -559,27 +577,33 @@ class CursorUsageMonitor:
     def get_runtime_status(self) -> dict[str, Any]:
         browser = self._session.get_runtime_status()
         reading = self._last_reading
-        effective_state = (
-            reading.last_error_state
-            if reading.state == UsageState.STALE and reading.last_error_state is not None
-            else reading.state
+        provider_status = project_usage_provider_status(
+            has_usable_cache=reading.is_usable,
+            error_type=self._last_error_type,
+            failure_count=self._failure_count,
+            retry_limit=self._retry_failure_limit,
+            collect_inflight=self._collect_inflight,
         )
-        if reading.state == UsageState.READY:
+        if provider_status == "ready":
             freshness = "fresh"
             monitor_state = "idle"
             session_state = "logged_in"
-        elif reading.state == UsageState.STALE:
+        elif provider_status == "stale":
             freshness = "stale"
-            if effective_state == UsageState.LOGGED_OUT:
-                monitor_state = "paused_auth_required"
-                session_state = "logged_out"
-            else:
-                monitor_state = "idle"
-                session_state = "logged_in"
-        elif reading.state == UsageState.LOGGED_OUT:
+            monitor_state = "idle"
+            session_state = "logged_in"
+        elif provider_status == "login":
             freshness = "unavailable"
             monitor_state = "paused_auth_required"
             session_state = "logged_out"
+        elif provider_status == "paused":
+            freshness = "stale" if reading.is_usable else "unavailable"
+            monitor_state = "paused_profile_in_use"
+            session_state = "logged_in" if reading.is_usable else "unknown"
+        elif provider_status == "rate_limited":
+            freshness = "stale" if reading.is_usable else "unavailable"
+            monitor_state = "idle"
+            session_state = "logged_in" if reading.is_usable else "unknown"
         else:
             freshness = "unavailable"
             monitor_state = "running" if self._collect_inflight else "idle"
@@ -590,7 +614,7 @@ class CursorUsageMonitor:
             "profile_id": self.profile_id,
             "state": reading.state.value,
             "message": reading.message,
-            "provider_status": effective_state.value,
+            "provider_status": provider_status,
             "last_error_state": (
                 reading.last_error_state.value
                 if reading.last_error_state is not None
@@ -598,6 +622,22 @@ class CursorUsageMonitor:
             ),
             "freshness": freshness,
             "last_snapshot_is_stale": reading.is_stale,
+            "last_error_type": self._last_error_type.value,
+            "failure_count": int(self._failure_count),
+            "retry_failure_limit": int(self._retry_failure_limit),
+            "retry_exhausted": bool(
+                self._last_error_type
+                not in {
+                    UsageErrorType.NONE,
+                    UsageErrorType.AUTH,
+                    UsageErrorType.PROFILE_IN_USE,
+                    UsageErrorType.DOM_DRIFT,
+                    UsageErrorType.UNSUPPORTED_CONTRACT,
+                }
+                and self._failure_count >= self._retry_failure_limit
+                and not reading.is_usable
+            ),
+            "retry_after_sec": self._retry_after_sec(provider_status),
             "monitor_state": monitor_state,
             "session_state": session_state,
             "collect_inflight": bool(self._collect_inflight),
@@ -624,12 +664,21 @@ class CursorUsageMonitor:
                 now = now.replace(tzinfo=timezone.utc)
             self._last_reading = self._reading_from_result(result, now)
             if self._last_reading.state == UsageState.READY:
+                self._failure_count = 0
+                self._last_error_type = UsageErrorType.NONE
                 self._save_last_success(self._last_reading)
             elif result.error in {
                 BrowserErrorCode.LOGIN_REQUIRED.value,
                 BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
             }:
                 self._start_login_poll()
+            if self._last_reading.state != UsageState.READY:
+                self._failure_count = min(self._failure_count + 1, 999)
+                self._last_error_type = self._error_type_from_result(
+                    result,
+                    self._last_reading,
+                )
+            self._append_collection_event(source="manual_login")
         elif source_key == "auto_monitor" and force_refresh:
             self.collect(force=False)
         elif force_refresh:
@@ -659,6 +708,8 @@ class CursorUsageMonitor:
                 captured_at=captured_at,
             )
             self._last_attempt_at = None
+            self._failure_count = 0
+            self._last_error_type = UsageErrorType.AUTH
         except Exception as exc:
             return False, f"Cursor 전용 브라우저 세션 종료 실패: {type(exc).__name__}"
         finally:
@@ -794,6 +845,53 @@ class CursorUsageMonitor:
             captured_at=captured_at,
         )
 
+    def _error_type_from_result(
+        self,
+        result: BrowserOperationResult,
+        reading: AiUsageReading,
+    ) -> UsageErrorType:
+        if result.error:
+            return normalize_usage_error_type(result.error)
+        if reading.last_error_state is not None:
+            return normalize_usage_error_type(reading.last_error_state.value)
+        return normalize_usage_error_type(reading.state.value)
+
+    def _retry_after_sec(self, provider_status: str) -> float | None:
+        if str(provider_status or "") != "retrying":
+            return None
+        exponent = max(0, min(int(self._failure_count) - 1, 4))
+        return float(min(self._refresh_interval_sec * (2**exponent), 15 * 60))
+
+    def _append_collection_event(self, *, source: str) -> None:
+        if not self._persistence_enabled:
+            return
+        provider_status = project_usage_provider_status(
+            has_usable_cache=self._last_reading.is_usable,
+            error_type=self._last_error_type,
+            failure_count=self._failure_count,
+            retry_limit=self._retry_failure_limit,
+            collect_inflight=False,
+        )
+        payload = {
+            "timestamp": _iso_now(self._clock),
+            "event": "collection_result",
+            "source": str(source or "collect"),
+            "provider": AiUsageProvider.CURSOR.value,
+            "profile_id": self.profile_id,
+            "reading_state": self._last_reading.state.value,
+            "provider_status": provider_status,
+            "error_type": self._last_error_type.value,
+            "failure_count": int(self._failure_count),
+            "has_usable_cache": bool(self._last_reading.is_usable),
+        }
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+            with open(self._event_log_path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                stream.write("\n")
+        except OSError:
+            pass
+
     def _emit_update(self, source: str) -> None:
         if self._notification_sink is None:
             return
@@ -840,9 +938,15 @@ class CursorUsageMonitor:
             reading = self._reading_from_result(result, now)
             self._last_reading = reading
             if reading.state == UsageState.READY:
+                self._failure_count = 0
+                self._last_error_type = UsageErrorType.NONE
                 self._save_last_success(reading)
+                self._append_collection_event(source="manual_login_poll")
                 self._emit_update("manual_login")
                 return
+            self._failure_count = min(self._failure_count + 1, 999)
+            self._last_error_type = self._error_type_from_result(result, reading)
+            self._append_collection_event(source="manual_login_poll")
             if result.error in {
                 BrowserErrorCode.LOGIN_WINDOW_CLOSED.value,
                 BrowserErrorCode.TRANSPORT_CLOSED.value,
@@ -857,6 +961,9 @@ class CursorUsageMonitor:
             state=UsageState.TIMEOUT,
             captured_at=now.isoformat(),
         )
+        self._failure_count = min(self._failure_count + 1, 999)
+        self._last_error_type = UsageErrorType.TIMEOUT
+        self._append_collection_event(source="manual_login_poll_exhausted")
         self._emit_update("manual_login")
 
     def _stop_login_poll(self) -> None:

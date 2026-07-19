@@ -409,6 +409,9 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
 
         self.assertEqual(limited.state, UsageState.RATE_LIMITED)
         self.assertIsNone(limited.used_percent)
+        limited_runtime = monitor.get_runtime_status()
+        self.assertEqual(limited_runtime["provider_status"], "rate_limited")
+        self.assertEqual(limited_runtime["freshness"], "unavailable")
 
         success_then_limit = self._Session(
             [
@@ -427,6 +430,26 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertEqual(stale.state, UsageState.STALE)
         self.assertEqual(stale.last_error_state, UsageState.RATE_LIMITED)
         self.assertEqual(stale.used_percent, 25.0)
+        stale_runtime = monitor.get_runtime_status()
+        self.assertEqual(stale_runtime["provider_status"], "rate_limited")
+        self.assertEqual(stale_runtime["freshness"], "stale")
+
+    def test_inflight_refresh_keeps_cached_cursor_session_logged_in(self) -> None:
+        monitor = CursorUsageMonitor(
+            profile_id="cursor-personal",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(probe=self._probe("Included usage: 5 / 20"))]
+            ),
+        )
+        monitor.collect(force=True)
+        monitor._collect_inflight = True
+
+        runtime = monitor.get_runtime_status()
+
+        self.assertEqual(runtime["provider_status"], "ready")
+        self.assertEqual(runtime["freshness"], "fresh")
+        self.assertEqual(runtime["session_state"], "logged_in")
+        self.assertFalse(runtime["can_login"])
 
     def test_empty_summary_is_dom_drift(self) -> None:
         session = self._Session(
@@ -646,6 +669,94 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("전용 프로필", message)
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+
+
+    def test_runtime_projects_transient_auth_paused_and_terminal_failures_by_cache_boundary(self) -> None:
+        transient = CursorUsageMonitor(
+            profile_id="cursor-transient",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(error="command_timeout") for _ in range(3)]
+            ),
+        )
+
+        transient.collect(force=True)
+        retrying = transient.get_runtime_status()
+        self.assertEqual(retrying["provider_status"], "retrying")
+        self.assertEqual(retrying["failure_count"], 1)
+        self.assertEqual(retrying["last_error_type"], "timeout")
+        self.assertFalse(retrying["retry_exhausted"])
+
+        transient.collect(force=True)
+        transient.collect(force=True)
+        exhausted = transient.get_runtime_status()
+        self.assertEqual(exhausted["provider_status"], "error")
+        self.assertTrue(exhausted["retry_exhausted"])
+
+        cached = CursorUsageMonitor(
+            profile_id="cursor-cached",
+            browser_session_factory=lambda _config: self._Session(
+                [
+                    BrowserOperationResult(probe=self._probe("Included usage: 5 / 20")),
+                    BrowserOperationResult(error="command_timeout"),
+                ]
+            ),
+        )
+        cached.collect(force=True)
+        cached.collect(force=True)
+        self.assertEqual(cached.get_runtime_status()["provider_status"], "stale")
+
+        auth = CursorUsageMonitor(
+            profile_id="cursor-auth",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(error="cloudflare_challenge")]
+            ),
+        )
+        auth.collect(force=True)
+        self.assertEqual(auth.get_runtime_status()["provider_status"], "login")
+
+        paused = CursorUsageMonitor(
+            profile_id="cursor-paused",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(error="profile_in_use")]
+            ),
+        )
+        paused.collect(force=True)
+        self.assertEqual(paused.get_runtime_status()["provider_status"], "paused")
+
+        terminal = CursorUsageMonitor(
+            profile_id="cursor-terminal",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(probe=self._probe("Usage dashboard"))]
+            ),
+        )
+        terminal.collect(force=True)
+        self.assertEqual(terminal.get_runtime_status()["provider_status"], "error")
+
+    def test_cursor_failure_writes_structured_jsonl_without_probe_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            monitor = CursorUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(Path(tmp) / "profile"),
+                profile_id="cursor-structured",
+                browser_session_factory=lambda _config: self._Session(
+                    [BrowserOperationResult(error="command_timeout")]
+                ),
+            )
+
+            monitor.collect(force=True)
+
+            log_path = config_dir / "cursor_usage_events.jsonl"
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["provider"], "cursor")
+            self.assertEqual(records[0]["profile_id"], "cursor-structured")
+            self.assertEqual(records[0]["error_type"], "timeout")
+            self.assertEqual(records[0]["failure_count"], 1)
+            self.assertNotIn("probe", records[0])
 
 
 if __name__ == "__main__":

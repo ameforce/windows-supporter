@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -1054,6 +1055,237 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(history[0]["captured_at"], "2026-06-01T10:02:00+09:00")
             self.assertEqual(history[-1]["captured_at"], "2026-06-01T10:10:00+09:00")
             self.assertNotIn("bad", [item["captured_at"] for item in history])
+
+
+    def test_runtime_projects_cache_auth_paused_retry_and_terminal_states(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            monitor.handle_snapshot(
+                UsageSnapshot.from_metrics(
+                    {"weekly_limit": "48%"},
+                    captured_at="2026-07-19T10:00:00+09:00",
+                )
+            )
+            monitor._CodexUsageMonitor__failure_count = 1
+            monitor._CodexUsageMonitor__handle_collect_error(
+                "command_timeout",
+                source="auto_monitor",
+            )
+            cached = monitor.get_runtime_status()
+            self.assertEqual(cached["provider_status"], "stale")
+            self.assertEqual(cached["freshness"], "stale")
+
+            monitor._CodexUsageMonitor__handle_collect_error(
+                "login_required",
+                source="auto_monitor",
+            )
+            cached_auth = monitor.get_runtime_status()
+            self.assertEqual(cached_auth["provider_status"], "login")
+            self.assertEqual(cached_auth["freshness"], "stale")
+            self.assertTrue(cached_auth["last_snapshot_is_stale"])
+
+        for error, expected in (
+            ("command_timeout", "retrying"),
+            ("login_required", "login"),
+            ("profile_in_use", "paused"),
+            ("parse_failed", "error"),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                monitor = CodexUsageMonitor(
+                    config_dir=tmp,
+                    profile_dir=os.path.join(tmp, "profile"),
+                    browser_session_factory=lambda _config: self._BrowserSession(),
+                )
+                monitor._CodexUsageMonitor__set_session_state("logged_in")
+                monitor._CodexUsageMonitor__failure_count = 1
+                monitor._CodexUsageMonitor__handle_collect_error(
+                    error,
+                    source="auto_monitor",
+                )
+                runtime = monitor.get_runtime_status()
+                self.assertEqual(runtime["provider_status"], expected)
+
+    def test_runtime_projects_persisted_auth_attention_as_login_with_stale_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = os.path.join(tmp, "profile")
+            original = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=profile_dir,
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            original.handle_snapshot(
+                UsageSnapshot.from_metrics(
+                    {"weekly_limit": "48%"},
+                    captured_at="2026-07-19T10:00:00+09:00",
+                )
+            )
+            original._CodexUsageMonitor__set_session_state("logged_in")
+            original._CodexUsageMonitor__set_auth_attention(
+                "login_required",
+                source="auto_monitor",
+            )
+            original._CodexUsageMonitor__save_state()
+
+            restored = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=profile_dir,
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            runtime = restored.get_runtime_status()
+
+            self.assertEqual(runtime["provider_status"], "login")
+            self.assertEqual(runtime["freshness"], "stale")
+            self.assertTrue(runtime["last_snapshot_is_stale"])
+            self.assertEqual(runtime["monitor_state"], "paused_auth_required")
+
+    def test_runtime_projects_logged_out_session_as_login_without_fresh_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+
+            runtime = monitor.get_runtime_status()
+
+            self.assertEqual(runtime["session_state"], "logged_out")
+            self.assertEqual(runtime["provider_status"], "login")
+            self.assertTrue(runtime["can_login"])
+
+    def test_external_scheduler_auto_monitor_call_waits_for_collection_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            monitor.attach(object(), None, start_monitor=False)
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            started = threading.Event()
+            release = threading.Event()
+
+            def collect_guarded(*, source, on_acquired=None):
+                _ = source, on_acquired
+                started.set()
+                release.wait(2.0)
+                return (
+                    UsageSnapshot.from_metrics(
+                        {"weekly_limit": "50%"},
+                        captured_at="2026-07-19T10:00:00+09:00",
+                    ),
+                    None,
+                )
+
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+                side_effect=collect_guarded,
+            ):
+                caller = threading.Thread(
+                    target=lambda: monitor.show_current_status(
+                        force_refresh=True,
+                        source="auto_monitor",
+                    )
+                )
+                caller.start()
+                self.assertTrue(started.wait(1.0))
+                self.assertTrue(caller.is_alive())
+                release.set()
+                caller.join(2.0)
+
+            self.assertFalse(caller.is_alive())
+            self.assertEqual(monitor.get_last_snapshot().weekly_limit, "50%")
+
+    def test_external_scheduler_manual_query_waits_for_collection_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            monitor.attach(object(), None, start_monitor=False)
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            started = threading.Event()
+            release = threading.Event()
+
+            def collect_guarded(*, source, on_acquired=None):
+                _ = source, on_acquired
+                started.set()
+                release.wait(2.0)
+                return (
+                    UsageSnapshot.from_metrics(
+                        {"weekly_limit": "50%"},
+                        captured_at="2026-07-19T10:00:00+09:00",
+                    ),
+                    None,
+                )
+
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+                side_effect=collect_guarded,
+            ):
+                caller = threading.Thread(
+                    target=lambda: monitor.show_current_status(
+                        force_refresh=True,
+                        source="manual_query",
+                    )
+                )
+                caller.start()
+                self.assertTrue(started.wait(1.0))
+                self.assertTrue(caller.is_alive())
+                release.set()
+                caller.join(2.0)
+
+            self.assertFalse(caller.is_alive())
+            self.assertEqual(monitor.get_last_snapshot().weekly_limit, "50%")
+
+    def test_external_scheduler_success_clears_transient_failure_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            monitor.attach(object(), None, start_monitor=False)
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            monitor.handle_snapshot(
+                UsageSnapshot.from_metrics(
+                    {"weekly_limit": "48%"},
+                    captured_at="2026-07-19T10:00:00+09:00",
+                )
+            )
+
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__collect_snapshot_guarded",
+                side_effect=[
+                    (None, "command_timeout"),
+                    (
+                        UsageSnapshot.from_metrics(
+                            {"weekly_limit": "42%"},
+                            captured_at="2026-07-19T10:05:00+09:00",
+                        ),
+                        None,
+                    ),
+                ],
+            ):
+                monitor.show_current_status(force_refresh=True, source="auto_monitor")
+                failed = monitor.get_runtime_status()
+                monitor.show_current_status(force_refresh=True, source="auto_monitor")
+                recovered = monitor.get_runtime_status()
+
+            self.assertEqual(failed["provider_status"], "stale")
+            self.assertEqual(failed["failure_count"], 1)
+            self.assertEqual(failed["last_error_type"], "timeout")
+            self.assertEqual(monitor.get_last_snapshot().weekly_limit, "42%")
+            self.assertEqual(recovered["provider_status"], "ready")
+            self.assertEqual(recovered["failure_count"], 0)
+            self.assertEqual(recovered["last_error_type"], "")
 
 
 if __name__ == "__main__":

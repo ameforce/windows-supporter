@@ -2450,13 +2450,19 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 caller.join(1.0)
 
             self.assertTrue(
-                self._wait_until(lambda: all(len(child.show_calls) == 1 for child in children))
+                self._wait_until(lambda: all(len(child.show_calls) == 2 for child in children))
             )
             self.assertEqual(
                 [child.show_calls for child in children],
                 [
-                    [{"force_refresh": True, "source": "manual_query"}],
-                    [{"force_refresh": True, "source": "manual_query"}],
+                    [
+                        {"force_refresh": True, "source": "manual_query"},
+                        {"force_refresh": True, "source": "manual_query"},
+                    ],
+                    [
+                        {"force_refresh": True, "source": "manual_query"},
+                        {"force_refresh": True, "source": "manual_query"},
+                    ],
                 ],
             )
             self.assertTrue(self._wait_until(lambda: not manager.get_runtime_status()["collect_inflight"]))
@@ -2534,6 +2540,8 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             try:
                 self.assertTrue(children[1].started.wait(1.0))
                 manager.login_account("account_1")
+                self.assertFalse(children[0].started.wait(0.1))
+                children[1].release.set()
                 self.assertTrue(children[0].started.wait(1.0))
             finally:
                 for child in children:
@@ -2573,12 +2581,14 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             children[1].runtime["session_state"] = "logged_out"
             root = _FakeRoot()
 
-            manager.attach(root, event_queue=None)
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=100.0):
+                manager.attach(root, event_queue=None)
 
             self.assertEqual(len(root.after_calls), 1)
             self.assertLessEqual(root.after_calls[0]["delay_ms"], 1000)
 
-            root.after_calls[0]["callback"]()
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=101.0):
+                root.after_calls[0]["callback"]()
 
             self.assertEqual(
                 children[0].show_calls,
@@ -2587,7 +2597,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(children[1].show_calls, [])
             self.assertGreaterEqual(len(root.after_calls), 2)
 
-    def test_background_monitor_skips_paused_auth_accounts_without_stopping_scheduler(self):
+    def test_background_monitor_stops_when_every_account_requires_auth(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
             children[0].runtime["session_state"] = "logged_in"
@@ -2598,12 +2608,61 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             manager.attach(root, event_queue=None)
 
-            self.assertEqual(len(root.after_calls), 1)
-            root.after_calls[0]["callback"]()
-
+            self.assertEqual(root.after_calls, [])
             self.assertEqual(children[0].show_calls, [])
             self.assertEqual(children[1].show_calls, [])
-            self.assertGreaterEqual(len(root.after_calls), 2)
+
+    def test_background_monitor_keeps_no_cache_transient_failure_eligible_for_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime["session_state"] = "unknown"
+            children[0].runtime["provider_status"] = "retrying"
+            children[0].runtime["retry_after_sec"] = 30.0
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=100.0):
+                manager.attach(root, event_queue=None)
+
+            self.assertEqual(len(root.after_calls), 1)
+            self.assertEqual(root.after_calls[0]["delay_ms"], 30000)
+
+    def test_background_monitor_does_not_retry_logged_out_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime.update(
+                {
+                    "session_state": "logged_out",
+                    "provider_status": "retrying",
+                    "retry_after_sec": 30.0,
+                }
+            )
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            manager.attach(root, event_queue=None)
+
+            self.assertEqual(root.after_calls, [])
+            self.assertEqual(children[0].show_calls, [])
+
+    def test_background_monitor_stops_retry_exhausted_profile_without_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime.update(
+                {
+                    "session_state": "logged_in",
+                    "provider_status": "error",
+                    "retry_exhausted": True,
+                    "collect_inflight": False,
+                }
+            )
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            manager.attach(root, event_queue=None)
+
+            self.assertEqual(root.after_calls, [])
+            self.assertEqual(children[0].show_calls, [])
 
     def test_attach_does_not_revalidate_logged_out_account_when_profile_session_is_present(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2749,6 +2808,156 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertGreaterEqual(_FakeTaskbarOverlay.instances[0].refresh_calls, 2)
             self.assertEqual(children[0].show_calls, [{"force_refresh": True, "source": "manual_login"}])
             self.assertEqual(children[1].show_calls, [])
+
+
+    def test_background_tick_collects_only_profiles_whose_individual_due_time_arrived(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            root = _FakeRoot()
+            for child in children:
+                child.runtime["session_state"] = "logged_in"
+            manager.attach(root)
+            manager._CodexUsageMultiMonitor__profile_next_collect_due_ts = {
+                "account_1": 10.0,
+                "account_2": 20.0,
+            }
+
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=10.0):
+                manager._CodexUsageMultiMonitor__monitor_tick()
+
+            self.assertEqual(len(children[0].show_calls), 1)
+            self.assertEqual(children[1].show_calls, [])
+
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=20.0):
+                manager._CodexUsageMultiMonitor__monitor_tick()
+
+            self.assertEqual(len(children[0].show_calls), 1)
+            self.assertEqual(len(children[1].show_calls), 1)
+
+    def test_manager_queue_keeps_overlapping_profile_requests_serial_and_does_not_drop_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first_started = threading.Event()
+            release_first = threading.Event()
+            second_finished = threading.Event()
+            state_lock = threading.Lock()
+            active = 0
+            max_active = 0
+            call_order: list[str] = []
+
+            class _SerialChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    nonlocal active, max_active
+                    account_id = "account_1" if "account-1" in self.config_dir else "account_2"
+                    with state_lock:
+                        active += 1
+                        max_active = max(max_active, active)
+                        call_order.append(account_id)
+                    if account_id == "account_1":
+                        first_started.set()
+                        release_first.wait(2.0)
+                    else:
+                        second_finished.set()
+                    with state_lock:
+                        active -= 1
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=lambda config_dir, profile_dir: _SerialChild(
+                    config_dir,
+                    profile_dir,
+                ),
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+
+            manager.show_account_status("account_1")
+            self.assertTrue(first_started.wait(1.0))
+            manager.show_account_status("account_2")
+            release_first.set()
+
+            self.assertTrue(second_finished.wait(2.0))
+            self.assertEqual(call_order, ["account_1", "account_2"])
+            self.assertEqual(max_active, 1)
+
+    def test_queued_refresh_resolves_current_child_after_profile_deletion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active_started = threading.Event()
+            release_active = threading.Event()
+            queue_drained = threading.Event()
+
+            class _QueuedChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    if "account-2" in self.config_dir:
+                        active_started.set()
+                        release_active.wait(2.0)
+                    else:
+                        queue_drained.set()
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+            children: list[_QueuedChild] = []
+
+            def factory(config_dir, profile_dir):
+                child = _QueuedChild(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+
+            manager.show_account_status("account_2")
+            self.assertTrue(active_started.wait(1.0))
+            manager.show_account_status("account_1")
+            ok, error = manager.delete_profile("account_1", confirmed=True)
+            self.assertTrue(ok, error)
+            release_active.set()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: not manager._CodexUsageMultiMonitor__refresh_inflight,
+                )
+            )
+
+            self.assertFalse(queue_drained.is_set())
+            self.assertEqual(children[0].show_calls, [])
+
+    def test_background_batch_continues_after_one_profile_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            for child in children:
+                child.runtime["session_state"] = "logged_in"
+
+            def fail_first(*_args, **_kwargs):
+                raise RuntimeError("first profile failed")
+
+            children[0].show_current_status = fail_first
+            manager._CodexUsageMultiMonitor__profile_next_collect_due_ts = {
+                "account_1": float("inf"),
+                "account_2": float("inf"),
+            }
+
+            manager._CodexUsageMultiMonitor__refresh_background_accounts(
+                source="auto_monitor",
+                manage_inflight=False,
+                account_ids=("account_1", "account_2"),
+            )
+
+            self.assertEqual(
+                children[1].show_calls,
+                [{"force_refresh": True, "source": "auto_monitor"}],
+            )
+            due = manager._CodexUsageMultiMonitor__profile_next_collect_due_ts
+            self.assertNotEqual(due["account_1"], float("inf"))
+            self.assertNotEqual(due["account_2"], float("inf"))
 
 
 if __name__ == "__main__":
