@@ -156,6 +156,8 @@ class CodexUsageMultiMonitor:
         self.__settings_mutation_lock = threading.RLock()
         self.__lifecycle_lock = threading.Lock()
         self.__closing = False
+        self.__shutdown_complete = False
+        self.__shutdown_succeeded = False
         self.__unsettled_children: dict[str, list[Any]] = {}
         self.__deferred_cleanup_transaction_ids: set[str] = set()
         self.__refresh_queue: deque[tuple[Callable[[], None], bool]] = deque()
@@ -259,10 +261,10 @@ class CodexUsageMultiMonitor:
             self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         return
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         with self.__lifecycle_lock:
             if bool(self.__closing):
-                return
+                return bool(self.__shutdown_complete and self.__shutdown_succeeded)
             self.__closing = True
         with self.__settings_mutation_lock:
             self.__clear_monitor_schedule()
@@ -288,18 +290,22 @@ class CodexUsageMultiMonitor:
             if not self.__shutdown_child(child):
                 continue
             pre_shutdown_child_ids.add(id(child))
-        self.__wait_for_refreshes_quiesced(
+        shutdown_succeeded = self.__wait_for_refreshes_quiesced(
             timeout_sec=60.0 if cancel_request_failed else None
         )
         for child in shutdown_children:
             if id(child) in pre_shutdown_child_ids:
                 continue
-            self.__shutdown_child(child)
+            if not self.__shutdown_child(child):
+                shutdown_succeeded = False
         with self.__settings_mutation_lock:
             self.__root = None
             self.__event_queue = None
             self.__ui_thread_id = None
-        return
+        with self.__lifecycle_lock:
+            self.__shutdown_succeeded = bool(shutdown_succeeded)
+            self.__shutdown_complete = True
+        return bool(shutdown_succeeded)
 
     def get_settings_snapshot(self) -> dict[str, Any]:
         with self.__settings_mutation_lock:

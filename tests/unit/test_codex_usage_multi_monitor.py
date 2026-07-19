@@ -190,6 +190,36 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual([child.shutdown_calls for child in children], [1, 1])
             self.assertIsNone(manager._CodexUsageMultiMonitor__monitor_after_id)
 
+    def test_shutdown_reports_false_when_a_child_never_confirms_termination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            children = []
+
+            class _UnsettledChild(_FakeChildMonitor):
+                def shutdown(self):
+                    self.shutdown_calls += 1
+                    return False
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _UnsettledChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+
+            result = manager.shutdown()
+
+            self.assertIs(result, False)
+            self.assertGreaterEqual(children[0].shutdown_calls, 1)
+            self.assertEqual(children[1].shutdown_calls, 1)
+
     def test_background_settings_mutation_posts_scheduler_restart_to_ui_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager, _children = self._build_manager(tmp)
