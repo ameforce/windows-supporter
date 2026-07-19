@@ -1048,6 +1048,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_login(self) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         if not hasattr(self._codex, "show_current_status"):
             self._set_status("연결 기능을 사용할 수 없습니다.", level="error")
             return
@@ -1071,6 +1073,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_account_login(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         account_label = self._account_display_label(account_id)
         try:
             runtime = self._safe_get_runtime()
@@ -1105,6 +1109,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_account_query(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         account_label = self._account_display_label(account_id)
         show = getattr(self._codex, "show_account_status", None)
         if callable(show):
@@ -1118,6 +1124,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_release_profile(self) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         tk = self._tk
         if tk is None:
             return
@@ -1173,6 +1181,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_account_release_profile(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         account_label = self._account_display_label(account_id)
         tk = self._tk
         if tk is None:
@@ -1320,7 +1330,7 @@ class CodexUsageSettingsView:
 
     def _autosave_now(self) -> None:
         self._autosave_after_id = None
-        return self._save_settings()
+        return self._save_settings(reschedule_transient=True)
 
     def _parse_positive_seconds_strict(self, text: str, label: str) -> tuple[float, str | None]:
         raw = str(text or "").strip()
@@ -1424,13 +1434,15 @@ class CodexUsageSettingsView:
             self._set_status(f"저장 실패: {err}", level="error")
         return False, str(err or "settings_save_failed"), provider_changed
 
-    def _save_settings(self) -> bool:
+    def _save_settings(self, *, reschedule_transient: bool = False) -> bool:
         if self._profile_settings_mutation_blocked():
             return False
         prepared = self._build_settings_update()
         if prepared is None:
             return False
-        ok, _error, _provider_changed = self._apply_settings_update(prepared)
+        ok, error, _provider_changed = self._apply_settings_update(prepared)
+        if not ok and bool(reschedule_transient) and error == "profile_refresh_busy":
+            self._schedule_autosave()
         return bool(ok)
 
     def _build_account_settings_payload(self) -> list[dict[str, Any]]:
@@ -2400,28 +2412,29 @@ class CodexUsageSettingsView:
     def _refresh_action_buttons(self, runtime: dict[str, Any]) -> None:
         login_button = self._login_button
         logout_button = self._logout_button
+        actions_blocked = bool(self._profile_deletions_inflight)
         try:
-            can_login = bool(runtime.get("can_login", False))
+            can_login = bool(runtime.get("can_login", False)) and not actions_blocked
         except Exception:
             can_login = False
         try:
-            can_logout = bool(runtime.get("can_logout", False))
+            can_logout = bool(runtime.get("can_logout", False)) and not actions_blocked
         except Exception:
             can_logout = False
         self._set_button_enabled(login_button, can_login)
         self._set_button_enabled(logout_button, can_logout)
         for account_id, button in self._account_query_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
-            account_can_query = self._account_query_permission(entry)
+            account_can_query = self._account_query_permission(entry) and not actions_blocked
             self._set_button_enabled(button, account_can_query)
         for account_id, button in self._account_login_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
             account_can_login, _account_can_logout = self._account_action_permissions(entry)
-            self._set_button_enabled(button, account_can_login)
+            self._set_button_enabled(button, account_can_login and not actions_blocked)
         for account_id, button in self._account_logout_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
             _account_can_login, account_can_logout = self._account_action_permissions(entry)
-            self._set_button_enabled(button, account_can_logout)
+            self._set_button_enabled(button, account_can_logout and not actions_blocked)
         return
 
     def _find_account_runtime_entry(

@@ -1320,6 +1320,41 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertTrue(statuses)
         self.assertEqual(statuses[-1][1], "error")
 
+    def test_autosave_retries_after_profile_refresh_busy(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.update_payloads = []
+
+            def get_settings_snapshot(self):
+                return {"accounts": []}
+
+            def update_settings(self, payload):
+                self.update_payloads.append(dict(payload))
+                if len(self.update_payloads) == 1:
+                    return False, "profile_refresh_busy"
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._win = _FakeWidget()
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._set_status = lambda *_args, **_kwargs: None
+
+        self.assertFalse(view._autosave_now())
+
+        self.assertEqual(len(monitor.update_payloads), 1)
+        self.assertEqual(len(view._win.after_calls), 1)
+        self.assertIsNotNone(view._autosave_after_id)
+
+        _delay_ms, retry = view._win.after_calls[-1]
+        self.assertTrue(retry())
+        self.assertEqual(len(monitor.update_payloads), 2)
+        self.assertIsNone(view._autosave_after_id)
+
     def test_mount_hides_legacy_global_login_logout_buttons_for_multi_account_settings(self) -> None:
         class _FakeMonitor:
             def get_settings_snapshot(self):
@@ -1789,6 +1824,86 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(monitor.login_calls, ["account_2"])
         self.assertEqual(monitor.release_calls, ["account_1"])
+
+    def test_delete_inflight_blocks_profile_query_login_and_release_actions(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.calls = []
+
+            def get_runtime_status(self):
+                return {
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "enabled": True,
+                            "runtime": {"can_login": True, "can_logout": True},
+                        }
+                    ]
+                }
+
+            def login_account(self, account_id):
+                self.calls.append(("login", account_id))
+
+            def show_account_status(self, account_id, **_kwargs):
+                self.calls.append(("query", account_id))
+
+            def release_account_profile_session(self, account_id):
+                self.calls.append(("release", account_id))
+                return True, "released"
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor, ui_post=lambda fn: fn())
+        view._tk = object()
+        view._win = object()
+        view._profile_deletions_inflight.add("account_1")
+        statuses = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        with patch("tkinter.messagebox.askyesno", return_value=True):
+            view._on_account_query("account_1")
+            view._on_account_login("account_1")
+            view._on_account_release_profile("account_1")
+
+        self.assertEqual(monitor.calls, [])
+        self.assertEqual(len(statuses), 3)
+        self.assertTrue(all("변경 중" in text for text, _level in statuses))
+
+    def test_delete_inflight_disables_profile_action_buttons(self) -> None:
+        class _StateButton:
+            def __init__(self):
+                self.disabled = False
+
+            def state(self, tokens):
+                self.disabled = list(tokens) == ["disabled"]
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        query = _StateButton()
+        login = _StateButton()
+        logout = _StateButton()
+        view._login_button = _StateButton()
+        view._logout_button = _StateButton()
+        view._account_query_buttons = {"account_1": query}
+        view._account_login_buttons = {"account_1": login}
+        view._account_logout_buttons = {"account_1": logout}
+        view._profile_deletions_inflight.add("account_1")
+
+        view._refresh_action_buttons(
+            {
+                "can_login": True,
+                "can_logout": True,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "enabled": True,
+                        "runtime": {"can_login": True, "can_logout": True},
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(query.disabled)
+        self.assertTrue(login.disabled)
+        self.assertTrue(logout.disabled)
 
     def test_account_query_calls_account_specific_manual_query(self) -> None:
         class _FakeMonitor:
