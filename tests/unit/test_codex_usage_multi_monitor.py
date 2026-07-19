@@ -1942,6 +1942,52 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(children[1].show_calls, [])
             self.assertEqual([child.shutdown_calls for child in children], [1, 1])
 
+    def test_shutdown_releases_settings_lock_before_waiting_for_refresh_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker_waiting = threading.Event()
+            allow_worker_lock = threading.Event()
+            shutdown_acquired = threading.Event()
+            shutdown_finished = threading.Event()
+
+            class _GatedRLock:
+                def __init__(self):
+                    self._lock = threading.RLock()
+
+                def __enter__(self):
+                    thread_name = threading.current_thread().name
+                    if thread_name != "MainThread" and thread_name != "manager-shutdown":
+                        worker_waiting.set()
+                        allow_worker_lock.wait(2.0)
+                    self._lock.acquire()
+                    if thread_name == "manager-shutdown":
+                        shutdown_acquired.set()
+                    return self
+
+                def __exit__(self, _exc_type, _exc, _traceback):
+                    self._lock.release()
+                    return False
+
+            manager, _children = self._build_manager(tmp)
+            manager.attach(_FakeRoot(), queue.Queue())
+            manager._CodexUsageMultiMonitor__settings_mutation_lock = _GatedRLock()
+
+            manager.show_current_status(force_refresh=True)
+            self.assertTrue(worker_waiting.wait(1.0))
+            shutdown_thread = threading.Thread(
+                target=lambda: (manager.shutdown(), shutdown_finished.set()),
+                name="manager-shutdown",
+                daemon=True,
+            )
+            shutdown_thread.start()
+            self.assertTrue(shutdown_acquired.wait(1.0))
+
+            allow_worker_lock.set()
+            shutdown_thread.join(2.0)
+
+            self.assertTrue(shutdown_finished.is_set())
+            self.assertFalse(shutdown_thread.is_alive())
+            self.assertFalse(manager._CodexUsageMultiMonitor__refresh_inflight)
+
     def test_delete_waits_for_active_profile_refresh_before_removing_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             refresh_started = threading.Event()

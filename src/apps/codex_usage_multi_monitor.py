@@ -277,7 +277,8 @@ class CodexUsageMultiMonitor:
                         shutdown()
                     except Exception:
                         pass
-            self.__wait_for_refreshes_quiesced(timeout_sec=None)
+        self.__wait_for_refreshes_quiesced(timeout_sec=None)
+        with self.__settings_mutation_lock:
             self.__root = None
             self.__event_queue = None
             self.__ui_thread_id = None
