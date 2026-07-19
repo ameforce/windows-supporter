@@ -124,6 +124,11 @@ class CodexUsageMultiMonitor:
             self.__config_dir,
             "ai_usage_cleanup_state.json",
         )
+        self.__settings_recovery_state_path = os.path.join(
+            self.__config_dir,
+            "ai_usage_settings_recovery.json",
+        )
+        self.__settings_recovery_profile_ids = self.__read_settings_recovery_profile_ids()
         self.__default_account_id = "account_1"
         self.__account_order = list(LEGACY_ACCOUNT_IDS)
         self.__enabled = True
@@ -211,6 +216,7 @@ class CodexUsageMultiMonitor:
             )
             for account_id, paths in self.__account_paths.items()
         }
+        self.__retry_pending_settings_recovery()
         return
 
     def attach(self, root, event_queue=None) -> None:
@@ -579,6 +585,11 @@ class CodexUsageMultiMonitor:
         candidate_settings[profile_id] = settings
         candidate_order = [*self.__account_order, profile_id]
         candidate_default = self.__default_account_id or profile_id
+        planned_paths = self.__build_profile_paths(profile_id, provider_id)
+        path_existed_before = {
+            os.path.normcase(os.path.abspath(path)): os.path.lexists(path)
+            for path in (planned_paths.config_dir, planned_paths.profile_dir)
+        }
         staged_paths = None
         staged_child = None
         try:
@@ -603,6 +614,12 @@ class CodexUsageMultiMonitor:
                     shutdown()
                 except Exception:
                     pass
+            self.__cleanup_failed_add_paths(
+                profile_id,
+                staged_paths or planned_paths,
+                planned_paths,
+                path_existed_before,
+            )
             return False, "profile_add_failed", None
         self.__account_settings = candidate_settings
         self.__account_order = candidate_order
@@ -661,7 +678,8 @@ class CodexUsageMultiMonitor:
             try:
                 shutdown()
             except Exception:
-                pass
+                self.__discard_cleanup_transaction(transaction_id)
+                return False, "profile_delete_failed"
         quarantined: list[dict[str, str]] = []
         try:
             for entry in deletion_entries:
@@ -714,6 +732,7 @@ class CodexUsageMultiMonitor:
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         self.__retry_pending_profile_cleanup()
+        self.__set_settings_recovery_pending(normalized, False)
         return True, None
 
     def get_runtime_status(self) -> dict[str, Any]:
@@ -1770,6 +1789,80 @@ class CodexUsageMultiMonitor:
             pass
         return
 
+    def __read_settings_recovery_profile_ids(self) -> set[str]:
+        data = self.__read_json_file(self.__settings_recovery_state_path)
+        if not isinstance(data, dict) or _safe_int(data.get("schema_version", 0), 0) != 1:
+            return set()
+        raw_ids = data.get("profile_ids")
+        if not isinstance(raw_ids, list):
+            return set()
+        return {
+            str(profile_id)
+            for profile_id in raw_ids
+            if _is_valid_profile_id(str(profile_id or ""))
+        }
+
+    def __persist_settings_recovery_profile_ids(self) -> None:
+        if self.__settings_recovery_profile_ids:
+            self.__write_json_file(
+                self.__settings_recovery_state_path,
+                {
+                    "schema_version": 1,
+                    "profile_ids": sorted(self.__settings_recovery_profile_ids),
+                },
+            )
+            return
+        if os.path.isfile(self.__settings_recovery_state_path):
+            os.remove(self.__settings_recovery_state_path)
+        return
+
+    def __set_settings_recovery_pending(self, profile_id: str, pending: bool) -> None:
+        normalized = str(profile_id or "")
+        if not _is_valid_profile_id(normalized):
+            return
+        if pending:
+            self.__settings_recovery_profile_ids.add(normalized)
+        else:
+            self.__settings_recovery_profile_ids.discard(normalized)
+        try:
+            self.__persist_settings_recovery_profile_ids()
+        except Exception:
+            pass
+        return
+
+    def __retry_pending_settings_recovery(self) -> None:
+        for profile_id in list(self.__settings_recovery_profile_ids):
+            account = self.__account_settings.get(profile_id)
+            child = self.__children.get(profile_id)
+            paths = self.__account_paths.get(profile_id)
+            if account is None or child is None or paths is None:
+                self.__settings_recovery_profile_ids.discard(profile_id)
+                continue
+            try:
+                self.__apply_child_settings(
+                    child,
+                    account,
+                    enabled=self.__enabled,
+                    interval_sec=self.__interval_sec,
+                    tooltip_duration_ms=self.__tooltip_duration_ms,
+                    usage_url=self.__usage_url,
+                )
+            except Exception:
+                shutdown = getattr(child, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        pass
+                self.__children[profile_id] = _RecoveryPendingChild(paths)
+                continue
+            self.__settings_recovery_profile_ids.discard(profile_id)
+        try:
+            self.__persist_settings_recovery_profile_ids()
+        except Exception:
+            pass
+        return
+
     def __normalize_cleanup_entry(self, raw: Any) -> dict[str, str] | None:
         if not isinstance(raw, dict):
             return None
@@ -1827,6 +1920,41 @@ class CodexUsageMultiMonitor:
                 os.remove(self.__cleanup_state_path)
         except Exception:
             pass
+        return
+
+    def __cleanup_failed_add_paths(
+        self,
+        profile_id: str,
+        staged_paths: _AccountPaths,
+        planned_paths: _AccountPaths,
+        path_existed_before: dict[str, bool],
+    ) -> None:
+        local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
+        for staged_path, planned_path, root in (
+            (staged_paths.config_dir, planned_paths.config_dir, self.__config_dir),
+            (staged_paths.profile_dir, planned_paths.profile_dir, local_app_root),
+        ):
+            staged_key = os.path.normcase(os.path.abspath(staged_path))
+            planned_key = os.path.normcase(os.path.abspath(planned_path))
+            if staged_key != planned_key or path_existed_before.get(planned_key, True):
+                continue
+            if not self.__is_owned_deletion_path(staged_path, root):
+                continue
+            try:
+                if os.path.isdir(staged_path):
+                    shutil.rmtree(staged_path)
+                elif os.path.lexists(staged_path):
+                    os.remove(staged_path)
+                profile_root = os.path.dirname(staged_path)
+                if (
+                    os.path.basename(profile_root) == profile_id
+                    and self.__is_owned_deletion_path(profile_root, root)
+                    and os.path.isdir(profile_root)
+                    and not os.listdir(profile_root)
+                ):
+                    os.rmdir(profile_root)
+            except Exception:
+                pass
         return
 
     def __is_owned_deletion_path(self, path: str, root: str) -> bool:
@@ -2033,6 +2161,9 @@ class CodexUsageMultiMonitor:
             replacement_child = _RecoveryPendingChild(original_paths)
             if self.__root is not None:
                 self.__attach_child(replacement_child, self.__root, self.__event_queue)
+            self.__set_settings_recovery_pending(account_id, True)
+        else:
+            self.__set_settings_recovery_pending(account_id, False)
         self.__account_paths[account_id] = replacement_paths
         self.__children[account_id] = replacement_child
         shutdown_original = getattr(original_child, "shutdown", None)
