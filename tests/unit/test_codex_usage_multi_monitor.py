@@ -212,6 +212,39 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             self.assertIn("after-existing", root.after_cancel_calls)
 
+    def test_queued_ui_callbacks_do_not_resurrect_taskbar_or_scheduler_after_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _FakeTaskbarOverlay.instances = []
+            manager, children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            for child in children:
+                child.runtime["session_state"] = "logged_in"
+            root = _FakeRoot()
+            event_queue = queue.Queue()
+            manager.attach(root, event_queue=event_queue)
+            manager._CodexUsageMultiMonitor__request_monitor_scheduler_restart(
+                initial_delay_sec=5.0
+            )
+
+            self.assertGreaterEqual(event_queue.qsize(), 2)
+            manager.shutdown()
+            self.assertEqual(
+                manager._CodexUsageMultiMonitor__profile_next_collect_due_ts,
+                {},
+            )
+
+            while not event_queue.empty():
+                event_queue.get_nowait()()
+
+            self.assertEqual(_FakeTaskbarOverlay.instances, [])
+            self.assertEqual(
+                manager._CodexUsageMultiMonitor__profile_next_collect_due_ts,
+                {},
+            )
+            self.assertIsNone(manager._CodexUsageMultiMonitor__monitor_after_id)
+
     def test_manager_preserves_date_only_reset_before_default_child_formatter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)

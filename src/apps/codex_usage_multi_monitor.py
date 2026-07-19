@@ -1164,11 +1164,13 @@ class CodexUsageMultiMonitor:
         invalidate_geometry: bool = False,
         rebind_native_owner: bool = False,
     ) -> None:
-        if self.__root is None:
+        if bool(self.__closing) or self.__root is None:
             return
 
         def action() -> None:
             try:
+                if bool(self.__closing) or self.__root is None:
+                    return
                 if not bool(self.__taskbar_overlay_enabled):
                     if self.__taskbar_progress is not None:
                         self.__taskbar_progress.hide()
@@ -1193,6 +1195,8 @@ class CodexUsageMultiMonitor:
         return
 
     def __ensure_taskbar_progress(self):
+        if bool(self.__closing) or self.__root is None:
+            return None
         if self.__taskbar_progress is not None:
             return self.__taskbar_progress
         factory = self.__taskbar_progress_factory
@@ -1203,7 +1207,7 @@ class CodexUsageMultiMonitor:
         return self.__taskbar_progress
 
     def __post_ui(self, fn) -> bool:
-        if not callable(fn):
+        if bool(self.__closing) or not callable(fn):
             return False
         queue_obj = self.__event_queue
         if queue_obj is None:
@@ -1268,6 +1272,10 @@ class CodexUsageMultiMonitor:
         return True
 
     def __restart_monitor_scheduler(self, initial_delay_sec: float | None = None) -> None:
+        if bool(self.__closing):
+            self.__clear_monitor_schedule()
+            self.__profile_next_collect_due_ts.clear()
+            return
         self.__clear_monitor_schedule()
         account_ids = self.__background_account_ids()
         self.__profile_next_collect_due_ts = {
@@ -1306,6 +1314,10 @@ class CodexUsageMultiMonitor:
         return
 
     def __schedule_monitor_tick(self, initial_delay_sec: float | None = None) -> None:
+        if bool(self.__closing):
+            self.__clear_monitor_schedule()
+            self.__profile_next_collect_due_ts.clear()
+            return
         account_ids = self.__background_account_ids()
         if not bool(self.__enabled and account_ids):
             self.__monitor_after_id = None
@@ -1356,6 +1368,9 @@ class CodexUsageMultiMonitor:
     def __monitor_tick(self) -> None:
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
+        if bool(self.__closing):
+            self.__profile_next_collect_due_ts.clear()
+            return
         account_ids = self.__background_account_ids()
         if not bool(self.__enabled and account_ids):
             self.__profile_next_collect_due_ts.clear()
