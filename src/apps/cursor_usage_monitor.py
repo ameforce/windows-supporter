@@ -506,10 +506,13 @@ class CursorUsageMonitor:
         self._external_scheduler = not bool(start_monitor)
 
     def shutdown(self) -> None:
-        self._stop_login_poll()
-        self._session.shutdown()
+        self.request_collect_cancel()
         self._root = None
         self._event_queue = None
+
+    def request_collect_cancel(self) -> None:
+        self._stop_login_poll()
+        self._session.shutdown()
 
     def collect(self, *, force: bool = False) -> AiUsageReading:
         now = self._clock()

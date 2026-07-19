@@ -96,6 +96,9 @@ class _RecoveryPendingChild:
     def attach(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
+    def request_collect_cancel(self) -> None:
+        return None
+
     def shutdown(self) -> None:
         return None
 
@@ -271,6 +274,8 @@ class CodexUsageMultiMonitor:
                 ],
             ]
             self.__unsettled_children = {}
+        for child in shutdown_children:
+            self.__request_child_collect_cancel(child)
         self.__wait_for_refreshes_quiesced(timeout_sec=None)
         for child in shutdown_children:
             shutdown = getattr(child, "shutdown", None)
@@ -931,6 +936,9 @@ class CodexUsageMultiMonitor:
             return False, "confirmation_required"
         if not self.__shutdown_unsettled_children(normalized):
             return False, "profile_delete_failed"
+        child = self.__children.get(normalized)
+        if not self.__request_child_collect_cancel(child):
+            return False, "profile_delete_failed"
         if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
             return False, "profile_delete_failed"
         local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
@@ -970,7 +978,6 @@ class CodexUsageMultiMonitor:
             )
         except Exception:
             return False, "profile_delete_failed"
-        child = self.__children.get(normalized)
         recovery_was_pending = normalized in self.__settings_recovery_profile_ids
         try:
             self.__prepare_settings_recovery([normalized])
@@ -1353,6 +1360,18 @@ class CodexUsageMultiMonitor:
                 if remaining <= 0.0:
                     return False
                 self.__refresh_condition.wait(timeout=min(0.25, remaining))
+
+    def __request_child_collect_cancel(self, child: Any | None) -> bool:
+        if child is None:
+            return True
+        request_cancel = getattr(child, "request_collect_cancel", None)
+        if not callable(request_cancel):
+            return True
+        try:
+            request_cancel()
+        except Exception:
+            return False
+        return True
 
     def __dispatch_refresh_worker(self, fn, *, refresh_taskbar: bool) -> bool:
         if not callable(fn):

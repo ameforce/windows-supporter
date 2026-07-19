@@ -1898,9 +1898,7 @@ class CodexUsageMonitor:
         return
 
     def shutdown(self) -> None:
-        self.__request_collect_cancel()
-        self.__pause_background_monitor()
-        self.__cancel_pending_login_poll()
+        self.request_collect_cancel()
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
@@ -1910,6 +1908,12 @@ class CodexUsageMonitor:
         self.__root = None
         self.__event_queue = None
         self.__ui_thread_id = None
+        return
+
+    def request_collect_cancel(self) -> None:
+        self.__request_collect_cancel()
+        self.__pause_background_monitor()
+        self.__cancel_pending_login_poll()
         return
 
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:

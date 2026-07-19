@@ -1898,7 +1898,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 (False, "shutdown"),
             )
 
-    def test_shutdown_waits_for_active_refresh_and_skips_remaining_children(self):
+    def test_shutdown_requests_cancel_then_waits_for_active_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
             refresh_started = threading.Event()
             release_refresh = threading.Event()
@@ -1906,10 +1906,26 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             children = []
 
             class _ActiveChild(_FakeChildMonitor):
+                def __init__(self, config_dir, profile_dir):
+                    super().__init__(config_dir, profile_dir)
+                    self.cancel_calls = 0
+                    self.events = []
+
                 def show_current_status(self, force_refresh=True, source="manual_query"):
+                    self.events.append("refresh_started")
                     refresh_started.set()
                     release_refresh.wait(2.0)
+                    self.events.append("refresh_finished")
                     return super().show_current_status(force_refresh=force_refresh, source=source)
+
+                def request_collect_cancel(self):
+                    self.cancel_calls += 1
+                    self.events.append("cancel_requested")
+                    release_refresh.set()
+
+                def shutdown(self):
+                    self.events.append("shutdown")
+                    return super().shutdown()
 
             def factory(config_dir, profile_dir):
                 child = (
@@ -1933,16 +1949,20 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 target=lambda: (manager.shutdown(), shutdown_finished.set())
             )
             shutdown_thread.start()
-            shutdown_finished_before_release = shutdown_finished.wait(0.2)
-            child_shutdown_before_release = children[0].shutdown_calls
-            release_refresh.set()
+            shutdown_completed_after_cancel = shutdown_finished.wait(1.0)
+            if not shutdown_completed_after_cancel:
+                release_refresh.set()
             shutdown_thread.join(2.0)
 
-            self.assertFalse(shutdown_finished_before_release)
-            self.assertEqual(child_shutdown_before_release, 0)
+            self.assertTrue(shutdown_completed_after_cancel)
             self.assertFalse(shutdown_thread.is_alive())
+            self.assertEqual(children[0].cancel_calls, 1)
             self.assertEqual(children[1].show_calls, [])
             self.assertEqual([child.shutdown_calls for child in children], [1, 1])
+            self.assertEqual(
+                children[0].events,
+                ["refresh_started", "cancel_requested", "refresh_finished", "shutdown"],
+            )
 
     def test_shutdown_releases_settings_lock_before_waiting_for_refresh_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1990,7 +2010,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertFalse(shutdown_thread.is_alive())
             self.assertFalse(manager._CodexUsageMultiMonitor__refresh_inflight)
 
-    def test_delete_waits_for_active_profile_refresh_before_removing_paths(self):
+    def test_delete_requests_cancel_then_waits_before_removing_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             refresh_started = threading.Event()
             release_refresh = threading.Event()
@@ -1999,13 +2019,29 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             children = []
 
             class _LateWritingChild(_FakeChildMonitor):
+                def __init__(self, config_dir, profile_dir):
+                    super().__init__(config_dir, profile_dir)
+                    self.cancel_calls = 0
+                    self.events = []
+
                 def show_current_status(self, force_refresh=True, source="manual_query"):
+                    self.events.append("refresh_started")
                     refresh_started.set()
                     release_refresh.wait(2.0)
                     os.makedirs(self.config_dir, exist_ok=True)
                     with open(os.path.join(self.config_dir, "late_state.json"), "w", encoding="utf-8") as fp:
                         fp.write("late")
+                    self.events.append("refresh_finished")
                     return super().show_current_status(force_refresh=force_refresh, source=source)
+
+                def request_collect_cancel(self):
+                    self.cancel_calls += 1
+                    self.events.append("cancel_requested")
+                    release_refresh.set()
+
+                def shutdown(self):
+                    self.events.append("shutdown")
+                    return super().shutdown()
 
             def factory(config_dir, profile_dir):
                 child = (
@@ -2034,16 +2070,20 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 )
             )
             delete_thread.start()
-            delete_finished_before_release = delete_finished.wait(0.2)
-            child_shutdown_before_release = children[0].shutdown_calls
-            release_refresh.set()
+            delete_completed_after_cancel = delete_finished.wait(1.0)
+            if not delete_completed_after_cancel:
+                release_refresh.set()
             delete_thread.join(2.0)
 
-            self.assertFalse(delete_finished_before_release)
-            self.assertEqual(child_shutdown_before_release, 0)
+            self.assertTrue(delete_completed_after_cancel)
             self.assertFalse(delete_thread.is_alive())
+            self.assertEqual(children[0].cancel_calls, 1)
             self.assertEqual(delete_result, [(True, None)])
             self.assertFalse(os.path.exists(account_path))
+            self.assertEqual(
+                children[0].events,
+                ["refresh_started", "cancel_requested", "refresh_finished", "shutdown"],
+            )
 
     def test_snapshot_readers_share_provider_publish_mutation_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
