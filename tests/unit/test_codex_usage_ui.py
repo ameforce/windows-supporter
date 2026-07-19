@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -88,10 +90,20 @@ class _FakeCanvas(_FakeWidget):
         super().__init__(owner, *args, **kwargs)
         self.windows = []
         self.itemconfigure_calls = []
+        self.yview_scroll_calls = []
+        self.yview_moveto_calls = []
         if owner is not None:
             owner.canvases.append(self)
 
     def yview(self, *_args, **_kwargs):
+        return None
+
+    def yview_scroll(self, amount, unit):
+        self.yview_scroll_calls.append((int(amount), str(unit)))
+        return None
+
+    def yview_moveto(self, fraction):
+        self.yview_moveto_calls.append(float(fraction))
         return None
 
     def create_window(self, *args, **kwargs):
@@ -315,6 +327,24 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "활성화 · US$8.20 사용",
         )
 
+    def test_metric_display_keeps_value_and_suffix_as_one_visual_unit(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        self.assertEqual(
+            view._format_account_metric_value(
+                "weekly_limit",
+                {"weekly_limit": "73% remaining"},
+            ),
+            "73%\u00a0남음",
+        )
+        self.assertEqual(
+            view._format_account_metric_value(
+                "on_demand_status",
+                {"on_demand_status": "Enabled · US$8.20 used"},
+            ),
+            "활성화 · US$8.20\u00a0사용",
+        )
+
     def test_on_release_profile_calls_monitor_and_sets_ok_status(self) -> None:
         class _FakeMonitor:
             def __init__(self):
@@ -365,7 +395,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertTrue(status_calls)
         self.assertEqual(status_calls[-1][1], "ok")
 
-    def test_mount_keeps_codex_content_unscrolled(self) -> None:
+    def test_mount_wraps_codex_content_in_scrollable_viewport(self) -> None:
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
         parent = _FakeWidget()
@@ -383,10 +413,17 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view.mount(parent)
 
-        self.assertEqual(len(fake_tk.canvases), 0)
-        self.assertEqual(len(fake_ttk.scrollbars), 0)
+        self.assertEqual(len(fake_tk.canvases), 1)
+        self.assertEqual(len(fake_ttk.scrollbars), 1)
+        canvas = fake_tk.canvases[0]
+        self.assertEqual(len(canvas.windows), 1)
+        sequences = {sequence for sequence, _callback in canvas.bind_calls}
+        self.assertTrue(
+            {"<Up>", "<Down>", "<Prior>", "<Next>", "<Home>", "<End>", "<MouseWheel>"}
+            <= sequences
+        )
 
-    def test_mount_keeps_two_account_settings_visible_without_scroll_canvas(self) -> None:
+    def test_mount_keeps_two_account_settings_visible_inside_scroll_canvas(self) -> None:
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
         parent = _FakeWidget()
@@ -408,13 +445,133 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view.mount(parent)
 
-        self.assertEqual(len(fake_tk.canvases), 0)
-        self.assertEqual(len(fake_ttk.scrollbars), 0)
+        self.assertEqual(len(fake_tk.canvases), 1)
+        self.assertEqual(len(fake_ttk.scrollbars), 1)
         texts = [label.kwargs.get("text") for label in fake_tk.labels]
         self.assertIn("작업표시줄 표시", texts)
-        self.assertIn("사용량 프로필 (전체 최대 2개)", texts)
+        self.assertIn("사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 2개)", texts)
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
+
+    def test_scroll_navigation_handles_keyboard_and_mouse_wheel(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+            "profiles": [],
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(_FakeWidget())
+
+        canvas = fake_tk.canvases[0]
+        callbacks = {sequence: callback for sequence, callback in canvas.bind_calls}
+        callbacks["<Down>"](object())
+        callbacks["<Next>"](object())
+        callbacks["<Home>"](object())
+        callbacks["<End>"](object())
+        callbacks["<MouseWheel>"](type("Event", (), {"delta": -240})())
+
+        self.assertEqual(
+            canvas.yview_scroll_calls,
+            [(1, "units"), (1, "pages"), (2, "units")],
+        )
+        self.assertEqual(canvas.yview_moveto_calls, [0.0, 1.0])
+
+    def test_scroll_navigation_reaches_focused_child_controls(self) -> None:
+        class _FocusedEntry(_FakeWidget):
+            def winfo_class(self):
+                return "TEntry"
+
+        class _FocusedButton(_FakeWidget):
+            def winfo_class(self):
+                return "TButton"
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        canvas = _FakeCanvas()
+        body = _FakeWidget()
+        focused_entry = _FocusedEntry()
+        focused_button = _FocusedButton()
+        body.children.extend([focused_entry, focused_button])
+
+        view._bind_scroll_navigation(canvas, body)
+
+        entry_callbacks = {
+            sequence: callback for sequence, callback in focused_entry.bind_calls
+        }
+        button_callbacks = {
+            sequence: callback for sequence, callback in focused_button.bind_calls
+        }
+        self.assertNotIn("<Down>", entry_callbacks)
+        self.assertNotIn("<Home>", entry_callbacks)
+        self.assertIn("<Next>", entry_callbacks)
+        self.assertIn("<Down>", button_callbacks)
+        entry_callbacks["<Next>"](object())
+        button_callbacks["<Down>"](object())
+        self.assertEqual(canvas.yview_scroll_calls, [(1, "pages"), (1, "units")])
+
+    def test_profile_cards_collapse_to_one_column_at_150_percent_scaling(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        class _TkBridge:
+            def call(self, *_args):
+                return 2.0
+
+        widget = type("Widget", (), {"tk": _TkBridge()})()
+
+        self.assertEqual(view._profile_card_column_count(widget), 1)
+        self.assertEqual(view._profile_card_column_count(object()), 2)
+
+    def test_profile_cards_collapse_to_one_column_when_viewport_is_narrow(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        class _TkBridge:
+            def call(self, *_args):
+                return 4.0 / 3.0
+
+        widget = type("Widget", (), {"tk": _TkBridge()})()
+
+        self.assertEqual(
+            view._profile_card_column_count(widget, available_width=700),
+            1,
+        )
+        self.assertEqual(
+            view._profile_card_column_count(widget, available_width=640),
+            1,
+        )
+        self.assertEqual(
+            view._profile_card_column_count(widget, available_width=768),
+            2,
+        )
+        self.assertEqual(
+            view._profile_card_column_count(widget, available_width=820),
+            2,
+        )
+
+    def test_profile_cards_reflow_when_viewport_crosses_narrow_boundary(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        cards = _FakeWidget()
+        cards.tk = type("TkBridge", (), {"call": lambda _self, *_args: 4.0 / 3.0})()
+        card_widgets = [_FakeWidget(), _FakeWidget(), _FakeWidget()]
+
+        view._reflow_profile_cards(cards, card_widgets, available_width=700)
+        self.assertEqual(
+            [(card.grid_kwargs["row"], card.grid_kwargs["column"]) for card in card_widgets],
+            [(0, 0), (1, 0), (2, 0)],
+        )
+
+        view._reflow_profile_cards(cards, card_widgets, available_width=820)
+        self.assertEqual(
+            [(card.grid_kwargs["row"], card.grid_kwargs["column"]) for card in card_widgets],
+            [(0, 0), (0, 1), (1, 0)],
+        )
 
     def test_mount_lays_runtime_values_out_in_two_columns(self) -> None:
         fake_tk = _FakeTk()
@@ -511,6 +668,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
         parent = _FakeWidget()
+
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         view._tk = fake_tk
         view._ttk = fake_ttk
@@ -538,6 +696,525 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("Codex 조회 URL", texts)
         self.assertNotIn("조회 URL", texts)
         self.assertEqual(len(fake_ttk.entries), 2)
+
+    def test_mount_renders_all_saved_profiles_with_add_and_delete_actions(self) -> None:
+        class _FakeMonitor:
+            def get_settings_snapshot(self):
+                profiles = []
+                for index in range(3):
+                    profiles.append(
+                        {
+                            "id": f"profile_{index:032x}",
+                            "label": f"프로필 {index + 1}",
+                            "provider": "codex",
+                            "enabled": True,
+                            "taskbar_selected": index < 2,
+                            "settings_path": "",
+                            "state_path": "",
+                            "profile_dir": "",
+                        }
+                    )
+                return {
+                    "enabled": True,
+                    "taskbar_overlay_enabled": True,
+                    "interval_sec": 90,
+                    "tooltip_duration_ms": 7000,
+                    "usage_url": "https://example.test",
+                    "profiles": profiles,
+                }
+
+            def get_runtime_status(self):
+                return {"profiles": []}
+
+            def get_last_snapshot(self):
+                return None
+
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(_FakeWidget())
+
+        texts = [label.kwargs.get("text") for label in fake_tk.labels]
+        self.assertEqual(view._account_order, [f"profile_{index:032x}" for index in range(3)])
+        self.assertIn("프로필 1", texts)
+        self.assertIn("프로필 2", texts)
+        self.assertIn("프로필 3", texts)
+        button_texts = [button.kwargs.get("text") for button in fake_ttk.buttons]
+        self.assertIn("프로필 추가", button_texts)
+        self.assertEqual(button_texts.count("삭제"), 3)
+
+    def test_mount_with_zero_profiles_still_exposes_add_action(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "profiles": [],
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(_FakeWidget())
+
+        button_texts = [button.kwargs.get("text") for button in fake_ttk.buttons]
+        self.assertIn("프로필 추가", button_texts)
+        self.assertNotIn("연결", button_texts)
+
+    def test_add_and_delete_profile_actions_remount_after_confirmed_manager_change(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.add_calls = []
+                self.delete_calls = []
+
+            def add_profile(self, provider):
+                self.add_calls.append(provider)
+                return True, None, {"id": "profile_0"}
+
+            def delete_profile(self, profile_id, confirmed=False):
+                self.delete_calls.append((profile_id, confirmed))
+                return True, None
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+                return None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: fn(),
+        )
+        remounts = []
+        view._remount = lambda: remounts.append(True)
+        view._set_status = lambda *_args, **_kwargs: None
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _InlineThread):
+            view._on_add_profile()
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_delete_profile("profile_0", "테스트 프로필")
+
+        self.assertEqual(monitor.add_calls, ["codex"])
+        self.assertEqual(monitor.delete_calls, [("profile_0", True)])
+        self.assertEqual(len(remounts), 2)
+
+    def test_delete_profile_runs_manager_shutdown_off_the_tk_callback(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.delete_calls = []
+
+            def delete_profile(self, profile_id, confirmed=False):
+                self.delete_calls.append((profile_id, confirmed))
+                return True, None
+
+        class _DeferredThread:
+            targets = []
+
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self.targets.append(self._target)
+                return None
+
+        monitor = _FakeMonitor()
+        posted = []
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: posted.append(fn),
+        )
+        remounts = []
+        statuses = []
+        view._remount = lambda: remounts.append(True)
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _DeferredThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_delete_profile("profile_0", "테스트 프로필")
+                view._on_delete_profile("profile_0", "테스트 프로필")
+                view._on_delete_profile("profile_1", "다른 프로필")
+
+        self.assertEqual(monitor.delete_calls, [])
+        self.assertEqual(remounts, [])
+        self.assertEqual(len(_DeferredThread.targets), 1)
+        self.assertIn("삭제 작업이 진행 중", statuses[-1][0])
+
+        _DeferredThread.targets[0]()
+
+        self.assertEqual(monitor.delete_calls, [("profile_0", True)])
+        self.assertEqual(remounts, [])
+        self.assertEqual(len(posted), 1)
+
+        posted[0]()
+
+        self.assertEqual(remounts, [True])
+        self.assertEqual(statuses[-1][1], "ok")
+        self.assertEqual(view._profile_deletions_inflight, set())
+
+    def test_delete_profile_clears_inflight_guard_on_failure_and_thread_start_error(self) -> None:
+        class _FailingMonitor:
+            def delete_profile(self, _profile_id, confirmed=False):
+                self.confirmed = bool(confirmed)
+                return False, "cleanup failed"
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self._target()
+                return None
+
+        statuses = []
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=_FailingMonitor(),
+            ui_post=lambda fn: fn(),
+        )
+        remounts = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+        view._remount = lambda: remounts.append(True)
+        with patch("src.apps.codex_usage_ui.threading.Thread", _InlineThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_delete_profile("profile_0", "테스트 프로필")
+
+        self.assertEqual(view._profile_deletions_inflight, set())
+        self.assertEqual(statuses[-1][1], "error")
+        self.assertEqual(remounts, [True])
+
+        class _StartFailThread:
+            def __init__(self, target=None, daemon=None):
+                _ = (target, daemon)
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _StartFailThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_delete_profile("profile_0", "테스트 프로필")
+
+        self.assertEqual(view._profile_deletions_inflight, set())
+        self.assertIn("시작하지 못했습니다", statuses[-1][0])
+        self.assertEqual(statuses[-1][1], "error")
+        self.assertEqual(remounts, [True])
+
+    def test_delete_inflight_blocks_all_other_profile_settings_mutations(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.add_calls = []
+                self.update_calls = []
+
+            def get_settings_snapshot(self):
+                return {"profiles": []}
+
+            def add_profile(self, provider):
+                self.add_calls.append(provider)
+                return True, None, {"id": "profile_new"}
+
+            def update_settings(self, payload):
+                self.update_calls.append(payload)
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._profile_deletions_inflight.add("account_1")
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.invalid/usage")
+        view._account_order = ["account_1", "account_2"]
+        view._account_taskbar_selected_vars = {
+            "account_1": _FakeVar(value=True),
+        }
+        remounts = []
+        scheduled = []
+        statuses = []
+        view._remount = lambda: remounts.append(True)
+        view._schedule_autosave = lambda: scheduled.append(True)
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        view._on_add_profile()
+        view._on_move_account("account_1", 1)
+        view._on_taskbar_selection_changed("account_1")
+        saved = view._save_settings()
+
+        self.assertFalse(saved)
+        self.assertEqual(monitor.add_calls, [])
+        self.assertEqual(monitor.update_calls, [])
+        self.assertEqual(view._account_order, ["account_1", "account_2"])
+        self.assertEqual(remounts, [])
+        self.assertEqual(scheduled, [])
+        self.assertTrue(statuses)
+        self.assertTrue(all("변경 중" in text for text, _level in statuses))
+
+    def test_delete_flushes_pending_autosave_inside_worker_before_deletion(self) -> None:
+        class _FakeMonitor:
+            def delete_profile(self, _profile_id, confirmed=False):
+                return bool(confirmed), None
+
+        class _DeferredThread:
+            targets = []
+
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self.targets.append(self._target)
+                return None
+
+        class _FakeWin:
+            def __init__(self):
+                self.after_cancel_calls = []
+
+            def after_cancel(self, after_id):
+                self.after_cancel_calls.append(after_id)
+
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=_FakeMonitor(),
+            ui_post=lambda fn: fn(),
+        )
+        view._win = _FakeWin()
+        view._autosave_after_id = "after-1"
+        events = []
+        view._build_settings_update = lambda: {"payload": "dirty"}
+        view._apply_settings_update = (
+            lambda prepared, update_ui=False: events.append(("save", prepared, update_ui))
+            or (True, None, False)
+        )
+        view._set_status = lambda *_args, **_kwargs: None
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _DeferredThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_delete_profile("account_2", "Codex 2")
+
+        self.assertEqual(view._win.after_cancel_calls, ["after-1"])
+        self.assertEqual(len(_DeferredThread.targets), 1)
+        self.assertEqual(events, [])
+
+        _DeferredThread.targets[0]()
+
+        self.assertEqual(events[0], ("save", {"payload": "dirty"}, False))
+
+    def test_pending_provider_save_does_not_block_delete_tk_callback(self) -> None:
+        save_started = threading.Event()
+        release_save = threading.Event()
+        delete_finished = threading.Event()
+
+        class _FakeMonitor:
+            def __init__(self):
+                self.delete_calls = []
+
+            def delete_profile(self, profile_id, confirmed=False):
+                self.delete_calls.append((profile_id, confirmed))
+                delete_finished.set()
+                return True, None
+
+        monitor = _FakeMonitor()
+        posted = []
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: posted.append(fn),
+        )
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-provider-change"
+        view._build_settings_update = lambda: {"payload": "provider-change"}
+
+        def blocking_save(prepared, update_ui=False):
+            self.assertEqual(prepared, {"payload": "provider-change"})
+            self.assertFalse(update_ui)
+            save_started.set()
+            release_save.wait(2.0)
+            return True, None, True
+
+        view._apply_settings_update = blocking_save
+        view._set_status = lambda *_args, **_kwargs: None
+        started_at = time.monotonic()
+
+        with patch("tkinter.messagebox.askyesno", return_value=True):
+            view._on_delete_profile("account_2", "Codex 2")
+
+        callback_elapsed = time.monotonic() - started_at
+        self.assertLess(callback_elapsed, 0.25)
+        self.assertTrue(save_started.wait(1.0))
+        self.assertEqual(monitor.delete_calls, [])
+
+        release_save.set()
+        self.assertTrue(delete_finished.wait(1.0))
+        self.assertEqual(monitor.delete_calls, [("account_2", True)])
+        self.assertEqual(len(posted), 1)
+        posted[0]()
+        self.assertEqual(view._profile_deletions_inflight, set())
+
+    def test_delete_aborts_when_pending_autosave_flush_fails(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.delete_calls = []
+
+            def delete_profile(self, profile_id, confirmed=False):
+                self.delete_calls.append((profile_id, confirmed))
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: fn(),
+        )
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-1"
+        view._build_settings_update = lambda: {"payload": "dirty"}
+        view._apply_settings_update = lambda _prepared, update_ui=False: (
+            False,
+            "save failed",
+            False,
+        )
+        statuses = []
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _InlineThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_delete_profile("account_2", "Codex 2")
+
+        self.assertEqual(monitor.delete_calls, [])
+        self.assertEqual(view._profile_deletions_inflight, set())
+        self.assertIn("삭제를 시작하지 않았습니다", statuses[-1][0])
+        self.assertEqual(statuses[-1][1], "error")
+
+    def test_third_taskbar_selection_is_reverted_before_autosave(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.payloads = []
+
+            def get_settings_snapshot(self):
+                return {
+                    "profiles": [
+                        {"id": "account_1", "provider": "codex"},
+                        {"id": "account_2", "provider": "cursor"},
+                        {"id": "profile_0", "provider": "codex"},
+                    ]
+                }
+
+            def update_settings(self, payload):
+                self.payloads.append(payload)
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._account_order = ["account_1", "account_2", "profile_0"]
+        view._account_enabled_vars = {
+            profile_id: _FakeVar(value=True)
+            for profile_id in view._account_order
+        }
+        view._account_provider_vars = {
+            "account_1": _FakeVar(value="codex"),
+            "account_2": _FakeVar(value="cursor"),
+            "profile_0": _FakeVar(value="codex"),
+        }
+        view._account_taskbar_selected_vars = {
+            "account_1": _FakeVar(value=True),
+            "account_2": _FakeVar(value=True),
+            "profile_0": _FakeVar(value=True),
+        }
+        view._win = _FakeWidget()
+        statuses = []
+        view._set_status = lambda text, level="info": statuses.append((text, level))
+        view._autosave_after_id = "after-existing"
+
+        view._on_taskbar_selection_changed("profile_0")
+
+        self.assertFalse(view._account_taskbar_selected_vars["profile_0"].get())
+        self.assertEqual(view._win.after_cancel_calls, ["after-existing"])
+        self.assertIsNotNone(view._autosave_after_id)
+        self.assertIn("최대 2개", statuses[-1][0])
+        self.assertEqual(statuses[-1][1], "error")
+
+        _delay, autosave = view._win.after_calls[-1]
+        autosave()
+
+        self.assertEqual(monitor.payloads[-1]["selected_profile_ids"], ["account_1", "account_2"])
+        self.assertIn("최대 2개", statuses[-1][0])
+        self.assertEqual(statuses[-1][1], "error")
+
+    def test_add_flushes_pending_autosave_inside_worker_before_profile_creation(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.add_calls = []
+
+            def add_profile(self, provider):
+                self.add_calls.append(provider)
+                return True, None, {"id": "profile_new"}
+
+        class _DeferredThread:
+            targets = []
+
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self.targets.append(self._target)
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor, ui_post=lambda fn: fn())
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-add"
+        events = []
+        view._build_settings_update = lambda: {"payload": "dirty"}
+        view._apply_settings_update = (
+            lambda prepared, update_ui=False: events.append(("save", prepared, update_ui))
+            or (True, None, False)
+        )
+        view._set_status = lambda *_args, **_kwargs: None
+        view._remount = lambda: events.append(("remount",))
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _DeferredThread):
+            view._on_add_profile()
+
+        self.assertEqual(monitor.add_calls, [])
+        self.assertEqual(events, [])
+        self.assertEqual(view._win.after_cancel_calls, ["after-add"])
+        self.assertEqual(len(_DeferredThread.targets), 1)
+
+        _DeferredThread.targets[0]()
+
+        self.assertEqual(events[0], ("save", {"payload": "dirty"}, False))
+        self.assertEqual(monitor.add_calls, ["codex"])
+        self.assertEqual(events[-1], ("remount",))
 
     def test_save_includes_taskbar_overlay_toggle(self) -> None:
         class _FakeMonitor:
@@ -942,7 +1619,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(remounts, ["remounted"])
 
-    def test_failed_provider_switch_reverts_selector_without_remounting_old_metrics(self) -> None:
+    def test_failed_save_preserves_dirty_provider_selector_for_retry(self) -> None:
         class _FakeMonitor:
             def get_settings_snapshot(self):
                 return {
@@ -967,13 +1644,15 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._account_provider_vars = {"account_1": provider_var}
         view._account_taskbar_selected_vars = {"account_1": _FakeVar(value=True)}
         view._set_status = lambda *_args, **_kwargs: None
-        view._load_settings = lambda: provider_var.set("codex")
+        load_calls = []
+        view._load_settings = lambda: load_calls.append(True)
         remounts = []
         view._remount = lambda: remounts.append("remounted")
 
         self.assertFalse(view._save_settings())
 
-        self.assertEqual(provider_var.get(), "codex")
+        self.assertEqual(provider_var.get(), "cursor")
+        self.assertEqual(load_calls, [])
         self.assertEqual(remounts, [])
 
     def test_runtime_provider_mismatch_remounts_before_updating_old_metric_vars(self) -> None:

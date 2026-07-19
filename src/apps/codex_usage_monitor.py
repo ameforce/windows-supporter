@@ -2300,29 +2300,27 @@ class CodexUsageMonitor:
 
     def __pause_background_monitor(self) -> None:
         root = self.__root
-        if root is not None:
-            try:
-                if self.__monitor_after_id is not None:
-                    root.after_cancel(self.__monitor_after_id)
-            except Exception:
-                pass
+        after_id = self.__monitor_after_id
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
         self.__monitor_running = False
         self.__startup_warmup_running = False
         self.__set_monitor_state("idle")
+        if root is not None and after_id is not None:
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __clear_monitor_schedule(self) -> None:
         root = self.__root
-        if root is not None:
-            try:
-                if self.__monitor_after_id is not None:
-                    root.after_cancel(self.__monitor_after_id)
-            except Exception:
-                pass
+        after_id = self.__monitor_after_id
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
+        if root is not None and after_id is not None:
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __pause_monitor_countdown_for_manual_query(self) -> None:
@@ -2973,10 +2971,9 @@ class CodexUsageMonitor:
         self.__pending_login_poll_reason = ""
         self.__pending_login_error_count = 0
         if root is not None and after_id is not None:
-            try:
-                root.after_cancel(after_id)
-            except Exception:
-                pass
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __schedule_pending_login_poll(
@@ -3410,6 +3407,22 @@ class CodexUsageMonitor:
                 return
             except Exception:
                 self.__log("ui callback post failed")
+        return
+
+    def __post_tk_cleanup(self, fn) -> None:
+        if not callable(fn):
+            return
+        queue_obj = self.__event_queue
+        if queue_obj is not None:
+            try:
+                queue_obj.put(fn)
+                return
+            except Exception:
+                self.__log("tk cleanup post failed")
+        try:
+            fn()
+        except Exception:
+            pass
         return
 
     def __queue_change_tooltip_until_input(
@@ -4001,10 +4014,7 @@ class CodexUsageMonitor:
         current = self.__active_tooltip
         self.__active_tooltip = None
         if current is not None:
-            try:
-                current.hide_tooltip()
-            except Exception:
-                pass
+            self.__post_tk_cleanup(current.hide_tooltip)
         return
 
     def __handle_collect_error(self, error: str, source: str = "") -> None:

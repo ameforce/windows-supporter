@@ -29,6 +29,9 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             tuple(harness.SCENARIO_NAMES),
             (
                 "mixed-ready-standard",
+                "one-profile-125",
+                "dynamic-three-profiles",
+                "ten-mixed-profiles-150",
                 "long-label-narrow",
                 "cursor-logged-out",
                 "cursor-stale-rate-limited",
@@ -42,7 +45,17 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 4)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 7)
+        by_name = {fixture["name"]: fixture for fixture in fixtures}
+        self.assertEqual(len(by_name["one-profile-125"]["settings"]["profiles"]), 1)
+        self.assertEqual(by_name["one-profile-125"]["ui_scale_percent"], 125)
+        dynamic = by_name["dynamic-three-profiles"]
+        self.assertEqual(len(dynamic["settings"]["profiles"]), 3)
+        self.assertFalse(dynamic["settings"]["profiles"][2]["taskbar_selected"])
+        ten_profiles = by_name["ten-mixed-profiles-150"]
+        self.assertEqual(len(ten_profiles["settings"]["profiles"]), 10)
+        self.assertEqual(ten_profiles["ui_scale_percent"], 150)
+        self.assertEqual(len(ten_profiles["settings"]["selected_profile_ids"]), 2)
 
     def test_fixture_is_provider_neutral_and_contains_no_machine_identity(self) -> None:
         harness = _load_harness_module()
@@ -60,12 +73,15 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         self.assertIn('"provider": "cursor"', serialized)
         for forbidden in ("epapyrus", "appdata", "\\users\\", "@example.com"):
             self.assertNotIn(forbidden, serialized)
-        self.assertLess(fixtures[1]["window_size"][0], fixtures[0]["window_size"][0])
-        self.assertGreater(len(fixtures[1]["settings"]["profiles"][0]["label"]), 40)
+        by_name = {fixture["name"]: fixture for fixture in fixtures}
+        long_label = by_name["long-label-narrow"]
+        self.assertEqual(long_label["window_size"][0], 700)
+        self.assertLess(long_label["window_size"][0], by_name["mixed-ready-standard"]["window_size"][0])
+        self.assertGreater(len(long_label["settings"]["profiles"][0]["label"]), 40)
 
-        logged_out = fixtures[2]["runtime"]["profiles"][1]["runtime"]
+        logged_out = by_name["cursor-logged-out"]["runtime"]["profiles"][1]["runtime"]
         self.assertEqual(logged_out["session_state"], "logged_out")
-        stale = fixtures[3]["runtime"]["profiles"][1]
+        stale = by_name["cursor-stale-rate-limited"]["runtime"]["profiles"][1]
         self.assertEqual(stale["runtime"]["provider_state"], "rate_limited")
         self.assertEqual(stale["runtime"]["failure_count"], 1)
 

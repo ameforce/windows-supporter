@@ -185,6 +185,33 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual([child.shutdown_calls for child in children], [1, 1])
             self.assertIsNone(manager._CodexUsageMultiMonitor__monitor_after_id)
 
+    def test_background_settings_mutation_posts_scheduler_restart_to_ui_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_manager(tmp)
+            root = _FakeRoot()
+            event_queue = queue.Queue()
+            manager.attach(root, event_queue=event_queue)
+            root.after_calls.clear()
+            root.after_cancel_calls.clear()
+            manager._CodexUsageMultiMonitor__monitor_after_id = "after-existing"
+            finished = threading.Event()
+
+            worker = threading.Thread(
+                target=lambda: (manager.toggle_enabled(), finished.set()),
+                daemon=True,
+            )
+            worker.start()
+
+            self.assertTrue(finished.wait(1.0))
+            self.assertEqual(root.after_calls, [])
+            self.assertEqual(root.after_cancel_calls, [])
+            self.assertGreaterEqual(event_queue.qsize(), 1)
+
+            while not event_queue.empty():
+                event_queue.get_nowait()()
+
+            self.assertIn("after-existing", root.after_cancel_calls)
+
     def test_manager_preserves_date_only_reset_before_default_child_formatter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
@@ -1673,6 +1700,147 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 encoding="utf-8",
             ) as fp:
                 self.assertEqual(json.load(fp)["profile_ids"], [profile_id])
+
+    def test_profile_mutations_serialize_delete_behind_inflight_settings_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_manager(tmp)
+            stale_profiles = manager.get_settings_snapshot()["profiles"]
+            update_before_save = threading.Event()
+            release_update = threading.Event()
+            delete_finished = threading.Event()
+            update_result = []
+            delete_result = []
+            original_save = manager._CodexUsageMultiMonitor__save_manager_settings
+
+            def block_update_before_save(*args, **kwargs):
+                if threading.current_thread().name == "stale-settings-update":
+                    update_before_save.set()
+                    release_update.wait(2.0)
+                return original_save(*args, **kwargs)
+
+            def update_settings():
+                update_result.append(
+                    manager.update_settings(
+                        {
+                            "profiles": stale_profiles,
+                            "interval_sec": 91,
+                        }
+                    )
+                )
+
+            def delete_profile():
+                delete_result.append(manager.delete_profile("account_1", confirmed=True))
+                delete_finished.set()
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__save_manager_settings",
+                side_effect=block_update_before_save,
+            ):
+                update_thread = threading.Thread(
+                    target=update_settings,
+                    name="stale-settings-update",
+                )
+                delete_thread = threading.Thread(target=delete_profile)
+                update_thread.start()
+                self.assertTrue(update_before_save.wait(1.0))
+                delete_thread.start()
+                delete_completed_while_update_blocked = delete_finished.wait(0.2)
+                release_update.set()
+                update_thread.join(2.0)
+                delete_thread.join(2.0)
+
+            self.assertFalse(delete_completed_while_update_blocked)
+            self.assertEqual(update_result, [(True, None)])
+            self.assertEqual(delete_result, [(True, None)])
+            snapshot = manager.get_settings_snapshot()
+            self.assertNotIn("account_1", snapshot["profile_order"])
+            self.assertNotIn(
+                "account_1",
+                manager._CodexUsageMultiMonitor__children,
+            )
+            self.assertNotIn(
+                "account_1",
+                manager._CodexUsageMultiMonitor__account_paths,
+            )
+
+    def test_shutdown_serializes_with_provider_switch_and_rejects_later_mutations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            factory_calls = 0
+            staged_update_started = threading.Event()
+            release_staged_update = threading.Event()
+            shutdown_finished = threading.Event()
+            staged_children = []
+
+            class _BlockingStagedChild(_FakeChildMonitor):
+                def update_settings(self, data):
+                    staged_update_started.set()
+                    release_staged_update.wait(2.0)
+                    return super().update_settings(data)
+
+            def factory(provider, config_dir, profile_dir):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls <= 2:
+                    return _FakeChildMonitor(config_dir, profile_dir)
+                child = _BlockingStagedChild(config_dir, profile_dir)
+                child.provider = provider
+                staged_children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            original = manager._CodexUsageMultiMonitor__children["account_1"]
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+            update_result = []
+
+            update_thread = threading.Thread(
+                target=lambda: update_result.append(
+                    manager.update_settings({"profiles": profiles})
+                ),
+                name="provider-switch-worker",
+            )
+            shutdown_thread = threading.Thread(
+                target=lambda: (manager.shutdown(), shutdown_finished.set()),
+                name="manager-shutdown",
+            )
+            update_thread.start()
+            self.assertTrue(staged_update_started.wait(1.0))
+            shutdown_thread.start()
+
+            shutdown_completed_while_update_blocked = shutdown_finished.wait(0.2)
+            self.assertTrue(
+                self._wait_until(
+                    lambda: manager._CodexUsageMultiMonitor__closing,
+                    timeout=1.0,
+                )
+            )
+            late_toggle_started = time.monotonic()
+            late_toggle_result = manager.toggle_enabled()
+            late_toggle_elapsed = time.monotonic() - late_toggle_started
+            release_staged_update.set()
+            update_thread.join(2.0)
+            shutdown_thread.join(2.0)
+
+            self.assertFalse(shutdown_completed_while_update_blocked)
+            self.assertEqual(late_toggle_result, (False, "shutdown"))
+            self.assertLess(late_toggle_elapsed, 0.2)
+            self.assertFalse(update_thread.is_alive())
+            self.assertFalse(shutdown_thread.is_alive())
+            self.assertEqual(update_result, [(True, None)])
+            self.assertEqual(original.shutdown_calls, 1)
+            self.assertEqual(staged_children[0].shutdown_calls, 1)
+            self.assertEqual(manager.update_settings({"interval_sec": 92}), (False, "shutdown"))
+            self.assertEqual(manager.toggle_enabled(), (False, "shutdown"))
+            self.assertEqual(manager.add_profile("codex"), (False, "shutdown", None))
+            self.assertEqual(
+                manager.delete_profile("account_1", confirmed=True),
+                (False, "shutdown"),
+            )
 
     def test_delete_profile_move_failure_restores_all_paths_and_live_child(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -102,6 +103,7 @@ class _FakeCodex:
             "usage_url": "https://example.test",
         }
         self.update_calls = []
+        self.toggle_calls = 0
         self.show_calls = []
 
     def get_settings_snapshot(self):
@@ -110,6 +112,11 @@ class _FakeCodex:
     def update_settings(self, data):
         self.update_calls.append(dict(data))
         self.settings.update(data)
+        return True, None
+
+    def toggle_enabled(self):
+        self.toggle_calls += 1
+        self.settings["enabled"] = not bool(self.settings.get("enabled", True))
         return True, None
 
     def get_runtime_status(self):
@@ -352,7 +359,8 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertEqual(startup.toggle_calls, 1)
             self.assertEqual(startup.rescan_calls, 0)
             self.assertEqual(startup.start_calls, [root])
-            self.assertEqual(monitor.codex.update_calls[-1]["enabled"], False)
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertFalse(monitor.codex.settings["enabled"])
             self.assertEqual(monitor.codex.show_calls, [])
             self.assertEqual(monitor.kakao.update_calls[-1]["enabled"], False)
             self.assertEqual(monitor.kakao.overlay_calls, [])
@@ -360,6 +368,70 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertEqual(monitor.wrike.weekly_calls, [])
             self.assertFalse(monitor.background_enabled)
             self.assertEqual(updater.check_calls, [True])
+
+    def test_dashboard_ai_toggle_runs_atomic_manager_mutation_in_background(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending = []
+            ui._run_bg = lambda fn: pending.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(monitor.codex.update_calls, [])
+
+            pending[0]()
+
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertFalse(monitor.codex.settings["enabled"])
+            self.assertEqual(monitor.codex.update_calls, [])
+
+    def test_dashboard_ai_toggle_flushes_pending_view_settings_then_remounts(self):
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _apply_settings_update(self, prepared, update_ui=False):
+                self.events.append(("save", prepared, update_ui))
+                return True, None, False
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = queue.Queue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(pending_view.events, [("begin",)])
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(len(workers), 1)
+
+            workers[0]()
+
+            self.assertEqual(
+                pending_view.events[:2],
+                [("begin",), ("save", {"payload": "dirty"}, False)],
+            )
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertFalse(monitor.codex.settings["enabled"])
+            self.assertEqual(ui._event_queue.qsize(), 1)
+
+            ui._event_queue.get_nowait()()
+
+            self.assertEqual(pending_view.events[-1], ("finish", True, None))
 
     def test_update_status_callback_refreshes_existing_dashboard(self):
         class FakeDashboard:
@@ -578,6 +650,27 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         labels = [text for text, _style in parts]
         self.assertIn("Codex 1 (Codex): logged_in / idle", labels)
         self.assertIn("Codex 2 (Codex): 비활성 / logged_out", labels)
+
+    def test_ai_usage_formatter_prefers_the_two_taskbar_selected_profiles(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        _, parts = view._format_ai_usage(
+            {
+                "enabled": True,
+                "profiles": [
+                    {"id": "first", "label": "First", "taskbar_selected": False},
+                    {"id": "second", "label": "Second", "taskbar_selected": True},
+                    {"id": "third", "label": "Third", "taskbar_selected": True},
+                    {"id": "fourth", "label": "Fourth", "taskbar_selected": False},
+                ],
+            }
+        )
+
+        labels = [text for text, _style in parts]
+        self.assertTrue(any(text.startswith("Second (Codex):") for text in labels))
+        self.assertTrue(any(text.startswith("Third (Codex):") for text in labels))
+        self.assertFalse(any(text.startswith("First (Codex):") for text in labels))
+        self.assertFalse(any(text.startswith("Fourth (Codex):") for text in labels))
 
     def test_update_formatter_shows_available_version(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})

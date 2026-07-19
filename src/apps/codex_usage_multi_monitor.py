@@ -141,6 +141,9 @@ class CodexUsageMultiMonitor:
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__refresh_inflight = False
         self.__refresh_lock = threading.Lock()
+        self.__settings_mutation_lock = threading.Lock()
+        self.__lifecycle_lock = threading.Lock()
+        self.__closing = False
         self.__unsettled_children: dict[str, list[Any]] = {}
         self.__deferred_cleanup_transaction_ids: set[str] = set()
         self.__refresh_queue: deque[tuple[Callable[[], None], bool]] = deque()
@@ -229,37 +232,47 @@ class CodexUsageMultiMonitor:
         return
 
     def attach(self, root, event_queue=None) -> None:
-        self.__root = root
-        self.__event_queue = event_queue
-        for child in self.__children.values():
-            self.__attach_child(child, root, event_queue)
-        self.__refresh_taskbar_progress()
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        if bool(self.__closing):
+            return
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return
+            self.__root = root
+            self.__event_queue = event_queue
+            for child in self.__children.values():
+                self.__attach_child(child, root, event_queue)
+            self.__refresh_taskbar_progress()
+            self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         return
 
     def shutdown(self) -> None:
-        self.__clear_monitor_schedule()
-        with self.__refresh_lock:
-            self.__refresh_queue.clear()
-        self.__profile_next_collect_due_ts.clear()
-        shutdown_children = [
-            *self.__children.values(),
-            *[
-                child
-                for children in self.__unsettled_children.values()
-                for child in children
-            ],
-        ]
-        self.__unsettled_children = {}
-        for child in shutdown_children:
-            shutdown = getattr(child, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    pass
-        self.__root = None
-        self.__event_queue = None
+        with self.__lifecycle_lock:
+            if bool(self.__closing):
+                return
+            self.__closing = True
+        with self.__settings_mutation_lock:
+            self.__clear_monitor_schedule()
+            with self.__refresh_lock:
+                self.__refresh_queue.clear()
+            self.__profile_next_collect_due_ts.clear()
+            shutdown_children = [
+                *self.__children.values(),
+                *[
+                    child
+                    for children in self.__unsettled_children.values()
+                    for child in children
+                ],
+            ]
+            self.__unsettled_children = {}
+            for child in shutdown_children:
+                shutdown = getattr(child, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        pass
+            self.__root = None
+            self.__event_queue = None
         return
 
     def get_settings_snapshot(self) -> dict[str, Any]:
@@ -291,6 +304,22 @@ class CodexUsageMultiMonitor:
         }
 
     def update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            return self.__update_settings(data)
+
+    def toggle_enabled(self) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            return self.__update_settings({"enabled": not bool(self.__enabled)})
+
+    def __update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
         if not isinstance(data, dict):
             return False, "invalid settings"
         profiles = data.get("profiles")
@@ -688,11 +717,22 @@ class CodexUsageMultiMonitor:
             - preexisting_recovery_ids
             - provider_shutdown_failed_ids
         )
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None
 
     def add_profile(
+        self,
+        provider: str = "codex",
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        if bool(self.__closing):
+            return False, "shutdown", None
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown", None
+            return self.__add_profile(provider)
+
+    def __add_profile(
         self,
         provider: str = "codex",
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
@@ -807,11 +847,24 @@ class CodexUsageMultiMonitor:
         self.__account_paths[profile_id] = staged_paths
         self.__children[profile_id] = staged_child
         self.__discard_cleanup_transaction(add_transaction_id)
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None, self.__build_account_settings_snapshot(profile_id)
 
     def delete_profile(self, profile_id: str, *, confirmed: bool = False) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            return self.__delete_profile(profile_id, confirmed=confirmed)
+
+    def __delete_profile(
+        self,
+        profile_id: str,
+        *,
+        confirmed: bool = False,
+    ) -> tuple[bool, str | None]:
         normalized = str(profile_id or "")
         if normalized not in self.__account_settings:
             return False, "invalid_profile"
@@ -933,7 +986,7 @@ class CodexUsageMultiMonitor:
             else:
                 self.__mark_profile_recovery_pending(normalized)
             return False, "profile_delete_failed"
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         self.__retry_pending_profile_cleanup()
         self.__set_settings_recovery_pending(normalized, False)
@@ -1225,6 +1278,18 @@ class CodexUsageMultiMonitor:
         if not account_ids:
             return
         self.__schedule_monitor_tick()
+        return
+
+    def __request_monitor_scheduler_restart(
+        self,
+        initial_delay_sec: float | None = None,
+    ) -> None:
+        action = lambda: self.__restart_monitor_scheduler(
+            initial_delay_sec=initial_delay_sec
+        )
+        if self.__event_queue is not None and self.__post_ui(action):
+            return
+        action()
         return
 
     def __clear_monitor_schedule(self) -> None:
