@@ -271,14 +271,14 @@ class CodexUsageMultiMonitor:
                 ],
             ]
             self.__unsettled_children = {}
-            for child in shutdown_children:
-                shutdown = getattr(child, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception:
-                        pass
         self.__wait_for_refreshes_quiesced(timeout_sec=None)
+        for child in shutdown_children:
+            shutdown = getattr(child, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    pass
         with self.__settings_mutation_lock:
             self.__root = None
             self.__event_queue = None
@@ -931,6 +931,8 @@ class CodexUsageMultiMonitor:
             return False, "confirmation_required"
         if not self.__shutdown_unsettled_children(normalized):
             return False, "profile_delete_failed"
+        if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
+            return False, "profile_delete_failed"
         local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
         transaction_id = uuid.uuid4().hex
         deletion_entries: list[dict[str, Any]] = []
@@ -994,12 +996,6 @@ class CodexUsageMultiMonitor:
                             self.__event_queue,
                         )
                 return False, "profile_delete_failed"
-        if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
-            self.__discard_cleanup_transaction(transaction_id)
-            if not recovery_was_pending:
-                self.__complete_settings_recovery({normalized})
-            self.__restore_child_monitor_or_mark_recovery_pending(normalized)
-            return False, "profile_delete_failed"
         if not recovery_was_pending:
             self.__complete_settings_recovery({normalized})
         quarantined: list[dict[str, Any]] = []
@@ -1422,13 +1418,8 @@ class CodexUsageMultiMonitor:
             try:
                 threading.Thread(target=worker, daemon=True).start()
             except Exception:
-                with self.__refresh_condition:
-                    if self.__refresh_worker_token is worker_token:
-                        self.__refresh_inflight = False
-                        self.__refresh_worker_token = None
-                        self.__refresh_queue.clear()
-                        self.__refresh_condition.notify_all()
-                return False
+                worker()
+                return True
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
         return True

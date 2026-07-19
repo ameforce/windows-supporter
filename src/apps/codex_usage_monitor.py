@@ -2252,6 +2252,7 @@ class CodexUsageMonitor:
             and not bool(self.__auth_attention_required)
             and not bool(self.__profile_in_use_detected)
             and not bool(self.__logout_in_progress)
+            and not self.__is_collect_cancel_requested()
         )
 
     def __get_background_collect_block_reason(self) -> str:

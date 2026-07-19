@@ -1934,10 +1934,12 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
             shutdown_thread.start()
             shutdown_finished_before_release = shutdown_finished.wait(0.2)
+            child_shutdown_before_release = children[0].shutdown_calls
             release_refresh.set()
             shutdown_thread.join(2.0)
 
             self.assertFalse(shutdown_finished_before_release)
+            self.assertEqual(child_shutdown_before_release, 0)
             self.assertFalse(shutdown_thread.is_alive())
             self.assertEqual(children[1].show_calls, [])
             self.assertEqual([child.shutdown_calls for child in children], [1, 1])
@@ -2033,10 +2035,12 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
             delete_thread.start()
             delete_finished_before_release = delete_finished.wait(0.2)
+            child_shutdown_before_release = children[0].shutdown_calls
             release_refresh.set()
             delete_thread.join(2.0)
 
             self.assertFalse(delete_finished_before_release)
+            self.assertEqual(child_shutdown_before_release, 0)
             self.assertFalse(delete_thread.is_alive())
             self.assertEqual(delete_result, [(True, None)])
             self.assertFalse(os.path.exists(account_path))
@@ -3556,6 +3560,70 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 )
             finally:
                 allow_empty_worker_exit.set()
+                manager.shutdown()
+
+    def test_manager_queue_drains_accepted_requests_when_worker_start_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            start_entered = threading.Event()
+            allow_start_failure = threading.Event()
+            first_finished = threading.Event()
+            second_finished = threading.Event()
+
+            class _RaceChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    if "account-1" in self.config_dir:
+                        first_finished.set()
+                    else:
+                        second_finished.set()
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+            class _GatedFailThread:
+                def __init__(self, target=None, daemon=None):
+                    _ = (target, daemon)
+
+                def start(self):
+                    start_entered.set()
+                    allow_start_failure.wait(2.0)
+                    raise RuntimeError("thread start failed")
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=lambda config_dir, profile_dir: _RaceChild(
+                    config_dir,
+                    profile_dir,
+                ),
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            first_caller = threading.Thread(
+                target=lambda: manager.show_account_status("account_1"),
+                daemon=True,
+            )
+
+            try:
+                with patch(
+                    "src.apps.codex_usage_multi_monitor.threading.Thread",
+                    _GatedFailThread,
+                ):
+                    first_caller.start()
+                    self.assertTrue(start_entered.wait(1.0))
+                    manager.show_account_status("account_2")
+                    allow_start_failure.set()
+                    first_caller.join(2.0)
+
+                self.assertFalse(first_caller.is_alive())
+                self.assertTrue(first_finished.is_set())
+                self.assertTrue(second_finished.is_set())
+                self.assertFalse(manager._CodexUsageMultiMonitor__refresh_inflight)
+                self.assertEqual(
+                    list(manager._CodexUsageMultiMonitor__refresh_queue),
+                    [],
+                )
+            finally:
+                allow_start_failure.set()
                 manager.shutdown()
 
     def test_queued_refresh_resolves_current_child_after_profile_deletion(self):

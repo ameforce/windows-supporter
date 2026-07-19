@@ -1517,7 +1517,9 @@ class CodexUsageSettingsView:
                 self._profile_deletions_inflight.discard(mutation_id)
                 self._preserve_status_after_next_autosave = False
                 if not ok:
-                    if not save_failed:
+                    if save_failed:
+                        self._schedule_autosave()
+                    else:
                         self._remount()
                     self._set_status(f"프로필 추가 실패: {error}", level="error")
                     return
@@ -1718,10 +1720,12 @@ class CodexUsageSettingsView:
                 self._profile_deletions_inflight.discard(normalized)
                 self._preserve_status_after_next_autosave = False
                 if not ok:
-                    if not save_failed:
+                    if save_failed:
+                        self._schedule_autosave()
+                    else:
                         self._remount()
                         message = f"프로필 삭제 실패: {error}"
-                    else:
+                    if save_failed:
                         message = (
                             "프로필 삭제 전 변경사항을 저장하지 못해 "
                             "삭제를 시작하지 않았습니다."

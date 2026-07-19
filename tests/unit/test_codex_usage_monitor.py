@@ -100,6 +100,43 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(root.after_cancel_calls, ["manual-query-timer"])
             self.assertTrue(event_queue.empty())
 
+    def test_stale_monitor_tick_does_not_start_after_worker_thread_shutdown(self) -> None:
+        class _Root:
+            def after_cancel(self, _after_id) -> None:
+                return
+
+        class _RecordingThread:
+            starts = 0
+
+            def __init__(self, target=None, daemon=None):
+                _ = (target, daemon)
+
+            def start(self):
+                type(self).starts += 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            event_queue = queue.Queue()
+            monitor.attach(_Root(), event_queue, start_monitor=False)
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            monitor._CodexUsageMonitor__monitor_after_id = "stale-timer"
+
+            shutdown_thread = threading.Thread(target=monitor.shutdown, daemon=True)
+            shutdown_thread.start()
+            shutdown_thread.join(1.0)
+            self.assertFalse(shutdown_thread.is_alive())
+            self.assertEqual(event_queue.qsize(), 1)
+
+            with patch("src.apps.codex_usage_monitor.threading.Thread", _RecordingThread):
+                monitor._CodexUsageMonitor__monitor_tick()
+
+            self.assertEqual(_RecordingThread.starts, 0)
+            self.assertFalse(monitor._CodexUsageMonitor__monitor_running)
+
     def test_collect_snapshot_routes_only_through_playwright_session_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session = self._BrowserSession()

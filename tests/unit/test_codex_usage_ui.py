@@ -1091,7 +1091,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             False,
         )
         statuses = []
+        scheduled = []
         view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+        view._schedule_autosave = lambda: scheduled.append(True)
 
         class _InlineThread:
             def __init__(self, target=None, daemon=None):
@@ -1107,8 +1109,51 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(monitor.delete_calls, [])
         self.assertEqual(view._profile_deletions_inflight, set())
+        self.assertEqual(scheduled, [True])
         self.assertIn("삭제를 시작하지 않았습니다", statuses[-1][0])
         self.assertEqual(statuses[-1][1], "error")
+
+    def test_add_reschedules_pending_autosave_when_flush_fails(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.add_calls = []
+
+            def add_profile(self, provider):
+                self.add_calls.append(provider)
+                return True, None, {"id": "profile_new"}
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: fn(),
+        )
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-add"
+        view._build_settings_update = lambda: {"payload": "dirty"}
+        view._apply_settings_update = lambda _prepared, update_ui=False: (
+            False,
+            "save failed",
+            False,
+        )
+        scheduled = []
+        view._schedule_autosave = lambda: scheduled.append(True)
+        view._set_status = lambda *_args, **_kwargs: None
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _InlineThread):
+            view._on_add_profile()
+
+        self.assertEqual(monitor.add_calls, [])
+        self.assertEqual(view._profile_deletions_inflight, set())
+        self.assertEqual(scheduled, [True])
 
     def test_third_taskbar_selection_is_reverted_before_autosave(self) -> None:
         class _FakeMonitor:
