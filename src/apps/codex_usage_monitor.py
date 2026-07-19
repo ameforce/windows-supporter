@@ -16,6 +16,11 @@ from src.apps.codex_usage_playwright_session import (
     CodexUsagePlaywrightSession,
     PlaywrightSessionConfig,
 )
+from src.apps.codex_usage_browser_types import (
+    BrowserOperationResult,
+    BrowserRuntimeStatus,
+    BrowserState,
+)
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
@@ -1756,6 +1761,32 @@ def compute_usage_changes(
     return changes
 
 
+class _UnavailableBrowserSession:
+    def __init__(self, error: str = "browser_session_create_failed") -> None:
+        self.__error = str(error or "browser_session_create_failed")
+
+    def collect(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def open_login(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def poll_login(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def close_session(self) -> None:
+        return
+
+    def request_cancel(self) -> bool:
+        return True
+
+    def shutdown(self) -> bool:
+        return True
+
+    def get_runtime_status(self) -> BrowserRuntimeStatus:
+        return BrowserRuntimeStatus(BrowserState.FAILED, False, self.__error)
+
+
 class CodexUsageMonitor:
     def __init__(
         self,
@@ -1780,6 +1811,7 @@ class CodexUsageMonitor:
         self.__external_scheduler = False
         self.__local_usage_provider = local_usage_provider
         self.__browser_session_factory = browser_session_factory
+        self.__browser_session_recovery_required = False
         self.__unrecoverable_timeout_handler = unrecoverable_timeout_handler
 
         self.__monitor_after_id = None
@@ -1932,6 +1964,17 @@ class CodexUsageMonitor:
     def __set_usage_url(self, value: str) -> tuple[bool, str | None]:
         previous = str(getattr(self, "_CodexUsageMonitor__usage_url", "") or "")
         candidate = canonicalize_codex_usage_url(value)
+        if bool(self.__browser_session_recovery_required):
+            self.__usage_url = candidate
+            try:
+                replacement = self.__create_browser_session()
+            except Exception:
+                self.__usage_url = previous
+                self.__browser_session = _UnavailableBrowserSession()
+                return False, "browser_session_create_failed"
+            self.__browser_session = replacement
+            self.__browser_session_recovery_required = False
+            return True, None
         if previous and previous != candidate and hasattr(
             self, "_CodexUsageMonitor__browser_session"
         ):
@@ -1950,7 +1993,8 @@ class CodexUsageMonitor:
                 try:
                     self.__browser_session = self.__create_browser_session()
                 except Exception:
-                    self.__browser_session = old_session
+                    self.__browser_session = _UnavailableBrowserSession()
+                    self.__browser_session_recovery_required = True
                 return False, "browser_session_create_failed"
             self.__browser_session = replacement
             return True, None

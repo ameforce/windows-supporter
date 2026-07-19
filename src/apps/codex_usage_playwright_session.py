@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from queue import Queue
 import threading
-import time
 from typing import Any, Protocol, final
 
 from src.apps.codex_usage_browser_types import (
@@ -109,6 +108,8 @@ class CodexUsagePlaywrightSession:
         self._status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         self._shutdown: bool = False
         self._cancel_requested: bool = False
+        self._collect_calls_inflight: int = 0
+        self._cancel_event = threading.Event()
         self._session_cookies: list[dict[str, Any]] = []
         self._timeout_retry_delays_sec = tuple(
             max(0.0, float(delay)) for delay in config.timeout_retry_delays_sec
@@ -116,10 +117,22 @@ class CodexUsagePlaywrightSession:
         self._timeout_recovery_grace_sec = max(
             0.0, float(config.timeout_recovery_grace_sec)
         )
-        self._sleep = sleep or time.sleep
+        self._sleep = sleep or self._cancel_event.wait
         self._unrecoverable_timeout_handler = unrecoverable_timeout_handler
 
     def collect(self) -> BrowserOperationResult:
+        with self._lock:
+            self._collect_calls_inflight += 1
+        try:
+            return self._collect_with_retries()
+        finally:
+            with self._lock:
+                self._collect_calls_inflight = max(
+                    0,
+                    self._collect_calls_inflight - 1,
+                )
+
+    def _collect_with_retries(self) -> BrowserOperationResult:
         retry_max = len(self._timeout_retry_delays_sec)
         retry_attempt = 0
         while True:
@@ -198,14 +211,16 @@ class CodexUsagePlaywrightSession:
         with self._lock:
             thread = self._thread
             self._cancel_requested = True
+            self._cancel_event.set()
+            collect_inflight = bool(self._collect_calls_inflight)
             if thread is None or not thread.is_alive():
-                return True
+                return not collect_inflight
             queue = self._queue
             driver = self._driver
             self._worker_poisoned = True
         queue.put(_CommandEnvelope(ShutdownCommand()))
         if driver is None:
-            return True
+            return False
         hard_cancelled = self._force_terminate_driver(
             driver,
             reason=BrowserErrorCode.COMMAND_TIMEOUT.value,
@@ -220,6 +235,8 @@ class CodexUsagePlaywrightSession:
             thread = self._thread
             if thread is None:
                 self._shutdown = True
+                if self._collect_calls_inflight:
+                    return False
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
                 return True
             if self._shutdown:

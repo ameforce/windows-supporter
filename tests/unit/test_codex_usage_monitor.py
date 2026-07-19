@@ -116,6 +116,52 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
                 before["usage_url"],
             )
 
+    def test_usage_url_change_never_restores_a_shutdown_session_when_factories_fail(self) -> None:
+        class _BrowserSession:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+
+            def shutdown(self) -> bool:
+                self.shutdown_calls += 1
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_session = _BrowserSession()
+            factory_calls = 0
+
+            def factory(_config):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls == 1:
+                    return old_session
+                raise RuntimeError("session factory failed")
+
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=factory,
+            )
+            before = monitor.get_settings_snapshot()["usage_url"]
+
+            result = monitor.update_settings(
+                {"usage_url": "https://example.invalid/different-usage"}
+            )
+
+            self.assertEqual(result, (False, "browser_session_create_failed"))
+            self.assertEqual(old_session.shutdown_calls, 1)
+            self.assertIsNot(
+                monitor._CodexUsageMonitor__browser_session,
+                old_session,
+            )
+            self.assertEqual(
+                monitor.get_settings_snapshot()["usage_url"],
+                before,
+            )
+            self.assertEqual(
+                monitor._CodexUsageMonitor__browser_session.get_runtime_status().state,
+                BrowserState.FAILED,
+            )
+
     def test_collect_cancel_interrupts_active_browser_session(self) -> None:
         class _BlockingBrowserSession:
             def __init__(self) -> None:

@@ -15,7 +15,12 @@ from typing import Any, Callable
 
 from src.apps.ai_usage_contracts import normalize_reset_boundary
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
-from src.apps.codex_usage_monitor import CURRENT_CODEX_USAGE_URL, CodexUsageMonitor, UsageSnapshot
+from src.apps.codex_usage_monitor import (
+    CURRENT_CODEX_USAGE_URL,
+    CodexUsageMonitor,
+    UsageSnapshot,
+    are_equivalent_codex_usage_urls,
+)
 from src.apps.codex_usage_taskbar_overlay import AiUsageTaskbarOverlay
 
 
@@ -334,22 +339,38 @@ class CodexUsageMultiMonitor:
         with self.__settings_mutation_lock:
             if bool(self.__closing):
                 return False, "shutdown"
-            provider_change_ids = self.__provider_change_ids(data)
-            for profile_id in provider_change_ids:
+            refresh_blocking_ids = self.__refresh_blocking_change_ids(data)
+            for profile_id in refresh_blocking_ids:
                 self.__set_profile_refresh_blocked(profile_id, True)
             try:
-                if provider_change_ids and not all(
+                if refresh_blocking_ids and not all(
                     self.__wait_for_refreshes_quiesced(
                         profile_id=profile_id,
                         timeout_sec=0.0,
                     )
-                    for profile_id in provider_change_ids
+                    for profile_id in refresh_blocking_ids
                 ):
                     return False, "profile_refresh_busy"
                 return self.__update_settings(data)
             finally:
-                for profile_id in provider_change_ids:
+                for profile_id in refresh_blocking_ids:
                     self.__set_profile_refresh_blocked(profile_id, False)
+
+    def __refresh_blocking_change_ids(self, data: dict[str, Any]) -> set[str]:
+        changed = self.__provider_change_ids(data)
+        if not isinstance(data, dict):
+            return changed
+        usage_url = data.get("usage_url")
+        if not isinstance(usage_url, str) or not usage_url.strip():
+            return changed
+        if are_equivalent_codex_usage_urls(usage_url.strip(), self.__usage_url):
+            return changed
+        changed.update(
+            profile_id
+            for profile_id, settings in self.__account_settings.items()
+            if settings.provider == "codex"
+        )
+        return changed
 
     def __provider_change_ids(self, data: dict[str, Any]) -> set[str]:
         if not isinstance(data, dict):

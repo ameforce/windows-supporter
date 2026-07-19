@@ -549,10 +549,38 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         release_factory.set()
         collect_thread.join(1.0)
 
-        self.assertTrue(cancel_result)
+        self.assertFalse(cancel_result)
         self.assertFalse(collect_thread.is_alive())
         self.assertNotIn("collect", driver.calls)
         session.shutdown()
+
+    def test_request_cancel_interrupts_retry_wait_without_reporting_completion(self) -> None:
+        driver = TimeoutThenSuccessDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory)
+        session._timeout_retry_delays_sec = (0.3,)
+        result = []
+        collect_thread = threading.Thread(
+            target=lambda: result.append(session.collect()),
+            daemon=True,
+        )
+        collect_thread.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            session.get_runtime_status().state != BrowserState.RECOVERING
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertEqual(session.get_runtime_status().state, BrowserState.RECOVERING)
+
+        cancel_result = session.request_cancel()
+        collect_thread.join(0.1)
+
+        self.assertFalse(cancel_result)
+        self.assertFalse(collect_thread.is_alive())
+        self.assertEqual(len(result), 1)
+        self.assertEqual(driver.collect_count, 1)
+        self.assertTrue(session.shutdown())
 
     def test_request_cancel_makes_driver_terminal_before_racing_dispatch(self) -> None:
         class _RespawnGuardDriver(FakeDriver):

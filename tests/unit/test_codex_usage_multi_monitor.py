@@ -2415,6 +2415,53 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 )
             )
 
+    def test_usage_url_change_is_rejected_while_codex_profile_refresh_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+            children = []
+
+            class _ActiveChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_refresh.wait(2.0)
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _ActiveChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            manager.show_account_status("account_1")
+            self.assertTrue(refresh_started.wait(1.0))
+            before = manager.get_settings_snapshot()["usage_url"]
+
+            result = manager.update_settings(
+                {"usage_url": "https://example.invalid/different-usage"}
+            )
+
+            self.assertEqual(result, (False, "profile_refresh_busy"))
+            self.assertEqual(manager.get_settings_snapshot()["usage_url"], before)
+            release_refresh.set()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: not manager._CodexUsageMultiMonitor__refresh_inflight
+                )
+            )
+
     def test_delete_profile_move_failure_restores_all_paths_and_live_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
