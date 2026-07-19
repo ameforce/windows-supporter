@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum, unique
+import re
 from typing import Any
 
 
@@ -88,6 +90,29 @@ def _optional_percent(value: float | int | None) -> float | None:
     return round(number, 4)
 
 
+def normalize_reset_boundary(value: object) -> tuple[str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    korean = re.fullmatch(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+    if korean is not None:
+        year, month, day = (int(part) for part in korean.groups())
+        try:
+            return datetime(year, month, day).date().isoformat(), "date"
+        except ValueError:
+            return text, ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            return datetime.fromisoformat(text).date().isoformat(), "date"
+        except ValueError:
+            return text, ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text, ""
+    return text, "datetime"
+
+
 @dataclass(frozen=True, slots=True)
 class AiUsageReading:
     provider: AiUsageProvider
@@ -103,6 +128,7 @@ class AiUsageReading:
     on_demand_enabled: bool | None = None
     message: str = ""
     last_error_state: UsageState | None = None
+    reset_precision: str = ""
 
     def __post_init__(self) -> None:
         provider = (
@@ -132,6 +158,12 @@ class AiUsageReading:
         object.__setattr__(self, "profile_id", str(self.profile_id or "").strip())
         object.__setattr__(self, "included_used", str(self.included_used or "").strip())
         object.__setattr__(self, "included_limit", str(self.included_limit or "").strip())
+        normalized_reset, inferred_precision = normalize_reset_boundary(self.reset_at)
+        requested_precision = str(self.reset_precision or "").strip().lower()
+        if requested_precision not in {"date", "datetime"}:
+            requested_precision = inferred_precision
+        object.__setattr__(self, "reset_at", normalized_reset)
+        object.__setattr__(self, "reset_precision", requested_precision)
         if not self.message:
             object.__setattr__(self, "message", usage_state_message(state))
 
@@ -186,6 +218,7 @@ class AiUsageReading:
             "last_success_at": self.last_success_at,
             "reset_at": self.reset_at,
             "billing_reset_at": self.reset_at,
+            "reset_precision": self.reset_precision,
             "on_demand_enabled": self.on_demand_enabled,
             "on_demand_status": (
                 "ON" if self.on_demand_enabled is True else "OFF" if self.on_demand_enabled is False else "조회 불가"

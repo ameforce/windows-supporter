@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
+from src.apps.ai_usage_contracts import normalize_reset_boundary
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
 from src.apps.codex_usage_monitor import CURRENT_CODEX_USAGE_URL, CodexUsageMonitor, UsageSnapshot
 from src.apps.codex_usage_taskbar_overlay import AiUsageTaskbarOverlay
@@ -970,6 +971,9 @@ class CodexUsageMultiMonitor:
         return str(value or "")
 
     def format_reset_at_for_display(self, value: str, key: str = "") -> str:
+        normalized = str(value or "").strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return normalized
         if not self.__default_account_id:
             return str(value or "")
         child = self.__child(self.__default_account_id)
@@ -2258,42 +2262,61 @@ class CodexUsageMultiMonitor:
         if isinstance(existing, list):
             return [dict(item) for item in existing if isinstance(item, dict)][:2]
         if str(provider or "") == "cursor":
-            return [
+            percent = _optional_percent(snapshot.get("included_remaining_percent"))
+            reset_at, inferred_precision = normalize_reset_boundary(
+                snapshot.get("billing_reset_at") or snapshot.get("reset_at")
+            )
+            metrics = [
                 {
                     "key": "included_usage",
                     "short_label": "INC",
-                    "percent": _optional_percent(snapshot.get("included_remaining_percent")),
+                    "percent": percent,
                     "value_text": str(snapshot.get("included_usage") or "조회 불가"),
-                    "reset_at": str(snapshot.get("billing_reset_at") or ""),
+                    "short_value_text": "--" if percent is None else f"{percent:g}%",
+                    "reset_at": reset_at,
+                    "reset_precision": str(
+                        snapshot.get("reset_precision") or inferred_precision
+                    ),
                     "state": str(snapshot.get("state") or "unavailable"),
-                },
-                {
+                }
+            ]
+            if snapshot.get("on_demand_enabled") is not False:
+                metrics.append({
                     "key": "on_demand",
                     "short_label": "OD",
                     "percent": None,
                     "value_text": str(snapshot.get("on_demand_status") or "조회 불가"),
+                    "short_value_text": (
+                        "ON" if snapshot.get("on_demand_enabled") is True else "--"
+                    ),
                     "reset_at": "",
+                    "reset_precision": "",
                     "state": str(snapshot.get("on_demand_state") or snapshot.get("state") or "unavailable"),
-                },
-            ]
-        return [
-            {
-                "key": "five_hour_limit",
-                "short_label": "5H",
-                "percent": _optional_percent(snapshot.get("five_hour_limit")),
-                "value_text": str(snapshot.get("five_hour_limit") or "--"),
-                "reset_at": str(snapshot.get("five_hour_reset_at") or ""),
-                "state": "ready" if snapshot.get("five_hour_limit") else "unavailable",
-            },
-            {
-                "key": "weekly_limit",
-                "short_label": "7D",
-                "percent": _optional_percent(snapshot.get("weekly_limit")),
-                "value_text": str(snapshot.get("weekly_limit") or "--"),
-                "reset_at": str(snapshot.get("weekly_reset_at") or ""),
-                "state": "ready" if snapshot.get("weekly_limit") else "unavailable",
-            },
-        ]
+                })
+            return metrics
+        metrics: list[dict[str, Any]] = []
+        for key, short_label, reset_key in (
+            ("five_hour_limit", "5H", "five_hour_limit_reset_at"),
+            ("weekly_limit", "7D", "weekly_limit_reset_at"),
+        ):
+            raw_value = str(snapshot.get(key) or "").strip()
+            if not raw_value:
+                continue
+            percent = _optional_percent(raw_value)
+            reset_at, reset_precision = normalize_reset_boundary(snapshot.get(reset_key))
+            metrics.append(
+                {
+                    "key": key,
+                    "short_label": short_label,
+                    "percent": percent,
+                    "value_text": raw_value,
+                    "short_value_text": "--" if percent is None else f"{percent:g}%",
+                    "reset_at": reset_at,
+                    "reset_precision": reset_precision,
+                    "state": "ready",
+                }
+            )
+        return metrics
 
     def __usage_history_to_dicts(self, value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list):

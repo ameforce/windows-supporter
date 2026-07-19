@@ -221,6 +221,130 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(first_metric["state"], "warning")
         self.assertIsNone(model["bars"][1]["metrics"][0]["percent"])
 
+    def test_provider_metric_uses_compact_taskbar_value_and_date_precision_countdown(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "cursor-1",
+                    "provider": "cursor",
+                    "label": "Cursor",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "metrics": [
+                        {
+                            "key": "included_usage",
+                            "short_label": "INC",
+                            "percent": 100,
+                            "value_text": "US$0 / US$20",
+                            "short_value_text": "100%",
+                            "reset_at": "2026-08-13",
+                            "reset_precision": "date",
+                            "state": "ready",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            now=datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc),
+        )
+
+        metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(metric["value_text"], "100%")
+        self.assertEqual(metric["detail_value_text"], "US$0 / US$20")
+        self.assertEqual(metric["reset_text"], "D-25")
+        self.assertEqual(metric["reset_short_text"], "D-25")
+
+    def test_taskbar_renderer_keeps_unreported_metrics_empty(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "codex-1",
+                    "provider": "codex",
+                    "label": "Codex",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "metrics": [],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        self.assertEqual(model["bars"][0]["metrics"], [])
+        self.assertEqual(
+            taskbar_overlay._visible_metrics_for_taskbar_bar(model["bars"][0]),
+            (),
+        )
+
+    def test_datetime_precision_uses_hour_minute_countdown_within_same_day(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "codex-1",
+                    "provider": "codex",
+                    "label": "Codex",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "metrics": [
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 80,
+                            "value_text": "80%",
+                            "reset_at": "2026-07-19T17:30:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            now=datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(model["bars"][0]["metrics"][0]["reset_text"], "02h 30m")
+
+    def test_datetime_precision_uses_total_hours_for_multi_day_countdown(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "codex-1",
+                    "provider": "codex",
+                    "label": "Codex",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "metrics": [
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 80,
+                            "value_text": "80%",
+                            "reset_at": "2026-07-22T00:30:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            now=datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(model["bars"][0]["metrics"][0]["reset_text"], "57h 30m")
+
     def test_render_signature_tracks_profile_provider_metric_freshness_and_status(self):
         runtime = {
             "enabled": True,
