@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import shutil
+import stat
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -17,6 +19,40 @@ from src.apps.codex_usage_playwright_session import (
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
+
+
+def _is_non_reparse_descendant(candidate: str, boundary: str) -> bool:
+    target = os.path.abspath(candidate)
+    root = os.path.abspath(boundary)
+    try:
+        if os.path.normcase(os.path.commonpath((target, root))) != os.path.normcase(root):
+            return False
+        if os.path.normcase(target) == os.path.normcase(root):
+            return False
+        real_target = os.path.realpath(target)
+        real_root = os.path.realpath(root)
+        if os.path.normcase(os.path.commonpath((real_target, real_root))) != os.path.normcase(
+            real_root
+        ):
+            return False
+        relative = os.path.relpath(target, root)
+    except (OSError, ValueError):
+        return False
+    current = root
+    for part in ("", *relative.split(os.sep)):
+        if part:
+            current = os.path.join(current, part)
+        if not os.path.lexists(current):
+            continue
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+        if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+            return False
+    return True
 
 
 USAGE_METRIC_KEYS = (
@@ -1728,6 +1764,7 @@ class CodexUsageMonitor:
         ]
         | None = None,
         unrecoverable_timeout_handler: Callable[[], bool] | None = None,
+        managed_profile_root: str | None = None,
     ) -> None:
         self.__lib = LibConnector()
         self.__root = None
@@ -1821,6 +1858,12 @@ class CodexUsageMonitor:
             local_base,
             "windows-supporter",
             "chatgpt-profile",
+        )
+        normalized_managed_profile_root = str(managed_profile_root or "").strip()
+        self.__managed_profile_root = (
+            normalized_managed_profile_root
+            if normalized_managed_profile_root
+            else self.__lib.os.path.dirname(self.__default_profile_dir)
         )
         normalized_profile_dir = str(profile_dir or "").strip()
         if normalized_profile_dir:
@@ -2062,9 +2105,26 @@ class CodexUsageMonitor:
         try:
             leaf = self.__lib.os.path.basename(target)
             parent_dir = self.__lib.os.path.dirname(target)
-            default_parent = self.__normalize_local_path(
-                self.__lib.os.path.dirname(default)
+            managed_parent = self.__normalize_local_path(
+                getattr(self, "_CodexUsageMonitor__managed_profile_root", "")
             )
+            if not managed_parent:
+                managed_parent = self.__normalize_local_path(
+                    self.__lib.os.path.dirname(default)
+                )
+            relative = self.__lib.os.path.relpath(target, managed_parent)
+            relative_parts = [
+                part.lower()
+                for part in relative.replace("\\", "/").split("/")
+                if part
+            ]
+            if (
+                len(relative_parts) == 3
+                and relative_parts[0] == "ai-profiles"
+                and re.fullmatch(r"profile_[0-9a-f]{32}", relative_parts[1])
+                and relative_parts[2] == "codex"
+            ):
+                return _is_non_reparse_descendant(target, managed_parent)
             parent = self.__lib.os.path.basename(parent_dir)
             allowed_leafs = {
                 "chatgpt-profile",
@@ -2073,13 +2133,13 @@ class CodexUsageMonitor:
             }
             if leaf.lower() not in allowed_leafs:
                 return False
-            if self.__normalize_local_path(parent_dir) != default_parent:
+            if self.__normalize_local_path(parent_dir) != managed_parent:
                 return False
             if parent.lower() != "windows-supporter":
                 return False
         except Exception:
             return False
-        return True
+        return _is_non_reparse_descendant(target, managed_parent)
 
     def __normalize_local_path(self, value: str) -> str:
         raw = str(value or "").strip()
