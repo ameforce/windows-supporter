@@ -53,6 +53,50 @@ class _AccountSettings:
     provider_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
+class _RecoveryPendingChild:
+    def __init__(self, paths: _AccountPaths) -> None:
+        self.__paths = paths
+
+    def get_settings_snapshot(self) -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "provider": self.__paths.provider,
+            "collection_supported": False,
+            "settings_path": self.__paths.settings_path,
+            "state_path": self.__paths.state_path,
+            "profile_dir": self.__paths.profile_dir,
+        }
+
+    def get_runtime_status(self) -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "provider": self.__paths.provider,
+            "monitor_state": "recovery_pending",
+            "provider_status": "recovery_pending",
+            "session_state": "unknown",
+            "collect_inflight": False,
+            "auto_monitoring_active": False,
+            "can_login": False,
+            "can_logout": False,
+            "recovery_pending": True,
+        }
+
+    def get_last_snapshot(self) -> dict[str, Any]:
+        return {}
+
+    def update_settings(self, _data: dict[str, Any]) -> tuple[bool, None]:
+        return True, None
+
+    def show_current_status(self, **_kwargs: Any) -> None:
+        return None
+
+    def attach(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
 class CodexUsageMultiMonitor:
     def __init__(
         self,
@@ -97,6 +141,7 @@ class CodexUsageMultiMonitor:
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
         self.__notification_events: list[dict[str, Any]] = []
+        self.__recovery_pending_profile_ids: set[str] = set()
         self.__account_settings = {
             account_id: _AccountSettings(
                 account_id=account_id,
@@ -144,10 +189,14 @@ class CodexUsageMultiMonitor:
             self.__save_manager_settings()
         self.__monitor_factory = monitor_factory or self.__create_child_monitor
         self.__children = {
-            account_id: self.__invoke_monitor_factory(
-                self.__account_settings[account_id].provider,
-                paths.config_dir,
-                paths.profile_dir,
+            account_id: (
+                _RecoveryPendingChild(paths)
+                if account_id in self.__recovery_pending_profile_ids
+                else self.__invoke_monitor_factory(
+                    self.__account_settings[account_id].provider,
+                    paths.config_dir,
+                    paths.profile_dir,
+                )
             )
             for account_id, paths in self.__account_paths.items()
         }
@@ -239,18 +288,7 @@ class CodexUsageMultiMonitor:
                 if provider not in SUPPORTED_PROVIDERS:
                     return False, "provider"
                 if current is None:
-                    current = _AccountSettings(
-                        account_id=profile_id,
-                        label=_default_profile_label(provider, len(candidate_settings) + 1),
-                        enabled=True,
-                        provider=provider,
-                        taskbar_selected=False,
-                        provider_settings={},
-                    )
-                    candidate_settings[profile_id] = current
-                    provider_changed = False
-                    previous_label = current.label
-                    previous_enabled = current.enabled
+                    return False, "invalid_profile"
                 else:
                     previous_label = current.label
                     previous_enabled = current.enabled
@@ -326,12 +364,18 @@ class CodexUsageMultiMonitor:
 
         old_settings = self.__account_settings
         old_ids = set(old_settings)
-        added_ids = set(candidate_settings) - old_ids
         changed_providers = [
             profile_id
             for profile_id in set(candidate_settings) & old_ids
             if candidate_settings[profile_id].provider != old_settings[profile_id].provider
         ]
+        old_order = list(self.__account_order)
+        old_default = self.__default_account_id
+        old_enabled = self.__enabled
+        old_taskbar_overlay_enabled = self.__taskbar_overlay_enabled
+        old_interval_sec = self.__interval_sec
+        old_tooltip_duration_ms = self.__tooltip_duration_ms
+        old_usage_url = self.__usage_url
         if "enabled" in data:
             self.__enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
@@ -355,9 +399,25 @@ class CodexUsageMultiMonitor:
         self.__account_settings = candidate_settings
         self.__account_order = candidate_order
         self.__default_account_id = candidate_default
-        for profile_id in [*changed_providers, *sorted(added_ids)]:
-            self.__replace_child_monitor(profile_id)
-        self.__save_manager_settings()
+        try:
+            for profile_id in changed_providers:
+                self.__replace_child_monitor(profile_id)
+            self.__save_manager_settings()
+        except Exception:
+            self.__account_settings = old_settings
+            self.__account_order = old_order
+            self.__default_account_id = old_default
+            self.__enabled = old_enabled
+            self.__taskbar_overlay_enabled = old_taskbar_overlay_enabled
+            self.__interval_sec = old_interval_sec
+            self.__tooltip_duration_ms = old_tooltip_duration_ms
+            self.__usage_url = old_usage_url
+            for profile_id in changed_providers:
+                try:
+                    self.__replace_child_monitor(profile_id)
+                except Exception:
+                    continue
+            return False, "settings_save_failed"
         self.__sync_child_settings()
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
@@ -478,6 +538,8 @@ class CodexUsageMultiMonitor:
             if restored:
                 self.__discard_cleanup_transaction(transaction_id)
                 self.__replace_child_monitor(normalized)
+            else:
+                self.__mark_profile_recovery_pending(normalized)
             return False, "profile_delete_failed"
         deleted_settings = replace(
             self.__account_settings[normalized],
@@ -509,6 +571,8 @@ class CodexUsageMultiMonitor:
             if restored:
                 self.__discard_cleanup_transaction(transaction_id)
                 self.__replace_child_monitor(normalized)
+            else:
+                self.__mark_profile_recovery_pending(normalized)
             return False, "profile_delete_failed"
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
@@ -1409,8 +1473,10 @@ class CodexUsageMultiMonitor:
 
     def __retry_pending_profile_cleanup(self) -> None:
         if not os.path.isfile(self.__cleanup_state_path):
+            self.__recovery_pending_profile_ids.clear()
             return
         pending: list[dict[str, str]] = []
+        recovery_pending: set[str] = set()
         for entry in self.__read_valid_cleanup_entries():
             path = entry["path"]
             original = entry["original"]
@@ -1420,6 +1486,7 @@ class CodexUsageMultiMonitor:
                         os.replace(path, original)
                     elif os.path.lexists(path):
                         pending.append(entry)
+                        recovery_pending.add(entry["profile_id"])
                     continue
                 if os.path.isdir(path):
                     shutil.rmtree(path)
@@ -1427,10 +1494,22 @@ class CodexUsageMultiMonitor:
                     os.remove(path)
             except Exception:
                 pending.append(entry)
+                if entry["profile_id"] in self.__account_settings:
+                    recovery_pending.add(entry["profile_id"])
+        self.__recovery_pending_profile_ids = recovery_pending
         try:
             self.__persist_pending_profile_cleanup(pending)
         except Exception:
             pass
+        return
+
+    def __mark_profile_recovery_pending(self, profile_id: str) -> None:
+        normalized = str(profile_id or "")
+        paths = self.__account_paths.get(normalized)
+        if paths is None:
+            return
+        self.__recovery_pending_profile_ids.add(normalized)
+        self.__children[normalized] = _RecoveryPendingChild(paths)
         return
 
     def __discard_cleanup_transaction(self, transaction_id: str) -> None:
@@ -1645,10 +1724,14 @@ class CodexUsageMultiMonitor:
         paths = self.__build_account_paths()[account_id]
         self.__account_paths[account_id] = paths
         account = self.__account_settings[account_id]
-        child = self.__invoke_monitor_factory(
-            account.provider,
-            paths.config_dir,
-            paths.profile_dir,
+        child = (
+            _RecoveryPendingChild(paths)
+            if account_id in self.__recovery_pending_profile_ids
+            else self.__invoke_monitor_factory(
+                account.provider,
+                paths.config_dir,
+                paths.profile_dir,
+            )
         )
         self.__children[account_id] = child
         if self.__root is not None:

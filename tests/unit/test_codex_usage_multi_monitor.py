@@ -339,11 +339,13 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                     "profiles": [
                         {"id": "account_1", "provider": "codex", "taskbar_selected": True},
                         {"id": "account_2", "provider": "cursor", "taskbar_selected": True},
-                        {"id": "profile_00000000000000000000000000000003", "provider": "cursor"},
                     ]
                 }
             )
             self.assertTrue(ok, error)
+            ok, error, created = manager.add_profile("cursor")
+            self.assertTrue(ok, error)
+            dynamic_profile_id = created["id"]
             self.assertEqual(len(manager.get_settings_snapshot()["profiles"]), 3)
 
             before = manager.get_settings_snapshot()
@@ -353,13 +355,60 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                     "selected_profile_ids": [
                         "account_1",
                         "account_2",
-                        "profile_00000000000000000000000000000003",
+                        dynamic_profile_id,
                     ]
                 }
             )
             self.assertFalse(ok)
             self.assertEqual(error, "taskbar_profile_limit")
             self.assertEqual(manager.get_settings_snapshot(), before)
+
+    def test_update_settings_rejects_unregistered_profile_id_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            before = manager.get_settings_snapshot()
+
+            ok, error = manager.update_settings(
+                {
+                    "profiles": [
+                        *before["profiles"],
+                        {
+                            "id": "profile_00000000000000000000000000000003",
+                            "provider": "cursor",
+                        },
+                    ]
+                }
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "invalid_profile")
+            self.assertEqual(manager.get_settings_snapshot(), before)
+
+    def test_update_settings_save_failure_restores_provider_scalars_and_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            before = manager.get_settings_snapshot()
+            profiles = [dict(item) for item in before["profiles"]]
+            profiles[0]["provider"] = "cursor"
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__save_manager_settings",
+                side_effect=OSError("disk full"),
+            ):
+                ok, error = manager.update_settings(
+                    {
+                        "profiles": profiles,
+                        "enabled": False,
+                        "interval_sec": 123,
+                    }
+                )
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            self.assertEqual(manager.get_settings_snapshot(), before)
+            child = manager._CodexUsageMultiMonitor__children["account_1"]
+            self.assertIn("codex-account-1", child.config_dir)
 
     def test_v3_settings_migrate_once_to_v4_and_preserve_raw_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -623,6 +672,16 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             with open(cleanup_state, encoding="utf-8") as fp:
                 quarantines = [item["path"] for item in json.load(fp)["paths"]]
             self.assertTrue(any(os.path.exists(path) for path in quarantines))
+            runtime = next(
+                item
+                for item in manager.get_runtime_status()["profiles"]
+                if item["id"] == profile_id
+            )
+            self.assertEqual(runtime["runtime"]["monitor_state"], "recovery_pending")
+            ok, error = manager.update_settings({"interval_sec": 91})
+            self.assertTrue(ok, error)
+            self.assertFalse(os.path.exists(owned_paths[0]))
+            self.assertTrue(os.path.isfile(cleanup_state))
 
             self._build_manager(tmp)
 
