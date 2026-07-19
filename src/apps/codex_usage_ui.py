@@ -1828,6 +1828,11 @@ class CodexUsageSettingsView:
         self._set_status(f"설정 변경 실패: {error}", level="error")
         return
 
+    def _resume_pending_autosave_after_external_failure(self) -> None:
+        self._preserve_status_after_next_autosave = True
+        self._schedule_autosave()
+        return
+
     def _remount(self) -> None:
         parent = self._parent
         if parent is None:

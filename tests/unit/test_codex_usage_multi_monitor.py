@@ -1898,6 +1898,171 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 (False, "shutdown"),
             )
 
+    def test_shutdown_waits_for_active_refresh_and_skips_remaining_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+            shutdown_finished = threading.Event()
+            children = []
+
+            class _ActiveChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_refresh.wait(2.0)
+                    return super().show_current_status(force_refresh=force_refresh, source=source)
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _ActiveChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            manager.show_current_status(force_refresh=True)
+            self.assertTrue(refresh_started.wait(1.0))
+
+            shutdown_thread = threading.Thread(
+                target=lambda: (manager.shutdown(), shutdown_finished.set())
+            )
+            shutdown_thread.start()
+            shutdown_finished_before_release = shutdown_finished.wait(0.2)
+            release_refresh.set()
+            shutdown_thread.join(2.0)
+
+            self.assertFalse(shutdown_finished_before_release)
+            self.assertFalse(shutdown_thread.is_alive())
+            self.assertEqual(children[1].show_calls, [])
+            self.assertEqual([child.shutdown_calls for child in children], [1, 1])
+
+    def test_delete_waits_for_active_profile_refresh_before_removing_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+            delete_finished = threading.Event()
+            delete_result = []
+            children = []
+
+            class _LateWritingChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_refresh.wait(2.0)
+                    os.makedirs(self.config_dir, exist_ok=True)
+                    with open(os.path.join(self.config_dir, "late_state.json"), "w", encoding="utf-8") as fp:
+                        fp.write("late")
+                    return super().show_current_status(force_refresh=force_refresh, source=source)
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _LateWritingChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            account_path = manager.get_settings_snapshot()["profiles"][0]["config_dir"]
+            os.makedirs(account_path, exist_ok=True)
+            manager.show_account_status("account_1")
+            self.assertTrue(refresh_started.wait(1.0))
+
+            delete_thread = threading.Thread(
+                target=lambda: (
+                    delete_result.append(manager.delete_profile("account_1", confirmed=True)),
+                    delete_finished.set(),
+                )
+            )
+            delete_thread.start()
+            delete_finished_before_release = delete_finished.wait(0.2)
+            release_refresh.set()
+            delete_thread.join(2.0)
+
+            self.assertFalse(delete_finished_before_release)
+            self.assertFalse(delete_thread.is_alive())
+            self.assertEqual(delete_result, [(True, None)])
+            self.assertFalse(os.path.exists(account_path))
+
+    def test_snapshot_readers_share_provider_publish_mutation_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_manager(tmp)
+            reader_finished = threading.Event()
+            results = []
+
+            def read_snapshots():
+                results.append(manager.get_settings_snapshot())
+                results.append(manager.get_runtime_status())
+                reader_finished.set()
+
+            with manager._CodexUsageMultiMonitor__settings_mutation_lock:
+                reader = threading.Thread(target=read_snapshots)
+                reader.start()
+                completed_inside_publish = reader_finished.wait(0.2)
+
+            reader.join(2.0)
+
+            self.assertFalse(completed_inside_publish)
+            self.assertFalse(reader.is_alive())
+            self.assertEqual(len(results), 2)
+
+    def test_provider_switch_is_rejected_while_profile_refresh_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+            children = []
+
+            class _ActiveChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_refresh.wait(2.0)
+                    return super().show_current_status(force_refresh=force_refresh, source=source)
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _ActiveChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            manager.show_account_status("account_1")
+            self.assertTrue(refresh_started.wait(1.0))
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+
+            result = manager.update_settings({"profiles": profiles})
+
+            self.assertEqual(result, (False, "profile_refresh_busy"))
+            self.assertEqual(
+                manager.get_settings_snapshot()["profiles"][0]["provider"],
+                "codex",
+            )
+            release_refresh.set()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: not manager._CodexUsageMultiMonitor__refresh_inflight
+                )
+            )
+
     def test_delete_profile_move_failure_restores_all_paths_and_live_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)

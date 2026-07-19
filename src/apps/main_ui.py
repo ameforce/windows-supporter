@@ -662,6 +662,18 @@ class WindowsSupporterMainUI:
                 if not view_mutation_started:
                     return
 
+        def resume_pending_autosave() -> None:
+            if prepared_settings is None or settings_view is None:
+                return
+            resume = getattr(
+                settings_view,
+                "_resume_pending_autosave_after_external_failure",
+                None,
+            )
+            if callable(resume):
+                resume()
+            return
+
         def task() -> None:
             ok = True
             error = None
@@ -704,6 +716,8 @@ class WindowsSupporterMainUI:
                     )
                     if callable(finish_mutation):
                         finish_mutation(ok, error)
+                    if not bool(ok):
+                        resume_pending_autosave()
                 self._refresh_dashboard_status()
                 return
 
@@ -721,6 +735,7 @@ class WindowsSupporterMainUI:
                 )
                 if callable(finish_mutation):
                     finish_mutation(False, "background_worker_start_failed")
+                resume_pending_autosave()
             self._refresh_dashboard_status()
         return
 

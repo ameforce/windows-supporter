@@ -445,6 +445,9 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             def _finish_external_settings_mutation(self, ok, error):
                 self.events.append(("finish", ok, error))
 
+            def _resume_pending_autosave_after_external_failure(self):
+                self.events.append(("resume_autosave",))
+
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
             ui, _, _, monitor, _ = self._build_ui(path)
@@ -461,6 +464,7 @@ class MainUiDashboardUnitTest(unittest.TestCase):
                 [
                     ("begin",),
                     ("finish", False, "background_worker_start_failed"),
+                    ("resume_autosave",),
                 ],
             )
 

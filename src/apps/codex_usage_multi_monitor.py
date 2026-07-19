@@ -141,7 +141,10 @@ class CodexUsageMultiMonitor:
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__refresh_inflight = False
         self.__refresh_lock = threading.Lock()
-        self.__settings_mutation_lock = threading.Lock()
+        self.__refresh_condition = threading.Condition(self.__refresh_lock)
+        self.__active_refresh_counts: dict[str, int] = {}
+        self.__blocked_refresh_profile_ids: set[str] = set()
+        self.__settings_mutation_lock = threading.RLock()
         self.__lifecycle_lock = threading.Lock()
         self.__closing = False
         self.__unsettled_children: dict[str, list[Any]] = {}
@@ -254,8 +257,9 @@ class CodexUsageMultiMonitor:
             self.__closing = True
         with self.__settings_mutation_lock:
             self.__clear_monitor_schedule()
-            with self.__refresh_lock:
+            with self.__refresh_condition:
                 self.__refresh_queue.clear()
+                self.__refresh_condition.notify_all()
             self.__profile_next_collect_due_ts.clear()
             shutdown_children = [
                 *self.__children.values(),
@@ -273,12 +277,17 @@ class CodexUsageMultiMonitor:
                         shutdown()
                     except Exception:
                         pass
+            self.__wait_for_refreshes_quiesced(timeout_sec=None)
             self.__root = None
             self.__event_queue = None
             self.__ui_thread_id = None
         return
 
     def get_settings_snapshot(self) -> dict[str, Any]:
+        with self.__settings_mutation_lock:
+            return self.__get_settings_snapshot()
+
+    def __get_settings_snapshot(self) -> dict[str, Any]:
         profiles = [
             self.__build_account_settings_snapshot(account_id)
             for account_id in self.__ordered_account_ids()
@@ -312,7 +321,43 @@ class CodexUsageMultiMonitor:
         with self.__settings_mutation_lock:
             if bool(self.__closing):
                 return False, "shutdown"
-            return self.__update_settings(data)
+            provider_change_ids = self.__provider_change_ids(data)
+            for profile_id in provider_change_ids:
+                self.__set_profile_refresh_blocked(profile_id, True)
+            try:
+                if provider_change_ids and not all(
+                    self.__wait_for_refreshes_quiesced(
+                        profile_id=profile_id,
+                        timeout_sec=0.0,
+                    )
+                    for profile_id in provider_change_ids
+                ):
+                    return False, "profile_refresh_busy"
+                return self.__update_settings(data)
+            finally:
+                for profile_id in provider_change_ids:
+                    self.__set_profile_refresh_blocked(profile_id, False)
+
+    def __provider_change_ids(self, data: dict[str, Any]) -> set[str]:
+        if not isinstance(data, dict):
+            return set()
+        raw_profiles = data.get("profiles")
+        if not isinstance(raw_profiles, list):
+            raw_profiles = data.get("accounts")
+        if not isinstance(raw_profiles, list):
+            return set()
+        changed: set[str] = set()
+        for raw in raw_profiles:
+            if not isinstance(raw, dict):
+                continue
+            profile_id = str(raw.get("id") or raw.get("profile_id") or "")
+            current = self.__account_settings.get(profile_id)
+            if current is None:
+                continue
+            provider = str(raw.get("provider") or current.provider).strip().lower()
+            if provider != current.provider:
+                changed.add(profile_id)
+        return changed
 
     def toggle_enabled(self) -> tuple[bool, str | None]:
         if bool(self.__closing):
@@ -860,7 +905,16 @@ class CodexUsageMultiMonitor:
         with self.__settings_mutation_lock:
             if bool(self.__closing):
                 return False, "shutdown"
-            return self.__delete_profile(profile_id, confirmed=confirmed)
+            normalized = str(profile_id or "")
+            if normalized not in self.__account_settings:
+                return False, "invalid_profile"
+            if not bool(confirmed):
+                return False, "confirmation_required"
+            self.__set_profile_refresh_blocked(normalized, True)
+            try:
+                return self.__delete_profile(normalized, confirmed=True)
+            finally:
+                self.__set_profile_refresh_blocked(normalized, False)
 
     def __delete_profile(
         self,
@@ -938,6 +992,12 @@ class CodexUsageMultiMonitor:
                             self.__event_queue,
                         )
                 return False, "profile_delete_failed"
+        if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
+            self.__discard_cleanup_transaction(transaction_id)
+            if not recovery_was_pending:
+                self.__complete_settings_recovery({normalized})
+            self.__restore_child_monitor_or_mark_recovery_pending(normalized)
+            return False, "profile_delete_failed"
         if not recovery_was_pending:
             self.__complete_settings_recovery({normalized})
         quarantined: list[dict[str, Any]] = []
@@ -996,6 +1056,10 @@ class CodexUsageMultiMonitor:
         return True, None
 
     def get_runtime_status(self) -> dict[str, Any]:
+        with self.__settings_mutation_lock:
+            return self.__get_runtime_status()
+
+    def __get_runtime_status(self) -> dict[str, Any]:
         profile_entries = [
             self.__build_account_runtime_entry(account_id)
             for account_id in self.__ordered_account_ids()
@@ -1037,9 +1101,10 @@ class CodexUsageMultiMonitor:
     def get_last_snapshot(self) -> Any:
         # Compatibility API for legacy single-account callers. Aggregate and
         # per-account consumers should use get_runtime_status()["accounts"].
-        if not self.__default_account_id:
-            return None
-        return self.__child(self.__default_account_id).get_last_snapshot()
+        with self.__settings_mutation_lock:
+            if not self.__default_account_id:
+                return None
+            return self.__child(self.__default_account_id).get_last_snapshot()
 
     def on_display_topology_changed(self, reason: str = "display_change") -> None:
         self.__refresh_taskbar_progress(
@@ -1049,6 +1114,8 @@ class CodexUsageMultiMonitor:
         return
 
     def show_current_status(self, force_refresh: bool = True, source: str = "manual_query") -> None:
+        if bool(self.__closing):
+            return
         source_key = str(source or "manual_query")
         if source_key == "manual_login":
             if self.__default_account_id:
@@ -1070,6 +1137,8 @@ class CodexUsageMultiMonitor:
         force_refresh: bool = True,
         source: str = "manual_query",
     ) -> None:
+        if bool(self.__closing):
+            return
         self.__show_account_status(
             account_id,
             force_refresh=bool(force_refresh),
@@ -1221,10 +1290,78 @@ class CodexUsageMultiMonitor:
         except Exception:
             return False
 
+    def __set_profile_refresh_blocked(self, profile_id: str, blocked: bool) -> None:
+        normalized = str(profile_id or "")
+        with self.__refresh_condition:
+            if bool(blocked):
+                self.__blocked_refresh_profile_ids.add(normalized)
+            else:
+                self.__blocked_refresh_profile_ids.discard(normalized)
+            self.__refresh_condition.notify_all()
+        return
+
+    def __begin_profile_refresh(self, profile_id: str) -> Any | None:
+        normalized = str(profile_id or "")
+        with self.__refresh_condition:
+            if (
+                bool(self.__closing)
+                or normalized in self.__blocked_refresh_profile_ids
+                or normalized not in self.__children
+            ):
+                return None
+            child = self.__children[normalized]
+            self.__active_refresh_counts[normalized] = (
+                int(self.__active_refresh_counts.get(normalized, 0)) + 1
+            )
+            return child
+
+    def __end_profile_refresh(self, profile_id: str) -> None:
+        normalized = str(profile_id or "")
+        with self.__refresh_condition:
+            remaining = int(self.__active_refresh_counts.get(normalized, 0)) - 1
+            if remaining > 0:
+                self.__active_refresh_counts[normalized] = remaining
+            else:
+                self.__active_refresh_counts.pop(normalized, None)
+            self.__refresh_condition.notify_all()
+        return
+
+    def __wait_for_refreshes_quiesced(
+        self,
+        *,
+        profile_id: str | None = None,
+        timeout_sec: float | None = 60.0,
+    ) -> bool:
+        normalized = None if profile_id is None else str(profile_id or "")
+        deadline = (
+            None
+            if timeout_sec is None
+            else float(time.monotonic()) + max(0.0, float(timeout_sec))
+        )
+        with self.__refresh_condition:
+            while True:
+                active = (
+                    bool(self.__active_refresh_counts)
+                    if normalized is None
+                    else int(self.__active_refresh_counts.get(normalized, 0)) > 0
+                )
+                manager_running = bool(self.__refresh_inflight) if normalized is None else False
+                if not bool(active or manager_running):
+                    return True
+                if deadline is None:
+                    self.__refresh_condition.wait(timeout=0.25)
+                    continue
+                remaining = deadline - float(time.monotonic())
+                if remaining <= 0.0:
+                    return False
+                self.__refresh_condition.wait(timeout=min(0.25, remaining))
+
     def __dispatch_refresh_worker(self, fn, *, refresh_taskbar: bool) -> bool:
         if not callable(fn):
             return False
-        with self.__refresh_lock:
+        with self.__refresh_condition:
+            if bool(self.__closing):
+                return False
             self.__refresh_queue.append((fn, bool(refresh_taskbar)))
             if bool(self.__refresh_inflight):
                 if bool(refresh_taskbar):
@@ -1234,26 +1371,32 @@ class CodexUsageMultiMonitor:
 
         def worker() -> None:
             refresh_after = False
-            while True:
-                with self.__refresh_lock:
-                    if not self.__refresh_queue:
-                        self.__refresh_inflight = False
-                        break
-                    queued_fn, queued_refresh = self.__refresh_queue.popleft()
-                try:
-                    queued_fn()
-                except Exception as exc:
-                    self.__notification_events.append(
-                        {
-                            "type": "manager_collection_error",
-                            "error_type": type(exc).__name__,
-                        }
-                    )
-                    if len(self.__notification_events) > 20:
-                        self.__notification_events = self.__notification_events[-20:]
-                refresh_after = bool(refresh_after or queued_refresh)
-                if bool(queued_refresh):
-                    self.__refresh_taskbar_progress()
+            try:
+                while True:
+                    with self.__refresh_condition:
+                        if bool(self.__closing):
+                            self.__refresh_queue.clear()
+                        if not self.__refresh_queue:
+                            break
+                        queued_fn, queued_refresh = self.__refresh_queue.popleft()
+                    try:
+                        queued_fn()
+                    except Exception as exc:
+                        self.__notification_events.append(
+                            {
+                                "type": "manager_collection_error",
+                                "error_type": type(exc).__name__,
+                            }
+                        )
+                        if len(self.__notification_events) > 20:
+                            self.__notification_events = self.__notification_events[-20:]
+                    refresh_after = bool(refresh_after or queued_refresh)
+                    if bool(queued_refresh):
+                        self.__refresh_taskbar_progress()
+            finally:
+                with self.__refresh_condition:
+                    self.__refresh_inflight = False
+                    self.__refresh_condition.notify_all()
             if bool(refresh_after):
                 self.__refresh_taskbar_progress()
             if not self.__post_ui(self.__schedule_monitor_tick):
@@ -1266,9 +1409,10 @@ class CodexUsageMultiMonitor:
             try:
                 threading.Thread(target=worker, daemon=True).start()
             except Exception:
-                with self.__refresh_lock:
+                with self.__refresh_condition:
                     self.__refresh_inflight = False
                     self.__refresh_queue.clear()
+                    self.__refresh_condition.notify_all()
                 return False
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
@@ -1419,10 +1563,10 @@ class CodexUsageMultiMonitor:
         manage_inflight: bool = True,
         account_ids: tuple[str, ...] | None = None,
     ) -> None:
-        if not bool(self.__enabled):
+        if bool(self.__closing) or not bool(self.__enabled):
             return
         if bool(manage_inflight):
-            with self.__refresh_lock:
+            with self.__refresh_condition:
                 self.__refresh_inflight = True
         try:
             selected_account_ids = (
@@ -1431,6 +1575,8 @@ class CodexUsageMultiMonitor:
                 else tuple(account_ids)
             )
             for account_id in selected_account_ids:
+                if bool(self.__closing):
+                    break
                 if account_id not in self.__background_account_ids():
                     self.__profile_next_collect_due_ts.pop(account_id, None)
                     continue
@@ -1453,7 +1599,9 @@ class CodexUsageMultiMonitor:
                     if len(self.__notification_events) > 20:
                         self.__notification_events = self.__notification_events[-20:]
                 finally:
-                    if account_id in self.__background_account_ids():
+                    if bool(self.__closing):
+                        self.__profile_next_collect_due_ts.pop(account_id, None)
+                    elif account_id in self.__background_account_ids():
                         self.__profile_next_collect_due_ts[account_id] = (
                             float(time.monotonic())
                             + self.__profile_collect_delay_sec(account_id)
@@ -1462,37 +1610,40 @@ class CodexUsageMultiMonitor:
                         self.__profile_next_collect_due_ts.pop(account_id, None)
         finally:
             if bool(manage_inflight):
-                with self.__refresh_lock:
+                with self.__refresh_condition:
                     self.__refresh_inflight = False
+                    self.__refresh_condition.notify_all()
         return
 
     def __should_run_background_collection(self) -> bool:
         return bool(self.__enabled and self.__background_account_ids())
 
     def __background_account_ids(self) -> list[str]:
-        account_ids = []
-        for account_id in self.__ordered_account_ids():
-            if not bool(self.__account_settings[account_id].enabled):
-                continue
-            runtime = self.__safe_child_runtime(account_id)
-            if bool(runtime.get("retry_exhausted")) and not bool(
-                runtime.get("collect_inflight")
-            ):
-                continue
-            if self.__is_background_account_paused(runtime):
-                continue
-            session_state = str(runtime.get("session_state") or "logged_out")
-            provider_status = str(runtime.get("provider_status") or "")
-            if (
-                session_state == "logged_in"
-                or (
-                    provider_status == "retrying"
-                    and session_state != "logged_out"
-                )
-                or bool(runtime.get("collect_inflight"))
-            ):
-                account_ids.append(account_id)
-        return account_ids
+        with self.__settings_mutation_lock:
+            account_ids = []
+            for account_id in self.__ordered_account_ids():
+                account = self.__account_settings.get(account_id)
+                if account is None or not bool(account.enabled):
+                    continue
+                runtime = self.__safe_child_runtime(account_id)
+                if bool(runtime.get("retry_exhausted")) and not bool(
+                    runtime.get("collect_inflight")
+                ):
+                    continue
+                if self.__is_background_account_paused(runtime):
+                    continue
+                session_state = str(runtime.get("session_state") or "logged_out")
+                provider_status = str(runtime.get("provider_status") or "")
+                if (
+                    session_state == "logged_in"
+                    or (
+                        provider_status == "retrying"
+                        and session_state != "logged_out"
+                    )
+                    or bool(runtime.get("collect_inflight"))
+                ):
+                    account_ids.append(account_id)
+            return account_ids
 
     def __is_background_account_paused(self, runtime: dict[str, Any]) -> bool:
         if not isinstance(runtime, dict):
@@ -1548,14 +1699,20 @@ class CodexUsageMultiMonitor:
         return max(1.0, float(initial_delay_sec))
 
     def __refresh_accounts(self, source: str, *, manage_inflight: bool = True) -> None:
-        if not bool(self.__enabled):
+        if bool(self.__closing) or not bool(self.__enabled):
             return
         if bool(manage_inflight):
-            with self.__refresh_lock:
+            with self.__refresh_condition:
                 self.__refresh_inflight = True
         try:
-            for account_id in self.__ordered_account_ids():
-                if not bool(self.__account_settings[account_id].enabled):
+            with self.__settings_mutation_lock:
+                account_ids = list(self.__ordered_account_ids())
+            for account_id in account_ids:
+                if bool(self.__closing):
+                    break
+                with self.__settings_mutation_lock:
+                    account = self.__account_settings.get(account_id)
+                if account is None or not bool(account.enabled):
                     continue
                 self.__show_account_status(
                     account_id,
@@ -1566,8 +1723,9 @@ class CodexUsageMultiMonitor:
                 )
         finally:
             if bool(manage_inflight):
-                with self.__refresh_lock:
+                with self.__refresh_condition:
                     self.__refresh_inflight = False
+                    self.__refresh_condition.notify_all()
         return
 
     def __show_account_status(
@@ -1597,8 +1755,13 @@ class CodexUsageMultiMonitor:
                 refresh_taskbar=bool(refresh_taskbar),
             ):
                 return
-        child = self.__child(account_id)
-        child.show_current_status(force_refresh=bool(force_refresh), source=source_key)
+        child = self.__begin_profile_refresh(account_id)
+        if child is None:
+            return
+        try:
+            child.show_current_status(force_refresh=bool(force_refresh), source=source_key)
+        finally:
+            self.__end_profile_refresh(account_id)
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
         return
