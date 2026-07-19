@@ -178,11 +178,21 @@ class CodexUsageMultiMonitor:
                         "codex_usage_multi_settings.v2.backup.json",
                     ),
                 )
+        source_settings_version = (
+            _safe_int(manager_settings.get("settings_version", 0), 0)
+            if isinstance(manager_settings, dict)
+            else 0
+        )
         self.__load_manager_settings(manager_settings)
         self.__retry_pending_profile_cleanup()
         self.__account_paths = self.__build_account_paths()
         legacy_settings = self.__read_legacy_settings()
-        self.__migrate_legacy_single_account_files_if_needed()
+        if (
+            source_settings_version < AI_USAGE_SETTINGS_VERSION
+            and "account_1" in self.__account_settings
+            and "account_1" not in self.__recovery_pending_profile_ids
+        ):
+            self.__migrate_legacy_single_account_files_if_needed()
         if not has_manager_settings or manager_settings_version < AI_USAGE_SETTINGS_VERSION:
             if not isinstance(manager_settings, dict):
                 self.__apply_legacy_manager_settings(legacy_settings)
@@ -408,9 +418,11 @@ class CodexUsageMultiMonitor:
         self.__account_settings = candidate_settings
         self.__account_order = candidate_order
         self.__default_account_id = candidate_default
+        replaced_profile_ids: list[str] = []
         try:
             for profile_id in changed_providers:
                 self.__replace_child_monitor(profile_id)
+                replaced_profile_ids.append(profile_id)
             self.__save_manager_settings()
         except Exception:
             self.__account_settings = old_settings
@@ -421,11 +433,11 @@ class CodexUsageMultiMonitor:
             self.__interval_sec = old_interval_sec
             self.__tooltip_duration_ms = old_tooltip_duration_ms
             self.__usage_url = old_usage_url
-            for profile_id in changed_providers:
+            for profile_id in reversed(replaced_profile_ids):
                 try:
                     self.__replace_child_monitor(profile_id)
                 except Exception:
-                    continue
+                    self.__mark_profile_recovery_pending(profile_id)
             return False, "settings_save_failed"
         self.__sync_child_settings()
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
@@ -520,6 +532,12 @@ class CodexUsageMultiMonitor:
             for entry in deletion_entries
         ):
             return False, "unsafe_profile_path"
+        try:
+            self.__persist_pending_profile_cleanup(
+                [*self.__read_valid_cleanup_entries(), *deletion_entries]
+            )
+        except Exception:
+            return False, "profile_delete_failed"
         child = self.__children.get(normalized)
         shutdown = getattr(child, "shutdown", None)
         if callable(shutdown):
@@ -527,13 +545,6 @@ class CodexUsageMultiMonitor:
                 shutdown()
             except Exception:
                 pass
-        try:
-            self.__persist_pending_profile_cleanup(
-                [*self.__read_valid_cleanup_entries(), *deletion_entries]
-            )
-        except Exception:
-            self.__replace_child_monitor(normalized)
-            return False, "profile_delete_failed"
         quarantined: list[dict[str, str]] = []
         try:
             for entry in deletion_entries:
@@ -546,7 +557,7 @@ class CodexUsageMultiMonitor:
             restored = self.__restore_quarantined_profile_paths(quarantined)
             if restored:
                 self.__discard_cleanup_transaction(transaction_id)
-                self.__replace_child_monitor(normalized)
+                self.__restore_child_monitor_or_mark_recovery_pending(normalized)
             else:
                 self.__mark_profile_recovery_pending(normalized)
             return False, "profile_delete_failed"
@@ -579,7 +590,7 @@ class CodexUsageMultiMonitor:
             restored = self.__restore_quarantined_profile_paths(quarantined)
             if restored:
                 self.__discard_cleanup_transaction(transaction_id)
-                self.__replace_child_monitor(normalized)
+                self.__restore_child_monitor_or_mark_recovery_pending(normalized)
             else:
                 self.__mark_profile_recovery_pending(normalized)
             return False, "profile_delete_failed"
@@ -1517,11 +1528,29 @@ class CodexUsageMultiMonitor:
 
     def __mark_profile_recovery_pending(self, profile_id: str) -> None:
         normalized = str(profile_id or "")
-        paths = self.__account_paths.get(normalized)
+        paths = self.__build_account_paths().get(normalized)
         if paths is None:
             return
+        old_child = self.__children.get(normalized)
+        shutdown = getattr(old_child, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
         self.__recovery_pending_profile_ids.add(normalized)
-        self.__children[normalized] = _RecoveryPendingChild(paths)
+        child = _RecoveryPendingChild(paths)
+        self.__account_paths[normalized] = paths
+        self.__children[normalized] = child
+        if self.__root is not None:
+            self.__attach_child(child, self.__root, self.__event_queue)
+        return
+
+    def __restore_child_monitor_or_mark_recovery_pending(self, profile_id: str) -> None:
+        try:
+            self.__replace_child_monitor(profile_id)
+        except Exception:
+            self.__mark_profile_recovery_pending(profile_id)
         return
 
     def __discard_cleanup_transaction(self, transaction_id: str) -> None:
@@ -1727,27 +1756,37 @@ class CodexUsageMultiMonitor:
 
     def __replace_child_monitor(self, account_id: str) -> None:
         old_child = self.__children.get(account_id)
-        shutdown = getattr(old_child, "shutdown", None)
-        if callable(shutdown):
+        paths = self.__build_account_paths()[account_id]
+        account = self.__account_settings[account_id]
+        child = None
+        try:
+            child = (
+                _RecoveryPendingChild(paths)
+                if account_id in self.__recovery_pending_profile_ids
+                else self.__invoke_monitor_factory(
+                    account.provider,
+                    paths.config_dir,
+                    paths.profile_dir,
+                )
+            )
+            if self.__root is not None:
+                self.__attach_child(child, self.__root, self.__event_queue)
+        except Exception:
+            shutdown_new = getattr(child, "shutdown", None)
+            if callable(shutdown_new):
+                try:
+                    shutdown_new()
+                except Exception:
+                    pass
+            raise
+        self.__account_paths[account_id] = paths
+        self.__children[account_id] = child
+        shutdown_old = getattr(old_child, "shutdown", None)
+        if callable(shutdown_old):
             try:
-                shutdown()
+                shutdown_old()
             except Exception:
                 pass
-        paths = self.__build_account_paths()[account_id]
-        self.__account_paths[account_id] = paths
-        account = self.__account_settings[account_id]
-        child = (
-            _RecoveryPendingChild(paths)
-            if account_id in self.__recovery_pending_profile_ids
-            else self.__invoke_monitor_factory(
-                account.provider,
-                paths.config_dir,
-                paths.profile_dir,
-            )
-        )
-        self.__children[account_id] = child
-        if self.__root is not None:
-            self.__attach_child(child, self.__root, self.__event_queue)
         return
 
     def __create_child_monitor(self, provider: str, config_dir: str, profile_dir: str) -> Any:

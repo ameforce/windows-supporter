@@ -232,6 +232,103 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 copied = json.load(fp)
             self.assertEqual(copied["interval_sec"], 33.0)
 
+    def test_v4_restart_does_not_recreate_deleted_legacy_account_1_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            with open(
+                os.path.join(config_dir, "codex_usage_settings.json"),
+                "w",
+                encoding="utf-8",
+            ) as fp:
+                json.dump({"enabled": True}, fp)
+
+            manager, _ = self._build_manager(tmp)
+            account_1 = next(
+                item
+                for item in manager.get_settings_snapshot()["profiles"]
+                if item["id"] == "account_1"
+            )
+            self.assertTrue(os.path.isfile(account_1["settings_path"]))
+
+            ok, error = manager.delete_profile("account_1", confirmed=True)
+
+            self.assertTrue(ok, error)
+            self.assertFalse(os.path.exists(account_1["config_dir"]))
+            restarted, _ = self._build_manager(tmp)
+            self.assertNotIn(
+                "account_1",
+                restarted.get_settings_snapshot()["profile_order"],
+            )
+            self.assertFalse(os.path.exists(account_1["config_dir"]))
+
+    def test_v4_recovery_conflict_does_not_copy_legacy_files_into_original_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            original = os.path.join(config_dir, "codex-account-1")
+            quarantine = f"{original}.delete-{'b' * 32}"
+            os.makedirs(original, exist_ok=True)
+            os.makedirs(quarantine, exist_ok=True)
+            with open(
+                os.path.join(config_dir, "codex_usage_settings.json"),
+                "w",
+                encoding="utf-8",
+            ) as fp:
+                json.dump({"enabled": True}, fp)
+            with open(
+                os.path.join(config_dir, "ai_usage_settings.json"),
+                "w",
+                encoding="utf-8",
+            ) as fp:
+                json.dump(
+                    {
+                        "settings_version": 4,
+                        "profiles": [
+                            {
+                                "id": "account_1",
+                                "provider": "codex",
+                                "enabled": True,
+                                "taskbar_selected": True,
+                            }
+                        ],
+                        "profile_order": ["account_1"],
+                        "selected_profile_ids": ["account_1"],
+                        "default_account_id": "account_1",
+                    },
+                    fp,
+                )
+            with open(
+                os.path.join(config_dir, "ai_usage_cleanup_state.json"),
+                "w",
+                encoding="utf-8",
+            ) as fp:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "paths": [
+                            {
+                                "transaction_id": "a" * 32,
+                                "profile_id": "account_1",
+                                "provider": "codex",
+                                "path_kind": "config",
+                                "original": original,
+                                "path": quarantine,
+                                "root": config_dir,
+                            }
+                        ],
+                    },
+                    fp,
+                )
+
+            manager, _ = self._build_manager(tmp)
+
+            runtime = manager.get_runtime_status()["profiles"][0]["runtime"]
+            self.assertEqual(runtime["monitor_state"], "recovery_pending")
+            self.assertFalse(
+                os.path.exists(os.path.join(original, "codex_usage_settings.json"))
+            )
+
     def test_v2_manager_settings_migrate_atomically_to_v4_and_keep_rollback_files_immutable(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = os.path.join(tmp, "config")
@@ -409,6 +506,73 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(manager.get_settings_snapshot(), before)
             child = manager._CodexUsageMultiMonitor__children["account_1"]
             self.assertIn("codex-account-1", child.config_dir)
+
+    def test_provider_factory_failure_keeps_original_child_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fail_factory = False
+            children = []
+
+            def factory(config_dir, profile_dir):
+                if fail_factory:
+                    raise RuntimeError("factory unavailable")
+                child = _FakeChildMonitor(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            original = manager._CodexUsageMultiMonitor__children["account_1"]
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+            fail_factory = True
+
+            ok, error = manager.update_settings({"profiles": profiles})
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            self.assertIs(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                original,
+            )
+            self.assertEqual(original.shutdown_calls, 0)
+
+    def test_provider_save_rollback_factory_failure_uses_recovery_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            factory_calls = 0
+
+            def factory(config_dir, profile_dir):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls >= 4:
+                    raise RuntimeError("rollback factory unavailable")
+                return _FakeChildMonitor(config_dir, profile_dir)
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__save_manager_settings",
+                side_effect=OSError("disk full"),
+            ):
+                ok, error = manager.update_settings({"profiles": profiles})
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            runtime = next(
+                item
+                for item in manager.get_runtime_status()["profiles"]
+                if item["id"] == "account_1"
+            )
+            self.assertEqual(runtime["runtime"]["monitor_state"], "recovery_pending")
 
     def test_invalid_interval_rejects_all_scalar_changes_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -807,7 +971,52 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertTrue(all(os.path.isdir(path) for path in owned_paths))
             active_child = manager._CodexUsageMultiMonitor__children[profile_id]
             self.assertEqual(active_child.shutdown_calls, 0)
-            self.assertGreater(len(children), 3)
+            self.assertEqual(len(children), 3)
+
+    def test_delete_profile_move_failure_and_factory_failure_returns_tuple(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fail_factory = False
+
+            def factory(config_dir, profile_dir):
+                if fail_factory:
+                    raise RuntimeError("factory unavailable")
+                return _FakeChildMonitor(config_dir, profile_dir)
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            for path in (created["config_dir"], created["profile_dir"]):
+                os.makedirs(path, exist_ok=True)
+            fail_factory = True
+            real_replace = os.replace
+            move_count = 0
+
+            def fail_second_move(source, target):
+                nonlocal move_count
+                if ".delete-" in str(target):
+                    move_count += 1
+                    if move_count == 2:
+                        raise PermissionError("locked")
+                return real_replace(source, target)
+
+            with patch(
+                "src.apps.codex_usage_multi_monitor.os.replace",
+                side_effect=fail_second_move,
+            ):
+                ok, error = manager.delete_profile(created["id"], confirmed=True)
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "profile_delete_failed")
+            runtime = next(
+                item
+                for item in manager.get_runtime_status()["profiles"]
+                if item["id"] == created["id"]
+            )
+            self.assertEqual(runtime["runtime"]["monitor_state"], "recovery_pending")
 
     def test_delete_profile_removes_owned_paths_for_every_provider_in_history(self):
         with tempfile.TemporaryDirectory() as tmp:
