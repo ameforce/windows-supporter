@@ -2458,6 +2458,10 @@ class CodexUsageMultiMonitor:
         return CodexUsageMonitor(
             config_dir=config_dir,
             profile_dir=profile_dir,
+            managed_profile_root=os.path.join(
+                self.__local_base_dir,
+                "windows-supporter",
+            ),
             notification_sink=self.__handle_child_notification,
             suppress_normal_tooltips=True,
             local_usage_provider=find_latest_windows_codex_usage,

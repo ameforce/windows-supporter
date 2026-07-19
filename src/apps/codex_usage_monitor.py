@@ -1764,6 +1764,7 @@ class CodexUsageMonitor:
         ]
         | None = None,
         unrecoverable_timeout_handler: Callable[[], bool] | None = None,
+        managed_profile_root: str | None = None,
     ) -> None:
         self.__lib = LibConnector()
         self.__root = None
@@ -1857,6 +1858,12 @@ class CodexUsageMonitor:
             local_base,
             "windows-supporter",
             "chatgpt-profile",
+        )
+        normalized_managed_profile_root = str(managed_profile_root or "").strip()
+        self.__managed_profile_root = (
+            normalized_managed_profile_root
+            if normalized_managed_profile_root
+            else self.__lib.os.path.dirname(self.__default_profile_dir)
         )
         normalized_profile_dir = str(profile_dir or "").strip()
         if normalized_profile_dir:
@@ -2098,10 +2105,14 @@ class CodexUsageMonitor:
         try:
             leaf = self.__lib.os.path.basename(target)
             parent_dir = self.__lib.os.path.dirname(target)
-            default_parent = self.__normalize_local_path(
-                self.__lib.os.path.dirname(default)
+            managed_parent = self.__normalize_local_path(
+                getattr(self, "_CodexUsageMonitor__managed_profile_root", "")
             )
-            relative = self.__lib.os.path.relpath(target, default_parent)
+            if not managed_parent:
+                managed_parent = self.__normalize_local_path(
+                    self.__lib.os.path.dirname(default)
+                )
+            relative = self.__lib.os.path.relpath(target, managed_parent)
             relative_parts = [
                 part.lower()
                 for part in relative.replace("\\", "/").split("/")
@@ -2113,7 +2124,7 @@ class CodexUsageMonitor:
                 and re.fullmatch(r"profile_[0-9a-f]{32}", relative_parts[1])
                 and relative_parts[2] == "codex"
             ):
-                return _is_non_reparse_descendant(target, default_parent)
+                return _is_non_reparse_descendant(target, managed_parent)
             parent = self.__lib.os.path.basename(parent_dir)
             allowed_leafs = {
                 "chatgpt-profile",
@@ -2122,13 +2133,13 @@ class CodexUsageMonitor:
             }
             if leaf.lower() not in allowed_leafs:
                 return False
-            if self.__normalize_local_path(parent_dir) != default_parent:
+            if self.__normalize_local_path(parent_dir) != managed_parent:
                 return False
             if parent.lower() != "windows-supporter":
                 return False
         except Exception:
             return False
-        return _is_non_reparse_descendant(target, default_parent)
+        return _is_non_reparse_descendant(target, managed_parent)
 
     def __normalize_local_path(self, value: str) -> str:
         raw = str(value or "").strip()

@@ -257,6 +257,35 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertTrue(ok, message)
             self.assertFalse(os.path.exists(profile_dir))
 
+    def test_logout_honors_explicit_managed_profile_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            managed_root = os.path.join(tmp, "custom-local", "windows-supporter")
+            profile_dir = os.path.join(
+                managed_root,
+                "ai-profiles",
+                f"profile_{'b' * 32}",
+                "codex",
+            )
+            os.makedirs(profile_dir, exist_ok=True)
+            with open(os.path.join(profile_dir, "marker.txt"), "w", encoding="utf-8") as fp:
+                fp.write("managed")
+            session = self._BrowserSession()
+            with patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.path.join(tmp, "default-local")},
+            ):
+                monitor = CodexUsageMonitor(
+                    config_dir=os.path.join(tmp, "config"),
+                    profile_dir=profile_dir,
+                    managed_profile_root=managed_root,
+                    browser_session_factory=lambda _config: session,
+                )
+
+            ok, message = monitor.release_profile_session()
+
+            self.assertTrue(ok, message)
+            self.assertFalse(os.path.exists(profile_dir))
+
     def test_logout_rejects_dynamic_profile_resolving_outside_app_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             profile_dir = os.path.join(
