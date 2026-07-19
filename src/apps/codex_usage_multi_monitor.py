@@ -391,10 +391,25 @@ class CodexUsageMultiMonitor:
         )
         self.__account_settings[profile_id] = settings
         self.__account_order.append(profile_id)
+        previous_default = self.__default_account_id
         if not self.__default_account_id:
             self.__default_account_id = profile_id
-        self.__replace_child_monitor(profile_id)
-        self.__save_manager_settings()
+        try:
+            self.__replace_child_monitor(profile_id)
+            self.__save_manager_settings()
+        except Exception:
+            child = self.__children.pop(profile_id, None)
+            shutdown = getattr(child, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    pass
+            self.__account_paths.pop(profile_id, None)
+            self.__account_settings.pop(profile_id, None)
+            self.__account_order = [item for item in self.__account_order if item != profile_id]
+            self.__default_account_id = previous_default
+            return False, "profile_add_failed", None
         self.__sync_child_settings()
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
@@ -407,20 +422,34 @@ class CodexUsageMultiMonitor:
         if not bool(confirmed):
             return False, "confirmation_required"
         local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
-        owned_roots: list[tuple[str, str]] = []
+        transaction_id = uuid.uuid4().hex
+        deletion_entries: list[dict[str, str]] = []
         seen_paths: set[str] = set()
         for provider in SUPPORTED_PROVIDERS:
             paths = self.__build_profile_paths(normalized, provider)
-            for path, root in (
-                (paths.config_dir, self.__config_dir),
-                (paths.profile_dir, local_app_root),
+            for path_kind, path, root in (
+                ("config", paths.config_dir, self.__config_dir),
+                ("profile", paths.profile_dir, local_app_root),
             ):
                 path_key = os.path.normcase(os.path.abspath(path))
                 if path_key in seen_paths:
                     continue
                 seen_paths.add(path_key)
-                owned_roots.append((path, root))
-        if any(not self.__is_owned_deletion_path(path, root) for path, root in owned_roots):
+                deletion_entries.append(
+                    {
+                        "transaction_id": transaction_id,
+                        "profile_id": normalized,
+                        "provider": provider,
+                        "path_kind": path_kind,
+                        "original": path,
+                        "path": f"{path}.delete-{uuid.uuid4().hex}",
+                        "root": root,
+                    }
+                )
+        if any(
+            self.__normalize_cleanup_entry(entry) is None
+            for entry in deletion_entries
+        ):
             return False, "unsafe_profile_path"
         child = self.__children.get(normalized)
         shutdown = getattr(child, "shutdown", None)
@@ -429,17 +458,26 @@ class CodexUsageMultiMonitor:
                 shutdown()
             except Exception:
                 pass
-        quarantined: list[tuple[str, str, str]] = []
         try:
-            for path, root in owned_roots:
+            self.__persist_pending_profile_cleanup(
+                [*self.__read_valid_cleanup_entries(), *deletion_entries]
+            )
+        except Exception:
+            self.__replace_child_monitor(normalized)
+            return False, "profile_delete_failed"
+        quarantined: list[dict[str, str]] = []
+        try:
+            for entry in deletion_entries:
+                path = entry["original"]
                 if not os.path.lexists(path):
                     continue
-                quarantine = f"{path}.delete-{uuid.uuid4().hex}"
-                os.replace(path, quarantine)
-                quarantined.append((path, quarantine, root))
+                os.replace(path, entry["path"])
+                quarantined.append(entry)
         except Exception:
-            self.__restore_quarantined_profile_paths(quarantined)
-            self.__replace_child_monitor(normalized)
+            restored = self.__restore_quarantined_profile_paths(quarantined)
+            if restored:
+                self.__discard_cleanup_transaction(transaction_id)
+                self.__replace_child_monitor(normalized)
             return False, "profile_delete_failed"
         deleted_settings = replace(
             self.__account_settings[normalized],
@@ -467,12 +505,14 @@ class CodexUsageMultiMonitor:
             self.__default_account_id = previous_default
             if deleted_paths is not None:
                 self.__account_paths[normalized] = deleted_paths
-            self.__restore_quarantined_profile_paths(quarantined)
-            self.__replace_child_monitor(normalized)
+            restored = self.__restore_quarantined_profile_paths(quarantined)
+            if restored:
+                self.__discard_cleanup_transaction(transaction_id)
+                self.__replace_child_monitor(normalized)
             return False, "profile_delete_failed"
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
-        self.__cleanup_quarantined_profile_paths(quarantined)
+        self.__retry_pending_profile_cleanup()
         return True, None
 
     def get_runtime_status(self) -> dict[str, Any]:
@@ -1343,79 +1383,109 @@ class CodexUsageMultiMonitor:
 
     def __restore_quarantined_profile_paths(
         self,
-        quarantined: list[tuple[str, str, str]],
-    ) -> None:
-        for original, quarantine, _root in reversed(quarantined):
+        quarantined: list[dict[str, str]],
+    ) -> bool:
+        restored = True
+        for entry in reversed(quarantined):
+            original = entry["original"]
+            quarantine = entry["path"]
             try:
                 if os.path.lexists(quarantine) and not os.path.lexists(original):
                     os.replace(quarantine, original)
             except Exception:
-                continue
-        return
+                restored = False
+        return restored
 
-    def __cleanup_quarantined_profile_paths(
-        self,
-        quarantined: list[tuple[str, str, str]],
-    ) -> None:
-        pending: list[dict[str, str]] = []
-        existing = self.__read_json_file(self.__cleanup_state_path)
-        existing_paths = existing.get("paths") if isinstance(existing, dict) else None
-        if isinstance(existing_paths, list):
-            pending.extend(
-                {
-                    "path": str(raw.get("path") or ""),
-                    "root": str(raw.get("root") or ""),
-                }
-                for raw in existing_paths
-                if isinstance(raw, dict) and str(raw.get("path") or "")
-            )
-        for _original, quarantine, root in quarantined:
-            try:
-                if os.path.isdir(quarantine):
-                    shutil.rmtree(quarantine)
-                elif os.path.exists(quarantine):
-                    os.remove(quarantine)
-            except Exception:
-                pending.append({"path": quarantine, "root": root})
-        deduplicated: dict[str, dict[str, str]] = {}
-        for item in pending:
-            deduplicated[os.path.normcase(os.path.abspath(item["path"]))] = item
-        self.__persist_pending_profile_cleanup(list(deduplicated.values()))
-        return
-
-    def __retry_pending_profile_cleanup(self) -> None:
+    def __read_valid_cleanup_entries(self) -> list[dict[str, str]]:
         data = self.__read_json_file(self.__cleanup_state_path)
         raw_paths = data.get("paths") if isinstance(data, dict) else None
         if not isinstance(raw_paths, list):
+            return []
+        return [
+            normalized
+            for raw in raw_paths
+            if (normalized := self.__normalize_cleanup_entry(raw)) is not None
+        ]
+
+    def __retry_pending_profile_cleanup(self) -> None:
+        if not os.path.isfile(self.__cleanup_state_path):
             return
-        allowed_roots = (
-            self.__config_dir,
-            os.path.join(self.__local_base_dir, "windows-supporter"),
-        )
         pending: list[dict[str, str]] = []
-        for raw in raw_paths:
-            if not isinstance(raw, dict):
-                continue
-            path = str(raw.get("path") or "")
-            root = next(
-                (
-                    candidate_root
-                    for candidate_root in allowed_roots
-                    if self.__is_owned_deletion_path(path, candidate_root)
-                ),
-                "",
-            )
-            if not root:
-                continue
+        for entry in self.__read_valid_cleanup_entries():
+            path = entry["path"]
+            original = entry["original"]
             try:
+                if entry["profile_id"] in self.__account_settings:
+                    if os.path.lexists(path) and not os.path.lexists(original):
+                        os.replace(path, original)
+                    elif os.path.lexists(path):
+                        pending.append(entry)
+                    continue
                 if os.path.isdir(path):
                     shutil.rmtree(path)
-                elif os.path.exists(path):
+                elif os.path.lexists(path):
                     os.remove(path)
             except Exception:
-                pending.append({"path": path, "root": root})
-        self.__persist_pending_profile_cleanup(pending)
+                pending.append(entry)
+        try:
+            self.__persist_pending_profile_cleanup(pending)
+        except Exception:
+            pass
         return
+
+    def __discard_cleanup_transaction(self, transaction_id: str) -> None:
+        pending = [
+            entry
+            for entry in self.__read_valid_cleanup_entries()
+            if entry["transaction_id"] != transaction_id
+        ]
+        try:
+            self.__persist_pending_profile_cleanup(pending)
+        except Exception:
+            pass
+        return
+
+    def __normalize_cleanup_entry(self, raw: Any) -> dict[str, str] | None:
+        if not isinstance(raw, dict):
+            return None
+        transaction_id = str(raw.get("transaction_id") or "")
+        profile_id = str(raw.get("profile_id") or "")
+        provider = str(raw.get("provider") or "").lower()
+        path_kind = str(raw.get("path_kind") or "").lower()
+        original = os.path.abspath(str(raw.get("original") or ""))
+        quarantine = os.path.abspath(str(raw.get("path") or ""))
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None
+            or not _is_valid_profile_id(profile_id)
+            or provider not in SUPPORTED_PROVIDERS
+            or path_kind not in {"config", "profile"}
+        ):
+            return None
+        paths = self.__build_profile_paths(profile_id, provider)
+        expected_original = paths.config_dir if path_kind == "config" else paths.profile_dir
+        expected_root = (
+            self.__config_dir
+            if path_kind == "config"
+            else os.path.join(self.__local_base_dir, "windows-supporter")
+        )
+        expected_prefix = f"{os.path.abspath(expected_original)}.delete-"
+        if (
+            os.path.normcase(original) != os.path.normcase(os.path.abspath(expected_original))
+            or not os.path.normcase(quarantine).startswith(os.path.normcase(expected_prefix))
+            or re.fullmatch(r"[0-9a-f]{32}", quarantine[len(expected_prefix) :]) is None
+            or not self.__is_owned_deletion_path(original, expected_root)
+            or not self.__is_owned_deletion_path(quarantine, expected_root)
+        ):
+            return None
+        return {
+            "transaction_id": transaction_id,
+            "profile_id": profile_id,
+            "provider": provider,
+            "path_kind": path_kind,
+            "original": os.path.abspath(expected_original),
+            "path": quarantine,
+            "root": os.path.abspath(expected_root),
+        }
 
     def __persist_pending_profile_cleanup(self, pending: list[dict[str, str]]) -> None:
         if pending:
