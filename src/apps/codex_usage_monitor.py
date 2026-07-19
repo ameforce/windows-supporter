@@ -19,6 +19,11 @@ from src.apps.codex_usage_playwright_session import (
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
+from src.apps.ai_usage_contracts import (
+    UsageErrorType,
+    normalize_usage_error_type,
+    project_usage_provider_status,
+)
 
 
 def _is_non_reparse_descendant(candidate: str, boundary: str) -> bool:
@@ -1787,6 +1792,8 @@ class CodexUsageMonitor:
         self.__pending_change_tooltip_after_id = None
         self.__pending_change_tooltip_poll_ms = 500
         self.__failure_count = 0
+        self.__retry_failure_limit = 3
+        self.__last_error_type = UsageErrorType.NONE
         self.__collect_inflight = False
         self.__collect_inflight_source = ""
         self.__collect_started_ts = 0.0
@@ -2389,6 +2396,26 @@ class CodexUsageMonitor:
             monitor_state = "paused_profile_in_use"
         elif self.__auth_attention_required:
             monitor_state = "paused_auth_required"
+        has_usable_cache = bool(self.__last_snapshot.has_any_metric())
+        effective_error_type = self.__last_error_type
+        if self.__profile_in_use_detected:
+            effective_error_type = UsageErrorType.PROFILE_IN_USE
+        elif self.__auth_attention_required or self.__session_state == "logged_out":
+            effective_error_type = UsageErrorType.AUTH
+        provider_status = project_usage_provider_status(
+            has_usable_cache=has_usable_cache,
+            error_type=effective_error_type,
+            failure_count=self.__failure_count,
+            retry_limit=self.__retry_failure_limit,
+            collect_inflight=self.__collect_inflight,
+        )
+        freshness = (
+            "stale"
+            if has_usable_cache and provider_status != "ready"
+            else "fresh"
+            if has_usable_cache and provider_status == "ready"
+            else "unavailable"
+        )
         can_login = bool(
             (
                 self.__session_state == "logged_out"
@@ -2416,6 +2443,28 @@ class CodexUsageMonitor:
             "next_collect_in_sec": remain,
             "next_collect_estimated": False,
             "failure_count": int(self.__failure_count),
+            "retry_failure_limit": int(self.__retry_failure_limit),
+            "retry_exhausted": bool(
+                self.__last_error_type
+                not in {
+                    UsageErrorType.NONE,
+                    UsageErrorType.AUTH,
+                    UsageErrorType.PROFILE_IN_USE,
+                    UsageErrorType.DOM_DRIFT,
+                    UsageErrorType.UNSUPPORTED_CONTRACT,
+                }
+                and self.__failure_count >= self.__retry_failure_limit
+                and not has_usable_cache
+            ),
+            "retry_after_sec": (
+                float(min(self.__interval_sec * (2 ** max(0, min(self.__failure_count - 1, 4))), 15 * 60))
+                if provider_status == "retrying"
+                else None
+            ),
+            "provider_status": provider_status,
+            "last_error_type": self.__last_error_type.value,
+            "freshness": freshness,
+            "last_snapshot_is_stale": freshness == "stale",
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
             "profile_session_present": bool(self.__has_profile_session()),
@@ -2532,7 +2581,11 @@ class CodexUsageMonitor:
                         post_terminal(lambda: self.__show_tooltip("조회가 취소되었습니다."))
                         return
                     self.__consume_manual_query_pending_result()
-                    if error is not None and error != "profile_in_use":
+                    if error is not None and bool(
+                        source_key == "auto_monitor" and self.__external_scheduler
+                    ):
+                        self.__failure_count = min(self.__failure_count + 1, 8)
+                    if error is not None:
                         self.__handle_collect_error(error, source=source_key)
                     if refreshed is not None:
                         if not self.__is_worker_epoch_current(worker_epoch):
@@ -2552,6 +2605,8 @@ class CodexUsageMonitor:
                         self.__commit_merged_snapshot(merged)
                         snapshot = merged
                         self.__profile_in_use_detected = False
+                        self.__failure_count = 0
+                        self.__last_error_type = UsageErrorType.NONE
                         self.__resume_background_monitor_if_needed()
                 if error == "profile_in_use":
                     latest = self.get_last_snapshot()
@@ -2592,6 +2647,9 @@ class CodexUsageMonitor:
                 )
             return
 
+        if bool(self.__external_scheduler):
+            worker()
+            return
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception as exc:
@@ -2620,6 +2678,8 @@ class CodexUsageMonitor:
             self.__usage_history = []
         self.__cancel_pending_login_poll()
         self.__profile_in_use_detected = False
+        self.__failure_count = 0
+        self.__last_error_type = UsageErrorType.NONE
         self.__set_session_state("logged_in")
         self.__clear_auth_attention()
         changes = compute_usage_changes(prev, merged)
@@ -3951,6 +4011,7 @@ class CodexUsageMonitor:
         msg = str(error or "unknown_error")
         if msg in {"collect_busy", "collect_cancelled"}:
             return
+        self.__last_error_type = normalize_usage_error_type(msg)
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = self.__is_manual_collect_source(normalized_source)

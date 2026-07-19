@@ -5,9 +5,12 @@ import unittest
 from src.apps.ai_usage_contracts import (
     AiUsageProvider,
     AiUsageReading,
+    UsageErrorType,
     UsageState,
+    normalize_usage_error_type,
     normalize_usage_state,
     normalize_reset_boundary,
+    project_usage_provider_status,
     usage_state_message,
 )
 
@@ -52,6 +55,83 @@ class AiUsageContractsUnitTest(unittest.TestCase):
         self.assertEqual(normalize_usage_state(""), UsageState.UNKNOWN)
         self.assertEqual(normalize_usage_state("new-upstream-error"), UsageState.UNKNOWN)
         self.assertEqual(normalize_usage_state(None), UsageState.UNKNOWN)
+
+    def test_runtime_status_projection_respects_cache_and_error_boundaries(self) -> None:
+        cases = (
+            ({"has_usable_cache": True, "error_type": "network_error"}, "stale"),
+            ({"has_usable_cache": True, "error_type": "parse_failed"}, "stale"),
+            ({"has_usable_cache": True, "error_type": "login_required"}, "login"),
+            ({"has_usable_cache": True, "error_type": "rate_limited"}, "rate_limited"),
+            ({"has_usable_cache": False, "error_type": "profile_in_use"}, "paused"),
+            ({"has_usable_cache": False, "error_type": "rate_limited"}, "rate_limited"),
+            (
+                {
+                    "has_usable_cache": False,
+                    "error_type": "network_error",
+                    "failure_count": 2,
+                    "retry_limit": 3,
+                },
+                "retrying",
+            ),
+            (
+                {
+                    "has_usable_cache": False,
+                    "error_type": "network_error",
+                    "failure_count": 3,
+                    "retry_limit": 3,
+                },
+                "error",
+            ),
+            (
+                {
+                    "has_usable_cache": False,
+                    "error_type": "rate_limited",
+                    "failure_count": 3,
+                    "retry_limit": 3,
+                },
+                "error",
+            ),
+            ({"has_usable_cache": False, "error_type": "parse_failed"}, "error"),
+            (
+                {
+                    "has_usable_cache": True,
+                    "error_type": "none",
+                    "collect_inflight": True,
+                },
+                "ready",
+            ),
+            (
+                {
+                    "has_usable_cache": True,
+                    "error_type": "network_error",
+                    "collect_inflight": True,
+                },
+                "stale",
+            ),
+            (
+                {
+                    "has_usable_cache": False,
+                    "error_type": "none",
+                    "collect_inflight": True,
+                },
+                "running",
+            ),
+        )
+
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(project_usage_provider_status(**arguments), expected)
+
+    def test_runtime_errors_normalize_to_typed_categories(self) -> None:
+        self.assertEqual(normalize_usage_error_type("login_required"), UsageErrorType.AUTH)
+        self.assertEqual(
+            normalize_usage_error_type("profile_in_use"),
+            UsageErrorType.PROFILE_IN_USE,
+        )
+        self.assertEqual(
+            normalize_usage_error_type("network_error"),
+            UsageErrorType.TRANSIENT,
+        )
 
     def test_unavailable_reading_has_no_fabricated_usage_value(self) -> None:
         reading = AiUsageReading.unavailable(

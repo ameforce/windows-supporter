@@ -422,6 +422,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         cases = {
             "idle": "N/A",
             "unsupported_contract": "N/A",
+            "retrying": "RETRY",
+            "login": "OUT",
+            "paused": "WAIT",
             "logged_out": "OUT",
             "navigation_timeout": "TIME",
             "dom_drift": "ERR",
