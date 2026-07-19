@@ -206,6 +206,7 @@ class CodexUsageMultiMonitor:
                     self.__account_settings[account_id].provider,
                     paths.config_dir,
                     paths.profile_dir,
+                    account_id,
                 )
             )
             for account_id, paths in self.__account_paths.items()
@@ -302,14 +303,17 @@ class CodexUsageMultiMonitor:
                 else:
                     previous_label = current.label
                     previous_enabled = current.enabled
+                    previous_provider = current.provider
                     current.provider_settings[current.provider] = {
                         "label": current.label,
                         "enabled": bool(current.enabled),
                     }
                     provider_changed = provider != current.provider
                     current.provider = provider
+                    had_saved_provider = False
                     if provider_changed:
                         saved_provider = current.provider_settings.get(provider)
+                        had_saved_provider = isinstance(saved_provider, dict)
                         if isinstance(saved_provider, dict):
                             current.label = str(
                                 saved_provider.get("label")
@@ -321,11 +325,23 @@ class CodexUsageMultiMonitor:
                             current.enabled = True
                 if "label" in raw:
                     label = str(raw.get("label", "") or "").strip()
-                    if label and (not provider_changed or label != previous_label):
+                    previous_label_was_default = previous_label == _default_profile_label(
+                        previous_provider,
+                        len(requested_order),
+                    )
+                    if label and (
+                        not provider_changed
+                        or label != previous_label
+                        or (not had_saved_provider and not previous_label_was_default)
+                    ):
                         current.label = label
                 if "enabled" in raw:
                     requested_enabled = bool(raw.get("enabled"))
-                    if not provider_changed or requested_enabled != previous_enabled:
+                    if (
+                        not provider_changed
+                        or not had_saved_provider
+                        or requested_enabled != previous_enabled
+                    ):
                         current.enabled = requested_enabled
                 if "taskbar_selected" in raw:
                     current.taskbar_selected = bool(raw.get("taskbar_selected"))
@@ -1495,8 +1511,10 @@ class CodexUsageMultiMonitor:
         ]
 
     def __retry_pending_profile_cleanup(self) -> None:
+        previous_recovery_pending = set(self.__recovery_pending_profile_ids)
         if not os.path.isfile(self.__cleanup_state_path):
             self.__recovery_pending_profile_ids.clear()
+            self.__reconcile_recovery_children(previous_recovery_pending)
             return
         pending: list[dict[str, str]] = []
         recovery_pending: set[str] = set()
@@ -1511,10 +1529,11 @@ class CodexUsageMultiMonitor:
                         pending.append(entry)
                         recovery_pending.add(entry["profile_id"])
                     continue
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                elif os.path.lexists(path):
-                    os.remove(path)
+                for candidate in (original, path):
+                    if os.path.isdir(candidate):
+                        shutil.rmtree(candidate)
+                    elif os.path.lexists(candidate):
+                        os.remove(candidate)
             except Exception:
                 pending.append(entry)
                 if entry["profile_id"] in self.__account_settings:
@@ -1524,6 +1543,24 @@ class CodexUsageMultiMonitor:
             self.__persist_pending_profile_cleanup(pending)
         except Exception:
             pass
+        self.__reconcile_recovery_children(previous_recovery_pending)
+        return
+
+    def __reconcile_recovery_children(self, previous_profile_ids: set[str]) -> None:
+        children = getattr(self, "_CodexUsageMultiMonitor__children", None)
+        if not isinstance(children, dict):
+            return
+        current_profile_ids = set(self.__recovery_pending_profile_ids)
+        for profile_id in current_profile_ids - set(previous_profile_ids):
+            if profile_id in self.__account_settings:
+                self.__mark_profile_recovery_pending(profile_id)
+        for profile_id in set(previous_profile_ids) - current_profile_ids:
+            if profile_id not in self.__account_settings:
+                continue
+            try:
+                self.__replace_child_monitor(profile_id)
+            except Exception:
+                self.__mark_profile_recovery_pending(profile_id)
         return
 
     def __mark_profile_recovery_pending(self, profile_id: str) -> None:
@@ -1746,13 +1783,30 @@ class CodexUsageMultiMonitor:
             return []
         return [dict(item) for item in value if isinstance(item, dict)]
 
-    def __invoke_monitor_factory(self, provider: str, config_dir: str, profile_dir: str) -> Any:
+    def __invoke_monitor_factory(
+        self,
+        provider: str,
+        config_dir: str,
+        profile_dir: str,
+        profile_id: str,
+    ) -> Any:
         factory = self.__monitor_factory
+        candidates = (
+            (provider, config_dir, profile_dir, profile_id),
+            (provider, config_dir, profile_dir),
+            (config_dir, profile_dir),
+        )
         try:
-            inspect.signature(factory).bind(provider, config_dir, profile_dir)
+            signature = inspect.signature(factory)
         except (TypeError, ValueError):
-            return factory(config_dir, profile_dir)
-        return factory(provider, config_dir, profile_dir)
+            return factory(provider, config_dir, profile_dir, profile_id)
+        for args in candidates:
+            try:
+                signature.bind(*args)
+            except TypeError:
+                continue
+            return factory(*args)
+        return factory(config_dir, profile_dir)
 
     def __replace_child_monitor(self, account_id: str) -> None:
         old_child = self.__children.get(account_id)
@@ -1767,6 +1821,7 @@ class CodexUsageMultiMonitor:
                     account.provider,
                     paths.config_dir,
                     paths.profile_dir,
+                    account_id,
                 )
             )
             if self.__root is not None:
@@ -1789,7 +1844,13 @@ class CodexUsageMultiMonitor:
                 pass
         return
 
-    def __create_child_monitor(self, provider: str, config_dir: str, profile_dir: str) -> Any:
+    def __create_child_monitor(
+        self,
+        provider: str,
+        config_dir: str,
+        profile_dir: str,
+        profile_id: str,
+    ) -> Any:
         if str(provider or "").lower() == "cursor":
             from src.apps.cursor_usage_monitor import CursorUsageMonitor
 
@@ -1799,6 +1860,7 @@ class CodexUsageMultiMonitor:
                 notification_sink=self.__handle_child_notification,
                 suppress_normal_tooltips=True,
                 unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
+                profile_id=profile_id,
             )
         return CodexUsageMonitor(
             config_dir=config_dir,
