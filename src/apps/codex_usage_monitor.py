@@ -1774,6 +1774,7 @@ class CodexUsageMonitor:
         self.__lib = LibConnector()
         self.__root = None
         self.__event_queue = None
+        self.__ui_thread_id: int | None = None
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         self.__external_scheduler = False
@@ -1887,6 +1888,7 @@ class CodexUsageMonitor:
     def attach(self, root, event_queue=None, start_monitor: bool = True) -> None:
         self.__root = root
         self.__event_queue = event_queue
+        self.__ui_thread_id = threading.get_ident()
         self.__external_scheduler = not bool(start_monitor)
         self.__refresh_session_state_from_profile()
         if bool(start_monitor):
@@ -1907,6 +1909,7 @@ class CodexUsageMonitor:
         self.__browser_session.shutdown()
         self.__root = None
         self.__event_queue = None
+        self.__ui_thread_id = None
         return
 
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:
@@ -3411,6 +3414,15 @@ class CodexUsageMonitor:
 
     def __post_tk_cleanup(self, fn) -> None:
         if not callable(fn):
+            return
+        if (
+            self.__ui_thread_id is not None
+            and threading.get_ident() == self.__ui_thread_id
+        ):
+            try:
+                fn()
+            except Exception:
+                pass
             return
         queue_obj = self.__event_queue
         if queue_obj is not None:

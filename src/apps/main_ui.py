@@ -586,14 +586,14 @@ class WindowsSupporterMainUI:
             "update.settings": self.show_update_settings,
         }
 
-    def _run_bg(self, fn) -> None:
+    def _run_bg(self, fn) -> bool:
         if not callable(fn):
-            return
+            return False
         try:
             threading.Thread(target=fn, daemon=True).start()
+            return True
         except Exception:
-            pass
-        return
+            return False
 
     def _dashboard_startup_toggle(self) -> None:
         def task() -> None:
@@ -711,7 +711,17 @@ class WindowsSupporterMainUI:
                 done()
             return
 
-        self._run_bg(task)
+        worker_started = self._run_bg(task)
+        if worker_started is False:
+            if view_mutation_started and settings_view is not None:
+                finish_mutation = getattr(
+                    settings_view,
+                    "_finish_external_settings_mutation",
+                    None,
+                )
+                if callable(finish_mutation):
+                    finish_mutation(False, "background_worker_start_failed")
+            self._refresh_dashboard_status()
         return
 
     def _dashboard_codex_toggle_enabled(self) -> None:

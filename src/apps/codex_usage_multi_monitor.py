@@ -150,6 +150,7 @@ class CodexUsageMultiMonitor:
         self.__profile_next_collect_due_ts: dict[str, float] = {}
         self.__root = None
         self.__event_queue = None
+        self.__ui_thread_id: int | None = None
         self.__taskbar_progress = None
         self.__taskbar_progress_factory = taskbar_progress_factory or AiUsageTaskbarOverlay
         self.__unrecoverable_timeout_handler = unrecoverable_timeout_handler
@@ -239,6 +240,7 @@ class CodexUsageMultiMonitor:
                 return
             self.__root = root
             self.__event_queue = event_queue
+            self.__ui_thread_id = threading.get_ident()
             for child in self.__children.values():
                 self.__attach_child(child, root, event_queue)
             self.__refresh_taskbar_progress()
@@ -273,6 +275,7 @@ class CodexUsageMultiMonitor:
                         pass
             self.__root = None
             self.__event_queue = None
+            self.__ui_thread_id = None
         return
 
     def get_settings_snapshot(self) -> dict[str, Any]:
@@ -1295,7 +1298,15 @@ class CodexUsageMultiMonitor:
         action = lambda: self.__restart_monitor_scheduler(
             initial_delay_sec=initial_delay_sec
         )
-        if self.__event_queue is not None and self.__post_ui(action):
+        on_ui_thread = (
+            self.__ui_thread_id is not None
+            and threading.get_ident() == self.__ui_thread_id
+        )
+        if (
+            self.__event_queue is not None
+            and not on_ui_thread
+            and self.__post_ui(action)
+        ):
             return
         action()
         return

@@ -212,6 +212,24 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             self.assertIn("after-existing", root.after_cancel_calls)
 
+    def test_ui_thread_settings_mutation_restarts_scheduler_without_requeueing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_manager(tmp)
+            root = _FakeRoot()
+            event_queue = queue.Queue()
+            manager.attach(root, event_queue=event_queue)
+            while not event_queue.empty():
+                event_queue.get_nowait()()
+            root.after_calls.clear()
+            root.after_cancel_calls.clear()
+            manager._CodexUsageMultiMonitor__monitor_after_id = "after-ui"
+
+            ok, error = manager.update_settings({"enabled": False})
+
+            self.assertTrue(ok, error)
+            self.assertEqual(root.after_cancel_calls, ["after-ui"])
+            self.assertEqual(event_queue.qsize(), 1)
+
     def test_queued_ui_callbacks_do_not_resurrect_taskbar_or_scheduler_after_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _FakeTaskbarOverlay.instances = []
@@ -224,10 +242,15 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             root = _FakeRoot()
             event_queue = queue.Queue()
             manager.attach(root, event_queue=event_queue)
-            manager._CodexUsageMultiMonitor__request_monitor_scheduler_restart(
-                initial_delay_sec=5.0
+            restart_thread = threading.Thread(
+                target=lambda: manager._CodexUsageMultiMonitor__request_monitor_scheduler_restart(
+                    initial_delay_sec=5.0
+                )
             )
+            restart_thread.start()
+            restart_thread.join(1.0)
 
+            self.assertFalse(restart_thread.is_alive())
             self.assertGreaterEqual(event_queue.qsize(), 2)
             manager.shutdown()
             self.assertEqual(

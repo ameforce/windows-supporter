@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import tempfile
 import threading
 import unittest
@@ -74,6 +75,30 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             monitor.shutdown()
 
             self.assertEqual(session.shutdown_calls, 1)
+
+    def test_ui_thread_monitor_pause_cancels_timer_without_requeueing_cleanup(self) -> None:
+        class _Root:
+            def __init__(self) -> None:
+                self.after_cancel_calls = []
+
+            def after_cancel(self, after_id) -> None:
+                self.after_cancel_calls.append(after_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            root = _Root()
+            event_queue = queue.Queue()
+            monitor.attach(root, event_queue, start_monitor=False)
+            monitor._CodexUsageMonitor__monitor_after_id = "manual-query-timer"
+
+            monitor._CodexUsageMonitor__pause_monitor_countdown_for_manual_query()
+
+            self.assertEqual(root.after_cancel_calls, ["manual-query-timer"])
+            self.assertTrue(event_queue.empty())
 
     def test_collect_snapshot_routes_only_through_playwright_session_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

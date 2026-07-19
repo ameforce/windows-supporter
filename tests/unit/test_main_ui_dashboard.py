@@ -433,6 +433,37 @@ class MainUiDashboardUnitTest(unittest.TestCase):
 
             self.assertEqual(pending_view.events[-1], ("finish", True, None))
 
+    def test_dashboard_ai_toggle_clears_external_mutation_when_worker_start_fails(self):
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = queue.Queue()
+
+            with patch("src.apps.main_ui.threading.Thread", side_effect=RuntimeError("start failed")):
+                ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin",),
+                    ("finish", False, "background_worker_start_failed"),
+                ],
+            )
+
     def test_update_status_callback_refreshes_existing_dashboard(self):
         class FakeDashboard:
             def __init__(self):
