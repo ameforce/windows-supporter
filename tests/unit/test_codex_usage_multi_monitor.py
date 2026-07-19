@@ -660,6 +660,49 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                     persisted = json.load(fp)
                 self.assertEqual(persisted["profiles"][0]["provider"], "codex")
 
+    def test_staged_attach_and_shutdown_failure_tracks_child_and_keeps_wal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            factory_calls = 0
+
+            class _UnsettledStagedChild(_FakeChildMonitor):
+                def attach(self, root, event_queue=None, start_monitor=True):
+                    raise RuntimeError("attach failed after resource start")
+
+                def shutdown(self):
+                    raise RuntimeError("resource still alive")
+
+            def factory(provider, config_dir, profile_dir):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls <= 2:
+                    return _FakeChildMonitor(config_dir, profile_dir)
+                return _UnsettledStagedChild(config_dir, profile_dir)
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot())
+            original = manager._CodexUsageMultiMonitor__children["account_1"]
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+
+            ok, error = manager.update_settings({"profiles": profiles})
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            self.assertIs(manager._CodexUsageMultiMonitor__children["account_1"], original)
+            self.assertEqual(
+                len(manager._CodexUsageMultiMonitor__unsettled_children["account_1"]),
+                1,
+            )
+            with open(
+                os.path.join(tmp, "config", "ai_usage_settings_recovery.json"),
+                encoding="utf-8",
+            ) as fp:
+                self.assertIn("account_1", json.load(fp)["profile_ids"])
+
     def test_provider_save_failure_keeps_original_without_rollback_factory(self):
         with tempfile.TemporaryDirectory() as tmp:
             factory_calls = 0
@@ -999,6 +1042,47 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 manager._CodexUsageMultiMonitor__children["account_1"],
                 _RecoveryPendingChild,
             )
+
+    def test_cleanup_recovery_tracks_unsettled_child_and_blocks_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            class _UnstoppableChild(_FakeChildMonitor):
+                def shutdown(self):
+                    raise RuntimeError("still alive")
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=lambda config_dir, profile_dir: _UnstoppableChild(
+                    config_dir,
+                    profile_dir,
+                ),
+            )
+            profile = manager.get_settings_snapshot()["profiles"][0]
+            for path in (profile["config_dir"], profile["profile_dir"]):
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, "keep.txt"), "w", encoding="utf-8") as fp:
+                    fp.write("keep")
+
+            manager._CodexUsageMultiMonitor__mark_profile_recovery_pending("account_1")
+            ok, error = manager.delete_profile("account_1", confirmed=True)
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "profile_delete_failed")
+            self.assertIsInstance(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                _RecoveryPendingChild,
+            )
+            self.assertEqual(
+                len(manager._CodexUsageMultiMonitor__unsettled_children["account_1"]),
+                1,
+            )
+            self.assertTrue(os.path.isfile(os.path.join(profile["config_dir"], "keep.txt")))
+            self.assertTrue(os.path.isfile(os.path.join(profile["profile_dir"], "keep.txt")))
+            with open(
+                os.path.join(tmp, "config", "ai_usage_settings_recovery.json"),
+                encoding="utf-8",
+            ) as fp:
+                self.assertIn("account_1", json.load(fp)["profile_ids"])
 
     def test_failed_add_shutdown_keeps_paths_for_durable_restart_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:

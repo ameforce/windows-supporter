@@ -482,6 +482,7 @@ class CodexUsageMultiMonitor:
         self.__retry_pending_settings_recovery()
         if any(
             profile_id in self.__settings_recovery_profile_ids
+            and profile_id not in self.__recovery_pending_profile_ids
             and isinstance(self.__children.get(profile_id), _RecoveryPendingChild)
             for profile_id in transaction_recovery_ids
         ):
@@ -572,6 +573,11 @@ class CodexUsageMultiMonitor:
                     except Exception:
                         self.__track_unsettled_child(profile_id, child)
                         rollback_failed_ids.add(profile_id)
+            rollback_failed_ids.update(
+                profile_id
+                for profile_id in transaction_recovery_ids
+                if self.__unsettled_children.get(profile_id)
+            )
             clear_ids = (
                 set(transaction_recovery_ids)
                 - preexisting_recovery_ids
@@ -705,7 +711,7 @@ class CodexUsageMultiMonitor:
                 default_account_id=candidate_default,
             )
         except Exception:
-            shutdown_succeeded = True
+            shutdown_succeeded = not bool(self.__unsettled_children.get(profile_id))
             shutdown = getattr(staged_child, "shutdown", None)
             if callable(shutdown):
                 try:
@@ -720,8 +726,9 @@ class CodexUsageMultiMonitor:
                     path_existed_before,
                 )
                 self.__discard_cleanup_transaction(add_transaction_id)
-            elif staged_child is not None:
-                self.__track_unsettled_child(profile_id, staged_child)
+            else:
+                if staged_child is not None:
+                    self.__track_unsettled_child(profile_id, staged_child)
                 self.__deferred_cleanup_transaction_ids.add(add_transaction_id)
             return False, "profile_add_failed", None
         self.__account_settings = candidate_settings
@@ -1919,13 +1926,18 @@ class CodexUsageMultiMonitor:
         paths = self.__build_account_paths().get(normalized)
         if paths is None:
             return
+        try:
+            self.__prepare_settings_recovery([normalized])
+        except Exception:
+            self.__recovery_pending_profile_ids.add(normalized)
+            return
         old_child = self.__children.get(normalized)
         shutdown = getattr(old_child, "shutdown", None)
         if callable(shutdown):
             try:
                 shutdown()
             except Exception:
-                pass
+                self.__track_unsettled_child(normalized, old_child)
         self.__recovery_pending_profile_ids.add(normalized)
         child = _RecoveryPendingChild(paths)
         self.__account_paths[normalized] = paths
@@ -2421,7 +2433,7 @@ class CodexUsageMultiMonitor:
                 try:
                     shutdown_new()
                 except Exception:
-                    pass
+                    self.__track_unsettled_child(account_id, child)
             raise
         return paths, child
 
