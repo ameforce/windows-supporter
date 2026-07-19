@@ -286,6 +286,7 @@ class CodexUsageMultiMonitor:
             for profile_id, settings in self.__account_settings.items()
         }
         candidate_order = list(self.__ordered_account_ids())
+        submitted_profile_ids: set[str] | None = None
         if isinstance(raw_profiles, list):
             seen_ids: set[str] = set()
             requested_order: list[str] = []
@@ -367,6 +368,7 @@ class CodexUsageMultiMonitor:
             candidate_order = requested_order + [
                 profile_id for profile_id in candidate_order if profile_id not in seen_ids
             ]
+            submitted_profile_ids = set(seen_ids)
         selected_profile_ids = data.get("selected_profile_ids")
         if isinstance(selected_profile_ids, list):
             if len(selected_profile_ids) > TASKBAR_PROFILE_LIMIT:
@@ -377,8 +379,15 @@ class CodexUsageMultiMonitor:
             ):
                 return False, "invalid_taskbar_profile"
             selected = set(normalized_selected)
+            selection_scope = set(candidate_settings)
+            if (
+                submitted_profile_ids is not None
+                and len(submitted_profile_ids) < len(candidate_settings)
+            ):
+                selection_scope = submitted_profile_ids | selected
             for profile_id, settings in candidate_settings.items():
-                settings.taskbar_selected = profile_id in selected
+                if profile_id in selection_scope:
+                    settings.taskbar_selected = profile_id in selected
         else:
             normalized_selected = None
         requested_profile_order = data.get("profile_order")

@@ -482,6 +482,36 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(error, "invalid_profile")
             self.assertEqual(manager.get_settings_snapshot(), before)
 
+    def test_partial_profiles_payload_preserves_omitted_taskbar_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("cursor")
+            self.assertTrue(ok, error)
+            hidden_profile_id = created["id"]
+            ok, error = manager.update_settings(
+                {"selected_profile_ids": ["account_1", hidden_profile_id]}
+            )
+            self.assertTrue(ok, error)
+            partial_profiles = [
+                dict(item)
+                for item in manager.get_settings_snapshot()["profiles"]
+                if item["id"] in {"account_1", "account_2"}
+            ]
+
+            ok, error = manager.update_settings(
+                {
+                    "profiles": partial_profiles,
+                    "selected_profile_ids": ["account_1"],
+                    "tooltip_duration_ms": 8000,
+                }
+            )
+
+            self.assertTrue(ok, error)
+            self.assertEqual(
+                manager.get_settings_snapshot()["selected_profile_ids"],
+                ["account_1", hidden_profile_id],
+            )
+
     def test_update_settings_save_failure_restores_provider_scalars_and_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, _ = self._build_manager(tmp)
