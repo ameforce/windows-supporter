@@ -429,6 +429,10 @@ class CodexUsageMultiMonitor:
 
         old_settings = self.__account_settings
         old_ids = set(old_settings)
+        old_enabled = self.__enabled
+        old_interval_sec = self.__interval_sec
+        old_tooltip_duration_ms = self.__tooltip_duration_ms
+        old_usage_url = self.__usage_url
         changed_providers = [
             profile_id
             for profile_id in candidate_order
@@ -436,11 +440,43 @@ class CodexUsageMultiMonitor:
             if candidate_settings[profile_id].provider != old_settings[profile_id].provider
         ]
         staged_children: dict[str, tuple[_AccountPaths, Any]] = {}
+        staged_rollback_settings: dict[str, dict[str, Any]] = {}
+        updated_existing_ids: list[str] = []
         try:
             for profile_id in changed_providers:
                 staged_children[profile_id] = self.__stage_child_monitor(
                     profile_id,
                     candidate_settings[profile_id],
+                )
+                staged_child = staged_children[profile_id][1]
+                getter = getattr(staged_child, "get_settings_snapshot", None)
+                if callable(getter):
+                    snapshot = getter()
+                    if isinstance(snapshot, dict):
+                        staged_rollback_settings[profile_id] = {
+                            key: snapshot[key]
+                            for key in (
+                                "enabled",
+                                "interval_sec",
+                                "tooltip_duration_ms",
+                                "usage_url",
+                            )
+                            if key in snapshot
+                        }
+            for profile_id in candidate_order:
+                account = candidate_settings[profile_id]
+                if profile_id in staged_children:
+                    child = staged_children[profile_id][1]
+                else:
+                    child = self.__children[profile_id]
+                    updated_existing_ids.append(profile_id)
+                self.__apply_child_settings(
+                    child,
+                    account,
+                    enabled=candidate_enabled,
+                    interval_sec=candidate_interval_sec,
+                    tooltip_duration_ms=candidate_tooltip_duration_ms,
+                    usage_url=candidate_usage_url,
                 )
             self.__save_manager_settings(
                 account_settings=candidate_settings,
@@ -453,7 +489,26 @@ class CodexUsageMultiMonitor:
                 usage_url=candidate_usage_url,
             )
         except Exception:
-            for _paths, child in staged_children.values():
+            for profile_id in reversed(updated_existing_ids):
+                try:
+                    self.__apply_child_settings(
+                        self.__children[profile_id],
+                        old_settings[profile_id],
+                        enabled=old_enabled,
+                        interval_sec=old_interval_sec,
+                        tooltip_duration_ms=old_tooltip_duration_ms,
+                        usage_url=old_usage_url,
+                    )
+                except Exception:
+                    pass
+            for profile_id, (_paths, child) in staged_children.items():
+                rollback = staged_rollback_settings.get(profile_id)
+                updater = getattr(child, "update_settings", None)
+                if rollback and callable(updater):
+                    try:
+                        updater(rollback)
+                    except Exception:
+                        pass
                 shutdown = getattr(child, "shutdown", None)
                 if callable(shutdown):
                     try:
@@ -483,7 +538,6 @@ class CodexUsageMultiMonitor:
                     shutdown()
                 except Exception:
                     pass
-        self.__sync_child_settings()
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None
@@ -1203,17 +1257,39 @@ class CodexUsageMultiMonitor:
         for account_id in self.__ordered_account_ids():
             account = self.__account_settings[account_id]
             child = self.__child(account_id)
-            updater = getattr(child, "update_settings", None)
-            if not callable(updater):
-                continue
-            child_data = {
-                "enabled": bool(self.__enabled and account.enabled),
-                "interval_sec": float(self.__interval_sec),
-                "tooltip_duration_ms": int(self.__tooltip_duration_ms),
-            }
-            if account.provider == "codex":
-                child_data["usage_url"] = str(self.__usage_url)
-            updater(child_data)
+            self.__apply_child_settings(
+                child,
+                account,
+                enabled=self.__enabled,
+                interval_sec=self.__interval_sec,
+                tooltip_duration_ms=self.__tooltip_duration_ms,
+                usage_url=self.__usage_url,
+            )
+        return
+
+    def __apply_child_settings(
+        self,
+        child: Any,
+        account: _AccountSettings,
+        *,
+        enabled: bool,
+        interval_sec: float,
+        tooltip_duration_ms: int,
+        usage_url: str,
+    ) -> None:
+        updater = getattr(child, "update_settings", None)
+        if not callable(updater):
+            return
+        child_data = {
+            "enabled": bool(enabled and account.enabled),
+            "interval_sec": float(interval_sec),
+            "tooltip_duration_ms": int(tooltip_duration_ms),
+        }
+        if account.provider == "codex":
+            child_data["usage_url"] = str(usage_url)
+        result = updater(child_data)
+        if isinstance(result, tuple) and result and result[0] is False:
+            raise RuntimeError(str(result[1] if len(result) > 1 else "child_settings_failed"))
         return
 
     def __child(self, account_id: str) -> Any:

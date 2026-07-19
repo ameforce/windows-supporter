@@ -581,6 +581,54 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(original_2.shutdown_calls, 0)
             self.assertEqual(created[2].shutdown_calls, 1)
 
+    def test_staged_provider_child_settings_failure_keeps_original_transaction(self):
+        for failure_mode in ("raise", "reject"):
+            with self.subTest(failure_mode=failure_mode), tempfile.TemporaryDirectory() as tmp:
+                factory_calls = 0
+                staged_children = []
+
+                class _FailingSettingsChild(_FakeChildMonitor):
+                    def update_settings(self, data):
+                        self.update_calls.append(dict(data))
+                        if failure_mode == "raise":
+                            raise OSError("child settings unavailable")
+                        return False, "child_settings_failed"
+
+                def factory(provider, config_dir, profile_dir):
+                    nonlocal factory_calls
+                    factory_calls += 1
+                    if factory_calls <= 2:
+                        return _FakeChildMonitor(config_dir, profile_dir)
+                    child = _FailingSettingsChild(config_dir, profile_dir)
+                    staged_children.append(child)
+                    return child
+
+                manager = CodexUsageMultiMonitor(
+                    config_dir=os.path.join(tmp, "config"),
+                    local_base_dir=os.path.join(tmp, "local"),
+                    monitor_factory=factory,
+                )
+                original = manager._CodexUsageMultiMonitor__children["account_1"]
+                profiles = manager.get_settings_snapshot()["profiles"]
+                profiles[0]["provider"] = "cursor"
+
+                ok, error = manager.update_settings({"profiles": profiles})
+
+                self.assertFalse(ok)
+                self.assertEqual(error, "settings_save_failed")
+                self.assertIs(
+                    manager._CodexUsageMultiMonitor__children["account_1"],
+                    original,
+                )
+                self.assertEqual(original.shutdown_calls, 0)
+                self.assertEqual(staged_children[0].shutdown_calls, 1)
+                with open(
+                    os.path.join(tmp, "config", "ai_usage_settings.json"),
+                    encoding="utf-8",
+                ) as fp:
+                    persisted = json.load(fp)
+                self.assertEqual(persisted["profiles"][0]["provider"], "codex")
+
     def test_provider_save_failure_keeps_original_without_rollback_factory(self):
         with tempfile.TemporaryDirectory() as tmp:
             factory_calls = 0
