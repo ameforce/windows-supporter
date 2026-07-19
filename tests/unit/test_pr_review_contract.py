@@ -102,6 +102,21 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertNotIn("reviewer_source", contract)
         self.assertNotIn("merge-live", contract)
 
+    def test_agents_contract_requires_intent_based_hotfix_classification(self) -> None:
+        contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+        for required_text in (
+            "Hotfix는 원래 의도한 동작의 버그, 회귀, 누락 또는 불완전 구현을 복구한다",
+            "Release는 기존 의도에 없던 사용자 기능이나 제품 정책을 의도적으로 도입한다",
+            "내부 재설계, 마이그레이션, 코드량 또는 UI 수정 규모만으로 hotfix를 release로 승격하지 않는다",
+            "문서와 확인된 제품 의도가 충돌하면 그 증거를 남긴다",
+            "문서와 구현이 함께 잘못됐다면 같은 hotfix에서 수정한다",
+            "의도한 계약 → 현재 동작 → 차이 → 판정",
+            "repo 고유 정책과 확인된 제품 계약을 일반 SemVer 추정보다 우선한다",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, contract)
+
 
 if __name__ == "__main__":
     unittest.main()
