@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from src.apps.codex_usage_multi_monitor import CodexUsageMultiMonitor
 
@@ -511,20 +512,219 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             with open(marker, "w", encoding="utf-8") as fp:
                 fp.write("keep")
 
-            paths = manager._CodexUsageMultiMonitor__account_paths[profile_id]
-            manager._CodexUsageMultiMonitor__account_paths[profile_id] = type(paths)(
-                account_id=profile_id,
-                provider=paths.provider,
-                config_dir=outside,
-                profile_dir=paths.profile_dir,
-            )
+            builder = manager._CodexUsageMultiMonitor__build_profile_paths
+            current_paths = manager._CodexUsageMultiMonitor__account_paths[profile_id]
 
-            ok, error = manager.delete_profile(profile_id, confirmed=True)
+            def unsafe_builder(account_id, provider):
+                paths = builder(account_id, provider)
+                if provider != "codex":
+                    return paths
+                return type(current_paths)(
+                    account_id=account_id,
+                    provider=provider,
+                    config_dir=outside,
+                    profile_dir=paths.profile_dir,
+                )
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__build_profile_paths",
+                side_effect=unsafe_builder,
+            ):
+                ok, error = manager.delete_profile(profile_id, confirmed=True)
 
             self.assertFalse(ok)
             self.assertEqual(error, "unsafe_profile_path")
             self.assertTrue(os.path.isfile(marker))
             self.assertIn(profile_id, manager.get_settings_snapshot()["profile_order"])
+
+    def test_delete_profile_move_failure_restores_all_paths_and_live_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            codex_paths = (created["config_dir"], created["profile_dir"])
+            for path in codex_paths:
+                os.makedirs(path, exist_ok=True)
+
+            profiles = manager.get_settings_snapshot()["profiles"]
+            for item in profiles:
+                if item["id"] == profile_id:
+                    item["provider"] = "cursor"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            cursor = next(
+                item for item in manager.get_settings_snapshot()["profiles"] if item["id"] == profile_id
+            )
+            cursor_paths = (cursor["config_dir"], cursor["profile_dir"])
+            for path in cursor_paths:
+                os.makedirs(path, exist_ok=True)
+
+            real_replace = os.replace
+            move_count = 0
+            failed_once = False
+
+            def fail_second_profile_move(source, target):
+                nonlocal move_count, failed_once
+                if ".delete-" in str(target):
+                    move_count += 1
+                    if move_count == 2 and not failed_once:
+                        failed_once = True
+                        raise PermissionError("locked")
+                return real_replace(source, target)
+
+            with patch("src.apps.codex_usage_multi_monitor.os.replace", side_effect=fail_second_profile_move):
+                ok, error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "profile_delete_failed")
+            for path in (*codex_paths, *cursor_paths):
+                self.assertTrue(os.path.isdir(path), path)
+            self.assertIn(profile_id, manager.get_settings_snapshot()["profile_order"])
+            active_child = manager._CodexUsageMultiMonitor__children[profile_id]
+            self.assertEqual(active_child.shutdown_calls, 0)
+            self.assertGreater(len(children), 4)
+
+    def test_delete_profile_removes_owned_paths_for_every_provider_in_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            codex_paths = (created["config_dir"], created["profile_dir"])
+            for path in codex_paths:
+                os.makedirs(path, exist_ok=True)
+
+            profiles = manager.get_settings_snapshot()["profiles"]
+            for item in profiles:
+                if item["id"] == profile_id:
+                    item["provider"] = "cursor"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            cursor = next(
+                item for item in manager.get_settings_snapshot()["profiles"] if item["id"] == profile_id
+            )
+            cursor_paths = (cursor["config_dir"], cursor["profile_dir"])
+            for path in cursor_paths:
+                os.makedirs(path, exist_ok=True)
+
+            ok, error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertTrue(ok, error)
+            for path in (*codex_paths, *cursor_paths):
+                self.assertFalse(os.path.exists(path), path)
+
+    def test_delete_profile_persists_and_retries_quarantine_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            for key in ("config_dir", "profile_dir"):
+                os.makedirs(created[key], exist_ok=True)
+
+            real_rmtree = __import__("shutil").rmtree
+
+            def fail_quarantine_cleanup(path, *args, **kwargs):
+                if ".delete-" in str(path):
+                    raise PermissionError("locked cleanup")
+                return real_rmtree(path, *args, **kwargs)
+
+            with patch(
+                "src.apps.codex_usage_multi_monitor.shutil.rmtree",
+                side_effect=fail_quarantine_cleanup,
+            ):
+                ok, error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertTrue(ok, error)
+            cleanup_state = os.path.join(tmp, "config", "ai_usage_cleanup_state.json")
+            self.assertTrue(os.path.isfile(cleanup_state))
+            with open(cleanup_state, encoding="utf-8") as fp:
+                pending_paths = [item["path"] for item in json.load(fp)["paths"]]
+            self.assertTrue(pending_paths)
+            self.assertTrue(all(os.path.exists(path) for path in pending_paths))
+
+            self._build_manager(tmp)
+
+            self.assertFalse(os.path.exists(cleanup_state))
+            self.assertTrue(all(not os.path.exists(path) for path in pending_paths))
+
+    def test_delete_profile_save_failure_restores_model_paths_and_live_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            owned_paths = (created["config_dir"], created["profile_dir"])
+            for path in owned_paths:
+                os.makedirs(path, exist_ok=True)
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__save_manager_settings",
+                side_effect=OSError("disk full"),
+            ):
+                ok, error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "profile_delete_failed")
+            self.assertIn(profile_id, manager.get_settings_snapshot()["profile_order"])
+            for path in owned_paths:
+                self.assertTrue(os.path.isdir(path), path)
+            active_child = manager._CodexUsageMultiMonitor__children[profile_id]
+            self.assertEqual(active_child.shutdown_calls, 0)
+            self.assertGreater(len(children), 3)
+
+    def test_v3_migration_preserves_codex_label_and_enabled_for_provider_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            with open(os.path.join(config_dir, "ai_usage_settings.json"), "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "settings_version": 3,
+                        "profiles": [
+                            {
+                                "id": "account_1",
+                                "provider": "cursor",
+                                "label": "Cursor 현재",
+                                "enabled": True,
+                                "taskbar_selected": True,
+                            }
+                        ],
+                        "legacy_codex_accounts": [
+                            {"id": "account_1", "label": "Codex 보존", "enabled": False}
+                        ],
+                    },
+                    fp,
+                    ensure_ascii=False,
+                )
+
+            manager, _ = self._build_manager(tmp)
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "codex"
+            ok, error = manager.update_settings({"profiles": profiles})
+
+            self.assertTrue(ok, error)
+            restored = manager.get_settings_snapshot()["profiles"][0]
+            self.assertEqual(restored["label"], "Codex 보존")
+            self.assertFalse(restored["enabled"])
+            with open(os.path.join(config_dir, "ai_usage_settings.json"), encoding="utf-8") as fp:
+                persisted = json.load(fp)
+            self.assertEqual(
+                persisted["profiles"][0]["provider_settings"]["codex"],
+                {"label": "Codex 보존", "enabled": False},
+            )
+
+    def test_partial_profile_order_keeps_omitted_profiles_in_existing_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+
+            ok, error = manager.update_settings({"profile_order": ["account_2"]})
+
+            self.assertTrue(ok, error)
+            self.assertEqual(manager.get_settings_snapshot()["profile_order"], ["account_2", "account_1"])
 
     def test_runtime_exposes_provider_neutral_profiles_and_legacy_accounts_alias(self):
         with tempfile.TemporaryDirectory() as tmp:

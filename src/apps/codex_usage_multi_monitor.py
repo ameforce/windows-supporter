@@ -8,7 +8,7 @@ import shutil
 import stat
 import threading
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
@@ -50,6 +50,7 @@ class _AccountSettings:
     enabled: bool = True
     provider: str = "codex"
     taskbar_selected: bool = True
+    provider_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class CodexUsageMultiMonitor:
@@ -75,6 +76,10 @@ class CodexUsageMultiMonitor:
             self.__config_dir,
             "codex_usage_multi_state.json",
         )
+        self.__cleanup_state_path = os.path.join(
+            self.__config_dir,
+            "ai_usage_cleanup_state.json",
+        )
         self.__default_account_id = "account_1"
         self.__account_order = list(LEGACY_ACCOUNT_IDS)
         self.__enabled = True
@@ -97,6 +102,12 @@ class CodexUsageMultiMonitor:
                 account_id=account_id,
                 label=DEFAULT_LABELS[account_id],
                 enabled=True,
+                provider_settings={
+                    "codex": {
+                        "label": DEFAULT_LABELS[account_id],
+                        "enabled": True,
+                    }
+                },
             )
             for account_id in LEGACY_ACCOUNT_IDS
         }
@@ -123,6 +134,7 @@ class CodexUsageMultiMonitor:
                     ),
                 )
         self.__load_manager_settings(manager_settings)
+        self.__retry_pending_profile_cleanup()
         self.__account_paths = self.__build_account_paths()
         legacy_settings = self.__read_legacy_settings()
         self.__migrate_legacy_single_account_files_if_needed()
@@ -198,7 +210,13 @@ class CodexUsageMultiMonitor:
         legacy_accounts = data.get("accounts")
         raw_profiles = profiles if isinstance(profiles, list) else legacy_accounts
         candidate_settings = {
-            profile_id: replace(settings)
+            profile_id: replace(
+                settings,
+                provider_settings={
+                    provider: dict(provider_data)
+                    for provider, provider_data in settings.provider_settings.items()
+                },
+            )
             for profile_id, settings in self.__account_settings.items()
         }
         candidate_order = list(self.__ordered_account_ids())
@@ -227,18 +245,46 @@ class CodexUsageMultiMonitor:
                         enabled=True,
                         provider=provider,
                         taskbar_selected=False,
+                        provider_settings={},
                     )
                     candidate_settings[profile_id] = current
+                    provider_changed = False
+                    previous_label = current.label
+                    previous_enabled = current.enabled
                 else:
+                    previous_label = current.label
+                    previous_enabled = current.enabled
+                    current.provider_settings[current.provider] = {
+                        "label": current.label,
+                        "enabled": bool(current.enabled),
+                    }
+                    provider_changed = provider != current.provider
                     current.provider = provider
+                    if provider_changed:
+                        saved_provider = current.provider_settings.get(provider)
+                        if isinstance(saved_provider, dict):
+                            current.label = str(
+                                saved_provider.get("label")
+                                or _default_profile_label(provider, len(requested_order))
+                            )
+                            current.enabled = bool(saved_provider.get("enabled", True))
+                        else:
+                            current.label = _default_profile_label(provider, len(requested_order))
+                            current.enabled = True
                 if "label" in raw:
                     label = str(raw.get("label", "") or "").strip()
-                    if label:
+                    if label and (not provider_changed or label != previous_label):
                         current.label = label
                 if "enabled" in raw:
-                    current.enabled = bool(raw.get("enabled"))
+                    requested_enabled = bool(raw.get("enabled"))
+                    if not provider_changed or requested_enabled != previous_enabled:
+                        current.enabled = requested_enabled
                 if "taskbar_selected" in raw:
                     current.taskbar_selected = bool(raw.get("taskbar_selected"))
+                current.provider_settings[current.provider] = {
+                    "label": current.label,
+                    "enabled": bool(current.enabled),
+                }
             candidate_order = requested_order + [
                 profile_id for profile_id in candidate_order if profile_id not in seen_ids
             ]
@@ -261,10 +307,14 @@ class CodexUsageMultiMonitor:
             normalized_profile_order = [str(item or "") for item in requested_profile_order]
             if (
                 len(normalized_profile_order) != len(set(normalized_profile_order))
-                or set(normalized_profile_order) != set(candidate_settings)
+                or any(item not in candidate_settings for item in normalized_profile_order)
             ):
                 return False, "invalid_profile_order"
-            candidate_order = normalized_profile_order
+            candidate_order = normalized_profile_order + [
+                profile_id
+                for profile_id in candidate_order
+                if profile_id not in normalized_profile_order
+            ]
         else:
             normalized_profile_order = None
         if sum(bool(item.taskbar_selected) for item in candidate_settings.values()) > TASKBAR_PROFILE_LIMIT:
@@ -329,6 +379,15 @@ class CodexUsageMultiMonitor:
             enabled=True,
             provider=provider_id,
             taskbar_selected=False,
+            provider_settings={
+                provider_id: {
+                    "label": _default_profile_label(
+                        provider_id,
+                        len(self.__account_settings) + 1,
+                    ),
+                    "enabled": True,
+                }
+            },
         )
         self.__account_settings[profile_id] = settings
         self.__account_order.append(profile_id)
@@ -347,14 +406,20 @@ class CodexUsageMultiMonitor:
             return False, "invalid_profile"
         if not bool(confirmed):
             return False, "confirmation_required"
-        paths = self.__account_paths[normalized]
-        owned_roots = (
-            (paths.config_dir, self.__config_dir),
-            (
-                paths.profile_dir,
-                os.path.join(self.__local_base_dir, "windows-supporter"),
-            ),
-        )
+        local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
+        owned_roots: list[tuple[str, str]] = []
+        seen_paths: set[str] = set()
+        for provider in SUPPORTED_PROVIDERS:
+            paths = self.__build_profile_paths(normalized, provider)
+            for path, root in (
+                (paths.config_dir, self.__config_dir),
+                (paths.profile_dir, local_app_root),
+            ):
+                path_key = os.path.normcase(os.path.abspath(path))
+                if path_key in seen_paths:
+                    continue
+                seen_paths.add(path_key)
+                owned_roots.append((path, root))
         if any(not self.__is_owned_deletion_path(path, root) for path, root in owned_roots):
             return False, "unsafe_profile_path"
         child = self.__children.get(normalized)
@@ -364,23 +429,50 @@ class CodexUsageMultiMonitor:
                 shutdown()
             except Exception:
                 pass
+        quarantined: list[tuple[str, str, str]] = []
         try:
-            for path, _root in owned_roots:
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                elif os.path.exists(path):
-                    os.remove(path)
+            for path, root in owned_roots:
+                if not os.path.lexists(path):
+                    continue
+                quarantine = f"{path}.delete-{uuid.uuid4().hex}"
+                os.replace(path, quarantine)
+                quarantined.append((path, quarantine, root))
         except Exception:
+            self.__restore_quarantined_profile_paths(quarantined)
+            self.__replace_child_monitor(normalized)
             return False, "profile_delete_failed"
+        deleted_settings = replace(
+            self.__account_settings[normalized],
+            provider_settings={
+                provider: dict(provider_data)
+                for provider, provider_data in self.__account_settings[
+                    normalized
+                ].provider_settings.items()
+            },
+        )
+        deleted_paths = self.__account_paths.get(normalized)
+        previous_order = list(self.__account_order)
+        previous_default = self.__default_account_id
         self.__children.pop(normalized, None)
         self.__account_paths.pop(normalized, None)
         self.__account_settings.pop(normalized, None)
         self.__account_order = [item for item in self.__account_order if item != normalized]
         if self.__default_account_id == normalized:
             self.__default_account_id = self.__account_order[0] if self.__account_order else ""
-        self.__save_manager_settings()
+        try:
+            self.__save_manager_settings()
+        except Exception:
+            self.__account_settings[normalized] = deleted_settings
+            self.__account_order = previous_order
+            self.__default_account_id = previous_default
+            if deleted_paths is not None:
+                self.__account_paths[normalized] = deleted_paths
+            self.__restore_quarantined_profile_paths(quarantined)
+            self.__replace_child_monitor(normalized)
+            return False, "profile_delete_failed"
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
+        self.__cleanup_quarantined_profile_paths(quarantined)
         return True, None
 
     def get_runtime_status(self) -> dict[str, Any]:
@@ -823,6 +915,10 @@ class CodexUsageMultiMonitor:
             "label": account.label,
             "enabled": bool(account.enabled),
             "taskbar_selected": bool(account.taskbar_selected),
+            "provider_settings": {
+                provider: dict(provider_data)
+                for provider, provider_data in account.provider_settings.items()
+            },
             "collection_supported": bool(child_settings.get("collection_supported", True)),
             "config_dir": str(paths.config_dir),
             "settings_path": str(child_settings.get("settings_path") or paths.settings_path),
@@ -969,44 +1065,49 @@ class CodexUsageMultiMonitor:
         return ordered
 
     def __build_account_paths(self) -> dict[str, _AccountPaths]:
-        local_app_base = os.path.join(self.__local_base_dir, "windows-supporter")
         result: dict[str, _AccountPaths] = {}
         for account_id in self.__ordered_account_ids():
             provider = self.__account_settings[account_id].provider
-            if account_id in LEGACY_ACCOUNT_IDS:
-                slot_number = account_id.rsplit("_", 1)[-1]
-                if provider == "codex":
-                    config_dir = os.path.join(self.__config_dir, f"codex-account-{slot_number}")
-                    profile_dir = os.path.join(
-                        local_app_base,
-                        f"chatgpt-profile-account-{slot_number}",
-                    )
-                else:
-                    config_dir = os.path.join(self.__config_dir, f"cursor-account-{slot_number}")
-                    profile_dir = os.path.join(
-                        local_app_base,
-                        f"cursor-profile-account-{slot_number}",
-                    )
-            else:
-                config_dir = os.path.join(
-                    self.__config_dir,
-                    "ai-profiles",
-                    account_id,
-                    provider,
-                )
+            result[account_id] = self.__build_profile_paths(account_id, provider)
+        return result
+
+    def __build_profile_paths(self, account_id: str, provider: str) -> _AccountPaths:
+        normalized_id = str(account_id or "")
+        normalized_provider = str(provider or "").lower()
+        local_app_base = os.path.join(self.__local_base_dir, "windows-supporter")
+        if normalized_id in LEGACY_ACCOUNT_IDS:
+            slot_number = normalized_id.rsplit("_", 1)[-1]
+            if normalized_provider == "codex":
+                config_dir = os.path.join(self.__config_dir, f"codex-account-{slot_number}")
                 profile_dir = os.path.join(
                     local_app_base,
-                    "ai-profiles",
-                    account_id,
-                    provider,
+                    f"chatgpt-profile-account-{slot_number}",
                 )
-            result[account_id] = _AccountPaths(
-                account_id=account_id,
-                provider=provider,
-                config_dir=config_dir,
-                profile_dir=profile_dir,
+            else:
+                config_dir = os.path.join(self.__config_dir, f"cursor-account-{slot_number}")
+                profile_dir = os.path.join(
+                    local_app_base,
+                    f"cursor-profile-account-{slot_number}",
+                )
+        else:
+            config_dir = os.path.join(
+                self.__config_dir,
+                "ai-profiles",
+                normalized_id,
+                normalized_provider,
             )
-        return result
+            profile_dir = os.path.join(
+                local_app_base,
+                "ai-profiles",
+                normalized_id,
+                normalized_provider,
+            )
+        return _AccountPaths(
+            account_id=normalized_id,
+            provider=normalized_provider,
+            config_dir=config_dir,
+            profile_dir=profile_dir,
+        )
 
     def __load_manager_settings(self, data: dict | None) -> None:
         if not isinstance(data, dict):
@@ -1037,13 +1138,28 @@ class CodexUsageMultiMonitor:
             else None
         )
         if isinstance(accounts, list):
-            loaded_settings: dict[str, _AccountSettings] = {}
+            loaded_settings: dict[str, _AccountSettings] = (
+                {}
+                if is_v4
+                else {
+                    profile_id: replace(
+                        settings,
+                        provider_settings={
+                            provider: dict(provider_data)
+                            for provider, provider_data in settings.provider_settings.items()
+                        },
+                    )
+                    for profile_id, settings in self.__account_settings.items()
+                }
+            )
+            seen_loaded: set[str] = set()
             for index, raw in enumerate(accounts):
                 if not isinstance(raw, dict):
                     continue
                 account_id = str(raw.get("id", "") or "")
-                if not _is_valid_profile_id(account_id) or account_id in loaded_settings:
+                if not _is_valid_profile_id(account_id) or account_id in seen_loaded:
                     continue
+                seen_loaded.add(account_id)
                 provider = str(raw.get("provider", "codex") or "codex").lower()
                 if provider not in SUPPORTED_PROVIDERS:
                     provider = "codex"
@@ -1054,15 +1170,40 @@ class CodexUsageMultiMonitor:
                     taskbar_selected = bool(raw.get("taskbar_selected"))
                 else:
                     taskbar_selected = bool(enabled and not is_v4)
+                provider_settings = _normalize_provider_settings(raw.get("provider_settings"))
+                provider_settings.setdefault(
+                    provider,
+                    {
+                        "label": str(
+                            raw.get("label") or _default_profile_label(provider, index + 1)
+                        ),
+                        "enabled": enabled,
+                    },
+                )
                 loaded_settings[account_id] = _AccountSettings(
                     account_id=account_id,
                     label=str(raw.get("label") or _default_profile_label(provider, index + 1)),
                     enabled=enabled,
                     provider=provider,
                     taskbar_selected=taskbar_selected,
+                    provider_settings=provider_settings,
                 )
             if is_v4 or loaded_settings:
                 self.__account_settings = loaded_settings
+
+        legacy_codex_accounts = data.get("legacy_codex_accounts")
+        if isinstance(legacy_codex_accounts, list):
+            for raw in legacy_codex_accounts:
+                if not isinstance(raw, dict):
+                    continue
+                account_id = str(raw.get("id", "") or "")
+                settings = self.__account_settings.get(account_id)
+                if settings is None:
+                    continue
+                settings.provider_settings["codex"] = {
+                    "label": str(raw.get("label") or _default_profile_label("codex", 1)),
+                    "enabled": bool(raw.get("enabled", True)),
+                }
 
         account_order = data.get("profile_order", data.get("account_order"))
         if isinstance(account_order, list):
@@ -1104,6 +1245,12 @@ class CodexUsageMultiMonitor:
                 "taskbar_selected": bool(
                     self.__account_settings[account_id].taskbar_selected
                 ),
+                "provider_settings": {
+                    provider: dict(provider_data)
+                    for provider, provider_data in self.__account_settings[
+                        account_id
+                    ].provider_settings.items()
+                },
             }
             for account_id in self.__ordered_account_ids()
         ]
@@ -1192,6 +1339,99 @@ class CodexUsageMultiMonitor:
                     os.remove(temp_path)
             except Exception:
                 pass
+        return
+
+    def __restore_quarantined_profile_paths(
+        self,
+        quarantined: list[tuple[str, str, str]],
+    ) -> None:
+        for original, quarantine, _root in reversed(quarantined):
+            try:
+                if os.path.lexists(quarantine) and not os.path.lexists(original):
+                    os.replace(quarantine, original)
+            except Exception:
+                continue
+        return
+
+    def __cleanup_quarantined_profile_paths(
+        self,
+        quarantined: list[tuple[str, str, str]],
+    ) -> None:
+        pending: list[dict[str, str]] = []
+        existing = self.__read_json_file(self.__cleanup_state_path)
+        existing_paths = existing.get("paths") if isinstance(existing, dict) else None
+        if isinstance(existing_paths, list):
+            pending.extend(
+                {
+                    "path": str(raw.get("path") or ""),
+                    "root": str(raw.get("root") or ""),
+                }
+                for raw in existing_paths
+                if isinstance(raw, dict) and str(raw.get("path") or "")
+            )
+        for _original, quarantine, root in quarantined:
+            try:
+                if os.path.isdir(quarantine):
+                    shutil.rmtree(quarantine)
+                elif os.path.exists(quarantine):
+                    os.remove(quarantine)
+            except Exception:
+                pending.append({"path": quarantine, "root": root})
+        deduplicated: dict[str, dict[str, str]] = {}
+        for item in pending:
+            deduplicated[os.path.normcase(os.path.abspath(item["path"]))] = item
+        self.__persist_pending_profile_cleanup(list(deduplicated.values()))
+        return
+
+    def __retry_pending_profile_cleanup(self) -> None:
+        data = self.__read_json_file(self.__cleanup_state_path)
+        raw_paths = data.get("paths") if isinstance(data, dict) else None
+        if not isinstance(raw_paths, list):
+            return
+        allowed_roots = (
+            self.__config_dir,
+            os.path.join(self.__local_base_dir, "windows-supporter"),
+        )
+        pending: list[dict[str, str]] = []
+        for raw in raw_paths:
+            if not isinstance(raw, dict):
+                continue
+            path = str(raw.get("path") or "")
+            root = next(
+                (
+                    candidate_root
+                    for candidate_root in allowed_roots
+                    if self.__is_owned_deletion_path(path, candidate_root)
+                ),
+                "",
+            )
+            if not root:
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pending.append({"path": path, "root": root})
+        self.__persist_pending_profile_cleanup(pending)
+        return
+
+    def __persist_pending_profile_cleanup(self, pending: list[dict[str, str]]) -> None:
+        if pending:
+            self.__write_json_file(
+                self.__cleanup_state_path,
+                {
+                    "schema_version": 1,
+                    "paths": pending,
+                },
+            )
+            return
+        try:
+            if os.path.isfile(self.__cleanup_state_path):
+                os.remove(self.__cleanup_state_path)
+        except Exception:
+            pass
         return
 
     def __is_owned_deletion_path(self, path: str, root: str) -> bool:
@@ -1402,6 +1642,24 @@ def _safe_int(value: Any, fallback: int) -> int:
         return int(value)
     except Exception:
         return int(fallback)
+
+
+def _normalize_provider_settings(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for provider in SUPPORTED_PROVIDERS:
+        raw = value.get(provider)
+        if not isinstance(raw, dict):
+            continue
+        label = str(raw.get("label") or "").strip()
+        if not label:
+            continue
+        normalized[provider] = {
+            "label": label,
+            "enabled": bool(raw.get("enabled", True)),
+        }
+    return normalized
 
 
 def _is_valid_profile_id(value: str) -> bool:
