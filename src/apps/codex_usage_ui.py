@@ -42,6 +42,7 @@ class CodexUsageSettingsView:
         self._account_metric_cells = {}
         self._account_order: list[str] = []
         self._profile_deletions_inflight: set[str] = set()
+        self._profile_actions_inflight: set[str] = set()
         self._scroll_canvas = None
         self._scroll_body = None
         self._autosave_after_id = None
@@ -1149,6 +1150,8 @@ class CodexUsageSettingsView:
         if not confirmed:
             return
 
+        action_id = "__global_release__"
+        self._profile_actions_inflight.add(action_id)
         self._set_status("연결 해제 중...", level="info")
 
         def worker() -> None:
@@ -1163,6 +1166,7 @@ class CodexUsageSettingsView:
                 message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
+                self._profile_actions_inflight.discard(action_id)
                 if ok:
                     self._load_settings()
                     self._refresh_runtime_status()
@@ -1171,17 +1175,22 @@ class CodexUsageSettingsView:
                 self._set_status(message, level="error")
                 return
 
-            self._post_ui(done)
+            if not self._post_ui(done):
+                self._profile_actions_inflight.discard(action_id)
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
+            self._profile_actions_inflight.discard(action_id)
             self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
         return
 
     def _on_account_release_profile(self, account_id: str) -> None:
         if self._profile_settings_mutation_blocked():
+            return
+        normalized = str(account_id or "")
+        if not normalized:
             return
         account_label = self._account_display_label(account_id)
         tk = self._tk
@@ -1219,13 +1228,14 @@ class CodexUsageSettingsView:
             confirmed = False
         if not confirmed:
             return
+        self._profile_actions_inflight.add(normalized)
         self._set_status(f"{account_label} 연결 해제 중...", level="info")
 
         def worker() -> None:
             ok = False
             message = ""
             try:
-                ok, message = release(str(account_id))
+                ok, message = release(normalized)
             except Exception:
                 ok = False
                 message = "연결 해제 중 오류가 발생했습니다."
@@ -1233,6 +1243,7 @@ class CodexUsageSettingsView:
                 message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
+                self._profile_actions_inflight.discard(normalized)
                 if ok:
                     self._load_settings()
                     self._refresh_runtime_status()
@@ -1241,12 +1252,14 @@ class CodexUsageSettingsView:
                 self._set_status(message, level="error")
                 return
 
-            self._post_ui(done)
+            if not self._post_ui(done):
+                self._profile_actions_inflight.discard(normalized)
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
+            self._profile_actions_inflight.discard(normalized)
             self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
         return
 
@@ -1676,6 +1689,12 @@ class CodexUsageSettingsView:
         normalized = str(account_id or "")
         if not normalized:
             return
+        if self._profile_actions_inflight:
+            self._set_status(
+                "프로필 연결 작업이 진행 중이므로 삭제할 수 없습니다.",
+                level="info",
+            )
+            return
         if self._profile_deletions_inflight:
             message = (
                 "이 프로필은 이미 삭제 중입니다."
@@ -1811,7 +1830,7 @@ class CodexUsageSettingsView:
         return
 
     def _profile_settings_mutation_blocked(self) -> bool:
-        if not self._profile_deletions_inflight:
+        if not self._profile_deletions_inflight and not self._profile_actions_inflight:
             return False
         self._set_status(
             "프로필 변경 중에는 다른 AI 사용량 설정을 변경할 수 없습니다.",
@@ -2412,7 +2431,9 @@ class CodexUsageSettingsView:
     def _refresh_action_buttons(self, runtime: dict[str, Any]) -> None:
         login_button = self._login_button
         logout_button = self._logout_button
-        actions_blocked = bool(self._profile_deletions_inflight)
+        actions_blocked = bool(
+            self._profile_deletions_inflight or self._profile_actions_inflight
+        )
         try:
             can_login = bool(runtime.get("can_login", False)) and not actions_blocked
         except Exception:

@@ -1825,6 +1825,71 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(monitor.login_calls, ["account_2"])
         self.assertEqual(monitor.release_calls, ["account_1"])
 
+    def test_account_release_inflight_blocks_same_profile_delete(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.release_calls = []
+                self.delete_calls = []
+
+            def get_runtime_status(self):
+                return {
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "enabled": True,
+                            "runtime": {"can_login": False, "can_logout": True},
+                        }
+                    ]
+                }
+
+            def release_account_profile_session(self, account_id):
+                self.release_calls.append(account_id)
+                return True, "released"
+
+            def delete_profile(self, profile_id, confirmed=False):
+                self.delete_calls.append((profile_id, confirmed))
+                return True, None
+
+        class _DeferredThread:
+            targets = []
+
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self.targets.append(self._target)
+                return None
+
+        monitor = _FakeMonitor()
+        posted = []
+        statuses = []
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: posted.append(fn),
+        )
+        view._tk = object()
+        view._win = object()
+        view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
+        view._load_settings = lambda: None
+        view._refresh_runtime_status = lambda: None
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _DeferredThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_account_release_profile("account_1")
+                view._on_delete_profile("account_1", "Codex 1")
+
+        self.assertEqual(len(_DeferredThread.targets), 1)
+        self.assertEqual(monitor.delete_calls, [])
+        self.assertIn("진행 중", statuses[-1][0])
+
+        _DeferredThread.targets[0]()
+        self.assertEqual(monitor.release_calls, ["account_1"])
+        self.assertEqual(len(posted), 1)
+        posted[0]()
+        self.assertEqual(view._profile_actions_inflight, set())
+
     def test_delete_inflight_blocks_profile_query_login_and_release_actions(self) -> None:
         class _FakeMonitor:
             def __init__(self):
