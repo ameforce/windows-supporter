@@ -1828,8 +1828,11 @@ class CodexUsageMultiMonitor:
         except (OSError, ValueError):
             return False
         current = boundary
+        owned_components = [boundary]
         for part in relative.split(os.sep):
             current = os.path.join(current, part)
+            owned_components.append(current)
+        for current in owned_components:
             if not os.path.lexists(current):
                 continue
             try:

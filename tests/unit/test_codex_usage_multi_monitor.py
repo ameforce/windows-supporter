@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import stat
 import tempfile
 import threading
 import time
@@ -995,6 +996,43 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 manager,
                 "_CodexUsageMultiMonitor__build_profile_paths",
                 side_effect=unsafe_builder,
+            ):
+                ok, error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "unsafe_profile_path")
+            self.assertTrue(os.path.isfile(marker))
+            self.assertIn(profile_id, manager.get_settings_snapshot()["profile_order"])
+
+    def test_delete_profile_rejects_reparse_app_owned_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            os.makedirs(created["profile_dir"], exist_ok=True)
+            marker = os.path.join(created["profile_dir"], "keep.txt")
+            with open(marker, "w", encoding="utf-8") as fp:
+                fp.write("keep")
+            local_app_root = os.path.abspath(os.path.join(tmp, "local", "windows-supporter"))
+            real_lstat = os.lstat
+
+            def reparse_boundary_lstat(path):
+                info = real_lstat(path)
+                if os.path.normcase(os.path.abspath(path)) != os.path.normcase(local_app_root):
+                    return info
+                return type(
+                    "ReparseStat",
+                    (),
+                    {
+                        "st_mode": info.st_mode,
+                        "st_file_attributes": stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                    },
+                )()
+
+            with patch(
+                "src.apps.codex_usage_multi_monitor.os.lstat",
+                side_effect=reparse_boundary_lstat,
             ):
                 ok, error = manager.delete_profile(profile_id, confirmed=True)
 
