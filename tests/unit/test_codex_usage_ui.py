@@ -175,10 +175,13 @@ class _FakeScrollbar(_FakeWidget):
 class _FakeTtk:
     def __init__(self):
         self.buttons = []
+        self.entries = []
         self.scrollbars = []
 
     def Entry(self, *args, **kwargs):
-        return _FakeWidget(self, *args, **kwargs)
+        widget = _FakeWidget(self, *args, **kwargs)
+        self.entries.append(widget)
+        return widget
 
     def Button(self, *args, **kwargs):
         return _FakeButton(self, *args, **kwargs)
@@ -503,6 +506,38 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("Codex 2", texts)
         self.assertIn("프로필 경로: profile-1", texts)
         self.assertIn("프로필 경로: profile-2", texts)
+
+    def test_mount_hides_codex_url_when_every_profile_is_cursor(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "usage_url": "https://example.test/codex",
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+            "profiles": [
+                {
+                    "id": "account_1",
+                    "provider": "cursor",
+                    "label": "Cursor 1",
+                    "enabled": True,
+                }
+            ],
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        texts = [label.kwargs.get("text") for label in fake_tk.labels]
+        self.assertNotIn("Codex 조회 URL", texts)
+        self.assertNotIn("조회 URL", texts)
+        self.assertEqual(len(fake_ttk.entries), 2)
 
     def test_save_includes_taskbar_overlay_toggle(self) -> None:
         class _FakeMonitor:
@@ -871,6 +906,126 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         )
         self.assertEqual(monitor.payload["selected_profile_ids"], ["account_2"])
         self.assertEqual(monitor.payload["profile_order"], ["account_1", "account_2"])
+
+    def test_successful_provider_switch_remounts_provider_specific_metric_surface(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.settings = {
+                    "profiles": [
+                        {"id": "account_1", "provider": "codex", "enabled": True},
+                    ]
+                }
+
+            def get_settings_snapshot(self):
+                return self.settings
+
+            def update_settings(self, payload):
+                self.settings = {"profiles": [dict(payload["profiles"][0])]}
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._account_order = ["account_1"]
+        view._account_enabled_vars = {"account_1": _FakeVar(value=True)}
+        view._account_provider_vars = {"account_1": _FakeVar(value="cursor")}
+        view._account_taskbar_selected_vars = {"account_1": _FakeVar(value=True)}
+        view._set_status = lambda *_args, **_kwargs: None
+        remounts = []
+        view._remount = lambda: remounts.append("remounted")
+
+        self.assertTrue(view._save_settings())
+
+        self.assertEqual(remounts, ["remounted"])
+
+    def test_failed_provider_switch_reverts_selector_without_remounting_old_metrics(self) -> None:
+        class _FakeMonitor:
+            def get_settings_snapshot(self):
+                return {
+                    "profiles": [
+                        {"id": "account_1", "provider": "codex", "enabled": True},
+                    ]
+                }
+
+            def update_settings(self, _payload):
+                return False, "provider_switch_failed"
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._account_order = ["account_1"]
+        view._account_enabled_vars = {"account_1": _FakeVar(value=True)}
+        provider_var = _FakeVar(value="cursor")
+        view._account_provider_vars = {"account_1": provider_var}
+        view._account_taskbar_selected_vars = {"account_1": _FakeVar(value=True)}
+        view._set_status = lambda *_args, **_kwargs: None
+        view._load_settings = lambda: provider_var.set("codex")
+        remounts = []
+        view._remount = lambda: remounts.append("remounted")
+
+        self.assertFalse(view._save_settings())
+
+        self.assertEqual(provider_var.get(), "codex")
+        self.assertEqual(remounts, [])
+
+    def test_runtime_provider_mismatch_remounts_before_updating_old_metric_vars(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._account_rendered_providers = {"account_1": "codex"}
+        old_metric = _FakeVar(value="old codex metric")
+        view._account_metric_vars = {"account_1": {"five_hour_limit": old_metric}}
+        remounts = []
+        view._remount = lambda: remounts.append("remounted")
+
+        view._refresh_account_runtime_summaries(
+            {
+                "profiles": [
+                    {
+                        "id": "account_1",
+                        "provider": "cursor",
+                        "enabled": True,
+                        "runtime": {},
+                        "last_snapshot": {"included_usage": "80% left"},
+                        "metrics": [],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(remounts, ["remounted"])
+        self.assertEqual(old_metric.get(), "old codex metric")
+
+    def test_runtime_label_refreshes_profile_header_and_action_label(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        label_var = _FakeVar(value="Cursor fallback")
+        view._account_label_vars = {"account_1": label_var}
+        view._account_labels = {"account_1": "Cursor fallback"}
+
+        view._refresh_account_runtime_summaries(
+            {
+                "profiles": [
+                    {
+                        "id": "account_1",
+                        "provider": "cursor",
+                        "label": "Stable Cursor",
+                        "enabled": True,
+                        "runtime": {},
+                        "last_snapshot": {},
+                        "metrics": [],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(label_var.get(), "Stable Cursor")
+        self.assertEqual(view._account_labels["account_1"], "Stable Cursor")
 
     def test_account_login_and_release_call_account_specific_manager_methods(self) -> None:
         class _FakeMonitor:

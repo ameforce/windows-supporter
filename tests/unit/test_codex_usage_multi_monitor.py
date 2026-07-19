@@ -1429,6 +1429,35 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(switched["label"], "내 업무")
             self.assertFalse(switched["enabled"])
 
+    def test_provider_switch_rejects_notifications_from_replaced_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+            )
+            old_child = manager._CodexUsageMultiMonitor__children["account_1"]
+            old_sink = old_child._CodexUsageMonitor__notification_sink
+            old_sink({"text": "current-codex-event"})
+            self.assertEqual(
+                manager.pop_notification_events(),
+                [{"text": "current-codex-event"}],
+            )
+
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+
+            old_sink({"text": "stale-codex-event"})
+            self.assertEqual(manager.pop_notification_events(), [])
+            new_child = manager._CodexUsageMultiMonitor__children["account_1"]
+            new_child._notification_sink({"text": "current-cursor-event"})
+            self.assertEqual(
+                manager.pop_notification_events(),
+                [{"text": "current-cursor-event"}],
+            )
+            manager.shutdown()
+
     def test_partial_provider_switch_preserves_omitted_custom_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, _ = self._build_manager(tmp)
@@ -2123,7 +2152,12 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 persisted = json.load(fp)
             self.assertEqual(
                 persisted["profiles"][0]["provider_settings"]["codex"],
-                {"label": "Codex 보존", "enabled": False},
+                {
+                    "label": "Codex 보존",
+                    "label_mode": "auto",
+                    "custom_label": "Codex 보존",
+                    "enabled": False,
+                },
             )
 
     def test_partial_profile_order_keeps_omitted_profiles_in_existing_order(self):
@@ -2261,6 +2295,112 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             self.assertEqual(runtime["accounts"][0]["label"], "Daeng")
             self.assertEqual(runtime["accounts"][0]["configured_label"], "Codex 1")
+
+    def test_provider_scoped_label_mode_round_trips_and_controls_runtime_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0].update(
+                {
+                    "label": "내 Codex",
+                    "label_mode": "custom",
+                    "custom_label": "내 Codex",
+                }
+            )
+
+            ok, error = manager.update_settings({"profiles": profiles})
+
+            self.assertTrue(ok, error)
+            children[0].runtime["profile_name"] = "Provider Codex"
+            runtime = manager.get_runtime_status()["profiles"][0]
+            self.assertEqual(runtime["label"], "내 Codex")
+            self.assertEqual(runtime["label_mode"], "custom")
+            self.assertEqual(runtime["custom_label"], "내 Codex")
+
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0].update(
+                {
+                    "provider": "cursor",
+                    "label": "Cursor fallback",
+                    "label_mode": "auto",
+                    "custom_label": "Cursor fallback",
+                }
+            )
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            cursor_child = manager._CodexUsageMultiMonitor__children["account_1"]
+            cursor_child.runtime["profile_name"] = "Stable Cursor"
+            self.assertEqual(
+                manager.get_runtime_status()["profiles"][0]["label"],
+                "Stable Cursor",
+            )
+            cursor_child.runtime["profile_name"] = ""
+            self.assertEqual(
+                manager.get_runtime_status()["profiles"][0]["label"],
+                "Cursor fallback",
+            )
+
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "codex"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            restored = manager.get_settings_snapshot()["profiles"][0]
+            self.assertEqual(restored["label_mode"], "custom")
+            self.assertEqual(restored["custom_label"], "내 Codex")
+            with open(
+                os.path.join(tmp, "config", "ai_usage_settings.json"),
+                encoding="utf-8",
+            ) as fp:
+                persisted = json.load(fp)
+            self.assertEqual(
+                persisted["profiles"][0]["provider_settings"]["codex"]["label_mode"],
+                "custom",
+            )
+
+    def test_provider_switch_applies_explicit_label_mode_against_saved_target_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0].update(
+                {
+                    "provider": "cursor",
+                    "label": "Cursor custom",
+                    "label_mode": "custom",
+                    "custom_label": "Cursor custom",
+                }
+            )
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            self.assertEqual(
+                manager.get_settings_snapshot()["profiles"][0]["label_mode"],
+                "custom",
+            )
+
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "codex"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            self.assertEqual(
+                manager.get_settings_snapshot()["profiles"][0]["label_mode"],
+                "auto",
+            )
+
+            ok, error = manager.update_settings(
+                {
+                    "profiles": [
+                        {
+                            "id": "account_1",
+                            "provider": "cursor",
+                            "label_mode": "auto",
+                        }
+                    ]
+                }
+            )
+            self.assertTrue(ok, error)
+            self.assertEqual(
+                manager.get_settings_snapshot()["profiles"][0]["label_mode"],
+                "auto",
+            )
 
     def test_logged_out_accounts_with_stopped_browser_do_not_drive_background_scheduler(self):
         with tempfile.TemporaryDirectory() as tmp:

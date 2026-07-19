@@ -162,6 +162,8 @@ class CodexUsageMultiMonitor:
                 provider_settings={
                     "codex": {
                         "label": DEFAULT_LABELS[account_id],
+                        "label_mode": "auto",
+                        "custom_label": DEFAULT_LABELS[account_id],
                         "enabled": True,
                     }
                 },
@@ -330,6 +332,18 @@ class CodexUsageMultiMonitor:
                     previous_label = current.label
                     previous_enabled = current.enabled
                     previous_provider = current.provider
+                    previous_provider_data = current.provider_settings.get(
+                        previous_provider,
+                        {},
+                    )
+                    previous_label_mode = _normalize_label_mode(
+                        previous_provider_data.get("label_mode")
+                    )
+                    previous_custom_label = str(
+                        previous_provider_data.get("custom_label")
+                        or previous_provider_data.get("label")
+                        or previous_label
+                    ).strip()
                     profile_label_index = self.__profile_label_index(
                         profile_id,
                         previous_provider,
@@ -341,6 +355,8 @@ class CodexUsageMultiMonitor:
                     )
                     current.provider_settings[current.provider] = {
                         "label": current.label,
+                        "label_mode": previous_label_mode,
+                        "custom_label": previous_custom_label,
                         "enabled": bool(current.enabled),
                     }
                     provider_changed = provider != current.provider
@@ -351,7 +367,8 @@ class CodexUsageMultiMonitor:
                         had_saved_provider = isinstance(saved_provider, dict)
                         if isinstance(saved_provider, dict):
                             current.label = str(
-                                saved_provider.get("label")
+                                saved_provider.get("custom_label")
+                                or saved_provider.get("label")
                                 or _default_profile_label(provider, profile_label_index)
                             )
                             current.enabled = bool(saved_provider.get("enabled", True))
@@ -362,6 +379,22 @@ class CodexUsageMultiMonitor:
                                 else previous_label
                             )
                             current.enabled = previous_enabled
+                    active_provider_data = current.provider_settings.get(provider, {})
+                    active_label_mode = _normalize_label_mode(
+                        active_provider_data.get("label_mode", previous_label_mode)
+                    )
+                    active_custom_label = str(
+                        active_provider_data.get("custom_label")
+                        or active_provider_data.get("label")
+                        or current.label
+                    ).strip()
+                    if not had_saved_provider:
+                        active_label_mode = previous_label_mode
+                        active_custom_label = (
+                            current.label
+                            if previous_label_was_default
+                            else previous_custom_label
+                        )
                 if "label" in raw:
                     label = str(raw.get("label", "") or "").strip()
                     if label and (
@@ -370,6 +403,28 @@ class CodexUsageMultiMonitor:
                         or (not had_saved_provider and not previous_label_was_default)
                     ):
                         current.label = label
+                        if "custom_label" not in raw:
+                            active_custom_label = label
+                if "label_mode" in raw:
+                    requested_label_mode = _normalize_label_mode(raw.get("label_mode"))
+                    # Full snapshots carry outgoing-provider values plus the provider map.
+                    # A partial profile patch omits that map, so its top-level mode is explicit.
+                    if (
+                        not provider_changed
+                        or not had_saved_provider
+                        or requested_label_mode != previous_label_mode
+                        or "provider_settings" not in raw
+                    ):
+                        active_label_mode = requested_label_mode
+                if "custom_label" in raw:
+                    requested_custom_label = str(raw.get("custom_label") or "").strip()
+                    if requested_custom_label and (
+                        not provider_changed
+                        or requested_custom_label != previous_custom_label
+                        or (not had_saved_provider and not previous_label_was_default)
+                    ):
+                        active_custom_label = requested_custom_label
+                        current.label = requested_custom_label
                 if "enabled" in raw:
                     requested_enabled = bool(raw.get("enabled"))
                     if (
@@ -382,6 +437,8 @@ class CodexUsageMultiMonitor:
                     current.taskbar_selected = bool(raw.get("taskbar_selected"))
                 current.provider_settings[current.provider] = {
                     "label": current.label,
+                    "label_mode": active_label_mode,
+                    "custom_label": active_custom_label or current.label,
                     "enabled": bool(current.enabled),
                 }
             candidate_order = requested_order + [
@@ -654,6 +711,11 @@ class CodexUsageMultiMonitor:
             provider_settings={
                 provider_id: {
                     "label": _default_profile_label(
+                        provider_id,
+                        len(self.__account_settings) + 1,
+                    ),
+                    "label_mode": "auto",
+                    "custom_label": _default_profile_label(
                         provider_id,
                         len(self.__account_settings) + 1,
                     ),
@@ -1454,11 +1516,20 @@ class CodexUsageMultiMonitor:
         account = self.__account_settings[account_id]
         child_settings = self.__safe_child_settings(account_id)
         paths = self.__account_paths[account_id]
+        provider_settings = account.provider_settings.get(account.provider, {})
+        label_mode = _normalize_label_mode(provider_settings.get("label_mode"))
+        custom_label = str(
+            provider_settings.get("custom_label")
+            or provider_settings.get("label")
+            or account.label
+        ).strip()
         return {
             "id": account.account_id,
             "profile_id": account.account_id,
             "provider": account.provider,
             "label": account.label,
+            "label_mode": label_mode,
+            "custom_label": custom_label,
             "enabled": bool(account.enabled),
             "taskbar_selected": bool(account.taskbar_selected),
             "provider_settings": {
@@ -1475,6 +1546,13 @@ class CodexUsageMultiMonitor:
     def __build_account_runtime_entry(self, account_id: str) -> dict[str, Any]:
         account = self.__account_settings[account_id]
         runtime = self.__safe_child_runtime(account_id)
+        provider_settings = account.provider_settings.get(account.provider, {})
+        label_mode = _normalize_label_mode(provider_settings.get("label_mode"))
+        custom_label = str(
+            provider_settings.get("custom_label")
+            or provider_settings.get("label")
+            or account.label
+        ).strip()
         snapshot = self.__snapshot_to_dict(
             self.__child(account_id).get_last_snapshot(),
             provider=account.provider,
@@ -1493,6 +1571,8 @@ class CodexUsageMultiMonitor:
             "provider": account.provider,
             "label": self.__display_account_label(account, runtime),
             "configured_label": account.label,
+            "label_mode": label_mode,
+            "custom_label": custom_label,
             "enabled": bool(account.enabled),
             "taskbar_selected": bool(account.taskbar_selected),
             "freshness": freshness,
@@ -1509,12 +1589,23 @@ class CodexUsageMultiMonitor:
         }
 
     def __display_account_label(self, account: _AccountSettings, runtime: dict[str, Any]) -> str:
+        provider_settings = account.provider_settings.get(account.provider, {})
+        label_mode = _normalize_label_mode(provider_settings.get("label_mode"))
+        custom_label = str(
+            provider_settings.get("custom_label")
+            or provider_settings.get("label")
+            or account.label
+        ).strip()
         profile_name = ""
         if isinstance(runtime, dict):
             profile_name = str(runtime.get("profile_name") or "").strip()
-        if profile_name:
+        if label_mode == "auto" and profile_name:
             return profile_name
-        return str(account.label or DEFAULT_LABELS.get(account.account_id, account.account_id))
+        return str(
+            custom_label
+            or account.label
+            or DEFAULT_LABELS.get(account.account_id, account.account_id)
+        )
 
     def __safe_child_settings(self, account_id: str) -> dict[str, Any]:
         try:
@@ -1764,12 +1855,25 @@ class CodexUsageMultiMonitor:
                         "label": str(
                             raw.get("label") or _default_profile_label(provider, index + 1)
                         ),
+                        "label_mode": _normalize_label_mode(raw.get("label_mode")),
+                        "custom_label": str(
+                            raw.get("custom_label")
+                            or raw.get("label")
+                            or _default_profile_label(provider, index + 1)
+                        ),
                         "enabled": enabled,
                     },
                 )
+                active_provider_settings = provider_settings[provider]
+                active_label = str(
+                    active_provider_settings.get("custom_label")
+                    or active_provider_settings.get("label")
+                    or raw.get("label")
+                    or _default_profile_label(provider, index + 1)
+                )
                 loaded_settings[account_id] = _AccountSettings(
                     account_id=account_id,
-                    label=str(raw.get("label") or _default_profile_label(provider, index + 1)),
+                    label=active_label,
                     enabled=enabled,
                     provider=provider,
                     taskbar_selected=taskbar_selected,
@@ -1789,6 +1893,10 @@ class CodexUsageMultiMonitor:
                     continue
                 settings.provider_settings["codex"] = {
                     "label": str(raw.get("label") or _default_profile_label("codex", 1)),
+                    "label_mode": "auto",
+                    "custom_label": str(
+                        raw.get("label") or _default_profile_label("codex", 1)
+                    ),
                     "enabled": bool(raw.get("enabled", True)),
                 }
 
@@ -2588,36 +2696,61 @@ class CodexUsageMultiMonitor:
         profile_dir: str,
         profile_id: str,
     ) -> Any:
-        if str(provider or "").lower() == "cursor":
+        provider_id = str(provider or "").lower()
+        child_ref: list[Any] = []
+
+        def notification_sink(event: dict[str, Any]) -> None:
+            child = child_ref[0] if child_ref else None
+            self.__handle_child_notification(profile_id, provider_id, child, event)
+
+        if provider_id == "cursor":
             from src.apps.cursor_usage_monitor import CursorUsageMonitor
 
-            return CursorUsageMonitor(
+            child = CursorUsageMonitor(
                 config_dir=config_dir,
                 profile_dir=profile_dir,
-                notification_sink=self.__handle_child_notification,
+                notification_sink=notification_sink,
                 suppress_normal_tooltips=True,
                 unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
                 profile_id=profile_id,
             )
-        return CodexUsageMonitor(
-            config_dir=config_dir,
-            profile_dir=profile_dir,
-            managed_profile_root=os.path.join(
-                self.__local_base_dir,
-                "windows-supporter",
-            ),
-            notification_sink=self.__handle_child_notification,
-            suppress_normal_tooltips=True,
-            local_usage_provider=find_latest_windows_codex_usage,
-            unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
-        )
+        else:
+            child = CodexUsageMonitor(
+                config_dir=config_dir,
+                profile_dir=profile_dir,
+                managed_profile_root=os.path.join(
+                    self.__local_base_dir,
+                    "windows-supporter",
+                ),
+                notification_sink=notification_sink,
+                suppress_normal_tooltips=True,
+                local_usage_provider=find_latest_windows_codex_usage,
+                unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
+            )
+        child_ref.append(child)
+        return child
 
-    def __handle_child_notification(self, event: dict[str, Any]) -> None:
-        if isinstance(event, dict):
-            self.__notification_events.append(dict(event))
-            if len(self.__notification_events) > 20:
-                self.__notification_events = self.__notification_events[-20:]
-            self.__refresh_taskbar_progress()
+    def __handle_child_notification(
+        self,
+        profile_id: str,
+        provider: str,
+        child: Any,
+        event: dict[str, Any],
+    ) -> None:
+        account = self.__account_settings.get(str(profile_id or ""))
+        children = getattr(self, "_CodexUsageMultiMonitor__children", None)
+        if (
+            not isinstance(event, dict)
+            or account is None
+            or account.provider != str(provider or "").lower()
+            or not isinstance(children, dict)
+            or children.get(profile_id) is not child
+        ):
+            return
+        self.__notification_events.append(dict(event))
+        if len(self.__notification_events) > 20:
+            self.__notification_events = self.__notification_events[-20:]
+        self.__refresh_taskbar_progress()
         return
 
     def __resolve_config_dir(self, config_dir: str | None) -> str:
@@ -2659,14 +2792,20 @@ def _normalize_provider_settings(value: Any) -> dict[str, dict[str, Any]]:
         raw = value.get(provider)
         if not isinstance(raw, dict):
             continue
-        label = str(raw.get("label") or "").strip()
+        label = str(raw.get("custom_label") or raw.get("label") or "").strip()
         if not label:
             continue
         normalized[provider] = {
             "label": label,
+            "label_mode": _normalize_label_mode(raw.get("label_mode")),
+            "custom_label": label,
             "enabled": bool(raw.get("enabled", True)),
         }
     return normalized
+
+
+def _normalize_label_mode(value: Any) -> str:
+    return "custom" if str(value or "").strip().lower() == "custom" else "auto"
 
 
 def _is_valid_profile_id(value: str) -> bool:
