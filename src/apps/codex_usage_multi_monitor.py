@@ -1789,6 +1789,8 @@ class CodexUsageMultiMonitor:
         if not os.path.isfile(self.__cleanup_state_path):
             self.__recovery_pending_profile_ids.clear()
             self.__reconcile_recovery_children(previous_recovery_pending)
+            if isinstance(getattr(self, "_CodexUsageMultiMonitor__children", None), dict):
+                self.__retry_pending_settings_recovery()
             return
         pending: list[dict[str, str]] = []
         recovery_pending: set[str] = set()

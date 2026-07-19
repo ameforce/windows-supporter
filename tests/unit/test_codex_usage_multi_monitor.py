@@ -899,6 +899,14 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 {"account_1"},
             )
 
+            manager._CodexUsageMultiMonitor__retry_pending_profile_cleanup()
+
+            self.assertFalse(os.path.exists(recovery_path))
+            self.assertNotIsInstance(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                _RecoveryPendingChild,
+            )
+
     def test_failed_add_shutdown_keeps_paths_for_durable_restart_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             factory_calls = 0
