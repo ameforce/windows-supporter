@@ -154,6 +154,7 @@ class CodexUsageMultiMonitor:
         self.__active_refresh_counts: dict[str, int] = {}
         self.__blocked_refresh_profile_ids: set[str] = set()
         self.__settings_mutation_lock = threading.RLock()
+        self.__profile_lifecycle_lock = threading.RLock()
         self.__lifecycle_lock = threading.Lock()
         self.__closing = False
         self.__shutdown_complete = False
@@ -266,6 +267,10 @@ class CodexUsageMultiMonitor:
             if bool(self.__closing):
                 return bool(self.__shutdown_complete and self.__shutdown_succeeded)
             self.__closing = True
+        with self.__profile_lifecycle_lock:
+            return self.__shutdown_started()
+
+    def __shutdown_started(self) -> bool:
         with self.__settings_mutation_lock:
             self.__clear_monitor_schedule()
             with self.__refresh_condition:
@@ -342,6 +347,12 @@ class CodexUsageMultiMonitor:
     def update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
         if bool(self.__closing):
             return False, "shutdown"
+        with self.__profile_lifecycle_lock:
+            return self.__update_settings_guarded(data)
+
+    def __update_settings_guarded(self, data: dict[str, Any]) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
         with self.__settings_mutation_lock:
             if bool(self.__closing):
                 return False, "shutdown"
@@ -400,6 +411,12 @@ class CodexUsageMultiMonitor:
         return changed
 
     def toggle_enabled(self) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__profile_lifecycle_lock:
+            return self.__toggle_enabled()
+
+    def __toggle_enabled(self) -> tuple[bool, str | None]:
         if bool(self.__closing):
             return False, "shutdown"
         with self.__settings_mutation_lock:
@@ -803,6 +820,15 @@ class CodexUsageMultiMonitor:
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
         if bool(self.__closing):
             return False, "shutdown", None
+        with self.__profile_lifecycle_lock:
+            return self.__add_profile_guarded(provider)
+
+    def __add_profile_guarded(
+        self,
+        provider: str = "codex",
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        if bool(self.__closing):
+            return False, "shutdown", None
         with self.__settings_mutation_lock:
             if bool(self.__closing):
                 return False, "shutdown", None
@@ -925,6 +951,17 @@ class CodexUsageMultiMonitor:
         return True, None, self.__build_account_settings_snapshot(profile_id)
 
     def delete_profile(self, profile_id: str, *, confirmed: bool = False) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__profile_lifecycle_lock:
+            return self.__delete_profile_guarded(profile_id, confirmed=confirmed)
+
+    def __delete_profile_guarded(
+        self,
+        profile_id: str,
+        *,
+        confirmed: bool = False,
+    ) -> tuple[bool, str | None]:
         if bool(self.__closing):
             return False, "shutdown"
         with self.__settings_mutation_lock:
@@ -1213,6 +1250,12 @@ class CodexUsageMultiMonitor:
     def release_account_profile_session(self, account_id: str) -> tuple[bool, str]:
         if bool(self.__closing):
             return False, "shutdown"
+        with self.__profile_lifecycle_lock:
+            return self.__release_account_profile_session(account_id)
+
+    def __release_account_profile_session(self, account_id: str) -> tuple[bool, str]:
+        if bool(self.__closing):
+            return False, "shutdown"
         normalized = str(account_id or "")
         with self.__settings_mutation_lock:
             if bool(self.__closing):
@@ -1221,18 +1264,18 @@ class CodexUsageMultiMonitor:
             if child is None or normalized not in self.__account_settings:
                 return False, "invalid_profile"
             self.__set_profile_refresh_blocked(normalized, True)
-            try:
-                result = child.release_profile_session()
-                if bool(result[0]) and not self.__wait_for_refreshes_quiesced(
-                    profile_id=normalized
-                ):
-                    return (
-                        False,
-                        "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-                    )
-                return result
-            finally:
-                self.__set_profile_refresh_blocked(normalized, False)
+        try:
+            result = child.release_profile_session()
+            if bool(result[0]) and not self.__wait_for_refreshes_quiesced(
+                profile_id=normalized
+            ):
+                return (
+                    False,
+                    "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+            return result
+        finally:
+            self.__set_profile_refresh_blocked(normalized, False)
 
     def format_captured_at_for_display(self, value: str) -> str:
         if not self.__default_account_id:

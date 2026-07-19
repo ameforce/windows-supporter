@@ -3260,6 +3260,55 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 [{"force_refresh": True, "source": "manual_login"}],
             )
 
+    def test_account_release_does_not_hold_settings_lock_while_child_quiesces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager_ref = {}
+            refresh_started = threading.Event()
+            release_requested = threading.Event()
+            refresh_finished = threading.Event()
+
+            class _CallbackOnReleaseChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_requested.wait(1.0)
+                    manager_ref["manager"].get_runtime_status()
+                    refresh_finished.set()
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+                def release_profile_session(self):
+                    self.release_calls += 1
+                    release_requested.set()
+                    completed = refresh_finished.wait(0.2)
+                    return bool(completed), "released" if completed else "blocked"
+
+            def factory(config_dir, profile_dir):
+                return _CallbackOnReleaseChild(config_dir, profile_dir)
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager_ref["manager"] = manager
+            refresh_thread = threading.Thread(
+                target=lambda: manager.show_account_status(
+                    "account_1",
+                    force_refresh=False,
+                )
+            )
+            refresh_thread.start()
+            self.assertTrue(refresh_started.wait(1.0))
+
+            ok, message = manager.release_account_profile_session("account_1")
+            refresh_thread.join(1.0)
+
+            self.assertTrue(ok, message)
+            self.assertTrue(refresh_finished.is_set())
+            self.assertFalse(refresh_thread.is_alive())
+
     def test_runtime_snapshot_prefers_profile_name_for_account_label(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
