@@ -2185,6 +2185,70 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 retained_child,
             )
 
+    def test_delete_partial_cancel_waits_before_publishing_replacement_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+            refresh_finished = threading.Event()
+            delete_finished = threading.Event()
+            delete_result = []
+            children = []
+
+            class _PartialCancelChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_refresh.wait(2.0)
+                    refresh_finished.set()
+                    return super().show_current_status(force_refresh=force_refresh, source=source)
+
+                def request_collect_cancel(self):
+                    self.cancel_calls += 1
+                    raise RuntimeError("partial cancel")
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _PartialCancelChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            original_child = children[0]
+            manager.show_account_status("account_1")
+            self.assertTrue(refresh_started.wait(1.0))
+
+            delete_thread = threading.Thread(
+                target=lambda: (
+                    delete_result.append(
+                        manager.delete_profile("account_1", confirmed=True)
+                    ),
+                    delete_finished.set(),
+                ),
+                daemon=True,
+            )
+            delete_thread.start()
+            completed_before_release = delete_finished.wait(0.2)
+            child_before_release = manager._CodexUsageMultiMonitor__children["account_1"]
+            release_refresh.set()
+            delete_thread.join(2.0)
+
+            self.assertFalse(completed_before_release)
+            self.assertIs(child_before_release, original_child)
+            self.assertTrue(refresh_finished.is_set())
+            self.assertFalse(delete_thread.is_alive())
+            self.assertEqual(delete_result, [(False, "profile_delete_failed")])
+            self.assertIsNot(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                original_child,
+            )
+
     def test_snapshot_readers_share_provider_publish_mutation_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, _children = self._build_manager(tmp)

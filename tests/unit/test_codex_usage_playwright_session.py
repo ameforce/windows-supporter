@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import threading
+import time
 import unittest
 from typing import final
 
@@ -500,6 +501,28 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertIn("force_terminate:command_timeout", driver.calls)
         self.assertTrue(session._thread is None or not session._thread.is_alive())
         self.assertEqual(session.get_runtime_status().state, BrowserState.STOPPED)
+
+    def test_request_cancel_hard_cancels_active_owner_without_command_timeout(self) -> None:
+        release = threading.Event()
+        driver = TerminableBlockingDriver(release, wait_timeout_sec=None)
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=2.0)
+        collect_thread = threading.Thread(target=session.collect, daemon=True)
+        collect_thread.start()
+        deadline = time.monotonic() + 1.0
+        while "collect" not in driver.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("collect", driver.calls)
+
+        started = time.monotonic()
+        session.request_cancel()
+        elapsed = time.monotonic() - started
+        collect_thread.join(1.0)
+
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(collect_thread.is_alive())
+        self.assertIn("force_terminate:command_timeout", driver.calls)
+        session.shutdown()
 
     def test_concurrent_shutdown_never_reports_stopped_with_poisoned_owner_alive(self) -> None:
         collect_release = threading.Event()

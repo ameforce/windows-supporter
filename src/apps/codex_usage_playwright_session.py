@@ -108,6 +108,7 @@ class CodexUsagePlaywrightSession:
         self._recovery_request_sent: bool = False
         self._status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         self._shutdown: bool = False
+        self._cancel_requested: bool = False
         self._session_cookies: list[dict[str, Any]] = []
         self._timeout_retry_delays_sec = tuple(
             max(0.0, float(delay)) for delay in config.timeout_retry_delays_sec
@@ -127,6 +128,9 @@ class CodexUsagePlaywrightSession:
                 retry_attempt=retry_attempt,
                 retry_max=retry_max,
             )
+            with self._lock:
+                if bool(self._cancel_requested):
+                    return result
             if result.error not in _RECOVERABLE_WORKER_ERRORS:
                 return result
             recovery_error = result.error or BrowserErrorCode.COMMAND_TIMEOUT.value
@@ -189,6 +193,25 @@ class CodexUsagePlaywrightSession:
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
                 return
         _ = self._invoke(CloseSessionCommand())
+
+    def request_cancel(self) -> bool:
+        with self._lock:
+            thread = self._thread
+            self._cancel_requested = True
+            if thread is None or not thread.is_alive():
+                return True
+            queue = self._queue
+            driver = self._driver
+            self._worker_poisoned = True
+        queue.put(_CommandEnvelope(ShutdownCommand()))
+        if driver is None:
+            return True
+        hard_cancelled = self._force_terminate_driver(
+            driver,
+            reason=BrowserErrorCode.COMMAND_TIMEOUT.value,
+        )
+        self._capture_session_cookies(driver)
+        return bool(hard_cancelled)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -338,7 +361,7 @@ class CodexUsagePlaywrightSession:
         self,
     ) -> tuple[Queue[_CommandEnvelope], threading.Thread, int] | None:
         with self._lock:
-            if self._shutdown:
+            if self._shutdown or self._cancel_requested:
                 return None
             if self._thread is not None and self._thread.is_alive():
                 if self._worker_poisoned:

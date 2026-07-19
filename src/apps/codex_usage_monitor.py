@@ -1898,7 +1898,12 @@ class CodexUsageMonitor:
         return
 
     def shutdown(self) -> None:
-        self.request_collect_cancel()
+        supports_cancel = callable(
+            getattr(self.__browser_session, "request_cancel", None)
+        )
+        cancelled = self.request_collect_cancel()
+        if bool(supports_cancel or not cancelled):
+            self.__browser_session.shutdown()
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
@@ -1909,12 +1914,15 @@ class CodexUsageMonitor:
         self.__ui_thread_id = None
         return
 
-    def request_collect_cancel(self) -> None:
+    def request_collect_cancel(self) -> bool:
         self.__request_collect_cancel()
         self.__pause_background_monitor()
         self.__cancel_pending_login_poll()
+        request_cancel = getattr(self.__browser_session, "request_cancel", None)
+        if callable(request_cancel):
+            return bool(request_cancel())
         self.__browser_session.shutdown()
-        return
+        return True
 
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:
         self.__notification_sink = notification_sink if callable(notification_sink) else None

@@ -1000,6 +1000,7 @@ class CodexUsageMultiMonitor:
             self.__rollback_cancelled_profile_delete(
                 normalized,
                 transaction_id,
+                child=child,
                 recovery_was_pending=recovery_was_pending,
             )
             return False, "profile_delete_failed"
@@ -1007,6 +1008,7 @@ class CodexUsageMultiMonitor:
             self.__rollback_cancelled_profile_delete(
                 normalized,
                 transaction_id,
+                child=child,
                 recovery_was_pending=recovery_was_pending,
             )
             return False, "profile_delete_failed"
@@ -1091,12 +1093,27 @@ class CodexUsageMultiMonitor:
         profile_id: str,
         transaction_id: str,
         *,
+        child: Any | None,
         recovery_was_pending: bool,
     ) -> None:
+        shutdown = getattr(child, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                self.__track_unsettled_child(profile_id, child)
+        quiesced = self.__wait_for_refreshes_quiesced(
+            profile_id=profile_id,
+            timeout_sec=60.0,
+        )
         self.__discard_cleanup_transaction(transaction_id)
-        if not bool(recovery_was_pending):
+        if bool(quiesced) and not bool(recovery_was_pending):
             self.__complete_settings_recovery({profile_id})
-        self.__restore_child_monitor_or_mark_recovery_pending(profile_id)
+        if bool(quiesced):
+            self.__restore_child_monitor_or_mark_recovery_pending(profile_id)
+        else:
+            self.__track_unsettled_child(profile_id, child)
+            self.__mark_profile_recovery_pending(profile_id)
         self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return
@@ -1409,10 +1426,10 @@ class CodexUsageMultiMonitor:
         if not callable(request_cancel):
             return True
         try:
-            request_cancel()
+            result = request_cancel()
         except Exception:
             return False
-        return True
+        return result is not False
 
     def __dispatch_refresh_worker(self, fn, *, refresh_taskbar: bool) -> bool:
         if not callable(fn):
