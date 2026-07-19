@@ -2065,6 +2065,19 @@ class CodexUsageMonitor:
             default_parent = self.__normalize_local_path(
                 self.__lib.os.path.dirname(default)
             )
+            relative = self.__lib.os.path.relpath(target, default_parent)
+            relative_parts = [
+                part.lower()
+                for part in relative.replace("\\", "/").split("/")
+                if part
+            ]
+            if (
+                len(relative_parts) == 3
+                and relative_parts[0] == "ai-profiles"
+                and re.fullmatch(r"profile_[0-9a-f]{32}", relative_parts[1])
+                and relative_parts[2] == "codex"
+            ):
+                return True
             parent = self.__lib.os.path.basename(parent_dir)
             allowed_leafs = {
                 "chatgpt-profile",

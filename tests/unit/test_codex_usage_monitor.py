@@ -232,6 +232,31 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(events, ["close_session", "clear_profile"])
 
+    def test_logout_removes_dynamic_app_owned_profile_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = os.path.join(
+                tmp,
+                "windows-supporter",
+                "ai-profiles",
+                f"profile_{'a' * 32}",
+                "codex",
+            )
+            os.makedirs(profile_dir, exist_ok=True)
+            with open(os.path.join(profile_dir, "marker.txt"), "w", encoding="utf-8") as fp:
+                fp.write("managed")
+            session = self._BrowserSession()
+            with patch.dict(os.environ, {"LOCALAPPDATA": tmp}):
+                monitor = CodexUsageMonitor(
+                    config_dir=os.path.join(tmp, "config"),
+                    profile_dir=profile_dir,
+                    browser_session_factory=lambda _config: session,
+                )
+
+            ok, message = monitor.release_profile_session()
+
+            self.assertTrue(ok, message)
+            self.assertFalse(os.path.exists(profile_dir))
+
     def test_pending_login_timeout_closes_headed_session_after_fifteen_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session = self._BrowserSession()

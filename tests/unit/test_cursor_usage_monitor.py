@@ -533,6 +533,31 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(monitor.get_last_snapshot().state, UsageState.LOGGED_OUT)
             self.assertEqual(monitor.get_runtime_status()["session_state"], "logged_out")
 
+    def test_release_removes_dynamic_app_owned_profile_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            profile_id = f"profile_{'b' * 32}"
+            profile_dir = (
+                Path(tmp)
+                / "windows-supporter"
+                / "ai-profiles"
+                / profile_id
+                / "cursor"
+            )
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "marker.txt").write_text("managed", encoding="utf-8")
+            monitor = CursorUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                profile_id=profile_id,
+                browser_session_factory=lambda _config: self._Session([]),
+            )
+
+            ok, message = monitor.release_profile_session()
+
+            self.assertTrue(ok, message)
+            self.assertFalse(profile_dir.exists())
+
     def test_release_rejects_profile_outside_windows_supporter_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             profile_dir = Path(tmp) / "external-browser-profile"

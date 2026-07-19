@@ -643,9 +643,17 @@ class CursorUsageMonitor:
             current = head
         basename = os.path.basename(profile_dir).lower()
         parent_basename = os.path.basename(os.path.dirname(profile_dir)).lower()
+        grandparent_dir = os.path.dirname(os.path.dirname(profile_dir))
+        great_grandparent_dir = os.path.dirname(grandparent_dir)
+        dynamic_managed = (
+            basename == "cursor"
+            and re.fullmatch(r"profile_[0-9a-f]{32}", parent_basename) is not None
+            and os.path.basename(grandparent_dir).lower() == "ai-profiles"
+            and os.path.basename(great_grandparent_dir).lower() == "windows-supporter"
+        )
         managed_name = basename.startswith("cursor-profile-") or (
             parent_basename == "cursor-usage-profiles" and bool(basename)
-        )
+        ) or dynamic_managed
         if "windows-supporter" not in components or not managed_name:
             return False, "Windows Supporter가 관리하는 Cursor 전용 프로필만 연결 해제할 수 있습니다."
         if not os.path.isdir(profile_dir):
