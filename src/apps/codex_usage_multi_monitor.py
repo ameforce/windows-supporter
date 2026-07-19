@@ -99,8 +99,8 @@ class _RecoveryPendingChild:
     def request_collect_cancel(self) -> None:
         return None
 
-    def shutdown(self) -> None:
-        return None
+    def shutdown(self) -> bool:
+        return True
 
 
 class CodexUsageMultiMonitor:
@@ -280,12 +280,7 @@ class CodexUsageMultiMonitor:
             if self.__request_child_collect_cancel(child):
                 continue
             cancel_request_failed = True
-            shutdown = getattr(child, "shutdown", None)
-            if not callable(shutdown):
-                continue
-            try:
-                shutdown()
-            except Exception:
+            if not self.__shutdown_child(child):
                 continue
             pre_shutdown_child_ids.add(id(child))
         self.__wait_for_refreshes_quiesced(
@@ -294,12 +289,7 @@ class CodexUsageMultiMonitor:
         for child in shutdown_children:
             if id(child) in pre_shutdown_child_ids:
                 continue
-            shutdown = getattr(child, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    pass
+            self.__shutdown_child(child)
         with self.__settings_mutation_lock:
             self.__root = None
             self.__event_queue = None
@@ -731,13 +721,9 @@ class CodexUsageMultiMonitor:
                         updater(rollback)
                     except Exception:
                         pass
-                shutdown = getattr(child, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception:
-                        self.__track_unsettled_child(profile_id, child)
-                        rollback_failed_ids.add(profile_id)
+                if not self.__shutdown_child(child):
+                    self.__track_unsettled_child(profile_id, child)
+                    rollback_failed_ids.add(profile_id)
             rollback_failed_ids.update(
                 profile_id
                 for profile_id in transaction_recovery_ids
@@ -767,22 +753,14 @@ class CodexUsageMultiMonitor:
             self.__children[profile_id] = child
         provider_shutdown_failed_ids: set[str] = set()
         for profile_id, old_child in old_children.items():
-            shutdown = getattr(old_child, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    self.__track_unsettled_child(profile_id, old_child)
-                    provider_shutdown_failed_ids.add(profile_id)
-                    replacement = self.__children.get(profile_id)
-                    shutdown_replacement = getattr(replacement, "shutdown", None)
-                    if callable(shutdown_replacement):
-                        try:
-                            shutdown_replacement()
-                        except Exception:
-                            self.__track_unsettled_child(profile_id, replacement)
-                    paths = self.__account_paths[profile_id]
-                    self.__children[profile_id] = _RecoveryPendingChild(paths)
+            if not self.__shutdown_child(old_child):
+                self.__track_unsettled_child(profile_id, old_child)
+                provider_shutdown_failed_ids.add(profile_id)
+                replacement = self.__children.get(profile_id)
+                if not self.__shutdown_child(replacement):
+                    self.__track_unsettled_child(profile_id, replacement)
+                paths = self.__account_paths[profile_id]
+                self.__children[profile_id] = _RecoveryPendingChild(paths)
         self.__complete_settings_recovery(
             set(transaction_recovery_ids)
             - preexisting_recovery_ids
@@ -892,13 +870,10 @@ class CodexUsageMultiMonitor:
                 default_account_id=candidate_default,
             )
         except Exception:
-            shutdown_succeeded = not bool(self.__unsettled_children.get(profile_id))
-            shutdown = getattr(staged_child, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    shutdown_succeeded = False
+            shutdown_succeeded = bool(
+                not self.__unsettled_children.get(profile_id)
+                and self.__shutdown_child(staged_child)
+            )
             if shutdown_succeeded:
                 self.__cleanup_failed_add_paths(
                     profile_id,
@@ -1012,25 +987,21 @@ class CodexUsageMultiMonitor:
                 recovery_was_pending=recovery_was_pending,
             )
             return False, "profile_delete_failed"
-        shutdown = getattr(child, "shutdown", None)
-        if callable(shutdown):
-            try:
-                shutdown()
-            except Exception:
-                self.__discard_cleanup_transaction(transaction_id)
-                if child is not None:
-                    self.__track_unsettled_child(normalized, child)
-                paths = self.__account_paths.get(normalized)
-                if paths is not None:
-                    recovery_child = _RecoveryPendingChild(paths)
-                    self.__children[normalized] = recovery_child
-                    if self.__root is not None:
-                        self.__attach_child(
-                            recovery_child,
-                            self.__root,
-                            self.__event_queue,
-                        )
-                return False, "profile_delete_failed"
+        if not self.__shutdown_child(child):
+            self.__discard_cleanup_transaction(transaction_id)
+            if child is not None:
+                self.__track_unsettled_child(normalized, child)
+            paths = self.__account_paths.get(normalized)
+            if paths is not None:
+                recovery_child = _RecoveryPendingChild(paths)
+                self.__children[normalized] = recovery_child
+                if self.__root is not None:
+                    self.__attach_child(
+                        recovery_child,
+                        self.__root,
+                        self.__event_queue,
+                    )
+            return False, "profile_delete_failed"
         if not recovery_was_pending:
             self.__complete_settings_recovery({normalized})
         quarantined: list[dict[str, Any]] = []
@@ -1096,15 +1067,9 @@ class CodexUsageMultiMonitor:
         child: Any | None,
         recovery_was_pending: bool,
     ) -> None:
-        shutdown_succeeded = child is None
-        shutdown = getattr(child, "shutdown", None)
-        if callable(shutdown):
-            try:
-                result = shutdown()
-            except Exception:
-                self.__track_unsettled_child(profile_id, child)
-            else:
-                shutdown_succeeded = result is not False
+        shutdown_succeeded = self.__shutdown_child(child)
+        if not shutdown_succeeded:
+            self.__track_unsettled_child(profile_id, child)
         quiesced = self.__wait_for_refreshes_quiesced(
             profile_id=profile_id,
             timeout_sec=60.0,
@@ -1266,18 +1231,23 @@ class CodexUsageMultiMonitor:
             tracked.append(child)
         return
 
+    def __shutdown_child(self, child: Any | None) -> bool:
+        if child is None:
+            return True
+        shutdown = getattr(child, "shutdown", None)
+        if not callable(shutdown):
+            return False
+        try:
+            return shutdown() is True
+        except Exception:
+            return False
+
     def __shutdown_unsettled_children(self, profile_id: str) -> bool:
         normalized = str(profile_id or "")
         unsettled = self.__unsettled_children.get(normalized, [])
         remaining: list[Any] = []
         for child in unsettled:
-            shutdown = getattr(child, "shutdown", None)
-            if not callable(shutdown):
-                remaining.append(child)
-                continue
-            try:
-                shutdown()
-            except Exception:
+            if not self.__shutdown_child(child):
                 remaining.append(child)
         if remaining:
             self.__unsettled_children[normalized] = remaining
@@ -2506,12 +2476,8 @@ class CodexUsageMultiMonitor:
             self.__recovery_pending_profile_ids.add(normalized)
             return
         old_child = self.__children.get(normalized)
-        shutdown = getattr(old_child, "shutdown", None)
-        if callable(shutdown):
-            try:
-                shutdown()
-            except Exception:
-                self.__track_unsettled_child(normalized, old_child)
+        if not self.__shutdown_child(old_child):
+            self.__track_unsettled_child(normalized, old_child)
         self.__recovery_pending_profile_ids.add(normalized)
         child = _RecoveryPendingChild(paths)
         self.__account_paths[normalized] = paths
@@ -2637,12 +2603,8 @@ class CodexUsageMultiMonitor:
                     usage_url=self.__usage_url,
                 )
             except Exception:
-                shutdown = getattr(child, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception:
-                        self.__track_unsettled_child(profile_id, child)
+                if not self.__shutdown_child(child):
+                    self.__track_unsettled_child(profile_id, child)
                 self.__children[profile_id] = _RecoveryPendingChild(paths)
                 continue
             self.__settings_recovery_profile_ids.discard(profile_id)
@@ -2924,14 +2886,15 @@ class CodexUsageMultiMonitor:
             account_id,
             self.__account_settings[account_id],
         )
+        if not self.__shutdown_child(old_child):
+            self.__track_unsettled_child(account_id, old_child)
+            if not self.__shutdown_child(child):
+                self.__track_unsettled_child(account_id, child)
+            self.__account_paths[account_id] = paths
+            self.__children[account_id] = _RecoveryPendingChild(paths)
+            raise RuntimeError("old child shutdown was not confirmed")
         self.__account_paths[account_id] = paths
         self.__children[account_id] = child
-        shutdown_old = getattr(old_child, "shutdown", None)
-        if callable(shutdown_old):
-            try:
-                shutdown_old()
-            except Exception:
-                pass
         return
 
     def __replace_child_after_failed_settings_rollback(
@@ -2962,12 +2925,8 @@ class CodexUsageMultiMonitor:
                 usage_url=usage_url,
             )
         except Exception:
-            shutdown_replacement = getattr(replacement_child, "shutdown", None)
-            if callable(shutdown_replacement):
-                try:
-                    shutdown_replacement()
-                except Exception:
-                    pass
+            if not self.__shutdown_child(replacement_child):
+                self.__track_unsettled_child(account_id, replacement_child)
             replacement_paths = original_paths
             replacement_child = _RecoveryPendingChild(original_paths)
             if self.__root is not None:
@@ -2975,27 +2934,19 @@ class CodexUsageMultiMonitor:
             recovered = False
         else:
             recovered = True
-        shutdown_original = getattr(original_child, "shutdown", None)
-        if callable(shutdown_original):
-            try:
-                shutdown_original()
-            except Exception:
-                self.__track_unsettled_child(account_id, original_child)
-                shutdown_replacement = getattr(replacement_child, "shutdown", None)
-                if callable(shutdown_replacement):
-                    try:
-                        shutdown_replacement()
-                    except Exception:
-                        self.__track_unsettled_child(account_id, replacement_child)
-                replacement_paths = original_paths
-                replacement_child = _RecoveryPendingChild(original_paths)
-                if self.__root is not None:
-                    self.__attach_child(
-                        replacement_child,
-                        self.__root,
-                        self.__event_queue,
-                    )
-                recovered = False
+        if not self.__shutdown_child(original_child):
+            self.__track_unsettled_child(account_id, original_child)
+            if not self.__shutdown_child(replacement_child):
+                self.__track_unsettled_child(account_id, replacement_child)
+            replacement_paths = original_paths
+            replacement_child = _RecoveryPendingChild(original_paths)
+            if self.__root is not None:
+                self.__attach_child(
+                    replacement_child,
+                    self.__root,
+                    self.__event_queue,
+                )
+            recovered = False
         self.__account_paths[account_id] = replacement_paths
         self.__children[account_id] = replacement_child
         return recovered
@@ -3021,12 +2972,8 @@ class CodexUsageMultiMonitor:
             if self.__root is not None:
                 self.__attach_child(child, self.__root, self.__event_queue)
         except Exception:
-            shutdown_new = getattr(child, "shutdown", None)
-            if callable(shutdown_new):
-                try:
-                    shutdown_new()
-                except Exception:
-                    self.__track_unsettled_child(account_id, child)
+            if not self.__shutdown_child(child):
+                self.__track_unsettled_child(account_id, child)
             raise
         return paths, child
 

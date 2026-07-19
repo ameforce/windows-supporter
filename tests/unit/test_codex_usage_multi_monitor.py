@@ -86,7 +86,7 @@ class _FakeChildMonitor:
 
     def shutdown(self):
         self.shutdown_calls += 1
-        return None
+        return True
 
     def request_collect_cancel(self):
         self.cancel_calls += 1
@@ -2313,6 +2313,39 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 _RecoveryPendingChild,
             )
             self.assertEqual(len(children), 2)
+
+    def test_delete_unknown_shutdown_result_publishes_recovery_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            children = []
+
+            class _UnknownShutdownChild(_FakeChildMonitor):
+                def shutdown(self):
+                    self.shutdown_calls += 1
+                    return None
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _UnknownShutdownChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+
+            result = manager.delete_profile("account_1", confirmed=True)
+
+            self.assertEqual(result, (False, "profile_delete_failed"))
+            self.assertIsInstance(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                _RecoveryPendingChild,
+            )
+            self.assertIn("account_1", manager.get_settings_snapshot()["profile_order"])
 
     def test_snapshot_readers_share_provider_publish_mutation_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:

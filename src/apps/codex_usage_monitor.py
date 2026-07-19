@@ -1897,13 +1897,14 @@ class CodexUsageMonitor:
         self.__clear_monitor_schedule()
         return
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         supports_cancel = callable(
             getattr(self.__browser_session, "request_cancel", None)
         )
         cancelled = self.request_collect_cancel()
+        shutdown_succeeded = bool(cancelled)
         if bool(supports_cancel or not cancelled):
-            self.__browser_session.shutdown()
+            shutdown_succeeded = self.__browser_session.shutdown() is True
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
@@ -1912,7 +1913,7 @@ class CodexUsageMonitor:
         self.__root = None
         self.__event_queue = None
         self.__ui_thread_id = None
-        return
+        return bool(cancelled and shutdown_succeeded)
 
     def request_collect_cancel(self) -> bool:
         self.__request_collect_cancel()
@@ -1921,8 +1922,7 @@ class CodexUsageMonitor:
         request_cancel = getattr(self.__browser_session, "request_cancel", None)
         if callable(request_cancel):
             return bool(request_cancel())
-        self.__browser_session.shutdown()
-        return True
+        return self.__browser_session.shutdown() is True
 
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:
         self.__notification_sink = notification_sink if callable(notification_sink) else None

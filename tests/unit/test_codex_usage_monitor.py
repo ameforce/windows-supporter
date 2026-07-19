@@ -51,8 +51,9 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         def close_session(self) -> None:
             self.calls.append("close_session")
 
-        def shutdown(self) -> None:
+        def shutdown(self) -> bool:
             self.calls.append("shutdown")
+            return True
 
         def get_runtime_status(self) -> BrowserRuntimeStatus:
             return self.status
@@ -62,8 +63,9 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.shutdown_calls = 0
 
-            def shutdown(self) -> None:
+            def shutdown(self) -> bool:
                 self.shutdown_calls += 1
+                return True
 
         with tempfile.TemporaryDirectory() as tmp:
             session = _BrowserSession()
@@ -97,9 +99,10 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             def close_session(self) -> None:
                 return None
 
-            def shutdown(self) -> None:
+            def shutdown(self) -> bool:
                 self.shutdown_calls += 1
                 self.collect_release.set()
+                return True
 
             def get_runtime_status(self) -> BrowserRuntimeStatus:
                 return BrowserRuntimeStatus(BrowserState.HEADLESS_READY, False, "")

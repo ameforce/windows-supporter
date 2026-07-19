@@ -663,8 +663,9 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         collect_thread.start()
         self.assertTrue(terminate_started.wait(1.0))
 
-        session.shutdown()
+        shutdown_result = session.shutdown()
 
+        self.assertIs(shutdown_result, False)
         self.assertEqual(session.get_runtime_status().state, BrowserState.FAILED)
         self.assertTrue(collect_thread.is_alive())
         terminate_release.set()

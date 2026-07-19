@@ -50,8 +50,9 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         def close_session(self) -> None:
             self.calls.append("close_session")
 
-        def shutdown(self) -> None:
+        def shutdown(self) -> bool:
             self.calls.append("shutdown")
+            return True
 
         def get_runtime_status(self) -> BrowserRuntimeStatus:
             return self.status

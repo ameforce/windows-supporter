@@ -162,7 +162,7 @@ class _BrowserSession(Protocol):
     def poll_login(self) -> BrowserOperationResult: ...
     def close_session(self) -> None: ...
     def request_cancel(self) -> bool: ...
-    def shutdown(self) -> None: ...
+    def shutdown(self) -> bool: ...
     def get_runtime_status(self) -> BrowserRuntimeStatus: ...
 
 
@@ -193,10 +193,11 @@ class _LazyCursorBrowserSession:
         if session is not None:
             session.close_session()
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         session = self._session
-        if session is not None:
-            session.shutdown()
+        if session is None:
+            return True
+        return session.shutdown() is True
 
     def request_cancel(self) -> bool:
         session = self._session
@@ -205,8 +206,7 @@ class _LazyCursorBrowserSession:
         request_cancel = getattr(session, "request_cancel", None)
         if callable(request_cancel):
             return bool(request_cancel())
-        session.shutdown()
-        return True
+        return session.shutdown() is True
 
     def get_runtime_status(self) -> BrowserRuntimeStatus:
         session = self._session
@@ -516,21 +516,22 @@ class CursorUsageMonitor:
         self._event_queue = event_queue
         self._external_scheduler = not bool(start_monitor)
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         supports_cancel = callable(getattr(self._session, "request_cancel", None))
         cancelled = self.request_collect_cancel()
+        shutdown_succeeded = bool(cancelled)
         if bool(supports_cancel or not cancelled):
-            self._session.shutdown()
+            shutdown_succeeded = self._session.shutdown() is True
         self._root = None
         self._event_queue = None
+        return bool(cancelled and shutdown_succeeded)
 
     def request_collect_cancel(self) -> bool:
         self._stop_login_poll()
         request_cancel = getattr(self._session, "request_cancel", None)
         if callable(request_cancel):
             return bool(request_cancel())
-        self._session.shutdown()
-        return True
+        return self._session.shutdown() is True
 
     def collect(self, *, force: bool = False) -> AiUsageReading:
         now = self._clock()

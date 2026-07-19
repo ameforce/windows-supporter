@@ -215,15 +215,15 @@ class CodexUsagePlaywrightSession:
         self._capture_session_cookies(driver)
         return bool(hard_cancelled)
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         with self._lock:
             thread = self._thread
             if thread is None:
                 self._shutdown = True
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
-                return
+                return True
             if self._shutdown:
-                return
+                return bool(not thread.is_alive())
             self._shutdown = True
             poisoned = bool(self._worker_poisoned)
         if poisoned:
@@ -236,10 +236,10 @@ class CodexUsagePlaywrightSession:
                         False,
                         BrowserErrorCode.COMMAND_TIMEOUT.value,
                     )
-                return
+                return False
             with self._lock:
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
-            return
+            return True
         envelope = _CommandEnvelope(ShutdownCommand())
         self._queue.put(envelope)
         completed = envelope.completed.wait(self._config.command_timeout_sec)
@@ -264,11 +264,17 @@ class CodexUsagePlaywrightSession:
                         False,
                         BrowserErrorCode.COMMAND_TIMEOUT.value,
                     )
-                return
+                return False
         else:
             thread.join(self._timeout_recovery_grace_sec)
+        terminated = bool(not thread.is_alive())
         with self._lock:
-            self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
+            self._status = BrowserRuntimeStatus(
+                BrowserState.STOPPED if terminated else BrowserState.FAILED,
+                False,
+                "" if terminated else BrowserErrorCode.COMMAND_TIMEOUT.value,
+            )
+        return terminated
 
     def get_runtime_status(self) -> BrowserRuntimeStatus:
         with self._lock:
