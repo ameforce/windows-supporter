@@ -3216,6 +3216,50 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(update_results, [(True, None)])
             self.assertEqual(children[0].shutdown_calls, 1)
 
+    def test_account_release_does_not_terminally_cancel_reconnectable_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            children = []
+
+            class _ReconnectableChild(_FakeChildMonitor):
+                def __init__(self, config_dir, profile_dir):
+                    super().__init__(config_dir, profile_dir)
+                    self.terminal = False
+
+                def request_collect_cancel(self):
+                    self.cancel_calls += 1
+                    self.terminal = True
+                    return True
+
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    if self.terminal:
+                        return None
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+            def factory(config_dir, profile_dir):
+                child = _ReconnectableChild(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+
+            ok, message = manager.release_account_profile_session("account_1")
+            manager.login_account("account_1")
+
+            self.assertTrue(ok, message)
+            self.assertFalse(children[0].terminal)
+            self.assertEqual(children[0].cancel_calls, 0)
+            self.assertEqual(
+                children[0].show_calls,
+                [{"force_refresh": True, "source": "manual_login"}],
+            )
+
     def test_runtime_snapshot_prefers_profile_name_for_account_label(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)

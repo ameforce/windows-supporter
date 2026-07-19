@@ -1222,17 +1222,15 @@ class CodexUsageMultiMonitor:
                 return False, "invalid_profile"
             self.__set_profile_refresh_blocked(normalized, True)
             try:
-                if not self.__request_child_collect_cancel(child):
+                result = child.release_profile_session()
+                if bool(result[0]) and not self.__wait_for_refreshes_quiesced(
+                    profile_id=normalized
+                ):
                     return (
                         False,
                         "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
                     )
-                if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
-                    return (
-                        False,
-                        "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-                    )
-                return child.release_profile_session()
+                return result
             finally:
                 self.__set_profile_refresh_blocked(normalized, False)
 
