@@ -696,6 +696,99 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(original.shutdown_calls, 0)
             self.assertEqual(factory_calls, 3)
 
+    def test_failed_rollback_shutdown_is_tracked_and_keeps_recovery_wal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            factory_calls = 0
+
+            class _OriginalChild(_FakeChildMonitor):
+                def update_settings(self, data):
+                    self.update_calls.append(dict(data))
+                    if len(self.update_calls) >= 2 and bool(data.get("enabled")):
+                        return False, "rollback_rejected"
+                    self.runtime["enabled"] = bool(data.get("enabled", True))
+                    return True, None
+
+                def shutdown(self):
+                    raise RuntimeError("original still alive")
+
+            def factory(config_dir, profile_dir):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls == 1:
+                    return _OriginalChild(config_dir, profile_dir)
+                return _FakeChildMonitor(config_dir, profile_dir)
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__save_manager_settings",
+                side_effect=OSError("disk full"),
+            ):
+                ok, error = manager.update_settings({"enabled": False})
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            self.assertIsInstance(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                _RecoveryPendingChild,
+            )
+            self.assertEqual(
+                len(manager._CodexUsageMultiMonitor__unsettled_children["account_1"]),
+                1,
+            )
+            with open(
+                os.path.join(tmp, "config", "ai_usage_settings_recovery.json"),
+                encoding="utf-8",
+            ) as fp:
+                self.assertIn("account_1", json.load(fp)["profile_ids"])
+
+    def test_provider_switch_shutdown_failure_publishes_recovery_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            factory_calls = 0
+
+            class _UnstoppableCodexChild(_FakeChildMonitor):
+                def shutdown(self):
+                    raise RuntimeError("codex child still alive")
+
+            def factory(provider, config_dir, profile_dir):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls == 1:
+                    return _UnstoppableCodexChild(config_dir, profile_dir)
+                child = _FakeChildMonitor(config_dir, profile_dir)
+                child.provider = provider
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+
+            ok, error = manager.update_settings({"profiles": profiles})
+
+            self.assertTrue(ok, error)
+            self.assertEqual(manager.get_settings_snapshot()["profiles"][0]["provider"], "cursor")
+            self.assertIsInstance(
+                manager._CodexUsageMultiMonitor__children["account_1"],
+                _RecoveryPendingChild,
+            )
+            self.assertEqual(
+                len(manager._CodexUsageMultiMonitor__unsettled_children["account_1"]),
+                1,
+            )
+            with open(
+                os.path.join(tmp, "config", "ai_usage_settings_recovery.json"),
+                encoding="utf-8",
+            ) as fp:
+                self.assertIn("account_1", json.load(fp)["profile_ids"])
+
     def test_save_failure_replaces_child_when_canonical_rollback_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             children = []
@@ -971,6 +1064,48 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             self.assertFalse(os.path.exists(child.config_dir))
             self.assertFalse(os.path.exists(child.profile_dir))
+            self.assertFalse(
+                os.path.exists(os.path.join(tmp, "config", "ai_usage_cleanup_state.json"))
+            )
+
+    def test_add_crash_recovery_preserves_preexisting_opaque_profile_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            fixed_hex = "a" * 32
+            profile_id = f"profile_{fixed_hex}"
+            planned = manager._CodexUsageMultiMonitor__build_profile_paths(profile_id, "codex")
+            for path in (planned.config_dir, planned.profile_dir):
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, "preexisting.txt"), "w", encoding="utf-8") as fp:
+                    fp.write("keep")
+            original_persist = manager._CodexUsageMultiMonitor__persist_pending_profile_cleanup
+
+            def persist_then_crash(pending):
+                original_persist(pending)
+                raise KeyboardInterrupt("simulated crash")
+
+            fixed_uuid = type("FixedUuid", (), {"hex": fixed_hex})()
+            with patch(
+                "src.apps.codex_usage_multi_monitor.uuid.uuid4",
+                return_value=fixed_uuid,
+            ), patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__persist_pending_profile_cleanup",
+                side_effect=persist_then_crash,
+            ), self.assertRaises(KeyboardInterrupt):
+                manager.add_profile("codex")
+
+            CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=lambda config_dir, profile_dir: _FakeChildMonitor(
+                    config_dir,
+                    profile_dir,
+                ),
+            )
+
+            self.assertTrue(os.path.isfile(os.path.join(planned.config_dir, "preexisting.txt")))
+            self.assertTrue(os.path.isfile(os.path.join(planned.profile_dir, "preexisting.txt")))
             self.assertFalse(
                 os.path.exists(os.path.join(tmp, "config", "ai_usage_cleanup_state.json"))
             )
@@ -1393,6 +1528,14 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 recovery_child.get_runtime_status()["monitor_state"],
                 "recovery_pending",
             )
+            self.assertTrue(os.path.isfile(os.path.join(created["config_dir"], "keep.txt")))
+            self.assertTrue(os.path.isfile(os.path.join(created["profile_dir"], "keep.txt")))
+
+            retry_ok, retry_error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertFalse(retry_ok)
+            self.assertEqual(retry_error, "profile_delete_failed")
+            self.assertIn(profile_id, manager.get_settings_snapshot()["profile_order"])
             self.assertTrue(os.path.isfile(os.path.join(created["config_dir"], "keep.txt")))
             self.assertTrue(os.path.isfile(os.path.join(created["profile_dir"], "keep.txt")))
             self.assertFalse(

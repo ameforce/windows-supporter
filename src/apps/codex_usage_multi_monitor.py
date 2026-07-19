@@ -138,7 +138,7 @@ class CodexUsageMultiMonitor:
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__refresh_inflight = False
         self.__refresh_lock = threading.Lock()
-        self.__unsettled_children: list[Any] = []
+        self.__unsettled_children: dict[str, list[Any]] = {}
         self.__deferred_cleanup_transaction_ids: set[str] = set()
         self.__root = None
         self.__event_queue = None
@@ -232,8 +232,15 @@ class CodexUsageMultiMonitor:
 
     def shutdown(self) -> None:
         self.__clear_monitor_schedule()
-        shutdown_children = [*self.__children.values(), *self.__unsettled_children]
-        self.__unsettled_children = []
+        shutdown_children = [
+            *self.__children.values(),
+            *[
+                child
+                for children in self.__unsettled_children.values()
+                for child in children
+            ],
+        ]
+        self.__unsettled_children = {}
         for child in shutdown_children:
             shutdown = getattr(child, "shutdown", None)
             if callable(shutdown):
@@ -466,9 +473,22 @@ class CodexUsageMultiMonitor:
             for profile_id in candidate_order
             if profile_id not in changed_providers
         ]
+        transaction_recovery_ids = list(candidate_order)
+        if any(
+            not self.__shutdown_unsettled_children(profile_id)
+            for profile_id in transaction_recovery_ids
+        ):
+            return False, "settings_save_failed"
+        self.__retry_pending_settings_recovery()
+        if any(
+            profile_id in self.__settings_recovery_profile_ids
+            and isinstance(self.__children.get(profile_id), _RecoveryPendingChild)
+            for profile_id in transaction_recovery_ids
+        ):
+            return False, "settings_save_failed"
         preexisting_recovery_ids = set(self.__settings_recovery_profile_ids)
         try:
-            self.__prepare_settings_recovery(existing_update_ids)
+            self.__prepare_settings_recovery(transaction_recovery_ids)
             for profile_id in changed_providers:
                 staged_children[profile_id] = self.__stage_child_monitor(
                     profile_id,
@@ -550,9 +570,10 @@ class CodexUsageMultiMonitor:
                     try:
                         shutdown()
                     except Exception:
-                        pass
+                        self.__track_unsettled_child(profile_id, child)
+                        rollback_failed_ids.add(profile_id)
             clear_ids = (
-                set(existing_update_ids)
+                set(transaction_recovery_ids)
                 - preexisting_recovery_ids
                 - rollback_failed_ids
             )
@@ -573,15 +594,28 @@ class CodexUsageMultiMonitor:
         for profile_id, (paths, child) in staged_children.items():
             self.__account_paths[profile_id] = paths
             self.__children[profile_id] = child
+        provider_shutdown_failed_ids: set[str] = set()
         for profile_id, old_child in old_children.items():
             shutdown = getattr(old_child, "shutdown", None)
             if callable(shutdown):
                 try:
                     shutdown()
                 except Exception:
-                    pass
+                    self.__track_unsettled_child(profile_id, old_child)
+                    provider_shutdown_failed_ids.add(profile_id)
+                    replacement = self.__children.get(profile_id)
+                    shutdown_replacement = getattr(replacement, "shutdown", None)
+                    if callable(shutdown_replacement):
+                        try:
+                            shutdown_replacement()
+                        except Exception:
+                            self.__track_unsettled_child(profile_id, replacement)
+                    paths = self.__account_paths[profile_id]
+                    self.__children[profile_id] = _RecoveryPendingChild(paths)
         self.__complete_settings_recovery(
-            set(existing_update_ids) - preexisting_recovery_ids
+            set(transaction_recovery_ids)
+            - preexisting_recovery_ids
+            - provider_shutdown_failed_ids
         )
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
@@ -618,6 +652,10 @@ class CodexUsageMultiMonitor:
         candidate_order = [*self.__account_order, profile_id]
         candidate_default = self.__default_account_id or profile_id
         planned_paths = self.__build_profile_paths(profile_id, provider_id)
+        path_existed_before = {
+            os.path.normcase(os.path.abspath(path)): os.path.lexists(path)
+            for path in (planned_paths.config_dir, planned_paths.profile_dir)
+        }
         add_transaction_id = uuid.uuid4().hex
         local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
         add_cleanup_entries = [
@@ -629,6 +667,9 @@ class CodexUsageMultiMonitor:
                 "original": path,
                 "path": f"{path}.delete-{uuid.uuid4().hex}",
                 "root": root,
+                "delete_original": not path_existed_before[
+                    os.path.normcase(os.path.abspath(path))
+                ],
             }
             for path_kind, path, root in (
                 ("config", planned_paths.config_dir, self.__config_dir),
@@ -646,10 +687,6 @@ class CodexUsageMultiMonitor:
             )
         except Exception:
             return False, "profile_add_failed", None
-        path_existed_before = {
-            os.path.normcase(os.path.abspath(path)): os.path.lexists(path)
-            for path in (planned_paths.config_dir, planned_paths.profile_dir)
-        }
         staged_paths = None
         staged_child = None
         try:
@@ -684,7 +721,7 @@ class CodexUsageMultiMonitor:
                 )
                 self.__discard_cleanup_transaction(add_transaction_id)
             elif staged_child is not None:
-                self.__unsettled_children.append(staged_child)
+                self.__track_unsettled_child(profile_id, staged_child)
                 self.__deferred_cleanup_transaction_ids.add(add_transaction_id)
             return False, "profile_add_failed", None
         self.__account_settings = candidate_settings
@@ -703,9 +740,11 @@ class CodexUsageMultiMonitor:
             return False, "invalid_profile"
         if not bool(confirmed):
             return False, "confirmation_required"
+        if not self.__shutdown_unsettled_children(normalized):
+            return False, "profile_delete_failed"
         local_app_root = os.path.join(self.__local_base_dir, "windows-supporter")
         transaction_id = uuid.uuid4().hex
-        deletion_entries: list[dict[str, str]] = []
+        deletion_entries: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
         for provider in SUPPORTED_PROVIDERS:
             paths = self.__build_profile_paths(normalized, provider)
@@ -726,6 +765,7 @@ class CodexUsageMultiMonitor:
                         "original": path,
                         "path": f"{path}.delete-{uuid.uuid4().hex}",
                         "root": root,
+                        "delete_original": True,
                     }
                 )
         if any(
@@ -753,7 +793,7 @@ class CodexUsageMultiMonitor:
             except Exception:
                 self.__discard_cleanup_transaction(transaction_id)
                 if child is not None:
-                    self.__unsettled_children.append(child)
+                    self.__track_unsettled_child(normalized, child)
                 paths = self.__account_paths.get(normalized)
                 if paths is not None:
                     recovery_child = _RecoveryPendingChild(paths)
@@ -767,7 +807,7 @@ class CodexUsageMultiMonitor:
                 return False, "profile_delete_failed"
         if not recovery_was_pending:
             self.__complete_settings_recovery({normalized})
-        quarantined: list[dict[str, str]] = []
+        quarantined: list[dict[str, Any]] = []
         try:
             for entry in deletion_entries:
                 path = entry["original"]
@@ -945,6 +985,33 @@ class CodexUsageMultiMonitor:
             return
         attach(root, event_queue)
         return
+
+    def __track_unsettled_child(self, profile_id: str, child: Any) -> None:
+        if child is None:
+            return
+        tracked = self.__unsettled_children.setdefault(str(profile_id or ""), [])
+        if all(existing is not child for existing in tracked):
+            tracked.append(child)
+        return
+
+    def __shutdown_unsettled_children(self, profile_id: str) -> bool:
+        normalized = str(profile_id or "")
+        unsettled = self.__unsettled_children.get(normalized, [])
+        remaining: list[Any] = []
+        for child in unsettled:
+            shutdown = getattr(child, "shutdown", None)
+            if not callable(shutdown):
+                remaining.append(child)
+                continue
+            try:
+                shutdown()
+            except Exception:
+                remaining.append(child)
+        if remaining:
+            self.__unsettled_children[normalized] = remaining
+            return False
+        self.__unsettled_children.pop(normalized, None)
+        return True
 
     def __call_supports_keyword(self, fn: Any, keyword: str) -> bool:
         try:
@@ -1757,7 +1824,7 @@ class CodexUsageMultiMonitor:
 
     def __restore_quarantined_profile_paths(
         self,
-        quarantined: list[dict[str, str]],
+        quarantined: list[dict[str, Any]],
     ) -> bool:
         restored = True
         for entry in reversed(quarantined):
@@ -1773,7 +1840,7 @@ class CodexUsageMultiMonitor:
                 restored = False
         return restored
 
-    def __read_valid_cleanup_entries(self) -> list[dict[str, str]]:
+    def __read_valid_cleanup_entries(self) -> list[dict[str, Any]]:
         data = self.__read_json_file(self.__cleanup_state_path)
         raw_paths = data.get("paths") if isinstance(data, dict) else None
         if not isinstance(raw_paths, list):
@@ -1792,7 +1859,7 @@ class CodexUsageMultiMonitor:
             if isinstance(getattr(self, "_CodexUsageMultiMonitor__children", None), dict):
                 self.__retry_pending_settings_recovery()
             return
-        pending: list[dict[str, str]] = []
+        pending: list[dict[str, Any]] = []
         recovery_pending: set[str] = set()
         for entry in self.__read_valid_cleanup_entries():
             path = entry["path"]
@@ -1808,7 +1875,10 @@ class CodexUsageMultiMonitor:
                         pending.append(entry)
                         recovery_pending.add(entry["profile_id"])
                     continue
-                for candidate in (original, path):
+                cleanup_candidates = [path]
+                if bool(entry.get("delete_original", True)):
+                    cleanup_candidates.insert(0, original)
+                for candidate in cleanup_candidates:
                     if os.path.isdir(candidate):
                         shutil.rmtree(candidate)
                     elif os.path.lexists(candidate):
@@ -1957,9 +2027,20 @@ class CodexUsageMultiMonitor:
                 continue
             if (
                 profile_id in self.__recovery_pending_profile_ids
-                or isinstance(child, _RecoveryPendingChild)
+                or bool(self.__unsettled_children.get(profile_id))
             ):
                 continue
+            if isinstance(child, _RecoveryPendingChild):
+                try:
+                    replacement_paths, replacement_child = self.__stage_child_monitor(
+                        profile_id,
+                        account,
+                    )
+                except Exception:
+                    continue
+                self.__account_paths[profile_id] = replacement_paths
+                self.__children[profile_id] = replacement_child
+                child = replacement_child
             try:
                 self.__apply_child_settings(
                     child,
@@ -1975,7 +2056,7 @@ class CodexUsageMultiMonitor:
                     try:
                         shutdown()
                     except Exception:
-                        pass
+                        self.__track_unsettled_child(profile_id, child)
                 self.__children[profile_id] = _RecoveryPendingChild(paths)
                 continue
             self.__settings_recovery_profile_ids.discard(profile_id)
@@ -1985,7 +2066,7 @@ class CodexUsageMultiMonitor:
             pass
         return
 
-    def __normalize_cleanup_entry(self, raw: Any) -> dict[str, str] | None:
+    def __normalize_cleanup_entry(self, raw: Any) -> dict[str, Any] | None:
         if not isinstance(raw, dict):
             return None
         transaction_id = str(raw.get("transaction_id") or "")
@@ -1994,11 +2075,13 @@ class CodexUsageMultiMonitor:
         path_kind = str(raw.get("path_kind") or "").lower()
         original = os.path.abspath(str(raw.get("original") or ""))
         quarantine = os.path.abspath(str(raw.get("path") or ""))
+        delete_original = raw.get("delete_original", True)
         if (
             re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None
             or not _is_valid_profile_id(profile_id)
             or provider not in SUPPORTED_PROVIDERS
             or path_kind not in {"config", "profile"}
+            or not isinstance(delete_original, bool)
         ):
             return None
         paths = self.__build_profile_paths(profile_id, provider)
@@ -2025,9 +2108,10 @@ class CodexUsageMultiMonitor:
             "original": os.path.abspath(expected_original),
             "path": quarantine,
             "root": os.path.abspath(expected_root),
+            "delete_original": delete_original,
         }
 
-    def __persist_pending_profile_cleanup(self, pending: list[dict[str, str]]) -> None:
+    def __persist_pending_profile_cleanup(self, pending: list[dict[str, Any]]) -> None:
         if pending:
             self.__write_json_file(
                 self.__cleanup_state_path,
@@ -2286,14 +2370,29 @@ class CodexUsageMultiMonitor:
             recovered = False
         else:
             recovered = True
-        self.__account_paths[account_id] = replacement_paths
-        self.__children[account_id] = replacement_child
         shutdown_original = getattr(original_child, "shutdown", None)
         if callable(shutdown_original):
             try:
                 shutdown_original()
             except Exception:
-                pass
+                self.__track_unsettled_child(account_id, original_child)
+                shutdown_replacement = getattr(replacement_child, "shutdown", None)
+                if callable(shutdown_replacement):
+                    try:
+                        shutdown_replacement()
+                    except Exception:
+                        self.__track_unsettled_child(account_id, replacement_child)
+                replacement_paths = original_paths
+                replacement_child = _RecoveryPendingChild(original_paths)
+                if self.__root is not None:
+                    self.__attach_child(
+                        replacement_child,
+                        self.__root,
+                        self.__event_queue,
+                    )
+                recovered = False
+        self.__account_paths[account_id] = replacement_paths
+        self.__children[account_id] = replacement_child
         return recovered
 
     def __stage_child_monitor(
