@@ -185,6 +185,20 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual([child.shutdown_calls for child in children], [1, 1])
             self.assertIsNone(manager._CodexUsageMultiMonitor__monitor_after_id)
 
+    def test_manager_preserves_date_only_reset_before_default_child_formatter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].format_reset_at_for_display = (
+                lambda value, key="": f"{value} 00:00:00 (invented by {key})"
+            )
+
+            rendered = manager.format_reset_at_for_display(
+                "2026-08-13",
+                key="billing_reset_at",
+            )
+
+            self.assertEqual(rendered, "2026-08-13")
+
     def test_settings_snapshot_creates_two_isolated_accounts_and_migrates_legacy_files_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = os.path.join(tmp, "config")
@@ -2155,6 +2169,48 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(runtime["profiles"][0]["profile_id"], "account_1")
             self.assertTrue(runtime["profiles"][0]["taskbar_selected"])
             self.assertEqual(runtime["profiles"][0]["metrics"][0]["key"], "five_hour_limit")
+
+    def test_runtime_omits_unreported_codex_five_hour_and_uses_limit_reset_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].last_snapshot.update(
+                {
+                    "five_hour_limit": "",
+                    "weekly_limit": "80%",
+                    "weekly_limit_reset_at": "2026-07-20T10:00:00+09:00",
+                }
+            )
+
+            metrics = manager.get_runtime_status()["profiles"][0]["metrics"]
+
+            self.assertEqual([item["key"] for item in metrics], ["weekly_limit"])
+            self.assertEqual(metrics[0]["reset_at"], "2026-07-20T10:00:00+09:00")
+            self.assertEqual(metrics[0]["reset_precision"], "datetime")
+
+    def test_cursor_metrics_omit_disabled_on_demand_and_separate_full_compact_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            cursor_child = children[-1]
+            cursor_child.last_snapshot = {
+                "state": "ready",
+                "included_remaining_percent": 100,
+                "included_usage": "US$0 / US$20",
+                "billing_reset_at": "2026-08-13",
+                "reset_precision": "date",
+                "on_demand_enabled": False,
+                "on_demand_status": "OFF",
+            }
+
+            metrics = manager.get_runtime_status()["profiles"][0]["metrics"]
+
+            self.assertEqual([item["key"] for item in metrics], ["included_usage"])
+            self.assertEqual(metrics[0]["value_text"], "US$0 / US$20")
+            self.assertEqual(metrics[0]["short_value_text"], "100%")
+            self.assertEqual(metrics[0]["reset_precision"], "date")
 
     def test_runtime_snapshot_aggregates_enabled_accounts_and_routes_account_actions(self):
         with tempfile.TemporaryDirectory() as tmp:

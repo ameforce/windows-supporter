@@ -98,6 +98,33 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertEqual(reading.reset_at, "2026-08-01T00:00:00Z")
         self.assertEqual(reading.to_dict()["included_usage"], "$12.50 / $20.00")
 
+    def test_collector_normalizes_korean_date_reset_at_provider_boundary(self) -> None:
+        session = self._Session(
+            [
+                BrowserOperationResult(
+                    probe=self._probe(
+                        "Included usage: US$0 / US$20\n"
+                        "Reset: 2026년 8월 13일\n"
+                        "On-demand usage: OFF"
+                    )
+                )
+            ]
+        )
+        monitor = CursorUsageMonitor(
+            profile_id="cursor-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        reading = monitor.collect()
+
+        self.assertEqual(reading.reset_at, "2026-08-13")
+        self.assertEqual(reading.reset_precision, "date")
+        self.assertFalse(reading.on_demand_enabled)
+        self.assertEqual(
+            monitor.format_reset_at_for_display(reading.reset_at, "billing_reset_at"),
+            "2026-08-13",
+        )
+
     def test_low_frequency_collection_reuses_fresh_reading(self) -> None:
         now = [datetime(2026, 7, 18, 10, 0, tzinfo=timezone.utc)]
         session = self._Session(
@@ -490,7 +517,10 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertNotIn("private@example.invalid", state_text)
             self.assertNotIn("probe", state_text.lower())
             self.assertNotIn("cookie", state_text.lower())
-            self.assertEqual(json.loads(state_text)["included_used"], "US$0")
+            state_payload = json.loads(state_text)
+            self.assertEqual(state_payload["included_used"], "US$0")
+            self.assertEqual(state_payload["reset_at"], "2026-08-13")
+            self.assertEqual(state_payload["reset_precision"], "date")
 
             restored = CursorUsageMonitor(
                 config_dir=str(config_dir),
@@ -502,6 +532,7 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(fresh.state, UsageState.READY)
             self.assertEqual(cached.state, UsageState.STALE)
             self.assertEqual(cached.to_dict()["included_usage"], "US$0 / US$20")
+            self.assertEqual(cached.reset_precision, "date")
             self.assertEqual(restored.get_settings_snapshot()["interval_sec"], 420.0)
             self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["provider"], "cursor")
 

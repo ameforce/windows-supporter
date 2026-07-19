@@ -37,6 +37,7 @@ class CodexUsageSettingsView:
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
         self._account_metric_display_vars = {}
+        self._account_metric_cells = {}
         self._account_order: list[str] = []
         self._autosave_after_id = None
         self._loading_settings = False
@@ -98,6 +99,7 @@ class CodexUsageSettingsView:
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
         self._account_metric_display_vars = {}
+        self._account_metric_cells = {}
         self._account_provider_vars = {}
         self._account_taskbar_selected_vars = {}
 
@@ -509,6 +511,7 @@ class CodexUsageSettingsView:
                 metric_grid,
                 card_bg,
                 provider=provider,
+                account_id=account_id,
             )
             self._account_metric_vars[account_id] = metric_vars
             self._account_metric_display_vars[account_id] = display_vars
@@ -656,6 +659,7 @@ class CodexUsageSettingsView:
         bg: str,
         *,
         provider: str = "codex",
+        account_id: str = "",
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         tk = self._tk
         if tk is None:
@@ -688,7 +692,9 @@ class CodexUsageSettingsView:
                 metric_vars[key] = value_var
                 display_vars[key] = display_var
                 self._bind_metric_display_value(label, value_var, display_var)
-                self._add_metric_cell(parent, row_index, column, display_var, bg)
+                cell = self._add_metric_cell(parent, row_index, column, display_var, bg)
+                if account_id and cell is not None:
+                    self._account_metric_cells.setdefault(account_id, {})[key] = cell
         return metric_vars, display_vars
 
     def _bind_metric_display_value(self, label: str, value_var: Any, display_var: Any) -> None:
@@ -717,12 +723,12 @@ class CodexUsageSettingsView:
         column: int,
         display_var: Any,
         bg: str,
-    ) -> None:
+    ) -> Any:
         tk = self._tk
         if tk is None:
-            return
+            return None
         padx = (0, 8) if int(column) == 0 else (8, 0)
-        tk.Label(
+        cell = tk.Label(
             parent,
             textvariable=display_var,
             bg=bg,
@@ -731,8 +737,9 @@ class CodexUsageSettingsView:
             anchor="w",
             justify="left",
             wraplength=180,
-        ).grid(row=row, column=column, sticky="we", padx=padx, pady=1)
-        return
+        )
+        cell.grid(row=row, column=column, sticky="we", padx=padx, pady=1)
+        return cell
 
     def _add_value_row(
         self,
@@ -1591,6 +1598,7 @@ class CodexUsageSettingsView:
             if isinstance(metric_vars, dict):
                 payload = self._snapshot_payload_from_any(raw.get("last_snapshot"))
                 descriptors = raw.get("metrics")
+                descriptor_keys: set[str] = set()
                 if isinstance(descriptors, list):
                     for descriptor in descriptors:
                         if not isinstance(descriptor, dict):
@@ -1598,9 +1606,16 @@ class CodexUsageSettingsView:
                         key = str(descriptor.get("key") or "")
                         if not key:
                             continue
+                        descriptor_keys.add(key)
                         payload.setdefault(key, descriptor.get("value_text", ""))
                         if key == "included_usage":
                             payload.setdefault("billing_reset_at", descriptor.get("reset_at", ""))
+                self._update_account_metric_visibility(
+                    account_id,
+                    provider=str(raw.get("provider") or "codex"),
+                    descriptor_keys=descriptor_keys,
+                    payload=payload,
+                )
                 for key, value_var in metric_vars.items():
                     try:
                         value_var.set(self._format_account_metric_value(key, payload))
@@ -1628,6 +1643,46 @@ class CodexUsageSettingsView:
                     value_var.set("-")
                 except Exception:
                     pass
+        return
+
+    def _update_account_metric_visibility(
+        self,
+        account_id: str,
+        *,
+        provider: str,
+        descriptor_keys: set[str],
+        payload: dict[str, Any],
+    ) -> None:
+        cells = self._account_metric_cells.get(str(account_id or ""), {})
+        if not isinstance(cells, dict):
+            return
+        visibility: dict[str, bool] = {}
+        if str(provider or "").lower() == "cursor":
+            on_demand_visible = (
+                "on_demand" in descriptor_keys
+                or payload.get("on_demand_enabled") is not False
+                and bool(str(payload.get("on_demand_status") or "").strip())
+            )
+            visibility["on_demand_status"] = bool(on_demand_visible)
+        else:
+            five_hour_visible = (
+                "five_hour_limit" in descriptor_keys
+                or bool(str(payload.get("five_hour_limit") or "").strip())
+            )
+            visibility["five_hour_limit"] = bool(five_hour_visible)
+            visibility["five_hour_limit_reset_at"] = bool(five_hour_visible)
+        for key, visible in visibility.items():
+            cell = cells.get(key)
+            if cell is None:
+                continue
+            try:
+                if visible:
+                    cell.grid()
+                else:
+                    cell.grid_remove()
+            except Exception:
+                pass
+        return
 
     def _start_runtime_refresh(self) -> None:
         self._stop_runtime_refresh()

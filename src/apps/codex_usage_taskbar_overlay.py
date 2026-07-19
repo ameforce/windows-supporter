@@ -602,15 +602,6 @@ def _visible_metrics_for_taskbar_bar(bar: dict[str, Any]) -> tuple[dict[str, Any
         for metric in bar_dict.get("metrics", [])
         if isinstance(metric, dict)
     ]
-    if not metrics:
-        metrics = [
-            {
-                "key": "5h",
-                "percent": int(bar_dict.get("percent") or 0),
-                "value_text": str(bar_dict.get("value_text") or "--"),
-                "color": str(bar_dict.get("color") or "#6b7280"),
-            }
-        ]
     return tuple(metrics[:2])
 
 
@@ -4394,16 +4385,19 @@ def _build_provider_metric(
     if reset_at is None:
         reset_at = descriptor.get("reset_at_value", descriptor.get("reset", ""))
     descriptor_captured_at = descriptor.get("captured_at", captured_at_value)
+    reset_precision = str(descriptor.get("reset_precision") or "").strip().lower()
     metric = _build_metric(
         key=metric_key,
         short_label=short_label,
         raw_value="" if percent is None else f"{int(percent)}%",
         reset_at_value=reset_at,
+        reset_precision=reset_precision,
         captured_at_value=descriptor_captured_at,
         account_state=account_state,
         now=now,
     )
     explicit_value_text = descriptor.get("value_text")
+    explicit_short_value_text = descriptor.get("short_value_text")
     explicit_state = str(descriptor.get("state") or "").strip()
     explicit_color = str(descriptor.get("color") or "").strip()
     metric.update(
@@ -4418,11 +4412,19 @@ def _build_provider_metric(
             "short_label": short_label,
             "percent": percent,
             "value_text": (
+                str(explicit_short_value_text)
+                if explicit_short_value_text is not None
+                else str(explicit_value_text)
+                if explicit_value_text is not None
+                else str(metric.get("value_text") or "--")
+            ),
+            "detail_value_text": (
                 str(explicit_value_text)
                 if explicit_value_text is not None
                 else str(metric.get("value_text") or "--")
             ),
             "reset_at": str(reset_at or ""),
+            "reset_precision": reset_precision,
         }
     )
     if explicit_state:
@@ -4438,6 +4440,7 @@ def _build_metric(
     short_label: str,
     raw_value: Any,
     reset_at_value: Any = "",
+    reset_precision: str = "",
     captured_at_value: Any = "",
     account_state: str,
     now: datetime | None = None,
@@ -4448,6 +4451,7 @@ def _build_metric(
         reset_at_value,
         metric_key=key,
         percent=percent,
+        reset_precision=reset_precision,
         now=now,
     )
     snapshot_reset_direction = _snapshot_reset_direction(
@@ -4578,6 +4582,7 @@ def _build_reset_info(
     *,
     metric_key: str,
     percent: int | None,
+    reset_precision: str = "",
     now: datetime | None = None,
 ) -> dict[str, str]:
     parsed = _parse_reset_datetime(value)
@@ -4592,9 +4597,27 @@ def _build_reset_info(
             "marker": profile["marker"],
         }
     current = _reset_now(parsed, now)
+    precision = str(reset_precision or "").strip().lower()
+    if precision == "date":
+        days = max(0, (parsed.date() - current.date()).days)
+        text = f"D-{days}"
+        direction = _reset_action_direction(metric_key, percent, days * 86400)
+        profile = _reset_direction_profile(direction)
+        return {
+            "text": text,
+            "short_text": text,
+            "state": profile["state"],
+            "color": profile["color"],
+            "direction": profile["direction"],
+            "marker": profile["marker"],
+        }
     seconds = int((parsed - current).total_seconds())
     if seconds <= 0:
-        text = _format_reset_remaining_detail(0, metric_key=metric_key)
+        text = _format_reset_remaining_detail(
+            0,
+            metric_key=metric_key,
+            reset_precision=precision,
+        )
         if str(metric_key or "") == "five_hour_limit":
             direction = (
                 _RESET_DIRECTION_SURPLUS
@@ -4627,8 +4650,16 @@ def _build_reset_info(
     direction = _reset_action_direction(metric_key, percent, seconds)
     profile = _reset_direction_profile(direction)
     return {
-        "text": _format_reset_remaining_detail(seconds, metric_key=metric_key),
-        "short_text": _format_reset_remaining_compact(seconds, metric_key=metric_key),
+        "text": _format_reset_remaining_detail(
+            seconds,
+            metric_key=metric_key,
+            reset_precision=precision,
+        ),
+        "short_text": _format_reset_remaining_compact(
+            seconds,
+            metric_key=metric_key,
+            reset_precision=precision,
+        ),
         "state": profile["state"],
         "color": profile["color"],
         "direction": profile["direction"],
@@ -4665,20 +4696,35 @@ def _current_overlay_datetime() -> datetime:
     return datetime.now().astimezone()
 
 
-def _format_reset_remaining_detail(seconds: int, *, metric_key: str = "") -> str:
+def _format_reset_remaining_detail(
+    seconds: int,
+    *,
+    metric_key: str = "",
+    reset_precision: str = "",
+) -> str:
     seconds = max(0, int(seconds))
     total_minutes = max(0, (seconds + 59) // 60)
     days = int(total_minutes // 1440)
     hours = int((total_minutes % 1440) // 60)
     minutes = int(total_minutes % 60)
-    if str(metric_key or "") == "five_hour_limit":
+    precision = str(reset_precision or "").strip().lower()
+    if str(metric_key or "") == "five_hour_limit" or precision == "datetime":
         total_hours = int(total_minutes // 60)
         return f"{total_hours:02d}h {minutes:02d}m"
     return f"{days}d {hours:02d}h {minutes:02d}m"
 
 
-def _format_reset_remaining_compact(seconds: int, *, metric_key: str = "") -> str:
-    return _format_reset_remaining_detail(seconds, metric_key=metric_key)
+def _format_reset_remaining_compact(
+    seconds: int,
+    *,
+    metric_key: str = "",
+    reset_precision: str = "",
+) -> str:
+    return _format_reset_remaining_detail(
+        seconds,
+        metric_key=metric_key,
+        reset_precision=reset_precision,
+    )
 
 
 def _display_reset_text_for_width(

@@ -12,6 +12,7 @@ class _FakeLabel:
         self.pack_kwargs = {}
         self.grid_kwargs = {}
         self.bind_calls = []
+        self.grid_remove_calls = 0
         owner.labels.append(self)
 
     def pack(self, **kwargs):
@@ -19,7 +20,12 @@ class _FakeLabel:
         return None
 
     def grid(self, **kwargs):
-        self.grid_kwargs = dict(kwargs)
+        if kwargs:
+            self.grid_kwargs = dict(kwargs)
+        return None
+
+    def grid_remove(self):
+        self.grid_remove_calls += 1
         return None
 
     def bind(self, event, callback):
@@ -182,6 +188,37 @@ class _FakeTtk:
 
 
 class CodexUsageUiUnitTest(unittest.TestCase):
+    def test_metric_presence_hides_unreported_codex_five_hour_and_disabled_cursor_od(self) -> None:
+        fake_tk = _FakeTk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        codex_value = _FakeLabel(fake_tk)
+        codex_reset = _FakeLabel(fake_tk)
+        cursor_od = _FakeLabel(fake_tk)
+        view._account_metric_cells = {
+            "codex-1": {
+                "five_hour_limit": codex_value,
+                "five_hour_limit_reset_at": codex_reset,
+            },
+            "cursor-1": {"on_demand_status": cursor_od},
+        }
+
+        view._update_account_metric_visibility(
+            "codex-1",
+            provider="codex",
+            descriptor_keys={"weekly_limit"},
+            payload={"weekly_limit": "80%"},
+        )
+        view._update_account_metric_visibility(
+            "cursor-1",
+            provider="cursor",
+            descriptor_keys={"included_usage"},
+            payload={"on_demand_enabled": False, "on_demand_status": "OFF"},
+        )
+
+        self.assertEqual(codex_value.grid_remove_calls, 1)
+        self.assertEqual(codex_reset.grid_remove_calls, 1)
+        self.assertEqual(cursor_od.grid_remove_calls, 1)
+
     def test_runtime_refresh_keeps_only_one_scheduled_callback(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         win = _FakeWidget()

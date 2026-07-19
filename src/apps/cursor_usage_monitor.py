@@ -717,6 +717,9 @@ class CursorUsageMonitor:
 
     def format_reset_at_for_display(self, value: str, key: str = "") -> str:
         _ = key
+        normalized = str(value or "").strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return normalized
         return self._format_timestamp(value)
 
     def _reading_from_result(
@@ -780,6 +783,7 @@ class CursorUsageMonitor:
                 captured_at=captured_at,
                 last_success_at=prior.last_success_at,
                 reset_at=prior.reset_at,
+                reset_precision=prior.reset_precision,
                 on_demand_enabled=prior.on_demand_enabled,
                 last_error_state=state,
             )
@@ -917,6 +921,7 @@ class CursorUsageMonitor:
                 captured_at=_iso_now(self._clock),
                 last_success_at=str(data.get("captured_at") or ""),
                 reset_at=str(data.get("reset_at") or ""),
+                reset_precision=str(data.get("reset_precision") or ""),
                 on_demand_enabled=(
                     data.get("on_demand_enabled")
                     if isinstance(data.get("on_demand_enabled"), bool)
@@ -947,6 +952,7 @@ class CursorUsageMonitor:
                     "included_limit": reading.included_limit,
                     "captured_at": reading.last_success_at or reading.captured_at,
                     "reset_at": reading.reset_at,
+                    "reset_precision": reading.reset_precision,
                     "on_demand_enabled": reading.on_demand_enabled,
                 },
             )
