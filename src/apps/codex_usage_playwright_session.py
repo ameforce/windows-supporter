@@ -210,6 +210,8 @@ class CodexUsagePlaywrightSession:
             driver,
             reason=BrowserErrorCode.COMMAND_TIMEOUT.value,
         )
+        if bool(hard_cancelled):
+            self._shutdown_driver(driver)
         self._capture_session_cookies(driver)
         return bool(hard_cancelled)
 
@@ -301,7 +303,20 @@ class CodexUsagePlaywrightSession:
             retry_attempt=retry_attempt,
             retry_max=retry_max,
         )
-        queue.put(envelope)
+        with self._lock:
+            cancelled = bool(self._cancel_requested)
+            worker_changed = bool(
+                generation != self._worker_generation or thread is not self._thread
+            )
+            if self._shutdown or cancelled or worker_changed:
+                return BrowserOperationResult(
+                    error=(
+                        BrowserErrorCode.COMMAND_TIMEOUT.value
+                        if cancelled
+                        else BrowserErrorCode.COLLECT_FAILED.value
+                    )
+                )
+            queue.put(envelope)
         timeout_sec = self._command_timeout_sec(command)
         if not envelope.completed.wait(timeout_sec):
             driver: DriverProtocol | None = None
