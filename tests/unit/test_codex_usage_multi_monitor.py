@@ -410,6 +410,23 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             child = manager._CodexUsageMultiMonitor__children["account_1"]
             self.assertIn("codex-account-1", child.config_dir)
 
+    def test_invalid_interval_rejects_all_scalar_changes_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            before = manager.get_settings_snapshot()
+
+            ok, error = manager.update_settings(
+                {
+                    "enabled": False,
+                    "taskbar_overlay_enabled": False,
+                    "interval_sec": "not-a-number",
+                }
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "interval")
+            self.assertEqual(manager.get_settings_snapshot(), before)
+
     def test_v3_settings_migrate_once_to_v4_and_preserve_raw_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = os.path.join(tmp, "config")
@@ -687,6 +704,49 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             self.assertTrue(os.path.isdir(owned_paths[0]))
             self.assertFalse(os.path.exists(cleanup_state))
+
+    def test_delete_profile_restore_conflict_keeps_journal_and_recovery_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            owned_paths = (created["config_dir"], created["profile_dir"])
+            for path in owned_paths:
+                os.makedirs(path, exist_ok=True)
+
+            real_replace = os.replace
+            move_count = 0
+
+            def recreate_original_before_move_failure(source, target):
+                nonlocal move_count
+                if ".delete-" in str(target):
+                    move_count += 1
+                    if move_count == 2:
+                        os.makedirs(owned_paths[0], exist_ok=True)
+                        raise PermissionError("second move locked")
+                return real_replace(source, target)
+
+            with patch(
+                "src.apps.codex_usage_multi_monitor.os.replace",
+                side_effect=recreate_original_before_move_failure,
+            ):
+                ok, error = manager.delete_profile(profile_id, confirmed=True)
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "profile_delete_failed")
+            cleanup_state = os.path.join(tmp, "config", "ai_usage_cleanup_state.json")
+            self.assertTrue(os.path.isfile(cleanup_state))
+            with open(cleanup_state, encoding="utf-8") as fp:
+                quarantines = [item["path"] for item in json.load(fp)["paths"]]
+            self.assertTrue(any(os.path.exists(path) for path in quarantines))
+            self.assertTrue(os.path.isdir(owned_paths[0]))
+            runtime = next(
+                item
+                for item in manager.get_runtime_status()["profiles"]
+                if item["id"] == profile_id
+            )
+            self.assertEqual(runtime["runtime"]["monitor_state"], "recovery_pending")
 
     def test_delete_profile_cleanup_journal_rejects_unrelated_app_owned_file(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -362,6 +362,30 @@ class CodexUsageMultiMonitor:
         if candidate_default not in candidate_settings:
             candidate_default = candidate_order[0] if candidate_order else ""
 
+        candidate_enabled = self.__enabled
+        candidate_taskbar_overlay_enabled = self.__taskbar_overlay_enabled
+        candidate_interval_sec = self.__interval_sec
+        candidate_tooltip_duration_ms = self.__tooltip_duration_ms
+        candidate_usage_url = self.__usage_url
+        if "enabled" in data:
+            candidate_enabled = bool(data.get("enabled"))
+        if "taskbar_overlay_enabled" in data:
+            candidate_taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
+        if "interval_sec" in data:
+            try:
+                interval_sec = float(data.get("interval_sec"))
+            except Exception:
+                return False, "interval"
+            candidate_interval_sec = max(10.0, interval_sec)
+        if "tooltip_duration_ms" in data:
+            candidate_tooltip_duration_ms = _normalize_tooltip_duration_ms(
+                data.get("tooltip_duration_ms"),
+                self.__tooltip_duration_ms,
+            )
+        usage_url = data.get("usage_url")
+        if isinstance(usage_url, str) and usage_url.strip():
+            candidate_usage_url = usage_url.strip()
+
         old_settings = self.__account_settings
         old_ids = set(old_settings)
         changed_providers = [
@@ -376,26 +400,11 @@ class CodexUsageMultiMonitor:
         old_interval_sec = self.__interval_sec
         old_tooltip_duration_ms = self.__tooltip_duration_ms
         old_usage_url = self.__usage_url
-        if "enabled" in data:
-            self.__enabled = bool(data.get("enabled"))
-        if "taskbar_overlay_enabled" in data:
-            self.__taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
-        if "interval_sec" in data:
-            try:
-                interval_sec = float(data.get("interval_sec"))
-            except Exception:
-                return False, "interval"
-            if interval_sec < 10.0:
-                interval_sec = 10.0
-            self.__interval_sec = float(interval_sec)
-        if "tooltip_duration_ms" in data:
-            self.__tooltip_duration_ms = _normalize_tooltip_duration_ms(
-                data.get("tooltip_duration_ms"),
-                self.__tooltip_duration_ms,
-            )
-        usage_url = data.get("usage_url")
-        if isinstance(usage_url, str) and usage_url.strip():
-            self.__usage_url = usage_url.strip()
+        self.__enabled = candidate_enabled
+        self.__taskbar_overlay_enabled = candidate_taskbar_overlay_enabled
+        self.__interval_sec = candidate_interval_sec
+        self.__tooltip_duration_ms = candidate_tooltip_duration_ms
+        self.__usage_url = candidate_usage_url
         self.__account_settings = candidate_settings
         self.__account_order = candidate_order
         self.__default_account_id = candidate_default
@@ -1454,8 +1463,11 @@ class CodexUsageMultiMonitor:
             original = entry["original"]
             quarantine = entry["path"]
             try:
-                if os.path.lexists(quarantine) and not os.path.lexists(original):
-                    os.replace(quarantine, original)
+                if os.path.lexists(quarantine):
+                    if os.path.lexists(original):
+                        restored = False
+                    else:
+                        os.replace(quarantine, original)
             except Exception:
                 restored = False
         return restored
