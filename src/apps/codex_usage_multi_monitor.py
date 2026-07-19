@@ -1211,8 +1211,30 @@ class CodexUsageMultiMonitor:
         return
 
     def release_account_profile_session(self, account_id: str) -> tuple[bool, str]:
-        child = self.__child(account_id)
-        return child.release_profile_session()
+        if bool(self.__closing):
+            return False, "shutdown"
+        normalized = str(account_id or "")
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            child = self.__children.get(normalized)
+            if child is None or normalized not in self.__account_settings:
+                return False, "invalid_profile"
+            self.__set_profile_refresh_blocked(normalized, True)
+            try:
+                if not self.__request_child_collect_cancel(child):
+                    return (
+                        False,
+                        "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                    )
+                if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
+                    return (
+                        False,
+                        "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                    )
+                return child.release_profile_session()
+            finally:
+                self.__set_profile_refresh_blocked(normalized, False)
 
     def format_captured_at_for_display(self, value: str) -> str:
         if not self.__default_account_id:

@@ -1269,8 +1269,7 @@ class CodexUsageSettingsView:
         ui_post = self._ui_post
         if callable(ui_post):
             try:
-                ui_post(fn)
-                return True
+                return ui_post(fn) is not False
             except Exception:
                 return False
         return False

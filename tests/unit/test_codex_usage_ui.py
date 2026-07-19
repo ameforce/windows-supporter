@@ -203,6 +203,15 @@ class _FakeTtk:
 
 
 class CodexUsageUiUnitTest(unittest.TestCase):
+    def test_post_ui_propagates_dispatch_rejection(self) -> None:
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=None,
+            ui_post=lambda _fn: False,
+        )
+
+        self.assertFalse(view._post_ui(lambda: None))
+
     def test_metric_presence_hides_unreported_codex_five_hour_and_disabled_cursor_od(self) -> None:
         fake_tk = _FakeTk()
         view = CodexUsageSettingsView(root=None, codex_monitor=None)

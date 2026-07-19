@@ -3104,6 +3104,118 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(children[1].release_calls, 1)
             self.assertFalse(hasattr(manager, "release_profile_session"))
 
+    def test_account_release_blocks_refresh_and_serializes_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            children = []
+            release_started = threading.Event()
+            release_continue = threading.Event()
+
+            class _BlockingReleaseChild(_FakeChildMonitor):
+                def release_profile_session(self):
+                    self.release_calls += 1
+                    release_started.set()
+                    release_continue.wait(2.0)
+                    return True, "released"
+
+            def factory(config_dir, profile_dir):
+                child = _BlockingReleaseChild(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            release_results = []
+            shutdown_results = []
+            release_thread = threading.Thread(
+                target=lambda: release_results.append(
+                    manager.release_account_profile_session("account_1")
+                )
+            )
+            release_thread.start()
+            self.assertTrue(release_started.wait(1.0))
+
+            refresh_thread = threading.Thread(
+                target=lambda: manager.show_account_status(
+                    "account_1",
+                    force_refresh=True,
+                )
+            )
+            refresh_thread.start()
+            shutdown_thread = threading.Thread(
+                target=lambda: shutdown_results.append(manager.shutdown())
+            )
+            shutdown_thread.start()
+            time.sleep(0.05)
+
+            self.assertEqual(children[0].show_calls, [])
+            self.assertEqual(children[0].shutdown_calls, 0)
+
+            release_continue.set()
+            release_thread.join(2.0)
+            refresh_thread.join(2.0)
+            shutdown_thread.join(2.0)
+
+            self.assertEqual(release_results, [(True, "released")])
+            self.assertEqual(shutdown_results, [True])
+            self.assertEqual(children[0].shutdown_calls, 1)
+
+    def test_account_release_serializes_provider_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            children = []
+            release_started = threading.Event()
+            release_continue = threading.Event()
+
+            class _BlockingReleaseChild(_FakeChildMonitor):
+                def release_profile_session(self):
+                    self.release_calls += 1
+                    release_started.set()
+                    release_continue.wait(2.0)
+                    return True, "released"
+
+            def factory(config_dir, profile_dir):
+                child = _BlockingReleaseChild(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+            release_results = []
+            update_results = []
+            release_thread = threading.Thread(
+                target=lambda: release_results.append(
+                    manager.release_account_profile_session("account_1")
+                )
+            )
+            release_thread.start()
+            self.assertTrue(release_started.wait(1.0))
+
+            update_thread = threading.Thread(
+                target=lambda: update_results.append(
+                    manager.update_settings({"profiles": profiles})
+                )
+            )
+            update_thread.start()
+            time.sleep(0.05)
+
+            self.assertEqual(update_results, [])
+            self.assertEqual(children[0].shutdown_calls, 0)
+
+            release_continue.set()
+            release_thread.join(2.0)
+            update_thread.join(2.0)
+
+            self.assertEqual(release_results, [(True, "released")])
+            self.assertEqual(update_results, [(True, None)])
+            self.assertEqual(children[0].shutdown_calls, 1)
+
     def test_runtime_snapshot_prefers_profile_name_for_account_label(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
