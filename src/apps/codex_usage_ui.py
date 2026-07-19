@@ -33,6 +33,8 @@ class CodexUsageSettingsView:
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_labels: dict[str, str] = {}
+        self._account_label_vars = {}
+        self._account_rendered_providers: dict[str, str] = {}
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
@@ -89,12 +91,19 @@ class CodexUsageSettingsView:
         if not isinstance(accounts, list):
             accounts = settings.get("accounts")
         has_multi_accounts = isinstance(accounts, list) and bool(accounts)
+        has_codex_profile = not isinstance(accounts, list) or any(
+            not isinstance(raw, dict)
+            or str(raw.get("provider", "codex") or "codex").strip().lower() == "codex"
+            for raw in accounts
+        )
         self._login_button = None
         self._logout_button = None
         self._account_query_buttons = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_labels = {}
+        self._account_label_vars = {}
+        self._account_rendered_providers = {}
         self._account_status_vars = {}
         self._account_snapshot_vars = {}
         self._account_metric_vars = {}
@@ -251,21 +260,22 @@ class CodexUsageSettingsView:
         )
         row += 1
 
-        tk.Label(
-            body,
-            text="Codex 조회 URL",
-            bg=card_bg,
-            fg="#111827",
-            font=("Segoe UI", 9),
-        ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
-        ttk.Entry(body, textvariable=self._usage_url_var, width=64).grid(
-            row=row,
-            column=1,
-            columnspan=3,
-            sticky="we",
-            pady=2,
-        )
-        row += 1
+        if has_codex_profile:
+            tk.Label(
+                body,
+                text="Codex 조회 URL",
+                bg=card_bg,
+                fg="#111827",
+                font=("Segoe UI", 9),
+            ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            ttk.Entry(body, textvariable=self._usage_url_var, width=64).grid(
+                row=row,
+                column=1,
+                columnspan=3,
+                sticky="we",
+                pady=2,
+            )
+            row += 1
 
         settings_path = str(settings.get("settings_path", "") or "").strip()
         state_path = str(settings.get("state_path", "") or "").strip()
@@ -357,6 +367,9 @@ class CodexUsageSettingsView:
             label = str(raw.get("label", "") or account_id).strip()
             self._account_labels[account_id] = label
             provider = str(raw.get("provider", "codex") or "codex").strip().lower()
+            self._account_rendered_providers[account_id] = provider
+            label_var = tk.StringVar(value=label)
+            self._account_label_vars[account_id] = label_var
             enabled_var = tk.BooleanVar(value=bool(raw.get("enabled", True)))
             provider_var = tk.StringVar(value=provider if provider in {"codex", "cursor"} else "codex")
             selected_var = tk.BooleanVar(value=bool(raw.get("taskbar_selected", True)))
@@ -389,6 +402,7 @@ class CodexUsageSettingsView:
             profile_label = tk.Label(
                 header,
                 text=label,
+                textvariable=label_var,
                 bg=card_bg,
                 fg="#111827",
                 font=("Segoe UI", 9, "bold"),
@@ -1172,6 +1186,15 @@ class CodexUsageSettingsView:
         return float(value), None
 
     def _save_settings(self) -> bool:
+        before_settings = self._safe_get_settings()
+        before_profiles = before_settings.get("profiles")
+        if not isinstance(before_profiles, list):
+            before_profiles = before_settings.get("accounts")
+        before_providers = {
+            str(raw.get("id") or ""): str(raw.get("provider") or "codex").lower()
+            for raw in before_profiles or []
+            if isinstance(raw, dict) and str(raw.get("id") or "")
+        }
         enabled = bool(self._enabled_var.get())
         interval_sec, parse_error = self._parse_positive_seconds_strict(
             self._interval_var.get(),
@@ -1207,8 +1230,17 @@ class CodexUsageSettingsView:
 
         ok, err = self._codex.update_settings(payload)
         if ok:
+            provider_changed = any(
+                before_providers.get(str(item.get("id") or ""))
+                != str(item.get("provider") or "codex").lower()
+                for item in accounts
+                if str(item.get("id") or "") in before_providers
+            )
+            if provider_changed:
+                self._remount()
             self._set_status("저장됨", level="ok")
             return True
+        self._load_settings()
         self._set_status(f"저장 실패: {err}", level="error")
         return False
 
@@ -1567,6 +1599,15 @@ class CodexUsageSettingsView:
             accounts = runtime.get("accounts")
         if not isinstance(accounts, list):
             accounts = []
+        for raw in accounts:
+            if not isinstance(raw, dict):
+                continue
+            account_id = str(raw.get("id") or "").strip()
+            provider = str(raw.get("provider") or "").strip().lower()
+            rendered_provider = self._account_rendered_providers.get(account_id)
+            if rendered_provider and provider and rendered_provider != provider:
+                self._remount()
+                return
         seen: set[str] = set()
         for raw in accounts:
             if not isinstance(raw, dict):
@@ -1575,6 +1616,15 @@ class CodexUsageSettingsView:
             if not account_id:
                 continue
             seen.add(account_id)
+            label = str(raw.get("label") or "").strip()
+            if label:
+                self._account_labels[account_id] = label
+                label_var = self._account_label_vars.get(account_id)
+                if label_var is not None:
+                    try:
+                        label_var.set(label)
+                    except Exception:
+                        pass
             child_runtime = raw.get("runtime", {})
             if not isinstance(child_runtime, dict):
                 child_runtime = {}
