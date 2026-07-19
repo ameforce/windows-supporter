@@ -3458,6 +3458,106 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(call_order, ["account_1", "account_2"])
             self.assertEqual(max_active, 1)
 
+    def test_manager_queue_does_not_strand_request_during_empty_to_idle_transition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first_finished = threading.Event()
+            worker_observed_empty = threading.Event()
+            allow_empty_worker_exit = threading.Event()
+            second_finished = threading.Event()
+
+            class _RaceChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    if "account-1" in self.config_dir:
+                        first_finished.set()
+                    else:
+                        second_finished.set()
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=lambda config_dir, profile_dir: _RaceChild(
+                    config_dir,
+                    profile_dir,
+                ),
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            original_condition = manager._CodexUsageMultiMonitor__refresh_condition
+
+            class _EmptyExitGateCondition:
+                def __init__(self):
+                    self._local = threading.local()
+                    self._gated = False
+                    self._empty_after_first_count = 0
+
+                def __enter__(self):
+                    entered = original_condition.__enter__()
+                    self._local.queue_size = len(
+                        manager._CodexUsageMultiMonitor__refresh_queue
+                    )
+                    if (
+                        threading.current_thread().name != "MainThread"
+                        and first_finished.is_set()
+                        and self._local.queue_size == 0
+                    ):
+                        self._empty_after_first_count += 1
+                    self._local.empty_after_first_count = (
+                        self._empty_after_first_count
+                    )
+                    return entered
+
+                def __exit__(self, exc_type, exc, traceback):
+                    queue_was_empty = self._local.queue_size == 0
+                    queue_is_empty = not manager._CodexUsageMultiMonitor__refresh_queue
+                    should_gate = (
+                        threading.current_thread().name != "MainThread"
+                        and queue_was_empty
+                        and queue_is_empty
+                        and self._local.empty_after_first_count >= 2
+                        and not self._gated
+                    )
+                    result = original_condition.__exit__(exc_type, exc, traceback)
+                    if should_gate:
+                        self._gated = True
+                        worker_observed_empty.set()
+                        allow_empty_worker_exit.wait(2.0)
+                    return result
+
+                def wait(self, timeout=None):
+                    return original_condition.wait(timeout=timeout)
+
+                def notify_all(self):
+                    return original_condition.notify_all()
+
+            manager._CodexUsageMultiMonitor__refresh_condition = (
+                _EmptyExitGateCondition()
+            )
+
+            try:
+                manager.show_account_status("account_1")
+                self.assertTrue(first_finished.wait(1.0))
+                self.assertTrue(worker_observed_empty.wait(1.0))
+
+                manager.show_account_status("account_2")
+                allow_empty_worker_exit.set()
+
+                self.assertTrue(second_finished.wait(1.0))
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: not manager._CodexUsageMultiMonitor__refresh_inflight
+                    )
+                )
+                self.assertEqual(
+                    list(manager._CodexUsageMultiMonitor__refresh_queue),
+                    [],
+                )
+            finally:
+                allow_empty_worker_exit.set()
+                manager.shutdown()
+
     def test_queued_refresh_resolves_current_child_after_profile_deletion(self):
         with tempfile.TemporaryDirectory() as tmp:
             active_started = threading.Event()

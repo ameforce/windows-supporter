@@ -140,6 +140,7 @@ class CodexUsageMultiMonitor:
         self.__tooltip_duration_ms = 7000
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__refresh_inflight = False
+        self.__refresh_worker_token: object | None = None
         self.__refresh_lock = threading.Lock()
         self.__refresh_condition = threading.Condition(self.__refresh_lock)
         self.__active_refresh_counts: dict[str, int] = {}
@@ -1360,6 +1361,7 @@ class CodexUsageMultiMonitor:
     def __dispatch_refresh_worker(self, fn, *, refresh_taskbar: bool) -> bool:
         if not callable(fn):
             return False
+        worker_token: object | None = None
         with self.__refresh_condition:
             if bool(self.__closing):
                 return False
@@ -1367,6 +1369,8 @@ class CodexUsageMultiMonitor:
             already_inflight = bool(self.__refresh_inflight)
             if not already_inflight:
                 self.__refresh_inflight = True
+                worker_token = object()
+                self.__refresh_worker_token = worker_token
         if already_inflight:
             if bool(refresh_taskbar):
                 self.__refresh_taskbar_progress()
@@ -1380,6 +1384,10 @@ class CodexUsageMultiMonitor:
                         if bool(self.__closing):
                             self.__refresh_queue.clear()
                         if not self.__refresh_queue:
+                            if self.__refresh_worker_token is worker_token:
+                                self.__refresh_inflight = False
+                                self.__refresh_worker_token = None
+                                self.__refresh_condition.notify_all()
                             break
                         queued_fn, queued_refresh = self.__refresh_queue.popleft()
                     try:
@@ -1398,8 +1406,10 @@ class CodexUsageMultiMonitor:
                         self.__refresh_taskbar_progress()
             finally:
                 with self.__refresh_condition:
-                    self.__refresh_inflight = False
-                    self.__refresh_condition.notify_all()
+                    if self.__refresh_worker_token is worker_token:
+                        self.__refresh_inflight = False
+                        self.__refresh_worker_token = None
+                        self.__refresh_condition.notify_all()
             if bool(refresh_after):
                 self.__refresh_taskbar_progress()
             if not self.__post_ui(self.__schedule_monitor_tick):
@@ -1413,9 +1423,11 @@ class CodexUsageMultiMonitor:
                 threading.Thread(target=worker, daemon=True).start()
             except Exception:
                 with self.__refresh_condition:
-                    self.__refresh_inflight = False
-                    self.__refresh_queue.clear()
-                    self.__refresh_condition.notify_all()
+                    if self.__refresh_worker_token is worker_token:
+                        self.__refresh_inflight = False
+                        self.__refresh_worker_token = None
+                        self.__refresh_queue.clear()
+                        self.__refresh_condition.notify_all()
                 return False
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
