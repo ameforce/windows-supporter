@@ -500,7 +500,14 @@ class CodexUsageMultiMonitor:
                         usage_url=old_usage_url,
                     )
                 except Exception:
-                    pass
+                    self.__replace_child_after_failed_settings_rollback(
+                        profile_id,
+                        old_settings[profile_id],
+                        enabled=old_enabled,
+                        interval_sec=old_interval_sec,
+                        tooltip_duration_ms=old_tooltip_duration_ms,
+                        usage_url=old_usage_url,
+                    )
             for profile_id, (_paths, child) in staged_children.items():
                 rollback = staged_rollback_settings.get(profile_id)
                 updater = getattr(child, "update_settings", None)
@@ -568,28 +575,40 @@ class CodexUsageMultiMonitor:
                 }
             },
         )
-        self.__account_settings[profile_id] = settings
-        self.__account_order.append(profile_id)
-        previous_default = self.__default_account_id
-        if not self.__default_account_id:
-            self.__default_account_id = profile_id
+        candidate_settings = dict(self.__account_settings)
+        candidate_settings[profile_id] = settings
+        candidate_order = [*self.__account_order, profile_id]
+        candidate_default = self.__default_account_id or profile_id
+        staged_paths = None
+        staged_child = None
         try:
-            self.__replace_child_monitor(profile_id)
-            self.__save_manager_settings()
+            staged_paths, staged_child = self.__stage_child_monitor(profile_id, settings)
+            self.__apply_child_settings(
+                staged_child,
+                settings,
+                enabled=self.__enabled,
+                interval_sec=self.__interval_sec,
+                tooltip_duration_ms=self.__tooltip_duration_ms,
+                usage_url=self.__usage_url,
+            )
+            self.__save_manager_settings(
+                account_settings=candidate_settings,
+                account_order=candidate_order,
+                default_account_id=candidate_default,
+            )
         except Exception:
-            child = self.__children.pop(profile_id, None)
-            shutdown = getattr(child, "shutdown", None)
+            shutdown = getattr(staged_child, "shutdown", None)
             if callable(shutdown):
                 try:
                     shutdown()
                 except Exception:
                     pass
-            self.__account_paths.pop(profile_id, None)
-            self.__account_settings.pop(profile_id, None)
-            self.__account_order = [item for item in self.__account_order if item != profile_id]
-            self.__default_account_id = previous_default
             return False, "profile_add_failed", None
-        self.__sync_child_settings()
+        self.__account_settings = candidate_settings
+        self.__account_order = candidate_order
+        self.__default_account_id = candidate_default
+        self.__account_paths[profile_id] = staged_paths
+        self.__children[profile_id] = staged_child
         self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None, self.__build_account_settings_snapshot(profile_id)
@@ -1972,6 +1991,54 @@ class CodexUsageMultiMonitor:
         if callable(shutdown_old):
             try:
                 shutdown_old()
+            except Exception:
+                pass
+        return
+
+    def __replace_child_after_failed_settings_rollback(
+        self,
+        account_id: str,
+        account: _AccountSettings,
+        *,
+        enabled: bool,
+        interval_sec: float,
+        tooltip_duration_ms: int,
+        usage_url: str,
+    ) -> None:
+        original_child = self.__children.get(account_id)
+        original_paths = self.__account_paths[account_id]
+        replacement_paths = original_paths
+        replacement_child = None
+        try:
+            replacement_paths, replacement_child = self.__stage_child_monitor(
+                account_id,
+                account,
+            )
+            self.__apply_child_settings(
+                replacement_child,
+                account,
+                enabled=enabled,
+                interval_sec=interval_sec,
+                tooltip_duration_ms=tooltip_duration_ms,
+                usage_url=usage_url,
+            )
+        except Exception:
+            shutdown_replacement = getattr(replacement_child, "shutdown", None)
+            if callable(shutdown_replacement):
+                try:
+                    shutdown_replacement()
+                except Exception:
+                    pass
+            replacement_paths = original_paths
+            replacement_child = _RecoveryPendingChild(original_paths)
+            if self.__root is not None:
+                self.__attach_child(replacement_child, self.__root, self.__event_queue)
+        self.__account_paths[account_id] = replacement_paths
+        self.__children[account_id] = replacement_child
+        shutdown_original = getattr(original_child, "shutdown", None)
+        if callable(shutdown_original):
+            try:
+                shutdown_original()
             except Exception:
                 pass
         return

@@ -666,6 +666,84 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(original.shutdown_calls, 0)
             self.assertEqual(factory_calls, 3)
 
+    def test_save_failure_replaces_child_when_canonical_rollback_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            children = []
+
+            class _RollbackRejectingChild(_FakeChildMonitor):
+                def update_settings(self, data):
+                    self.update_calls.append(dict(data))
+                    if len(self.update_calls) >= 2 and bool(data.get("enabled")):
+                        return False, "rollback_rejected"
+                    self.runtime["enabled"] = bool(data.get("enabled", True))
+                    return True, None
+
+            def factory(config_dir, profile_dir):
+                child = _RollbackRejectingChild(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            original = manager._CodexUsageMultiMonitor__children["account_1"]
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__save_manager_settings",
+                side_effect=OSError("disk full"),
+            ):
+                ok, error = manager.update_settings({"enabled": False})
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            self.assertTrue(manager.get_settings_snapshot()["enabled"])
+            live = manager._CodexUsageMultiMonitor__children["account_1"]
+            self.assertIsNot(live, original)
+            self.assertTrue(live.get_runtime_status()["enabled"])
+            self.assertEqual(original.shutdown_calls, 1)
+
+    def test_add_profile_child_settings_rejection_rolls_back_model_and_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            factory_calls = 0
+            staged_children = []
+
+            class _RejectingSettingsChild(_FakeChildMonitor):
+                def update_settings(self, data):
+                    self.update_calls.append(dict(data))
+                    return False, "persist_failed"
+
+            def factory(config_dir, profile_dir):
+                nonlocal factory_calls
+                factory_calls += 1
+                if factory_calls <= 2:
+                    return _FakeChildMonitor(config_dir, profile_dir)
+                child = _RejectingSettingsChild(config_dir, profile_dir)
+                staged_children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+
+            ok, error, profile = manager.add_profile("codex")
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "profile_add_failed")
+            self.assertIsNone(profile)
+            self.assertEqual(len(manager.get_settings_snapshot()["profiles"]), 2)
+            with open(
+                os.path.join(tmp, "config", "ai_usage_settings.json"),
+                encoding="utf-8",
+            ) as fp:
+                persisted = json.load(fp)
+            self.assertEqual(len(persisted["profiles"]), 2)
+            self.assertEqual(staged_children[0].shutdown_calls, 1)
+
     def test_invalid_interval_rejects_all_scalar_changes_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, _ = self._build_manager(tmp)
