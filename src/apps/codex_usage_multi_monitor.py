@@ -304,9 +304,14 @@ class CodexUsageMultiMonitor:
                     previous_label = current.label
                     previous_enabled = current.enabled
                     previous_provider = current.provider
+                    profile_label_index = self.__profile_label_index(
+                        profile_id,
+                        previous_provider,
+                        previous_label,
+                    )
                     previous_label_was_default = previous_label == _default_profile_label(
                         previous_provider,
-                        len(requested_order),
+                        profile_label_index,
                     )
                     current.provider_settings[current.provider] = {
                         "label": current.label,
@@ -321,12 +326,12 @@ class CodexUsageMultiMonitor:
                         if isinstance(saved_provider, dict):
                             current.label = str(
                                 saved_provider.get("label")
-                                or _default_profile_label(provider, len(requested_order))
+                                or _default_profile_label(provider, profile_label_index)
                             )
                             current.enabled = bool(saved_provider.get("enabled", True))
                         else:
                             current.label = (
-                                _default_profile_label(provider, len(requested_order))
+                                _default_profile_label(provider, profile_label_index)
                                 if previous_label_was_default
                                 else previous_label
                             )
@@ -388,8 +393,14 @@ class CodexUsageMultiMonitor:
         if sum(bool(item.taskbar_selected) for item in candidate_settings.values()) > TASKBAR_PROFILE_LIMIT:
             return False, "taskbar_profile_limit"
 
-        candidate_default = str(data.get("default_account_id", self.__default_account_id) or "")
-        if candidate_default not in candidate_settings:
+        requested_default = str(data.get("default_account_id", "") or "")
+        if requested_default in candidate_settings:
+            candidate_default = requested_default
+        elif isinstance(raw_profiles, list):
+            candidate_default = candidate_order[0] if candidate_order else ""
+        elif self.__default_account_id in candidate_settings:
+            candidate_default = self.__default_account_id
+        else:
             candidate_default = candidate_order[0] if candidate_order else ""
 
         candidate_enabled = self.__enabled
@@ -1214,6 +1225,25 @@ class CodexUsageMultiMonitor:
             provider = self.__account_settings[account_id].provider
             result[account_id] = self.__build_profile_paths(account_id, provider)
         return result
+
+    def __profile_label_index(
+        self,
+        profile_id: str,
+        provider: str,
+        label: str,
+    ) -> int:
+        normalized_id = str(profile_id or "")
+        if normalized_id in LEGACY_ACCOUNT_IDS:
+            return max(1, _safe_int(normalized_id.rsplit("_", 1)[-1], 1))
+        provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
+        match = re.fullmatch(rf"{re.escape(provider_name)} ([1-9]\d*)", str(label or ""))
+        if match is not None:
+            return max(1, _safe_int(match.group(1), 1))
+        ordered = self.__ordered_account_ids()
+        try:
+            return ordered.index(normalized_id) + 1
+        except ValueError:
+            return len(ordered) + 1
 
     def __build_profile_paths(self, account_id: str, provider: str) -> _AccountPaths:
         normalized_id = str(account_id or "")

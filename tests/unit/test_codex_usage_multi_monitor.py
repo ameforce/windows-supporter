@@ -833,6 +833,47 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(profiles[1]["label"], "Cursor 2")
             self.assertFalse(profiles[1]["enabled"])
 
+    def test_provider_default_label_is_stable_across_reordered_and_partial_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reordered, _ = self._build_manager(os.path.join(tmp, "reordered"))
+            profiles = reordered.get_settings_snapshot()["profiles"]
+            profiles.reverse()
+            profiles[0]["provider"] = "cursor"
+
+            ok, error = reordered.update_settings({"profiles": profiles})
+
+            self.assertTrue(ok, error)
+            account_2 = next(
+                item
+                for item in reordered.get_settings_snapshot()["profiles"]
+                if item["id"] == "account_2"
+            )
+            self.assertEqual(account_2["label"], "Cursor 2")
+
+            partial, _ = self._build_manager(os.path.join(tmp, "partial"))
+            ok, error = partial.update_settings(
+                {"profiles": [{"id": "account_2", "provider": "cursor"}]}
+            )
+
+            self.assertTrue(ok, error)
+            account_2 = next(
+                item
+                for item in partial.get_settings_snapshot()["profiles"]
+                if item["id"] == "account_2"
+            )
+            self.assertEqual(account_2["label"], "Cursor 2")
+
+    def test_partial_accounts_payload_keeps_legacy_first_profile_default_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _ = self._build_manager(tmp)
+
+            ok, error = manager.update_settings({"accounts": [{"id": "account_2"}]})
+
+            self.assertTrue(ok, error)
+            snapshot = manager.get_settings_snapshot()
+            self.assertEqual(snapshot["profile_order"], ["account_2", "account_1"])
+            self.assertEqual(snapshot["default_account_id"], "account_2")
+
     def test_delete_profile_rejects_path_outside_app_owned_boundaries(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, _ = self._build_manager(tmp)
