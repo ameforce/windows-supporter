@@ -78,6 +78,44 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
 
             self.assertEqual(session.shutdown_calls, 1)
 
+    def test_usage_url_change_rejects_unconfirmed_old_session_shutdown(self) -> None:
+        class _UnsettledBrowserSession:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+
+            def shutdown(self) -> bool:
+                self.shutdown_calls += 1
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = []
+
+            def factory(_config):
+                session = _UnsettledBrowserSession()
+                sessions.append(session)
+                return session
+
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=factory,
+            )
+            before = monitor.get_settings_snapshot()
+            old_session = monitor._CodexUsageMonitor__browser_session
+
+            result = monitor.update_settings(
+                {"usage_url": "https://example.invalid/different-usage"}
+            )
+
+            self.assertEqual(result, (False, "browser_session_shutdown_failed"))
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(old_session.shutdown_calls, 1)
+            self.assertIs(monitor._CodexUsageMonitor__browser_session, old_session)
+            self.assertEqual(
+                monitor.get_settings_snapshot()["usage_url"],
+                before["usage_url"],
+            )
+
     def test_collect_cancel_interrupts_active_browser_session(self) -> None:
         class _BlockingBrowserSession:
             def __init__(self) -> None:

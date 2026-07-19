@@ -1929,15 +1929,33 @@ class CodexUsageMonitor:
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         return
 
-    def __set_usage_url(self, value: str) -> None:
+    def __set_usage_url(self, value: str) -> tuple[bool, str | None]:
         previous = str(getattr(self, "_CodexUsageMonitor__usage_url", "") or "")
-        self.__usage_url = canonicalize_codex_usage_url(value)
-        if previous and previous != self.__usage_url and hasattr(
+        candidate = canonicalize_codex_usage_url(value)
+        if previous and previous != candidate and hasattr(
             self, "_CodexUsageMonitor__browser_session"
         ):
-            self.__browser_session.shutdown()
-            self.__browser_session = self.__create_browser_session()
-        return
+            old_session = self.__browser_session
+            try:
+                shutdown_succeeded = old_session.shutdown() is True
+            except Exception:
+                shutdown_succeeded = False
+            if not shutdown_succeeded:
+                return False, "browser_session_shutdown_failed"
+            self.__usage_url = candidate
+            try:
+                replacement = self.__create_browser_session()
+            except Exception:
+                self.__usage_url = previous
+                try:
+                    self.__browser_session = self.__create_browser_session()
+                except Exception:
+                    self.__browser_session = old_session
+                return False, "browser_session_create_failed"
+            self.__browser_session = replacement
+            return True, None
+        self.__usage_url = candidate
+        return True, None
 
     def __create_browser_session(self) -> CodexUsagePlaywrightSession:
         config = PlaywrightSessionConfig(
@@ -1988,8 +2006,10 @@ class CodexUsageMonitor:
             interval_sec = min_interval
         if tooltip_ms < 1200:
             tooltip_ms = 1200
+        url_updated, url_error = self.__set_usage_url(usage_url)
+        if not url_updated:
+            return False, url_error
         self.__enabled = enabled
-        self.__set_usage_url(usage_url)
         self.__interval_sec = float(interval_sec)
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__refresh_session_state_from_profile()
