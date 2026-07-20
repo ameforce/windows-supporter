@@ -78,6 +78,32 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
 
             self.assertEqual(session.shutdown_calls, 1)
 
+    def test_worker_does_not_run_tk_cleanup_directly_when_ui_queue_post_fails(self) -> None:
+        class _FailingQueue:
+            def put(self, _fn):
+                raise RuntimeError("ui queue unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: self._BrowserSession(),
+            )
+            monitor._CodexUsageMonitor__ui_thread_id = threading.get_ident()
+            monitor._CodexUsageMonitor__event_queue = _FailingQueue()
+            callback_thread_ids = []
+
+            worker = threading.Thread(
+                target=lambda: monitor._CodexUsageMonitor__post_tk_cleanup(
+                    lambda: callback_thread_ids.append(threading.get_ident())
+                )
+            )
+            worker.start()
+            worker.join(1.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(callback_thread_ids, [])
+
     def test_usage_url_change_rejects_unconfirmed_old_session_shutdown(self) -> None:
         class _UnsettledBrowserSession:
             def __init__(self) -> None:

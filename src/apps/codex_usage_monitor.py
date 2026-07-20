@@ -3508,10 +3508,13 @@ class CodexUsageMonitor:
                 return
             except Exception:
                 self.__log("tk cleanup post failed")
-        try:
-            fn()
-        except Exception:
-            pass
+        if self.__ui_thread_id is None:
+            try:
+                fn()
+            except Exception:
+                pass
+            return
+        self.__log("tk cleanup dropped outside ui thread")
         return
 
     def __queue_change_tooltip_until_input(

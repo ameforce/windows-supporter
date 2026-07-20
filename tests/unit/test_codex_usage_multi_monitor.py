@@ -4273,6 +4273,45 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 allow_start_failure.set()
                 manager.shutdown()
 
+    def test_worker_drops_tk_and_taskbar_fallback_when_ui_queue_post_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            class _FailingQueue:
+                def put(self, _fn):
+                    raise RuntimeError("ui queue unavailable")
+
+            root = _FakeRoot()
+            manager, _children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
+            )
+            manager.attach(root, event_queue=queue.Queue())
+            overlay = _FakeTaskbarOverlay(root, manager.get_runtime_status)
+            manager._CodexUsageMultiMonitor__taskbar_progress = overlay
+            manager._CodexUsageMultiMonitor__event_queue = _FailingQueue()
+            manager._CodexUsageMultiMonitor__monitor_after_id = "existing-after"
+            root.after_calls.clear()
+            root.after_cancel_calls.clear()
+
+            worker = threading.Thread(
+                target=lambda: (
+                    manager._CodexUsageMultiMonitor__request_monitor_scheduler_restart(1.0),
+                    manager._CodexUsageMultiMonitor__refresh_taskbar_progress(),
+                )
+            )
+            worker.start()
+            worker.join(1.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(root.after_calls, [])
+            self.assertEqual(root.after_cancel_calls, [])
+            self.assertEqual(overlay.refresh_calls, 0)
+            self.assertTrue(
+                any(
+                    event.get("type") == "manager_ui_dispatch_dropped"
+                    for event in manager.pop_notification_events()
+                )
+            )
+
     def test_queued_refresh_resolves_current_child_after_profile_deletion(self):
         with tempfile.TemporaryDirectory() as tmp:
             active_started = threading.Event()

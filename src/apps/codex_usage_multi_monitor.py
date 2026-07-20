@@ -1401,8 +1401,7 @@ class CodexUsageMultiMonitor:
                 pass
             return
 
-        if not self.__post_ui(action):
-            action()
+        self.__dispatch_ui_action(action, prefer_queue=True)
         return
 
     def __ensure_taskbar_progress(self):
@@ -1434,6 +1433,43 @@ class CodexUsageMultiMonitor:
             return True
         except Exception:
             return False
+
+    def __dispatch_ui_action(
+        self,
+        fn,
+        *,
+        allow_closing: bool = False,
+        prefer_queue: bool = False,
+    ) -> bool:
+        if not callable(fn):
+            return False
+        on_ui_thread = (
+            self.__ui_thread_id is None
+            or threading.get_ident() == self.__ui_thread_id
+        )
+        if prefer_queue and self.__post_ui(fn, allow_closing=allow_closing):
+            return True
+        if on_ui_thread:
+            try:
+                fn()
+                return True
+            except Exception as exc:
+                self.__append_notification_event(
+                    {
+                        "type": "manager_ui_dispatch_error",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                return False
+        if not prefer_queue and self.__post_ui(fn, allow_closing=allow_closing):
+            return True
+        self.__append_notification_event(
+            {
+                "type": "manager_ui_dispatch_dropped",
+                "thread_name": threading.current_thread().name,
+            }
+        )
+        return False
 
     def __set_profile_refresh_blocked(self, profile_id: str, blocked: bool) -> None:
         normalized = str(profile_id or "")
@@ -1548,14 +1584,12 @@ class CodexUsageMultiMonitor:
                     try:
                         queued_fn()
                     except Exception as exc:
-                        self.__notification_events.append(
+                        self.__append_notification_event(
                             {
                                 "type": "manager_collection_error",
                                 "error_type": type(exc).__name__,
                             }
                         )
-                        if len(self.__notification_events) > 20:
-                            self.__notification_events = self.__notification_events[-20:]
                     refresh_after = bool(refresh_after or queued_refresh)
                     if bool(queued_refresh):
                         self.__refresh_taskbar_progress()
@@ -1567,8 +1601,10 @@ class CodexUsageMultiMonitor:
                         self.__refresh_condition.notify_all()
             if bool(refresh_after):
                 self.__refresh_taskbar_progress()
-            if not self.__post_ui(self.__schedule_monitor_tick):
-                self.__schedule_monitor_tick()
+            self.__dispatch_ui_action(
+                self.__schedule_monitor_tick,
+                prefer_queue=True,
+            )
             return
 
         if self.__event_queue is None:
@@ -1607,17 +1643,7 @@ class CodexUsageMultiMonitor:
         action = lambda: self.__restart_monitor_scheduler(
             initial_delay_sec=initial_delay_sec
         )
-        on_ui_thread = (
-            self.__ui_thread_id is not None
-            and threading.get_ident() == self.__ui_thread_id
-        )
-        if (
-            self.__event_queue is not None
-            and not on_ui_thread
-            and self.__post_ui(action)
-        ):
-            return
-        action()
+        self.__dispatch_ui_action(action, prefer_queue=False)
         return
 
     def __clear_monitor_schedule(self) -> None:
@@ -1627,10 +1653,11 @@ class CodexUsageMultiMonitor:
         self.__next_collect_due_ts = 0.0
         if root is None or after_id is None:
             return
-        try:
-            root.after_cancel(after_id)
-        except Exception:
-            pass
+        self.__dispatch_ui_action(
+            lambda root=root, after_id=after_id: root.after_cancel(after_id),
+            allow_closing=True,
+            prefer_queue=False,
+        )
         return
 
     def __schedule_monitor_tick(self, initial_delay_sec: float | None = None) -> None:
