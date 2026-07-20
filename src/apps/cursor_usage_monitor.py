@@ -711,7 +711,7 @@ class CursorUsageMonitor:
             monitor_state = "idle"
             session_state = "logged_in"
         elif provider_status == "login":
-            freshness = "unavailable"
+            freshness = "stale" if reading.is_usable else "unavailable"
             monitor_state = "paused_auth_required"
             session_state = "logged_out"
         elif provider_status == "paused":

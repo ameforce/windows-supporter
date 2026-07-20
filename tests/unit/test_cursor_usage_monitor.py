@@ -518,6 +518,9 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
 
         self.assertEqual(stale.state, UsageState.STALE)
         self.assertEqual(stale.last_error_state, UsageState.LOGGED_OUT)
+        self.assertEqual(runtime["provider_status"], "login")
+        self.assertEqual(runtime["freshness"], "stale")
+        self.assertTrue(runtime["last_snapshot_is_stale"])
         self.assertEqual(runtime["session_state"], "logged_out")
         self.assertEqual(runtime["monitor_state"], "paused_auth_required")
         self.assertTrue(runtime["can_login"])
