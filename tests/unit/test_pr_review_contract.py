@@ -156,6 +156,13 @@ class PullRequestReviewContractTest(unittest.TestCase):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, contract)
 
+    def test_review_gate_rca_matches_p3_expiry_contract(self) -> None:
+        policy = (REPO_ROOT / "docs" / "hotfix-v0.8.4-review-gate-policy.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("merge 시점에도 유효한 미래 만료일", policy)
+        self.assertIn("만료된 위험수용은 stale·미완료", policy)
+
 
 if __name__ == "__main__":
     unittest.main()
