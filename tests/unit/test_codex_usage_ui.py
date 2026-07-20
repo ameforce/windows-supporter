@@ -351,7 +351,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                 "on_demand_status",
                 {"on_demand_status": "Enabled · US$8.20 used"},
             ),
-            "활성화 · US$8.20\u00a0사용",
+            "활성화\u00a0·\u00a0US$8.20\u00a0사용",
         )
 
     def test_on_release_profile_calls_monitor_and_sets_ok_status(self) -> None:

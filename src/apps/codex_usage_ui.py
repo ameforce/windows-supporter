@@ -2152,6 +2152,8 @@ class CodexUsageSettingsView:
             except Exception:
                 pass
         localized = self._localize_usage_metric_value(raw)
+        if key == "on_demand_status":
+            localized = localized.replace(" · ", "\u00a0·\u00a0")
         return re.sub(r" (?=(?:남음|사용)$)", "\u00a0", localized)
 
     def _refresh_account_runtime_summaries(self, runtime: dict[str, Any]) -> None:
