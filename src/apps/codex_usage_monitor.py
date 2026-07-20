@@ -671,8 +671,9 @@ def normalize_usage_value(value: str) -> str:
 _PROFILE_NAME_REJECT_EXACT_PATTERN = re.compile(
     r"^(?:"
     r"open|close|menu|settings?|profile|account|user|button|toggle|"
+    r"my|your|edit|switch|view|"
     r"pro|plus|team|enterprise|free|"
-    r"열기|닫기|메뉴|설정|프로필|계정|사용자|버튼|지정"
+    r"열기|닫기|메뉴|설정|프로필|계정|사용자|버튼|지정|내|나의"
     r")$",
     re.IGNORECASE,
 )
@@ -680,8 +681,9 @@ _PROFILE_NAME_REJECT_EXACT_PATTERN = re.compile(
 _PROFILE_NAME_REJECT_FRAGMENT_PATTERN = re.compile(
     r"(?:"
     r"log in|sign in|logout|log out|settings|"
+    r"(?:account|profile|user)\s+menu|"
     r"로그인|로그아웃|설정|메뉴\s*열기|프로필\s*메뉴|알림\s*열기|"
-    r"사용자\s*지정|그룹화\s*기준"
+    r"계정\s*메뉴|사용자\s*지정|그룹화\s*기준"
     r")",
     re.IGNORECASE,
 )
@@ -691,6 +693,30 @@ def sanitize_profile_name(value: Any) -> str:
     text = normalize_usage_value(str(value or ""))
     if not text or len(text) > 96:
         return ""
+    text = re.sub(
+        r"^(?:account|profile|user)\s+menu\s*[:：\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^(?:계정|프로필|사용자)\s*메뉴\s*[:：\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^(?:my|your|edit|switch|view|open)\s+(?:account|profile)\s*[:：\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^(?:내|나의)\s*(?:계정|프로필)\s*[:：\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(
         r"^(profile|account|user|menu|open|프로필|계정|사용자|메뉴)\s*[:：-]?\s*",
         "",
