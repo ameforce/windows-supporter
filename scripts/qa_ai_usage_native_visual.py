@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import struct
+import subprocess
 import sys
 import time
 from typing import Any
@@ -822,9 +823,31 @@ def capture_scenario(
             pass
 
 
+def capture_provenance() -> dict[str, Any]:
+    git_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+    ).strip()
+    if len(git_sha) != 40:
+        raise RuntimeError(f"expected a full Git SHA, got: {git_sha!r}")
+    worktree_status = subprocess.check_output(
+        ["git", "status", "--porcelain"],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+    )
+    return {
+        "git_sha": git_sha,
+        "worktree_clean": not bool(worktree_status.strip()),
+    }
+
+
 def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, Any]:
     output_dir = validate_output_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    provenance = capture_provenance()
     dpi_awareness = _enable_per_monitor_dpi_awareness()
     generated_at = datetime.now(timezone.utc)
     results: list[dict[str, Any]] = []
@@ -864,6 +887,8 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
             and {"initial", "interaction", "final"}.issubset(phases)
         ),
         "generated_at_utc": _iso(generated_at),
+        "git_sha": provenance["git_sha"],
+        "git_worktree_clean": provenance["worktree_clean"],
         "capture_surface": "native-tk",
         "dpi_awareness": dpi_awareness,
         "fixture_policy": {

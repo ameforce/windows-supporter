@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -105,6 +106,54 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = harness.validate_output_dir(Path(tmp) / "ai-usage-native")
             self.assertFalse(output_dir.is_relative_to(REPO_ROOT.resolve()))
+
+    def test_capture_provenance_records_exact_head_and_clean_tree(self) -> None:
+        harness = _load_harness_module()
+
+        with mock.patch.object(
+            harness.subprocess,
+            "check_output",
+            side_effect=["a" * 40 + "\n", ""],
+        ):
+            provenance = harness.capture_provenance()
+
+        self.assertEqual(provenance["git_sha"], "a" * 40)
+        self.assertTrue(provenance["worktree_clean"])
+
+    def test_capture_report_keeps_provenance_at_metadata_root(self) -> None:
+        harness = _load_harness_module()
+
+        def fake_capture(fixture, output_dir, *, settle_ms):
+            screenshot = output_dir / fixture["screenshot_name"]
+            screenshot.write_bytes(b"fixture")
+            return {
+                "ok": True,
+                "scenario": fixture["name"],
+                "phase": fixture["phase"],
+                "screenshot": screenshot.name,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "ai-usage-native"
+            with (
+                mock.patch.object(
+                    harness,
+                    "capture_provenance",
+                    return_value={"git_sha": "b" * 40, "worktree_clean": True},
+                ),
+                mock.patch.object(harness, "_enable_per_monitor_dpi_awareness", return_value="test"),
+                mock.patch.object(harness, "capture_scenario", side_effect=fake_capture),
+            ):
+                report = harness.run_capture_matrix(output_dir)
+
+            persisted = json.loads(
+                (output_dir / harness.METADATA_FILENAME).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(report["git_sha"], "b" * 40)
+        self.assertTrue(report["git_worktree_clean"])
+        self.assertEqual(persisted["git_sha"], "b" * 40)
+        self.assertTrue(persisted["git_worktree_clean"])
 
 
 if __name__ == "__main__":
