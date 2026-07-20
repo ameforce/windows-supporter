@@ -28,6 +28,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         self.assertEqual(
             tuple(harness.SCENARIO_NAMES),
             (
+                "zero-profiles",
                 "mixed-ready-standard",
                 "one-profile-125",
                 "dynamic-three-profiles",
@@ -46,8 +47,10 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 8)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 9)
         by_name = {fixture["name"]: fixture for fixture in fixtures}
+        self.assertEqual(by_name["zero-profiles"]["settings"]["profiles"], [])
+        self.assertEqual(by_name["zero-profiles"]["runtime"]["profiles"], [])
         self.assertEqual(len(by_name["one-profile-125"]["settings"]["profiles"]), 1)
         self.assertEqual(by_name["one-profile-125"]["ui_scale_percent"], 125)
         dynamic = by_name["dynamic-three-profiles"]

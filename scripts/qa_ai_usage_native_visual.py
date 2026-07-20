@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 SCENARIO_NAMES = (
+    "zero-profiles",
     "mixed-ready-standard",
     "one-profile-125",
     "dynamic-three-profiles",
@@ -149,7 +150,11 @@ def build_scenario_fixture(
             if scenario in {"dynamic-three-profiles", "ten-mixed-profiles-150"}
             else [1040, 660]
         )
-        phase = "initial" if scenario == "mixed-ready-standard" else "final"
+        phase = (
+            "initial"
+            if scenario in {"zero-profiles", "mixed-ready-standard"}
+            else "final"
+        )
         interaction = {"action": "none", "profile_id": ""}
         codex_id = "codex_primary"
         cursor_id = "cursor_primary"
@@ -209,7 +214,10 @@ def build_scenario_fixture(
             "Enabled · US$1,234,567,890.12 used"
         )
     settings_profiles = [codex_profile, cursor_profile]
-    if scenario == "one-profile-125":
+    if scenario == "zero-profiles":
+        settings_profiles = []
+        runtime_profiles = []
+    elif scenario == "one-profile-125":
         ui_scale_percent = 125
         settings_profiles = [codex_profile]
         runtime_profiles = [runtime_profiles[0]]
