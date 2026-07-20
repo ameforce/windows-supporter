@@ -322,6 +322,29 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(len(win.after_calls), 2)
         self.assertEqual(win.after_cancel_calls, [first_after_id])
 
+    def test_runtime_refresh_reschedules_after_any_pending_result_reconciliation(self) -> None:
+        reconciler_names = (
+            "_reconcile_pending_profile_release_result",
+            "_reconcile_pending_profile_add_result",
+            "_reconcile_pending_profile_delete_result",
+            "_reconcile_external_settings_result",
+        )
+        for target_name in reconciler_names:
+            with self.subTest(reconciler=target_name):
+                view = CodexUsageSettingsView(root=None, codex_monitor=None)
+                view._win = _FakeWidget()
+                view._schedule_runtime_refresh = Mock()
+                for reconciler_name in reconciler_names:
+                    setattr(
+                        view,
+                        reconciler_name,
+                        Mock(return_value=reconciler_name == target_name),
+                    )
+
+                view._refresh_runtime_status()
+
+                view._schedule_runtime_refresh.assert_called_once_with(1000)
+
     def test_rate_limit_status_uses_user_facing_retry_countdown(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
 
@@ -1101,6 +1124,21 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._finish_external_settings_mutation(True, None)
 
         self.assertEqual(remounts, [True])
+        self.assertEqual(retries, [captured])
+        self.assertEqual(view._profile_deletions_inflight, set())
+
+    def test_external_toggle_failure_retries_edits_accepted_while_blocked(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._profile_deletions_inflight.add("__external_settings__")
+        captured = {"payload": {"profiles": [{"id": "account_1", "label": "edited"}]}}
+        view._build_settings_update = lambda: captured
+        view._set_status = lambda *_args, **_kwargs: None
+        retries = []
+        view._schedule_captured_autosave_retry = lambda payload: retries.append(payload)
+
+        view._schedule_autosave()
+        view._finish_external_settings_mutation(False, "toggle_failed")
+
         self.assertEqual(retries, [captured])
         self.assertEqual(view._profile_deletions_inflight, set())
 

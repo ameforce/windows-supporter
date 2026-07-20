@@ -1975,6 +1975,8 @@ class CodexUsageSettingsView:
             if retry_prepared is not None:
                 self._schedule_captured_autosave_retry(retry_prepared)
             return
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
         self._set_status(f"설정 변경 실패: {error}", level="error")
         return
 
@@ -2708,14 +2710,15 @@ class CodexUsageSettingsView:
         win = self._win
         if win is None:
             return
-        if self._reconcile_pending_profile_release_result():
-            return
-        if self._reconcile_pending_profile_add_result():
-            return
-        if self._reconcile_pending_profile_delete_result():
-            return
-        if self._reconcile_external_settings_result():
-            return
+        for reconcile in (
+            self._reconcile_pending_profile_release_result,
+            self._reconcile_pending_profile_add_result,
+            self._reconcile_pending_profile_delete_result,
+            self._reconcile_external_settings_result,
+        ):
+            if reconcile():
+                self._schedule_runtime_refresh(1000)
+                return
         runtime = self._safe_get_runtime()
         session_state = str(runtime.get("session_state", "logged_out") or "logged_out")
         profile_in_use = bool(runtime.get("profile_in_use", False))
