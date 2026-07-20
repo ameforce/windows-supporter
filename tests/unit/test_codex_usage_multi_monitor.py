@@ -3807,7 +3807,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             cursor_child.runtime["profile_name"] = ""
             self.assertEqual(
                 manager.get_runtime_status()["profiles"][0]["label"],
-                "Cursor 1",
+                "Cursor fallback",
             )
 
             profiles = manager.get_settings_snapshot()["profiles"]

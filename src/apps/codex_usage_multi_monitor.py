@@ -2090,6 +2090,11 @@ class CodexUsageMultiMonitor:
         if label_mode == "auto":
             if profile_name:
                 return profile_name
+            if custom_label and not _is_cross_provider_default_label(
+                custom_label,
+                account.provider,
+            ):
+                return custom_label
             return _default_profile_label(
                 account.provider,
                 self.__profile_label_index(
@@ -3426,6 +3431,15 @@ def _is_valid_profile_id(value: str) -> bool:
 def _default_profile_label(provider: str, index: int) -> str:
     provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
     return f"{provider_name} {max(1, int(index))}"
+
+
+def _is_cross_provider_default_label(label: str, provider: str) -> bool:
+    text = str(label or "").strip()
+    if not text:
+        return False
+    if str(provider or "").lower() == "cursor":
+        return bool(re.fullmatch(r"Codex [1-9]\d*", text))
+    return bool(re.fullmatch(r"Cursor [1-9]\d*", text))
 
 
 def _optional_percent(value: Any) -> float | None:
