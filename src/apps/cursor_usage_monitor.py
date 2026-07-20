@@ -131,10 +131,51 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
   ).filter(isVisible).map((element) => clean(element.innerText)).filter((text) =>
     /^(sign in|log in|continue with google|로그인)$/i.test(text)
   ).slice(0, 4).join(' ');
+  const collectProfileName = () => {
+    const selectors = [
+      '[data-testid*="profile" i]',
+      '[data-testid*="account" i]',
+      '[aria-label*="profile" i]',
+      '[aria-label*="account" i]',
+      '[aria-label*="프로필" i]',
+      '[aria-label*="계정" i]',
+      'header button[aria-haspopup="menu"]',
+      'nav button[aria-haspopup="menu"]',
+      'button[aria-haspopup="menu"]',
+    ];
+    const seen = new Set();
+    for (const selector of selectors) {
+      for (const node of Array.from(document.querySelectorAll(selector))) {
+        if (!isVisible(node) || isExcluded(node)) continue;
+        const nodeIdentity = clean([
+          node.getAttribute ? node.getAttribute('data-testid') : '',
+          node.getAttribute ? node.getAttribute('aria-label') : '',
+          node.getAttribute ? node.getAttribute('title') : '',
+        ].join(' ')).toLowerCase();
+        if (nodeIdentity && !/(profile|account|프로필|계정|avatar|user)/i.test(nodeIdentity)) {
+          continue;
+        }
+        for (const raw of [
+          node.getAttribute ? node.getAttribute('aria-label') : '',
+          node.getAttribute ? node.getAttribute('title') : '',
+          node.innerText || node.textContent || '',
+        ]) {
+          const candidate = clean(raw);
+          if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
+          if (/^(sign in|log in|settings|설정|로그아웃|로그인)$/i.test(candidate)) continue;
+          if (seen.has(candidate)) continue;
+          seen.add(candidate);
+          return candidate;
+        }
+      }
+    }
+    return '';
+  };
   return {
     url: String(location.href || ''),
     title: clean(document.title),
     mainText: summaryText || loginText,
+    profileName: collectProfileName(),
     metricBlocks: summaryText ? [{
       metric_key: 'cursor_account_summary',
       block_text: summaryText,
@@ -588,6 +629,7 @@ class CursorUsageMonitor:
             profile_id=self.profile_id,
             state=UsageState.UNKNOWN,
         )
+        self._profile_name = ""
         self._restore_last_success()
         if self._last_reading.state == UsageState.STALE:
             self._last_error_type = UsageErrorType.TRANSIENT
@@ -766,6 +808,7 @@ class CursorUsageMonitor:
             "login_window_open": bool(browser.login_window_open),
             "can_login": session_state != "logged_in" and not browser.login_window_open,
             "can_logout": browser.state != BrowserState.STOPPED or session_state == "logged_in",
+            "profile_name": str(self._profile_name or ""),
             "usage_history": [],
         }
 
@@ -908,6 +951,11 @@ class CursorUsageMonitor:
                 state=UsageState.DOM_DRIFT,
                 captured_at=captured_at,
             )
+        from src.apps.codex_usage_monitor import sanitize_profile_name
+
+        profile_name = sanitize_profile_name(probe.get("profileName", ""))
+        if profile_name:
+            self._profile_name = profile_name
         summary_text = ""
         for block in probe.get("metricBlocks", []):
             if not isinstance(block, dict):
@@ -1157,6 +1205,11 @@ class CursorUsageMonitor:
             return
         if reading.is_usable:
             self._last_reading = reading
+        from src.apps.codex_usage_monitor import sanitize_profile_name
+
+        profile_name = sanitize_profile_name(data.get("profile_name", ""))
+        if profile_name:
+            self._profile_name = profile_name
 
     def _save_last_success(self, reading: AiUsageReading) -> None:
         if (
@@ -1179,6 +1232,7 @@ class CursorUsageMonitor:
                     "reset_at": reading.reset_at,
                     "reset_precision": reading.reset_precision,
                     "on_demand_enabled": reading.on_demand_enabled,
+                    "profile_name": str(self._profile_name or ""),
                 },
             )
         except OSError:

@@ -3469,6 +3469,48 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(metrics[0]["short_value_text"], "100%")
             self.assertEqual(metrics[0]["reset_precision"], "date")
 
+    def test_taskbar_short_value_text_rounds_percent_to_integer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            children[-1].last_snapshot = {
+                "state": "ready",
+                "included_remaining_percent": 80.75,
+                "included_usage": "US$3.85 / US$20",
+                "billing_reset_at": "2026-08-13",
+                "reset_precision": "date",
+                "on_demand_enabled": False,
+            }
+
+            metrics = manager.get_runtime_status()["profiles"][0]["metrics"]
+
+            self.assertEqual(metrics[0]["short_value_text"], "81%")
+            self.assertEqual(metrics[0]["percent"], 80.75)
+
+    def test_auto_label_uses_provider_default_when_cursor_profile_name_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[1].update(
+                {
+                    "provider": "cursor",
+                    "label": "Codex 2",
+                    "label_mode": "auto",
+                    "custom_label": "Codex 2",
+                }
+            )
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            cursor_child = manager._CodexUsageMultiMonitor__children["account_2"]
+            cursor_child.runtime["profile_name"] = ""
+
+            label = manager.get_runtime_status()["profiles"][1]["label"]
+
+            self.assertEqual(label, "Cursor 2")
+
     def test_runtime_snapshot_aggregates_enabled_accounts_and_routes_account_actions(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
@@ -3765,7 +3807,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             cursor_child.runtime["profile_name"] = ""
             self.assertEqual(
                 manager.get_runtime_status()["profiles"][0]["label"],
-                "Cursor fallback",
+                "Cursor 1",
             )
 
             profiles = manager.get_settings_snapshot()["profiles"]

@@ -885,6 +885,42 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(records[0]["failure_count"], 1)
             self.assertNotIn("probe", records[0])
 
+    def test_probe_contract_collects_visible_profile_name(self) -> None:
+        lowered = CURSOR_USAGE_PAGE_PROBE_SCRIPT.lower()
+
+        self.assertIn("profilename", lowered)
+        self.assertIn("collectprofilename", lowered)
+        self.assertIn("aria-label", lowered)
+        self.assertNotIn("document.cookie", lowered)
+        self.assertNotIn("localstorage", lowered)
+        self.assertNotIn("fetch(", lowered)
+
+    def test_collector_binds_probe_profile_name_into_runtime(self) -> None:
+        session = self._Session(
+            [
+                BrowserOperationResult(
+                    probe={
+                        **self._probe(
+                            "Included usage: $12.50 / $20.00\n"
+                            "Reset: 2026-08-01T00:00:00Z\n"
+                            "On-demand usage: ON"
+                        ),
+                        "profileName": "Kim Jong Account",
+                    }
+                )
+            ]
+        )
+        monitor = CursorUsageMonitor(
+            profile_id="cursor-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        reading = monitor.collect()
+        runtime = monitor.get_runtime_status()
+
+        self.assertEqual(reading.state, UsageState.READY)
+        self.assertEqual(runtime["profile_name"], "Kim Jong")
+
 
 if __name__ == "__main__":
     unittest.main()
