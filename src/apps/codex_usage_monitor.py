@@ -671,6 +671,7 @@ def normalize_usage_value(value: str) -> str:
 _PROFILE_NAME_REJECT_EXACT_PATTERN = re.compile(
     r"^(?:"
     r"open|close|menu|settings?|profile|account|user|button|toggle|"
+    r"my|your|edit|switch|view|"
     r"pro|plus|team|enterprise|free|"
     r"열기|닫기|메뉴|설정|프로필|계정|사용자|버튼|지정"
     r")$",
@@ -680,6 +681,8 @@ _PROFILE_NAME_REJECT_EXACT_PATTERN = re.compile(
 _PROFILE_NAME_REJECT_FRAGMENT_PATTERN = re.compile(
     r"(?:"
     r"log in|sign in|logout|log out|settings|"
+    r"(?:my|your|edit|switch|view|open)\s+(?:account|profile)|"
+    r"(?:account|profile|user)\s+menu|"
     r"로그인|로그아웃|설정|메뉴\s*열기|프로필\s*메뉴|알림\s*열기|"
     r"사용자\s*지정|그룹화\s*기준"
     r")",

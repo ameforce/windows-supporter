@@ -133,7 +133,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
   ).slice(0, 4).join(' ');
   const collectProfileName = () => {
     const identityCue = /(profile|account|프로필|계정|avatar|user)/i;
-    const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close)$/i;
+    const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu)$/i;
     const selectors = [
       '[data-testid*="profile" i]',
       '[data-testid*="account" i]',

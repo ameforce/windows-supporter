@@ -749,6 +749,22 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(sanitize_profile_name(value), "")
 
+    def test_sanitize_profile_name_rejects_account_chrome_aria_labels(self) -> None:
+        for value in (
+            "Account menu",
+            "Profile menu",
+            "User menu",
+            "My Account",
+            "Your account",
+            "Edit profile",
+            "Switch account",
+            "View account",
+            "Open account menu",
+            "Open profile",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(sanitize_profile_name(value), "")
+
     def test_sanitize_profile_name_keeps_real_profile_name(self) -> None:
         self.assertEqual(sanitize_profile_name("Profile: Daeng"), "Daeng")
         self.assertEqual(sanitize_profile_name("이니미니"), "이니미니")

@@ -893,9 +893,42 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertIn("aria-label", lowered)
         self.assertIn("genericlabel", lowered)
         self.assertIn("broadmenu", lowered)
+        self.assertIn(r"(?:account|profile|user)\s+menu", lowered)
+        self.assertIn(r"(?:my|your|edit|switch|view|open)\s+(?:account|profile)", lowered)
         self.assertNotIn("document.cookie", lowered)
         self.assertNotIn("localstorage", lowered)
         self.assertNotIn("fetch(", lowered)
+
+    def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
+        for chrome_name in (
+            "Account menu",
+            "Profile menu",
+            "My Account",
+            "Edit profile",
+            "Switch account",
+        ):
+            with self.subTest(chrome_name=chrome_name):
+                session = self._Session(
+                    [
+                        BrowserOperationResult(
+                            probe={
+                                **self._probe(
+                                    "Included usage: $12.50 / $20.00\n"
+                                    "Reset: 2026-08-01T00:00:00Z\n"
+                                    "On-demand usage: ON"
+                                ),
+                                "profileName": chrome_name,
+                            }
+                        )
+                    ]
+                )
+                monitor = CursorUsageMonitor(
+                    profile_id="cursor-personal",
+                    browser_session_factory=lambda _config: session,
+                )
+                reading = monitor.collect()
+                self.assertEqual(reading.state, UsageState.READY)
+                self.assertEqual(monitor.get_runtime_status()["profile_name"], "")
 
     def test_collector_binds_probe_profile_name_into_runtime(self) -> None:
         session = self._Session(
