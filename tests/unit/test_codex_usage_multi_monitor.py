@@ -1375,6 +1375,90 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             with open(backup_path, encoding="utf-8") as fp:
                 self.assertEqual(json.load(fp), source)
 
+    def test_future_and_malformed_v4_settings_remain_read_only_and_unchanged(self):
+        cases = {
+            "future": {
+                "settings_version": 5,
+                "future_field": {"must": "survive"},
+                "profiles": [
+                    {
+                        "id": f"profile_{'a' * 32}",
+                        "provider": "cursor",
+                        "enabled": True,
+                    }
+                ],
+                "profile_order": [f"profile_{'a' * 32}"],
+                "selected_profile_ids": [],
+                "default_account_id": f"profile_{'a' * 32}",
+            },
+            "duplicate": {
+                "settings_version": 4,
+                "profiles": [
+                    {"id": "account_1", "provider": "codex", "enabled": True},
+                    {"id": "account_1", "provider": "cursor", "enabled": True},
+                ],
+                "profile_order": ["account_1"],
+                "selected_profile_ids": ["account_1"],
+                "default_account_id": "account_1",
+            },
+            "unsupported_provider": {
+                "settings_version": 4,
+                "profiles": [
+                    {"id": "account_1", "provider": "future-ai", "enabled": True}
+                ],
+                "profile_order": ["account_1"],
+                "selected_profile_ids": ["account_1"],
+                "default_account_id": "account_1",
+            },
+            "fractional_version": {
+                "settings_version": 4.5,
+                "profiles": [
+                    {"id": "account_1", "provider": "codex", "enabled": True}
+                ],
+                "profile_order": ["account_1"],
+                "selected_profile_ids": ["account_1"],
+                "default_account_id": "account_1",
+            },
+            "accounts_mismatch": {
+                "settings_version": 4,
+                "profiles": [
+                    {"id": "account_1", "provider": "codex", "enabled": True}
+                ],
+                "accounts": [
+                    {"id": "account_2", "provider": "cursor", "enabled": True}
+                ],
+                "profile_order": ["account_1"],
+                "selected_profile_ids": ["account_1"],
+                "default_account_id": "account_1",
+            },
+        }
+        for name, payload in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                config_dir = os.path.join(tmp, "config")
+                os.makedirs(config_dir, exist_ok=True)
+                settings_path = os.path.join(config_dir, "ai_usage_settings.json")
+                original = json.dumps(payload, ensure_ascii=False, indent=2)
+                with open(settings_path, "w", encoding="utf-8") as fp:
+                    fp.write(original)
+                manager = CodexUsageMultiMonitor(
+                    config_dir=config_dir,
+                    local_base_dir=os.path.join(tmp, "local"),
+                    monitor_factory=lambda config_dir, profile_dir: _FakeChildMonitor(
+                        config_dir,
+                        profile_dir,
+                    ),
+                )
+
+                self.assertEqual(
+                    manager.update_settings({"interval_sec": 123}),
+                    (False, "settings_read_only"),
+                )
+                with open(settings_path, "r", encoding="utf-8") as fp:
+                    self.assertEqual(fp.read(), original)
+                snapshot = manager.get_settings_snapshot()
+                self.assertTrue(snapshot["settings_read_only"])
+                self.assertTrue(snapshot["settings_error"])
+
     def test_profiles_support_zero_one_three_and_twenty_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             for count in (0, 1, 3, 20):

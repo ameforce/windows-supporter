@@ -174,6 +174,8 @@ class CodexUsageMultiMonitor:
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
         self.__notification_events: list[dict[str, Any]] = []
+        self.__settings_write_block_reason: str | None = None
+        self.__source_settings_version = 0
         self.__recovery_pending_profile_ids: set[str] = set()
         self.__account_settings = {
             account_id: _AccountSettings(
@@ -218,17 +220,37 @@ class CodexUsageMultiMonitor:
             if isinstance(manager_settings, dict)
             else 0
         )
-        self.__load_manager_settings(manager_settings)
-        self.__retry_pending_profile_cleanup()
+        self.__source_settings_version = int(source_settings_version)
+        self.__settings_write_block_reason = self.__validate_manager_settings(
+            manager_settings
+        )
+        if self.__settings_write_block_reason is None:
+            self.__load_manager_settings(manager_settings)
+            self.__retry_pending_profile_cleanup()
+        else:
+            self.__account_settings = {}
+            self.__account_order = []
+            self.__default_account_id = ""
+            self.__append_notification_event(
+                {
+                    "type": "manager_settings_read_only",
+                    "reason": self.__settings_write_block_reason,
+                    "settings_version": int(source_settings_version),
+                }
+            )
         self.__account_paths = self.__build_account_paths()
         legacy_settings = self.__read_legacy_settings()
         if (
-            source_settings_version < AI_USAGE_SETTINGS_VERSION
+            self.__settings_write_block_reason is None
+            and source_settings_version < AI_USAGE_SETTINGS_VERSION
             and "account_1" in self.__account_settings
             and "account_1" not in self.__recovery_pending_profile_ids
         ):
             self.__migrate_legacy_single_account_files_if_needed()
-        if not has_manager_settings or manager_settings_version < AI_USAGE_SETTINGS_VERSION:
+        if self.__settings_write_block_reason is None and (
+            not has_manager_settings
+            or manager_settings_version < AI_USAGE_SETTINGS_VERSION
+        ):
             if not isinstance(manager_settings, dict):
                 self.__apply_legacy_manager_settings(legacy_settings)
             self.__save_manager_settings()
@@ -246,7 +268,8 @@ class CodexUsageMultiMonitor:
             )
             for account_id, paths in self.__account_paths.items()
         }
-        self.__retry_pending_settings_recovery()
+        if self.__settings_write_block_reason is None:
+            self.__retry_pending_settings_recovery()
         return
 
     def attach(self, root, event_queue=None) -> None:
@@ -335,6 +358,9 @@ class CodexUsageMultiMonitor:
         ]
         return {
             "settings_version": AI_USAGE_SETTINGS_VERSION,
+            "source_settings_version": int(self.__source_settings_version),
+            "settings_read_only": bool(self.__settings_write_block_reason),
+            "settings_error": str(self.__settings_write_block_reason or ""),
             "enabled": bool(self.__enabled),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
             "interval_sec": float(self.__interval_sec),
@@ -359,6 +385,8 @@ class CodexUsageMultiMonitor:
     def update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
         if bool(self.__closing):
             return False, "shutdown"
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only"
         with self.__profile_lifecycle_lock:
             return self.__update_settings_guarded(data)
 
@@ -425,6 +453,8 @@ class CodexUsageMultiMonitor:
     def toggle_enabled(self) -> tuple[bool, str | None]:
         if bool(self.__closing):
             return False, "shutdown"
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only"
         with self.__profile_lifecycle_lock:
             return self.__toggle_enabled()
 
@@ -832,6 +862,8 @@ class CodexUsageMultiMonitor:
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
         if bool(self.__closing):
             return False, "shutdown", None
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only", None
         with self.__profile_lifecycle_lock:
             return self.__add_profile_guarded(provider)
 
@@ -965,6 +997,8 @@ class CodexUsageMultiMonitor:
     def delete_profile(self, profile_id: str, *, confirmed: bool = False) -> tuple[bool, str | None]:
         if bool(self.__closing):
             return False, "shutdown"
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only"
         with self.__profile_lifecycle_lock:
             return self.__delete_profile_guarded(profile_id, confirmed=confirmed)
 
@@ -1183,6 +1217,8 @@ class CodexUsageMultiMonitor:
         )
         return {
             "enabled": bool(self.__enabled),
+            "settings_read_only": bool(self.__settings_write_block_reason),
+            "settings_error": str(self.__settings_write_block_reason or ""),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
             "monitor_state": self.__aggregate_monitor_state(runtimes),
             "session_state": self.__aggregate_session_state(runtimes),
@@ -2233,6 +2269,82 @@ class CodexUsageMultiMonitor:
             profile_dir=profile_dir,
         )
 
+    def __validate_manager_settings(self, data: dict | None) -> str | None:
+        if not isinstance(data, dict):
+            return None
+        raw_version = data.get("settings_version", 0)
+        if isinstance(raw_version, bool) or not (
+            isinstance(raw_version, int)
+            or (
+                isinstance(raw_version, str)
+                and re.fullmatch(r"[0-9]+", raw_version.strip()) is not None
+            )
+        ):
+            return "invalid_settings_version"
+        settings_version = int(raw_version)
+        if settings_version > AI_USAGE_SETTINGS_VERSION:
+            return "unsupported_settings_version"
+        if settings_version < AI_USAGE_SETTINGS_VERSION:
+            return None
+
+        profiles = data.get("profiles")
+        if not isinstance(profiles, list):
+            return "invalid_v4_profiles"
+        accounts = data.get("accounts")
+        if accounts is not None and accounts != profiles:
+            return "invalid_v4_accounts_alias"
+        profile_ids: list[str] = []
+        for raw in profiles:
+            if not isinstance(raw, dict):
+                return "invalid_v4_profile"
+            profile_id = str(raw.get("id", "") or "")
+            if not _is_valid_profile_id(profile_id) or profile_id in profile_ids:
+                return "invalid_v4_profile_id"
+            provider = str(raw.get("provider", "") or "").strip().lower()
+            if provider not in SUPPORTED_PROVIDERS:
+                return "invalid_v4_provider"
+            provider_settings = raw.get("provider_settings")
+            if provider_settings is not None:
+                if not isinstance(provider_settings, dict):
+                    return "invalid_v4_provider_settings"
+                if any(
+                    key not in SUPPORTED_PROVIDERS or not isinstance(value, dict)
+                    for key, value in provider_settings.items()
+                ):
+                    return "invalid_v4_provider_settings"
+            profile_ids.append(profile_id)
+
+        known_ids = set(profile_ids)
+        for key in ("profile_order", "account_order"):
+            raw_order = data.get(key)
+            if raw_order is None:
+                continue
+            if not isinstance(raw_order, list):
+                return "invalid_v4_profile_order"
+            normalized_order = [str(item or "") for item in raw_order]
+            if (
+                len(normalized_order) != len(set(normalized_order))
+                or any(item not in known_ids for item in normalized_order)
+            ):
+                return "invalid_v4_profile_order"
+
+        selected = data.get("selected_profile_ids")
+        if selected is not None:
+            if not isinstance(selected, list):
+                return "invalid_v4_taskbar_selection"
+            normalized_selected = [str(item or "") for item in selected]
+            if (
+                len(normalized_selected) > TASKBAR_PROFILE_LIMIT
+                or len(normalized_selected) != len(set(normalized_selected))
+                or any(item not in known_ids for item in normalized_selected)
+            ):
+                return "invalid_v4_taskbar_selection"
+
+        default_profile_id = str(data.get("default_account_id", "") or "")
+        if default_profile_id and default_profile_id not in known_ids:
+            return "invalid_v4_default_profile"
+        return None
+
     def __load_manager_settings(self, data: dict | None) -> None:
         if not isinstance(data, dict):
             return
@@ -2388,6 +2500,8 @@ class CodexUsageMultiMonitor:
         tooltip_duration_ms: int | None = None,
         usage_url: str | None = None,
     ) -> None:
+        if self.__settings_write_block_reason is not None:
+            raise RuntimeError("settings are read-only")
         settings = account_settings if account_settings is not None else self.__account_settings
         requested_order = account_order if account_order is not None else self.__ordered_account_ids()
         ordered_ids: list[str] = []
