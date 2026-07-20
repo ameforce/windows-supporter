@@ -325,6 +325,11 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(display_vars["included_usage"].get(), "포함 사용량: -")
         self.assertEqual(display_vars["billing_reset_at"].get(), "결제 주기 초기화: -")
         self.assertEqual(display_vars["on_demand_status"].get(), "온디맨드: -")
+        metric_vars["on_demand_status"].set("활성화\u00a0·\u00a0US$8.20\u00a0사용")
+        self.assertEqual(
+            display_vars["on_demand_status"].get(),
+            "온디맨드:\u00a0활성화\u00a0·\u00a0US$8.20\u00a0사용",
+        )
 
     def test_usage_metric_values_are_localized_without_changing_amounts(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)

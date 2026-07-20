@@ -848,21 +848,34 @@ class CodexUsageSettingsView:
                 display_var = tk.StringVar(value=f"{label}: -")
                 metric_vars[key] = value_var
                 display_vars[key] = display_var
-                self._bind_metric_display_value(label, value_var, display_var)
+                self._bind_metric_display_value(
+                    label,
+                    value_var,
+                    display_var,
+                    keep_together=key == "on_demand_status",
+                )
                 cell = self._add_metric_cell(parent, row_index, column, display_var, bg)
                 if account_id and cell is not None:
                     self._account_metric_cells.setdefault(account_id, {})[key] = cell
         return metric_vars, display_vars
 
-    def _bind_metric_display_value(self, label: str, value_var: Any, display_var: Any) -> None:
+    def _bind_metric_display_value(
+        self,
+        label: str,
+        value_var: Any,
+        display_var: Any,
+        *,
+        keep_together: bool = False,
+    ) -> None:
         def sync(*_args: Any) -> None:
             try:
                 raw = str(value_var.get() or "").strip()
             except Exception:
                 raw = ""
             value = raw if raw else "-"
+            separator = "\u00a0" if keep_together and value != "-" else " "
             try:
-                display_var.set(f"{label}: {value}")
+                display_var.set(f"{label}:{separator}{value}")
             except Exception:
                 pass
 
