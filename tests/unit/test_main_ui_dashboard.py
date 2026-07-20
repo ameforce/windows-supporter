@@ -860,6 +860,25 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertFalse(any(text.startswith("Third (Codex):") for text in labels))
         self.assertFalse(any(text.startswith("Fourth (Codex):") for text in labels))
 
+    def test_ai_usage_profile_summary_parts_are_rendered_on_separate_rows(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        _, parts = view._format_ai_usage(
+            {
+                "enabled": True,
+                "profiles": [
+                    {"id": "first", "label": "First", "taskbar_selected": False},
+                    {"id": "second", "label": "Second", "taskbar_selected": True},
+                ],
+            }
+        )
+
+        rows = view._status_part_rows("ai_usage", parts)
+
+        self.assertEqual(rows[0], parts[:3])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[1][0][0].split(" (")[0], "First")
+        self.assertEqual(rows[2][0][0].split(" (")[0], "Second")
+
     def test_update_formatter_shows_available_version(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 

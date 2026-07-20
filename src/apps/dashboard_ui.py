@@ -393,38 +393,48 @@ class DashboardView:
                     continue
         except Exception:
             return
-        for idx, (raw_text, kind) in enumerate(list(parts or [])):
-            if idx > 0:
-                tk.Label(
-                    frame,
-                    text=" | ",
+        for row_parts in self._status_part_rows(key, parts):
+            row = tk.Frame(frame, bg="#FFFFFF")
+            row.pack(anchor="w", fill="x")
+            for idx, (raw_text, kind) in enumerate(row_parts):
+                if idx > 0:
+                    tk.Label(
+                        row,
+                        text=" | ",
+                        bg="#FFFFFF",
+                        fg="#6B7280",
+                        font=("Segoe UI", 9),
+                    ).pack(side="left")
+                fg = "#111827"
+                if kind == "enabled":
+                    fg = "#059669"
+                elif kind == "disabled":
+                    fg = "#DC2626"
+                label = tk.Label(
+                    row,
+                    text=str(raw_text),
                     bg="#FFFFFF",
-                    fg="#6B7280",
-                    font=("Segoe UI", 9),
-                ).pack(side="left")
-            fg = "#111827"
-            if kind == "enabled":
-                fg = "#059669"
-            elif kind == "disabled":
-                fg = "#DC2626"
-            label = tk.Label(
-                frame,
-                text=str(raw_text),
-                bg="#FFFFFF",
-                fg=fg,
-                font=("Segoe UI", 9, "bold") if kind in {"enabled", "disabled"} else ("Segoe UI", 9),
-            )
-            label.pack(
-                side="left",
-            )
-            callback_name = f"{key}.settings"
-            if callable(self._get_callback(callback_name)):
-                try:
-                    label.configure(cursor="hand2")
-                except Exception:
-                    pass
-                self._bind_click(label, callback_name)
+                    fg=fg,
+                    font=("Segoe UI", 9, "bold") if kind in {"enabled", "disabled"} else ("Segoe UI", 9),
+                )
+                label.pack(side="left")
+                callback_name = f"{key}.settings"
+                if callable(self._get_callback(callback_name)):
+                    try:
+                        label.configure(cursor="hand2")
+                    except Exception:
+                        pass
+                    self._bind_click(label, callback_name)
         return
+
+    @staticmethod
+    def _status_part_rows(key: str, parts: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
+        normalized = list(parts or [])
+        if str(key) != "ai_usage":
+            return [normalized] if normalized else []
+        summary = normalized[:3]
+        profiles = [[part] for part in normalized[3:]]
+        return ([summary] if summary else []) + profiles
 
     def _get_callback(self, name: str) -> Callable[[], Any] | None:
         callback_name = str(name)
