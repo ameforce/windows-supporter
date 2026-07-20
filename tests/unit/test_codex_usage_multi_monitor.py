@@ -1431,6 +1431,31 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 "selected_profile_ids": ["account_1"],
                 "default_account_id": "account_1",
             },
+            "order_alias_mismatch": {
+                "settings_version": 4,
+                "profiles": [
+                    {"id": "account_1", "provider": "codex", "enabled": True},
+                    {"id": "account_2", "provider": "cursor", "enabled": True},
+                ],
+                "profile_order": ["account_1", "account_2"],
+                "account_order": ["account_2", "account_1"],
+                "selected_profile_ids": ["account_1"],
+                "default_account_id": "account_1",
+            },
+            "selection_mismatch": {
+                "settings_version": 4,
+                "profiles": [
+                    {
+                        "id": "account_1",
+                        "provider": "codex",
+                        "enabled": True,
+                        "taskbar_selected": False,
+                    }
+                ],
+                "profile_order": ["account_1"],
+                "selected_profile_ids": ["account_1"],
+                "default_account_id": "account_1",
+            },
         }
         for name, payload in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
@@ -1458,6 +1483,43 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 snapshot = manager.get_settings_snapshot()
                 self.assertTrue(snapshot["settings_read_only"])
                 self.assertTrue(snapshot["settings_error"])
+
+    def test_existing_unreadable_settings_never_fall_back_or_overwrite_original_bytes(self):
+        cases = {
+            "malformed_json": b"{",
+            "top_level_array": b"[]",
+            "invalid_utf8": b"\xff\xfe",
+        }
+        for name, original in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                config_dir = os.path.join(tmp, "config")
+                os.makedirs(config_dir, exist_ok=True)
+                settings_path = os.path.join(config_dir, "ai_usage_settings.json")
+                with open(settings_path, "wb") as fp:
+                    fp.write(original)
+                with open(
+                    os.path.join(config_dir, "codex_usage_multi_settings.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as fp:
+                    json.dump({"settings_version": 3, "enabled": False}, fp)
+
+                manager = CodexUsageMultiMonitor(
+                    config_dir=config_dir,
+                    local_base_dir=os.path.join(tmp, "local"),
+                    monitor_factory=lambda config_dir, profile_dir: _FakeChildMonitor(
+                        config_dir,
+                        profile_dir,
+                    ),
+                )
+
+                self.assertEqual(
+                    manager.update_settings({"interval_sec": 123}),
+                    (False, "settings_read_only"),
+                )
+                self.assertTrue(manager.get_settings_snapshot()["settings_read_only"])
+                with open(settings_path, "rb") as fp:
+                    self.assertEqual(fp.read(), original)
 
     def test_profiles_support_zero_one_three_and_twenty_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2117,8 +2179,13 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 config_dir=os.path.join(tmp, "config"),
                 local_base_dir=os.path.join(tmp, "local"),
                 monitor_factory=factory,
+                taskbar_progress_factory=_FakeTaskbarOverlay,
             )
-            manager.attach(_FakeRoot(), queue.Queue())
+            root = _FakeRoot()
+            event_queue = queue.Queue()
+            manager.attach(root, event_queue)
+            overlay = _FakeTaskbarOverlay(root, manager.get_runtime_status)
+            manager._CodexUsageMultiMonitor__taskbar_progress = overlay
             manager._CodexUsageMultiMonitor__shutdown_quiescence_timeout_sec = 0.05
             manager.show_current_status(force_refresh=True)
             self.assertTrue(refresh_started.wait(1.0))
@@ -2132,13 +2199,31 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
             shutdown_thread.start()
             completed_with_timeout = shutdown_finished.wait(0.5)
+            after_calls_after_shutdown = list(root.after_calls)
+            after_cancel_calls_after_shutdown = list(root.after_cancel_calls)
+            queued_callbacks_after_shutdown = event_queue.qsize()
+            overlay_refreshes_after_shutdown = overlay.refresh_calls
             release_refresh.set()
             shutdown_thread.join(2.0)
+            self.assertTrue(
+                self._wait_until(
+                    lambda: not manager._CodexUsageMultiMonitor__refresh_inflight,
+                )
+            )
 
             self.assertTrue(completed_with_timeout)
             self.assertFalse(shutdown_thread.is_alive())
             self.assertEqual(shutdown_results, [False])
             self.assertEqual(children[0].cancel_calls, 1)
+            self.assertEqual(root.after_calls, after_calls_after_shutdown)
+            self.assertEqual(root.after_cancel_calls, after_cancel_calls_after_shutdown)
+            self.assertEqual(event_queue.qsize(), queued_callbacks_after_shutdown)
+            self.assertEqual(
+                overlay.refresh_calls,
+                overlay_refreshes_after_shutdown,
+            )
+            self.assertIsNone(manager._CodexUsageMultiMonitor__root)
+            self.assertIsNone(manager._CodexUsageMultiMonitor__event_queue)
             self.assertTrue(
                 any(
                     event.get("type") == "manager_shutdown_quiescence_timeout"

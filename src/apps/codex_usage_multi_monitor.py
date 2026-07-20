@@ -193,7 +193,11 @@ class CodexUsageMultiMonitor:
             )
             for account_id in LEGACY_ACCOUNT_IDS
         }
+        manager_settings_file_present = os.path.isfile(self.__settings_path)
         manager_settings = self.__read_json_file(self.__settings_path)
+        manager_settings_unreadable = bool(
+            manager_settings_file_present and not isinstance(manager_settings, dict)
+        )
         has_manager_settings = isinstance(manager_settings, dict)
         manager_settings_version = (
             _safe_int(manager_settings.get("settings_version", 0), 0)
@@ -205,7 +209,7 @@ class CodexUsageMultiMonitor:
                 self.__settings_path,
                 os.path.join(self.__config_dir, "ai_usage_settings.v3.backup.json"),
             )
-        if not isinstance(manager_settings, dict):
+        if not isinstance(manager_settings, dict) and not manager_settings_unreadable:
             manager_settings = self.__read_json_file(self.__legacy_manager_settings_path)
             if isinstance(manager_settings, dict):
                 self.__backup_file_once(
@@ -221,8 +225,10 @@ class CodexUsageMultiMonitor:
             else 0
         )
         self.__source_settings_version = int(source_settings_version)
-        self.__settings_write_block_reason = self.__validate_manager_settings(
-            manager_settings
+        self.__settings_write_block_reason = (
+            "invalid_settings_file"
+            if manager_settings_unreadable
+            else self.__validate_manager_settings(manager_settings)
         )
         if self.__settings_write_block_reason is None:
             self.__load_manager_settings(manager_settings)
@@ -2315,6 +2321,7 @@ class CodexUsageMultiMonitor:
             profile_ids.append(profile_id)
 
         known_ids = set(profile_ids)
+        normalized_orders: dict[str, list[str]] = {}
         for key in ("profile_order", "account_order"):
             raw_order = data.get(key)
             if raw_order is None:
@@ -2327,6 +2334,13 @@ class CodexUsageMultiMonitor:
                 or any(item not in known_ids for item in normalized_order)
             ):
                 return "invalid_v4_profile_order"
+            normalized_orders[key] = normalized_order
+        if (
+            "profile_order" in normalized_orders
+            and "account_order" in normalized_orders
+            and normalized_orders["profile_order"] != normalized_orders["account_order"]
+        ):
+            return "invalid_v4_order_alias"
 
         selected = data.get("selected_profile_ids")
         if selected is not None:
@@ -2339,6 +2353,16 @@ class CodexUsageMultiMonitor:
                 or any(item not in known_ids for item in normalized_selected)
             ):
                 return "invalid_v4_taskbar_selection"
+            if profiles and all(
+                isinstance(raw, dict) and "taskbar_selected" in raw for raw in profiles
+            ):
+                profile_selected_ids = {
+                    str(raw.get("id", "") or "")
+                    for raw in profiles
+                    if bool(raw.get("taskbar_selected"))
+                }
+                if profile_selected_ids != set(normalized_selected):
+                    return "invalid_v4_taskbar_alias"
 
         default_profile_id = str(data.get("default_account_id", "") or "")
         if default_profile_id and default_profile_id not in known_ids:
