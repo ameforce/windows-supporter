@@ -123,6 +123,9 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "상위 등급",
             "P3 처분",
             "P3 처분, validation",
+            "merge 직전에도 유효한 미래 만료일",
+            "만료된 위험수용은 stale·미완료",
+            "유효한 P3 처분",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, contract)
