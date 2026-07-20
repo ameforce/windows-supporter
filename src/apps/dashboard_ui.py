@@ -61,8 +61,38 @@ class DashboardView:
         except Exception:
             pass
 
-        container = tk.Frame(parent, bg=bg)
-        container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(parent, bg=bg, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        container = tk.Frame(canvas, bg=bg)
+        window_id = canvas.create_window((0, 0), window=container, anchor="nw")
+
+        def sync_scroll_region(_event: Any = None) -> None:
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+            return
+
+        def sync_content_width(event: Any) -> None:
+            try:
+                canvas.itemconfigure(window_id, width=max(1, int(event.width)))
+            except Exception:
+                pass
+            return
+
+        container.bind("<Configure>", sync_scroll_region)
+        canvas.bind("<Configure>", sync_content_width)
+        canvas.bind("<Enter>", lambda _event: canvas.focus_set())
+        canvas.bind("<MouseWheel>", lambda event: self._scroll_dashboard(canvas, event))
+        canvas.bind("<Button-4>", lambda event: self._scroll_dashboard(canvas, event))
+        canvas.bind("<Button-5>", lambda event: self._scroll_dashboard(canvas, event))
+        canvas.bind("<Up>", lambda _event: self._scroll_dashboard_units(canvas, -1))
+        canvas.bind("<Down>", lambda _event: self._scroll_dashboard_units(canvas, 1))
+        canvas.bind("<Prior>", lambda _event: self._scroll_dashboard_units(canvas, -1, pages=True))
+        canvas.bind("<Next>", lambda _event: self._scroll_dashboard_units(canvas, 1, pages=True))
 
         header_card = tk.Frame(
             container,
@@ -108,7 +138,36 @@ class DashboardView:
         self._add_update_section(body, text=text, bg=card_bg, border=border)
 
         self.refresh()
+        sync_scroll_region()
         return
+
+    @staticmethod
+    def _dashboard_scroll_units(delta: int | float | None) -> int:
+        try:
+            value = float(delta or 0)
+        except (TypeError, ValueError):
+            return 0
+        if value > 0:
+            return -1
+        if value < 0:
+            return 1
+        return 0
+
+    def _scroll_dashboard_units(self, canvas: Any, units: int, *, pages: bool = False) -> str:
+        if not int(units):
+            return "break"
+        try:
+            canvas.yview_scroll(int(units), "pages" if pages else "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _scroll_dashboard(self, canvas: Any, event: Any) -> str:
+        units = self._dashboard_scroll_units(getattr(event, "delta", 0))
+        if not units:
+            button = getattr(event, "num", None)
+            units = -1 if button == 4 else 1 if button == 5 else 0
+        return self._scroll_dashboard_units(canvas, units)
 
     def refresh(self) -> None:
         try:

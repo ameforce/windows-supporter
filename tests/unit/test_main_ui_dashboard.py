@@ -879,6 +879,13 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertEqual(rows[1][0][0].split(" (")[0], "First")
         self.assertEqual(rows[2][0][0].split(" (")[0], "Second")
 
+    def test_dashboard_scroll_wheel_uses_directional_single_steps(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        self.assertEqual(view._dashboard_scroll_units(120), -1)
+        self.assertEqual(view._dashboard_scroll_units(-120), 1)
+        self.assertEqual(view._dashboard_scroll_units(0), 0)
+
     def test_update_formatter_shows_available_version(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 
