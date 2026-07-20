@@ -896,6 +896,43 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
 
         self.assertEqual(rows, [[part] for part in parts])
 
+    def test_section_status_frame_fills_the_available_button_row_width(self):
+        class _Widget:
+            def __init__(self, *_args, **_kwargs):
+                self.grid_kwargs = None
+
+            def pack(self, **_kwargs):
+                return None
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+        class _Tk:
+            Frame = _Widget
+            Label = _Widget
+
+        class _Ttk:
+            Button = _Widget
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._tk = _Tk()
+        view._ttk = _Ttk()
+        view._add_section(
+            _Widget(),
+            key="background",
+            title="Background",
+            text="#111827",
+            bg="#FFFFFF",
+            border="#E5E7EB",
+            settings_callback=None,
+            toggle_callback="background.toggle",
+        )
+
+        self.assertEqual(view._status_frames["background"].grid_kwargs["sticky"], "ew")
+
     def test_dashboard_scroll_wheel_uses_directional_single_steps(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 

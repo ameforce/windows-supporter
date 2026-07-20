@@ -425,7 +425,7 @@ class DashboardView:
         except Exception:
             pass
         status_frame = tk.Frame(row, bg=bg, cursor="hand2" if settings_callback else "")
-        status_frame.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        status_frame.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         btn = ttk.Button(
             row,
             text="활성화",
