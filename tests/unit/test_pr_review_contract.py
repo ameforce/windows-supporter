@@ -122,9 +122,10 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "지적된 줄만 고치",
             "main Codex가 새 head를 완성됐다고 판정",
             "P3는 순수 권고이며 병합을 차단하지 않는다",
-            "처분, owner, 만료일 또는 후속 이슈",
+            "처분, owner, 만료일 또는 후속 이슈를 요구하지 않는다",
             "데이터·설정 무결성",
             "보안·인증",
+            "개인정보",
             "공개 호환성",
             "삭제·업데이트·릴리스 무결성",
             "영향 불확실성",
@@ -136,6 +137,7 @@ class PullRequestReviewContractTest(unittest.TestCase):
         for required_text in (
             "P0=0, P1=0, P2=0",
             "P3는 순수 권고·비차단",
+            "connector 명시 오류일 때만 같은 key 1회 재시도",
             "unresolved review thread: `0`",
         ):
             with self.subTest(required_text=required_text):
