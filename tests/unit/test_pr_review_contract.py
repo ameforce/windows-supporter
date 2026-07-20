@@ -134,6 +134,8 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "P0=0, P1=0, P2=0",
             "P3 처분",
             "수정/기각/위험수용/후속 이슈",
+            "merge 시점에도 유효한 미래 만료일",
+            "만료된 위험수용은 stale·미완료",
             "unresolved review thread: `0`",
         ):
             with self.subTest(required_text=required_text):
