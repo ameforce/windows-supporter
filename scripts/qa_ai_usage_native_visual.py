@@ -881,6 +881,8 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
     report = {
         "schema_version": 1,
         "ok": (
+            provenance["worktree_clean"]
+            and
             len(results) == len(SCENARIO_NAMES)
             and all(bool(result.get("ok")) for result in results)
             and len(generated_pngs) == len(SCENARIO_NAMES)
