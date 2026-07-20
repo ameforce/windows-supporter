@@ -13,8 +13,7 @@
 - [ ] P3 처분: `해당 없음` 또는 finding ID별 `수정/기각/위험수용/후속 이슈`; exact base/head, 근거·검증·책임자를 기록함. 기각에는 반증, 위험수용에는 **merge 시점에도 유효한 미래 만료일**, 후속 이슈에는 URL·owner·milestone·완료 조건을 기록함. 만료된 위험수용은 stale·미완료이며 새 처분 또는 P2 재분류가 필요함.
 - [ ] GitHub unresolved review thread: `0`
 - [ ] 위 기록 이후 push나 base 이동이 없으며 두 리뷰가 동일한 최신 base/head를 검토함
-- [ ] 위 조건을 확인한 뒤에만 `reviews-complete` label을 붙여 별도 테스트·빌드 CI를 실행함
-- [ ] push 또는 base/head SHA 변경 시 `reviews-complete` label, 기존 CI, P3 처분을 stale 처리하고 두 리뷰와 처분을 다시 확인한 뒤 label을 제거했다가 다시 붙임
+- [ ] push 또는 base/head SHA 변경 시 기존 리뷰와 P3 처분을 stale 처리하고 새 exact base/head에서 다시 확인함
 
 ## 별도 검증
 

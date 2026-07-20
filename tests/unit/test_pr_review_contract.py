@@ -37,27 +37,19 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertTrue(pull_request_rule["required_review_thread_resolution"])
         self.assertEqual(pull_request_rule["allowed_merge_methods"], ["merge"])
 
-    def test_pull_request_validation_is_exact_head_non_review_ci(self) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/pull-request-validation.yml").read_text(
+    def test_separate_pull_request_validation_gate_is_absent(self) -> None:
+        self.assertFalse(
+            (REPO_ROOT / ".github/workflows/pull-request-validation.yml").exists()
+        )
+
+        contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        template = (REPO_ROOT / ".github/pull_request_template.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("name: Pull request validation", workflow)
-        self.assertIn("name: pull-request-validation", workflow)
-        self.assertIn("github.event.pull_request.draft == false", workflow)
-        self.assertIn("github.event.label.name == 'reviews-complete'", workflow)
-        self.assertIn("- labeled", workflow)
-        self.assertNotIn("- synchronize", workflow)
-        self.assertIn("ref: ${{ github.sha }}", workflow)
-        self.assertIn("Verify immutable merge candidate identity", workflow)
-        self.assertIn("git rev-list --parents -n 1 HEAD", workflow)
-        self.assertIn("$parts.Count -ne 3", workflow)
-        self.assertIn("$baseSha -ne $eventBaseSha", workflow)
-        self.assertIn("$headSha -ne $eventHeadSha", workflow)
-        self.assertIn('"base_sha=$baseSha"', workflow)
-        self.assertIn('"head_sha=$headSha"', workflow)
-        self.assertIn('"merge_candidate_sha=$mergeSha"', workflow)
-        self.assertIn("It does not perform or prove PR review.", workflow)
-        self.assertNotIn("pr-quality-gate", workflow)
+        for removed_text in ("pull-request-validation", "reviews-complete"):
+            with self.subTest(removed_text=removed_text):
+                self.assertNotIn(removed_text, contract)
+                self.assertNotIn(removed_text, template)
 
     def test_pull_request_template_is_non_authoritative(self) -> None:
         template = (REPO_ROOT / ".github/pull_request_template.md").read_text(encoding="utf-8")
@@ -89,11 +81,6 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "creation/update/deletion을 모두 차단",
             "remote ref 부재를 최종 확인",
             "임시 freeze ruleset의 ID와 이름이 live 목록에 없음을 확인",
-            "`reviews-complete` label",
-            "potentialMergeCommit",
-            "refs/pull/<N>/merge",
-            "git rev-list --parents -n 1 FETCH_HEAD",
-            "workflow가 default branch에 들어간 뒤 새 PR에는 bootstrap 예외를 사용하지 않는다",
             "GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다",
         ):
             with self.subTest(required_text=required_text):
@@ -122,10 +109,10 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "작성자 단독으로 하향",
             "상위 등급",
             "P3 처분",
-            "P3 처분, validation",
+            "P3 처분을 모두 stale",
             "merge 직전에도 유효한 미래 만료일",
             "만료된 위험수용은 stale·미완료",
-            "유효한 P3 처분",
+            "P3 처분 완료",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, contract)
