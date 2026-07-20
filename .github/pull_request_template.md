@@ -9,11 +9,12 @@
 - [ ] 최종 base ref/SHA와 head SHA: `<base ref> / <40자리 base SHA> / <40자리 head SHA>`
 - [ ] GitHub `@codex review` 요청과 결과 — URL: `<URL>`; review `commit_id` 또는 zero-finding 댓글의 유일한 `Reviewed commit` prefix
 - [ ] 독립 native Codex read-only review 참조와 대상 SHA: `<참조> / <40자리 SHA>`
-- [ ] 두 실제 리뷰의 정규화 결과: `P0=0, P1=0, P2=0, P3=0`
+- [ ] 두 실제 리뷰의 병합 차단 결과: `P0=0, P1=0, P2=0`
+- [ ] P3 처분: `해당 없음` 또는 finding ID별 `수정/기각/위험수용/후속 이슈`; exact base/head, 근거·검증·책임자를 기록함. 기각에는 반증, 위험수용에는 만료일, 후속 이슈에는 URL·owner·milestone·완료 조건을 기록함.
 - [ ] GitHub unresolved review thread: `0`
 - [ ] 위 기록 이후 push나 base 이동이 없으며 두 리뷰가 동일한 최신 base/head를 검토함
 - [ ] 위 조건을 확인한 뒤에만 `reviews-complete` label을 붙여 별도 테스트·빌드 CI를 실행함
-- [ ] push 또는 base SHA 변경 시 `reviews-complete` label과 기존 CI를 stale 처리하고, 두 리뷰 뒤 label을 제거했다가 다시 붙임
+- [ ] push 또는 base/head SHA 변경 시 `reviews-complete` label, 기존 CI, P3 처분을 stale 처리하고 두 리뷰와 처분을 다시 확인한 뒤 label을 제거했다가 다시 붙임
 
 ## 별도 검증
 
