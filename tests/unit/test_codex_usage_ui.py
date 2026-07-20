@@ -1,7 +1,7 @@
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.apps.codex_usage_ui import CodexUsageSettingsView
 
@@ -222,6 +222,61 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("__external_settings__", view._profile_deletions_inflight)
         self.assertFalse(view._preserve_status_after_next_autosave)
 
+    def test_external_mutation_failed_result_retries_captured_payload_on_ui_tick(self) -> None:
+        captured = {"payload": {"enabled": False}, "before_providers": {}}
+        monitor = Mock()
+        monitor.get_runtime_snapshot.return_value = {}
+        monitor.get_last_snapshot.return_value = None
+        monitor.update_settings.return_value = (True, None)
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._profile_deletions_inflight.add("__external_settings__")
+        view._win = Mock()
+        view._collect_state_var = Mock()
+        view._next_collect_var = Mock()
+        view._live_time_var = Mock()
+        view._live_five_hour_var = Mock()
+        view._live_weekly_var = Mock()
+        view._live_credit_var = Mock()
+        scheduled = []
+        view._win.after.side_effect = lambda _delay, callback: scheduled.append(callback) or "after-retry"
+
+        worker = threading.Thread(
+            target=lambda: view._record_external_settings_result_without_ui(
+                False,
+                "settings_save_failed",
+                captured,
+            )
+        )
+        worker.start()
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIn("__external_settings__", view._profile_deletions_inflight)
+        view._refresh_runtime_status()
+
+        self.assertNotIn("__external_settings__", view._profile_deletions_inflight)
+        self.assertGreaterEqual(len(scheduled), 1)
+        scheduled[0]()
+        monitor.update_settings.assert_called_once_with(captured["payload"])
+
+    def test_external_mutation_success_reconciles_settings_and_dashboard_on_ui_tick(self) -> None:
+        reconciled = Mock()
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=None,
+            on_external_settings_reconciled=reconciled,
+        )
+        view._win = Mock()
+        view._remount = Mock()
+        view._profile_deletions_inflight.add("__external_settings__")
+
+        view._record_external_settings_result_without_ui(True, None, None)
+        view._refresh_runtime_status()
+
+        self.assertNotIn("__external_settings__", view._profile_deletions_inflight)
+        view._remount.assert_called_once_with()
+        reconciled.assert_called_once_with()
+
     def test_metric_presence_hides_unreported_codex_five_hour_and_disabled_cursor_od(self) -> None:
         fake_tk = _FakeTk()
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
@@ -337,12 +392,12 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(display_vars["on_demand_status"].get(), "온디맨드: -")
         self.assertGreaterEqual(
             int(fake_tk.labels[-1].kwargs.get("wraplength", 0)),
-            220,
+            300,
         )
-        metric_vars["on_demand_status"].set("활성화\u00a0·\u00a0US$8.20\u00a0사용")
+        metric_vars["on_demand_status"].set("활성화 · US$8.20\u00a0사용")
         self.assertEqual(
             display_vars["on_demand_status"].get(),
-            "온디맨드:\u00a0활성화\u00a0·\u00a0US$8.20\u00a0사용",
+            "온디맨드: 활성화 · US$8.20\u00a0사용",
         )
 
     def test_usage_metric_values_are_localized_without_changing_amounts(self) -> None:
@@ -370,7 +425,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                 "on_demand_status",
                 {"on_demand_status": "Enabled · US$8.20 used"},
             ),
-            "활성화\u00a0·\u00a0US$8.20\u00a0사용",
+            "활성화 · US$8.20\u00a0사용",
         )
 
     def test_on_release_profile_calls_monitor_and_sets_ok_status(self) -> None:

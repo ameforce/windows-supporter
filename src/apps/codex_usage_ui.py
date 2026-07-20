@@ -7,10 +7,21 @@ from typing import Any
 
 
 class CodexUsageSettingsView:
-    def __init__(self, root: Any, codex_monitor: Any, ui_post=None) -> None:
+    def __init__(
+        self,
+        root: Any,
+        codex_monitor: Any,
+        ui_post=None,
+        on_external_settings_reconciled=None,
+    ) -> None:
         self._root = root
         self._codex = codex_monitor
         self._ui_post = ui_post if callable(ui_post) else None
+        self._on_external_settings_reconciled = (
+            on_external_settings_reconciled
+            if callable(on_external_settings_reconciled)
+            else None
+        )
 
         self._tk = None
         self._ttk = None
@@ -47,6 +58,12 @@ class CodexUsageSettingsView:
         self._scroll_body = None
         self._autosave_after_id = None
         self._preserve_status_after_next_autosave = False
+        self._external_settings_result_lock = threading.Lock()
+        self._pending_external_settings_result: tuple[
+            bool,
+            str | None,
+            dict[str, Any] | None,
+        ] | None = None
         self._loading_settings = False
         self._runtime_after_id = None
         self._collect_state_var = None
@@ -852,7 +869,6 @@ class CodexUsageSettingsView:
                     label,
                     value_var,
                     display_var,
-                    keep_together=key == "on_demand_status",
                 )
                 cell = self._add_metric_cell(
                     parent,
@@ -860,7 +876,7 @@ class CodexUsageSettingsView:
                     column,
                     display_var,
                     bg,
-                    wraplength=220 if key == "on_demand_status" else 180,
+                    wraplength=300 if key == "on_demand_status" else 180,
                 )
                 if account_id and cell is not None:
                     self._account_metric_cells.setdefault(account_id, {})[key] = cell
@@ -1891,6 +1907,74 @@ class CodexUsageSettingsView:
         self._preserve_status_after_next_autosave = False
         return
 
+    def _record_external_settings_result_without_ui(
+        self,
+        ok: bool,
+        error: str | None,
+        prepared: dict[str, Any] | None,
+    ) -> None:
+        """Hand a worker result to the next Tk-owned runtime refresh."""
+        captured = prepared if isinstance(prepared, dict) else None
+        with self._external_settings_result_lock:
+            self._pending_external_settings_result = (
+                bool(ok),
+                str(error) if error is not None else None,
+                captured,
+            )
+        return
+
+    def _reconcile_external_settings_result(self) -> bool:
+        with self._external_settings_result_lock:
+            result = self._pending_external_settings_result
+            self._pending_external_settings_result = None
+        if result is None:
+            return False
+        ok, error, prepared = result
+        self._profile_deletions_inflight.discard("__external_settings__")
+        self._preserve_status_after_next_autosave = False
+        if bool(ok):
+            self._remount()
+            self._notify_external_settings_reconciled()
+            return True
+        self._set_status(f"설정 변경 실패: {error}", level="error")
+        if prepared is not None:
+            self._schedule_captured_autosave_retry(prepared)
+        self._notify_external_settings_reconciled()
+        return False
+
+    def _notify_external_settings_reconciled(self) -> None:
+        callback = self._on_external_settings_reconciled
+        if not callable(callback):
+            return
+        try:
+            callback()
+        except Exception:
+            pass
+        return
+
+    def _schedule_captured_autosave_retry(self, prepared: dict[str, Any]) -> None:
+        self._cancel_pending_autosave()
+        win = self._win
+        after = getattr(win, "after", None)
+        if callable(after):
+            try:
+                self._autosave_after_id = after(
+                    350,
+                    lambda: self._retry_captured_autosave(prepared),
+                )
+                return
+            except Exception:
+                self._autosave_after_id = None
+        self._retry_captured_autosave(prepared)
+        return
+
+    def _retry_captured_autosave(self, prepared: dict[str, Any]) -> None:
+        self._autosave_after_id = None
+        ok, error, _provider_changed = self._apply_settings_update(prepared)
+        if not ok and error == "profile_refresh_busy":
+            self._schedule_captured_autosave_retry(prepared)
+        return
+
     def _resume_pending_autosave_after_external_failure(self) -> None:
         self._preserve_status_after_next_autosave = True
         self._schedule_autosave()
@@ -2180,8 +2264,6 @@ class CodexUsageSettingsView:
             except Exception:
                 pass
         localized = self._localize_usage_metric_value(raw)
-        if key == "on_demand_status":
-            localized = localized.replace(" · ", "\u00a0·\u00a0")
         return re.sub(r" (?=(?:남음|사용)$)", "\u00a0", localized)
 
     def _refresh_account_runtime_summaries(self, runtime: dict[str, Any]) -> None:
@@ -2358,6 +2440,8 @@ class CodexUsageSettingsView:
     def _refresh_runtime_status(self) -> None:
         win = self._win
         if win is None:
+            return
+        if self._reconcile_external_settings_result():
             return
         runtime = self._safe_get_runtime()
         session_state = str(runtime.get("session_state", "logged_out") or "logged_out")

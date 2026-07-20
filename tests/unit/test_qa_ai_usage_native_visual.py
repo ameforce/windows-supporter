@@ -33,6 +33,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
                 "dynamic-three-profiles",
                 "ten-mixed-profiles-150",
                 "long-label-narrow",
+                "cursor-long-amount-150",
                 "cursor-logged-out",
                 "cursor-stale-rate-limited",
             ),
@@ -45,7 +46,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 7)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 8)
         by_name = {fixture["name"]: fixture for fixture in fixtures}
         self.assertEqual(len(by_name["one-profile-125"]["settings"]["profiles"]), 1)
         self.assertEqual(by_name["one-profile-125"]["ui_scale_percent"], 125)
@@ -78,6 +79,13 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         self.assertEqual(long_label["window_size"][0], 700)
         self.assertLess(long_label["window_size"][0], by_name["mixed-ready-standard"]["window_size"][0])
         self.assertGreater(len(long_label["settings"]["profiles"][0]["label"]), 40)
+        long_amount = by_name["cursor-long-amount-150"]
+        self.assertEqual(long_amount["ui_scale_percent"], 150)
+        self.assertEqual(long_amount["window_size"][0], 960)
+        self.assertEqual(
+            long_amount["runtime"]["profiles"][1]["last_snapshot"]["on_demand_status"],
+            "Enabled · US$1,234,567,890.12 used",
+        )
 
         logged_out = by_name["cursor-logged-out"]["runtime"]["profiles"][1]["runtime"]
         self.assertEqual(logged_out["session_state"], "logged_out")

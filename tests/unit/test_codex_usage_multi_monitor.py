@@ -948,7 +948,8 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             ok, error = manager.update_settings({"profiles": profiles})
 
-            self.assertTrue(ok, error)
+            self.assertFalse(ok)
+            self.assertEqual(error, "provider_shutdown_failed")
             self.assertEqual(manager.get_settings_snapshot()["profiles"][0]["provider"], "cursor")
             self.assertIsInstance(
                 manager._CodexUsageMultiMonitor__children["account_1"],

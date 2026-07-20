@@ -860,6 +860,8 @@ class CodexUsageMultiMonitor:
         )
         self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
+        if provider_shutdown_failed_ids:
+            return False, "provider_shutdown_failed"
         return True, None
 
     def add_profile(

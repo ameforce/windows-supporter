@@ -30,6 +30,7 @@ SCENARIO_NAMES = (
     "dynamic-three-profiles",
     "ten-mixed-profiles-150",
     "long-label-narrow",
+    "cursor-long-amount-150",
     "cursor-logged-out",
     "cursor-stale-rate-limited",
 )
@@ -153,6 +154,12 @@ def build_scenario_fixture(
         codex_id = "codex_primary"
         cursor_id = "cursor_primary"
 
+    if scenario == "cursor-long-amount-150":
+        ui_scale_percent = 150
+        window_size = [960, 720]
+        phase = "interaction"
+        interaction = {"action": "keyboard_end_scroll", "profile_id": ""}
+
     codex_profile = _profile_settings(codex_id, codex_label, "codex")
     cursor_profile = _profile_settings(cursor_id, cursor_label, "cursor")
     codex_runtime = _ready_runtime()
@@ -197,6 +204,10 @@ def build_scenario_fixture(
             _cursor_snapshot(cursor_captured_at),
         ),
     ]
+    if scenario == "cursor-long-amount-150":
+        runtime_profiles[1]["last_snapshot"]["on_demand_status"] = (
+            "Enabled · US$1,234,567,890.12 used"
+        )
     settings_profiles = [codex_profile, cursor_profile]
     if scenario == "one-profile-125":
         ui_scale_percent = 125
@@ -644,7 +655,13 @@ def _collect_widget_metrics(root: Any) -> dict[str, Any]:
         )
         if left < root_left or top < root_top or left + width > root_right + 1 or top + height > root_bottom + 1:
             clipped.append(path)
-        if text and requested_width > width + 1:
+        intersects_viewport = bool(
+            left < root_right
+            and left + width > root_left
+            and top < root_bottom
+            and top + height > root_top
+        )
+        if text and intersects_viewport and requested_width > width + 1:
             text_overflow.append(path)
     return {
         "widget_count": len(widgets),

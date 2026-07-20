@@ -517,6 +517,56 @@ class MainUiDashboardUnitTest(unittest.TestCase):
                 ],
             )
 
+    def test_dashboard_ai_toggle_records_failed_save_for_ui_reconciliation_when_queue_fails(self):
+        class _FailingQueue:
+            def put(self, _callback):
+                raise RuntimeError("UI queue unavailable")
+
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _apply_settings_update(self, prepared, update_ui=False):
+                self.events.append(("save", prepared, update_ui))
+                return False, "settings_save_failed", False
+
+            def _record_external_settings_result_without_ui(self, ok, error, prepared):
+                self.events.append(("record", ok, error, prepared))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = _FailingQueue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+            worker = threading.Thread(target=workers[0])
+            worker.start()
+            worker.join(1.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin",),
+                    ("save", {"payload": "dirty"}, False),
+                    (
+                        "record",
+                        False,
+                        "settings_save_failed",
+                        {"payload": "dirty"},
+                    ),
+                ],
+            )
+
     def test_update_status_callback_refreshes_existing_dashboard(self):
         class FakeDashboard:
             def __init__(self):

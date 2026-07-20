@@ -725,13 +725,21 @@ class WindowsSupporterMainUI:
                 if threading.current_thread() is threading.main_thread():
                     done()
                 elif view_mutation_started and settings_view is not None:
-                    release_mutation = getattr(
+                    record_result = getattr(
                         settings_view,
-                        "_release_external_settings_mutation_without_ui",
+                        "_record_external_settings_result_without_ui",
                         None,
                     )
-                    if callable(release_mutation):
-                        release_mutation()
+                    if callable(record_result):
+                        record_result(ok, error, prepared_settings)
+                    else:
+                        release_mutation = getattr(
+                            settings_view,
+                            "_release_external_settings_mutation_without_ui",
+                            None,
+                        )
+                        if callable(release_mutation):
+                            release_mutation()
             return
 
         worker_started = self._run_bg(task)
@@ -1101,6 +1109,7 @@ class WindowsSupporterMainUI:
                 self._root,
                 usage,
                 ui_post=self._ui_post,
+                on_external_settings_reconciled=self._refresh_dashboard_status,
             )
             self._ai_usage_view.mount(tab)
             self._ai_usage_built = True
