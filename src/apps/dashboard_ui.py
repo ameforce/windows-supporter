@@ -26,6 +26,8 @@ class DashboardView:
         self._parent = None
         self._status_frames: dict[str, Any] = {}
         self._toggle_buttons: dict[str, Any] = {}
+        self._dashboard_scroll_canvas = None
+        self._dashboard_scroll_container = None
         self._tk = None
         self._ttk = None
         return
@@ -68,6 +70,8 @@ class DashboardView:
         scrollbar.pack(side="right", fill="y")
         container = tk.Frame(canvas, bg=bg)
         window_id = canvas.create_window((0, 0), window=container, anchor="nw")
+        self._dashboard_scroll_canvas = canvas
+        self._dashboard_scroll_container = container
 
         def sync_scroll_region(_event: Any = None) -> None:
             try:
@@ -86,13 +90,6 @@ class DashboardView:
         container.bind("<Configure>", sync_scroll_region)
         canvas.bind("<Configure>", sync_content_width)
         canvas.bind("<Enter>", lambda _event: canvas.focus_set())
-        canvas.bind("<MouseWheel>", lambda event: self._scroll_dashboard(canvas, event))
-        canvas.bind("<Button-4>", lambda event: self._scroll_dashboard(canvas, event))
-        canvas.bind("<Button-5>", lambda event: self._scroll_dashboard(canvas, event))
-        canvas.bind("<Up>", lambda _event: self._scroll_dashboard_units(canvas, -1))
-        canvas.bind("<Down>", lambda _event: self._scroll_dashboard_units(canvas, 1))
-        canvas.bind("<Prior>", lambda _event: self._scroll_dashboard_units(canvas, -1, pages=True))
-        canvas.bind("<Next>", lambda _event: self._scroll_dashboard_units(canvas, 1, pages=True))
 
         header_card = tk.Frame(
             container,
@@ -138,6 +135,7 @@ class DashboardView:
         self._add_update_section(body, text=text, bg=card_bg, border=border)
 
         self.refresh()
+        self._bind_dashboard_scroll_targets()
         sync_scroll_region()
         return
 
@@ -169,6 +167,40 @@ class DashboardView:
             units = -1 if button == 4 else 1 if button == 5 else 0
         return self._scroll_dashboard_units(canvas, units)
 
+    def _bind_dashboard_scroll_targets(self) -> None:
+        canvas = self._dashboard_scroll_canvas
+        container = self._dashboard_scroll_container
+        if canvas is None or container is None:
+            return
+        visited: set[int] = set()
+
+        def bind_widget(widget: Any) -> None:
+            marker = id(widget)
+            if marker in visited:
+                return
+            visited.add(marker)
+            try:
+                widget.bind("<MouseWheel>", lambda event: self._scroll_dashboard(canvas, event))
+                widget.bind("<Button-4>", lambda event: self._scroll_dashboard(canvas, event))
+                widget.bind("<Button-5>", lambda event: self._scroll_dashboard(canvas, event))
+                widget.bind("<Up>", lambda _event: self._scroll_dashboard_units(canvas, -1))
+                widget.bind("<Down>", lambda _event: self._scroll_dashboard_units(canvas, 1))
+                widget.bind("<Prior>", lambda _event: self._scroll_dashboard_units(canvas, -1, pages=True))
+                widget.bind("<Next>", lambda _event: self._scroll_dashboard_units(canvas, 1, pages=True))
+            except Exception:
+                pass
+            try:
+                children = list(widget.winfo_children())
+            except Exception:
+                children = []
+            for child in children:
+                bind_widget(child)
+            return
+
+        bind_widget(canvas)
+        bind_widget(container)
+        return
+
     def refresh(self) -> None:
         try:
             snapshot = self._status_provider()
@@ -186,6 +218,7 @@ class DashboardView:
         self._set_feature_status("wrike", self._format_wrike(snapshot.get("wrike")))
         self._set_feature_status("background", self._format_background(snapshot.get("background")))
         self._set_feature_status("update", self._format_update(snapshot.get("update")))
+        self._bind_dashboard_scroll_targets()
         return
 
     def _lazy_import_tk(self) -> bool:

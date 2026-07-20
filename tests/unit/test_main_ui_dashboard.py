@@ -886,6 +886,37 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertEqual(view._dashboard_scroll_units(-120), 1)
         self.assertEqual(view._dashboard_scroll_units(0), 0)
 
+    def test_dashboard_scroll_binds_wheel_to_card_children(self):
+        class _Widget:
+            def __init__(self, children=()):
+                self.children = list(children)
+                self.bindings = {}
+                self.scroll_calls = []
+
+            def winfo_children(self):
+                return list(self.children)
+
+            def bind(self, sequence, callback):
+                self.bindings[sequence] = callback
+
+            def yview_scroll(self, units, mode):
+                self.scroll_calls.append((units, mode))
+
+        child = _Widget()
+        container = _Widget([child])
+        canvas = _Widget([container])
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._dashboard_scroll_canvas = canvas
+        view._dashboard_scroll_container = container
+
+        view._bind_dashboard_scroll_targets()
+
+        self.assertIn("<MouseWheel>", container.bindings)
+        self.assertIn("<MouseWheel>", child.bindings)
+        result = child.bindings["<MouseWheel>"](type("Event", (), {"delta": -120})())
+        self.assertEqual(result, "break")
+        self.assertEqual(canvas.scroll_calls, [(1, "units")])
+
     def test_update_formatter_shows_available_version(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 
