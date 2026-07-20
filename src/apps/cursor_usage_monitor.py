@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import threading
 from typing import Any, Protocol
 import uuid
@@ -15,8 +16,11 @@ import uuid
 from src.apps.ai_usage_contracts import (
     AiUsageProvider,
     AiUsageReading,
+    UsageErrorType,
     UsageState,
+    normalize_usage_error_type,
     normalize_usage_state,
+    project_usage_provider_status,
     usage_state_message,
 )
 from src.apps.codex_usage_browser_types import (
@@ -33,6 +37,40 @@ from src.apps.cursor_usage_playwright_worker import run_cursor_playwright_worker
 
 
 CURSOR_USAGE_URL = "https://cursor.com/dashboard/usage"
+
+
+def _is_non_reparse_descendant(candidate: str, boundary: str) -> bool:
+    target = os.path.abspath(candidate)
+    root = os.path.abspath(boundary)
+    try:
+        if os.path.normcase(os.path.commonpath((target, root))) != os.path.normcase(root):
+            return False
+        if os.path.normcase(target) == os.path.normcase(root):
+            return False
+        real_target = os.path.realpath(target)
+        real_root = os.path.realpath(root)
+        if os.path.normcase(os.path.commonpath((real_target, real_root))) != os.path.normcase(
+            real_root
+        ):
+            return False
+        relative = os.path.relpath(target, root)
+    except (OSError, ValueError):
+        return False
+    current = root
+    for part in ("", *relative.split(os.sep)):
+        if part:
+            current = os.path.join(current, part)
+        if not os.path.lexists(current):
+            continue
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+        if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+            return False
+    return True
 CURSOR_COLLECTION_MODE = "visible_dashboard_summary"
 MIN_CURSOR_REFRESH_INTERVAL_SEC = 300.0
 
@@ -123,7 +161,8 @@ class _BrowserSession(Protocol):
     def open_login(self) -> BrowserOperationResult: ...
     def poll_login(self) -> BrowserOperationResult: ...
     def close_session(self) -> None: ...
-    def shutdown(self) -> None: ...
+    def request_cancel(self) -> bool: ...
+    def shutdown(self) -> bool: ...
     def get_runtime_status(self) -> BrowserRuntimeStatus: ...
 
 
@@ -138,45 +177,151 @@ class _LazyCursorBrowserSession:
         self._config = config
         self._unrecoverable_timeout_handler = unrecoverable_timeout_handler
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._session: _BrowserSession | None = None
+        self._creating = False
+        self._terminal = False
+        self._terminal_cleanup_complete = False
+        self._terminal_cleanup_succeeded = False
 
     def collect(self) -> BrowserOperationResult:
-        return self._ensure().collect()
+        session = self._ensure()
+        if session is None:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return session.collect()
 
     def open_login(self) -> BrowserOperationResult:
-        return self._ensure().open_login()
+        session = self._ensure()
+        if session is None:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return session.open_login()
 
     def poll_login(self) -> BrowserOperationResult:
-        return self._ensure().poll_login()
+        session = self._ensure()
+        if session is None:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return session.poll_login()
 
     def close_session(self) -> None:
-        session = self._session
+        with self._lock:
+            session = self._session
         if session is not None:
             session.close_session()
 
-    def shutdown(self) -> None:
-        session = self._session
-        if session is not None:
-            session.shutdown()
+    def shutdown(self) -> bool:
+        with self._lock:
+            self._terminal = True
+            session = self._session
+            if session is None:
+                if self._creating:
+                    return False
+                if self._terminal_cleanup_complete:
+                    return bool(self._terminal_cleanup_succeeded)
+                self._terminal_cleanup_complete = True
+                self._terminal_cleanup_succeeded = True
+                return True
+        try:
+            succeeded = session.shutdown() is True
+        except Exception:
+            succeeded = False
+        with self._lock:
+            if session is self._session:
+                self._terminal_cleanup_complete = True
+                self._terminal_cleanup_succeeded = bool(succeeded)
+                if succeeded:
+                    self._session = None
+        return bool(succeeded)
+
+    def request_cancel(self) -> bool:
+        with self._lock:
+            self._terminal = True
+            session = self._session
+            if session is None:
+                if self._creating:
+                    return False
+                if self._terminal_cleanup_complete:
+                    return bool(self._terminal_cleanup_succeeded)
+                self._terminal_cleanup_complete = True
+                self._terminal_cleanup_succeeded = True
+                return True
+        request_cancel = getattr(session, "request_cancel", None)
+        if callable(request_cancel):
+            try:
+                return bool(request_cancel())
+            except Exception:
+                return False
+        try:
+            return session.shutdown() is True
+        except Exception:
+            return False
 
     def get_runtime_status(self) -> BrowserRuntimeStatus:
-        session = self._session
+        with self._lock:
+            session = self._session
+            terminal = bool(self._terminal)
+            cleanup_complete = bool(self._terminal_cleanup_complete)
+            cleanup_succeeded = bool(self._terminal_cleanup_succeeded)
         if session is None:
+            if terminal and cleanup_complete and not cleanup_succeeded:
+                return BrowserRuntimeStatus(
+                    BrowserState.FAILED,
+                    False,
+                    BrowserErrorCode.COLLECT_FAILED.value,
+                )
             return BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         return session.get_runtime_status()
 
-    def _ensure(self) -> _BrowserSession:
-        with self._lock:
+    def _ensure(self) -> _BrowserSession | None:
+        with self._condition:
+            while self._creating:
+                self._condition.wait(timeout=0.25)
+            if self._terminal:
+                return None
             if self._session is not None:
                 return self._session
+            self._creating = True
+        created: _BrowserSession | None = None
+        try:
             from src.apps.codex_usage_playwright_session import CodexUsagePlaywrightSession
 
-            self._session = CodexUsagePlaywrightSession(
+            created = CodexUsagePlaywrightSession(
                 self._config,
                 driver_factory=_cursor_driver_factory,
                 unrecoverable_timeout_handler=self._unrecoverable_timeout_handler,
             )
-            return self._session
+        except Exception:
+            with self._condition:
+                self._creating = False
+                if self._terminal:
+                    self._terminal_cleanup_complete = True
+                    self._terminal_cleanup_succeeded = True
+                self._condition.notify_all()
+            raise
+        with self._condition:
+            terminal = bool(self._terminal)
+            if not terminal:
+                self._session = created
+                self._creating = False
+                self._condition.notify_all()
+                return created
+        cancel = getattr(created, "request_cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+        try:
+            cleanup_succeeded = created.shutdown() is True
+        except Exception:
+            cleanup_succeeded = False
+        with self._condition:
+            self._creating = False
+            self._terminal_cleanup_complete = True
+            self._terminal_cleanup_succeeded = bool(cleanup_succeeded)
+            if not cleanup_succeeded:
+                self._session = created
+            self._condition.notify_all()
+        return None
 
 
 def _decimal(value: str) -> Decimal | None:
@@ -350,6 +495,7 @@ def _browser_error_state(error: object) -> UsageState:
     if key in {
         BrowserErrorCode.LOGIN_REQUIRED.value,
         BrowserErrorCode.LOGIN_WINDOW_CLOSED.value,
+        BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
     }:
         return UsageState.LOGGED_OUT
     if key in {
@@ -366,6 +512,8 @@ def _browser_error_state(error: object) -> UsageState:
         return UsageState.CRASH
     if key in {"worker_recycle", "page_recycling"}:
         return UsageState.RECYCLE
+    if key == BrowserErrorCode.PROFILE_IN_USE.value:
+        return UsageState.UNKNOWN
     if key == BrowserErrorCode.COLLECT_FAILED.value:
         return UsageState.DOM_DRIFT
     return normalize_usage_state(key)
@@ -408,6 +556,7 @@ class CursorUsageMonitor:
         )
         self._settings_path = os.path.join(self.config_dir, "cursor_usage_settings.json")
         self._state_path = os.path.join(self.config_dir, "cursor_usage_state.json")
+        self._event_log_path = os.path.join(self.config_dir, "cursor_usage_events.jsonl")
         self._persistence_enabled = bool(
             config_dir is not None or browser_session_factory is None
         )
@@ -427,6 +576,9 @@ class CursorUsageMonitor:
         self._collect_lock = threading.Lock()
         self._collect_inflight = False
         self._last_attempt_at: datetime | None = None
+        self._failure_count = 0
+        self._retry_failure_limit = 3
+        self._last_error_type = UsageErrorType.NONE
         self._login_poll_interval_sec = max(0.01, float(login_poll_interval_sec))
         self._login_poll_max_attempts = max(1, int(login_poll_max_attempts))
         self._login_poll_stop = threading.Event()
@@ -437,6 +589,8 @@ class CursorUsageMonitor:
             state=UsageState.UNKNOWN,
         )
         self._restore_last_success()
+        if self._last_reading.state == UsageState.STALE:
+            self._last_error_type = UsageErrorType.TRANSIENT
         config = PlaywrightSessionConfig(
             profile_dir=self.profile_dir,
             usage_url=CURSOR_USAGE_URL,
@@ -458,11 +612,22 @@ class CursorUsageMonitor:
         self._event_queue = event_queue
         self._external_scheduler = not bool(start_monitor)
 
-    def shutdown(self) -> None:
-        self._stop_login_poll()
-        self._session.shutdown()
+    def shutdown(self) -> bool:
+        supports_cancel = callable(getattr(self._session, "request_cancel", None))
+        cancelled = self.request_collect_cancel()
+        shutdown_succeeded = bool(cancelled)
+        if bool(supports_cancel or not cancelled):
+            shutdown_succeeded = self._session.shutdown() is True
         self._root = None
         self._event_queue = None
+        return bool(cancelled and shutdown_succeeded)
+
+    def request_collect_cancel(self) -> bool:
+        self._stop_login_poll()
+        request_cancel = getattr(self._session, "request_cancel", None)
+        if callable(request_cancel):
+            return bool(request_cancel())
+        return self._session.shutdown() is True
 
     def collect(self, *, force: bool = False) -> AiUsageReading:
         now = self._clock()
@@ -482,7 +647,13 @@ class CursorUsageMonitor:
                 reading = self._reading_from_result(result, now)
                 self._last_reading = reading
                 if reading.state == UsageState.READY:
+                    self._failure_count = 0
+                    self._last_error_type = UsageErrorType.NONE
                     self._save_last_success(reading)
+                else:
+                    self._failure_count = min(self._failure_count + 1, 999)
+                    self._last_error_type = self._error_type_from_result(result, reading)
+                self._append_collection_event(source="collect")
                 return reading
             finally:
                 self._collect_inflight = False
@@ -524,27 +695,33 @@ class CursorUsageMonitor:
     def get_runtime_status(self) -> dict[str, Any]:
         browser = self._session.get_runtime_status()
         reading = self._last_reading
-        effective_state = (
-            reading.last_error_state
-            if reading.state == UsageState.STALE and reading.last_error_state is not None
-            else reading.state
+        provider_status = project_usage_provider_status(
+            has_usable_cache=reading.is_usable,
+            error_type=self._last_error_type,
+            failure_count=self._failure_count,
+            retry_limit=self._retry_failure_limit,
+            collect_inflight=self._collect_inflight,
         )
-        if reading.state == UsageState.READY:
+        if provider_status == "ready":
             freshness = "fresh"
             monitor_state = "idle"
             session_state = "logged_in"
-        elif reading.state == UsageState.STALE:
+        elif provider_status == "stale":
             freshness = "stale"
-            if effective_state == UsageState.LOGGED_OUT:
-                monitor_state = "paused_auth_required"
-                session_state = "logged_out"
-            else:
-                monitor_state = "idle"
-                session_state = "logged_in"
-        elif reading.state == UsageState.LOGGED_OUT:
-            freshness = "unavailable"
+            monitor_state = "idle"
+            session_state = "logged_in"
+        elif provider_status == "login":
+            freshness = "stale" if reading.is_usable else "unavailable"
             monitor_state = "paused_auth_required"
             session_state = "logged_out"
+        elif provider_status == "paused":
+            freshness = "stale" if reading.is_usable else "unavailable"
+            monitor_state = "paused_profile_in_use"
+            session_state = "logged_in" if reading.is_usable else "unknown"
+        elif provider_status == "rate_limited":
+            freshness = "stale" if reading.is_usable else "unavailable"
+            monitor_state = "idle"
+            session_state = "logged_in" if reading.is_usable else "unknown"
         else:
             freshness = "unavailable"
             monitor_state = "running" if self._collect_inflight else "idle"
@@ -555,7 +732,7 @@ class CursorUsageMonitor:
             "profile_id": self.profile_id,
             "state": reading.state.value,
             "message": reading.message,
-            "provider_status": effective_state.value,
+            "provider_status": provider_status,
             "last_error_state": (
                 reading.last_error_state.value
                 if reading.last_error_state is not None
@@ -563,6 +740,22 @@ class CursorUsageMonitor:
             ),
             "freshness": freshness,
             "last_snapshot_is_stale": reading.is_stale,
+            "last_error_type": self._last_error_type.value,
+            "failure_count": int(self._failure_count),
+            "retry_failure_limit": int(self._retry_failure_limit),
+            "retry_exhausted": bool(
+                self._last_error_type
+                not in {
+                    UsageErrorType.NONE,
+                    UsageErrorType.AUTH,
+                    UsageErrorType.PROFILE_IN_USE,
+                    UsageErrorType.DOM_DRIFT,
+                    UsageErrorType.UNSUPPORTED_CONTRACT,
+                }
+                and self._failure_count >= self._retry_failure_limit
+                and not reading.is_usable
+            ),
+            "retry_after_sec": self._retry_after_sec(provider_status),
             "monitor_state": monitor_state,
             "session_state": session_state,
             "collect_inflight": bool(self._collect_inflight),
@@ -589,12 +782,21 @@ class CursorUsageMonitor:
                 now = now.replace(tzinfo=timezone.utc)
             self._last_reading = self._reading_from_result(result, now)
             if self._last_reading.state == UsageState.READY:
+                self._failure_count = 0
+                self._last_error_type = UsageErrorType.NONE
                 self._save_last_success(self._last_reading)
             elif result.error in {
                 BrowserErrorCode.LOGIN_REQUIRED.value,
                 BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
             }:
                 self._start_login_poll()
+            if self._last_reading.state != UsageState.READY:
+                self._failure_count = min(self._failure_count + 1, 999)
+                self._last_error_type = self._error_type_from_result(
+                    result,
+                    self._last_reading,
+                )
+            self._append_collection_event(source="manual_login")
         elif source_key == "auto_monitor" and force_refresh:
             self.collect(force=False)
         elif force_refresh:
@@ -624,6 +826,8 @@ class CursorUsageMonitor:
                 captured_at=captured_at,
             )
             self._last_attempt_at = None
+            self._failure_count = 0
+            self._last_error_type = UsageErrorType.AUTH
         except Exception as exc:
             return False, f"Cursor 전용 브라우저 세션 종료 실패: {type(exc).__name__}"
         finally:
@@ -643,10 +847,31 @@ class CursorUsageMonitor:
             current = head
         basename = os.path.basename(profile_dir).lower()
         parent_basename = os.path.basename(os.path.dirname(profile_dir)).lower()
-        managed_name = basename.startswith("cursor-profile-") or (
-            parent_basename == "cursor-usage-profiles" and bool(basename)
+        grandparent_dir = os.path.dirname(os.path.dirname(profile_dir))
+        great_grandparent_dir = os.path.dirname(grandparent_dir)
+        dynamic_managed = (
+            basename == "cursor"
+            and re.fullmatch(r"profile_[0-9a-f]{32}", parent_basename) is not None
+            and os.path.basename(grandparent_dir).lower() == "ai-profiles"
+            and os.path.basename(great_grandparent_dir).lower() == "windows-supporter"
+        )
+        managed_name = (
+            basename.startswith("cursor-profile-")
+            or (parent_basename == "cursor-usage-profiles" and bool(basename))
+            or dynamic_managed
         )
         if "windows-supporter" not in components or not managed_name:
+            return False, "Windows Supporter가 관리하는 Cursor 전용 프로필만 연결 해제할 수 있습니다."
+        if dynamic_managed:
+            app_root = great_grandparent_dir
+        elif parent_basename == "cursor-usage-profiles":
+            app_root = os.path.dirname(os.path.dirname(profile_dir))
+        else:
+            app_root = os.path.dirname(profile_dir)
+        if (
+            os.path.basename(app_root).lower() != "windows-supporter"
+            or not _is_non_reparse_descendant(profile_dir, app_root)
+        ):
             return False, "Windows Supporter가 관리하는 Cursor 전용 프로필만 연결 해제할 수 있습니다."
         if not os.path.isdir(profile_dir):
             return True, "이미 연결 해제된 상태입니다."
@@ -661,6 +886,9 @@ class CursorUsageMonitor:
 
     def format_reset_at_for_display(self, value: str, key: str = "") -> str:
         _ = key
+        normalized = str(value or "").strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return normalized
         return self._format_timestamp(value)
 
     def _reading_from_result(
@@ -724,6 +952,7 @@ class CursorUsageMonitor:
                 captured_at=captured_at,
                 last_success_at=prior.last_success_at,
                 reset_at=prior.reset_at,
+                reset_precision=prior.reset_precision,
                 on_demand_enabled=prior.on_demand_enabled,
                 last_error_state=state,
             )
@@ -733,6 +962,53 @@ class CursorUsageMonitor:
             state=state,
             captured_at=captured_at,
         )
+
+    def _error_type_from_result(
+        self,
+        result: BrowserOperationResult,
+        reading: AiUsageReading,
+    ) -> UsageErrorType:
+        if result.error:
+            return normalize_usage_error_type(result.error)
+        if reading.last_error_state is not None:
+            return normalize_usage_error_type(reading.last_error_state.value)
+        return normalize_usage_error_type(reading.state.value)
+
+    def _retry_after_sec(self, provider_status: str) -> float | None:
+        if str(provider_status or "") != "retrying":
+            return None
+        exponent = max(0, min(int(self._failure_count) - 1, 4))
+        return float(min(self._refresh_interval_sec * (2**exponent), 15 * 60))
+
+    def _append_collection_event(self, *, source: str) -> None:
+        if not self._persistence_enabled:
+            return
+        provider_status = project_usage_provider_status(
+            has_usable_cache=self._last_reading.is_usable,
+            error_type=self._last_error_type,
+            failure_count=self._failure_count,
+            retry_limit=self._retry_failure_limit,
+            collect_inflight=False,
+        )
+        payload = {
+            "timestamp": _iso_now(self._clock),
+            "event": "collection_result",
+            "source": str(source or "collect"),
+            "provider": AiUsageProvider.CURSOR.value,
+            "profile_id": self.profile_id,
+            "reading_state": self._last_reading.state.value,
+            "provider_status": provider_status,
+            "error_type": self._last_error_type.value,
+            "failure_count": int(self._failure_count),
+            "has_usable_cache": bool(self._last_reading.is_usable),
+        }
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+            with open(self._event_log_path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                stream.write("\n")
+        except OSError:
+            pass
 
     def _emit_update(self, source: str) -> None:
         if self._notification_sink is None:
@@ -780,9 +1056,15 @@ class CursorUsageMonitor:
             reading = self._reading_from_result(result, now)
             self._last_reading = reading
             if reading.state == UsageState.READY:
+                self._failure_count = 0
+                self._last_error_type = UsageErrorType.NONE
                 self._save_last_success(reading)
+                self._append_collection_event(source="manual_login_poll")
                 self._emit_update("manual_login")
                 return
+            self._failure_count = min(self._failure_count + 1, 999)
+            self._last_error_type = self._error_type_from_result(result, reading)
+            self._append_collection_event(source="manual_login_poll")
             if result.error in {
                 BrowserErrorCode.LOGIN_WINDOW_CLOSED.value,
                 BrowserErrorCode.TRANSPORT_CLOSED.value,
@@ -797,6 +1079,9 @@ class CursorUsageMonitor:
             state=UsageState.TIMEOUT,
             captured_at=now.isoformat(),
         )
+        self._failure_count = min(self._failure_count + 1, 999)
+        self._last_error_type = UsageErrorType.TIMEOUT
+        self._append_collection_event(source="manual_login_poll_exhausted")
         self._emit_update("manual_login")
 
     def _stop_login_poll(self) -> None:
@@ -861,6 +1146,7 @@ class CursorUsageMonitor:
                 captured_at=_iso_now(self._clock),
                 last_success_at=str(data.get("captured_at") or ""),
                 reset_at=str(data.get("reset_at") or ""),
+                reset_precision=str(data.get("reset_precision") or ""),
                 on_demand_enabled=(
                     data.get("on_demand_enabled")
                     if isinstance(data.get("on_demand_enabled"), bool)
@@ -891,6 +1177,7 @@ class CursorUsageMonitor:
                     "included_limit": reading.included_limit,
                     "captured_at": reading.last_success_at or reading.captured_at,
                     "reset_at": reading.reset_at,
+                    "reset_precision": reading.reset_precision,
                     "on_demand_enabled": reading.on_demand_enabled,
                 },
             )

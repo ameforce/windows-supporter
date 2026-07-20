@@ -1,6 +1,8 @@
 import json
 import os
+import queue
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -102,6 +104,7 @@ class _FakeCodex:
             "usage_url": "https://example.test",
         }
         self.update_calls = []
+        self.toggle_calls = 0
         self.show_calls = []
 
     def get_settings_snapshot(self):
@@ -110,6 +113,11 @@ class _FakeCodex:
     def update_settings(self, data):
         self.update_calls.append(dict(data))
         self.settings.update(data)
+        return True, None
+
+    def toggle_enabled(self):
+        self.toggle_calls += 1
+        self.settings["enabled"] = not bool(self.settings.get("enabled", True))
         return True, None
 
     def get_runtime_status(self):
@@ -352,7 +360,8 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertEqual(startup.toggle_calls, 1)
             self.assertEqual(startup.rescan_calls, 0)
             self.assertEqual(startup.start_calls, [root])
-            self.assertEqual(monitor.codex.update_calls[-1]["enabled"], False)
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertFalse(monitor.codex.settings["enabled"])
             self.assertEqual(monitor.codex.show_calls, [])
             self.assertEqual(monitor.kakao.update_calls[-1]["enabled"], False)
             self.assertEqual(monitor.kakao.overlay_calls, [])
@@ -360,6 +369,252 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             self.assertEqual(monitor.wrike.weekly_calls, [])
             self.assertFalse(monitor.background_enabled)
             self.assertEqual(updater.check_calls, [True])
+
+    def test_dashboard_ai_toggle_runs_atomic_manager_mutation_in_background(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending = []
+            ui._run_bg = lambda fn: pending.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(monitor.codex.update_calls, [])
+
+            pending[0]()
+
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertFalse(monitor.codex.settings["enabled"])
+            self.assertEqual(monitor.codex.update_calls, [])
+
+    def test_dashboard_ai_toggle_flushes_pending_view_settings_then_remounts(self):
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _apply_settings_update(self, prepared, update_ui=False):
+                self.events.append(("save", prepared, update_ui))
+                return True, None, False
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = queue.Queue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(pending_view.events, [("begin",)])
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(len(workers), 1)
+
+            workers[0]()
+
+            self.assertEqual(
+                pending_view.events[:2],
+                [("begin",), ("save", {"payload": "dirty"}, False)],
+            )
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertFalse(monitor.codex.settings["enabled"])
+            self.assertEqual(ui._event_queue.qsize(), 1)
+
+            ui._event_queue.get_nowait()()
+
+            self.assertEqual(pending_view.events[-1], ("finish", True, None))
+
+    def test_dashboard_provider_change_flushes_before_background_toggle(self):
+        ui_thread_id = threading.get_ident()
+
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin", threading.get_ident()))
+                return True, {"payload": "provider-dirty"}
+
+            def _flush_provider_changing_settings_before_worker(self, prepared):
+                self.events.append(("save", prepared, threading.get_ident()))
+                return True, None, None
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error, threading.get_ident()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = queue.Queue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin", ui_thread_id),
+                    ("save", {"payload": "provider-dirty"}, ui_thread_id),
+                ],
+            )
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(len(workers), 1)
+
+            workers[0]()
+
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertEqual(
+                [event[0] for event in pending_view.events],
+                ["begin", "save"],
+            )
+            ui._event_queue.get_nowait()()
+            self.assertEqual(pending_view.events[-1][:3], ("finish", True, None))
+
+    def test_dashboard_ai_toggle_clears_external_mutation_when_worker_start_fails(self):
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error))
+
+            def _resume_pending_autosave_after_external_failure(self):
+                self.events.append(("resume_autosave",))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = queue.Queue()
+
+            with patch("src.apps.main_ui.threading.Thread", side_effect=RuntimeError("start failed")):
+                ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin",),
+                    ("finish", False, "background_worker_start_failed"),
+                    ("resume_autosave",),
+                ],
+            )
+
+    def test_dashboard_ai_toggle_releases_external_mutation_when_ui_queue_fails(self):
+        class _FailingQueue:
+            def put(self, _callback):
+                raise RuntimeError("UI queue unavailable")
+
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _apply_settings_update(self, prepared, update_ui=False):
+                self.events.append(("save", prepared, update_ui))
+                return True, None, False
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error))
+
+            def _release_external_settings_mutation_without_ui(self):
+                self.events.append(("release_without_ui",))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = _FailingQueue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+            worker = threading.Thread(target=workers[0])
+            worker.start()
+            worker.join(1.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin",),
+                    ("save", {"payload": "dirty"}, False),
+                    ("release_without_ui",),
+                ],
+            )
+
+    def test_dashboard_ai_toggle_records_failed_save_for_ui_reconciliation_when_queue_fails(self):
+        class _FailingQueue:
+            def put(self, _callback):
+                raise RuntimeError("UI queue unavailable")
+
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _apply_settings_update(self, prepared, update_ui=False):
+                self.events.append(("save", prepared, update_ui))
+                return False, "settings_save_failed", False
+
+            def _record_external_settings_result_without_ui(self, ok, error, prepared):
+                self.events.append(("record", ok, error, prepared))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = _FailingQueue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+            worker = threading.Thread(target=workers[0])
+            worker.start()
+            worker.join(1.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin",),
+                    ("save", {"payload": "dirty"}, False),
+                    (
+                        "record",
+                        False,
+                        "settings_save_failed",
+                        {"payload": "dirty"},
+                    ),
+                ],
+            )
 
     def test_update_status_callback_refreshes_existing_dashboard(self):
         class FakeDashboard:
@@ -578,6 +833,143 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         labels = [text for text, _style in parts]
         self.assertIn("Codex 1 (Codex): logged_in / idle", labels)
         self.assertIn("Codex 2 (Codex): 비활성 / logged_out", labels)
+
+    def test_ai_usage_formatter_keeps_unselected_dashboard_profiles_annotated(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        _, parts = view._format_ai_usage(
+            {
+                "enabled": True,
+                "profiles": [
+                    {"id": "first", "label": "First", "taskbar_selected": False},
+                    {"id": "second", "label": "Second", "taskbar_selected": True},
+                    {"id": "third", "label": "Third", "taskbar_selected": True},
+                    {"id": "fourth", "label": "Fourth", "taskbar_selected": False},
+                ],
+            }
+        )
+
+        labels = [text for text, _style in parts]
+        self.assertTrue(
+            any(
+                text.startswith("First (Codex):") and text.endswith("/ 표시 안 함")
+                for text in labels
+            )
+        )
+        self.assertTrue(any(text.startswith("Second (Codex):") for text in labels))
+        self.assertFalse(any(text.startswith("Third (Codex):") for text in labels))
+        self.assertFalse(any(text.startswith("Fourth (Codex):") for text in labels))
+
+    def test_ai_usage_profile_summary_parts_are_rendered_on_separate_rows(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        _, parts = view._format_ai_usage(
+            {
+                "enabled": True,
+                "profiles": [
+                    {"id": "first", "label": "First", "taskbar_selected": False},
+                    {"id": "second", "label": "Second", "taskbar_selected": True},
+                ],
+            }
+        )
+
+        rows = view._status_part_rows("ai_usage", parts)
+
+        self.assertEqual(rows[0], parts[:3])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[1][0][0].split(" (")[0], "First")
+        self.assertEqual(rows[2][0][0].split(" (")[0], "Second")
+
+    def test_background_status_parts_are_rendered_on_separate_rows(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        _, parts = view._format_background(
+            {
+                "enabled": True,
+                "hotkeys_registered": True,
+                "features_warmup_done": True,
+                "foreground_hotkey_profile": "긴 한국어 프로필 이름",
+                "wrike_attached": True,
+                "ai_usage_attached": True,
+            }
+        )
+
+        rows = view._status_part_rows("background", parts)
+
+        self.assertEqual(rows, [[part] for part in parts])
+
+    def test_section_status_frame_fills_the_available_button_row_width(self):
+        class _Widget:
+            def __init__(self, *_args, **_kwargs):
+                self.grid_kwargs = None
+
+            def pack(self, **_kwargs):
+                return None
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+        class _Tk:
+            Frame = _Widget
+            Label = _Widget
+
+        class _Ttk:
+            Button = _Widget
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._tk = _Tk()
+        view._ttk = _Ttk()
+        view._add_section(
+            _Widget(),
+            key="background",
+            title="Background",
+            text="#111827",
+            bg="#FFFFFF",
+            border="#E5E7EB",
+            settings_callback=None,
+            toggle_callback="background.toggle",
+        )
+
+        self.assertEqual(view._status_frames["background"].grid_kwargs["sticky"], "ew")
+
+    def test_dashboard_scroll_wheel_uses_directional_single_steps(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+
+        self.assertEqual(view._dashboard_scroll_units(120), -1)
+        self.assertEqual(view._dashboard_scroll_units(-120), 1)
+        self.assertEqual(view._dashboard_scroll_units(0), 0)
+
+    def test_dashboard_scroll_binds_wheel_to_card_children(self):
+        class _Widget:
+            def __init__(self, children=()):
+                self.children = list(children)
+                self.bindings = {}
+                self.scroll_calls = []
+
+            def winfo_children(self):
+                return list(self.children)
+
+            def bind(self, sequence, callback):
+                self.bindings[sequence] = callback
+
+            def yview_scroll(self, units, mode):
+                self.scroll_calls.append((units, mode))
+
+        child = _Widget()
+        container = _Widget([child])
+        canvas = _Widget([container])
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._dashboard_scroll_canvas = canvas
+        view._dashboard_scroll_container = container
+
+        view._bind_dashboard_scroll_targets()
+
+        self.assertIn("<MouseWheel>", container.bindings)
+        self.assertIn("<MouseWheel>", child.bindings)
+        result = child.bindings["<MouseWheel>"](type("Event", (), {"delta": -120})())
+        self.assertEqual(result, "break")
+        self.assertEqual(canvas.scroll_calls, [(1, "units")])
 
     def test_update_formatter_shows_available_version(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})

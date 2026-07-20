@@ -7,19 +7,23 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
 from src.apps.ai_usage_contracts import AiUsageProvider, UsageState
 from src.apps.codex_usage_browser_types import (
+    BrowserErrorCode,
     BrowserOperationResult,
     BrowserRuntimeStatus,
     BrowserState,
+    PlaywrightSessionConfig,
 )
 from src.apps.cursor_usage_monitor import (
     CursorUsageMonitor,
     CURSOR_USAGE_PAGE_PROBE_SCRIPT,
+    _LazyCursorBrowserSession,
     parse_sanitized_cursor_usage_text,
 )
 
@@ -50,11 +54,131 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         def close_session(self) -> None:
             self.calls.append("close_session")
 
-        def shutdown(self) -> None:
+        def shutdown(self) -> bool:
             self.calls.append("shutdown")
+            return True
 
         def get_runtime_status(self) -> BrowserRuntimeStatus:
             return self.status
+
+    def test_lazy_session_cancels_inner_created_after_terminal_request(self) -> None:
+        constructor_started = threading.Event()
+        release_constructor = threading.Event()
+
+        class _InnerSession:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def collect(self) -> BrowserOperationResult:
+                self.calls.append("collect")
+                return BrowserOperationResult(probe={"url": "usage"})
+
+            def request_cancel(self) -> bool:
+                self.calls.append("request_cancel")
+                return True
+
+            def shutdown(self) -> bool:
+                self.calls.append("shutdown")
+                return True
+
+            def get_runtime_status(self) -> BrowserRuntimeStatus:
+                return BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
+
+        inner = _InnerSession()
+
+        def blocking_constructor(*_args, **_kwargs):
+            constructor_started.set()
+            release_constructor.wait(2.0)
+            return inner
+
+        lazy = _LazyCursorBrowserSession(
+            PlaywrightSessionConfig(
+                profile_dir="profile",
+                usage_url="https://cursor.com/dashboard/usage",
+                probe_script="probe()",
+            ),
+            None,
+        )
+        results = []
+        collect_thread = threading.Thread(
+            target=lambda: results.append(lazy.collect()),
+            daemon=True,
+        )
+
+        with patch(
+            "src.apps.codex_usage_playwright_session.CodexUsagePlaywrightSession",
+            side_effect=blocking_constructor,
+        ):
+            collect_thread.start()
+            self.assertTrue(constructor_started.wait(1.0))
+
+            self.assertFalse(lazy.request_cancel())
+            self.assertFalse(lazy.shutdown())
+            release_constructor.set()
+            collect_thread.join(1.0)
+
+        self.assertFalse(collect_thread.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].error, BrowserErrorCode.COLLECT_FAILED.value)
+        self.assertEqual(inner.calls, ["request_cancel", "shutdown"])
+        self.assertTrue(lazy.shutdown())
+
+    def test_lazy_session_retains_failed_terminal_cleanup_for_shutdown_retry(self) -> None:
+        constructor_started = threading.Event()
+        release_constructor = threading.Event()
+
+        class _RetryableInnerSession:
+            def __init__(self) -> None:
+                self.calls = []
+                self.shutdown_results = [False, True]
+
+            def collect(self) -> BrowserOperationResult:
+                self.calls.append("collect")
+                return BrowserOperationResult()
+
+            def request_cancel(self) -> bool:
+                self.calls.append("request_cancel")
+                return False
+
+            def shutdown(self) -> bool:
+                self.calls.append("shutdown")
+                return self.shutdown_results.pop(0)
+
+        inner = _RetryableInnerSession()
+
+        def blocking_constructor(*_args, **_kwargs):
+            constructor_started.set()
+            release_constructor.wait(2.0)
+            return inner
+
+        lazy = _LazyCursorBrowserSession(
+            PlaywrightSessionConfig(
+                profile_dir="profile",
+                usage_url="https://cursor.com/dashboard/usage",
+                probe_script="probe()",
+            ),
+            None,
+        )
+        result = []
+        collect_thread = threading.Thread(
+            target=lambda: result.append(lazy.collect()),
+            daemon=True,
+        )
+
+        with patch(
+            "src.apps.codex_usage_playwright_session.CodexUsagePlaywrightSession",
+            side_effect=blocking_constructor,
+        ):
+            collect_thread.start()
+            self.assertTrue(constructor_started.wait(1.0))
+            self.assertFalse(lazy.shutdown())
+            release_constructor.set()
+            collect_thread.join(1.0)
+
+        self.assertFalse(collect_thread.is_alive())
+        self.assertEqual(result[0].error, BrowserErrorCode.COLLECT_FAILED.value)
+        self.assertTrue(lazy.shutdown())
+        self.assertEqual(inner.calls, ["request_cancel", "shutdown", "shutdown"])
 
     @staticmethod
     def _probe(text: str) -> dict[str, object]:
@@ -97,6 +221,33 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertTrue(reading.on_demand_enabled)
         self.assertEqual(reading.reset_at, "2026-08-01T00:00:00Z")
         self.assertEqual(reading.to_dict()["included_usage"], "$12.50 / $20.00")
+
+    def test_collector_normalizes_korean_date_reset_at_provider_boundary(self) -> None:
+        session = self._Session(
+            [
+                BrowserOperationResult(
+                    probe=self._probe(
+                        "Included usage: US$0 / US$20\n"
+                        "Reset: 2026년 8월 13일\n"
+                        "On-demand usage: OFF"
+                    )
+                )
+            ]
+        )
+        monitor = CursorUsageMonitor(
+            profile_id="cursor-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        reading = monitor.collect()
+
+        self.assertEqual(reading.reset_at, "2026-08-13")
+        self.assertEqual(reading.reset_precision, "date")
+        self.assertFalse(reading.on_demand_enabled)
+        self.assertEqual(
+            monitor.format_reset_at_for_display(reading.reset_at, "billing_reset_at"),
+            "2026-08-13",
+        )
 
     def test_low_frequency_collection_reuses_fresh_reading(self) -> None:
         now = [datetime(2026, 7, 18, 10, 0, tzinfo=timezone.utc)]
@@ -367,6 +518,9 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
 
         self.assertEqual(stale.state, UsageState.STALE)
         self.assertEqual(stale.last_error_state, UsageState.LOGGED_OUT)
+        self.assertEqual(runtime["provider_status"], "login")
+        self.assertEqual(runtime["freshness"], "stale")
+        self.assertTrue(runtime["last_snapshot_is_stale"])
         self.assertEqual(runtime["session_state"], "logged_out")
         self.assertEqual(runtime["monitor_state"], "paused_auth_required")
         self.assertTrue(runtime["can_login"])
@@ -382,6 +536,9 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
 
         self.assertEqual(limited.state, UsageState.RATE_LIMITED)
         self.assertIsNone(limited.used_percent)
+        limited_runtime = monitor.get_runtime_status()
+        self.assertEqual(limited_runtime["provider_status"], "rate_limited")
+        self.assertEqual(limited_runtime["freshness"], "unavailable")
 
         success_then_limit = self._Session(
             [
@@ -400,6 +557,26 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertEqual(stale.state, UsageState.STALE)
         self.assertEqual(stale.last_error_state, UsageState.RATE_LIMITED)
         self.assertEqual(stale.used_percent, 25.0)
+        stale_runtime = monitor.get_runtime_status()
+        self.assertEqual(stale_runtime["provider_status"], "rate_limited")
+        self.assertEqual(stale_runtime["freshness"], "stale")
+
+    def test_inflight_refresh_keeps_cached_cursor_session_logged_in(self) -> None:
+        monitor = CursorUsageMonitor(
+            profile_id="cursor-personal",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(probe=self._probe("Included usage: 5 / 20"))]
+            ),
+        )
+        monitor.collect(force=True)
+        monitor._collect_inflight = True
+
+        runtime = monitor.get_runtime_status()
+
+        self.assertEqual(runtime["provider_status"], "ready")
+        self.assertEqual(runtime["freshness"], "fresh")
+        self.assertEqual(runtime["session_state"], "logged_in")
+        self.assertFalse(runtime["can_login"])
 
     def test_empty_summary_is_dom_drift(self) -> None:
         session = self._Session(
@@ -490,7 +667,10 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertNotIn("private@example.invalid", state_text)
             self.assertNotIn("probe", state_text.lower())
             self.assertNotIn("cookie", state_text.lower())
-            self.assertEqual(json.loads(state_text)["included_used"], "US$0")
+            state_payload = json.loads(state_text)
+            self.assertEqual(state_payload["included_used"], "US$0")
+            self.assertEqual(state_payload["reset_at"], "2026-08-13")
+            self.assertEqual(state_payload["reset_precision"], "date")
 
             restored = CursorUsageMonitor(
                 config_dir=str(config_dir),
@@ -502,6 +682,7 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(fresh.state, UsageState.READY)
             self.assertEqual(cached.state, UsageState.STALE)
             self.assertEqual(cached.to_dict()["included_usage"], "US$0 / US$20")
+            self.assertEqual(cached.reset_precision, "date")
             self.assertEqual(restored.get_settings_snapshot()["interval_sec"], 420.0)
             self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["provider"], "cursor")
 
@@ -533,6 +714,71 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(monitor.get_last_snapshot().state, UsageState.LOGGED_OUT)
             self.assertEqual(monitor.get_runtime_status()["session_state"], "logged_out")
 
+    def test_release_removes_dynamic_app_owned_profile_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            profile_id = f"profile_{'b' * 32}"
+            profile_dir = (
+                Path(tmp)
+                / "windows-supporter"
+                / "ai-profiles"
+                / profile_id
+                / "cursor"
+            )
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "marker.txt").write_text("managed", encoding="utf-8")
+            monitor = CursorUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                profile_id=profile_id,
+                browser_session_factory=lambda _config: self._Session([]),
+            )
+
+            ok, message = monitor.release_profile_session()
+
+            self.assertTrue(ok, message)
+            self.assertFalse(profile_dir.exists())
+
+    def test_release_rejects_dynamic_profile_resolving_outside_app_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            profile_id = f"profile_{'d' * 32}"
+            profile_dir = (
+                Path(tmp)
+                / "windows-supporter"
+                / "ai-profiles"
+                / profile_id
+                / "cursor"
+            )
+            profile_dir.mkdir(parents=True)
+            marker = profile_dir / "preserve.txt"
+            marker.write_text("outside-backed", encoding="utf-8")
+            outside = Path(tmp) / "outside" / "cursor"
+            real_realpath = os.path.realpath
+
+            def junction_realpath(path):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+                    os.path.abspath(profile_dir)
+                ):
+                    return str(outside)
+                return real_realpath(path)
+
+            monitor = CursorUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                profile_id=profile_id,
+                browser_session_factory=lambda _config: self._Session([]),
+            )
+
+            with patch(
+                "src.apps.cursor_usage_monitor.os.path.realpath",
+                side_effect=junction_realpath,
+            ):
+                ok, _message = monitor.release_profile_session()
+
+            self.assertFalse(ok)
+            self.assertTrue(marker.is_file())
+
     def test_release_rejects_profile_outside_windows_supporter_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             profile_dir = Path(tmp) / "external-browser-profile"
@@ -550,6 +796,94 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("전용 프로필", message)
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+
+
+    def test_runtime_projects_transient_auth_paused_and_terminal_failures_by_cache_boundary(self) -> None:
+        transient = CursorUsageMonitor(
+            profile_id="cursor-transient",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(error="command_timeout") for _ in range(3)]
+            ),
+        )
+
+        transient.collect(force=True)
+        retrying = transient.get_runtime_status()
+        self.assertEqual(retrying["provider_status"], "retrying")
+        self.assertEqual(retrying["failure_count"], 1)
+        self.assertEqual(retrying["last_error_type"], "timeout")
+        self.assertFalse(retrying["retry_exhausted"])
+
+        transient.collect(force=True)
+        transient.collect(force=True)
+        exhausted = transient.get_runtime_status()
+        self.assertEqual(exhausted["provider_status"], "error")
+        self.assertTrue(exhausted["retry_exhausted"])
+
+        cached = CursorUsageMonitor(
+            profile_id="cursor-cached",
+            browser_session_factory=lambda _config: self._Session(
+                [
+                    BrowserOperationResult(probe=self._probe("Included usage: 5 / 20")),
+                    BrowserOperationResult(error="command_timeout"),
+                ]
+            ),
+        )
+        cached.collect(force=True)
+        cached.collect(force=True)
+        self.assertEqual(cached.get_runtime_status()["provider_status"], "stale")
+
+        auth = CursorUsageMonitor(
+            profile_id="cursor-auth",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(error="cloudflare_challenge")]
+            ),
+        )
+        auth.collect(force=True)
+        self.assertEqual(auth.get_runtime_status()["provider_status"], "login")
+
+        paused = CursorUsageMonitor(
+            profile_id="cursor-paused",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(error="profile_in_use")]
+            ),
+        )
+        paused.collect(force=True)
+        self.assertEqual(paused.get_runtime_status()["provider_status"], "paused")
+
+        terminal = CursorUsageMonitor(
+            profile_id="cursor-terminal",
+            browser_session_factory=lambda _config: self._Session(
+                [BrowserOperationResult(probe=self._probe("Usage dashboard"))]
+            ),
+        )
+        terminal.collect(force=True)
+        self.assertEqual(terminal.get_runtime_status()["provider_status"], "error")
+
+    def test_cursor_failure_writes_structured_jsonl_without_probe_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            monitor = CursorUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(Path(tmp) / "profile"),
+                profile_id="cursor-structured",
+                browser_session_factory=lambda _config: self._Session(
+                    [BrowserOperationResult(error="command_timeout")]
+                ),
+            )
+
+            monitor.collect(force=True)
+
+            log_path = config_dir / "cursor_usage_events.jsonl"
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["provider"], "cursor")
+            self.assertEqual(records[0]["profile_id"], "cursor-structured")
+            self.assertEqual(records[0]["error_type"], "timeout")
+            self.assertEqual(records[0]["failure_count"], 1)
+            self.assertNotIn("probe", records[0])
 
 
 if __name__ == "__main__":

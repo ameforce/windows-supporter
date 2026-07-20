@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import shutil
+import stat
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -14,9 +16,53 @@ from src.apps.codex_usage_playwright_session import (
     CodexUsagePlaywrightSession,
     PlaywrightSessionConfig,
 )
+from src.apps.codex_usage_browser_types import (
+    BrowserOperationResult,
+    BrowserRuntimeStatus,
+    BrowserState,
+)
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
+from src.apps.ai_usage_contracts import (
+    UsageErrorType,
+    normalize_usage_error_type,
+    project_usage_provider_status,
+)
+
+
+def _is_non_reparse_descendant(candidate: str, boundary: str) -> bool:
+    target = os.path.abspath(candidate)
+    root = os.path.abspath(boundary)
+    try:
+        if os.path.normcase(os.path.commonpath((target, root))) != os.path.normcase(root):
+            return False
+        if os.path.normcase(target) == os.path.normcase(root):
+            return False
+        real_target = os.path.realpath(target)
+        real_root = os.path.realpath(root)
+        if os.path.normcase(os.path.commonpath((real_target, real_root))) != os.path.normcase(
+            real_root
+        ):
+            return False
+        relative = os.path.relpath(target, root)
+    except (OSError, ValueError):
+        return False
+    current = root
+    for part in ("", *relative.split(os.sep)):
+        if part:
+            current = os.path.join(current, part)
+        if not os.path.lexists(current):
+            continue
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+        if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+            return False
+    return True
 
 
 USAGE_METRIC_KEYS = (
@@ -1715,6 +1761,32 @@ def compute_usage_changes(
     return changes
 
 
+class _UnavailableBrowserSession:
+    def __init__(self, error: str = "browser_session_create_failed") -> None:
+        self.__error = str(error or "browser_session_create_failed")
+
+    def collect(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def open_login(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def poll_login(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def close_session(self) -> None:
+        return
+
+    def request_cancel(self) -> bool:
+        return True
+
+    def shutdown(self) -> bool:
+        return True
+
+    def get_runtime_status(self) -> BrowserRuntimeStatus:
+        return BrowserRuntimeStatus(BrowserState.FAILED, False, self.__error)
+
+
 class CodexUsageMonitor:
     def __init__(
         self,
@@ -1728,15 +1800,18 @@ class CodexUsageMonitor:
         ]
         | None = None,
         unrecoverable_timeout_handler: Callable[[], bool] | None = None,
+        managed_profile_root: str | None = None,
     ) -> None:
         self.__lib = LibConnector()
         self.__root = None
         self.__event_queue = None
+        self.__ui_thread_id: int | None = None
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         self.__external_scheduler = False
         self.__local_usage_provider = local_usage_provider
         self.__browser_session_factory = browser_session_factory
+        self.__browser_session_recovery_required = False
         self.__unrecoverable_timeout_handler = unrecoverable_timeout_handler
 
         self.__monitor_after_id = None
@@ -1750,6 +1825,8 @@ class CodexUsageMonitor:
         self.__pending_change_tooltip_after_id = None
         self.__pending_change_tooltip_poll_ms = 500
         self.__failure_count = 0
+        self.__retry_failure_limit = 3
+        self.__last_error_type = UsageErrorType.NONE
         self.__collect_inflight = False
         self.__collect_inflight_source = ""
         self.__collect_started_ts = 0.0
@@ -1822,6 +1899,12 @@ class CodexUsageMonitor:
             "windows-supporter",
             "chatgpt-profile",
         )
+        normalized_managed_profile_root = str(managed_profile_root or "").strip()
+        self.__managed_profile_root = (
+            normalized_managed_profile_root
+            if normalized_managed_profile_root
+            else self.__lib.os.path.dirname(self.__default_profile_dir)
+        )
         normalized_profile_dir = str(profile_dir or "").strip()
         if normalized_profile_dir:
             self.__profile_dir = normalized_profile_dir
@@ -1837,6 +1920,7 @@ class CodexUsageMonitor:
     def attach(self, root, event_queue=None, start_monitor: bool = True) -> None:
         self.__root = root
         self.__event_queue = event_queue
+        self.__ui_thread_id = threading.get_ident()
         self.__external_scheduler = not bool(start_monitor)
         self.__refresh_session_state_from_profile()
         if bool(start_monitor):
@@ -1845,34 +1929,77 @@ class CodexUsageMonitor:
         self.__clear_monitor_schedule()
         return
 
-    def shutdown(self) -> None:
-        self.__request_collect_cancel()
-        self.__pause_background_monitor()
-        self.__cancel_pending_login_poll()
+    def shutdown(self) -> bool:
+        supports_cancel = callable(
+            getattr(self.__browser_session, "request_cancel", None)
+        )
+        cancelled = self.request_collect_cancel()
+        shutdown_succeeded = bool(cancelled)
+        if bool(supports_cancel or not cancelled):
+            shutdown_succeeded = self.__browser_session.shutdown() is True
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
             self.__worker_epoch = 1
         self.__hide_active_tooltip()
-        self.__browser_session.shutdown()
         self.__root = None
         self.__event_queue = None
-        return
+        self.__ui_thread_id = None
+        return bool(cancelled and shutdown_succeeded)
+
+    def request_collect_cancel(self) -> bool:
+        self.__request_collect_cancel()
+        self.__pause_background_monitor()
+        self.__cancel_pending_login_poll()
+        request_cancel = getattr(self.__browser_session, "request_cancel", None)
+        if callable(request_cancel):
+            return bool(request_cancel())
+        return self.__browser_session.shutdown() is True
 
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         return
 
-    def __set_usage_url(self, value: str) -> None:
+    def __set_usage_url(self, value: str) -> tuple[bool, str | None]:
         previous = str(getattr(self, "_CodexUsageMonitor__usage_url", "") or "")
-        self.__usage_url = canonicalize_codex_usage_url(value)
-        if previous and previous != self.__usage_url and hasattr(
+        candidate = canonicalize_codex_usage_url(value)
+        if bool(self.__browser_session_recovery_required):
+            self.__usage_url = candidate
+            try:
+                replacement = self.__create_browser_session()
+            except Exception:
+                self.__usage_url = previous
+                self.__browser_session = _UnavailableBrowserSession()
+                return False, "browser_session_create_failed"
+            self.__browser_session = replacement
+            self.__browser_session_recovery_required = False
+            return True, None
+        if previous and previous != candidate and hasattr(
             self, "_CodexUsageMonitor__browser_session"
         ):
-            self.__browser_session.shutdown()
-            self.__browser_session = self.__create_browser_session()
-        return
+            old_session = self.__browser_session
+            try:
+                shutdown_succeeded = old_session.shutdown() is True
+            except Exception:
+                shutdown_succeeded = False
+            if not shutdown_succeeded:
+                return False, "browser_session_shutdown_failed"
+            self.__usage_url = candidate
+            try:
+                replacement = self.__create_browser_session()
+            except Exception:
+                self.__usage_url = previous
+                try:
+                    self.__browser_session = self.__create_browser_session()
+                except Exception:
+                    self.__browser_session = _UnavailableBrowserSession()
+                    self.__browser_session_recovery_required = True
+                return False, "browser_session_create_failed"
+            self.__browser_session = replacement
+            return True, None
+        self.__usage_url = candidate
+        return True, None
 
     def __create_browser_session(self) -> CodexUsagePlaywrightSession:
         config = PlaywrightSessionConfig(
@@ -1923,8 +2050,10 @@ class CodexUsageMonitor:
             interval_sec = min_interval
         if tooltip_ms < 1200:
             tooltip_ms = 1200
+        url_updated, url_error = self.__set_usage_url(usage_url)
+        if not url_updated:
+            return False, url_error
         self.__enabled = enabled
-        self.__set_usage_url(usage_url)
         self.__interval_sec = float(interval_sec)
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__refresh_session_state_from_profile()
@@ -1937,9 +2066,10 @@ class CodexUsageMonitor:
 
     def release_profile_session(self) -> tuple[bool, str]:
         acquired = False
+        terminal_session = self.__browser_session
         self.__logout_in_progress = True
         self.__set_monitor_state("cancelling")
-        self.__request_collect_cancel()
+        self.request_collect_cancel()
         self.__pause_background_monitor()
         self.__cancel_pending_login_poll()
         try:
@@ -1981,10 +2111,27 @@ class CodexUsageMonitor:
                 pass
 
         try:
-            self.__browser_session.close_session()
+            if terminal_session.shutdown() is not True:
+                return (
+                    False,
+                    "브라우저 세션을 종료하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+            try:
+                replacement_session = self.__create_browser_session()
+            except Exception as exc:
+                self.__browser_session_recovery_required = True
+                self.__log_exception("recreate browser session after release failed", exc)
+                return (
+                    False,
+                    "브라우저 세션을 다시 준비하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
             ok, message = self.__clear_profile_directory()
             if not ok:
+                self.__browser_session = replacement_session
+                self.__browser_session_recovery_required = False
                 return False, message
+            self.__browser_session = replacement_session
+            self.__browser_session_recovery_required = False
             self.__last_snapshot = UsageSnapshot()
             self.__usage_history = []
             self.__snapshot_backfill_allowed = False
@@ -2062,9 +2209,26 @@ class CodexUsageMonitor:
         try:
             leaf = self.__lib.os.path.basename(target)
             parent_dir = self.__lib.os.path.dirname(target)
-            default_parent = self.__normalize_local_path(
-                self.__lib.os.path.dirname(default)
+            managed_parent = self.__normalize_local_path(
+                getattr(self, "_CodexUsageMonitor__managed_profile_root", "")
             )
+            if not managed_parent:
+                managed_parent = self.__normalize_local_path(
+                    self.__lib.os.path.dirname(default)
+                )
+            relative = self.__lib.os.path.relpath(target, managed_parent)
+            relative_parts = [
+                part.lower()
+                for part in relative.replace("\\", "/").split("/")
+                if part
+            ]
+            if (
+                len(relative_parts) == 3
+                and relative_parts[0] == "ai-profiles"
+                and re.fullmatch(r"profile_[0-9a-f]{32}", relative_parts[1])
+                and relative_parts[2] == "codex"
+            ):
+                return _is_non_reparse_descendant(target, managed_parent)
             parent = self.__lib.os.path.basename(parent_dir)
             allowed_leafs = {
                 "chatgpt-profile",
@@ -2073,13 +2237,13 @@ class CodexUsageMonitor:
             }
             if leaf.lower() not in allowed_leafs:
                 return False
-            if self.__normalize_local_path(parent_dir) != default_parent:
+            if self.__normalize_local_path(parent_dir) != managed_parent:
                 return False
             if parent.lower() != "windows-supporter":
                 return False
         except Exception:
             return False
-        return True
+        return _is_non_reparse_descendant(target, managed_parent)
 
     def __normalize_local_path(self, value: str) -> str:
         raw = str(value or "").strip()
@@ -2182,6 +2346,7 @@ class CodexUsageMonitor:
             and not bool(self.__auth_attention_required)
             and not bool(self.__profile_in_use_detected)
             and not bool(self.__logout_in_progress)
+            and not self.__is_collect_cancel_requested()
         )
 
     def __get_background_collect_block_reason(self) -> str:
@@ -2233,29 +2398,27 @@ class CodexUsageMonitor:
 
     def __pause_background_monitor(self) -> None:
         root = self.__root
-        if root is not None:
-            try:
-                if self.__monitor_after_id is not None:
-                    root.after_cancel(self.__monitor_after_id)
-            except Exception:
-                pass
+        after_id = self.__monitor_after_id
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
         self.__monitor_running = False
         self.__startup_warmup_running = False
         self.__set_monitor_state("idle")
+        if root is not None and after_id is not None:
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __clear_monitor_schedule(self) -> None:
         root = self.__root
-        if root is not None:
-            try:
-                if self.__monitor_after_id is not None:
-                    root.after_cancel(self.__monitor_after_id)
-            except Exception:
-                pass
+        after_id = self.__monitor_after_id
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
+        if root is not None and after_id is not None:
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __pause_monitor_countdown_for_manual_query(self) -> None:
@@ -2329,6 +2492,26 @@ class CodexUsageMonitor:
             monitor_state = "paused_profile_in_use"
         elif self.__auth_attention_required:
             monitor_state = "paused_auth_required"
+        has_usable_cache = bool(self.__last_snapshot.has_any_metric())
+        effective_error_type = self.__last_error_type
+        if self.__profile_in_use_detected:
+            effective_error_type = UsageErrorType.PROFILE_IN_USE
+        elif self.__auth_attention_required or self.__session_state == "logged_out":
+            effective_error_type = UsageErrorType.AUTH
+        provider_status = project_usage_provider_status(
+            has_usable_cache=has_usable_cache,
+            error_type=effective_error_type,
+            failure_count=self.__failure_count,
+            retry_limit=self.__retry_failure_limit,
+            collect_inflight=self.__collect_inflight,
+        )
+        freshness = (
+            "stale"
+            if has_usable_cache and provider_status != "ready"
+            else "fresh"
+            if has_usable_cache and provider_status == "ready"
+            else "unavailable"
+        )
         can_login = bool(
             (
                 self.__session_state == "logged_out"
@@ -2356,6 +2539,28 @@ class CodexUsageMonitor:
             "next_collect_in_sec": remain,
             "next_collect_estimated": False,
             "failure_count": int(self.__failure_count),
+            "retry_failure_limit": int(self.__retry_failure_limit),
+            "retry_exhausted": bool(
+                self.__last_error_type
+                not in {
+                    UsageErrorType.NONE,
+                    UsageErrorType.AUTH,
+                    UsageErrorType.PROFILE_IN_USE,
+                    UsageErrorType.DOM_DRIFT,
+                    UsageErrorType.UNSUPPORTED_CONTRACT,
+                }
+                and self.__failure_count >= self.__retry_failure_limit
+                and not has_usable_cache
+            ),
+            "retry_after_sec": (
+                float(min(self.__interval_sec * (2 ** max(0, min(self.__failure_count - 1, 4))), 15 * 60))
+                if provider_status == "retrying"
+                else None
+            ),
+            "provider_status": provider_status,
+            "last_error_type": self.__last_error_type.value,
+            "freshness": freshness,
+            "last_snapshot_is_stale": freshness == "stale",
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
             "profile_session_present": bool(self.__has_profile_session()),
@@ -2472,7 +2677,11 @@ class CodexUsageMonitor:
                         post_terminal(lambda: self.__show_tooltip("조회가 취소되었습니다."))
                         return
                     self.__consume_manual_query_pending_result()
-                    if error is not None and error != "profile_in_use":
+                    if error is not None and bool(
+                        source_key == "auto_monitor" and self.__external_scheduler
+                    ):
+                        self.__failure_count = min(self.__failure_count + 1, 8)
+                    if error is not None:
                         self.__handle_collect_error(error, source=source_key)
                     if refreshed is not None:
                         if not self.__is_worker_epoch_current(worker_epoch):
@@ -2492,6 +2701,8 @@ class CodexUsageMonitor:
                         self.__commit_merged_snapshot(merged)
                         snapshot = merged
                         self.__profile_in_use_detected = False
+                        self.__failure_count = 0
+                        self.__last_error_type = UsageErrorType.NONE
                         self.__resume_background_monitor_if_needed()
                 if error == "profile_in_use":
                     latest = self.get_last_snapshot()
@@ -2532,6 +2743,9 @@ class CodexUsageMonitor:
                 )
             return
 
+        if bool(self.__external_scheduler):
+            worker()
+            return
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception as exc:
@@ -2560,6 +2774,8 @@ class CodexUsageMonitor:
             self.__usage_history = []
         self.__cancel_pending_login_poll()
         self.__profile_in_use_detected = False
+        self.__failure_count = 0
+        self.__last_error_type = UsageErrorType.NONE
         self.__set_session_state("logged_in")
         self.__clear_auth_attention()
         changes = compute_usage_changes(prev, merged)
@@ -2853,10 +3069,9 @@ class CodexUsageMonitor:
         self.__pending_login_poll_reason = ""
         self.__pending_login_error_count = 0
         if root is not None and after_id is not None:
-            try:
-                root.after_cancel(after_id)
-            except Exception:
-                pass
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __schedule_pending_login_poll(
@@ -3290,6 +3505,34 @@ class CodexUsageMonitor:
                 return
             except Exception:
                 self.__log("ui callback post failed")
+        return
+
+    def __post_tk_cleanup(self, fn) -> None:
+        if not callable(fn):
+            return
+        if (
+            self.__ui_thread_id is not None
+            and threading.get_ident() == self.__ui_thread_id
+        ):
+            try:
+                fn()
+            except Exception:
+                pass
+            return
+        queue_obj = self.__event_queue
+        if queue_obj is not None:
+            try:
+                queue_obj.put(fn)
+                return
+            except Exception:
+                self.__log("tk cleanup post failed")
+        if self.__ui_thread_id is None:
+            try:
+                fn()
+            except Exception:
+                pass
+            return
+        self.__log("tk cleanup dropped outside ui thread")
         return
 
     def __queue_change_tooltip_until_input(
@@ -3881,16 +4124,14 @@ class CodexUsageMonitor:
         current = self.__active_tooltip
         self.__active_tooltip = None
         if current is not None:
-            try:
-                current.hide_tooltip()
-            except Exception:
-                pass
+            self.__post_tk_cleanup(current.hide_tooltip)
         return
 
     def __handle_collect_error(self, error: str, source: str = "") -> None:
         msg = str(error or "unknown_error")
         if msg in {"collect_busy", "collect_cancelled"}:
             return
+        self.__last_error_type = normalize_usage_error_type(msg)
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = self.__is_manual_collect_source(normalized_source)
