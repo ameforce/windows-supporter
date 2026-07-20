@@ -256,8 +256,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertNotIn("__external_settings__", view._profile_deletions_inflight)
         self.assertGreaterEqual(len(scheduled), 1)
+        self.assertTrue(view._preserve_status_after_next_autosave)
         scheduled[0]()
         monitor.update_settings.assert_called_once_with(captured["payload"])
+        self.assertFalse(view._preserve_status_after_next_autosave)
 
     def test_external_mutation_success_reconciles_settings_and_dashboard_on_ui_tick(self) -> None:
         reconciled = Mock()

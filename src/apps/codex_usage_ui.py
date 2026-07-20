@@ -1953,6 +1953,7 @@ class CodexUsageSettingsView:
         return
 
     def _schedule_captured_autosave_retry(self, prepared: dict[str, Any]) -> None:
+        self._preserve_status_after_next_autosave = True
         self._cancel_pending_autosave()
         win = self._win
         after = getattr(win, "after", None)
