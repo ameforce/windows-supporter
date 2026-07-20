@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from queue import Queue
 import threading
-import time
 from typing import Any, Protocol, final
 
 from src.apps.codex_usage_browser_types import (
@@ -108,6 +107,9 @@ class CodexUsagePlaywrightSession:
         self._recovery_request_sent: bool = False
         self._status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         self._shutdown: bool = False
+        self._cancel_requested: bool = False
+        self._cancellable_calls_inflight: int = 0
+        self._cancel_event = threading.Event()
         self._session_cookies: list[dict[str, Any]] = []
         self._timeout_retry_delays_sec = tuple(
             max(0.0, float(delay)) for delay in config.timeout_retry_delays_sec
@@ -115,10 +117,22 @@ class CodexUsagePlaywrightSession:
         self._timeout_recovery_grace_sec = max(
             0.0, float(config.timeout_recovery_grace_sec)
         )
-        self._sleep = sleep or time.sleep
+        self._sleep = sleep or self._cancel_event.wait
         self._unrecoverable_timeout_handler = unrecoverable_timeout_handler
 
     def collect(self) -> BrowserOperationResult:
+        with self._lock:
+            self._cancellable_calls_inflight += 1
+        try:
+            return self._collect_with_retries()
+        finally:
+            with self._lock:
+                self._cancellable_calls_inflight = max(
+                    0,
+                    self._cancellable_calls_inflight - 1,
+                )
+
+    def _collect_with_retries(self) -> BrowserOperationResult:
         retry_max = len(self._timeout_retry_delays_sec)
         retry_attempt = 0
         while True:
@@ -127,6 +141,9 @@ class CodexUsagePlaywrightSession:
                 retry_attempt=retry_attempt,
                 retry_max=retry_max,
             )
+            with self._lock:
+                if bool(self._cancel_requested):
+                    return result
             if result.error not in _RECOVERABLE_WORKER_ERRORS:
                 return result
             recovery_error = result.error or BrowserErrorCode.COMMAND_TIMEOUT.value
@@ -178,10 +195,22 @@ class CodexUsagePlaywrightSession:
                 self._sleep(delay_sec)
 
     def open_login(self) -> BrowserOperationResult:
-        return self._invoke(OpenLoginCommand())
+        return self._invoke_cancellable(OpenLoginCommand())
 
     def poll_login(self) -> BrowserOperationResult:
-        return self._invoke(PollLoginCommand())
+        return self._invoke_cancellable(PollLoginCommand())
+
+    def _invoke_cancellable(self, command: BrowserCommand) -> BrowserOperationResult:
+        with self._lock:
+            self._cancellable_calls_inflight += 1
+        try:
+            return self._invoke(command)
+        finally:
+            with self._lock:
+                self._cancellable_calls_inflight = max(
+                    0,
+                    self._cancellable_calls_inflight - 1,
+                )
 
     def close_session(self) -> None:
         with self._lock:
@@ -190,15 +219,42 @@ class CodexUsagePlaywrightSession:
                 return
         _ = self._invoke(CloseSessionCommand())
 
-    def shutdown(self) -> None:
+    def request_cancel(self) -> bool:
+        with self._lock:
+            thread = self._thread
+            self._cancel_requested = True
+            self._cancel_event.set()
+            operation_inflight = bool(self._cancellable_calls_inflight)
+            if thread is None or not thread.is_alive():
+                return not operation_inflight
+            if not operation_inflight:
+                return True
+            queue = self._queue
+            driver = self._driver
+            self._worker_poisoned = True
+        queue.put(_CommandEnvelope(ShutdownCommand()))
+        if driver is None:
+            return False
+        hard_cancelled = self._force_terminate_driver(
+            driver,
+            reason=BrowserErrorCode.COMMAND_TIMEOUT.value,
+        )
+        if bool(hard_cancelled):
+            self._shutdown_driver(driver)
+        self._capture_session_cookies(driver)
+        return bool(hard_cancelled)
+
+    def shutdown(self) -> bool:
         with self._lock:
             thread = self._thread
             if thread is None:
                 self._shutdown = True
+                if self._cancellable_calls_inflight:
+                    return False
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
-                return
+                return True
             if self._shutdown:
-                return
+                return bool(not thread.is_alive())
             self._shutdown = True
             poisoned = bool(self._worker_poisoned)
         if poisoned:
@@ -211,10 +267,10 @@ class CodexUsagePlaywrightSession:
                         False,
                         BrowserErrorCode.COMMAND_TIMEOUT.value,
                     )
-                return
+                return False
             with self._lock:
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
-            return
+            return True
         envelope = _CommandEnvelope(ShutdownCommand())
         self._queue.put(envelope)
         completed = envelope.completed.wait(self._config.command_timeout_sec)
@@ -239,11 +295,17 @@ class CodexUsagePlaywrightSession:
                         False,
                         BrowserErrorCode.COMMAND_TIMEOUT.value,
                     )
-                return
+                return False
         else:
             thread.join(self._timeout_recovery_grace_sec)
+        terminated = bool(not thread.is_alive())
         with self._lock:
-            self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
+            self._status = BrowserRuntimeStatus(
+                BrowserState.STOPPED if terminated else BrowserState.FAILED,
+                False,
+                "" if terminated else BrowserErrorCode.COMMAND_TIMEOUT.value,
+            )
+        return terminated
 
     def get_runtime_status(self) -> BrowserRuntimeStatus:
         with self._lock:
@@ -278,7 +340,20 @@ class CodexUsagePlaywrightSession:
             retry_attempt=retry_attempt,
             retry_max=retry_max,
         )
-        queue.put(envelope)
+        with self._lock:
+            cancelled = bool(self._cancel_requested)
+            worker_changed = bool(
+                generation != self._worker_generation or thread is not self._thread
+            )
+            if self._shutdown or cancelled or worker_changed:
+                return BrowserOperationResult(
+                    error=(
+                        BrowserErrorCode.COMMAND_TIMEOUT.value
+                        if cancelled
+                        else BrowserErrorCode.COLLECT_FAILED.value
+                    )
+                )
+            queue.put(envelope)
         timeout_sec = self._command_timeout_sec(command)
         if not envelope.completed.wait(timeout_sec):
             driver: DriverProtocol | None = None
@@ -338,7 +413,7 @@ class CodexUsagePlaywrightSession:
         self,
     ) -> tuple[Queue[_CommandEnvelope], threading.Thread, int] | None:
         with self._lock:
-            if self._shutdown:
+            if self._shutdown or self._cancel_requested:
                 return None
             if self._thread is not None and self._thread.is_alive():
                 if self._worker_poisoned:
@@ -371,9 +446,17 @@ class CodexUsagePlaywrightSession:
         with self._lock:
             if generation == self._worker_generation:
                 self._driver = driver
+            cancel_before_start = bool(
+                generation == self._worker_generation and self._cancel_requested
+            )
         try:
-            started = driver.start()
-            self._update_status(driver.get_runtime_status())
+            if bool(cancel_before_start):
+                started = BrowserOperationResult(
+                    error=BrowserErrorCode.COMMAND_TIMEOUT.value
+                )
+            else:
+                started = driver.start()
+                self._update_status(driver.get_runtime_status())
             while True:
                 envelope = queue.get()
                 command = envelope.command
@@ -381,6 +464,13 @@ class CodexUsagePlaywrightSession:
                     driver.shutdown()
                     self._update_status(driver.get_runtime_status())
                     envelope.completed.set()
+                    return
+                if self._is_cancel_requested_for_generation(generation):
+                    envelope.result = BrowserOperationResult(
+                        error=BrowserErrorCode.COMMAND_TIMEOUT.value
+                    )
+                    envelope.completed.set()
+                    self._shutdown_driver(driver)
                     return
                 if envelope.retry_attempt > 0:
                     self._update_status(
@@ -447,6 +537,12 @@ class CodexUsagePlaywrightSession:
         with self._lock:
             return bool(
                 generation == self._worker_generation and self._worker_poisoned
+            )
+
+    def _is_cancel_requested_for_generation(self, generation: int) -> bool:
+        with self._lock:
+            return bool(
+                generation == self._worker_generation and self._cancel_requested
             )
 
     def _recover_poisoned_worker(self) -> bool:

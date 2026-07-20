@@ -1,3 +1,4 @@
+import ctypes
 import unittest
 from unittest.mock import patch
 
@@ -116,6 +117,80 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         self.assertLessEqual(height, 620)
         self.assertGreaterEqual(min_width, 940)
         self.assertLessEqual(min_height, 580)
+
+    def test_ai_usage_geometry_is_capped_to_current_monitor_work_area(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+                self.resize_events = []
+
+            def winfo_width(self):
+                return 1200
+
+            def winfo_height(self):
+                return 900
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+                self.resize_events.append(("geometry", value))
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+                self.resize_events.append(("minsize", (int(width), int(height))))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (800, 500)
+
+        ui._apply_tab_geometry(ui._TAB_AI_USAGE)
+
+        self.assertEqual(root.geometry_calls[-1], "768x452")
+        self.assertEqual(root.minsize_calls[-1], (768, 452))
+        self.assertEqual(
+            root.resize_events,
+            [("minsize", (768, 452)), ("geometry", "768x452")],
+        )
+
+    def test_work_area_winapi_uses_pointer_sized_monitor_handles(self) -> None:
+        class _Callable:
+            def __init__(self, result):
+                self.result = result
+                self.argtypes = None
+                self.restype = None
+                self.calls = []
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return self.result
+
+        class _User32:
+            def __init__(self):
+                self.MonitorFromWindow = _Callable(0x123456789ABC)
+                self.GetMonitorInfoW = _Callable(0)
+
+        class _Root(_FakeRoot):
+            def winfo_id(self):
+                return 0x23456789ABCD
+
+            def winfo_screenwidth(self):
+                return 1920
+
+            def winfo_screenheight(self):
+                return 1080
+
+        user32 = _User32()
+        ui, _, _ = self._build_ui(root=_Root())
+
+        with patch.object(ctypes, "windll", type("Windll", (), {"user32": user32})(), create=True):
+            self.assertEqual(ui._work_area_size(), (1920, 1080))
+
+        self.assertIs(user32.MonitorFromWindow.argtypes[0], ctypes.c_void_p)
+        self.assertIs(user32.MonitorFromWindow.restype, ctypes.c_void_p)
+        self.assertIs(user32.GetMonitorInfoW.argtypes[0], ctypes.c_void_p)
+        self.assertEqual(user32.MonitorFromWindow.calls[0][0], 0x23456789ABCD)
+        self.assertEqual(user32.GetMonitorInfoW.calls[0][0], 0x123456789ABC)
 
     def test_main_shell_uses_ai_usage_tab_title_and_loading_text(self) -> None:
         fake_ttk = _FakeTtk()

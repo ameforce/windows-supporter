@@ -22,9 +22,15 @@ class AIUsageSettingsView(CodexUsageSettingsView):
         ui_post=None,
         *,
         codex_monitor: Any = None,
+        on_external_settings_reconciled=None,
     ) -> None:
         monitor = usage_monitor if usage_monitor is not None else codex_monitor
-        super().__init__(root, monitor, ui_post=ui_post)
+        super().__init__(
+            root,
+            monitor,
+            ui_post=ui_post,
+            on_external_settings_reconciled=on_external_settings_reconciled,
+        )
 
     def mount(self, parent: Any) -> None:
         super().mount(parent)

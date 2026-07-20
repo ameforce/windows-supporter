@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import struct
+import subprocess
 import sys
 import time
 from typing import Any
@@ -25,8 +26,13 @@ if str(REPO_ROOT) not in sys.path:
 
 
 SCENARIO_NAMES = (
+    "zero-profiles",
     "mixed-ready-standard",
+    "one-profile-125",
+    "dynamic-three-profiles",
+    "ten-mixed-profiles-150",
     "long-label-narrow",
+    "cursor-long-amount-150",
     "cursor-logged-out",
     "cursor-stale-rate-limited",
 )
@@ -123,10 +129,11 @@ def build_scenario_fixture(
     recent = _iso(current - timedelta(seconds=30))
     stale = _iso(current - timedelta(days=3))
 
+    ui_scale_percent = 100
     if scenario == "long-label-narrow":
         codex_label = "Codex 장기 프로젝트 품질 검증 및 릴리스 자동화 업무용 프로필 아주 긴 표시 이름"
         cursor_label = "Cursor 다중 모니터 고해상도 한국어 레이아웃 검증 전용 프로필 아주 긴 표시 이름"
-        window_size = [820, 680]
+        window_size = [700, 680]
         phase = "interaction"
         interaction = {
             "action": "manual_query_and_toggle_taskbar_selection",
@@ -137,11 +144,27 @@ def build_scenario_fixture(
     else:
         codex_label = "Codex 업무"
         cursor_label = "Cursor 개발"
-        window_size = [1040, 660]
-        phase = "initial" if scenario == "mixed-ready-standard" else "final"
+        window_size = (
+            [900, 620]
+            if scenario == "one-profile-125"
+            else [1040, 760]
+            if scenario in {"dynamic-three-profiles", "ten-mixed-profiles-150"}
+            else [1040, 660]
+        )
+        phase = (
+            "initial"
+            if scenario in {"zero-profiles", "mixed-ready-standard"}
+            else "final"
+        )
         interaction = {"action": "none", "profile_id": ""}
         codex_id = "codex_primary"
         cursor_id = "cursor_primary"
+
+    if scenario == "cursor-long-amount-150":
+        ui_scale_percent = 150
+        window_size = [960, 720]
+        phase = "interaction"
+        interaction = {"action": "keyboard_end_scroll", "profile_id": ""}
 
     codex_profile = _profile_settings(codex_id, codex_label, "codex")
     cursor_profile = _profile_settings(cursor_id, cursor_label, "cursor")
@@ -187,7 +210,45 @@ def build_scenario_fixture(
             _cursor_snapshot(cursor_captured_at),
         ),
     ]
+    if scenario == "cursor-long-amount-150":
+        runtime_profiles[1]["last_snapshot"]["on_demand_status"] = (
+            "Enabled · US$1,234,567,890.12 used"
+        )
     settings_profiles = [codex_profile, cursor_profile]
+    if scenario == "zero-profiles":
+        settings_profiles = []
+        runtime_profiles = []
+    elif scenario == "one-profile-125":
+        ui_scale_percent = 125
+        settings_profiles = [codex_profile]
+        runtime_profiles = [runtime_profiles[0]]
+    elif scenario == "dynamic-three-profiles":
+        third_profile = _profile_settings(
+            "profile_00000000000000000000000000000003",
+            "Codex 릴리스 검증",
+            "codex",
+            selected=False,
+        )
+        settings_profiles.append(third_profile)
+        runtime_profiles.append(
+            _runtime_profile(third_profile, _ready_runtime(), _codex_snapshot(recent))
+        )
+        interaction = {"action": "mousewheel_scroll", "profile_id": ""}
+    elif scenario == "ten-mixed-profiles-150":
+        ui_scale_percent = 150
+        for index in range(3, 11):
+            provider = "codex" if index % 2 else "cursor"
+            profile = _profile_settings(
+                f"profile_{index:032x}",
+                f"{provider.title()} QA 프로필 {index} · {'한국어 긴 이름' if index % 3 == 0 else 'English long label'}",
+                provider,
+                selected=False,
+            )
+            settings_profiles.append(profile)
+            snapshot = _codex_snapshot(recent) if provider == "codex" else _cursor_snapshot(recent)
+            runtime_profiles.append(_runtime_profile(profile, _ready_runtime(), snapshot))
+        phase = "interaction"
+        interaction = {"action": "keyboard_end_scroll", "profile_id": ""}
     settings = {
         "enabled": True,
         "taskbar_overlay_enabled": True,
@@ -199,8 +260,12 @@ def build_scenario_fixture(
         "profile_dir": "C:\\QA\\AIUsage\\profiles",
         "profiles": copy.deepcopy(settings_profiles),
         "accounts": copy.deepcopy(settings_profiles),
-        "profile_order": [codex_id, cursor_id],
-        "selected_profile_ids": [codex_id, cursor_id],
+        "profile_order": [str(profile["id"]) for profile in settings_profiles],
+        "selected_profile_ids": [
+            str(profile["id"])
+            for profile in settings_profiles
+            if bool(profile.get("taskbar_selected"))
+        ],
     }
     runtime = {
         "enabled": True,
@@ -214,6 +279,7 @@ def build_scenario_fixture(
         "phase": phase,
         "screenshot_name": f"{scenario}.png",
         "window_size": window_size,
+        "ui_scale_percent": ui_scale_percent,
         "interaction": interaction,
         "settings": settings,
         "runtime": runtime,
@@ -598,7 +664,13 @@ def _collect_widget_metrics(root: Any) -> dict[str, Any]:
         )
         if left < root_left or top < root_top or left + width > root_right + 1 or top + height > root_bottom + 1:
             clipped.append(path)
-        if text and requested_width > width + 1:
+        intersects_viewport = bool(
+            left < root_right
+            and left + width > root_left
+            and top < root_bottom
+            and top + height > root_top
+        )
+        if text and intersects_viewport and requested_width > width + 1:
             text_overflow.append(path)
     return {
         "widget_count": len(widgets),
@@ -612,6 +684,30 @@ def _apply_interaction(view: Any, manager: SyntheticAiUsageManager, fixture: dic
     interaction = fixture.get("interaction", {})
     if not isinstance(interaction, dict) or interaction.get("action") == "none":
         return {"action": "none", "applied": True, "manager_calls": []}
+    action = str(interaction.get("action") or "")
+    if action in {"mousewheel_scroll", "keyboard_end_scroll"}:
+        canvas = getattr(view, "_scroll_canvas", None)
+        if canvas is None:
+            return {"action": action, "applied": False, "manager_calls": []}
+        try:
+            before = tuple(float(value) for value in canvas.yview())
+            canvas.focus_force()
+            canvas.update()
+            if action == "mousewheel_scroll":
+                canvas.event_generate("<MouseWheel>", delta=-480)
+            else:
+                canvas.event_generate("<End>")
+            canvas.update()
+            after = tuple(float(value) for value in canvas.yview())
+        except Exception:
+            return {"action": action, "applied": False, "manager_calls": []}
+        return {
+            "action": action,
+            "applied": bool(after != before and after[0] > before[0]),
+            "scroll_before": list(before),
+            "scroll_after": list(after),
+            "manager_calls": [],
+        }
     profile_id = str(interaction.get("profile_id") or "")
     selected_var = getattr(view, "_account_taskbar_selected_vars", {}).get(profile_id)
     if selected_var is not None:
@@ -659,6 +755,8 @@ def capture_scenario(
     try:
         name = str(fixture.get("name") or "scenario")
         width, height = [int(value) for value in fixture.get("window_size", [1040, 660])]
+        ui_scale_percent = int(fixture.get("ui_scale_percent", 100) or 100)
+        root.tk.call("tk", "scaling", (96.0 * ui_scale_percent / 100.0) / 72.0)
         root.title(f"Windows Supporter · AI 사용량 · {name}")
         root.geometry(f"{width}x{height}+40+40")
         root.minsize(700, 560)
@@ -705,6 +803,7 @@ def capture_scenario(
                 "virtual_screen_px": _virtual_screen_metrics(),
             },
             "dpi": {
+                "requested_ui_scale_percent": ui_scale_percent,
                 "window_dpi": _window_dpi(root),
                 "system_dpi": _system_dpi(),
                 "tk_scaling": float(root.tk.call("tk", "scaling")),
@@ -724,9 +823,31 @@ def capture_scenario(
             pass
 
 
+def capture_provenance() -> dict[str, Any]:
+    git_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+    ).strip()
+    if len(git_sha) != 40:
+        raise RuntimeError(f"expected a full Git SHA, got: {git_sha!r}")
+    worktree_status = subprocess.check_output(
+        ["git", "status", "--porcelain"],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+    )
+    return {
+        "git_sha": git_sha,
+        "worktree_clean": not bool(worktree_status.strip()),
+    }
+
+
 def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, Any]:
     output_dir = validate_output_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    provenance = capture_provenance()
     dpi_awareness = _enable_per_monitor_dpi_awareness()
     generated_at = datetime.now(timezone.utc)
     results: list[dict[str, Any]] = []
@@ -757,15 +878,28 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
         if (output_dir / name).is_file()
     ]
     phases = {str(result.get("phase") or "") for result in results if result.get("ok")}
+    final_provenance = capture_provenance()
+    provenance_stable = provenance == final_provenance
     report = {
         "schema_version": 1,
         "ok": (
-            len(results) == 4
+            provenance["worktree_clean"]
+            and
+            final_provenance["worktree_clean"]
+            and
+            provenance_stable
+            and
+            len(results) == len(SCENARIO_NAMES)
             and all(bool(result.get("ok")) for result in results)
-            and len(generated_pngs) == 4
+            and len(generated_pngs) == len(SCENARIO_NAMES)
             and {"initial", "interaction", "final"}.issubset(phases)
         ),
         "generated_at_utc": _iso(generated_at),
+        "git_sha": provenance["git_sha"],
+        "git_worktree_clean": provenance["worktree_clean"],
+        "git_end_sha": final_provenance["git_sha"],
+        "git_end_worktree_clean": final_provenance["worktree_clean"],
+        "git_provenance_stable": provenance_stable,
         "capture_surface": "native-tk",
         "dpi_awareness": dpi_awareness,
         "fixture_policy": {

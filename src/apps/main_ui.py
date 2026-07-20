@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import threading
 from typing import Any
 
@@ -374,24 +375,78 @@ class WindowsSupporterMainUI:
         if int(w) <= 0 or int(h) <= 0:
             return
         try:
+            min_size = self._tab_minsizes.get(tab_key) or (1, 1)
+        except Exception:
+            min_size = (1, 1)
+        work_width, work_height = self._work_area_size()
+        max_width = max(320, int(work_width) - 32)
+        max_height = max(280, int(work_height) - 48)
+        w = min(int(w), max_width)
+        h = min(int(h), max_height)
+        min_width = min(int(min_size[0]), max_width, int(w))
+        min_height = min(int(min_size[1]), max_height, int(h))
+        try:
             cur_w = int(root.winfo_width())
             cur_h = int(root.winfo_height())
         except Exception:
             cur_w = -1
             cur_h = -1
+        try:
+            root.minsize(max(1, min_width), max(1, min_height))
+        except Exception:
+            pass
         if cur_w != int(w) or cur_h != int(h):
             try:
                 root.geometry(f"{int(w)}x{int(h)}")
             except Exception:
                 pass
+        return
+
+    def _work_area_size(self) -> tuple[int, int]:
+        root = self._root
         try:
-            min_size = self._tab_minsizes.get(tab_key)
-            if min_size:
-                mw, mh = min_size
-                root.minsize(int(mw), int(mh))
+            hwnd = int(root.winfo_id())
+
+            class _Rect(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            class _MonitorInfo(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_ulong),
+                    ("rcMonitor", _Rect),
+                    ("rcWork", _Rect),
+                    ("dwFlags", ctypes.c_ulong),
+                ]
+
+            user32 = ctypes.windll.user32
+            monitor_from_window = user32.MonitorFromWindow
+            monitor_from_window.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            monitor_from_window.restype = ctypes.c_void_p
+            get_monitor_info = user32.GetMonitorInfoW
+            get_monitor_info.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_MonitorInfo),
+            ]
+            get_monitor_info.restype = ctypes.c_int
+            monitor = monitor_from_window(hwnd, 2)
+            info = _MonitorInfo()
+            info.cbSize = ctypes.sizeof(_MonitorInfo)
+            if monitor and get_monitor_info(monitor, ctypes.byref(info)):
+                width = int(info.rcWork.right - info.rcWork.left)
+                height = int(info.rcWork.bottom - info.rcWork.top)
+                if width > 0 and height > 0:
+                    return width, height
         except Exception:
             pass
-        return
+        try:
+            return int(root.winfo_screenwidth()), int(root.winfo_screenheight())
+        except Exception:
+            return 1920, 1080
 
     def _ensure_selected_tab_built(self) -> None:
         nb = self._notebook
@@ -531,14 +586,14 @@ class WindowsSupporterMainUI:
             "update.settings": self.show_update_settings,
         }
 
-    def _run_bg(self, fn) -> None:
+    def _run_bg(self, fn) -> bool:
         if not callable(fn):
-            return
+            return False
         try:
             threading.Thread(target=fn, daemon=True).start()
+            return True
         except Exception:
-            pass
-        return
+            return False
 
     def _dashboard_startup_toggle(self) -> None:
         def task() -> None:
@@ -589,14 +644,142 @@ class WindowsSupporterMainUI:
         usage = self._get_ai_usage_monitor()
         if usage is None:
             return
-        try:
-            settings = usage.get_settings_snapshot()
-            if not isinstance(settings, dict):
-                settings = {}
-            settings["enabled"] = not bool(settings.get("enabled", True))
-            usage.update_settings(settings)
-        except Exception:
-            pass
+        settings_view = self._ai_usage_view
+        prepared_settings = None
+        view_mutation_started = False
+        if settings_view is not None and self._event_queue is not None:
+            begin_mutation = getattr(
+                settings_view,
+                "_begin_external_settings_mutation",
+                None,
+            )
+            if callable(begin_mutation):
+                try:
+                    view_mutation_started, prepared_settings = begin_mutation()
+                except Exception:
+                    view_mutation_started = False
+                    prepared_settings = None
+                if not view_mutation_started:
+                    return
+
+        def resume_pending_autosave() -> None:
+            if prepared_settings is None or settings_view is None:
+                return
+            resume = getattr(
+                settings_view,
+                "_resume_pending_autosave_after_external_failure",
+                None,
+            )
+            if callable(resume):
+                resume()
+            return
+
+        if prepared_settings is not None and settings_view is not None:
+            flush_provider_change = getattr(
+                settings_view,
+                "_flush_provider_changing_settings_before_worker",
+                None,
+            )
+            if callable(flush_provider_change):
+                try:
+                    flush_ok, flush_error, prepared_settings = flush_provider_change(
+                        prepared_settings
+                    )
+                except Exception as exc:
+                    flush_ok = False
+                    flush_error = str(exc)
+                if not bool(flush_ok):
+                    finish_mutation = getattr(
+                        settings_view,
+                        "_finish_external_settings_mutation",
+                        None,
+                    )
+                    if callable(finish_mutation):
+                        finish_mutation(False, flush_error)
+                    resume_pending_autosave()
+                    self._refresh_dashboard_status()
+                    return
+
+        def task() -> None:
+            ok = True
+            error = None
+            try:
+                if prepared_settings is not None and settings_view is not None:
+                    apply_settings = getattr(
+                        settings_view,
+                        "_apply_settings_update",
+                        None,
+                    )
+                    if callable(apply_settings):
+                        ok, error, _provider_changed = apply_settings(
+                            prepared_settings,
+                            update_ui=False,
+                        )
+                if ok:
+                    toggle = getattr(usage, "toggle_enabled", None)
+                    if callable(toggle):
+                        result = toggle()
+                    else:
+                        settings = usage.get_settings_snapshot()
+                        if not isinstance(settings, dict):
+                            settings = {}
+                        result = usage.update_settings(
+                            {"enabled": not bool(settings.get("enabled", True))}
+                        )
+                    if isinstance(result, tuple):
+                        ok = bool(result[0])
+                        error = result[1] if len(result) > 1 else None
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+
+            def done() -> None:
+                if view_mutation_started and settings_view is not None:
+                    finish_mutation = getattr(
+                        settings_view,
+                        "_finish_external_settings_mutation",
+                        None,
+                    )
+                    if callable(finish_mutation):
+                        finish_mutation(ok, error)
+                    if not bool(ok):
+                        resume_pending_autosave()
+                self._refresh_dashboard_status()
+                return
+
+            if not self._ui_post(done):
+                if threading.current_thread() is threading.main_thread():
+                    done()
+                elif view_mutation_started and settings_view is not None:
+                    record_result = getattr(
+                        settings_view,
+                        "_record_external_settings_result_without_ui",
+                        None,
+                    )
+                    if callable(record_result):
+                        record_result(ok, error, prepared_settings)
+                    else:
+                        release_mutation = getattr(
+                            settings_view,
+                            "_release_external_settings_mutation_without_ui",
+                            None,
+                        )
+                        if callable(release_mutation):
+                            release_mutation()
+            return
+
+        worker_started = self._run_bg(task)
+        if worker_started is False:
+            if view_mutation_started and settings_view is not None:
+                finish_mutation = getattr(
+                    settings_view,
+                    "_finish_external_settings_mutation",
+                    None,
+                )
+                if callable(finish_mutation):
+                    finish_mutation(False, "background_worker_start_failed")
+                resume_pending_autosave()
+            self._refresh_dashboard_status()
         return
 
     def _dashboard_codex_toggle_enabled(self) -> None:
@@ -952,6 +1135,7 @@ class WindowsSupporterMainUI:
                 self._root,
                 usage,
                 ui_post=self._ui_post,
+                on_external_settings_reconciled=self._refresh_dashboard_status,
             )
             self._ai_usage_view.mount(tab)
             self._ai_usage_built = True

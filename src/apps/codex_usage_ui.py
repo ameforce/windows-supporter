@@ -7,10 +7,21 @@ from typing import Any
 
 
 class CodexUsageSettingsView:
-    def __init__(self, root: Any, codex_monitor: Any, ui_post=None) -> None:
+    def __init__(
+        self,
+        root: Any,
+        codex_monitor: Any,
+        ui_post=None,
+        on_external_settings_reconciled=None,
+    ) -> None:
         self._root = root
         self._codex = codex_monitor
         self._ui_post = ui_post if callable(ui_post) else None
+        self._on_external_settings_reconciled = (
+            on_external_settings_reconciled
+            if callable(on_external_settings_reconciled)
+            else None
+        )
 
         self._tk = None
         self._ttk = None
@@ -41,7 +52,32 @@ class CodexUsageSettingsView:
         self._account_metric_display_vars = {}
         self._account_metric_cells = {}
         self._account_order: list[str] = []
+        self._profile_deletions_inflight: set[str] = set()
+        self._profile_actions_inflight: set[str] = set()
+        self._scroll_canvas = None
+        self._scroll_body = None
         self._autosave_after_id = None
+        self._preserve_status_after_next_autosave = False
+        self._external_settings_result_lock = threading.Lock()
+        self._pending_external_settings_result: tuple[
+            bool,
+            str | None,
+            dict[str, Any] | None,
+        ] | None = None
+        self._profile_add_result_lock = threading.Lock()
+        self._pending_profile_add_result: tuple[bool, str | None, bool] | None = None
+        self._profile_delete_result_lock = threading.Lock()
+        self._pending_profile_delete_result: tuple[
+            str,
+            bool,
+            str | None,
+            bool,
+            dict[str, Any] | None,
+        ] | None = None
+        self._profile_release_result_lock = threading.Lock()
+        self._pending_profile_release_result: tuple[str, bool, str] | None = None
+        self._profile_add_settings_changed = False
+        self._blocked_mutation_settings_changed = False
         self._loading_settings = False
         self._runtime_after_id = None
         self._collect_state_var = None
@@ -90,7 +126,7 @@ class CodexUsageSettingsView:
         accounts = settings.get("profiles")
         if not isinstance(accounts, list):
             accounts = settings.get("accounts")
-        has_multi_accounts = isinstance(accounts, list) and bool(accounts)
+        has_multi_accounts = isinstance(accounts, list)
         has_codex_profile = not isinstance(accounts, list) or any(
             not isinstance(raw, dict)
             or str(raw.get("provider", "codex") or "codex").strip().lower() == "codex"
@@ -184,8 +220,39 @@ class CodexUsageSettingsView:
         )
         content_card.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        body = tk.Frame(content_card, bg=card_bg)
-        body.pack(fill="both", expand=True, padx=12, pady=7)
+        viewport = tk.Frame(content_card, bg=card_bg)
+        viewport.pack(fill="both", expand=True, padx=3, pady=3)
+        canvas = tk.Canvas(
+            viewport,
+            bg=card_bg,
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=True,
+        )
+        scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas, bg=card_bg)
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        self._scroll_canvas = canvas
+        self._scroll_body = body
+        try:
+            body.bind(
+                "<Configure>",
+                lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+            )
+            canvas.bind(
+                "<Configure>",
+                lambda event: canvas.itemconfigure(
+                    body_window,
+                    width=max(1, int(getattr(event, "width", 1) or 1)),
+                ),
+            )
+        except Exception:
+            pass
+        body.configure(padx=9, pady=4)
         body.columnconfigure(1, weight=1)
         body.columnconfigure(3, weight=1)
 
@@ -268,7 +335,7 @@ class CodexUsageSettingsView:
                 fg="#111827",
                 font=("Segoe UI", 9),
             ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
-            ttk.Entry(body, textvariable=self._usage_url_var, width=64).grid(
+            ttk.Entry(body, textvariable=self._usage_url_var, width=24).grid(
                 row=row,
                 column=1,
                 columnspan=3,
@@ -302,11 +369,14 @@ class CodexUsageSettingsView:
                 pass
         row += 1
 
-        if isinstance(accounts, list) and accounts:
+        if isinstance(accounts, list):
             row = self._add_account_sections(body, row, accounts, card_bg, border, text_muted)
 
         if not has_multi_accounts:
             row = self._add_realtime_status_section(body, row, card_bg, border)
+
+        self._bind_scroll_navigation(canvas, body)
+        self._bind_mousewheel_tree(body, canvas)
 
         self._load_settings()
         self._register_autosave_traces()
@@ -336,22 +406,29 @@ class CodexUsageSettingsView:
         row += 1
         tk.Label(
             body,
-            text="사용량 프로필 (전체 최대 2개)",
+            text="사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 2개)",
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 2))
+        ttk.Button(
+            body,
+            text="프로필 추가",
+            command=self._on_add_profile,
+        ).grid(row=row, column=3, sticky="e", pady=(0, 2))
         row += 1
         cards = tk.Frame(body, bg=card_bg)
         cards.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 2))
+        card_columns = self._profile_card_column_count(body)
+        card_widgets: list[Any] = []
         try:
-            cards.columnconfigure(0, weight=1)
-            cards.columnconfigure(1, weight=1)
+            for column in range(card_columns):
+                cards.columnconfigure(column, weight=1)
         except Exception:
             pass
         ordered_accounts = [
             raw
-            for raw in accounts[:2]
+            for raw in accounts
             if isinstance(raw, dict) and str(raw.get("id", "") or "").strip()
         ]
         self._account_order = [
@@ -383,12 +460,15 @@ class CodexUsageSettingsView:
                 highlightbackground=border,
             )
             card.grid(
-                row=0,
-                column=index,
+                row=index // card_columns,
+                column=index % card_columns,
                 sticky="nwe",
-                padx=(0, 5) if index == 0 else (5, 0),
-                pady=0,
+                padx=(0, 5) if card_columns > 1 and index % card_columns == 0 else (5, 0)
+                if card_columns > 1
+                else 0,
+                pady=(0, 6),
             )
+            card_widgets.append(card)
             try:
                 card.columnconfigure(0, weight=1)
             except Exception:
@@ -447,6 +527,7 @@ class CodexUsageSettingsView:
                 fg="#111827",
                 activeforeground="#111827",
                 font=("Segoe UI", 9),
+                command=lambda aid=account_id: self._on_taskbar_selection_changed(aid),
             ).pack(side="left", padx=(2, 3))
 
             actions = tk.Frame(header, bg=card_bg)
@@ -456,32 +537,43 @@ class CodexUsageSettingsView:
                     ttk.Button(
                         actions,
                         text="위로",
+                        width=6,
                         command=lambda aid=account_id: self._on_move_account(aid, -1),
                     ).pack(side="left", padx=(4, 0))
                 if index < len(ordered_accounts) - 1:
                     ttk.Button(
                         actions,
                         text="아래로",
+                        width=6,
                         command=lambda aid=account_id: self._on_move_account(aid, 1),
                     ).pack(side="left", padx=(4, 0))
             query_button = ttk.Button(
                 actions,
                 text="새로고침",
+                width=8,
                 command=lambda aid=account_id: self._on_account_query(aid),
             )
             query_button.pack(side="left", padx=(4, 0))
             login_button = ttk.Button(
                 actions,
                 text="연결",
+                width=6,
                 command=lambda aid=account_id: self._on_account_login(aid),
             )
             login_button.pack(side="left", padx=(4, 0))
             logout_button = ttk.Button(
                 actions,
                 text="연결 해제",
+                width=8,
                 command=lambda aid=account_id: self._on_account_release_profile(aid),
             )
             logout_button.pack(side="left")
+            ttk.Button(
+                actions,
+                text="삭제",
+                width=6,
+                command=lambda aid=account_id, name=label: self._on_delete_profile(aid, name),
+            ).pack(side="left", padx=(4, 0))
             self._account_query_buttons[account_id] = query_button
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
@@ -563,6 +655,31 @@ class CodexUsageSettingsView:
                     except Exception:
                         pass
                 detail_row += 1
+        self._reflow_profile_cards(cards, card_widgets)
+        try:
+            cards.bind(
+                "<Configure>",
+                lambda event: self._reflow_profile_cards(
+                    cards,
+                    card_widgets,
+                    available_width=int(getattr(event, "width", 0) or 0),
+                ),
+                add="+",
+            )
+        except TypeError:
+            try:
+                cards.bind(
+                    "<Configure>",
+                    lambda event: self._reflow_profile_cards(
+                        cards,
+                        card_widgets,
+                        available_width=int(getattr(event, "width", 0) or 0),
+                    ),
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
         row += 1
         return row
 
@@ -667,6 +784,63 @@ class CodexUsageSettingsView:
         )
         return row + 1
 
+    def _profile_card_column_count(
+        self,
+        widget: Any,
+        *,
+        available_width: int | None = None,
+    ) -> int:
+        try:
+            scaling = float(widget.tk.call("tk", "scaling"))
+        except Exception:
+            scaling = 4.0 / 3.0
+        width = int(available_width or 0)
+        if width <= 1:
+            try:
+                width = int(widget.winfo_width())
+            except Exception:
+                width = 0
+        return 1 if scaling >= 1.65 or (width > 1 and width < 760) else 2
+
+    def _reflow_profile_cards(
+        self,
+        cards: Any,
+        card_widgets: list[Any],
+        *,
+        available_width: int | None = None,
+    ) -> None:
+        columns = self._profile_card_column_count(
+            cards,
+            available_width=available_width,
+        )
+        if getattr(cards, "_windows_supporter_profile_columns", None) == columns:
+            return
+        try:
+            cards._windows_supporter_profile_columns = columns
+        except Exception:
+            pass
+        for column in range(2):
+            try:
+                cards.columnconfigure(column, weight=1 if column < columns else 0)
+            except Exception:
+                pass
+        for index, card in enumerate(card_widgets):
+            try:
+                card.grid(
+                    row=index // columns,
+                    column=index % columns,
+                    sticky="nwe",
+                    padx=(0, 5)
+                    if columns > 1 and index % columns == 0
+                    else (5, 0)
+                    if columns > 1
+                    else 0,
+                    pady=(0, 6),
+                )
+            except Exception:
+                pass
+        return
+
     def _build_account_metric_rows(
         self,
         parent: Any,
@@ -705,21 +879,40 @@ class CodexUsageSettingsView:
                 display_var = tk.StringVar(value=f"{label}: -")
                 metric_vars[key] = value_var
                 display_vars[key] = display_var
-                self._bind_metric_display_value(label, value_var, display_var)
-                cell = self._add_metric_cell(parent, row_index, column, display_var, bg)
+                self._bind_metric_display_value(
+                    label,
+                    value_var,
+                    display_var,
+                )
+                cell = self._add_metric_cell(
+                    parent,
+                    row_index,
+                    column,
+                    display_var,
+                    bg,
+                    wraplength=300 if key == "on_demand_status" else 180,
+                )
                 if account_id and cell is not None:
                     self._account_metric_cells.setdefault(account_id, {})[key] = cell
         return metric_vars, display_vars
 
-    def _bind_metric_display_value(self, label: str, value_var: Any, display_var: Any) -> None:
+    def _bind_metric_display_value(
+        self,
+        label: str,
+        value_var: Any,
+        display_var: Any,
+        *,
+        keep_together: bool = False,
+    ) -> None:
         def sync(*_args: Any) -> None:
             try:
                 raw = str(value_var.get() or "").strip()
             except Exception:
                 raw = ""
             value = raw if raw else "-"
+            separator = "\u00a0" if keep_together and value != "-" else " "
             try:
-                display_var.set(f"{label}: {value}")
+                display_var.set(f"{label}:{separator}{value}")
             except Exception:
                 pass
 
@@ -737,6 +930,8 @@ class CodexUsageSettingsView:
         column: int,
         display_var: Any,
         bg: str,
+        *,
+        wraplength: int = 180,
     ) -> Any:
         tk = self._tk
         if tk is None:
@@ -750,7 +945,7 @@ class CodexUsageSettingsView:
             font=("Segoe UI", 8),
             anchor="w",
             justify="left",
-            wraplength=180,
+            wraplength=max(1, int(wraplength)),
         )
         cell.grid(row=row, column=column, sticky="we", padx=padx, pady=1)
         return cell
@@ -906,6 +1101,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_login(self) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         if not hasattr(self._codex, "show_current_status"):
             self._set_status("연결 기능을 사용할 수 없습니다.", level="error")
             return
@@ -929,6 +1126,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_account_login(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         account_label = self._account_display_label(account_id)
         try:
             runtime = self._safe_get_runtime()
@@ -963,6 +1162,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_account_query(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         account_label = self._account_display_label(account_id)
         show = getattr(self._codex, "show_account_status", None)
         if callable(show):
@@ -976,6 +1177,8 @@ class CodexUsageSettingsView:
         return
 
     def _on_release_profile(self) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         tk = self._tk
         if tk is None:
             return
@@ -999,6 +1202,8 @@ class CodexUsageSettingsView:
         if not confirmed:
             return
 
+        action_id = "__global_release__"
+        self._profile_actions_inflight.add(action_id)
         self._set_status("연결 해제 중...", level="info")
 
         def worker() -> None:
@@ -1013,24 +1218,29 @@ class CodexUsageSettingsView:
                 message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
-                if ok:
-                    self._load_settings()
-                    self._refresh_runtime_status()
-                    self._set_status(message, level="ok")
-                    return
-                self._set_status(message, level="error")
+                self._finish_profile_release_on_ui(action_id, ok, message)
                 return
 
-            self._post_ui(done)
+            if not self._post_ui(done):
+                self._record_pending_profile_release_result(action_id, ok, message)
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
+            self._finish_profile_release_on_ui(
+                action_id,
+                False,
+                "연결 해제 작업을 시작하지 못했습니다.",
+            )
         return
 
     def _on_account_release_profile(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
+        normalized = str(account_id or "")
+        if not normalized:
+            return
         account_label = self._account_display_label(account_id)
         tk = self._tk
         if tk is None:
@@ -1067,13 +1277,14 @@ class CodexUsageSettingsView:
             confirmed = False
         if not confirmed:
             return
+        self._profile_actions_inflight.add(normalized)
         self._set_status(f"{account_label} 연결 해제 중...", level="info")
 
         def worker() -> None:
             ok = False
             message = ""
             try:
-                ok, message = release(str(account_id))
+                ok, message = release(normalized)
             except Exception:
                 ok = False
                 message = "연결 해제 중 오류가 발생했습니다."
@@ -1081,22 +1292,64 @@ class CodexUsageSettingsView:
                 message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
-                if ok:
-                    self._load_settings()
-                    self._refresh_runtime_status()
-                    self._set_status(message, level="ok")
-                    return
-                self._set_status(message, level="error")
+                self._finish_profile_release_on_ui(normalized, ok, message)
                 return
 
-            self._post_ui(done)
+            if not self._post_ui(done):
+                self._record_pending_profile_release_result(normalized, ok, message)
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
+            self._finish_profile_release_on_ui(
+                normalized,
+                False,
+                "연결 해제 작업을 시작하지 못했습니다.",
+            )
         return
+
+    def _finish_profile_release_on_ui(
+        self,
+        action_id: str,
+        ok: bool,
+        message: str,
+    ) -> None:
+        retry_prepared = self._consume_blocked_mutation_settings()
+        self._profile_actions_inflight.discard(str(action_id or ""))
+        if retry_prepared is None and bool(ok):
+            self._load_settings()
+        elif retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        if bool(ok):
+            self._refresh_runtime_status()
+            self._set_status(message, level="ok")
+            return
+        self._set_status(message, level="error")
+        return
+
+    def _record_pending_profile_release_result(
+        self,
+        action_id: str,
+        ok: bool,
+        message: str,
+    ) -> None:
+        with self._profile_release_result_lock:
+            self._pending_profile_release_result = (
+                str(action_id or ""),
+                bool(ok),
+                str(message or ""),
+            )
+        return
+
+    def _reconcile_pending_profile_release_result(self) -> bool:
+        with self._profile_release_result_lock:
+            result = self._pending_profile_release_result
+            self._pending_profile_release_result = None
+        if result is None:
+            return False
+        self._finish_profile_release_on_ui(*result)
+        return True
 
     def _post_ui(self, fn) -> bool:
         if not callable(fn):
@@ -1104,8 +1357,7 @@ class CodexUsageSettingsView:
         ui_post = self._ui_post
         if callable(ui_post):
             try:
-                ui_post(fn)
-                return True
+                return ui_post(fn) is not False
             except Exception:
                 return False
         return False
@@ -1148,9 +1400,29 @@ class CodexUsageSettingsView:
         except Exception:
             return
 
-    def _schedule_autosave(self) -> None:
+    def _schedule_autosave(self, *, immediate_fallback: bool = True) -> None:
         if bool(self._loading_settings):
             return
+        if self._profile_settings_mutation_blocked():
+            if "__add_profile__" in self._profile_deletions_inflight:
+                self._profile_add_settings_changed = True
+            else:
+                self._blocked_mutation_settings_changed = True
+            return
+        self._cancel_pending_autosave()
+        win = self._win
+        after = getattr(win, "after", None)
+        if callable(after):
+            try:
+                self._autosave_after_id = after(350, self._autosave_now)
+                return
+            except Exception:
+                self._autosave_after_id = None
+        if bool(immediate_fallback):
+            self._autosave_now()
+        return
+
+    def _cancel_pending_autosave(self) -> None:
         win = self._win
         after_cancel = getattr(win, "after_cancel", None)
         if self._autosave_after_id is not None and callable(after_cancel):
@@ -1159,19 +1431,11 @@ class CodexUsageSettingsView:
             except Exception:
                 pass
         self._autosave_after_id = None
-        after = getattr(win, "after", None)
-        if callable(after):
-            try:
-                self._autosave_after_id = after(350, self._autosave_now)
-                return
-            except Exception:
-                self._autosave_after_id = None
-        self._autosave_now()
         return
 
     def _autosave_now(self) -> None:
         self._autosave_after_id = None
-        return self._save_settings()
+        return self._save_settings(reschedule_transient=True)
 
     def _parse_positive_seconds_strict(self, text: str, label: str) -> tuple[float, str | None]:
         raw = str(text or "").strip()
@@ -1185,7 +1449,7 @@ class CodexUsageSettingsView:
             return 0.0, f"{label} 값은 0보다 커야 합니다."
         return float(value), None
 
-    def _save_settings(self) -> bool:
+    def _build_settings_update(self) -> dict[str, Any] | None:
         before_settings = self._safe_get_settings()
         before_profiles = before_settings.get("profiles")
         if not isinstance(before_profiles, list):
@@ -1202,7 +1466,7 @@ class CodexUsageSettingsView:
         )
         if parse_error:
             self._set_status(f"저장 실패: {parse_error}", level="error")
-            return False
+            return None
         tooltip_sec = self._parse_seconds(self._tooltip_var.get(), default=7.0)
         usage_url = str(self._usage_url_var.get() or "").strip()
         accounts = self._build_account_settings_payload()
@@ -1213,7 +1477,7 @@ class CodexUsageSettingsView:
         ]
         if len(selected_profile_ids) > 2:
             self._set_status("저장 실패: 작업표시줄 표시 프로필은 최대 2개입니다.", level="error")
-            return False
+            return None
         payload = {
             "enabled": enabled,
             "taskbar_overlay_enabled": bool(self._taskbar_overlay_var.get()),
@@ -1227,22 +1491,82 @@ class CodexUsageSettingsView:
         }
         if accounts:
             payload["default_account_id"] = str(accounts[0].get("id") or "")
+        return {
+            "payload": payload,
+            "before_providers": before_providers,
+        }
 
-        ok, err = self._codex.update_settings(payload)
+    def _apply_settings_update(
+        self,
+        prepared: dict[str, Any],
+        *,
+        update_ui: bool = True,
+    ) -> tuple[bool, str | None, bool]:
+        payload = prepared.get("payload") if isinstance(prepared, dict) else None
+        if not isinstance(payload, dict):
+            return False, "invalid settings", False
+        try:
+            ok, err = self._codex.update_settings(payload)
+        except Exception as exc:
+            ok = False
+            err = str(exc)
+        provider_changed = self._prepared_settings_changes_provider(prepared)
         if ok:
-            provider_changed = any(
-                before_providers.get(str(item.get("id") or ""))
-                != str(item.get("provider") or "codex").lower()
-                for item in accounts
-                if str(item.get("id") or "") in before_providers
-            )
-            if provider_changed:
-                self._remount()
-            self._set_status("저장됨", level="ok")
-            return True
-        self._load_settings()
-        self._set_status(f"저장 실패: {err}", level="error")
-        return False
+            if update_ui:
+                if provider_changed:
+                    self._remount()
+                if self._preserve_status_after_next_autosave:
+                    self._preserve_status_after_next_autosave = False
+                else:
+                    self._set_status("저장됨", level="ok")
+            return True, None, provider_changed
+        if update_ui:
+            self._preserve_status_after_next_autosave = False
+            self._set_status(f"저장 실패: {err}", level="error")
+        return False, str(err or "settings_save_failed"), provider_changed
+
+    def _prepared_settings_changes_provider(self, prepared: dict[str, Any]) -> bool:
+        payload = prepared.get("payload") if isinstance(prepared, dict) else None
+        before_providers = (
+            prepared.get("before_providers") if isinstance(prepared, dict) else None
+        )
+        if not isinstance(payload, dict) or not isinstance(before_providers, dict):
+            return False
+        accounts = payload.get("profiles")
+        if not isinstance(accounts, list):
+            accounts = []
+        return any(
+            before_providers.get(str(item.get("id") or ""))
+            != str(item.get("provider") or "codex").lower()
+            for item in accounts
+            if isinstance(item, dict)
+            and str(item.get("id") or "") in before_providers
+        )
+
+    def _flush_provider_changing_settings_before_worker(
+        self,
+        prepared: dict[str, Any] | None,
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        if not isinstance(prepared, dict) or not self._prepared_settings_changes_provider(
+            prepared
+        ):
+            return True, None, prepared
+        ok, error, _provider_changed = self._apply_settings_update(
+            prepared,
+            update_ui=False,
+        )
+        return bool(ok), error, None if ok else prepared
+
+    def _save_settings(self, *, reschedule_transient: bool = False) -> bool:
+        if self._profile_settings_mutation_blocked():
+            return False
+        prepared = self._build_settings_update()
+        if prepared is None:
+            return False
+        ok, error, _provider_changed = self._apply_settings_update(prepared)
+        if not ok and bool(reschedule_transient) and error == "profile_refresh_busy":
+            self._schedule_autosave(immediate_fallback=False)
+        return bool(ok)
 
     def _build_account_settings_payload(self) -> list[dict[str, Any]]:
         settings = self._safe_get_settings()
@@ -1263,7 +1587,7 @@ class CodexUsageSettingsView:
         ]
         order.extend(account_id for account_id in accounts_by_id if account_id not in order)
         payload = []
-        for account_id in order[:2]:
+        for account_id in order:
             raw = accounts_by_id.get(account_id, {})
             if not account_id:
                 continue
@@ -1290,7 +1614,315 @@ class CodexUsageSettingsView:
             payload.append(item)
         return payload
 
+    def _on_add_profile(self) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
+        creator = getattr(self._codex, "add_profile", None)
+        if not callable(creator):
+            self._set_status("프로필 추가 기능을 사용할 수 없습니다.", level="error")
+            return
+        prepared = None
+        if self._autosave_after_id is not None:
+            self._cancel_pending_autosave()
+            prepared = self._build_settings_update()
+            if prepared is None:
+                return
+        ok, error, prepared = self._flush_provider_changing_settings_before_worker(
+            prepared
+        )
+        if not ok:
+            if prepared is not None:
+                self._schedule_captured_autosave_retry(prepared)
+            self._set_status(
+                f"프로필 추가 전 provider 변경사항을 저장하지 못했습니다: {error}",
+                level="error",
+            )
+            return
+        mutation_id = "__add_profile__"
+        self._profile_add_settings_changed = False
+        self._profile_deletions_inflight.add(mutation_id)
+        self._set_status("프로필 추가 중...", level="info")
+
+        if prepared is None:
+            self._finish_profile_add_on_ui(True, None, False)
+            return
+
+        def worker() -> None:
+            ok, error, _provider_changed = self._apply_settings_update(
+                prepared,
+                update_ui=False,
+            )
+            if not self._post_ui(
+                lambda: self._finish_profile_add_on_ui(ok, error, not ok)
+            ):
+                self._record_pending_profile_add_result(ok, error, not ok)
+            return
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._profile_deletions_inflight.discard(mutation_id)
+            if prepared is not None:
+                self._schedule_autosave()
+            self._set_status("프로필 추가 작업을 시작하지 못했습니다.", level="error")
+        return
+
+    def _bind_scroll_navigation(self, canvas: Any, body: Any) -> None:
+        def scroll_units(units: int):
+            try:
+                canvas.yview_scroll(int(units), "units")
+            except Exception:
+                pass
+            return "break"
+
+        def scroll_pages(pages: int):
+            try:
+                canvas.yview_scroll(int(pages), "pages")
+            except Exception:
+                pass
+            return "break"
+
+        def scroll_edge(fraction: float):
+            try:
+                canvas.yview_moveto(float(fraction))
+            except Exception:
+                pass
+            return "break"
+
+        bindings = {
+            "<Up>": lambda _event: scroll_units(-1),
+            "<Down>": lambda _event: scroll_units(1),
+            "<Prior>": lambda _event: scroll_pages(-1),
+            "<Next>": lambda _event: scroll_pages(1),
+            "<Home>": lambda _event: scroll_edge(0.0),
+            "<End>": lambda _event: scroll_edge(1.0),
+        }
+        pending = [body, canvas]
+        seen: set[int] = set()
+        native_input_sequences = {"<Up>", "<Down>", "<Home>", "<End>"}
+        native_input_classes = {
+            "entry",
+            "tentry",
+            "combobox",
+            "tcombobox",
+            "spinbox",
+            "tspinbox",
+        }
+        while pending:
+            current = pending.pop()
+            identity = id(current)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                widget_class = str(current.winfo_class() or "").strip().lower()
+            except Exception:
+                widget_class = ""
+            for sequence, callback in bindings.items():
+                if (
+                    widget_class in native_input_classes
+                    and sequence in native_input_sequences
+                ):
+                    continue
+                try:
+                    current.bind(sequence, callback, add="+")
+                except TypeError:
+                    try:
+                        current.bind(sequence, callback)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                pending.extend(list(current.winfo_children()))
+            except Exception:
+                pass
+        return
+
+    def _bind_mousewheel_tree(self, widget: Any, canvas: Any) -> None:
+        def on_mousewheel(event):
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return None
+            units = max(1, abs(delta) // 120)
+            try:
+                canvas.yview_scroll(-units if delta > 0 else units, "units")
+            except Exception:
+                pass
+            return "break"
+
+        callbacks = {
+            "<MouseWheel>": on_mousewheel,
+            "<Button-4>": lambda _event: self._scroll_canvas_units(canvas, -1),
+            "<Button-5>": lambda _event: self._scroll_canvas_units(canvas, 1),
+        }
+        pending = [widget, canvas]
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop()
+            identity = id(current)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            for sequence, callback in callbacks.items():
+                try:
+                    current.bind(sequence, callback, add="+")
+                except TypeError:
+                    try:
+                        current.bind(sequence, callback)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                pending.extend(list(current.winfo_children()))
+            except Exception:
+                pass
+        return
+
+    def _scroll_canvas_units(self, canvas: Any, units: int):
+        try:
+            canvas.yview_scroll(int(units), "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _on_delete_profile(self, account_id: str, label: str = "") -> None:
+        normalized = str(account_id or "")
+        if not normalized:
+            return
+        if self._profile_actions_inflight:
+            self._set_status(
+                "프로필 연결 작업이 진행 중이므로 삭제할 수 없습니다.",
+                level="info",
+            )
+            return
+        if self._profile_deletions_inflight:
+            message = (
+                "이 프로필은 이미 삭제 중입니다."
+                if normalized in self._profile_deletions_inflight
+                else "다른 프로필 삭제 작업이 진행 중입니다."
+            )
+            self._set_status(message, level="info")
+            return
+        try:
+            from tkinter import messagebox
+
+            confirmed = bool(
+                messagebox.askyesno(
+                    "AI 사용량 프로필 삭제",
+                    f"'{str(label or normalized)}' 프로필과 이 앱이 관리하는 해당 프로필 데이터만 삭제할까요?",
+                    parent=self._win,
+                )
+            )
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            return
+        deleter = getattr(self._codex, "delete_profile", None)
+        if not callable(deleter):
+            self._set_status("프로필 삭제 기능을 사용할 수 없습니다.", level="error")
+            return
+        prepared = None
+        if self._autosave_after_id is not None:
+            self._cancel_pending_autosave()
+            prepared = self._build_settings_update()
+            if prepared is None:
+                return
+        ok, error, prepared = self._flush_provider_changing_settings_before_worker(
+            prepared
+        )
+        if not ok:
+            if prepared is not None:
+                self._schedule_captured_autosave_retry(prepared)
+            self._set_status(
+                f"프로필 삭제 전 provider 변경사항을 저장하지 못했습니다: {error}",
+                level="error",
+            )
+            return
+        self._blocked_mutation_settings_changed = False
+        self._profile_deletions_inflight.add(normalized)
+        self._set_status("프로필 삭제 중...", level="info")
+
+        def worker() -> None:
+            ok = True
+            error = None
+            save_failed = False
+            if prepared is not None:
+                ok, error, _provider_changed = self._apply_settings_update(
+                    prepared,
+                    update_ui=False,
+                )
+                save_failed = not ok
+            if ok:
+                try:
+                    ok, error = deleter(normalized, confirmed=True)
+                except Exception as exc:
+                    ok = False
+                    error = str(exc)
+
+            def done() -> None:
+                self._finish_profile_delete_on_ui(
+                    normalized,
+                    ok,
+                    error,
+                    save_failed,
+                    prepared,
+                )
+                return
+
+            if not self._post_ui(done):
+                self._record_pending_profile_delete_result(
+                    normalized,
+                    ok,
+                    error,
+                    save_failed,
+                    prepared,
+                )
+            return
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._profile_deletions_inflight.discard(normalized)
+            self._blocked_mutation_settings_changed = False
+            if prepared is not None:
+                self._schedule_autosave()
+            self._set_status("프로필 삭제 작업을 시작하지 못했습니다.", level="error")
+        return
+
+    def _on_taskbar_selection_changed(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
+        normalized = str(account_id or "")
+        selected = [
+            profile_id
+            for profile_id, var in self._account_taskbar_selected_vars.items()
+            if bool(var.get())
+        ]
+        if len(selected) > 2:
+            current = self._account_taskbar_selected_vars.get(normalized)
+            if current is not None:
+                self._loading_settings = True
+                try:
+                    current.set(False)
+                finally:
+                    self._loading_settings = False
+            self._cancel_pending_autosave()
+            rejection = (
+                "작업표시줄 표시 프로필은 최대 2개입니다. "
+                "세 번째 선택은 저장하지 않았습니다."
+            )
+            self._preserve_status_after_next_autosave = True
+            self._schedule_autosave()
+            self._set_status(rejection, level="error")
+            return
+        self._schedule_autosave()
+        return
+
     def _on_move_account(self, account_id: str, direction: int) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
         normalized = str(account_id or "")
         if not normalized:
             return
@@ -1306,6 +1938,315 @@ class CodexUsageSettingsView:
         if self._autosave_now():
             self._remount()
             self._set_status("저장됨", level="ok")
+        return
+
+    def _profile_settings_mutation_blocked(self) -> bool:
+        if not self._profile_deletions_inflight and not self._profile_actions_inflight:
+            return False
+        self._set_status(
+            "프로필 변경 중에는 다른 AI 사용량 설정을 변경할 수 없습니다.",
+            level="info",
+        )
+        return True
+
+    def _begin_external_settings_mutation(self) -> tuple[bool, dict[str, Any] | None]:
+        if self._profile_settings_mutation_blocked():
+            return False, None
+        prepared = None
+        if self._autosave_after_id is not None:
+            self._cancel_pending_autosave()
+            prepared = self._build_settings_update()
+            if prepared is None:
+                return False, None
+        self._blocked_mutation_settings_changed = False
+        self._profile_deletions_inflight.add("__external_settings__")
+        return True, prepared
+
+    def _finish_external_settings_mutation(
+        self,
+        ok: bool,
+        error: str | None,
+    ) -> None:
+        retry_prepared = self._consume_blocked_mutation_settings()
+        self._profile_deletions_inflight.discard("__external_settings__")
+        self._preserve_status_after_next_autosave = False
+        if bool(ok):
+            self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
+            return
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        self._set_status(f"설정 변경 실패: {error}", level="error")
+        return
+
+    def _release_external_settings_mutation_without_ui(self) -> None:
+        """Release the state-only guard when the UI callback queue is unavailable."""
+        self._profile_deletions_inflight.discard("__external_settings__")
+        self._preserve_status_after_next_autosave = False
+        self._blocked_mutation_settings_changed = False
+        return
+
+    def _consume_blocked_mutation_settings(self) -> dict[str, Any] | None:
+        changed = bool(self._blocked_mutation_settings_changed)
+        self._blocked_mutation_settings_changed = False
+        if not changed:
+            return None
+        return self._build_settings_update()
+
+    def _prepared_settings_without_profile(
+        self,
+        prepared: dict[str, Any],
+        profile_id: str,
+    ) -> dict[str, Any]:
+        normalized = str(profile_id or "")
+        result = dict(prepared)
+        payload = prepared.get("payload")
+        if not isinstance(payload, dict):
+            return result
+        updated_payload = dict(payload)
+        remaining_ids: list[str] = []
+        for key in ("profiles", "accounts"):
+            raw_items = payload.get(key)
+            if not isinstance(raw_items, list):
+                continue
+            filtered = [
+                dict(item)
+                for item in raw_items
+                if isinstance(item, dict) and str(item.get("id") or "") != normalized
+            ]
+            updated_payload[key] = filtered
+            if key == "profiles":
+                remaining_ids = [str(item.get("id") or "") for item in filtered]
+        for key in ("profile_order", "selected_profile_ids"):
+            raw_ids = payload.get(key)
+            if isinstance(raw_ids, list):
+                updated_payload[key] = [
+                    str(item or "") for item in raw_ids if str(item or "") != normalized
+                ]
+        if str(payload.get("default_account_id") or "") == normalized:
+            updated_payload["default_account_id"] = remaining_ids[0] if remaining_ids else ""
+        result["payload"] = updated_payload
+        before_providers = prepared.get("before_providers")
+        if isinstance(before_providers, dict):
+            updated_before = dict(before_providers)
+            updated_before.pop(normalized, None)
+            result["before_providers"] = updated_before
+        return result
+
+    def _finish_profile_delete_on_ui(
+        self,
+        profile_id: str,
+        ok: bool,
+        error: str | None,
+        save_failed: bool,
+        prepared: dict[str, Any] | None,
+    ) -> None:
+        retry_prepared = self._consume_blocked_mutation_settings()
+        if retry_prepared is None and bool(save_failed) and isinstance(prepared, dict):
+            retry_prepared = prepared
+        if bool(ok) and retry_prepared is not None:
+            retry_prepared = self._prepared_settings_without_profile(
+                retry_prepared,
+                profile_id,
+            )
+        self._profile_deletions_inflight.discard(str(profile_id or ""))
+        self._preserve_status_after_next_autosave = False
+        if not bool(ok):
+            if not bool(save_failed):
+                self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
+            message = (
+                "프로필 삭제 전 변경사항을 저장하지 못해 삭제를 시작하지 않았습니다."
+                if bool(save_failed)
+                else f"프로필 삭제 실패: {error}"
+            )
+            self._set_status(message, level="error")
+            return
+        self._remount()
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        self._set_status("프로필을 삭제했습니다.", level="ok")
+        return
+
+    def _record_pending_profile_delete_result(
+        self,
+        profile_id: str,
+        ok: bool,
+        error: str | None,
+        save_failed: bool,
+        prepared: dict[str, Any] | None,
+    ) -> None:
+        captured = prepared if isinstance(prepared, dict) else None
+        with self._profile_delete_result_lock:
+            self._pending_profile_delete_result = (
+                str(profile_id or ""),
+                bool(ok),
+                str(error) if error is not None else None,
+                bool(save_failed),
+                captured,
+            )
+        return
+
+    def _reconcile_pending_profile_delete_result(self) -> bool:
+        with self._profile_delete_result_lock:
+            result = self._pending_profile_delete_result
+            self._pending_profile_delete_result = None
+        if result is None:
+            return False
+        self._finish_profile_delete_on_ui(*result)
+        return True
+
+    def _finish_profile_add_on_ui(
+        self,
+        save_ok: bool,
+        save_error: str | None,
+        save_failed: bool,
+    ) -> bool:
+        creator = getattr(self._codex, "add_profile", None)
+        ok = bool(save_ok and callable(creator))
+        error = save_error if callable(creator) else "profile_add_unavailable"
+        if ok:
+            try:
+                ok, error, _profile = creator("codex")
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+        settings_changed = bool(self._profile_add_settings_changed)
+        self._profile_add_settings_changed = False
+        retry_prepared = None
+        if settings_changed and not save_failed:
+            retry_prepared = self._build_settings_update()
+        retry_capture_failed = bool(settings_changed and retry_prepared is None)
+        self._profile_deletions_inflight.discard("__add_profile__")
+        self._preserve_status_after_next_autosave = False
+        if not ok:
+            if save_failed:
+                self._schedule_autosave()
+                self._set_status(f"프로필 추가 실패: {error}", level="error")
+                return False
+            self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
+            if retry_capture_failed:
+                self._set_status(
+                    "프로필 추가 실패 후 보류된 설정을 저장하지 못했습니다.",
+                    level="error",
+                )
+                return True
+            self._set_status(f"프로필 추가 실패: {error}", level="error")
+            return True
+        self._remount()
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        if retry_capture_failed:
+            self._set_status(
+                "프로필은 추가했지만 보류된 설정을 저장하지 못했습니다.",
+                level="error",
+            )
+            return True
+        self._set_status("프로필을 추가했습니다.", level="ok")
+        return True
+
+    def _record_pending_profile_add_result(
+        self,
+        save_ok: bool,
+        save_error: str | None,
+        save_failed: bool,
+    ) -> None:
+        with self._profile_add_result_lock:
+            self._pending_profile_add_result = (
+                bool(save_ok),
+                str(save_error) if save_error is not None else None,
+                bool(save_failed),
+            )
+        return
+
+    def _reconcile_pending_profile_add_result(self) -> bool:
+        with self._profile_add_result_lock:
+            result = self._pending_profile_add_result
+            self._pending_profile_add_result = None
+        if result is None:
+            return False
+        return self._finish_profile_add_on_ui(*result)
+
+    def _record_external_settings_result_without_ui(
+        self,
+        ok: bool,
+        error: str | None,
+        prepared: dict[str, Any] | None,
+    ) -> None:
+        """Hand a worker result to the next Tk-owned runtime refresh."""
+        captured = prepared if isinstance(prepared, dict) else None
+        with self._external_settings_result_lock:
+            self._pending_external_settings_result = (
+                bool(ok),
+                str(error) if error is not None else None,
+                captured,
+            )
+        return
+
+    def _reconcile_external_settings_result(self) -> bool:
+        with self._external_settings_result_lock:
+            result = self._pending_external_settings_result
+            self._pending_external_settings_result = None
+        if result is None:
+            return False
+        ok, error, prepared = result
+        retry_prepared = self._consume_blocked_mutation_settings()
+        self._profile_deletions_inflight.discard("__external_settings__")
+        self._preserve_status_after_next_autosave = False
+        if bool(ok):
+            self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
+            self._notify_external_settings_reconciled()
+            return True
+        self._set_status(f"설정 변경 실패: {error}", level="error")
+        retry_prepared = retry_prepared or prepared
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        self._notify_external_settings_reconciled()
+        return False
+
+    def _notify_external_settings_reconciled(self) -> None:
+        callback = self._on_external_settings_reconciled
+        if not callable(callback):
+            return
+        try:
+            callback()
+        except Exception:
+            pass
+        return
+
+    def _schedule_captured_autosave_retry(self, prepared: dict[str, Any]) -> None:
+        self._preserve_status_after_next_autosave = True
+        self._cancel_pending_autosave()
+        win = self._win
+        after = getattr(win, "after", None)
+        if callable(after):
+            try:
+                self._autosave_after_id = after(
+                    350,
+                    lambda: self._retry_captured_autosave(prepared),
+                )
+                return
+            except Exception:
+                self._autosave_after_id = None
+        self._retry_captured_autosave(prepared)
+        return
+
+    def _retry_captured_autosave(self, prepared: dict[str, Any]) -> None:
+        self._autosave_after_id = None
+        ok, error, _provider_changed = self._apply_settings_update(prepared)
+        if not ok and error == "profile_refresh_busy":
+            self._schedule_captured_autosave_retry(prepared)
+        return
+
+    def _resume_pending_autosave_after_external_failure(self) -> None:
+        self._preserve_status_after_next_autosave = True
+        self._schedule_autosave()
         return
 
     def _remount(self) -> None:
@@ -1591,7 +2532,8 @@ class CodexUsageSettingsView:
                     return rendered if rendered else "-"
             except Exception:
                 pass
-        return self._localize_usage_metric_value(raw)
+        localized = self._localize_usage_metric_value(raw)
+        return re.sub(r" (?=(?:남음|사용)$)", "\u00a0", localized)
 
     def _refresh_account_runtime_summaries(self, runtime: dict[str, Any]) -> None:
         accounts = runtime.get("profiles") if isinstance(runtime, dict) else None
@@ -1768,6 +2710,15 @@ class CodexUsageSettingsView:
         win = self._win
         if win is None:
             return
+        for reconcile in (
+            self._reconcile_pending_profile_release_result,
+            self._reconcile_pending_profile_add_result,
+            self._reconcile_pending_profile_delete_result,
+            self._reconcile_external_settings_result,
+        ):
+            if reconcile():
+                self._schedule_runtime_refresh(1000)
+                return
         runtime = self._safe_get_runtime()
         session_state = str(runtime.get("session_state", "logged_out") or "logged_out")
         profile_in_use = bool(runtime.get("profile_in_use", False))
@@ -1870,28 +2821,31 @@ class CodexUsageSettingsView:
     def _refresh_action_buttons(self, runtime: dict[str, Any]) -> None:
         login_button = self._login_button
         logout_button = self._logout_button
+        actions_blocked = bool(
+            self._profile_deletions_inflight or self._profile_actions_inflight
+        )
         try:
-            can_login = bool(runtime.get("can_login", False))
+            can_login = bool(runtime.get("can_login", False)) and not actions_blocked
         except Exception:
             can_login = False
         try:
-            can_logout = bool(runtime.get("can_logout", False))
+            can_logout = bool(runtime.get("can_logout", False)) and not actions_blocked
         except Exception:
             can_logout = False
         self._set_button_enabled(login_button, can_login)
         self._set_button_enabled(logout_button, can_logout)
         for account_id, button in self._account_query_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
-            account_can_query = self._account_query_permission(entry)
+            account_can_query = self._account_query_permission(entry) and not actions_blocked
             self._set_button_enabled(button, account_can_query)
         for account_id, button in self._account_login_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
             account_can_login, _account_can_logout = self._account_action_permissions(entry)
-            self._set_button_enabled(button, account_can_login)
+            self._set_button_enabled(button, account_can_login and not actions_blocked)
         for account_id, button in self._account_logout_buttons.items():
             entry = self._find_account_runtime_entry(runtime, account_id)
             _account_can_login, account_can_logout = self._account_action_permissions(entry)
-            self._set_button_enabled(button, account_can_logout)
+            self._set_button_enabled(button, account_can_logout and not actions_blocked)
         return
 
     def _find_account_runtime_entry(

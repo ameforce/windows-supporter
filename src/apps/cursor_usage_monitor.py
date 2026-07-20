@@ -161,7 +161,8 @@ class _BrowserSession(Protocol):
     def open_login(self) -> BrowserOperationResult: ...
     def poll_login(self) -> BrowserOperationResult: ...
     def close_session(self) -> None: ...
-    def shutdown(self) -> None: ...
+    def request_cancel(self) -> bool: ...
+    def shutdown(self) -> bool: ...
     def get_runtime_status(self) -> BrowserRuntimeStatus: ...
 
 
@@ -176,45 +177,151 @@ class _LazyCursorBrowserSession:
         self._config = config
         self._unrecoverable_timeout_handler = unrecoverable_timeout_handler
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._session: _BrowserSession | None = None
+        self._creating = False
+        self._terminal = False
+        self._terminal_cleanup_complete = False
+        self._terminal_cleanup_succeeded = False
 
     def collect(self) -> BrowserOperationResult:
-        return self._ensure().collect()
+        session = self._ensure()
+        if session is None:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return session.collect()
 
     def open_login(self) -> BrowserOperationResult:
-        return self._ensure().open_login()
+        session = self._ensure()
+        if session is None:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return session.open_login()
 
     def poll_login(self) -> BrowserOperationResult:
-        return self._ensure().poll_login()
+        session = self._ensure()
+        if session is None:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return session.poll_login()
 
     def close_session(self) -> None:
-        session = self._session
+        with self._lock:
+            session = self._session
         if session is not None:
             session.close_session()
 
-    def shutdown(self) -> None:
-        session = self._session
-        if session is not None:
-            session.shutdown()
+    def shutdown(self) -> bool:
+        with self._lock:
+            self._terminal = True
+            session = self._session
+            if session is None:
+                if self._creating:
+                    return False
+                if self._terminal_cleanup_complete:
+                    return bool(self._terminal_cleanup_succeeded)
+                self._terminal_cleanup_complete = True
+                self._terminal_cleanup_succeeded = True
+                return True
+        try:
+            succeeded = session.shutdown() is True
+        except Exception:
+            succeeded = False
+        with self._lock:
+            if session is self._session:
+                self._terminal_cleanup_complete = True
+                self._terminal_cleanup_succeeded = bool(succeeded)
+                if succeeded:
+                    self._session = None
+        return bool(succeeded)
+
+    def request_cancel(self) -> bool:
+        with self._lock:
+            self._terminal = True
+            session = self._session
+            if session is None:
+                if self._creating:
+                    return False
+                if self._terminal_cleanup_complete:
+                    return bool(self._terminal_cleanup_succeeded)
+                self._terminal_cleanup_complete = True
+                self._terminal_cleanup_succeeded = True
+                return True
+        request_cancel = getattr(session, "request_cancel", None)
+        if callable(request_cancel):
+            try:
+                return bool(request_cancel())
+            except Exception:
+                return False
+        try:
+            return session.shutdown() is True
+        except Exception:
+            return False
 
     def get_runtime_status(self) -> BrowserRuntimeStatus:
-        session = self._session
+        with self._lock:
+            session = self._session
+            terminal = bool(self._terminal)
+            cleanup_complete = bool(self._terminal_cleanup_complete)
+            cleanup_succeeded = bool(self._terminal_cleanup_succeeded)
         if session is None:
+            if terminal and cleanup_complete and not cleanup_succeeded:
+                return BrowserRuntimeStatus(
+                    BrowserState.FAILED,
+                    False,
+                    BrowserErrorCode.COLLECT_FAILED.value,
+                )
             return BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         return session.get_runtime_status()
 
-    def _ensure(self) -> _BrowserSession:
-        with self._lock:
+    def _ensure(self) -> _BrowserSession | None:
+        with self._condition:
+            while self._creating:
+                self._condition.wait(timeout=0.25)
+            if self._terminal:
+                return None
             if self._session is not None:
                 return self._session
+            self._creating = True
+        created: _BrowserSession | None = None
+        try:
             from src.apps.codex_usage_playwright_session import CodexUsagePlaywrightSession
 
-            self._session = CodexUsagePlaywrightSession(
+            created = CodexUsagePlaywrightSession(
                 self._config,
                 driver_factory=_cursor_driver_factory,
                 unrecoverable_timeout_handler=self._unrecoverable_timeout_handler,
             )
-            return self._session
+        except Exception:
+            with self._condition:
+                self._creating = False
+                if self._terminal:
+                    self._terminal_cleanup_complete = True
+                    self._terminal_cleanup_succeeded = True
+                self._condition.notify_all()
+            raise
+        with self._condition:
+            terminal = bool(self._terminal)
+            if not terminal:
+                self._session = created
+                self._creating = False
+                self._condition.notify_all()
+                return created
+        cancel = getattr(created, "request_cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+        try:
+            cleanup_succeeded = created.shutdown() is True
+        except Exception:
+            cleanup_succeeded = False
+        with self._condition:
+            self._creating = False
+            self._terminal_cleanup_complete = True
+            self._terminal_cleanup_succeeded = bool(cleanup_succeeded)
+            if not cleanup_succeeded:
+                self._session = created
+            self._condition.notify_all()
+        return None
 
 
 def _decimal(value: str) -> Decimal | None:
@@ -505,11 +612,22 @@ class CursorUsageMonitor:
         self._event_queue = event_queue
         self._external_scheduler = not bool(start_monitor)
 
-    def shutdown(self) -> None:
-        self._stop_login_poll()
-        self._session.shutdown()
+    def shutdown(self) -> bool:
+        supports_cancel = callable(getattr(self._session, "request_cancel", None))
+        cancelled = self.request_collect_cancel()
+        shutdown_succeeded = bool(cancelled)
+        if bool(supports_cancel or not cancelled):
+            shutdown_succeeded = self._session.shutdown() is True
         self._root = None
         self._event_queue = None
+        return bool(cancelled and shutdown_succeeded)
+
+    def request_collect_cancel(self) -> bool:
+        self._stop_login_poll()
+        request_cancel = getattr(self._session, "request_cancel", None)
+        if callable(request_cancel):
+            return bool(request_cancel())
+        return self._session.shutdown() is True
 
     def collect(self, *, force: bool = False) -> AiUsageReading:
         now = self._clock()

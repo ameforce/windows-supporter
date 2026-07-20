@@ -15,7 +15,12 @@ from typing import Any, Callable
 
 from src.apps.ai_usage_contracts import normalize_reset_boundary
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
-from src.apps.codex_usage_monitor import CURRENT_CODEX_USAGE_URL, CodexUsageMonitor, UsageSnapshot
+from src.apps.codex_usage_monitor import (
+    CURRENT_CODEX_USAGE_URL,
+    CodexUsageMonitor,
+    UsageSnapshot,
+    are_equivalent_codex_usage_urls,
+)
 from src.apps.codex_usage_taskbar_overlay import AiUsageTaskbarOverlay
 
 
@@ -23,6 +28,7 @@ LEGACY_ACCOUNT_IDS = ("account_1", "account_2")
 SUPPORTED_PROVIDERS = ("codex", "cursor")
 AI_USAGE_SETTINGS_VERSION = 4
 TASKBAR_PROFILE_LIMIT = 2
+SHUTDOWN_QUIESCENCE_TIMEOUT_SEC = 60.0
 PROFILE_ID_PATTERN = re.compile(r"^(?:account_[12]|profile_[0-9a-f]{32})$")
 DEFAULT_LABELS = {
     "account_1": "Codex 1",
@@ -96,8 +102,11 @@ class _RecoveryPendingChild:
     def attach(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
-    def shutdown(self) -> None:
+    def request_collect_cancel(self) -> None:
         return None
+
+    def shutdown(self) -> bool:
+        return True
 
 
 class CodexUsageMultiMonitor:
@@ -140,19 +149,33 @@ class CodexUsageMultiMonitor:
         self.__tooltip_duration_ms = 7000
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__refresh_inflight = False
+        self.__refresh_worker_token: object | None = None
         self.__refresh_lock = threading.Lock()
+        self.__refresh_condition = threading.Condition(self.__refresh_lock)
+        self.__active_refresh_counts: dict[str, int] = {}
+        self.__blocked_refresh_profile_ids: set[str] = set()
+        self.__settings_mutation_lock = threading.RLock()
+        self.__profile_lifecycle_lock = threading.RLock()
+        self.__lifecycle_lock = threading.Lock()
+        self.__closing = False
+        self.__shutdown_complete = False
+        self.__shutdown_succeeded = False
+        self.__shutdown_quiescence_timeout_sec = SHUTDOWN_QUIESCENCE_TIMEOUT_SEC
         self.__unsettled_children: dict[str, list[Any]] = {}
         self.__deferred_cleanup_transaction_ids: set[str] = set()
         self.__refresh_queue: deque[tuple[Callable[[], None], bool]] = deque()
         self.__profile_next_collect_due_ts: dict[str, float] = {}
         self.__root = None
         self.__event_queue = None
+        self.__ui_thread_id: int | None = None
         self.__taskbar_progress = None
         self.__taskbar_progress_factory = taskbar_progress_factory or AiUsageTaskbarOverlay
         self.__unrecoverable_timeout_handler = unrecoverable_timeout_handler
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
         self.__notification_events: list[dict[str, Any]] = []
+        self.__settings_write_block_reason: str | None = None
+        self.__source_settings_version = 0
         self.__recovery_pending_profile_ids: set[str] = set()
         self.__account_settings = {
             account_id: _AccountSettings(
@@ -170,7 +193,11 @@ class CodexUsageMultiMonitor:
             )
             for account_id in LEGACY_ACCOUNT_IDS
         }
+        manager_settings_file_present = os.path.isfile(self.__settings_path)
         manager_settings = self.__read_json_file(self.__settings_path)
+        manager_settings_unreadable = bool(
+            manager_settings_file_present and not isinstance(manager_settings, dict)
+        )
         has_manager_settings = isinstance(manager_settings, dict)
         manager_settings_version = (
             _safe_int(manager_settings.get("settings_version", 0), 0)
@@ -182,7 +209,7 @@ class CodexUsageMultiMonitor:
                 self.__settings_path,
                 os.path.join(self.__config_dir, "ai_usage_settings.v3.backup.json"),
             )
-        if not isinstance(manager_settings, dict):
+        if not isinstance(manager_settings, dict) and not manager_settings_unreadable:
             manager_settings = self.__read_json_file(self.__legacy_manager_settings_path)
             if isinstance(manager_settings, dict):
                 self.__backup_file_once(
@@ -197,17 +224,39 @@ class CodexUsageMultiMonitor:
             if isinstance(manager_settings, dict)
             else 0
         )
-        self.__load_manager_settings(manager_settings)
-        self.__retry_pending_profile_cleanup()
+        self.__source_settings_version = int(source_settings_version)
+        self.__settings_write_block_reason = (
+            "invalid_settings_file"
+            if manager_settings_unreadable
+            else self.__validate_manager_settings(manager_settings)
+        )
+        if self.__settings_write_block_reason is None:
+            self.__load_manager_settings(manager_settings)
+            self.__retry_pending_profile_cleanup()
+        else:
+            self.__account_settings = {}
+            self.__account_order = []
+            self.__default_account_id = ""
+            self.__append_notification_event(
+                {
+                    "type": "manager_settings_read_only",
+                    "reason": self.__settings_write_block_reason,
+                    "settings_version": int(source_settings_version),
+                }
+            )
         self.__account_paths = self.__build_account_paths()
         legacy_settings = self.__read_legacy_settings()
         if (
-            source_settings_version < AI_USAGE_SETTINGS_VERSION
+            self.__settings_write_block_reason is None
+            and source_settings_version < AI_USAGE_SETTINGS_VERSION
             and "account_1" in self.__account_settings
             and "account_1" not in self.__recovery_pending_profile_ids
         ):
             self.__migrate_legacy_single_account_files_if_needed()
-        if not has_manager_settings or manager_settings_version < AI_USAGE_SETTINGS_VERSION:
+        if self.__settings_write_block_reason is None and (
+            not has_manager_settings
+            or manager_settings_version < AI_USAGE_SETTINGS_VERSION
+        ):
             if not isinstance(manager_settings, dict):
                 self.__apply_legacy_manager_settings(legacy_settings)
             self.__save_manager_settings()
@@ -225,50 +274,99 @@ class CodexUsageMultiMonitor:
             )
             for account_id, paths in self.__account_paths.items()
         }
-        self.__retry_pending_settings_recovery()
+        if self.__settings_write_block_reason is None:
+            self.__retry_pending_settings_recovery()
         return
 
     def attach(self, root, event_queue=None) -> None:
-        self.__root = root
-        self.__event_queue = event_queue
-        for child in self.__children.values():
-            self.__attach_child(child, root, event_queue)
-        self.__refresh_taskbar_progress()
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        if bool(self.__closing):
+            return
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return
+            self.__root = root
+            self.__event_queue = event_queue
+            self.__ui_thread_id = threading.get_ident()
+            for child in self.__children.values():
+                self.__attach_child(child, root, event_queue)
+            self.__refresh_taskbar_progress()
+            self.__restart_monitor_scheduler(initial_delay_sec=1.0)
         return
 
-    def shutdown(self) -> None:
-        self.__clear_monitor_schedule()
-        with self.__refresh_lock:
-            self.__refresh_queue.clear()
-        self.__profile_next_collect_due_ts.clear()
-        shutdown_children = [
-            *self.__children.values(),
-            *[
-                child
-                for children in self.__unsettled_children.values()
-                for child in children
-            ],
-        ]
-        self.__unsettled_children = {}
+    def shutdown(self) -> bool:
+        with self.__lifecycle_lock:
+            if bool(self.__closing):
+                return bool(self.__shutdown_complete and self.__shutdown_succeeded)
+            self.__closing = True
+        with self.__profile_lifecycle_lock:
+            return self.__shutdown_started()
+
+    def __shutdown_started(self) -> bool:
+        with self.__settings_mutation_lock:
+            self.__clear_monitor_schedule()
+            with self.__refresh_condition:
+                self.__refresh_queue.clear()
+                self.__refresh_condition.notify_all()
+            self.__profile_next_collect_due_ts.clear()
+            shutdown_children = [
+                *self.__children.values(),
+                *[
+                    child
+                    for children in self.__unsettled_children.values()
+                    for child in children
+                ],
+            ]
+            self.__unsettled_children = {}
+        pre_shutdown_child_ids: set[int] = set()
         for child in shutdown_children:
-            shutdown = getattr(child, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    pass
-        self.__root = None
-        self.__event_queue = None
-        return
+            if self.__request_child_collect_cancel(child):
+                continue
+            if not self.__shutdown_child(child):
+                continue
+            pre_shutdown_child_ids.add(id(child))
+        shutdown_succeeded = self.__wait_for_refreshes_quiesced(
+            timeout_sec=self.__shutdown_quiescence_timeout_sec
+        )
+        if not shutdown_succeeded:
+            with self.__refresh_condition:
+                active_profile_ids = sorted(self.__active_refresh_counts)
+                refresh_inflight = bool(self.__refresh_inflight)
+            self.__append_notification_event(
+                {
+                    "type": "manager_shutdown_quiescence_timeout",
+                    "timeout_sec": float(self.__shutdown_quiescence_timeout_sec),
+                    "active_profile_ids": active_profile_ids,
+                    "refresh_inflight": refresh_inflight,
+                }
+            )
+        for child in shutdown_children:
+            if id(child) in pre_shutdown_child_ids:
+                continue
+            if not self.__shutdown_child(child):
+                shutdown_succeeded = False
+        with self.__settings_mutation_lock:
+            self.__root = None
+            self.__event_queue = None
+            self.__ui_thread_id = None
+        with self.__lifecycle_lock:
+            self.__shutdown_succeeded = bool(shutdown_succeeded)
+            self.__shutdown_complete = True
+        return bool(shutdown_succeeded)
 
     def get_settings_snapshot(self) -> dict[str, Any]:
+        with self.__settings_mutation_lock:
+            return self.__get_settings_snapshot()
+
+    def __get_settings_snapshot(self) -> dict[str, Any]:
         profiles = [
             self.__build_account_settings_snapshot(account_id)
             for account_id in self.__ordered_account_ids()
         ]
         return {
             "settings_version": AI_USAGE_SETTINGS_VERSION,
+            "source_settings_version": int(self.__source_settings_version),
+            "settings_read_only": bool(self.__settings_write_block_reason),
+            "settings_error": str(self.__settings_write_block_reason or ""),
             "enabled": bool(self.__enabled),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
             "interval_sec": float(self.__interval_sec),
@@ -291,6 +389,97 @@ class CodexUsageMultiMonitor:
         }
 
     def update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only"
+        with self.__profile_lifecycle_lock:
+            return self.__update_settings_guarded(data)
+
+    def __update_settings_guarded(self, data: dict[str, Any]) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            if (
+                self.__root is not None
+                and self.__ui_thread_id is not None
+                and threading.get_ident() != self.__ui_thread_id
+                and bool(self.__provider_change_ids(data))
+            ):
+                return False, "settings_ui_thread_required"
+            refresh_blocking_ids = self.__refresh_blocking_change_ids(data)
+            for profile_id in refresh_blocking_ids:
+                self.__set_profile_refresh_blocked(profile_id, True)
+            try:
+                if refresh_blocking_ids and not all(
+                    self.__wait_for_refreshes_quiesced(
+                        profile_id=profile_id,
+                        timeout_sec=0.0,
+                    )
+                    for profile_id in refresh_blocking_ids
+                ):
+                    return False, "profile_refresh_busy"
+                return self.__update_settings(data)
+            finally:
+                for profile_id in refresh_blocking_ids:
+                    self.__set_profile_refresh_blocked(profile_id, False)
+
+    def __refresh_blocking_change_ids(self, data: dict[str, Any]) -> set[str]:
+        changed = self.__provider_change_ids(data)
+        if not isinstance(data, dict):
+            return changed
+        usage_url = data.get("usage_url")
+        if not isinstance(usage_url, str) or not usage_url.strip():
+            return changed
+        if are_equivalent_codex_usage_urls(usage_url.strip(), self.__usage_url):
+            return changed
+        changed.update(
+            profile_id
+            for profile_id, settings in self.__account_settings.items()
+            if settings.provider == "codex"
+        )
+        return changed
+
+    def __provider_change_ids(self, data: dict[str, Any]) -> set[str]:
+        if not isinstance(data, dict):
+            return set()
+        raw_profiles = data.get("profiles")
+        if not isinstance(raw_profiles, list):
+            raw_profiles = data.get("accounts")
+        if not isinstance(raw_profiles, list):
+            return set()
+        changed: set[str] = set()
+        for raw in raw_profiles:
+            if not isinstance(raw, dict):
+                continue
+            profile_id = str(raw.get("id") or raw.get("profile_id") or "")
+            current = self.__account_settings.get(profile_id)
+            if current is None:
+                continue
+            provider = str(raw.get("provider") or current.provider).strip().lower()
+            if provider != current.provider:
+                changed.add(profile_id)
+        return changed
+
+    def toggle_enabled(self) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only"
+        with self.__profile_lifecycle_lock:
+            return self.__toggle_enabled()
+
+    def __toggle_enabled(self) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            return self.__update_settings({"enabled": not bool(self.__enabled)})
+
+    def __update_settings(self, data: dict[str, Any]) -> tuple[bool, str | None]:
         if not isinstance(data, dict):
             return False, "invalid settings"
         profiles = data.get("profiles")
@@ -631,13 +820,9 @@ class CodexUsageMultiMonitor:
                         updater(rollback)
                     except Exception:
                         pass
-                shutdown = getattr(child, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception:
-                        self.__track_unsettled_child(profile_id, child)
-                        rollback_failed_ids.add(profile_id)
+                if not self.__shutdown_child(child):
+                    self.__track_unsettled_child(profile_id, child)
+                    rollback_failed_ids.add(profile_id)
             rollback_failed_ids.update(
                 profile_id
                 for profile_id in transaction_recovery_ids
@@ -667,32 +852,48 @@ class CodexUsageMultiMonitor:
             self.__children[profile_id] = child
         provider_shutdown_failed_ids: set[str] = set()
         for profile_id, old_child in old_children.items():
-            shutdown = getattr(old_child, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    self.__track_unsettled_child(profile_id, old_child)
-                    provider_shutdown_failed_ids.add(profile_id)
-                    replacement = self.__children.get(profile_id)
-                    shutdown_replacement = getattr(replacement, "shutdown", None)
-                    if callable(shutdown_replacement):
-                        try:
-                            shutdown_replacement()
-                        except Exception:
-                            self.__track_unsettled_child(profile_id, replacement)
-                    paths = self.__account_paths[profile_id]
-                    self.__children[profile_id] = _RecoveryPendingChild(paths)
+            if not self.__shutdown_child(old_child):
+                self.__track_unsettled_child(profile_id, old_child)
+                provider_shutdown_failed_ids.add(profile_id)
+                replacement = self.__children.get(profile_id)
+                if not self.__shutdown_child(replacement):
+                    self.__track_unsettled_child(profile_id, replacement)
+                paths = self.__account_paths[profile_id]
+                self.__children[profile_id] = _RecoveryPendingChild(paths)
         self.__complete_settings_recovery(
             set(transaction_recovery_ids)
             - preexisting_recovery_ids
             - provider_shutdown_failed_ids
         )
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
+        if provider_shutdown_failed_ids:
+            return False, "provider_shutdown_failed"
         return True, None
 
     def add_profile(
+        self,
+        provider: str = "codex",
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        if bool(self.__closing):
+            return False, "shutdown", None
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only", None
+        with self.__profile_lifecycle_lock:
+            return self.__add_profile_guarded(provider)
+
+    def __add_profile_guarded(
+        self,
+        provider: str = "codex",
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        if bool(self.__closing):
+            return False, "shutdown", None
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown", None
+            return self.__add_profile(provider)
+
+    def __add_profile(
         self,
         provider: str = "codex",
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
@@ -781,13 +982,10 @@ class CodexUsageMultiMonitor:
                 default_account_id=candidate_default,
             )
         except Exception:
-            shutdown_succeeded = not bool(self.__unsettled_children.get(profile_id))
-            shutdown = getattr(staged_child, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    shutdown_succeeded = False
+            shutdown_succeeded = bool(
+                not self.__unsettled_children.get(profile_id)
+                and self.__shutdown_child(staged_child)
+            )
             if shutdown_succeeded:
                 self.__cleanup_failed_add_paths(
                     profile_id,
@@ -807,11 +1005,46 @@ class CodexUsageMultiMonitor:
         self.__account_paths[profile_id] = staged_paths
         self.__children[profile_id] = staged_child
         self.__discard_cleanup_transaction(add_transaction_id)
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         return True, None, self.__build_account_settings_snapshot(profile_id)
 
     def delete_profile(self, profile_id: str, *, confirmed: bool = False) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        if self.__settings_write_block_reason is not None:
+            return False, "settings_read_only"
+        with self.__profile_lifecycle_lock:
+            return self.__delete_profile_guarded(profile_id, confirmed=confirmed)
+
+    def __delete_profile_guarded(
+        self,
+        profile_id: str,
+        *,
+        confirmed: bool = False,
+    ) -> tuple[bool, str | None]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            normalized = str(profile_id or "")
+            if normalized not in self.__account_settings:
+                return False, "invalid_profile"
+            if not bool(confirmed):
+                return False, "confirmation_required"
+            self.__set_profile_refresh_blocked(normalized, True)
+            try:
+                return self.__delete_profile(normalized, confirmed=True)
+            finally:
+                self.__set_profile_refresh_blocked(normalized, False)
+
+    def __delete_profile(
+        self,
+        profile_id: str,
+        *,
+        confirmed: bool = False,
+    ) -> tuple[bool, str | None]:
         normalized = str(profile_id or "")
         if normalized not in self.__account_settings:
             return False, "invalid_profile"
@@ -856,32 +1089,35 @@ class CodexUsageMultiMonitor:
             )
         except Exception:
             return False, "profile_delete_failed"
-        child = self.__children.get(normalized)
         recovery_was_pending = normalized in self.__settings_recovery_profile_ids
         try:
             self.__prepare_settings_recovery([normalized])
         except Exception:
             self.__discard_cleanup_transaction(transaction_id)
             return False, "profile_delete_failed"
-        shutdown = getattr(child, "shutdown", None)
-        if callable(shutdown):
-            try:
-                shutdown()
-            except Exception:
-                self.__discard_cleanup_transaction(transaction_id)
-                if child is not None:
-                    self.__track_unsettled_child(normalized, child)
-                paths = self.__account_paths.get(normalized)
-                if paths is not None:
-                    recovery_child = _RecoveryPendingChild(paths)
-                    self.__children[normalized] = recovery_child
-                    if self.__root is not None:
-                        self.__attach_child(
-                            recovery_child,
-                            self.__root,
-                            self.__event_queue,
-                        )
-                return False, "profile_delete_failed"
+        child = self.__children.get(normalized)
+        if not self.__request_child_collect_cancel(child):
+            self.__rollback_cancelled_profile_delete(
+                normalized,
+                transaction_id,
+                child=child,
+                recovery_was_pending=recovery_was_pending,
+            )
+            return False, "profile_delete_failed"
+        if not self.__wait_for_refreshes_quiesced(profile_id=normalized):
+            self.__rollback_cancelled_profile_delete(
+                normalized,
+                transaction_id,
+                child=child,
+                recovery_was_pending=recovery_was_pending,
+            )
+            return False, "profile_delete_failed"
+        if not self.__shutdown_child(child):
+            self.__discard_cleanup_transaction(transaction_id)
+            if child is not None:
+                self.__track_unsettled_child(normalized, child)
+            self.__mark_profile_recovery_pending(normalized)
+            return False, "profile_delete_failed"
         if not recovery_was_pending:
             self.__complete_settings_recovery({normalized})
         quarantined: list[dict[str, Any]] = []
@@ -933,13 +1169,45 @@ class CodexUsageMultiMonitor:
             else:
                 self.__mark_profile_recovery_pending(normalized)
             return False, "profile_delete_failed"
-        self.__restart_monitor_scheduler(initial_delay_sec=1.0)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
         self.__refresh_taskbar_progress()
         self.__retry_pending_profile_cleanup()
         self.__set_settings_recovery_pending(normalized, False)
         return True, None
 
+    def __rollback_cancelled_profile_delete(
+        self,
+        profile_id: str,
+        transaction_id: str,
+        *,
+        child: Any | None,
+        recovery_was_pending: bool,
+    ) -> None:
+        shutdown_succeeded = self.__shutdown_child(child)
+        if not shutdown_succeeded:
+            self.__track_unsettled_child(profile_id, child)
+        quiesced = self.__wait_for_refreshes_quiesced(
+            profile_id=profile_id,
+            timeout_sec=60.0,
+        )
+        self.__discard_cleanup_transaction(transaction_id)
+        can_publish_fresh_child = bool(quiesced and shutdown_succeeded)
+        if can_publish_fresh_child and not bool(recovery_was_pending):
+            self.__complete_settings_recovery({profile_id})
+        if can_publish_fresh_child:
+            self.__restore_child_monitor_or_mark_recovery_pending(profile_id)
+        else:
+            self.__track_unsettled_child(profile_id, child)
+            self.__mark_profile_recovery_pending(profile_id)
+        self.__request_monitor_scheduler_restart(initial_delay_sec=1.0)
+        self.__refresh_taskbar_progress()
+        return
+
     def get_runtime_status(self) -> dict[str, Any]:
+        with self.__settings_mutation_lock:
+            return self.__get_runtime_status()
+
+    def __get_runtime_status(self) -> dict[str, Any]:
         profile_entries = [
             self.__build_account_runtime_entry(account_id)
             for account_id in self.__ordered_account_ids()
@@ -955,6 +1223,8 @@ class CodexUsageMultiMonitor:
         )
         return {
             "enabled": bool(self.__enabled),
+            "settings_read_only": bool(self.__settings_write_block_reason),
+            "settings_error": str(self.__settings_write_block_reason or ""),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
             "monitor_state": self.__aggregate_monitor_state(runtimes),
             "session_state": self.__aggregate_session_state(runtimes),
@@ -981,9 +1251,10 @@ class CodexUsageMultiMonitor:
     def get_last_snapshot(self) -> Any:
         # Compatibility API for legacy single-account callers. Aggregate and
         # per-account consumers should use get_runtime_status()["accounts"].
-        if not self.__default_account_id:
-            return None
-        return self.__child(self.__default_account_id).get_last_snapshot()
+        with self.__settings_mutation_lock:
+            if not self.__default_account_id:
+                return None
+            return self.__child(self.__default_account_id).get_last_snapshot()
 
     def on_display_topology_changed(self, reason: str = "display_change") -> None:
         self.__refresh_taskbar_progress(
@@ -993,6 +1264,8 @@ class CodexUsageMultiMonitor:
         return
 
     def show_current_status(self, force_refresh: bool = True, source: str = "manual_query") -> None:
+        if bool(self.__closing):
+            return
         source_key = str(source or "manual_query")
         if source_key == "manual_login":
             if self.__default_account_id:
@@ -1014,6 +1287,8 @@ class CodexUsageMultiMonitor:
         force_refresh: bool = True,
         source: str = "manual_query",
     ) -> None:
+        if bool(self.__closing):
+            return
         self.__show_account_status(
             account_id,
             force_refresh=bool(force_refresh),
@@ -1027,8 +1302,34 @@ class CodexUsageMultiMonitor:
         return
 
     def release_account_profile_session(self, account_id: str) -> tuple[bool, str]:
-        child = self.__child(account_id)
-        return child.release_profile_session()
+        if bool(self.__closing):
+            return False, "shutdown"
+        with self.__profile_lifecycle_lock:
+            return self.__release_account_profile_session(account_id)
+
+    def __release_account_profile_session(self, account_id: str) -> tuple[bool, str]:
+        if bool(self.__closing):
+            return False, "shutdown"
+        normalized = str(account_id or "")
+        with self.__settings_mutation_lock:
+            if bool(self.__closing):
+                return False, "shutdown"
+            child = self.__children.get(normalized)
+            if child is None or normalized not in self.__account_settings:
+                return False, "invalid_profile"
+            self.__set_profile_refresh_blocked(normalized, True)
+        try:
+            result = child.release_profile_session()
+            if bool(result[0]) and not self.__wait_for_refreshes_quiesced(
+                profile_id=normalized
+            ):
+                return (
+                    False,
+                    "진행 중인 조회를 중단하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+            return result
+        finally:
+            self.__set_profile_refresh_blocked(normalized, False)
 
     def format_captured_at_for_display(self, value: str) -> str:
         if not self.__default_account_id:
@@ -1074,18 +1375,23 @@ class CodexUsageMultiMonitor:
             tracked.append(child)
         return
 
+    def __shutdown_child(self, child: Any | None) -> bool:
+        if child is None:
+            return True
+        shutdown = getattr(child, "shutdown", None)
+        if not callable(shutdown):
+            return False
+        try:
+            return shutdown() is True
+        except Exception:
+            return False
+
     def __shutdown_unsettled_children(self, profile_id: str) -> bool:
         normalized = str(profile_id or "")
         unsettled = self.__unsettled_children.get(normalized, [])
         remaining: list[Any] = []
         for child in unsettled:
-            shutdown = getattr(child, "shutdown", None)
-            if not callable(shutdown):
-                remaining.append(child)
-                continue
-            try:
-                shutdown()
-            except Exception:
+            if not self.__shutdown_child(child):
                 remaining.append(child)
         if remaining:
             self.__unsettled_children[normalized] = remaining
@@ -1111,11 +1417,13 @@ class CodexUsageMultiMonitor:
         invalidate_geometry: bool = False,
         rebind_native_owner: bool = False,
     ) -> None:
-        if self.__root is None:
+        if bool(self.__closing) or self.__root is None:
             return
 
         def action() -> None:
             try:
+                if bool(self.__closing) or self.__root is None:
+                    return
                 if not bool(self.__taskbar_overlay_enabled):
                     if self.__taskbar_progress is not None:
                         self.__taskbar_progress.hide()
@@ -1135,11 +1443,12 @@ class CodexUsageMultiMonitor:
                 pass
             return
 
-        if not self.__post_ui(action):
-            action()
+        self.__dispatch_ui_action(action, prefer_queue=True)
         return
 
     def __ensure_taskbar_progress(self):
+        if bool(self.__closing) or self.__root is None:
+            return None
         if self.__taskbar_progress is not None:
             return self.__taskbar_progress
         factory = self.__taskbar_progress_factory
@@ -1149,8 +1458,14 @@ class CodexUsageMultiMonitor:
         )
         return self.__taskbar_progress
 
-    def __post_ui(self, fn) -> bool:
-        if not callable(fn):
+    def __append_notification_event(self, event: dict[str, Any]) -> None:
+        self.__notification_events.append(dict(event))
+        if len(self.__notification_events) > 20:
+            self.__notification_events = self.__notification_events[-20:]
+        return
+
+    def __post_ui(self, fn, *, allow_closing: bool = False) -> bool:
+        if (bool(self.__closing) and not allow_closing) or not callable(fn):
             return False
         queue_obj = self.__event_queue
         if queue_obj is None:
@@ -1161,43 +1476,177 @@ class CodexUsageMultiMonitor:
         except Exception:
             return False
 
+    def __dispatch_ui_action(
+        self,
+        fn,
+        *,
+        allow_closing: bool = False,
+        prefer_queue: bool = False,
+    ) -> bool:
+        if not callable(fn):
+            return False
+        on_ui_thread = (
+            self.__ui_thread_id is None
+            or threading.get_ident() == self.__ui_thread_id
+        )
+        if prefer_queue and self.__post_ui(fn, allow_closing=allow_closing):
+            return True
+        if on_ui_thread:
+            try:
+                fn()
+                return True
+            except Exception as exc:
+                self.__append_notification_event(
+                    {
+                        "type": "manager_ui_dispatch_error",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                return False
+        if not prefer_queue and self.__post_ui(fn, allow_closing=allow_closing):
+            return True
+        self.__append_notification_event(
+            {
+                "type": "manager_ui_dispatch_dropped",
+                "thread_name": threading.current_thread().name,
+            }
+        )
+        return False
+
+    def __set_profile_refresh_blocked(self, profile_id: str, blocked: bool) -> None:
+        normalized = str(profile_id or "")
+        with self.__refresh_condition:
+            if bool(blocked):
+                self.__blocked_refresh_profile_ids.add(normalized)
+            else:
+                self.__blocked_refresh_profile_ids.discard(normalized)
+            self.__refresh_condition.notify_all()
+        return
+
+    def __begin_profile_refresh(self, profile_id: str) -> Any | None:
+        normalized = str(profile_id or "")
+        with self.__refresh_condition:
+            if (
+                bool(self.__closing)
+                or normalized in self.__blocked_refresh_profile_ids
+                or normalized not in self.__children
+            ):
+                return None
+            child = self.__children[normalized]
+            self.__active_refresh_counts[normalized] = (
+                int(self.__active_refresh_counts.get(normalized, 0)) + 1
+            )
+            return child
+
+    def __end_profile_refresh(self, profile_id: str) -> None:
+        normalized = str(profile_id or "")
+        with self.__refresh_condition:
+            remaining = int(self.__active_refresh_counts.get(normalized, 0)) - 1
+            if remaining > 0:
+                self.__active_refresh_counts[normalized] = remaining
+            else:
+                self.__active_refresh_counts.pop(normalized, None)
+            self.__refresh_condition.notify_all()
+        return
+
+    def __wait_for_refreshes_quiesced(
+        self,
+        *,
+        profile_id: str | None = None,
+        timeout_sec: float | None = 60.0,
+    ) -> bool:
+        normalized = None if profile_id is None else str(profile_id or "")
+        deadline = (
+            None
+            if timeout_sec is None
+            else float(time.monotonic()) + max(0.0, float(timeout_sec))
+        )
+        with self.__refresh_condition:
+            while True:
+                active = (
+                    bool(self.__active_refresh_counts)
+                    if normalized is None
+                    else int(self.__active_refresh_counts.get(normalized, 0)) > 0
+                )
+                manager_running = bool(self.__refresh_inflight) if normalized is None else False
+                if not bool(active or manager_running):
+                    return True
+                if deadline is None:
+                    self.__refresh_condition.wait(timeout=0.25)
+                    continue
+                remaining = deadline - float(time.monotonic())
+                if remaining <= 0.0:
+                    return False
+                self.__refresh_condition.wait(timeout=min(0.25, remaining))
+
+    def __request_child_collect_cancel(self, child: Any | None) -> bool:
+        if child is None:
+            return True
+        request_cancel = getattr(child, "request_collect_cancel", None)
+        if not callable(request_cancel):
+            return True
+        try:
+            result = request_cancel()
+        except Exception:
+            return False
+        return result is not False
+
     def __dispatch_refresh_worker(self, fn, *, refresh_taskbar: bool) -> bool:
         if not callable(fn):
             return False
-        with self.__refresh_lock:
+        worker_token: object | None = None
+        with self.__refresh_condition:
+            if bool(self.__closing):
+                return False
             self.__refresh_queue.append((fn, bool(refresh_taskbar)))
-            if bool(self.__refresh_inflight):
-                if bool(refresh_taskbar):
-                    self.__refresh_taskbar_progress()
-                return True
-            self.__refresh_inflight = True
+            already_inflight = bool(self.__refresh_inflight)
+            if not already_inflight:
+                self.__refresh_inflight = True
+                worker_token = object()
+                self.__refresh_worker_token = worker_token
+        if already_inflight:
+            if bool(refresh_taskbar):
+                self.__refresh_taskbar_progress()
+            return True
 
         def worker() -> None:
             refresh_after = False
-            while True:
-                with self.__refresh_lock:
-                    if not self.__refresh_queue:
+            try:
+                while True:
+                    with self.__refresh_condition:
+                        if bool(self.__closing):
+                            self.__refresh_queue.clear()
+                        if not self.__refresh_queue:
+                            if self.__refresh_worker_token is worker_token:
+                                self.__refresh_inflight = False
+                                self.__refresh_worker_token = None
+                                self.__refresh_condition.notify_all()
+                            break
+                        queued_fn, queued_refresh = self.__refresh_queue.popleft()
+                    try:
+                        queued_fn()
+                    except Exception as exc:
+                        self.__append_notification_event(
+                            {
+                                "type": "manager_collection_error",
+                                "error_type": type(exc).__name__,
+                            }
+                        )
+                    refresh_after = bool(refresh_after or queued_refresh)
+                    if bool(queued_refresh):
+                        self.__refresh_taskbar_progress()
+            finally:
+                with self.__refresh_condition:
+                    if self.__refresh_worker_token is worker_token:
                         self.__refresh_inflight = False
-                        break
-                    queued_fn, queued_refresh = self.__refresh_queue.popleft()
-                try:
-                    queued_fn()
-                except Exception as exc:
-                    self.__notification_events.append(
-                        {
-                            "type": "manager_collection_error",
-                            "error_type": type(exc).__name__,
-                        }
-                    )
-                    if len(self.__notification_events) > 20:
-                        self.__notification_events = self.__notification_events[-20:]
-                refresh_after = bool(refresh_after or queued_refresh)
-                if bool(queued_refresh):
-                    self.__refresh_taskbar_progress()
+                        self.__refresh_worker_token = None
+                        self.__refresh_condition.notify_all()
             if bool(refresh_after):
                 self.__refresh_taskbar_progress()
-            if not self.__post_ui(self.__schedule_monitor_tick):
-                self.__schedule_monitor_tick()
+            self.__dispatch_ui_action(
+                self.__schedule_monitor_tick,
+                prefer_queue=True,
+            )
             return
 
         if self.__event_queue is None:
@@ -1206,15 +1655,17 @@ class CodexUsageMultiMonitor:
             try:
                 threading.Thread(target=worker, daemon=True).start()
             except Exception:
-                with self.__refresh_lock:
-                    self.__refresh_inflight = False
-                    self.__refresh_queue.clear()
-                return False
+                worker()
+                return True
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
         return True
 
     def __restart_monitor_scheduler(self, initial_delay_sec: float | None = None) -> None:
+        if bool(self.__closing):
+            self.__clear_monitor_schedule()
+            self.__profile_next_collect_due_ts.clear()
+            return
         self.__clear_monitor_schedule()
         account_ids = self.__background_account_ids()
         self.__profile_next_collect_due_ts = {
@@ -1227,6 +1678,16 @@ class CodexUsageMultiMonitor:
         self.__schedule_monitor_tick()
         return
 
+    def __request_monitor_scheduler_restart(
+        self,
+        initial_delay_sec: float | None = None,
+    ) -> None:
+        action = lambda: self.__restart_monitor_scheduler(
+            initial_delay_sec=initial_delay_sec
+        )
+        self.__dispatch_ui_action(action, prefer_queue=False)
+        return
+
     def __clear_monitor_schedule(self) -> None:
         root = self.__root
         after_id = self.__monitor_after_id
@@ -1234,13 +1695,18 @@ class CodexUsageMultiMonitor:
         self.__next_collect_due_ts = 0.0
         if root is None or after_id is None:
             return
-        try:
-            root.after_cancel(after_id)
-        except Exception:
-            pass
+        self.__dispatch_ui_action(
+            lambda root=root, after_id=after_id: root.after_cancel(after_id),
+            allow_closing=True,
+            prefer_queue=False,
+        )
         return
 
     def __schedule_monitor_tick(self, initial_delay_sec: float | None = None) -> None:
+        if bool(self.__closing):
+            self.__clear_monitor_schedule()
+            self.__profile_next_collect_due_ts.clear()
+            return
         account_ids = self.__background_account_ids()
         if not bool(self.__enabled and account_ids):
             self.__monitor_after_id = None
@@ -1291,6 +1757,9 @@ class CodexUsageMultiMonitor:
     def __monitor_tick(self) -> None:
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
+        if bool(self.__closing):
+            self.__profile_next_collect_due_ts.clear()
+            return
         account_ids = self.__background_account_ids()
         if not bool(self.__enabled and account_ids):
             self.__profile_next_collect_due_ts.clear()
@@ -1328,10 +1797,10 @@ class CodexUsageMultiMonitor:
         manage_inflight: bool = True,
         account_ids: tuple[str, ...] | None = None,
     ) -> None:
-        if not bool(self.__enabled):
+        if bool(self.__closing) or not bool(self.__enabled):
             return
         if bool(manage_inflight):
-            with self.__refresh_lock:
+            with self.__refresh_condition:
                 self.__refresh_inflight = True
         try:
             selected_account_ids = (
@@ -1340,6 +1809,8 @@ class CodexUsageMultiMonitor:
                 else tuple(account_ids)
             )
             for account_id in selected_account_ids:
+                if bool(self.__closing):
+                    break
                 if account_id not in self.__background_account_ids():
                     self.__profile_next_collect_due_ts.pop(account_id, None)
                     continue
@@ -1362,7 +1833,9 @@ class CodexUsageMultiMonitor:
                     if len(self.__notification_events) > 20:
                         self.__notification_events = self.__notification_events[-20:]
                 finally:
-                    if account_id in self.__background_account_ids():
+                    if bool(self.__closing):
+                        self.__profile_next_collect_due_ts.pop(account_id, None)
+                    elif account_id in self.__background_account_ids():
                         self.__profile_next_collect_due_ts[account_id] = (
                             float(time.monotonic())
                             + self.__profile_collect_delay_sec(account_id)
@@ -1371,37 +1844,40 @@ class CodexUsageMultiMonitor:
                         self.__profile_next_collect_due_ts.pop(account_id, None)
         finally:
             if bool(manage_inflight):
-                with self.__refresh_lock:
+                with self.__refresh_condition:
                     self.__refresh_inflight = False
+                    self.__refresh_condition.notify_all()
         return
 
     def __should_run_background_collection(self) -> bool:
         return bool(self.__enabled and self.__background_account_ids())
 
     def __background_account_ids(self) -> list[str]:
-        account_ids = []
-        for account_id in self.__ordered_account_ids():
-            if not bool(self.__account_settings[account_id].enabled):
-                continue
-            runtime = self.__safe_child_runtime(account_id)
-            if bool(runtime.get("retry_exhausted")) and not bool(
-                runtime.get("collect_inflight")
-            ):
-                continue
-            if self.__is_background_account_paused(runtime):
-                continue
-            session_state = str(runtime.get("session_state") or "logged_out")
-            provider_status = str(runtime.get("provider_status") or "")
-            if (
-                session_state == "logged_in"
-                or (
-                    provider_status == "retrying"
-                    and session_state != "logged_out"
-                )
-                or bool(runtime.get("collect_inflight"))
-            ):
-                account_ids.append(account_id)
-        return account_ids
+        with self.__settings_mutation_lock:
+            account_ids = []
+            for account_id in self.__ordered_account_ids():
+                account = self.__account_settings.get(account_id)
+                if account is None or not bool(account.enabled):
+                    continue
+                runtime = self.__safe_child_runtime(account_id)
+                if bool(runtime.get("retry_exhausted")) and not bool(
+                    runtime.get("collect_inflight")
+                ):
+                    continue
+                if self.__is_background_account_paused(runtime):
+                    continue
+                session_state = str(runtime.get("session_state") or "logged_out")
+                provider_status = str(runtime.get("provider_status") or "")
+                if (
+                    session_state == "logged_in"
+                    or (
+                        provider_status == "retrying"
+                        and session_state != "logged_out"
+                    )
+                    or bool(runtime.get("collect_inflight"))
+                ):
+                    account_ids.append(account_id)
+            return account_ids
 
     def __is_background_account_paused(self, runtime: dict[str, Any]) -> bool:
         if not isinstance(runtime, dict):
@@ -1457,14 +1933,20 @@ class CodexUsageMultiMonitor:
         return max(1.0, float(initial_delay_sec))
 
     def __refresh_accounts(self, source: str, *, manage_inflight: bool = True) -> None:
-        if not bool(self.__enabled):
+        if bool(self.__closing) or not bool(self.__enabled):
             return
         if bool(manage_inflight):
-            with self.__refresh_lock:
+            with self.__refresh_condition:
                 self.__refresh_inflight = True
         try:
-            for account_id in self.__ordered_account_ids():
-                if not bool(self.__account_settings[account_id].enabled):
+            with self.__settings_mutation_lock:
+                account_ids = list(self.__ordered_account_ids())
+            for account_id in account_ids:
+                if bool(self.__closing):
+                    break
+                with self.__settings_mutation_lock:
+                    account = self.__account_settings.get(account_id)
+                if account is None or not bool(account.enabled):
                     continue
                 self.__show_account_status(
                     account_id,
@@ -1475,8 +1957,9 @@ class CodexUsageMultiMonitor:
                 )
         finally:
             if bool(manage_inflight):
-                with self.__refresh_lock:
+                with self.__refresh_condition:
                     self.__refresh_inflight = False
+                    self.__refresh_condition.notify_all()
         return
 
     def __show_account_status(
@@ -1506,8 +1989,13 @@ class CodexUsageMultiMonitor:
                 refresh_taskbar=bool(refresh_taskbar),
             ):
                 return
-        child = self.__child(account_id)
-        child.show_current_status(force_refresh=bool(force_refresh), source=source_key)
+        child = self.__begin_profile_refresh(account_id)
+        if child is None:
+            return
+        try:
+            child.show_current_status(force_refresh=bool(force_refresh), source=source_key)
+        finally:
+            self.__end_profile_refresh(account_id)
         if bool(refresh_taskbar):
             self.__refresh_taskbar_progress()
         return
@@ -1787,6 +2275,100 @@ class CodexUsageMultiMonitor:
             profile_dir=profile_dir,
         )
 
+    def __validate_manager_settings(self, data: dict | None) -> str | None:
+        if not isinstance(data, dict):
+            return None
+        raw_version = data.get("settings_version", 0)
+        if isinstance(raw_version, bool) or not (
+            isinstance(raw_version, int)
+            or (
+                isinstance(raw_version, str)
+                and re.fullmatch(r"[0-9]+", raw_version.strip()) is not None
+            )
+        ):
+            return "invalid_settings_version"
+        settings_version = int(raw_version)
+        if settings_version > AI_USAGE_SETTINGS_VERSION:
+            return "unsupported_settings_version"
+        if settings_version < AI_USAGE_SETTINGS_VERSION:
+            return None
+
+        profiles = data.get("profiles")
+        if not isinstance(profiles, list):
+            return "invalid_v4_profiles"
+        accounts = data.get("accounts")
+        if accounts is not None and accounts != profiles:
+            return "invalid_v4_accounts_alias"
+        profile_ids: list[str] = []
+        for raw in profiles:
+            if not isinstance(raw, dict):
+                return "invalid_v4_profile"
+            profile_id = str(raw.get("id", "") or "")
+            if not _is_valid_profile_id(profile_id) or profile_id in profile_ids:
+                return "invalid_v4_profile_id"
+            provider = str(raw.get("provider", "") or "").strip().lower()
+            if provider not in SUPPORTED_PROVIDERS:
+                return "invalid_v4_provider"
+            provider_settings = raw.get("provider_settings")
+            if provider_settings is not None:
+                if not isinstance(provider_settings, dict):
+                    return "invalid_v4_provider_settings"
+                if any(
+                    key not in SUPPORTED_PROVIDERS or not isinstance(value, dict)
+                    for key, value in provider_settings.items()
+                ):
+                    return "invalid_v4_provider_settings"
+            profile_ids.append(profile_id)
+
+        known_ids = set(profile_ids)
+        normalized_orders: dict[str, list[str]] = {}
+        for key in ("profile_order", "account_order"):
+            raw_order = data.get(key)
+            if raw_order is None:
+                continue
+            if not isinstance(raw_order, list):
+                return "invalid_v4_profile_order"
+            normalized_order = [str(item or "") for item in raw_order]
+            if (
+                len(normalized_order) != len(set(normalized_order))
+                or any(item not in known_ids for item in normalized_order)
+            ):
+                return "invalid_v4_profile_order"
+            normalized_orders[key] = normalized_order
+        if (
+            "profile_order" in normalized_orders
+            and "account_order" in normalized_orders
+            and normalized_orders["profile_order"] != normalized_orders["account_order"]
+        ):
+            return "invalid_v4_order_alias"
+
+        selected = data.get("selected_profile_ids")
+        if selected is not None:
+            if not isinstance(selected, list):
+                return "invalid_v4_taskbar_selection"
+            normalized_selected = [str(item or "") for item in selected]
+            if (
+                len(normalized_selected) > TASKBAR_PROFILE_LIMIT
+                or len(normalized_selected) != len(set(normalized_selected))
+                or any(item not in known_ids for item in normalized_selected)
+            ):
+                return "invalid_v4_taskbar_selection"
+            if profiles and all(
+                isinstance(raw, dict) and "taskbar_selected" in raw for raw in profiles
+            ):
+                profile_selected_ids = {
+                    str(raw.get("id", "") or "")
+                    for raw in profiles
+                    if bool(raw.get("taskbar_selected"))
+                }
+                if profile_selected_ids != set(normalized_selected):
+                    return "invalid_v4_taskbar_alias"
+
+        default_profile_id = str(data.get("default_account_id", "") or "")
+        if default_profile_id and default_profile_id not in known_ids:
+            return "invalid_v4_default_profile"
+        return None
+
     def __load_manager_settings(self, data: dict | None) -> None:
         if not isinstance(data, dict):
             return
@@ -1942,6 +2524,8 @@ class CodexUsageMultiMonitor:
         tooltip_duration_ms: int | None = None,
         usage_url: str | None = None,
     ) -> None:
+        if self.__settings_write_block_reason is not None:
+            raise RuntimeError("settings are read-only")
         settings = account_settings if account_settings is not None else self.__account_settings
         requested_order = account_order if account_order is not None else self.__ordered_account_ids()
         ordered_ids: list[str] = []
@@ -2165,25 +2749,56 @@ class CodexUsageMultiMonitor:
             self.__recovery_pending_profile_ids.add(normalized)
             return
         old_child = self.__children.get(normalized)
-        shutdown = getattr(old_child, "shutdown", None)
-        if callable(shutdown):
-            try:
-                shutdown()
-            except Exception:
-                self.__track_unsettled_child(normalized, old_child)
+        if not self.__shutdown_child(old_child):
+            self.__track_unsettled_child(normalized, old_child)
         self.__recovery_pending_profile_ids.add(normalized)
         child = _RecoveryPendingChild(paths)
         self.__account_paths[normalized] = paths
         self.__children[normalized] = child
-        if self.__root is not None:
+        if (
+            self.__root is not None
+            and (
+                self.__ui_thread_id is None
+                or threading.get_ident() == self.__ui_thread_id
+            )
+        ):
             self.__attach_child(child, self.__root, self.__event_queue)
         return
 
     def __restore_child_monitor_or_mark_recovery_pending(self, profile_id: str) -> None:
+        normalized = str(profile_id or "")
+        if (
+            self.__root is not None
+            and self.__ui_thread_id is not None
+            and threading.get_ident() != self.__ui_thread_id
+        ):
+            paths = self.__build_account_paths().get(normalized)
+            if paths is None:
+                return
+            old_child = self.__children.get(normalized)
+            if not self.__shutdown_child(old_child):
+                self.__track_unsettled_child(normalized, old_child)
+            self.__account_paths[normalized] = paths
+            self.__children[normalized] = _RecoveryPendingChild(paths)
+
+            def restore_on_ui() -> None:
+                with self.__profile_lifecycle_lock:
+                    with self.__settings_mutation_lock:
+                        if bool(self.__closing) or normalized not in self.__account_settings:
+                            return
+                        try:
+                            self.__replace_child_monitor(normalized)
+                        except Exception:
+                            self.__mark_profile_recovery_pending(normalized)
+                return
+
+            if not self.__dispatch_ui_action(restore_on_ui, prefer_queue=True):
+                self.__mark_profile_recovery_pending(normalized)
+            return
         try:
-            self.__replace_child_monitor(profile_id)
+            self.__replace_child_monitor(normalized)
         except Exception:
-            self.__mark_profile_recovery_pending(profile_id)
+            self.__mark_profile_recovery_pending(normalized)
         return
 
     def __discard_cleanup_transaction(self, transaction_id: str) -> None:
@@ -2263,6 +2878,12 @@ class CodexUsageMultiMonitor:
         return
 
     def __retry_pending_settings_recovery(self) -> None:
+        if (
+            self.__root is not None
+            and self.__ui_thread_id is not None
+            and threading.get_ident() != self.__ui_thread_id
+        ):
+            return
         for profile_id in list(self.__settings_recovery_profile_ids):
             account = self.__account_settings.get(profile_id)
             child = self.__children.get(profile_id)
@@ -2296,12 +2917,8 @@ class CodexUsageMultiMonitor:
                     usage_url=self.__usage_url,
                 )
             except Exception:
-                shutdown = getattr(child, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception:
-                        self.__track_unsettled_child(profile_id, child)
+                if not self.__shutdown_child(child):
+                    self.__track_unsettled_child(profile_id, child)
                 self.__children[profile_id] = _RecoveryPendingChild(paths)
                 continue
             self.__settings_recovery_profile_ids.discard(profile_id)
@@ -2583,14 +3200,15 @@ class CodexUsageMultiMonitor:
             account_id,
             self.__account_settings[account_id],
         )
+        if not self.__shutdown_child(old_child):
+            self.__track_unsettled_child(account_id, old_child)
+            if not self.__shutdown_child(child):
+                self.__track_unsettled_child(account_id, child)
+            self.__account_paths[account_id] = paths
+            self.__children[account_id] = _RecoveryPendingChild(paths)
+            raise RuntimeError("old child shutdown was not confirmed")
         self.__account_paths[account_id] = paths
         self.__children[account_id] = child
-        shutdown_old = getattr(old_child, "shutdown", None)
-        if callable(shutdown_old):
-            try:
-                shutdown_old()
-            except Exception:
-                pass
         return
 
     def __replace_child_after_failed_settings_rollback(
@@ -2621,12 +3239,8 @@ class CodexUsageMultiMonitor:
                 usage_url=usage_url,
             )
         except Exception:
-            shutdown_replacement = getattr(replacement_child, "shutdown", None)
-            if callable(shutdown_replacement):
-                try:
-                    shutdown_replacement()
-                except Exception:
-                    pass
+            if not self.__shutdown_child(replacement_child):
+                self.__track_unsettled_child(account_id, replacement_child)
             replacement_paths = original_paths
             replacement_child = _RecoveryPendingChild(original_paths)
             if self.__root is not None:
@@ -2634,27 +3248,19 @@ class CodexUsageMultiMonitor:
             recovered = False
         else:
             recovered = True
-        shutdown_original = getattr(original_child, "shutdown", None)
-        if callable(shutdown_original):
-            try:
-                shutdown_original()
-            except Exception:
-                self.__track_unsettled_child(account_id, original_child)
-                shutdown_replacement = getattr(replacement_child, "shutdown", None)
-                if callable(shutdown_replacement):
-                    try:
-                        shutdown_replacement()
-                    except Exception:
-                        self.__track_unsettled_child(account_id, replacement_child)
-                replacement_paths = original_paths
-                replacement_child = _RecoveryPendingChild(original_paths)
-                if self.__root is not None:
-                    self.__attach_child(
-                        replacement_child,
-                        self.__root,
-                        self.__event_queue,
-                    )
-                recovered = False
+        if not self.__shutdown_child(original_child):
+            self.__track_unsettled_child(account_id, original_child)
+            if not self.__shutdown_child(replacement_child):
+                self.__track_unsettled_child(account_id, replacement_child)
+            replacement_paths = original_paths
+            replacement_child = _RecoveryPendingChild(original_paths)
+            if self.__root is not None:
+                self.__attach_child(
+                    replacement_child,
+                    self.__root,
+                    self.__event_queue,
+                )
+            recovered = False
         self.__account_paths[account_id] = replacement_paths
         self.__children[account_id] = replacement_child
         return recovered
@@ -2680,12 +3286,8 @@ class CodexUsageMultiMonitor:
             if self.__root is not None:
                 self.__attach_child(child, self.__root, self.__event_queue)
         except Exception:
-            shutdown_new = getattr(child, "shutdown", None)
-            if callable(shutdown_new):
-                try:
-                    shutdown_new()
-                except Exception:
-                    self.__track_unsettled_child(account_id, child)
+            if not self.__shutdown_child(child):
+                self.__track_unsettled_child(account_id, child)
             raise
         return paths, child
 

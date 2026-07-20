@@ -16,6 +16,11 @@ from src.apps.codex_usage_playwright_session import (
     CodexUsagePlaywrightSession,
     PlaywrightSessionConfig,
 )
+from src.apps.codex_usage_browser_types import (
+    BrowserOperationResult,
+    BrowserRuntimeStatus,
+    BrowserState,
+)
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
@@ -1756,6 +1761,32 @@ def compute_usage_changes(
     return changes
 
 
+class _UnavailableBrowserSession:
+    def __init__(self, error: str = "browser_session_create_failed") -> None:
+        self.__error = str(error or "browser_session_create_failed")
+
+    def collect(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def open_login(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def poll_login(self) -> BrowserOperationResult:
+        return BrowserOperationResult(error=self.__error)
+
+    def close_session(self) -> None:
+        return
+
+    def request_cancel(self) -> bool:
+        return True
+
+    def shutdown(self) -> bool:
+        return True
+
+    def get_runtime_status(self) -> BrowserRuntimeStatus:
+        return BrowserRuntimeStatus(BrowserState.FAILED, False, self.__error)
+
+
 class CodexUsageMonitor:
     def __init__(
         self,
@@ -1774,11 +1805,13 @@ class CodexUsageMonitor:
         self.__lib = LibConnector()
         self.__root = None
         self.__event_queue = None
+        self.__ui_thread_id: int | None = None
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         self.__external_scheduler = False
         self.__local_usage_provider = local_usage_provider
         self.__browser_session_factory = browser_session_factory
+        self.__browser_session_recovery_required = False
         self.__unrecoverable_timeout_handler = unrecoverable_timeout_handler
 
         self.__monitor_after_id = None
@@ -1887,6 +1920,7 @@ class CodexUsageMonitor:
     def attach(self, root, event_queue=None, start_monitor: bool = True) -> None:
         self.__root = root
         self.__event_queue = event_queue
+        self.__ui_thread_id = threading.get_ident()
         self.__external_scheduler = not bool(start_monitor)
         self.__refresh_session_state_from_profile()
         if bool(start_monitor):
@@ -1895,34 +1929,77 @@ class CodexUsageMonitor:
         self.__clear_monitor_schedule()
         return
 
-    def shutdown(self) -> None:
-        self.__request_collect_cancel()
-        self.__pause_background_monitor()
-        self.__cancel_pending_login_poll()
+    def shutdown(self) -> bool:
+        supports_cancel = callable(
+            getattr(self.__browser_session, "request_cancel", None)
+        )
+        cancelled = self.request_collect_cancel()
+        shutdown_succeeded = bool(cancelled)
+        if bool(supports_cancel or not cancelled):
+            shutdown_succeeded = self.__browser_session.shutdown() is True
         try:
             self.__worker_epoch = int(self.__worker_epoch) + 1
         except Exception:
             self.__worker_epoch = 1
         self.__hide_active_tooltip()
-        self.__browser_session.shutdown()
         self.__root = None
         self.__event_queue = None
-        return
+        self.__ui_thread_id = None
+        return bool(cancelled and shutdown_succeeded)
+
+    def request_collect_cancel(self) -> bool:
+        self.__request_collect_cancel()
+        self.__pause_background_monitor()
+        self.__cancel_pending_login_poll()
+        request_cancel = getattr(self.__browser_session, "request_cancel", None)
+        if callable(request_cancel):
+            return bool(request_cancel())
+        return self.__browser_session.shutdown() is True
 
     def set_notification_sink(self, notification_sink=None, suppress_normal_tooltips: bool = True) -> None:
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         return
 
-    def __set_usage_url(self, value: str) -> None:
+    def __set_usage_url(self, value: str) -> tuple[bool, str | None]:
         previous = str(getattr(self, "_CodexUsageMonitor__usage_url", "") or "")
-        self.__usage_url = canonicalize_codex_usage_url(value)
-        if previous and previous != self.__usage_url and hasattr(
+        candidate = canonicalize_codex_usage_url(value)
+        if bool(self.__browser_session_recovery_required):
+            self.__usage_url = candidate
+            try:
+                replacement = self.__create_browser_session()
+            except Exception:
+                self.__usage_url = previous
+                self.__browser_session = _UnavailableBrowserSession()
+                return False, "browser_session_create_failed"
+            self.__browser_session = replacement
+            self.__browser_session_recovery_required = False
+            return True, None
+        if previous and previous != candidate and hasattr(
             self, "_CodexUsageMonitor__browser_session"
         ):
-            self.__browser_session.shutdown()
-            self.__browser_session = self.__create_browser_session()
-        return
+            old_session = self.__browser_session
+            try:
+                shutdown_succeeded = old_session.shutdown() is True
+            except Exception:
+                shutdown_succeeded = False
+            if not shutdown_succeeded:
+                return False, "browser_session_shutdown_failed"
+            self.__usage_url = candidate
+            try:
+                replacement = self.__create_browser_session()
+            except Exception:
+                self.__usage_url = previous
+                try:
+                    self.__browser_session = self.__create_browser_session()
+                except Exception:
+                    self.__browser_session = _UnavailableBrowserSession()
+                    self.__browser_session_recovery_required = True
+                return False, "browser_session_create_failed"
+            self.__browser_session = replacement
+            return True, None
+        self.__usage_url = candidate
+        return True, None
 
     def __create_browser_session(self) -> CodexUsagePlaywrightSession:
         config = PlaywrightSessionConfig(
@@ -1973,8 +2050,10 @@ class CodexUsageMonitor:
             interval_sec = min_interval
         if tooltip_ms < 1200:
             tooltip_ms = 1200
+        url_updated, url_error = self.__set_usage_url(usage_url)
+        if not url_updated:
+            return False, url_error
         self.__enabled = enabled
-        self.__set_usage_url(usage_url)
         self.__interval_sec = float(interval_sec)
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__refresh_session_state_from_profile()
@@ -1987,9 +2066,10 @@ class CodexUsageMonitor:
 
     def release_profile_session(self) -> tuple[bool, str]:
         acquired = False
+        terminal_session = self.__browser_session
         self.__logout_in_progress = True
         self.__set_monitor_state("cancelling")
-        self.__request_collect_cancel()
+        self.request_collect_cancel()
         self.__pause_background_monitor()
         self.__cancel_pending_login_poll()
         try:
@@ -2031,10 +2111,27 @@ class CodexUsageMonitor:
                 pass
 
         try:
-            self.__browser_session.close_session()
+            if terminal_session.shutdown() is not True:
+                return (
+                    False,
+                    "브라우저 세션을 종료하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+            try:
+                replacement_session = self.__create_browser_session()
+            except Exception as exc:
+                self.__browser_session_recovery_required = True
+                self.__log_exception("recreate browser session after release failed", exc)
+                return (
+                    False,
+                    "브라우저 세션을 다시 준비하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
             ok, message = self.__clear_profile_directory()
             if not ok:
+                self.__browser_session = replacement_session
+                self.__browser_session_recovery_required = False
                 return False, message
+            self.__browser_session = replacement_session
+            self.__browser_session_recovery_required = False
             self.__last_snapshot = UsageSnapshot()
             self.__usage_history = []
             self.__snapshot_backfill_allowed = False
@@ -2249,6 +2346,7 @@ class CodexUsageMonitor:
             and not bool(self.__auth_attention_required)
             and not bool(self.__profile_in_use_detected)
             and not bool(self.__logout_in_progress)
+            and not self.__is_collect_cancel_requested()
         )
 
     def __get_background_collect_block_reason(self) -> str:
@@ -2300,29 +2398,27 @@ class CodexUsageMonitor:
 
     def __pause_background_monitor(self) -> None:
         root = self.__root
-        if root is not None:
-            try:
-                if self.__monitor_after_id is not None:
-                    root.after_cancel(self.__monitor_after_id)
-            except Exception:
-                pass
+        after_id = self.__monitor_after_id
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
         self.__monitor_running = False
         self.__startup_warmup_running = False
         self.__set_monitor_state("idle")
+        if root is not None and after_id is not None:
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __clear_monitor_schedule(self) -> None:
         root = self.__root
-        if root is not None:
-            try:
-                if self.__monitor_after_id is not None:
-                    root.after_cancel(self.__monitor_after_id)
-            except Exception:
-                pass
+        after_id = self.__monitor_after_id
         self.__monitor_after_id = None
         self.__next_collect_due_ts = 0.0
+        if root is not None and after_id is not None:
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __pause_monitor_countdown_for_manual_query(self) -> None:
@@ -2973,10 +3069,9 @@ class CodexUsageMonitor:
         self.__pending_login_poll_reason = ""
         self.__pending_login_error_count = 0
         if root is not None and after_id is not None:
-            try:
-                root.after_cancel(after_id)
-            except Exception:
-                pass
+            self.__post_tk_cleanup(
+                lambda root=root, after_id=after_id: root.after_cancel(after_id)
+            )
         return
 
     def __schedule_pending_login_poll(
@@ -3410,6 +3505,34 @@ class CodexUsageMonitor:
                 return
             except Exception:
                 self.__log("ui callback post failed")
+        return
+
+    def __post_tk_cleanup(self, fn) -> None:
+        if not callable(fn):
+            return
+        if (
+            self.__ui_thread_id is not None
+            and threading.get_ident() == self.__ui_thread_id
+        ):
+            try:
+                fn()
+            except Exception:
+                pass
+            return
+        queue_obj = self.__event_queue
+        if queue_obj is not None:
+            try:
+                queue_obj.put(fn)
+                return
+            except Exception:
+                self.__log("tk cleanup post failed")
+        if self.__ui_thread_id is None:
+            try:
+                fn()
+            except Exception:
+                pass
+            return
+        self.__log("tk cleanup dropped outside ui thread")
         return
 
     def __queue_change_tooltip_until_input(
@@ -4001,10 +4124,7 @@ class CodexUsageMonitor:
         current = self.__active_tooltip
         self.__active_tooltip = None
         if current is not None:
-            try:
-                current.hide_tooltip()
-            except Exception:
-                pass
+            self.__post_tk_cleanup(current.hide_tooltip)
         return
 
     def __handle_collect_error(self, error: str, source: str = "") -> None:

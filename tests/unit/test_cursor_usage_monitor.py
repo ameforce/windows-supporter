@@ -7,19 +7,23 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
 from src.apps.ai_usage_contracts import AiUsageProvider, UsageState
 from src.apps.codex_usage_browser_types import (
+    BrowserErrorCode,
     BrowserOperationResult,
     BrowserRuntimeStatus,
     BrowserState,
+    PlaywrightSessionConfig,
 )
 from src.apps.cursor_usage_monitor import (
     CursorUsageMonitor,
     CURSOR_USAGE_PAGE_PROBE_SCRIPT,
+    _LazyCursorBrowserSession,
     parse_sanitized_cursor_usage_text,
 )
 
@@ -50,11 +54,131 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         def close_session(self) -> None:
             self.calls.append("close_session")
 
-        def shutdown(self) -> None:
+        def shutdown(self) -> bool:
             self.calls.append("shutdown")
+            return True
 
         def get_runtime_status(self) -> BrowserRuntimeStatus:
             return self.status
+
+    def test_lazy_session_cancels_inner_created_after_terminal_request(self) -> None:
+        constructor_started = threading.Event()
+        release_constructor = threading.Event()
+
+        class _InnerSession:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def collect(self) -> BrowserOperationResult:
+                self.calls.append("collect")
+                return BrowserOperationResult(probe={"url": "usage"})
+
+            def request_cancel(self) -> bool:
+                self.calls.append("request_cancel")
+                return True
+
+            def shutdown(self) -> bool:
+                self.calls.append("shutdown")
+                return True
+
+            def get_runtime_status(self) -> BrowserRuntimeStatus:
+                return BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
+
+        inner = _InnerSession()
+
+        def blocking_constructor(*_args, **_kwargs):
+            constructor_started.set()
+            release_constructor.wait(2.0)
+            return inner
+
+        lazy = _LazyCursorBrowserSession(
+            PlaywrightSessionConfig(
+                profile_dir="profile",
+                usage_url="https://cursor.com/dashboard/usage",
+                probe_script="probe()",
+            ),
+            None,
+        )
+        results = []
+        collect_thread = threading.Thread(
+            target=lambda: results.append(lazy.collect()),
+            daemon=True,
+        )
+
+        with patch(
+            "src.apps.codex_usage_playwright_session.CodexUsagePlaywrightSession",
+            side_effect=blocking_constructor,
+        ):
+            collect_thread.start()
+            self.assertTrue(constructor_started.wait(1.0))
+
+            self.assertFalse(lazy.request_cancel())
+            self.assertFalse(lazy.shutdown())
+            release_constructor.set()
+            collect_thread.join(1.0)
+
+        self.assertFalse(collect_thread.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].error, BrowserErrorCode.COLLECT_FAILED.value)
+        self.assertEqual(inner.calls, ["request_cancel", "shutdown"])
+        self.assertTrue(lazy.shutdown())
+
+    def test_lazy_session_retains_failed_terminal_cleanup_for_shutdown_retry(self) -> None:
+        constructor_started = threading.Event()
+        release_constructor = threading.Event()
+
+        class _RetryableInnerSession:
+            def __init__(self) -> None:
+                self.calls = []
+                self.shutdown_results = [False, True]
+
+            def collect(self) -> BrowserOperationResult:
+                self.calls.append("collect")
+                return BrowserOperationResult()
+
+            def request_cancel(self) -> bool:
+                self.calls.append("request_cancel")
+                return False
+
+            def shutdown(self) -> bool:
+                self.calls.append("shutdown")
+                return self.shutdown_results.pop(0)
+
+        inner = _RetryableInnerSession()
+
+        def blocking_constructor(*_args, **_kwargs):
+            constructor_started.set()
+            release_constructor.wait(2.0)
+            return inner
+
+        lazy = _LazyCursorBrowserSession(
+            PlaywrightSessionConfig(
+                profile_dir="profile",
+                usage_url="https://cursor.com/dashboard/usage",
+                probe_script="probe()",
+            ),
+            None,
+        )
+        result = []
+        collect_thread = threading.Thread(
+            target=lambda: result.append(lazy.collect()),
+            daemon=True,
+        )
+
+        with patch(
+            "src.apps.codex_usage_playwright_session.CodexUsagePlaywrightSession",
+            side_effect=blocking_constructor,
+        ):
+            collect_thread.start()
+            self.assertTrue(constructor_started.wait(1.0))
+            self.assertFalse(lazy.shutdown())
+            release_constructor.set()
+            collect_thread.join(1.0)
+
+        self.assertFalse(collect_thread.is_alive())
+        self.assertEqual(result[0].error, BrowserErrorCode.COLLECT_FAILED.value)
+        self.assertTrue(lazy.shutdown())
+        self.assertEqual(inner.calls, ["request_cancel", "shutdown", "shutdown"])
 
     @staticmethod
     def _probe(text: str) -> dict[str, object]:
