@@ -465,6 +465,41 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(events, ["close_session", "clear_profile"])
 
+    def test_logout_hard_cancels_active_browser_collect_before_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor_ref = []
+
+            class _CancellingBrowserSession(self._BrowserSession):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.request_cancel_calls = 0
+
+                def request_cancel(self) -> bool:
+                    self.request_cancel_calls += 1
+                    monitor_ref[0]._CodexUsageMonitor__collect_lock.release()
+                    return True
+
+            session = _CancellingBrowserSession()
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: session,
+            )
+            monitor_ref.append(monitor)
+            self.assertTrue(monitor._CodexUsageMonitor__collect_lock.acquire(False))
+            monitor._CodexUsageMonitor__release_wait_timeout_sec = 0.2
+
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__clear_profile_directory",
+                return_value=(True, "로그아웃되었습니다."),
+            ):
+                ok, message = monitor.release_profile_session()
+
+            self.assertTrue(ok, message)
+            self.assertEqual(session.request_cancel_calls, 1)
+            self.assertIn("close_session", session.calls)
+
     def test_logout_removes_dynamic_app_owned_profile_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             profile_dir = os.path.join(

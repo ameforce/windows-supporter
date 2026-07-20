@@ -2068,7 +2068,7 @@ class CodexUsageMonitor:
         acquired = False
         self.__logout_in_progress = True
         self.__set_monitor_state("cancelling")
-        self.__request_collect_cancel()
+        self.request_collect_cancel()
         self.__pause_background_monitor()
         self.__cancel_pending_login_poll()
         try:
