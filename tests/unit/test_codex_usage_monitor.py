@@ -773,6 +773,11 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
         self.assertEqual(sanitize_profile_name("Account menu: Alice"), "Alice")
         self.assertEqual(sanitize_profile_name("Account menu: Daeng"), "Daeng")
         self.assertEqual(sanitize_profile_name("Profile menu - Daeng"), "Daeng")
+        self.assertEqual(sanitize_profile_name("계정 메뉴: Alice"), "Alice")
+        self.assertEqual(sanitize_profile_name("프로필 메뉴: Bob"), "Bob")
+        self.assertEqual(sanitize_profile_name("My Account: Alice"), "Alice")
+        self.assertEqual(sanitize_profile_name("Your profile: Bob"), "Bob")
+        self.assertEqual(sanitize_profile_name("내 계정: Alice"), "Alice")
 
     def test_sanitize_profile_name_keeps_real_profile_name(self) -> None:
         self.assertEqual(sanitize_profile_name("Profile: Daeng"), "Daeng")
