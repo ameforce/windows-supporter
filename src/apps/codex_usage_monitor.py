@@ -2066,6 +2066,7 @@ class CodexUsageMonitor:
 
     def release_profile_session(self) -> tuple[bool, str]:
         acquired = False
+        terminal_session = self.__browser_session
         self.__logout_in_progress = True
         self.__set_monitor_state("cancelling")
         self.request_collect_cancel()
@@ -2110,10 +2111,27 @@ class CodexUsageMonitor:
                 pass
 
         try:
-            self.__browser_session.close_session()
+            if terminal_session.shutdown() is not True:
+                return (
+                    False,
+                    "브라우저 세션을 종료하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+            try:
+                replacement_session = self.__create_browser_session()
+            except Exception as exc:
+                self.__browser_session_recovery_required = True
+                self.__log_exception("recreate browser session after release failed", exc)
+                return (
+                    False,
+                    "브라우저 세션을 다시 준비하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
             ok, message = self.__clear_profile_directory()
             if not ok:
+                self.__browser_session = replacement_session
+                self.__browser_session_recovery_required = False
                 return False, message
+            self.__browser_session = replacement_session
+            self.__browser_session_recovery_required = False
             self.__last_snapshot = UsageSnapshot()
             self.__usage_history = []
             self.__snapshot_backfill_allowed = False

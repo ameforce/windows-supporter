@@ -74,6 +74,8 @@ class CodexUsageSettingsView:
             bool,
             dict[str, Any] | None,
         ] | None = None
+        self._profile_release_result_lock = threading.Lock()
+        self._pending_profile_release_result: tuple[str, bool, str] | None = None
         self._profile_add_settings_changed = False
         self._blocked_mutation_settings_changed = False
         self._loading_settings = False
@@ -1216,24 +1218,21 @@ class CodexUsageSettingsView:
                 message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
-                self._profile_actions_inflight.discard(action_id)
-                if ok:
-                    self._load_settings()
-                    self._refresh_runtime_status()
-                    self._set_status(message, level="ok")
-                    return
-                self._set_status(message, level="error")
+                self._finish_profile_release_on_ui(action_id, ok, message)
                 return
 
             if not self._post_ui(done):
-                self._profile_actions_inflight.discard(action_id)
+                self._record_pending_profile_release_result(action_id, ok, message)
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            self._profile_actions_inflight.discard(action_id)
-            self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
+            self._finish_profile_release_on_ui(
+                action_id,
+                False,
+                "연결 해제 작업을 시작하지 못했습니다.",
+            )
         return
 
     def _on_account_release_profile(self, account_id: str) -> None:
@@ -1293,25 +1292,64 @@ class CodexUsageSettingsView:
                 message = "연결 해제가 완료되었습니다." if ok else "연결 해제에 실패했습니다."
 
             def done() -> None:
-                self._profile_actions_inflight.discard(normalized)
-                if ok:
-                    self._load_settings()
-                    self._refresh_runtime_status()
-                    self._set_status(message, level="ok")
-                    return
-                self._set_status(message, level="error")
+                self._finish_profile_release_on_ui(normalized, ok, message)
                 return
 
             if not self._post_ui(done):
-                self._profile_actions_inflight.discard(normalized)
+                self._record_pending_profile_release_result(normalized, ok, message)
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
-            self._profile_actions_inflight.discard(normalized)
-            self._set_status("연결 해제 작업을 시작하지 못했습니다.", level="error")
+            self._finish_profile_release_on_ui(
+                normalized,
+                False,
+                "연결 해제 작업을 시작하지 못했습니다.",
+            )
         return
+
+    def _finish_profile_release_on_ui(
+        self,
+        action_id: str,
+        ok: bool,
+        message: str,
+    ) -> None:
+        retry_prepared = self._consume_blocked_mutation_settings()
+        self._profile_actions_inflight.discard(str(action_id or ""))
+        if retry_prepared is None and bool(ok):
+            self._load_settings()
+        elif retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        if bool(ok):
+            self._refresh_runtime_status()
+            self._set_status(message, level="ok")
+            return
+        self._set_status(message, level="error")
+        return
+
+    def _record_pending_profile_release_result(
+        self,
+        action_id: str,
+        ok: bool,
+        message: str,
+    ) -> None:
+        with self._profile_release_result_lock:
+            self._pending_profile_release_result = (
+                str(action_id or ""),
+                bool(ok),
+                str(message or ""),
+            )
+        return
+
+    def _reconcile_pending_profile_release_result(self) -> bool:
+        with self._profile_release_result_lock:
+            result = self._pending_profile_release_result
+            self._pending_profile_release_result = None
+        if result is None:
+            return False
+        self._finish_profile_release_on_ui(*result)
+        return True
 
     def _post_ui(self, fn) -> bool:
         if not callable(fn):
@@ -2669,6 +2707,8 @@ class CodexUsageSettingsView:
     def _refresh_runtime_status(self) -> None:
         win = self._win
         if win is None:
+            return
+        if self._reconcile_pending_profile_release_result():
             return
         if self._reconcile_pending_profile_add_result():
             return

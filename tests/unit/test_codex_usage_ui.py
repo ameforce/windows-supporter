@@ -2301,6 +2301,123 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         posted[0]()
         self.assertEqual(view._profile_actions_inflight, set())
 
+    def test_account_release_retries_blocked_edits_without_reloading_stale_settings(self) -> None:
+        class _FakeMonitor:
+            def get_runtime_status(self):
+                return {
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "enabled": True,
+                            "runtime": {"can_login": False, "can_logout": True},
+                        }
+                    ]
+                }
+
+            def release_account_profile_session(self, account_id):
+                self.released = account_id
+                return True, "released"
+
+        class _DeferredThread:
+            targets = []
+
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self.targets.append(self._target)
+                return None
+
+        captured = {"payload": {"profiles": [{"id": "account_1", "enabled": False}]}}
+        posted = []
+        events = []
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=_FakeMonitor(),
+            ui_post=lambda fn: posted.append(fn) or True,
+        )
+        view._tk = object()
+        view._win = object()
+        view._set_status = lambda *_args, **_kwargs: None
+        view._build_settings_update = lambda: captured
+        view._load_settings = lambda: events.append(("load", None))
+        view._refresh_runtime_status = lambda: events.append(("refresh", None))
+        view._schedule_captured_autosave_retry = (
+            lambda prepared: events.append(("retry", prepared))
+        )
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _DeferredThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_account_release_profile("account_1")
+        self.assertEqual(len(_DeferredThread.targets), 1)
+        view._schedule_autosave()
+        self.assertTrue(view._blocked_mutation_settings_changed)
+
+        _DeferredThread.targets[0]()
+        self.assertEqual(len(posted), 1)
+        posted[0]()
+
+        self.assertEqual(events.count(("retry", captured)), 1)
+        self.assertNotIn(("load", None), events)
+        self.assertIn(("refresh", None), events)
+        self.assertFalse(view._blocked_mutation_settings_changed)
+
+    def test_account_release_queue_failure_reconciles_blocked_edits_on_ui_tick(self) -> None:
+        class _FakeMonitor:
+            def get_runtime_status(self):
+                return {
+                    "accounts": [
+                        {
+                            "id": "account_1",
+                            "enabled": True,
+                            "runtime": {"can_login": False, "can_logout": True},
+                        }
+                    ]
+                }
+
+            def release_account_profile_session(self, _account_id):
+                return True, "released"
+
+        class _InlineThread:
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self._target()
+                return None
+
+        captured = {"payload": {"profiles": [{"id": "account_1", "enabled": False}]}}
+        retries = []
+        loads = []
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=_FakeMonitor(),
+            ui_post=lambda _fn: False,
+        )
+        view._tk = object()
+        view._win = object()
+        view._set_status = lambda *_args, **_kwargs: None
+        view._build_settings_update = lambda: captured
+        view._load_settings = lambda: loads.append(True)
+        view._refresh_runtime_status = lambda: None
+        view._schedule_captured_autosave_retry = lambda prepared: retries.append(prepared)
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _InlineThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_account_release_profile("account_1")
+
+        self.assertEqual(view._profile_actions_inflight, {"account_1"})
+        self.assertIsNotNone(view._pending_profile_release_result)
+        view._schedule_autosave()
+        self.assertTrue(view._blocked_mutation_settings_changed)
+
+        self.assertTrue(view._reconcile_pending_profile_release_result())
+        self.assertEqual(retries, [captured])
+        self.assertEqual(loads, [])
+        self.assertEqual(view._profile_actions_inflight, set())
+
     def test_delete_inflight_blocks_profile_query_login_and_release_actions(self) -> None:
         class _FakeMonitor:
             def __init__(self):

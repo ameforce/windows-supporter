@@ -526,6 +526,73 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertIn("force_terminate:command_timeout", driver.calls)
         session.shutdown()
 
+    def test_request_cancel_hard_cancels_active_login_command(self) -> None:
+        release = threading.Event()
+
+        class _TerminableBlockingLoginDriver(FakeDriver):
+            def open_login(self) -> BrowserOperationResult:
+                self._record("open_login")
+                release.wait()
+                return BrowserOperationResult(error="login_required")
+
+            def force_terminate(self, reason: str) -> bool:
+                self.calls.append(f"force_terminate:{reason}")
+                release.set()
+                return True
+
+        driver = _TerminableBlockingLoginDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=2.0)
+        login_thread = threading.Thread(target=session.open_login, daemon=True)
+        login_thread.start()
+        deadline = time.monotonic() + 1.0
+        while "open_login" not in driver.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("open_login", driver.calls)
+
+        started = time.monotonic()
+        cancel_result = session.request_cancel()
+        elapsed = time.monotonic() - started
+        login_thread.join(1.0)
+
+        self.assertTrue(cancel_result)
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(login_thread.is_alive())
+        self.assertIn("force_terminate:command_timeout", driver.calls)
+        session.shutdown()
+
+    def test_request_cancel_hard_cancels_active_login_poll(self) -> None:
+        release = threading.Event()
+
+        class _TerminableBlockingLoginPollDriver(FakeDriver):
+            def poll_login(self) -> BrowserOperationResult:
+                self._record("poll_login")
+                release.wait()
+                return BrowserOperationResult(error="login_required")
+
+            def force_terminate(self, reason: str) -> bool:
+                self.calls.append(f"force_terminate:{reason}")
+                release.set()
+                return True
+
+        driver = _TerminableBlockingLoginPollDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=2.0)
+        poll_thread = threading.Thread(target=session.poll_login, daemon=True)
+        poll_thread.start()
+        deadline = time.monotonic() + 1.0
+        while "poll_login" not in driver.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("poll_login", driver.calls)
+
+        cancel_result = session.request_cancel()
+        poll_thread.join(1.0)
+
+        self.assertTrue(cancel_result)
+        self.assertFalse(poll_thread.is_alive())
+        self.assertIn("force_terminate:command_timeout", driver.calls)
+        session.shutdown()
+
     def test_request_cancel_leaves_alive_idle_owner_for_normal_shutdown(self) -> None:
         class _TerminableIdleDriver(FakeDriver):
             def force_terminate(self, reason: str) -> bool:

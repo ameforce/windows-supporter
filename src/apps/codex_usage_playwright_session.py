@@ -108,7 +108,7 @@ class CodexUsagePlaywrightSession:
         self._status: BrowserRuntimeStatus = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
         self._shutdown: bool = False
         self._cancel_requested: bool = False
-        self._collect_calls_inflight: int = 0
+        self._cancellable_calls_inflight: int = 0
         self._cancel_event = threading.Event()
         self._session_cookies: list[dict[str, Any]] = []
         self._timeout_retry_delays_sec = tuple(
@@ -122,14 +122,14 @@ class CodexUsagePlaywrightSession:
 
     def collect(self) -> BrowserOperationResult:
         with self._lock:
-            self._collect_calls_inflight += 1
+            self._cancellable_calls_inflight += 1
         try:
             return self._collect_with_retries()
         finally:
             with self._lock:
-                self._collect_calls_inflight = max(
+                self._cancellable_calls_inflight = max(
                     0,
-                    self._collect_calls_inflight - 1,
+                    self._cancellable_calls_inflight - 1,
                 )
 
     def _collect_with_retries(self) -> BrowserOperationResult:
@@ -195,10 +195,22 @@ class CodexUsagePlaywrightSession:
                 self._sleep(delay_sec)
 
     def open_login(self) -> BrowserOperationResult:
-        return self._invoke(OpenLoginCommand())
+        return self._invoke_cancellable(OpenLoginCommand())
 
     def poll_login(self) -> BrowserOperationResult:
-        return self._invoke(PollLoginCommand())
+        return self._invoke_cancellable(PollLoginCommand())
+
+    def _invoke_cancellable(self, command: BrowserCommand) -> BrowserOperationResult:
+        with self._lock:
+            self._cancellable_calls_inflight += 1
+        try:
+            return self._invoke(command)
+        finally:
+            with self._lock:
+                self._cancellable_calls_inflight = max(
+                    0,
+                    self._cancellable_calls_inflight - 1,
+                )
 
     def close_session(self) -> None:
         with self._lock:
@@ -212,10 +224,10 @@ class CodexUsagePlaywrightSession:
             thread = self._thread
             self._cancel_requested = True
             self._cancel_event.set()
-            collect_inflight = bool(self._collect_calls_inflight)
+            operation_inflight = bool(self._cancellable_calls_inflight)
             if thread is None or not thread.is_alive():
-                return not collect_inflight
-            if not collect_inflight:
+                return not operation_inflight
+            if not operation_inflight:
                 return True
             queue = self._queue
             driver = self._driver
@@ -237,7 +249,7 @@ class CodexUsagePlaywrightSession:
             thread = self._thread
             if thread is None:
                 self._shutdown = True
-                if self._collect_calls_inflight:
+                if self._cancellable_calls_inflight:
                     return False
                 self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
                 return True
