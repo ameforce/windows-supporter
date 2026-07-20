@@ -485,6 +485,7 @@ class DashboardView:
                     continue
         except Exception:
             return
+        status_labels: list[Any] = []
         for row_parts in self._status_part_rows(key, parts):
             row = tk.Frame(frame, bg="#FFFFFF")
             row.pack(anchor="w", fill="x")
@@ -508,8 +509,11 @@ class DashboardView:
                     bg="#FFFFFF",
                     fg=fg,
                     font=("Segoe UI", 9, "bold") if kind in {"enabled", "disabled"} else ("Segoe UI", 9),
+                    anchor="w",
+                    justify="left",
                 )
                 label.pack(side="left")
+                status_labels.append(label)
                 callback_name = f"{key}.settings"
                 if callable(self._get_callback(callback_name)):
                     try:
@@ -517,11 +521,32 @@ class DashboardView:
                     except Exception:
                         pass
                     self._bind_click(label, callback_name)
+        def sync_wraplength(event: Any = None) -> None:
+            try:
+                width = int(getattr(event, "width", 0) or frame.winfo_width())
+            except Exception:
+                return
+            if width <= 1:
+                return
+            for label in status_labels:
+                try:
+                    label.configure(wraplength=width)
+                except Exception:
+                    continue
+            return
+
+        try:
+            frame.bind("<Configure>", sync_wraplength)
+            frame.after_idle(sync_wraplength)
+        except Exception:
+            pass
         return
 
     @staticmethod
     def _status_part_rows(key: str, parts: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
         normalized = list(parts or [])
+        if str(key) == "background":
+            return [[part] for part in normalized]
         if str(key) != "ai_usage":
             return [normalized] if normalized else []
         summary = normalized[:3]

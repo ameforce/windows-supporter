@@ -879,6 +879,23 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertEqual(rows[1][0][0].split(" (")[0], "First")
         self.assertEqual(rows[2][0][0].split(" (")[0], "Second")
 
+    def test_background_status_parts_are_rendered_on_separate_rows(self):
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        _, parts = view._format_background(
+            {
+                "enabled": True,
+                "hotkeys_registered": True,
+                "features_warmup_done": True,
+                "foreground_hotkey_profile": "긴 한국어 프로필 이름",
+                "wrike_attached": True,
+                "ai_usage_attached": True,
+            }
+        )
+
+        rows = view._status_part_rows("background", parts)
+
+        self.assertEqual(rows, [[part] for part in parts])
+
     def test_dashboard_scroll_wheel_uses_directional_single_steps(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 
