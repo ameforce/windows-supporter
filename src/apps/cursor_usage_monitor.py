@@ -132,6 +132,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     /^(sign in|log in|continue with google|로그인)$/i.test(text)
   ).slice(0, 4).join(' ');
   const collectProfileName = () => {
+    const identityCue = /(profile|account|프로필|계정|avatar|user)/i;
+    const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close)$/i;
     const selectors = [
       '[data-testid*="profile" i]',
       '[data-testid*="account" i]',
@@ -145,24 +147,29 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     ];
     const seen = new Set();
     for (const selector of selectors) {
+      const broadMenu = /aria-haspopup=["']menu["']/.test(selector);
       for (const node of Array.from(document.querySelectorAll(selector))) {
         if (!isVisible(node) || isExcluded(node)) continue;
-        const nodeIdentity = clean([
-          node.getAttribute ? node.getAttribute('data-testid') : '',
-          node.getAttribute ? node.getAttribute('aria-label') : '',
-          node.getAttribute ? node.getAttribute('title') : '',
-        ].join(' ')).toLowerCase();
-        if (nodeIdentity && !/(profile|account|프로필|계정|avatar|user)/i.test(nodeIdentity)) {
+        const ariaLabel = node.getAttribute ? node.getAttribute('aria-label') : '';
+        const title = node.getAttribute ? node.getAttribute('title') : '';
+        const testId = node.getAttribute ? node.getAttribute('data-testid') : '';
+        const nodeIdentity = clean([testId, ariaLabel, title].join(' ')).toLowerCase();
+        const hasCue = identityCue.test(nodeIdentity);
+        // Broad menu buttons without identity cues may still expose the display
+        // name as aria-label/title, but must not fall through to random innerText.
+        const rawCandidates = (broadMenu && !hasCue)
+          ? [ariaLabel, title]
+          : [ariaLabel, title, node.innerText || node.textContent || ''];
+        if (broadMenu && !hasCue && !clean(ariaLabel) && !clean(title)) {
           continue;
         }
-        for (const raw of [
-          node.getAttribute ? node.getAttribute('aria-label') : '',
-          node.getAttribute ? node.getAttribute('title') : '',
-          node.innerText || node.textContent || '',
-        ]) {
+        if (!broadMenu && nodeIdentity && !hasCue) {
+          continue;
+        }
+        for (const raw of rawCandidates) {
           const candidate = clean(raw);
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
-          if (/^(sign in|log in|settings|설정|로그아웃|로그인)$/i.test(candidate)) continue;
+          if (genericLabel.test(candidate)) continue;
           if (seen.has(candidate)) continue;
           seen.add(candidate);
           return candidate;
@@ -862,6 +869,7 @@ class CursorUsageMonitor:
             except OSError:
                 pass
             captured_at = _iso_now(self._clock)
+            self._profile_name = ""
             self._last_reading = AiUsageReading.unavailable(
                 provider=AiUsageProvider.CURSOR,
                 profile_id=self.profile_id,
@@ -954,8 +962,6 @@ class CursorUsageMonitor:
         from src.apps.codex_usage_monitor import sanitize_profile_name
 
         profile_name = sanitize_profile_name(probe.get("profileName", ""))
-        if profile_name:
-            self._profile_name = profile_name
         summary_text = ""
         for block in probe.get("metricBlocks", []):
             if not isinstance(block, dict):
@@ -972,6 +978,8 @@ class CursorUsageMonitor:
                 state=UsageState.DOM_DRIFT,
                 captured_at=captured_at,
             )
+        # Successful usage scrape owns identity: empty profileName clears stale names.
+        self._profile_name = profile_name
         return AiUsageReading(
             provider=AiUsageProvider.CURSOR,
             profile_id=self.profile_id,
