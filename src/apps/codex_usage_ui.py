@@ -66,7 +66,16 @@ class CodexUsageSettingsView:
         ] | None = None
         self._profile_add_result_lock = threading.Lock()
         self._pending_profile_add_result: tuple[bool, str | None, bool] | None = None
+        self._profile_delete_result_lock = threading.Lock()
+        self._pending_profile_delete_result: tuple[
+            str,
+            bool,
+            str | None,
+            bool,
+            dict[str, Any] | None,
+        ] | None = None
         self._profile_add_settings_changed = False
+        self._blocked_mutation_settings_changed = False
         self._loading_settings = False
         self._runtime_after_id = None
         self._collect_state_var = None
@@ -1359,6 +1368,8 @@ class CodexUsageSettingsView:
         if self._profile_settings_mutation_blocked():
             if "__add_profile__" in self._profile_deletions_inflight:
                 self._profile_add_settings_changed = True
+            else:
+                self._blocked_mutation_settings_changed = True
             return
         self._cancel_pending_autosave()
         win = self._win
@@ -1791,6 +1802,7 @@ class CodexUsageSettingsView:
                 level="error",
             )
             return
+        self._blocked_mutation_settings_changed = False
         self._profile_deletions_inflight.add(normalized)
         self._set_status("프로필 삭제 중...", level="info")
 
@@ -1812,33 +1824,30 @@ class CodexUsageSettingsView:
                     error = str(exc)
 
             def done() -> None:
-                self._profile_deletions_inflight.discard(normalized)
-                self._preserve_status_after_next_autosave = False
-                if not ok:
-                    if save_failed:
-                        self._schedule_autosave()
-                    else:
-                        self._remount()
-                        message = f"프로필 삭제 실패: {error}"
-                    if save_failed:
-                        message = (
-                            "프로필 삭제 전 변경사항을 저장하지 못해 "
-                            "삭제를 시작하지 않았습니다."
-                        )
-                    self._set_status(message, level="error")
-                    return
-                self._remount()
-                self._set_status("프로필을 삭제했습니다.", level="ok")
+                self._finish_profile_delete_on_ui(
+                    normalized,
+                    ok,
+                    error,
+                    save_failed,
+                    prepared,
+                )
                 return
 
             if not self._post_ui(done):
-                self._profile_deletions_inflight.discard(normalized)
+                self._record_pending_profile_delete_result(
+                    normalized,
+                    ok,
+                    error,
+                    save_failed,
+                    prepared,
+                )
             return
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
             self._profile_deletions_inflight.discard(normalized)
+            self._blocked_mutation_settings_changed = False
             if prepared is not None:
                 self._schedule_autosave()
             self._set_status("프로필 삭제 작업을 시작하지 못했습니다.", level="error")
@@ -1911,6 +1920,7 @@ class CodexUsageSettingsView:
             prepared = self._build_settings_update()
             if prepared is None:
                 return False, None
+        self._blocked_mutation_settings_changed = False
         self._profile_deletions_inflight.add("__external_settings__")
         return True, prepared
 
@@ -1919,10 +1929,13 @@ class CodexUsageSettingsView:
         ok: bool,
         error: str | None,
     ) -> None:
+        retry_prepared = self._consume_blocked_mutation_settings()
         self._profile_deletions_inflight.discard("__external_settings__")
         self._preserve_status_after_next_autosave = False
         if bool(ok):
             self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
             return
         self._set_status(f"설정 변경 실패: {error}", level="error")
         return
@@ -1931,7 +1944,119 @@ class CodexUsageSettingsView:
         """Release the state-only guard when the UI callback queue is unavailable."""
         self._profile_deletions_inflight.discard("__external_settings__")
         self._preserve_status_after_next_autosave = False
+        self._blocked_mutation_settings_changed = False
         return
+
+    def _consume_blocked_mutation_settings(self) -> dict[str, Any] | None:
+        changed = bool(self._blocked_mutation_settings_changed)
+        self._blocked_mutation_settings_changed = False
+        if not changed:
+            return None
+        return self._build_settings_update()
+
+    def _prepared_settings_without_profile(
+        self,
+        prepared: dict[str, Any],
+        profile_id: str,
+    ) -> dict[str, Any]:
+        normalized = str(profile_id or "")
+        result = dict(prepared)
+        payload = prepared.get("payload")
+        if not isinstance(payload, dict):
+            return result
+        updated_payload = dict(payload)
+        remaining_ids: list[str] = []
+        for key in ("profiles", "accounts"):
+            raw_items = payload.get(key)
+            if not isinstance(raw_items, list):
+                continue
+            filtered = [
+                dict(item)
+                for item in raw_items
+                if isinstance(item, dict) and str(item.get("id") or "") != normalized
+            ]
+            updated_payload[key] = filtered
+            if key == "profiles":
+                remaining_ids = [str(item.get("id") or "") for item in filtered]
+        for key in ("profile_order", "selected_profile_ids"):
+            raw_ids = payload.get(key)
+            if isinstance(raw_ids, list):
+                updated_payload[key] = [
+                    str(item or "") for item in raw_ids if str(item or "") != normalized
+                ]
+        if str(payload.get("default_account_id") or "") == normalized:
+            updated_payload["default_account_id"] = remaining_ids[0] if remaining_ids else ""
+        result["payload"] = updated_payload
+        before_providers = prepared.get("before_providers")
+        if isinstance(before_providers, dict):
+            updated_before = dict(before_providers)
+            updated_before.pop(normalized, None)
+            result["before_providers"] = updated_before
+        return result
+
+    def _finish_profile_delete_on_ui(
+        self,
+        profile_id: str,
+        ok: bool,
+        error: str | None,
+        save_failed: bool,
+        prepared: dict[str, Any] | None,
+    ) -> None:
+        retry_prepared = self._consume_blocked_mutation_settings()
+        if retry_prepared is None and bool(save_failed) and isinstance(prepared, dict):
+            retry_prepared = prepared
+        if bool(ok) and retry_prepared is not None:
+            retry_prepared = self._prepared_settings_without_profile(
+                retry_prepared,
+                profile_id,
+            )
+        self._profile_deletions_inflight.discard(str(profile_id or ""))
+        self._preserve_status_after_next_autosave = False
+        if not bool(ok):
+            if not bool(save_failed):
+                self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
+            message = (
+                "프로필 삭제 전 변경사항을 저장하지 못해 삭제를 시작하지 않았습니다."
+                if bool(save_failed)
+                else f"프로필 삭제 실패: {error}"
+            )
+            self._set_status(message, level="error")
+            return
+        self._remount()
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        self._set_status("프로필을 삭제했습니다.", level="ok")
+        return
+
+    def _record_pending_profile_delete_result(
+        self,
+        profile_id: str,
+        ok: bool,
+        error: str | None,
+        save_failed: bool,
+        prepared: dict[str, Any] | None,
+    ) -> None:
+        captured = prepared if isinstance(prepared, dict) else None
+        with self._profile_delete_result_lock:
+            self._pending_profile_delete_result = (
+                str(profile_id or ""),
+                bool(ok),
+                str(error) if error is not None else None,
+                bool(save_failed),
+                captured,
+            )
+        return
+
+    def _reconcile_pending_profile_delete_result(self) -> bool:
+        with self._profile_delete_result_lock:
+            result = self._pending_profile_delete_result
+            self._pending_profile_delete_result = None
+        if result is None:
+            return False
+        self._finish_profile_delete_on_ui(*result)
+        return True
 
     def _finish_profile_add_on_ui(
         self,
@@ -2029,15 +2154,19 @@ class CodexUsageSettingsView:
         if result is None:
             return False
         ok, error, prepared = result
+        retry_prepared = self._consume_blocked_mutation_settings()
         self._profile_deletions_inflight.discard("__external_settings__")
         self._preserve_status_after_next_autosave = False
         if bool(ok):
             self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
             self._notify_external_settings_reconciled()
             return True
         self._set_status(f"설정 변경 실패: {error}", level="error")
-        if prepared is not None:
-            self._schedule_captured_autosave_retry(prepared)
+        retry_prepared = retry_prepared or prepared
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
         self._notify_external_settings_reconciled()
         return False
 
@@ -2542,6 +2671,8 @@ class CodexUsageSettingsView:
         if win is None:
             return
         if self._reconcile_pending_profile_add_result():
+            return
+        if self._reconcile_pending_profile_delete_result():
             return
         if self._reconcile_external_settings_result():
             return

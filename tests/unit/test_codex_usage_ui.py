@@ -1001,6 +1001,109 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(statuses[-1][1], "error")
         self.assertEqual(remounts, [True])
 
+    def test_delete_queue_failure_reconciles_failed_presave_on_tk_tick(self) -> None:
+        worker_finished = threading.Event()
+
+        class _FakeMonitor:
+            def delete_profile(self, _profile_id, confirmed=False):
+                self.confirmed = confirmed
+                self.fail("delete must not run after a failed pre-save")
+
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=_FakeMonitor(),
+            ui_post=lambda _fn: False,
+        )
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-delete"
+        prepared = {"payload": {"profiles": [{"id": "account_1"}]}}
+        view._build_settings_update = lambda: prepared
+        view._apply_settings_update = lambda _prepared, update_ui=False: (
+            worker_finished.set() and False,
+            "settings_save_failed",
+            False,
+        )
+        view._set_status = lambda *_args, **_kwargs: None
+        retries = []
+        view._schedule_captured_autosave_retry = lambda payload: retries.append(payload)
+
+        with patch("tkinter.messagebox.askyesno", return_value=True):
+            view._on_delete_profile("account_1", "Codex 1")
+
+        self.assertTrue(worker_finished.wait(1.0))
+        self.assertIn("account_1", view._profile_deletions_inflight)
+        self.assertTrue(view._reconcile_pending_profile_delete_result())
+        self.assertEqual(view._profile_deletions_inflight, set())
+        self.assertEqual(retries, [prepared])
+        self.assertFalse(view._reconcile_pending_profile_delete_result())
+
+    def test_delete_success_retries_edits_accepted_while_worker_was_running(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._profile_deletions_inflight.add("account_1")
+        captured = {
+            "payload": {
+                "profiles": [
+                    {"id": "account_1", "label": "deleted"},
+                    {"id": "account_2", "label": "edited"},
+                ],
+                "accounts": [
+                    {"id": "account_1", "label": "deleted"},
+                    {"id": "account_2", "label": "edited"},
+                ],
+                "profile_order": ["account_1", "account_2"],
+                "selected_profile_ids": ["account_1", "account_2"],
+                "default_account_id": "account_1",
+            },
+            "before_providers": {
+                "account_1": "codex",
+                "account_2": "cursor",
+            },
+        }
+        view._build_settings_update = lambda: captured
+        view._set_status = lambda *_args, **_kwargs: None
+        remounts = []
+        retries = []
+        view._remount = lambda: remounts.append(True)
+        view._schedule_captured_autosave_retry = lambda payload: retries.append(payload)
+
+        view._schedule_autosave()
+        view._finish_profile_delete_on_ui(
+            "account_1",
+            True,
+            None,
+            False,
+            None,
+        )
+
+        self.assertEqual(remounts, [True])
+        self.assertEqual(len(retries), 1)
+        retry_payload = retries[0]["payload"]
+        self.assertEqual(retry_payload["profile_order"], ["account_2"])
+        self.assertEqual(retry_payload["selected_profile_ids"], ["account_2"])
+        self.assertEqual(retry_payload["default_account_id"], "account_2")
+        self.assertEqual(
+            [item["id"] for item in retry_payload["profiles"]],
+            ["account_2"],
+        )
+
+    def test_external_toggle_success_retries_edits_accepted_while_blocked(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._profile_deletions_inflight.add("__external_settings__")
+        captured = {"payload": {"profiles": [{"id": "account_1", "label": "edited"}]}}
+        view._build_settings_update = lambda: captured
+        view._set_status = lambda *_args, **_kwargs: None
+        remounts = []
+        retries = []
+        view._remount = lambda: remounts.append(True)
+        view._schedule_captured_autosave_retry = lambda payload: retries.append(payload)
+
+        view._schedule_autosave()
+        view._finish_external_settings_mutation(True, None)
+
+        self.assertEqual(remounts, [True])
+        self.assertEqual(retries, [captured])
+        self.assertEqual(view._profile_deletions_inflight, set())
+
     def test_delete_inflight_blocks_all_other_profile_settings_mutations(self) -> None:
         class _FakeMonitor:
             def __init__(self):
@@ -1178,7 +1281,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         statuses = []
         scheduled = []
         view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
-        view._schedule_autosave = lambda: scheduled.append(True)
+        view._schedule_captured_autosave_retry = lambda payload: scheduled.append(payload)
 
         class _InlineThread:
             def __init__(self, target=None, daemon=None):
@@ -1194,7 +1297,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(monitor.delete_calls, [])
         self.assertEqual(view._profile_deletions_inflight, set())
-        self.assertEqual(scheduled, [True])
+        self.assertEqual(scheduled, [{"payload": "dirty"}])
         self.assertIn("삭제를 시작하지 않았습니다", statuses[-1][0])
         self.assertEqual(statuses[-1][1], "error")
 
