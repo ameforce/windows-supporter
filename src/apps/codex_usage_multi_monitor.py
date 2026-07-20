@@ -2087,8 +2087,17 @@ class CodexUsageMultiMonitor:
         profile_name = ""
         if isinstance(runtime, dict):
             profile_name = str(runtime.get("profile_name") or "").strip()
-        if label_mode == "auto" and profile_name:
-            return profile_name
+        if label_mode == "auto":
+            if profile_name:
+                return profile_name
+            return _default_profile_label(
+                account.provider,
+                self.__profile_label_index(
+                    account.account_id,
+                    account.provider,
+                    account.label,
+                ),
+            )
         return str(
             custom_label
             or account.label
@@ -3118,7 +3127,7 @@ class CodexUsageMultiMonitor:
                     "short_label": "INC",
                     "percent": percent,
                     "value_text": str(snapshot.get("included_usage") or "조회 불가"),
-                    "short_value_text": "--" if percent is None else f"{percent:g}%",
+                    "short_value_text": "--" if percent is None else f"{int(round(percent))}%",
                     "reset_at": reset_at,
                     "reset_precision": str(
                         snapshot.get("reset_precision") or inferred_precision
@@ -3156,7 +3165,7 @@ class CodexUsageMultiMonitor:
                     "short_label": short_label,
                     "percent": percent,
                     "value_text": raw_value,
-                    "short_value_text": "--" if percent is None else f"{percent:g}%",
+                    "short_value_text": "--" if percent is None else f"{int(round(percent))}%",
                     "reset_at": reset_at,
                     "reset_precision": reset_precision,
                     "state": "ready",
