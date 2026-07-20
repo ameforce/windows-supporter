@@ -402,6 +402,13 @@ class CodexUsageMultiMonitor:
         with self.__settings_mutation_lock:
             if bool(self.__closing):
                 return False, "shutdown"
+            if (
+                self.__root is not None
+                and self.__ui_thread_id is not None
+                and threading.get_ident() != self.__ui_thread_id
+                and bool(self.__provider_change_ids(data))
+            ):
+                return False, "settings_ui_thread_required"
             refresh_blocking_ids = self.__refresh_blocking_change_ids(data)
             for profile_id in refresh_blocking_ids:
                 self.__set_profile_refresh_blocked(profile_id, True)
@@ -1109,16 +1116,7 @@ class CodexUsageMultiMonitor:
             self.__discard_cleanup_transaction(transaction_id)
             if child is not None:
                 self.__track_unsettled_child(normalized, child)
-            paths = self.__account_paths.get(normalized)
-            if paths is not None:
-                recovery_child = _RecoveryPendingChild(paths)
-                self.__children[normalized] = recovery_child
-                if self.__root is not None:
-                    self.__attach_child(
-                        recovery_child,
-                        self.__root,
-                        self.__event_queue,
-                    )
+            self.__mark_profile_recovery_pending(normalized)
             return False, "profile_delete_failed"
         if not recovery_was_pending:
             self.__complete_settings_recovery({normalized})
@@ -2757,15 +2755,50 @@ class CodexUsageMultiMonitor:
         child = _RecoveryPendingChild(paths)
         self.__account_paths[normalized] = paths
         self.__children[normalized] = child
-        if self.__root is not None:
+        if (
+            self.__root is not None
+            and (
+                self.__ui_thread_id is None
+                or threading.get_ident() == self.__ui_thread_id
+            )
+        ):
             self.__attach_child(child, self.__root, self.__event_queue)
         return
 
     def __restore_child_monitor_or_mark_recovery_pending(self, profile_id: str) -> None:
+        normalized = str(profile_id or "")
+        if (
+            self.__root is not None
+            and self.__ui_thread_id is not None
+            and threading.get_ident() != self.__ui_thread_id
+        ):
+            paths = self.__build_account_paths().get(normalized)
+            if paths is None:
+                return
+            old_child = self.__children.get(normalized)
+            if not self.__shutdown_child(old_child):
+                self.__track_unsettled_child(normalized, old_child)
+            self.__account_paths[normalized] = paths
+            self.__children[normalized] = _RecoveryPendingChild(paths)
+
+            def restore_on_ui() -> None:
+                with self.__profile_lifecycle_lock:
+                    with self.__settings_mutation_lock:
+                        if bool(self.__closing) or normalized not in self.__account_settings:
+                            return
+                        try:
+                            self.__replace_child_monitor(normalized)
+                        except Exception:
+                            self.__mark_profile_recovery_pending(normalized)
+                return
+
+            if not self.__dispatch_ui_action(restore_on_ui, prefer_queue=True):
+                self.__mark_profile_recovery_pending(normalized)
+            return
         try:
-            self.__replace_child_monitor(profile_id)
+            self.__replace_child_monitor(normalized)
         except Exception:
-            self.__mark_profile_recovery_pending(profile_id)
+            self.__mark_profile_recovery_pending(normalized)
         return
 
     def __discard_cleanup_transaction(self, transaction_id: str) -> None:
@@ -2845,6 +2878,12 @@ class CodexUsageMultiMonitor:
         return
 
     def __retry_pending_settings_recovery(self) -> None:
+        if (
+            self.__root is not None
+            and self.__ui_thread_id is not None
+            and threading.get_ident() != self.__ui_thread_id
+        ):
+            return
         for profile_id in list(self.__settings_recovery_profile_ids):
             account = self.__account_settings.get(profile_id)
             child = self.__children.get(profile_id)

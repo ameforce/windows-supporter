@@ -674,6 +674,32 @@ class WindowsSupporterMainUI:
                 resume()
             return
 
+        if prepared_settings is not None and settings_view is not None:
+            flush_provider_change = getattr(
+                settings_view,
+                "_flush_provider_changing_settings_before_worker",
+                None,
+            )
+            if callable(flush_provider_change):
+                try:
+                    flush_ok, flush_error, prepared_settings = flush_provider_change(
+                        prepared_settings
+                    )
+                except Exception as exc:
+                    flush_ok = False
+                    flush_error = str(exc)
+                if not bool(flush_ok):
+                    finish_mutation = getattr(
+                        settings_view,
+                        "_finish_external_settings_mutation",
+                        None,
+                    )
+                    if callable(finish_mutation):
+                        finish_mutation(False, flush_error)
+                    resume_pending_autosave()
+                    self._refresh_dashboard_status()
+                    return
+
         def task() -> None:
             ok = True
             error = None

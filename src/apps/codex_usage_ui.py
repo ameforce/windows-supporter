@@ -1454,28 +1454,14 @@ class CodexUsageSettingsView:
         update_ui: bool = True,
     ) -> tuple[bool, str | None, bool]:
         payload = prepared.get("payload") if isinstance(prepared, dict) else None
-        before_providers = (
-            prepared.get("before_providers") if isinstance(prepared, dict) else None
-        )
         if not isinstance(payload, dict):
             return False, "invalid settings", False
-        if not isinstance(before_providers, dict):
-            before_providers = {}
         try:
             ok, err = self._codex.update_settings(payload)
         except Exception as exc:
             ok = False
             err = str(exc)
-        accounts = payload.get("profiles")
-        if not isinstance(accounts, list):
-            accounts = []
-        provider_changed = any(
-            before_providers.get(str(item.get("id") or ""))
-            != str(item.get("provider") or "codex").lower()
-            for item in accounts
-            if isinstance(item, dict)
-            and str(item.get("id") or "") in before_providers
-        )
+        provider_changed = self._prepared_settings_changes_provider(prepared)
         if ok:
             if update_ui:
                 if provider_changed:
@@ -1489,6 +1475,38 @@ class CodexUsageSettingsView:
             self._preserve_status_after_next_autosave = False
             self._set_status(f"저장 실패: {err}", level="error")
         return False, str(err or "settings_save_failed"), provider_changed
+
+    def _prepared_settings_changes_provider(self, prepared: dict[str, Any]) -> bool:
+        payload = prepared.get("payload") if isinstance(prepared, dict) else None
+        before_providers = (
+            prepared.get("before_providers") if isinstance(prepared, dict) else None
+        )
+        if not isinstance(payload, dict) or not isinstance(before_providers, dict):
+            return False
+        accounts = payload.get("profiles")
+        if not isinstance(accounts, list):
+            accounts = []
+        return any(
+            before_providers.get(str(item.get("id") or ""))
+            != str(item.get("provider") or "codex").lower()
+            for item in accounts
+            if isinstance(item, dict)
+            and str(item.get("id") or "") in before_providers
+        )
+
+    def _flush_provider_changing_settings_before_worker(
+        self,
+        prepared: dict[str, Any] | None,
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        if not isinstance(prepared, dict) or not self._prepared_settings_changes_provider(
+            prepared
+        ):
+            return True, None, prepared
+        ok, error, _provider_changed = self._apply_settings_update(
+            prepared,
+            update_ui=False,
+        )
+        return bool(ok), error, None if ok else prepared
 
     def _save_settings(self, *, reschedule_transient: bool = False) -> bool:
         if self._profile_settings_mutation_blocked():
@@ -1560,6 +1578,17 @@ class CodexUsageSettingsView:
             prepared = self._build_settings_update()
             if prepared is None:
                 return
+        ok, error, prepared = self._flush_provider_changing_settings_before_worker(
+            prepared
+        )
+        if not ok:
+            if prepared is not None:
+                self._schedule_captured_autosave_retry(prepared)
+            self._set_status(
+                f"프로필 추가 전 provider 변경사항을 저장하지 못했습니다: {error}",
+                level="error",
+            )
+            return
         mutation_id = "__add_profile__"
         self._profile_add_settings_changed = False
         self._profile_deletions_inflight.add(mutation_id)
@@ -1751,6 +1780,17 @@ class CodexUsageSettingsView:
             prepared = self._build_settings_update()
             if prepared is None:
                 return
+        ok, error, prepared = self._flush_provider_changing_settings_before_worker(
+            prepared
+        )
+        if not ok:
+            if prepared is not None:
+                self._schedule_captured_autosave_retry(prepared)
+            self._set_status(
+                f"프로필 삭제 전 provider 변경사항을 저장하지 못했습니다: {error}",
+                level="error",
+            )
+            return
         self._profile_deletions_inflight.add(normalized)
         self._set_status("프로필 삭제 중...", level="info")
 

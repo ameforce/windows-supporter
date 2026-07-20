@@ -434,6 +434,55 @@ class MainUiDashboardUnitTest(unittest.TestCase):
 
             self.assertEqual(pending_view.events[-1], ("finish", True, None))
 
+    def test_dashboard_provider_change_flushes_before_background_toggle(self):
+        ui_thread_id = threading.get_ident()
+
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin", threading.get_ident()))
+                return True, {"payload": "provider-dirty"}
+
+            def _flush_provider_changing_settings_before_worker(self, prepared):
+                self.events.append(("save", prepared, threading.get_ident()))
+                return True, None, None
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error, threading.get_ident()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = queue.Queue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin", ui_thread_id),
+                    ("save", {"payload": "provider-dirty"}, ui_thread_id),
+                ],
+            )
+            self.assertEqual(monitor.codex.toggle_calls, 0)
+            self.assertEqual(len(workers), 1)
+
+            workers[0]()
+
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertEqual(
+                [event[0] for event in pending_view.events],
+                ["begin", "save"],
+            )
+            ui._event_queue.get_nowait()()
+            self.assertEqual(pending_view.events[-1][:3], ("finish", True, None))
+
     def test_dashboard_ai_toggle_clears_external_mutation_when_worker_start_fails(self):
         class _PendingView:
             def __init__(self):

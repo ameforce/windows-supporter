@@ -526,6 +526,28 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertIn("force_terminate:command_timeout", driver.calls)
         session.shutdown()
 
+    def test_request_cancel_leaves_alive_idle_owner_for_normal_shutdown(self) -> None:
+        class _TerminableIdleDriver(FakeDriver):
+            def force_terminate(self, reason: str) -> bool:
+                self.calls.append(f"force_terminate:{reason}")
+                return True
+
+        driver = _TerminableIdleDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory)
+        self.assertIsNotNone(session.collect().probe)
+        self.assertIsNotNone(session._thread)
+        self.assertTrue(session._thread.is_alive())
+
+        cancel_result = session.request_cancel()
+
+        self.assertTrue(cancel_result)
+        self.assertFalse(session._worker_poisoned)
+        self.assertNotIn("force_terminate:command_timeout", driver.calls)
+        self.assertTrue(session.shutdown())
+        self.assertIn("shutdown", driver.calls)
+        self.assertTrue(session._thread is None or not session._thread.is_alive())
+
     def test_request_cancel_during_factory_start_never_dispatches_queued_collect(self) -> None:
         factory_started = threading.Event()
         release_factory = threading.Event()

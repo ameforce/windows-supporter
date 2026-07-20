@@ -1354,6 +1354,104 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(monitor.add_calls, ["codex"])
         self.assertEqual(events[-1], ("remount",))
 
+    def test_pending_provider_change_is_flushed_on_ui_before_add_worker(self) -> None:
+        ui_thread_id = threading.get_ident()
+        update_thread_ids = []
+        add_thread_ids = []
+
+        class _FakeMonitor:
+            def add_profile(self, _provider):
+                add_thread_ids.append(threading.get_ident())
+                return True, None, {"id": "profile_new"}
+
+        class _DeferredThread:
+            targets = []
+
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self.targets.append(self._target)
+
+        prepared = {
+            "payload": {
+                "profiles": [{"id": "account_1", "provider": "cursor"}],
+            },
+            "before_providers": {"account_1": "codex"},
+        }
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-add"
+        view._build_settings_update = lambda: prepared
+        view._apply_settings_update = lambda _prepared, update_ui=False: (
+            update_thread_ids.append(threading.get_ident()) or True,
+            None,
+            True,
+        )
+        view._set_status = lambda *_args, **_kwargs: None
+        view._remount = lambda: None
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _DeferredThread):
+            view._on_add_profile()
+
+        self.assertEqual(update_thread_ids, [ui_thread_id])
+        self.assertEqual(add_thread_ids, [ui_thread_id])
+        self.assertEqual(_DeferredThread.targets, [])
+
+    def test_pending_provider_change_is_flushed_on_ui_before_delete_worker(self) -> None:
+        ui_thread_id = threading.get_ident()
+        update_thread_ids = []
+        delete_thread_ids = []
+
+        class _FakeMonitor:
+            def delete_profile(self, _profile_id, confirmed=False):
+                self.confirmed = confirmed
+                delete_thread_ids.append(threading.get_ident())
+                return True, None
+
+        class _DeferredThread:
+            targets = []
+
+            def __init__(self, target=None, daemon=None):
+                _ = daemon
+                self._target = target
+
+            def start(self):
+                self.targets.append(self._target)
+
+        prepared = {
+            "payload": {
+                "profiles": [{"id": "account_1", "provider": "cursor"}],
+            },
+            "before_providers": {"account_1": "codex"},
+        }
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-delete"
+        view._build_settings_update = lambda: prepared
+        view._apply_settings_update = lambda _prepared, update_ui=False: (
+            update_thread_ids.append(threading.get_ident()) or True,
+            None,
+            True,
+        )
+        view._set_status = lambda *_args, **_kwargs: None
+
+        with patch("src.apps.codex_usage_ui.threading.Thread", _DeferredThread):
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                view._on_delete_profile("account_1", "Codex 1")
+
+        self.assertEqual(update_thread_ids, [ui_thread_id])
+        self.assertEqual(delete_thread_ids, [])
+        self.assertEqual(len(_DeferredThread.targets), 1)
+        worker = threading.Thread(target=_DeferredThread.targets[0])
+        worker.start()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(update_thread_ids, [ui_thread_id])
+        self.assertEqual(len(delete_thread_ids), 1)
+        self.assertNotEqual(delete_thread_ids[0], ui_thread_id)
+
     def test_add_profile_creator_runs_on_the_tk_thread_after_worker_save(self) -> None:
         ui_thread_id = threading.get_ident()
         creator_thread_ids = []

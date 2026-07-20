@@ -702,6 +702,51 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
             self.assertEqual(original.shutdown_calls, 0)
 
+    def test_attached_provider_switch_from_worker_is_rejected_before_attach(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui_thread_id = threading.get_ident()
+            children = []
+
+            class _ThreadRecordingChild(_FakeChildMonitor):
+                def __init__(self, config_dir, profile_dir):
+                    super().__init__(config_dir, profile_dir)
+                    self.attach_thread_ids = []
+
+                def attach(self, root, event_queue=None, start_monitor=True):
+                    self.attach_thread_ids.append(threading.get_ident())
+                    return super().attach(root, event_queue, start_monitor=start_monitor)
+
+            def factory(config_dir, profile_dir):
+                child = _ThreadRecordingChild(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            original = manager._CodexUsageMultiMonitor__children["account_1"]
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["provider"] = "cursor"
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(manager.update_settings({"profiles": profiles}))
+            )
+            worker.start()
+            worker.join(1.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, [(False, "settings_ui_thread_required")])
+            self.assertIs(manager._CodexUsageMultiMonitor__children["account_1"], original)
+            self.assertEqual(original.attach_thread_ids, [ui_thread_id])
+            self.assertEqual(len(children), 2)
+
+            self.assertEqual(manager.update_settings({"profiles": profiles}), (True, None))
+            replacement = manager._CodexUsageMultiMonitor__children["account_1"]
+            self.assertEqual(replacement.attach_thread_ids, [ui_thread_id])
+
     def test_multi_provider_factory_failure_keeps_every_original_child_live(self):
         with tempfile.TemporaryDirectory() as tmp:
             factory_calls = 0
@@ -2772,6 +2817,133 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             active_child = manager._CodexUsageMultiMonitor__children[profile_id]
             self.assertEqual(active_child.shutdown_calls, 0)
             self.assertGreater(len(children), 4)
+
+    def test_delete_rollback_restores_child_on_attached_ui_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui_thread_id = threading.get_ident()
+            children = []
+
+            class _ThreadRecordingChild(_FakeChildMonitor):
+                def __init__(self, config_dir, profile_dir):
+                    super().__init__(config_dir, profile_dir)
+                    self.attach_thread_ids = []
+
+                def attach(self, root, event_queue=None, start_monitor=True):
+                    self.attach_thread_ids.append(threading.get_ident())
+                    return super().attach(root, event_queue, start_monitor=start_monitor)
+
+            def factory(config_dir, profile_dir):
+                child = _ThreadRecordingChild(config_dir, profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            ui_queue = queue.Queue()
+            manager.attach(_FakeRoot(), ui_queue)
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            owned_paths = (created["config_dir"], created["profile_dir"])
+            for path in owned_paths:
+                os.makedirs(path, exist_ok=True)
+
+            real_replace = os.replace
+            move_count = 0
+
+            def fail_second_profile_move(source, target):
+                nonlocal move_count
+                if ".delete-" in str(target):
+                    move_count += 1
+                    if move_count == 2:
+                        raise PermissionError("locked")
+                return real_replace(source, target)
+
+            result = []
+            worker_thread_id = []
+
+            def delete_profile():
+                worker_thread_id.append(threading.get_ident())
+                with patch(
+                    "src.apps.codex_usage_multi_monitor.os.replace",
+                    side_effect=fail_second_profile_move,
+                ):
+                    result.append(manager.delete_profile(profile_id, confirmed=True))
+
+            worker = threading.Thread(target=delete_profile)
+            worker.start()
+            worker.join(2.0)
+            self.assertFalse(worker.is_alive())
+            while not ui_queue.empty():
+                ui_queue.get_nowait()()
+
+            self.assertEqual(result, [(False, "profile_delete_failed")])
+            replacement = manager._CodexUsageMultiMonitor__children[profile_id]
+            self.assertEqual(replacement.attach_thread_ids, [ui_thread_id])
+            self.assertNotIn(worker_thread_id[0], replacement.attach_thread_ids)
+            for path in owned_paths:
+                self.assertTrue(os.path.isdir(path), path)
+
+    def test_delete_rollback_ui_queue_failure_keeps_recovery_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            class _FailingQueue:
+                def put(self, _callback):
+                    raise RuntimeError("UI queue unavailable")
+
+            manager, _children = self._build_manager(tmp)
+            manager.attach(_FakeRoot(), queue.Queue())
+            ok, error, created = manager.add_profile("codex")
+            self.assertTrue(ok, error)
+            profile_id = created["id"]
+            owned_paths = (created["config_dir"], created["profile_dir"])
+            for path in owned_paths:
+                os.makedirs(path, exist_ok=True)
+            manager._CodexUsageMultiMonitor__event_queue = _FailingQueue()
+
+            real_replace = os.replace
+            move_count = 0
+
+            def fail_second_profile_move(source, target):
+                nonlocal move_count
+                if ".delete-" in str(target):
+                    move_count += 1
+                    if move_count == 2:
+                        raise PermissionError("locked")
+                return real_replace(source, target)
+
+            result = []
+
+            def delete_profile():
+                with patch(
+                    "src.apps.codex_usage_multi_monitor.os.replace",
+                    side_effect=fail_second_profile_move,
+                ):
+                    result.append(manager.delete_profile(profile_id, confirmed=True))
+
+            worker = threading.Thread(target=delete_profile)
+            worker.start()
+            worker.join(2.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, [(False, "profile_delete_failed")])
+            self.assertIsInstance(
+                manager._CodexUsageMultiMonitor__children[profile_id],
+                _RecoveryPendingChild,
+            )
+            runtime = next(
+                item
+                for item in manager.get_runtime_status()["profiles"]
+                if item["id"] == profile_id
+            )
+            self.assertEqual(runtime["runtime"]["monitor_state"], "recovery_pending")
+            self.assertTrue(
+                os.path.isfile(
+                    os.path.join(tmp, "config", "ai_usage_settings_recovery.json")
+                )
+            )
 
     def test_delete_profile_rollback_failure_is_journaled_and_restored_on_restart(self):
         with tempfile.TemporaryDirectory() as tmp:

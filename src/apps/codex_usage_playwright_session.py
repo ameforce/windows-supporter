@@ -215,6 +215,8 @@ class CodexUsagePlaywrightSession:
             collect_inflight = bool(self._collect_calls_inflight)
             if thread is None or not thread.is_alive():
                 return not collect_inflight
+            if not collect_inflight:
+                return True
             queue = self._queue
             driver = self._driver
             self._worker_poisoned = True
