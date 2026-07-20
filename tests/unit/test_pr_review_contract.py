@@ -60,10 +60,15 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertNotIn("review_evidence_digest", template)
         self.assertNotIn("`<URL> / review `", template)
 
-    def test_agents_contract_requires_two_exact_head_reviews(self) -> None:
+    def test_agents_contract_requires_complete_head_before_parallel_final_reviews(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
         for required_text in (
+            "완성된 head",
+            "RCA, red test, 구현, 인접 경로",
+            "관련 테스트, 전체 테스트, build",
+            "자체 diff",
+            "base 안정",
             "@codex review",
             "chatgpt-codex-connector",
             "review object의 `commit_id`",
@@ -71,6 +76,16 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "`Reviewed commit` prefix",
             "base ref, 최신 base SHA와 head SHA",
             "native Codex subagent",
+            "`gpt-5.6-sol`",
+            "reasoning `high`",
+            "동시에 시작",
+            "결과를 격리",
+            "둘 다 terminal",
+            "head를 바꾸지 않는다",
+            "review key",
+            "중복 요청",
+            "connector가 명시적 오류",
+            "같은 key로 1회 재시도",
             "P0/P1/P2/P3",
             "unresolved 0",
             "stale",
@@ -89,7 +104,7 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertNotIn("reviewer_source", contract)
         self.assertNotIn("merge-live", contract)
 
-    def test_agents_contract_blocks_p2_and_requires_p3_disposition(self) -> None:
+    def test_agents_contract_requires_finding_rca_and_keeps_p3_advisory(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         template = (REPO_ROOT / ".github" / "pull_request_template.md").read_text(
             encoding="utf-8"
@@ -98,35 +113,45 @@ class PullRequestReviewContractTest(unittest.TestCase):
         for required_text in (
             "P0/P1/P2 중 하나라도 존재하면 병합을 차단",
             "병합 조건은 `P0=0, P1=0, P2=0`",
-            "P3는 병합 비차단",
-            "국소적·가역적·탐지 가능",
+            "실제 재현 또는 직접 증거",
+            "직접 원인과 구조적 원인",
+            "영향과 인접 실패 경로",
+            "red test 또는 동등한 증거",
+            "원인 경계의 최소 완전 수정",
+            "불변조건, 실패 모드, side effect",
+            "지적된 줄만 고치",
+            "main Codex가 새 head를 완성됐다고 판정",
+            "P3는 순수 권고이며 병합을 차단하지 않는다",
+            "처분, owner, 만료일 또는 후속 이슈를 요구하지 않는다",
             "데이터·설정 무결성",
-            "보안·개인정보·인증",
+            "보안·인증",
+            "개인정보",
             "공개 호환성",
             "삭제·업데이트·릴리스 무결성",
-            "전역 상태 침묵 오류",
-            "애매하면 P2",
-            "작성자 단독으로 하향",
-            "상위 등급",
-            "P3 처분",
-            "P3 처분을 모두 stale",
-            "merge 직전에도 유효한 미래 만료일",
-            "만료된 위험수용은 stale·미완료",
-            "P3 처분 완료",
+            "영향 불확실성",
+            "최소 P2",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, contract)
 
         for required_text in (
             "P0=0, P1=0, P2=0",
-            "P3 처분",
-            "수정/기각/위험수용/후속 이슈",
-            "merge 시점에도 유효한 미래 만료일",
-            "만료된 위험수용은 stale·미완료",
+            "P3는 순수 권고·비차단",
+            "connector 명시 오류일 때만 같은 key 1회 재시도",
             "unresolved review thread: `0`",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, template)
+
+        for removed_text in (
+            "P3 처분",
+            "위험수용",
+            "미래 만료일",
+            "milestone",
+        ):
+            with self.subTest(removed_text=removed_text):
+                self.assertNotIn(removed_text, contract)
+                self.assertNotIn(removed_text, template)
 
     def test_agents_contract_requires_intent_based_hotfix_classification(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -143,12 +168,21 @@ class PullRequestReviewContractTest(unittest.TestCase):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, contract)
 
-    def test_review_gate_rca_matches_p3_expiry_contract(self) -> None:
-        policy = (REPO_ROOT / "docs" / "hotfix-v0.8.4-review-gate-policy.md").read_text(
+    def test_review_gate_rca_documents_raw_finding_outcomes(self) -> None:
+        policy = (REPO_ROOT / "docs" / "hotfix-v0.8.5-review-policy.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("merge 시점에도 유효한 미래 만료일", policy)
-        self.assertIn("만료된 위험수용은 stale·미완료", policy)
+        for required_text in (
+            "증상 줄만 고치는 patch는 거부",
+            "근본 원인 수정은 수용",
+            "무효 finding은 직접 반증",
+            "P3 미수정은 허용",
+            "미완성 head에는 final review를 요청하지 않는다",
+            "두 final review를 동시에 시작",
+            "동일 review key를 중복 사용하지 않는다",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, policy)
 
 
 if __name__ == "__main__":
