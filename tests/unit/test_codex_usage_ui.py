@@ -1390,6 +1390,55 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         posted[0]()
         self.assertEqual(creator_thread_ids, [ui_thread_id])
 
+    def test_add_profile_queue_failure_reconciles_creator_exactly_once_on_tk_tick(self) -> None:
+        ui_thread_id = threading.get_ident()
+        creator_thread_ids = []
+        worker_finished = threading.Event()
+
+        class _FakeMonitor:
+            def add_profile(self, _provider):
+                creator_thread_ids.append(threading.get_ident())
+                return True, None, {"id": "profile_new"}
+
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=_FakeMonitor(),
+            ui_post=lambda _fn: False,
+        )
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-add"
+        view._build_settings_update = lambda: {"payload": "dirty"}
+        view._apply_settings_update = lambda _prepared, update_ui=False: (
+            worker_finished.set() or True,
+            None,
+            False,
+        )
+        view._set_status = lambda *_args, **_kwargs: None
+        remounts = []
+        captured_retries = []
+        view._remount = lambda: remounts.append(True)
+        view._schedule_captured_autosave_retry = (
+            lambda prepared: captured_retries.append(prepared)
+        )
+
+        view._on_add_profile()
+
+        self.assertTrue(worker_finished.wait(1.0))
+        self.assertEqual(creator_thread_ids, [])
+        self.assertIn("__add_profile__", view._profile_deletions_inflight)
+        view._schedule_autosave()
+        view._on_add_profile()
+        self.assertEqual(creator_thread_ids, [])
+
+        self.assertTrue(view._reconcile_pending_profile_add_result())
+        self.assertEqual(creator_thread_ids, [ui_thread_id])
+        self.assertEqual(remounts, [True])
+        self.assertEqual(captured_retries, [{"payload": "dirty"}])
+        self.assertNotIn("__add_profile__", view._profile_deletions_inflight)
+
+        self.assertFalse(view._reconcile_pending_profile_add_result())
+        self.assertEqual(creator_thread_ids, [ui_thread_id])
+
     def test_save_includes_taskbar_overlay_toggle(self) -> None:
         class _FakeMonitor:
             def __init__(self):

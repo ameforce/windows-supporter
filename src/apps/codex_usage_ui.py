@@ -64,6 +64,9 @@ class CodexUsageSettingsView:
             str | None,
             dict[str, Any] | None,
         ] | None = None
+        self._profile_add_result_lock = threading.Lock()
+        self._pending_profile_add_result: tuple[bool, str | None, bool] | None = None
+        self._profile_add_settings_changed = False
         self._loading_settings = False
         self._runtime_after_id = None
         self._collect_state_var = None
@@ -1354,6 +1357,8 @@ class CodexUsageSettingsView:
         if bool(self._loading_settings):
             return
         if self._profile_settings_mutation_blocked():
+            if "__add_profile__" in self._profile_deletions_inflight:
+                self._profile_add_settings_changed = True
             return
         self._cancel_pending_autosave()
         win = self._win
@@ -1556,37 +1561,12 @@ class CodexUsageSettingsView:
             if prepared is None:
                 return
         mutation_id = "__add_profile__"
+        self._profile_add_settings_changed = False
         self._profile_deletions_inflight.add(mutation_id)
         self._set_status("프로필 추가 중...", level="info")
 
-        def finish_on_ui(
-            save_ok: bool,
-            save_error: str | None,
-            save_failed: bool,
-        ) -> None:
-            ok = bool(save_ok)
-            error = save_error
-            if ok:
-                try:
-                    ok, error, _profile = creator("codex")
-                except Exception as exc:
-                    ok = False
-                    error = str(exc)
-            self._profile_deletions_inflight.discard(mutation_id)
-            self._preserve_status_after_next_autosave = False
-            if not ok:
-                if save_failed:
-                    self._schedule_autosave()
-                else:
-                    self._remount()
-                self._set_status(f"프로필 추가 실패: {error}", level="error")
-                return
-            self._remount()
-            self._set_status("프로필을 추가했습니다.", level="ok")
-            return
-
         if prepared is None:
-            finish_on_ui(True, None, False)
+            self._finish_profile_add_on_ui(True, None, False)
             return
 
         def worker() -> None:
@@ -1594,8 +1574,10 @@ class CodexUsageSettingsView:
                 prepared,
                 update_ui=False,
             )
-            if not self._post_ui(lambda: finish_on_ui(ok, error, not ok)):
-                self._profile_deletions_inflight.discard(mutation_id)
+            if not self._post_ui(
+                lambda: self._finish_profile_add_on_ui(ok, error, not ok)
+            ):
+                self._record_pending_profile_add_result(ok, error, not ok)
             return
 
         try:
@@ -1910,6 +1892,79 @@ class CodexUsageSettingsView:
         self._profile_deletions_inflight.discard("__external_settings__")
         self._preserve_status_after_next_autosave = False
         return
+
+    def _finish_profile_add_on_ui(
+        self,
+        save_ok: bool,
+        save_error: str | None,
+        save_failed: bool,
+    ) -> bool:
+        creator = getattr(self._codex, "add_profile", None)
+        ok = bool(save_ok and callable(creator))
+        error = save_error if callable(creator) else "profile_add_unavailable"
+        if ok:
+            try:
+                ok, error, _profile = creator("codex")
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+        settings_changed = bool(self._profile_add_settings_changed)
+        self._profile_add_settings_changed = False
+        retry_prepared = None
+        if settings_changed and not save_failed:
+            retry_prepared = self._build_settings_update()
+        retry_capture_failed = bool(settings_changed and retry_prepared is None)
+        self._profile_deletions_inflight.discard("__add_profile__")
+        self._preserve_status_after_next_autosave = False
+        if not ok:
+            if save_failed:
+                self._schedule_autosave()
+                self._set_status(f"프로필 추가 실패: {error}", level="error")
+                return False
+            self._remount()
+            if retry_prepared is not None:
+                self._schedule_captured_autosave_retry(retry_prepared)
+            if retry_capture_failed:
+                self._set_status(
+                    "프로필 추가 실패 후 보류된 설정을 저장하지 못했습니다.",
+                    level="error",
+                )
+                return True
+            self._set_status(f"프로필 추가 실패: {error}", level="error")
+            return True
+        self._remount()
+        if retry_prepared is not None:
+            self._schedule_captured_autosave_retry(retry_prepared)
+        if retry_capture_failed:
+            self._set_status(
+                "프로필은 추가했지만 보류된 설정을 저장하지 못했습니다.",
+                level="error",
+            )
+            return True
+        self._set_status("프로필을 추가했습니다.", level="ok")
+        return True
+
+    def _record_pending_profile_add_result(
+        self,
+        save_ok: bool,
+        save_error: str | None,
+        save_failed: bool,
+    ) -> None:
+        with self._profile_add_result_lock:
+            self._pending_profile_add_result = (
+                bool(save_ok),
+                str(save_error) if save_error is not None else None,
+                bool(save_failed),
+            )
+        return
+
+    def _reconcile_pending_profile_add_result(self) -> bool:
+        with self._profile_add_result_lock:
+            result = self._pending_profile_add_result
+            self._pending_profile_add_result = None
+        if result is None:
+            return False
+        return self._finish_profile_add_on_ui(*result)
 
     def _record_external_settings_result_without_ui(
         self,
@@ -2445,6 +2500,8 @@ class CodexUsageSettingsView:
     def _refresh_runtime_status(self) -> None:
         win = self._win
         if win is None:
+            return
+        if self._reconcile_pending_profile_add_result():
             return
         if self._reconcile_external_settings_result():
             return
