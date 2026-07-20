@@ -30,6 +30,19 @@ v0.8.0의 provider 일반화가 저장 모델, 수집 생명주기, 표시 메�
 | #11 provider 전환 잔상 | 합리적 | provider 변경 후 UI를 remount하지 않았고 구 label payload가 기본 label 교체를 되돌렸다. | child runtime, snapshot, label, metric UI 교체가 원자적이지 않았다. | provider switch가 child monitor/runtime/snapshot/label/metric UI를 함께 교체하고 실패 시 rollback하며 custom label은 보존한다. | v0.8.4에서 종료 가능 |
 | #12 집계 | 합리적 | 위 결함들의 공통 추적 이슈다. | v0.8.0 AI 사용량 일반화의 미완성 경계를 한곳에서 추적할 필요가 있다. | #3~#11 결과와 v0.8.4 검증을 집계한다. | #7 실환경 RCA가 남아 열린 상태 유지 |
 
+## 이슈별 증거와 closure 한계
+
+- #3: auto/custom label 및 provider round-trip **fixture/unit test**로 경로를 증명했다. 실제 Cursor 계정의 안정적 profile_name 수집은 자격 증명 부재로 미검증이므로 이슈 댓글에는 그 한계를 남기고 release 후 실계정 확인 전 닫지 않는다.
+- #4: 빈 metric fixture와 manager/UI/taskbar **red test**로 실제 값 없는 5H 행의 비생성을 증명했다. 실제 Codex 페이지의 모든 변형은 미검증이다.
+- #5: 한국어·ISO·date/datetime reset **unit fixture**로 provider-boundary 정규화와 표시 정밀도를 증명했다. 실제 provider 응답의 미지 포맷은 release 후 관찰 대상이다.
+- #6: `on_demand_enabled=false` fixture와 taskbar **contract test**로 OD 비생성을 증명했다. 실제 Cursor 계정 capability 응답은 미검증이다.
+- #7: typed error/cache/retry/global queue **unit·race test**는 수정했지만 최초 실환경 DOM/recycle 트리거는 관측하지 못했다. 따라서 열어 둔다.
+- #8: 긴 금액 fixture와 taskbar compact rendering **test**로 겹침 방지 경로를 증명했다. 실제 Windows taskbar 폭/DPI는 물리 검증 한계다.
+- #9: native Tk 0/1/3/10 profile × 100/125/150% scaling capture 및 mouse wheel/keyboard test가 있다. 물리 이종-DPI·OS work area는 미검증이다.
+- #10: v3→v4, 0/1/3/20, legacy ID/path/order, add/delete/reorder, third selection rejection **migration·manager/UI test**로 증명했다. 실제 장기 사용자 설정의 모든 변형은 backup/rollback 관찰 대상이다.
+- #11: provider round-trip, snapshot/label/metric remount, shutdown-failure recovery-pending **unit test**로 증명했다. 실제 provider 로그인 전환은 자격 증명 부재로 미검증이다.
+- #12: 위 증거와 한계를 집계하며 #7 및 실계정·물리 DPI 한계가 남아 있으므로 열어 둔다.
+
 ## 데이터 및 삭제 안전성
 
 - v4가 canonical settings/state이며 기존 v3/v2 파일은 rollback 자료로 보존한다.
@@ -68,7 +81,7 @@ v0.8.0의 provider 일반화가 저장 모델, 수집 생명주기, 표시 메�
 - 런타임: cached success→transient error→recovery, auth, profile-in-use, retry exhaustion, global serial collection, 삭제/provider switch race, batch 예외 격리.
 - UI: 1/3/10 mixed profiles, 긴 한국어·영문 이름, 작은 창, 100/125/150% Tk scaling, keyboard/mouse wheel scroll, taskbar 선택 정확히 2개.
 
-최종 task PR 후보 `40f71fd785036a571713c643bb907f6a255a7bac` 기준 전체 unittest 917건과 UI/multi-manager 관련 177건이 통과했다. release/reconnect/lifecycle 경계 4개 테스트는 100회 반복에서도 모두 통과했다. 독립 exact-head 리뷰는 실제 Codex/Cursor monitor에 fake browser를 주입해 release 뒤 terminal cancel 0회, `close_session` 1회, 재연결 `open_login` 성공과 기존 callback lock inversion 해소를 확인했고 `P0/P1/P2/P3 = 0/0/0/0`으로 판정했다. Native Tk 시각 검증은 7개 시나리오를 캡처해 수동 확인했고 mouse wheel, keyboard End, manual query/taskbar toggle interaction도 통과했다. exact-head `cmd /c build.bat`는 PyInstaller archive, frozen worker, 승격 후 worker, post-build launch를 모두 통과했으며 EXE SHA256은 `052FC3CBE1BCCB54C213DF7F8A383DB4168F3857DE2ADA83B5CF076ADA8E0B37`이다. 이 수치는 task PR의 base/head가 바뀌면 stale로 취급하고 같은 exact pair에서 다시 확인한다.
+`40f71fd785036a571713c643bb907f6a255a7bac`의 917-test/build/capture 수치는 **초기 task PR의 역사적 증거**일 뿐, 현재 hotfix tip 또는 release closure 증거가 아니다. 현재 release 전 final evidence는 모든 task PR merge 뒤 hotfix exact tip에서 새로 실행해 기록한다. task PR base/head가 바뀌면 해당 PR의 review·test·build·visual 증거는 stale이며 같은 exact pair에서 다시 확인한다.
 
 ## 검증 한계
 
