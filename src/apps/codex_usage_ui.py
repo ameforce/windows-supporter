@@ -1559,38 +1559,42 @@ class CodexUsageSettingsView:
         self._profile_deletions_inflight.add(mutation_id)
         self._set_status("프로필 추가 중...", level="info")
 
-        def worker() -> None:
-            ok = True
-            error = None
-            save_failed = False
-            if prepared is not None:
-                ok, error, _provider_changed = self._apply_settings_update(
-                    prepared,
-                    update_ui=False,
-                )
-                save_failed = not ok
+        def finish_on_ui(
+            save_ok: bool,
+            save_error: str | None,
+            save_failed: bool,
+        ) -> None:
+            ok = bool(save_ok)
+            error = save_error
             if ok:
                 try:
                     ok, error, _profile = creator("codex")
                 except Exception as exc:
                     ok = False
                     error = str(exc)
-
-            def done() -> None:
-                self._profile_deletions_inflight.discard(mutation_id)
-                self._preserve_status_after_next_autosave = False
-                if not ok:
-                    if save_failed:
-                        self._schedule_autosave()
-                    else:
-                        self._remount()
-                    self._set_status(f"프로필 추가 실패: {error}", level="error")
-                    return
-                self._remount()
-                self._set_status("프로필을 추가했습니다.", level="ok")
+            self._profile_deletions_inflight.discard(mutation_id)
+            self._preserve_status_after_next_autosave = False
+            if not ok:
+                if save_failed:
+                    self._schedule_autosave()
+                else:
+                    self._remount()
+                self._set_status(f"프로필 추가 실패: {error}", level="error")
                 return
+            self._remount()
+            self._set_status("프로필을 추가했습니다.", level="ok")
+            return
 
-            if not self._post_ui(done):
+        if prepared is None:
+            finish_on_ui(True, None, False)
+            return
+
+        def worker() -> None:
+            ok, error, _provider_changed = self._apply_settings_update(
+                prepared,
+                update_ui=False,
+            )
+            if not self._post_ui(lambda: finish_on_ui(ok, error, not ok)):
                 self._profile_deletions_inflight.discard(mutation_id)
             return
 

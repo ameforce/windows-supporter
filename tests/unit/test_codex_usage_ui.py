@@ -1320,7 +1320,12 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                 self.targets.append(self._target)
 
         monitor = _FakeMonitor()
-        view = CodexUsageSettingsView(root=None, codex_monitor=monitor, ui_post=lambda fn: fn())
+        posted = []
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=monitor,
+            ui_post=lambda fn: posted.append(fn) or True,
+        )
         view._win = _FakeWidget()
         view._autosave_after_id = "after-add"
         events = []
@@ -1343,8 +1348,47 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         _DeferredThread.targets[0]()
 
         self.assertEqual(events[0], ("save", {"payload": "dirty"}, False))
+        self.assertEqual(monitor.add_calls, [])
+        self.assertEqual(len(posted), 1)
+        posted[0]()
         self.assertEqual(monitor.add_calls, ["codex"])
         self.assertEqual(events[-1], ("remount",))
+
+    def test_add_profile_creator_runs_on_the_tk_thread_after_worker_save(self) -> None:
+        ui_thread_id = threading.get_ident()
+        creator_thread_ids = []
+        posted = []
+
+        class _FakeMonitor:
+            def add_profile(self, _provider):
+                creator_thread_ids.append(threading.get_ident())
+                return True, None, {"id": "profile_new"}
+
+        view = CodexUsageSettingsView(
+            root=None,
+            codex_monitor=_FakeMonitor(),
+            ui_post=lambda fn: posted.append(fn) or True,
+        )
+        view._win = _FakeWidget()
+        view._autosave_after_id = "after-add"
+        view._build_settings_update = lambda: {"payload": "dirty"}
+        view._apply_settings_update = lambda _prepared, update_ui=False: (
+            True,
+            None,
+            False,
+        )
+        view._set_status = lambda *_args, **_kwargs: None
+        view._remount = lambda: None
+
+        view._on_add_profile()
+        deadline = time.monotonic() + 1.0
+        while not posted and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertTrue(posted)
+        self.assertEqual(creator_thread_ids, [])
+        posted[0]()
+        self.assertEqual(creator_thread_ids, [ui_thread_id])
 
     def test_save_includes_taskbar_overlay_toggle(self) -> None:
         class _FakeMonitor:
