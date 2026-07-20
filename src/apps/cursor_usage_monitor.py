@@ -133,7 +133,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
   ).slice(0, 4).join(' ');
   const collectProfileName = () => {
     const identityCue = /(profile|account|프로필|계정|avatar|user)/i;
-    const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu)$/i;
+    const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴)$/i;
     const selectors = [
       '[data-testid*="profile" i]',
       '[data-testid*="account" i]',
@@ -155,17 +155,15 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         const testId = node.getAttribute ? node.getAttribute('data-testid') : '';
         const nodeIdentity = clean([testId, ariaLabel, title].join(' ')).toLowerCase();
         const hasCue = identityCue.test(nodeIdentity);
-        // Broad menu buttons without identity cues may still expose the display
-        // name as aria-label/title, but must not fall through to random innerText.
-        const rawCandidates = (broadMenu && !hasCue)
-          ? [ariaLabel, title]
-          : [ariaLabel, title, node.innerText || node.textContent || ''];
-        if (broadMenu && !hasCue && !clean(ariaLabel) && !clean(title)) {
+        // Uncued header/nav menus (notifications, language, workspace, ...) must
+        // not be harvested as profile identity; only identity-cued nodes qualify.
+        if (broadMenu && !hasCue) {
           continue;
         }
         if (!broadMenu && nodeIdentity && !hasCue) {
           continue;
         }
+        const rawCandidates = [ariaLabel, title, node.innerText || node.textContent || ''];
         for (const raw of rawCandidates) {
           const candidate = clean(raw);
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;

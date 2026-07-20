@@ -761,9 +761,18 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             "View account",
             "Open account menu",
             "Open profile",
+            "내 계정",
+            "나의 계정",
+            "내 프로필",
         ):
             with self.subTest(value=value):
                 self.assertEqual(sanitize_profile_name(value), "")
+
+    def test_sanitize_profile_name_keeps_name_after_account_menu_prefix(self) -> None:
+        # Full chrome prefix must strip so the display name remains.
+        self.assertEqual(sanitize_profile_name("Account menu: Alice"), "Alice")
+        self.assertEqual(sanitize_profile_name("Account menu: Daeng"), "Daeng")
+        self.assertEqual(sanitize_profile_name("Profile menu - Daeng"), "Daeng")
 
     def test_sanitize_profile_name_keeps_real_profile_name(self) -> None:
         self.assertEqual(sanitize_profile_name("Profile: Daeng"), "Daeng")

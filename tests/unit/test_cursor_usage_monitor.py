@@ -895,6 +895,11 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertIn("broadmenu", lowered)
         self.assertIn(r"(?:account|profile|user)\s+menu", lowered)
         self.assertIn(r"(?:my|your|edit|switch|view|open)\s+(?:account|profile)", lowered)
+        # Uncued header menus must be skipped; only identity-cued nodes harvest names.
+        self.assertRegex(
+            CURSOR_USAGE_PAGE_PROBE_SCRIPT,
+            r"if\s*\(\s*broadMenu\s*&&\s*!hasCue\s*\)\s*\{\s*continue\s*;",
+        )
         self.assertNotIn("document.cookie", lowered)
         self.assertNotIn("localstorage", lowered)
         self.assertNotIn("fetch(", lowered)
