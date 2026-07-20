@@ -721,8 +721,17 @@ class WindowsSupporterMainUI:
                 self._refresh_dashboard_status()
                 return
 
-            if not self._ui_post(done) and threading.current_thread() is threading.main_thread():
-                done()
+            if not self._ui_post(done):
+                if threading.current_thread() is threading.main_thread():
+                    done()
+                elif view_mutation_started and settings_view is not None:
+                    release_mutation = getattr(
+                        settings_view,
+                        "_release_external_settings_mutation_without_ui",
+                        None,
+                    )
+                    if callable(release_mutation):
+                        release_mutation()
             return
 
         worker_started = self._run_bg(task)

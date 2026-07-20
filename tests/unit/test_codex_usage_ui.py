@@ -212,6 +212,16 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertFalse(view._post_ui(lambda: None))
 
+    def test_external_mutation_state_only_release_does_not_touch_tk(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._profile_deletions_inflight.add("__external_settings__")
+        view._preserve_status_after_next_autosave = True
+
+        view._release_external_settings_mutation_without_ui()
+
+        self.assertNotIn("__external_settings__", view._profile_deletions_inflight)
+        self.assertFalse(view._preserve_status_after_next_autosave)
+
     def test_metric_presence_hides_unreported_codex_five_hour_and_disabled_cursor_od(self) -> None:
         fake_tk = _FakeTk()
         view = CodexUsageSettingsView(root=None, codex_monitor=None)

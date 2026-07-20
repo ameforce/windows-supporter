@@ -2,6 +2,7 @@ import json
 import os
 import queue
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -465,6 +466,54 @@ class MainUiDashboardUnitTest(unittest.TestCase):
                     ("begin",),
                     ("finish", False, "background_worker_start_failed"),
                     ("resume_autosave",),
+                ],
+            )
+
+    def test_dashboard_ai_toggle_releases_external_mutation_when_ui_queue_fails(self):
+        class _FailingQueue:
+            def put(self, _callback):
+                raise RuntimeError("UI queue unavailable")
+
+        class _PendingView:
+            def __init__(self):
+                self.events = []
+
+            def _begin_external_settings_mutation(self):
+                self.events.append(("begin",))
+                return True, {"payload": "dirty"}
+
+            def _apply_settings_update(self, prepared, update_ui=False):
+                self.events.append(("save", prepared, update_ui))
+                return True, None, False
+
+            def _finish_external_settings_mutation(self, ok, error):
+                self.events.append(("finish", ok, error))
+
+            def _release_external_settings_mutation_without_ui(self):
+                self.events.append(("release_without_ui",))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, _, _, monitor, _ = self._build_ui(path)
+            pending_view = _PendingView()
+            ui._ai_usage_view = pending_view
+            ui._event_queue = _FailingQueue()
+            workers = []
+            ui._run_bg = lambda fn: workers.append(fn)
+
+            ui._dashboard_ai_usage_toggle_enabled()
+            worker = threading.Thread(target=workers[0])
+            worker.start()
+            worker.join(1.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(monitor.codex.toggle_calls, 1)
+            self.assertEqual(
+                pending_view.events,
+                [
+                    ("begin",),
+                    ("save", {"payload": "dirty"}, False),
+                    ("release_without_ui",),
                 ],
             )
 

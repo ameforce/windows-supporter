@@ -1885,6 +1885,12 @@ class CodexUsageSettingsView:
         self._set_status(f"설정 변경 실패: {error}", level="error")
         return
 
+    def _release_external_settings_mutation_without_ui(self) -> None:
+        """Release the state-only guard when the UI callback queue is unavailable."""
+        self._profile_deletions_inflight.discard("__external_settings__")
+        self._preserve_status_after_next_autosave = False
+        return
+
     def _resume_pending_autosave_after_external_failure(self) -> None:
         self._preserve_status_after_next_autosave = True
         self._schedule_autosave()
