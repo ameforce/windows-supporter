@@ -184,6 +184,39 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertFalse(report["git_worktree_clean"])
 
+    def test_capture_report_fails_closed_when_provenance_changes_mid_capture(self) -> None:
+        harness = _load_harness_module()
+
+        def fake_capture(fixture, output_dir, *, settle_ms):
+            screenshot = output_dir / fixture["screenshot_name"]
+            screenshot.write_bytes(b"fixture")
+            return {
+                "ok": True,
+                "scenario": fixture["name"],
+                "phase": fixture["phase"],
+                "screenshot": screenshot.name,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "ai-usage-native"
+            with (
+                mock.patch.object(
+                    harness,
+                    "capture_provenance",
+                    side_effect=[
+                        {"git_sha": "d" * 40, "worktree_clean": True},
+                        {"git_sha": "e" * 40, "worktree_clean": True},
+                    ],
+                ),
+                mock.patch.object(harness, "_enable_per_monitor_dpi_awareness", return_value="test"),
+                mock.patch.object(harness, "capture_scenario", side_effect=fake_capture),
+            ):
+                report = harness.run_capture_matrix(output_dir)
+
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["git_provenance_stable"])
+        self.assertEqual(report["git_end_sha"], "e" * 40)
+
 
 if __name__ == "__main__":
     unittest.main()

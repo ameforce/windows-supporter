@@ -878,10 +878,16 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
         if (output_dir / name).is_file()
     ]
     phases = {str(result.get("phase") or "") for result in results if result.get("ok")}
+    final_provenance = capture_provenance()
+    provenance_stable = provenance == final_provenance
     report = {
         "schema_version": 1,
         "ok": (
             provenance["worktree_clean"]
+            and
+            final_provenance["worktree_clean"]
+            and
+            provenance_stable
             and
             len(results) == len(SCENARIO_NAMES)
             and all(bool(result.get("ok")) for result in results)
@@ -891,6 +897,9 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
         "generated_at_utc": _iso(generated_at),
         "git_sha": provenance["git_sha"],
         "git_worktree_clean": provenance["worktree_clean"],
+        "git_end_sha": final_provenance["git_sha"],
+        "git_end_worktree_clean": final_provenance["worktree_clean"],
+        "git_provenance_stable": provenance_stable,
         "capture_surface": "native-tk",
         "dpi_awareness": dpi_awareness,
         "fixture_policy": {
