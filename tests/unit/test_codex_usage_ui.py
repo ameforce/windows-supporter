@@ -325,6 +325,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(display_vars["included_usage"].get(), "포함 사용량: -")
         self.assertEqual(display_vars["billing_reset_at"].get(), "결제 주기 초기화: -")
         self.assertEqual(display_vars["on_demand_status"].get(), "온디맨드: -")
+        self.assertGreaterEqual(
+            int(fake_tk.labels[-1].kwargs.get("wraplength", 0)),
+            220,
+        )
         metric_vars["on_demand_status"].set("활성화\u00a0·\u00a0US$8.20\u00a0사용")
         self.assertEqual(
             display_vars["on_demand_status"].get(),

@@ -854,7 +854,14 @@ class CodexUsageSettingsView:
                     display_var,
                     keep_together=key == "on_demand_status",
                 )
-                cell = self._add_metric_cell(parent, row_index, column, display_var, bg)
+                cell = self._add_metric_cell(
+                    parent,
+                    row_index,
+                    column,
+                    display_var,
+                    bg,
+                    wraplength=220 if key == "on_demand_status" else 180,
+                )
                 if account_id and cell is not None:
                     self._account_metric_cells.setdefault(account_id, {})[key] = cell
         return metric_vars, display_vars
@@ -893,6 +900,8 @@ class CodexUsageSettingsView:
         column: int,
         display_var: Any,
         bg: str,
+        *,
+        wraplength: int = 180,
     ) -> Any:
         tk = self._tk
         if tk is None:
@@ -906,7 +915,7 @@ class CodexUsageSettingsView:
             font=("Segoe UI", 8),
             anchor="w",
             justify="left",
-            wraplength=180,
+            wraplength=max(1, int(wraplength)),
         )
         cell.grid(row=row, column=column, sticky="we", padx=padx, pady=1)
         return cell
