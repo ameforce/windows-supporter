@@ -885,6 +885,149 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(records[0]["failure_count"], 1)
             self.assertNotIn("probe", records[0])
 
+    def test_probe_contract_collects_visible_profile_name(self) -> None:
+        lowered = CURSOR_USAGE_PAGE_PROBE_SCRIPT.lower()
+
+        self.assertIn("profilename", lowered)
+        self.assertIn("collectprofilename", lowered)
+        self.assertIn("aria-label", lowered)
+        self.assertIn("genericlabel", lowered)
+        self.assertIn("broadmenu", lowered)
+        self.assertIn(r"(?:account|profile|user)\s+menu", lowered)
+        self.assertIn(r"(?:my|your|edit|switch|view|open)\s+(?:account|profile)", lowered)
+        # Uncued header menus must be skipped; only identity-cued nodes harvest names.
+        self.assertRegex(
+            CURSOR_USAGE_PAGE_PROBE_SCRIPT,
+            r"if\s*\(\s*broadMenu\s*&&\s*!hasCue\s*\)\s*\{\s*continue\s*;",
+        )
+        self.assertNotIn("document.cookie", lowered)
+        self.assertNotIn("localstorage", lowered)
+        self.assertNotIn("fetch(", lowered)
+
+    def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
+        for chrome_name in (
+            "Account menu",
+            "Profile menu",
+            "My Account",
+            "Edit profile",
+            "Switch account",
+        ):
+            with self.subTest(chrome_name=chrome_name):
+                session = self._Session(
+                    [
+                        BrowserOperationResult(
+                            probe={
+                                **self._probe(
+                                    "Included usage: $12.50 / $20.00\n"
+                                    "Reset: 2026-08-01T00:00:00Z\n"
+                                    "On-demand usage: ON"
+                                ),
+                                "profileName": chrome_name,
+                            }
+                        )
+                    ]
+                )
+                monitor = CursorUsageMonitor(
+                    profile_id="cursor-personal",
+                    browser_session_factory=lambda _config: session,
+                )
+                reading = monitor.collect()
+                self.assertEqual(reading.state, UsageState.READY)
+                self.assertEqual(monitor.get_runtime_status()["profile_name"], "")
+
+    def test_collector_binds_probe_profile_name_into_runtime(self) -> None:
+        session = self._Session(
+            [
+                BrowserOperationResult(
+                    probe={
+                        **self._probe(
+                            "Included usage: $12.50 / $20.00\n"
+                            "Reset: 2026-08-01T00:00:00Z\n"
+                            "On-demand usage: ON"
+                        ),
+                        "profileName": "Kim Jong Account",
+                    }
+                )
+            ]
+        )
+        monitor = CursorUsageMonitor(
+            profile_id="cursor-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        reading = monitor.collect()
+        runtime = monitor.get_runtime_status()
+
+        self.assertEqual(reading.state, UsageState.READY)
+        self.assertEqual(runtime["profile_name"], "Kim Jong")
+
+    def test_successful_scrape_without_profile_name_clears_stale_identity(self) -> None:
+        first = BrowserOperationResult(
+            probe={
+                **self._probe(
+                    "Included usage: $12.50 / $20.00\n"
+                    "Reset: 2026-08-01T00:00:00Z\n"
+                    "On-demand usage: ON"
+                ),
+                "profileName": "Alice",
+            }
+        )
+        second = BrowserOperationResult(
+            probe={
+                **self._probe(
+                    "Included usage: $10.00 / $20.00\n"
+                    "Reset: 2026-08-01T00:00:00Z\n"
+                    "On-demand usage: ON"
+                ),
+                "profileName": "",
+            }
+        )
+        session = self._Session([first, second])
+        monitor = CursorUsageMonitor(
+            profile_id="cursor-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        monitor.collect()
+        self.assertEqual(monitor.get_runtime_status()["profile_name"], "Alice")
+        monitor.collect(force=True)
+        self.assertEqual(monitor.get_runtime_status()["profile_name"], "")
+
+    def test_release_profile_session_clears_runtime_profile_name(self) -> None:
+        session = self._Session(
+            [
+                BrowserOperationResult(
+                    probe={
+                        **self._probe(
+                            "Included usage: $12.50 / $20.00\n"
+                            "Reset: 2026-08-01T00:00:00Z\n"
+                            "On-demand usage: ON"
+                        ),
+                        "profileName": "Alice",
+                    }
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = os.path.join(
+                tmp,
+                "windows-supporter",
+                "cursor-usage-profiles",
+                "cursor-personal",
+            )
+            os.makedirs(profile_dir, exist_ok=True)
+            monitor = CursorUsageMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                profile_dir=profile_dir,
+                profile_id="cursor-personal",
+                browser_session_factory=lambda _config: session,
+            )
+            monitor.collect()
+            self.assertEqual(monitor.get_runtime_status()["profile_name"], "Alice")
+            ok, _message = monitor.release_profile_session()
+            self.assertTrue(ok)
+            self.assertEqual(monitor.get_runtime_status()["profile_name"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

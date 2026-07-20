@@ -2087,8 +2087,22 @@ class CodexUsageMultiMonitor:
         profile_name = ""
         if isinstance(runtime, dict):
             profile_name = str(runtime.get("profile_name") or "").strip()
-        if label_mode == "auto" and profile_name:
-            return profile_name
+        if label_mode == "auto":
+            if profile_name:
+                return profile_name
+            if custom_label and not _is_cross_provider_default_label(
+                custom_label,
+                account.provider,
+            ):
+                return custom_label
+            return _default_profile_label(
+                account.provider,
+                self.__profile_label_index(
+                    account.account_id,
+                    account.provider,
+                    account.label,
+                ),
+            )
         return str(
             custom_label
             or account.label
@@ -3118,7 +3132,7 @@ class CodexUsageMultiMonitor:
                     "short_label": "INC",
                     "percent": percent,
                     "value_text": str(snapshot.get("included_usage") or "조회 불가"),
-                    "short_value_text": "--" if percent is None else f"{percent:g}%",
+                    "short_value_text": "--" if percent is None else f"{int(round(percent))}%",
                     "reset_at": reset_at,
                     "reset_precision": str(
                         snapshot.get("reset_precision") or inferred_precision
@@ -3156,7 +3170,7 @@ class CodexUsageMultiMonitor:
                     "short_label": short_label,
                     "percent": percent,
                     "value_text": raw_value,
-                    "short_value_text": "--" if percent is None else f"{percent:g}%",
+                    "short_value_text": "--" if percent is None else f"{int(round(percent))}%",
                     "reset_at": reset_at,
                     "reset_precision": reset_precision,
                     "state": "ready",
@@ -3417,6 +3431,15 @@ def _is_valid_profile_id(value: str) -> bool:
 def _default_profile_label(provider: str, index: int) -> str:
     provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
     return f"{provider_name} {max(1, int(index))}"
+
+
+def _is_cross_provider_default_label(label: str, provider: str) -> bool:
+    text = str(label or "").strip()
+    if not text:
+        return False
+    if str(provider or "").lower() == "cursor":
+        return bool(re.fullmatch(r"Codex [1-9]\d*", text))
+    return bool(re.fullmatch(r"Cursor [1-9]\d*", text))
 
 
 def _optional_percent(value: Any) -> float | None:
