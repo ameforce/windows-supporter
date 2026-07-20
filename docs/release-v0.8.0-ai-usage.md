@@ -3,7 +3,7 @@
 ## 변경 개요
 
 - 사용자 노출 기능명을 `AI 사용량`으로 통일하고 Codex 전용 구조를 provider-neutral 프로필 구조로 확장한다.
-- 지원 provider는 `codex`, `cursor`이며 전체 프로필 슬롯과 작업표시줄 표시 선택은 각각 최대 2개다.
+- 지원 provider는 `codex`, `cursor`이며 저장 프로필 수에는 상한이 없고 작업표시줄 표시 선택은 Codex/Cursor 합산 최대 2개다.
 - `Codex/Codex`, `Codex/Cursor`, `Cursor/Codex`, `Cursor/Cursor` 조합과 표시 순서를 지원한다.
 - 기존 `codex_usage` route, getter, class, import는 호환 facade와 alias로 유지한다.
 

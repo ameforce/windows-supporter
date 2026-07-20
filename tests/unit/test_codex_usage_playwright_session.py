@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from queue import Queue
 import threading
+import time
 import unittest
 from typing import final
+from unittest.mock import patch
 
 from src.apps.codex_usage_browser_types import (
     BrowserOperationResult,
@@ -501,6 +504,265 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertTrue(session._thread is None or not session._thread.is_alive())
         self.assertEqual(session.get_runtime_status().state, BrowserState.STOPPED)
 
+    def test_request_cancel_hard_cancels_active_owner_without_command_timeout(self) -> None:
+        release = threading.Event()
+        driver = TerminableBlockingDriver(release, wait_timeout_sec=None)
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=2.0)
+        collect_thread = threading.Thread(target=session.collect, daemon=True)
+        collect_thread.start()
+        deadline = time.monotonic() + 1.0
+        while "collect" not in driver.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("collect", driver.calls)
+
+        started = time.monotonic()
+        session.request_cancel()
+        elapsed = time.monotonic() - started
+        collect_thread.join(1.0)
+
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(collect_thread.is_alive())
+        self.assertIn("force_terminate:command_timeout", driver.calls)
+        session.shutdown()
+
+    def test_request_cancel_hard_cancels_active_login_command(self) -> None:
+        release = threading.Event()
+
+        class _TerminableBlockingLoginDriver(FakeDriver):
+            def open_login(self) -> BrowserOperationResult:
+                self._record("open_login")
+                release.wait()
+                return BrowserOperationResult(error="login_required")
+
+            def force_terminate(self, reason: str) -> bool:
+                self.calls.append(f"force_terminate:{reason}")
+                release.set()
+                return True
+
+        driver = _TerminableBlockingLoginDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=2.0)
+        login_thread = threading.Thread(target=session.open_login, daemon=True)
+        login_thread.start()
+        deadline = time.monotonic() + 1.0
+        while "open_login" not in driver.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("open_login", driver.calls)
+
+        started = time.monotonic()
+        cancel_result = session.request_cancel()
+        elapsed = time.monotonic() - started
+        login_thread.join(1.0)
+
+        self.assertTrue(cancel_result)
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(login_thread.is_alive())
+        self.assertIn("force_terminate:command_timeout", driver.calls)
+        session.shutdown()
+
+    def test_request_cancel_hard_cancels_active_login_poll(self) -> None:
+        release = threading.Event()
+
+        class _TerminableBlockingLoginPollDriver(FakeDriver):
+            def poll_login(self) -> BrowserOperationResult:
+                self._record("poll_login")
+                release.wait()
+                return BrowserOperationResult(error="login_required")
+
+            def force_terminate(self, reason: str) -> bool:
+                self.calls.append(f"force_terminate:{reason}")
+                release.set()
+                return True
+
+        driver = _TerminableBlockingLoginPollDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory, command_timeout_sec=2.0)
+        poll_thread = threading.Thread(target=session.poll_login, daemon=True)
+        poll_thread.start()
+        deadline = time.monotonic() + 1.0
+        while "poll_login" not in driver.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("poll_login", driver.calls)
+
+        cancel_result = session.request_cancel()
+        poll_thread.join(1.0)
+
+        self.assertTrue(cancel_result)
+        self.assertFalse(poll_thread.is_alive())
+        self.assertIn("force_terminate:command_timeout", driver.calls)
+        session.shutdown()
+
+    def test_request_cancel_leaves_alive_idle_owner_for_normal_shutdown(self) -> None:
+        class _TerminableIdleDriver(FakeDriver):
+            def force_terminate(self, reason: str) -> bool:
+                self.calls.append(f"force_terminate:{reason}")
+                return True
+
+        driver = _TerminableIdleDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory)
+        self.assertIsNotNone(session.collect().probe)
+        self.assertIsNotNone(session._thread)
+        self.assertTrue(session._thread.is_alive())
+
+        cancel_result = session.request_cancel()
+
+        self.assertTrue(cancel_result)
+        self.assertFalse(session._worker_poisoned)
+        self.assertNotIn("force_terminate:command_timeout", driver.calls)
+        self.assertTrue(session.shutdown())
+        self.assertIn("shutdown", driver.calls)
+        self.assertTrue(session._thread is None or not session._thread.is_alive())
+
+    def test_request_cancel_during_factory_start_never_dispatches_queued_collect(self) -> None:
+        factory_started = threading.Event()
+        release_factory = threading.Event()
+        driver = FakeDriver()
+
+        def gated_factory(
+            _config: PlaywrightSessionConfig,
+            _log_sink: LogSink | None,
+            _playwright_starter: PlaywrightStarter | None,
+        ) -> FakeDriver:
+            factory_started.set()
+            release_factory.wait(2.0)
+            return driver
+
+        session = make_session(gated_factory)
+        collect_thread = threading.Thread(target=session.collect, daemon=True)
+        collect_thread.start()
+        self.assertTrue(factory_started.wait(1.0))
+
+        cancel_result = session.request_cancel()
+        release_factory.set()
+        collect_thread.join(1.0)
+
+        self.assertFalse(cancel_result)
+        self.assertFalse(collect_thread.is_alive())
+        self.assertNotIn("collect", driver.calls)
+        session.shutdown()
+
+    def test_request_cancel_interrupts_retry_wait_without_reporting_completion(self) -> None:
+        driver = TimeoutThenSuccessDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory)
+        session._timeout_retry_delays_sec = (0.3,)
+        result = []
+        collect_thread = threading.Thread(
+            target=lambda: result.append(session.collect()),
+            daemon=True,
+        )
+        collect_thread.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            session.get_runtime_status().state != BrowserState.RECOVERING
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertEqual(session.get_runtime_status().state, BrowserState.RECOVERING)
+
+        cancel_result = session.request_cancel()
+        collect_thread.join(0.1)
+
+        self.assertFalse(cancel_result)
+        self.assertFalse(collect_thread.is_alive())
+        self.assertEqual(len(result), 1)
+        self.assertEqual(driver.collect_count, 1)
+        self.assertTrue(session.shutdown())
+
+    def test_request_cancel_makes_driver_terminal_before_racing_dispatch(self) -> None:
+        class _RespawnGuardDriver(FakeDriver):
+            def __init__(self) -> None:
+                super().__init__()
+                self.hard_terminated = False
+                self.terminal = False
+                self.spawned_after_cancel = False
+
+            def collect(self) -> BrowserOperationResult:
+                self._record("collect")
+                if self.hard_terminated and not self.terminal:
+                    self.spawned_after_cancel = True
+                return BrowserOperationResult(error="collect_failed")
+
+            def force_terminate(self, reason: str) -> bool:
+                self.calls.append(f"force_terminate:{reason}")
+                self.hard_terminated = True
+                return True
+
+            def shutdown(self) -> None:
+                self.terminal = True
+                super().shutdown()
+
+        check_started = threading.Event()
+        release_check = threading.Event()
+        driver = _RespawnGuardDriver()
+        factory = SequenceDriverFactory([driver])
+        session = make_session(factory)
+
+        def gated_cancel_check(_generation: int) -> bool:
+            check_started.set()
+            release_check.wait(2.0)
+            return False
+
+        session._is_cancel_requested_for_generation = gated_cancel_check
+        collect_thread = threading.Thread(target=session.collect, daemon=True)
+        collect_thread.start()
+        self.assertTrue(check_started.wait(1.0))
+
+        self.assertTrue(session.request_cancel())
+        release_check.set()
+        collect_thread.join(1.0)
+
+        self.assertFalse(collect_thread.is_alive())
+        self.assertFalse(driver.spawned_after_cancel)
+        session.shutdown()
+
+    def test_collect_enqueue_is_atomic_with_cancel_shutdown_enqueue(self) -> None:
+        collect_put_started = threading.Event()
+        release_collect_put = threading.Event()
+
+        class _GateQueue(Queue):
+            def put(self, item, block=True, timeout=None):
+                command_name = type(getattr(item, "command", None)).__name__
+                if command_name == "CollectCommand":
+                    collect_put_started.set()
+                    release_collect_put.wait(2.0)
+                return super().put(item, block=block, timeout=timeout)
+
+        gate_queue = _GateQueue()
+        factory = DriverFactory()
+        with patch(
+            "src.apps.codex_usage_playwright_session.Queue",
+            return_value=gate_queue,
+        ):
+            session = make_session(factory, command_timeout_sec=0.3)
+            collect_finished = threading.Event()
+            cancel_finished = threading.Event()
+            collect_thread = threading.Thread(
+                target=lambda: (session.collect(), collect_finished.set()),
+                daemon=True,
+            )
+            collect_thread.start()
+            self.assertTrue(collect_put_started.wait(1.0))
+            cancel_thread = threading.Thread(
+                target=lambda: (session.request_cancel(), cancel_finished.set()),
+                daemon=True,
+            )
+            cancel_thread.start()
+
+            cancel_completed_before_release = cancel_finished.wait(0.1)
+            release_collect_put.set()
+            collect_completed_after_release = collect_finished.wait(0.15)
+            collect_thread.join(1.0)
+            cancel_thread.join(1.0)
+
+            self.assertFalse(cancel_completed_before_release)
+            self.assertTrue(collect_completed_after_release)
+            self.assertFalse(collect_thread.is_alive())
+            self.assertFalse(cancel_thread.is_alive())
+            session.shutdown()
+
     def test_concurrent_shutdown_never_reports_stopped_with_poisoned_owner_alive(self) -> None:
         collect_release = threading.Event()
         terminate_started = threading.Event()
@@ -518,8 +780,9 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         collect_thread.start()
         self.assertTrue(terminate_started.wait(1.0))
 
-        session.shutdown()
+        shutdown_result = session.shutdown()
 
+        self.assertIs(shutdown_result, False)
         self.assertEqual(session.get_runtime_status().state, BrowserState.FAILED)
         self.assertTrue(collect_thread.is_alive())
         terminate_release.set()

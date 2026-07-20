@@ -13,14 +13,17 @@
 - 일반 구현은 `hotfix/vX.Y.Z` 또는 `release/vX.Y.Z`에서 task branch를 만들고, 해당 버전형 branch를 base로 하는 PR을 통해서만 합친다. 일반 task branch는 `task/`, `feat/`, `fix/`, `chore/`, `refact/` 중 하나의 prefix를 사용하고, 리뷰·릴리스 정책 변경에는 `policy/`를 사용할 수 있다.
 - PR을 연 뒤 정확한 base ref, 최신 base SHA와 head SHA를 기록하고, 그 base/head 쌍을 명시한 `@codex review`를 GitHub PR에 요청한다. finding이 있으면 `chatgpt-codex-connector` GitHub review object의 `commit_id`가 최신 40자리 head SHA와 일치해야 한다. finding이 없어 connector가 top-level zero-finding 댓글만 남기면 그 댓글의 `Reviewed commit` prefix가 최신 head에 유일하게 해석되고, 바로 앞 review 요청에 full base/head SHA가 기록돼 있으며 응답 전후 head가 바뀌지 않았음을 확인한다.
 - 같은 exact base/head diff를 native Codex subagent 또는 별도 Codex task가 독립적으로 read-only 리뷰한다. GitHub Codex 리뷰와 독립 리뷰는 서로의 결론을 전달받기 전에 수행한다.
-- 두 리뷰의 finding은 `P0/P1/P2/P3`로 정규화하고 모든 등급을 0으로 만든다. GitHub review thread도 unresolved 0이어야 한다. 작성자가 PR 본문에 적은 finding 수, reviewer 이름, digest 또는 Actions status는 실제 리뷰 증거를 대신하지 않는다.
-- 리뷰 뒤 push로 head SHA가 바뀌거나 base SHA가 이동하면 이전 GitHub Codex 리뷰와 독립 리뷰를 모두 stale로 처리하고, 새 exact base/head에서 두 리뷰를 다시 수행한다. 최종 두 리뷰가 같은 최신 base/head 쌍을 검토하지 않았다면 merge하지 않는다.
+- 두 리뷰의 finding은 `P0/P1/P2/P3`로 정규화한다. P0/P1/P2 중 하나라도 존재하면 병합을 차단하며, 병합 조건은 `P0=0, P1=0, P2=0`이다. GitHub review thread도 unresolved 0이어야 한다. 작성자가 PR 본문에 적은 finding 수, reviewer 이름, digest 또는 Actions status는 실제 리뷰 증거를 대신하지 않는다.
+- P3는 병합 비차단이지만, 국소적·가역적·탐지 가능한 경우에만 허용한다. 데이터·설정 무결성, 보안·개인정보·인증, 공개 호환성, 삭제·업데이트·릴리스 무결성, 전역 상태 침묵 오류를 침해하거나 그럴 가능성이 있는 finding은 P3가 될 수 없다. 심각도가 애매하면 P2로 분류한다.
+- 모든 P3 finding은 finding ID, exact base/head, 처분, 근거, 검증, 책임자를 PR 기록에 남기고 thread를 해소한다. P3 처분은 수정/기각/위험수용/후속 이슈 중 하나여야 한다. 기각에는 반증을, 위험수용에는 merge 직전에도 유효한 미래 만료일을, 후속 이슈에는 URL·owner·milestone·완료 조건을 남긴다. 만료된 위험수용은 stale·미완료로 취급해 새 처분 또는 P2 재분류를 요구한다. reviewer 간 severity 불일치는 상위 등급을 적용하며 작성자 단독으로 하향할 수 없다.
+- 리뷰 뒤 push로 head SHA가 바뀌거나 base SHA가 이동하면 이전 GitHub Codex 리뷰와 독립 리뷰, P3 처분, validation을 모두 stale로 처리하고, 새 exact base/head에서 두 리뷰와 처분을 다시 수행한다. 최종 두 리뷰가 같은 최신 base/head 쌍을 검토하지 않았다면 merge하지 않는다.
 - 테스트, 정적 검사, 빌드, Windows 실제 실행, `release-chain-gate`는 리뷰와 별개의 검증 증거다. GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다.
-- 최종 이중 리뷰가 같은 base/head에서 all-zero가 된 뒤에만 PR에 `reviews-complete` label을 새로 붙여 `pull-request-validation`을 실행한다. workflow는 label 추가 이벤트에서 현재 PR merge candidate를 테스트하고 base/head/merge-candidate SHA를 기록한다. label은 리뷰 완료를 증명하지 않고 검증 시작 순서 제어 신호일 뿐이다.
+- 최종 이중 리뷰가 같은 base/head에서 `P0=0, P1=0, P2=0`, 유효한 P3 처분, unresolved 0을 만족한 뒤에만 PR에 `reviews-complete` label을 새로 붙여 `pull-request-validation`을 실행한다. workflow는 label 추가 이벤트에서 현재 PR merge candidate를 테스트하고 base/head/merge-candidate SHA를 기록한다. label은 리뷰 완료를 증명하지 않고 검증 시작 순서 제어 신호일 뿐이다.
 - 새 validation workflow가 아직 default branch에 없어 현재 PR의 label 이벤트로 실행될 수 없는 bootstrap은 우회로 숨기지 않는다. 최종 이중 리뷰 뒤 `gh pr view <N> --json baseRefOid,headRefOid,potentialMergeCommit`으로 reviewed base/head와 candidate SHA를 고정하고, `git fetch origin refs/pull/<N>/merge`의 `FETCH_HEAD`가 그 candidate와 같은지 및 `git rev-list --parents -n 1 FETCH_HEAD`의 두 부모가 reviewed base/head와 같은지 확인한다. 그 exact merge SHA의 별도 detached worktree에서 workflow와 동일한 테스트·artifact-only 빌드·SHA 기록을 수행한 뒤 PR의 base/head/potentialMergeCommit을 다시 읽어 모두 불변일 때만 동등한 bootstrap 검증으로 인정한다.
 - bootstrap 검증은 PR 기록에 exact base/head/merge SHA, worktree 경로, 테스트 수, artifact SHA와 명령을 남긴다. workflow가 default branch에 들어간 뒤 새 PR에는 bootstrap 예외를 사용하지 않는다.
 - push 또는 base 이동이 발생하면 `reviews-complete` label과 기존 CI 결과도 stale다. 두 리뷰를 새 base/head에서 반복한 뒤 label이 남아 있으면 제거하고 다시 붙여 새 merge candidate를 검증한다.
-- merge 직전에 PR의 base ref/SHA와 head SHA, 두 리뷰 대상 base/head, `P0/P1/P2/P3 = 0`, unresolved thread 0, `pull-request-validation`에 기록된 base/head를 다시 확인한다. base와 head가 모두 기대값일 때만 `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>` 또는 동등한 API precondition으로 병합한다. 최종 확인과 merge 사이에는 같은 base에 다른 PR을 merge하지 않는다. 이어 `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
+- merge 직전에 PR의 base ref/SHA와 head SHA, 두 리뷰 대상 base/head, `P0=0, P1=0, P2=0`, P3 처분 완료, unresolved thread 0, `pull-request-validation`에 기록된 base/head를 다시 확인한다. base와 head가 모두 기대값일 때만 `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>` 또는 동등한 API precondition으로 병합한다. 최종 확인과 merge 사이에는 같은 base에 다른 PR을 merge하지 않는다. 이어 `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
+- 이 P2 차단/P3 처분 정책은 이 정책 PR의 merge commit 이후 생성하는 PR부터 적용한다. 이 정책 PR 자체와 그 전에 열린 PR은 기존 `P0/P1/P2/P3 = 0` gate를 소급 유지한다.
 - `AGENTS.md`, 리뷰 절차, workflow, ruleset을 바꾸는 PR에도 같은 이중 리뷰 절차를 적용한다. 리뷰를 실제로 수행하지 않는 workflow나 self-attestation validator를 리뷰 gate라는 이름으로 도입하지 않는다.
 - `.github/pr-protection/ruleset.json`은 `hotfix/*`와 `release/*`에 PR-only merge, stale review dismiss, unresolved thread 해소, force-push·deletion 보호만 적용한다. 이 ruleset은 이중 리뷰를 실행하거나 증명하지 않으며 required status check를 두지 않는다.
 - 공개된 `main`, `develop`, tag의 잘못된 이력은 revert 또는 다음 patch release로 교정한다. 정상 release 절차에서 `--force-with-lease`로 공개 ref를 다시 쓰지 않는다.
@@ -33,6 +36,15 @@
 2. 테스트 통과 후 `@build.bat`(=`build.bat`)를 실행해 새로운 `windows-supporter.exe`를 만든다.
    - 실행 예시: `cmd /c build.bat`
 3. 빌드 실패/실행 실패 시 원인을 해결한 뒤, 테스트부터 다시 수행하고 재빌드한다.
+
+## 변경 분류 게이트
+
+- Hotfix는 원래 의도한 동작의 버그, 회귀, 누락 또는 불완전 구현을 복구한다.
+- Release는 기존 의도에 없던 사용자 기능이나 제품 정책을 의도적으로 도입한다.
+- 내부 재설계, 마이그레이션, 코드량 또는 UI 수정 규모만으로 hotfix를 release로 승격하지 않는다.
+- 문서와 확인된 제품 의도가 충돌하면 그 증거를 남긴다. 문서와 구현이 함께 잘못됐다면 같은 hotfix에서 수정한다.
+- 분류 대상 branch를 만들기 전에 `의도한 계약 → 현재 동작 → 차이 → 판정`을 기록한다.
+- repo 고유 정책과 확인된 제품 계약을 일반 SemVer 추정보다 우선한다.
 
 ## hotfix 완료 정책
 

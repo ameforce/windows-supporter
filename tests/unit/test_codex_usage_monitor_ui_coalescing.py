@@ -1,5 +1,6 @@
 import queue
 import tempfile
+import threading
 import unittest
 
 from src.apps.codex_usage_monitor import CodexUsageMonitor, UsageSnapshot
@@ -86,6 +87,53 @@ class CodexUsageMonitorUiCoalescingTest(unittest.TestCase):
         monitor._CodexUsageMonitor__reset_monitor_countdown_after_manual_query()  # noqa: SLF001
 
         self.assertEqual(root.after_calls, [])
+
+    def test_shutdown_from_worker_posts_tk_cleanup_to_ui_queue(self) -> None:
+        class _Root:
+            def __init__(self):
+                self.after_cancel_calls = []
+
+            def after_cancel(self, after_id):
+                self.after_cancel_calls.append(
+                    (after_id, threading.current_thread().name)
+                )
+
+        class _Tooltip:
+            def __init__(self):
+                self.hide_threads = []
+
+            def hide_tooltip(self):
+                self.hide_threads.append(threading.current_thread().name)
+
+        monitor = self._make_monitor()
+        root = _Root()
+        event_queue = queue.Queue()
+        tooltip = _Tooltip()
+        monitor.attach(root=root, event_queue=event_queue, start_monitor=False)
+        monitor._CodexUsageMonitor__monitor_after_id = "after-monitor"  # noqa: SLF001
+        monitor._CodexUsageMonitor__pending_login_after_id = "after-login"  # noqa: SLF001
+        monitor._CodexUsageMonitor__active_tooltip = tooltip  # noqa: SLF001
+        worker = threading.Thread(target=monitor.shutdown, name="shutdown-worker")
+
+        worker.start()
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(root.after_cancel_calls, [])
+        self.assertEqual(tooltip.hide_threads, [])
+        self.assertGreaterEqual(event_queue.qsize(), 3)
+
+        while not event_queue.empty():
+            event_queue.get_nowait()()
+
+        self.assertEqual(
+            {after_id for after_id, _thread in root.after_cancel_calls},
+            {"after-monitor", "after-login"},
+        )
+        self.assertTrue(
+            all(thread_name != "shutdown-worker" for _after_id, thread_name in root.after_cancel_calls)
+        )
+        self.assertEqual(tooltip.hide_threads, [threading.current_thread().name])
 
 
 if __name__ == "__main__":

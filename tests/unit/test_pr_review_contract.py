@@ -102,6 +102,67 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertNotIn("reviewer_source", contract)
         self.assertNotIn("merge-live", contract)
 
+    def test_agents_contract_blocks_p2_and_requires_p3_disposition(self) -> None:
+        contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        template = (REPO_ROOT / ".github" / "pull_request_template.md").read_text(
+            encoding="utf-8"
+        )
+
+        for required_text in (
+            "P0/P1/P2 중 하나라도 존재하면 병합을 차단",
+            "병합 조건은 `P0=0, P1=0, P2=0`",
+            "P3는 병합 비차단",
+            "국소적·가역적·탐지 가능",
+            "데이터·설정 무결성",
+            "보안·개인정보·인증",
+            "공개 호환성",
+            "삭제·업데이트·릴리스 무결성",
+            "전역 상태 침묵 오류",
+            "애매하면 P2",
+            "작성자 단독으로 하향",
+            "상위 등급",
+            "P3 처분",
+            "P3 처분, validation",
+            "merge 직전에도 유효한 미래 만료일",
+            "만료된 위험수용은 stale·미완료",
+            "유효한 P3 처분",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, contract)
+
+        for required_text in (
+            "P0=0, P1=0, P2=0",
+            "P3 처분",
+            "수정/기각/위험수용/후속 이슈",
+            "merge 시점에도 유효한 미래 만료일",
+            "만료된 위험수용은 stale·미완료",
+            "unresolved review thread: `0`",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, template)
+
+    def test_agents_contract_requires_intent_based_hotfix_classification(self) -> None:
+        contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+        for required_text in (
+            "Hotfix는 원래 의도한 동작의 버그, 회귀, 누락 또는 불완전 구현을 복구한다",
+            "Release는 기존 의도에 없던 사용자 기능이나 제품 정책을 의도적으로 도입한다",
+            "내부 재설계, 마이그레이션, 코드량 또는 UI 수정 규모만으로 hotfix를 release로 승격하지 않는다",
+            "문서와 확인된 제품 의도가 충돌하면 그 증거를 남긴다",
+            "문서와 구현이 함께 잘못됐다면 같은 hotfix에서 수정한다",
+            "의도한 계약 → 현재 동작 → 차이 → 판정",
+            "repo 고유 정책과 확인된 제품 계약을 일반 SemVer 추정보다 우선한다",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, contract)
+
+    def test_review_gate_rca_matches_p3_expiry_contract(self) -> None:
+        policy = (REPO_ROOT / "docs" / "hotfix-v0.8.4-review-gate-policy.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("merge 시점에도 유효한 미래 만료일", policy)
+        self.assertIn("만료된 위험수용은 stale·미완료", policy)
+
 
 if __name__ == "__main__":
     unittest.main()
