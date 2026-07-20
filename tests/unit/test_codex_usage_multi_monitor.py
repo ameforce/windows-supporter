@@ -1999,6 +1999,69 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 ["refresh_started", "cancel_requested", "refresh_finished", "shutdown"],
             )
 
+    def test_shutdown_times_out_when_cancel_is_accepted_but_refresh_never_quiesces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+            shutdown_finished = threading.Event()
+            shutdown_results = []
+            children = []
+
+            class _StuckAfterCancelChild(_FakeChildMonitor):
+                def show_current_status(self, force_refresh=True, source="manual_query"):
+                    refresh_started.set()
+                    release_refresh.wait(2.0)
+                    return super().show_current_status(
+                        force_refresh=force_refresh,
+                        source=source,
+                    )
+
+                def request_collect_cancel(self):
+                    self.cancel_calls += 1
+                    return True
+
+            def factory(config_dir, profile_dir):
+                child = (
+                    _StuckAfterCancelChild(config_dir, profile_dir)
+                    if not children
+                    else _FakeChildMonitor(config_dir, profile_dir)
+                )
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            manager.attach(_FakeRoot(), queue.Queue())
+            manager._CodexUsageMultiMonitor__shutdown_quiescence_timeout_sec = 0.05
+            manager.show_current_status(force_refresh=True)
+            self.assertTrue(refresh_started.wait(1.0))
+
+            shutdown_thread = threading.Thread(
+                target=lambda: (
+                    shutdown_results.append(manager.shutdown()),
+                    shutdown_finished.set(),
+                ),
+                daemon=True,
+            )
+            shutdown_thread.start()
+            completed_with_timeout = shutdown_finished.wait(0.5)
+            release_refresh.set()
+            shutdown_thread.join(2.0)
+
+            self.assertTrue(completed_with_timeout)
+            self.assertFalse(shutdown_thread.is_alive())
+            self.assertEqual(shutdown_results, [False])
+            self.assertEqual(children[0].cancel_calls, 1)
+            self.assertTrue(
+                any(
+                    event.get("type") == "manager_shutdown_quiescence_timeout"
+                    for event in manager.pop_notification_events()
+                )
+            )
+
     def test_shutdown_uses_final_shutdown_when_cancel_request_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             refresh_started = threading.Event()

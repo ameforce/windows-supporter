@@ -28,6 +28,7 @@ LEGACY_ACCOUNT_IDS = ("account_1", "account_2")
 SUPPORTED_PROVIDERS = ("codex", "cursor")
 AI_USAGE_SETTINGS_VERSION = 4
 TASKBAR_PROFILE_LIMIT = 2
+SHUTDOWN_QUIESCENCE_TIMEOUT_SEC = 60.0
 PROFILE_ID_PATTERN = re.compile(r"^(?:account_[12]|profile_[0-9a-f]{32})$")
 DEFAULT_LABELS = {
     "account_1": "Codex 1",
@@ -159,6 +160,7 @@ class CodexUsageMultiMonitor:
         self.__closing = False
         self.__shutdown_complete = False
         self.__shutdown_succeeded = False
+        self.__shutdown_quiescence_timeout_sec = SHUTDOWN_QUIESCENCE_TIMEOUT_SEC
         self.__unsettled_children: dict[str, list[Any]] = {}
         self.__deferred_cleanup_transaction_ids: set[str] = set()
         self.__refresh_queue: deque[tuple[Callable[[], None], bool]] = deque()
@@ -287,17 +289,27 @@ class CodexUsageMultiMonitor:
             ]
             self.__unsettled_children = {}
         pre_shutdown_child_ids: set[int] = set()
-        cancel_request_failed = False
         for child in shutdown_children:
             if self.__request_child_collect_cancel(child):
                 continue
-            cancel_request_failed = True
             if not self.__shutdown_child(child):
                 continue
             pre_shutdown_child_ids.add(id(child))
         shutdown_succeeded = self.__wait_for_refreshes_quiesced(
-            timeout_sec=60.0 if cancel_request_failed else None
+            timeout_sec=self.__shutdown_quiescence_timeout_sec
         )
+        if not shutdown_succeeded:
+            with self.__refresh_condition:
+                active_profile_ids = sorted(self.__active_refresh_counts)
+                refresh_inflight = bool(self.__refresh_inflight)
+            self.__append_notification_event(
+                {
+                    "type": "manager_shutdown_quiescence_timeout",
+                    "timeout_sec": float(self.__shutdown_quiescence_timeout_sec),
+                    "active_profile_ids": active_profile_ids,
+                    "refresh_inflight": refresh_inflight,
+                }
+            )
         for child in shutdown_children:
             if id(child) in pre_shutdown_child_ids:
                 continue
@@ -1405,8 +1417,14 @@ class CodexUsageMultiMonitor:
         )
         return self.__taskbar_progress
 
-    def __post_ui(self, fn) -> bool:
-        if bool(self.__closing) or not callable(fn):
+    def __append_notification_event(self, event: dict[str, Any]) -> None:
+        self.__notification_events.append(dict(event))
+        if len(self.__notification_events) > 20:
+            self.__notification_events = self.__notification_events[-20:]
+        return
+
+    def __post_ui(self, fn, *, allow_closing: bool = False) -> bool:
+        if (bool(self.__closing) and not allow_closing) or not callable(fn):
             return False
         queue_obj = self.__event_queue
         if queue_obj is None:
