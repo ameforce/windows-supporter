@@ -823,8 +823,8 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
                 )
                 for visible_metrics in rows
             ):
-                return _wide_slot_preferred_width(model, int(candidate_width))
-    return _wide_slot_preferred_width(model, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX)
+                return int(candidate_width)
+    return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
 
 
 def _render_signature_value(value: Any) -> Any:
@@ -879,19 +879,9 @@ def _overlay_render_signature(model: dict[str, Any] | None) -> tuple[Any, ...]:
 
 
 def _wide_slot_preferred_width(model: dict[str, Any], minimum_width: int) -> int:
-    geometry = model.get("geometry") if isinstance(model, dict) else None
-    if not isinstance(geometry, dict):
-        return int(minimum_width)
-    try:
-        geometry_width = int(geometry.get("width", 0) or 0)
-    except (TypeError, ValueError):
-        geometry_width = 0
-    if geometry_width <= _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX:
-        return int(minimum_width)
-    return min(
-        max(int(minimum_width), _WIDE_EMPTY_SLOT_TARGET_WIDTH_PX),
-        int(geometry_width),
-    )
+    """Return content-fit width only; do not inflate into unused empty-slot space."""
+    _ = model
+    return int(minimum_width)
 
 
 def _model_geometry(model: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -4600,7 +4590,7 @@ def _build_reset_info(
     precision = str(reset_precision or "").strip().lower()
     if precision == "date":
         days = max(0, (parsed.date() - current.date()).days)
-        text = f"D-{days}"
+        text = f"{days:02d}d 00h 00m 00s"
         direction = _reset_action_direction(metric_key, percent, days * 86400)
         profile = _reset_direction_profile(direction)
         return {
@@ -4702,16 +4692,14 @@ def _format_reset_remaining_detail(
     metric_key: str = "",
     reset_precision: str = "",
 ) -> str:
+    _ = metric_key
+    _ = reset_precision
     seconds = max(0, int(seconds))
-    total_minutes = max(0, (seconds + 59) // 60)
-    days = int(total_minutes // 1440)
-    hours = int((total_minutes % 1440) // 60)
-    minutes = int(total_minutes % 60)
-    precision = str(reset_precision or "").strip().lower()
-    if str(metric_key or "") == "five_hour_limit" or precision == "datetime":
-        total_hours = int(total_minutes // 60)
-        return f"{total_hours:02d}h {minutes:02d}m"
-    return f"{days}d {hours:02d}h {minutes:02d}m"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{days:02d}d {hours:02d}h {minutes:02d}m {secs:02d}s"
 
 
 def _format_reset_remaining_compact(
