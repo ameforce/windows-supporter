@@ -834,7 +834,7 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertIn("Codex 1 (Codex): logged_in / idle", labels)
         self.assertIn("Codex 2 (Codex): 비활성 / logged_out", labels)
 
-    def test_ai_usage_formatter_prefers_the_two_taskbar_selected_profiles(self):
+    def test_ai_usage_formatter_keeps_unselected_dashboard_profiles_annotated(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
 
         _, parts = view._format_ai_usage(
@@ -850,9 +850,14 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         )
 
         labels = [text for text, _style in parts]
+        self.assertTrue(
+            any(
+                text.startswith("First (Codex):") and text.endswith("/ 표시 안 함")
+                for text in labels
+            )
+        )
         self.assertTrue(any(text.startswith("Second (Codex):") for text in labels))
-        self.assertTrue(any(text.startswith("Third (Codex):") for text in labels))
-        self.assertFalse(any(text.startswith("First (Codex):") for text in labels))
+        self.assertFalse(any(text.startswith("Third (Codex):") for text in labels))
         self.assertFalse(any(text.startswith("Fourth (Codex):") for text in labels))
 
     def test_update_formatter_shows_available_version(self):

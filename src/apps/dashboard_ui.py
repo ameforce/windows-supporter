@@ -485,14 +485,7 @@ class DashboardView:
             accounts = data.get("accounts")
         if isinstance(accounts, list):
             valid_accounts = [raw for raw in accounts if isinstance(raw, dict)]
-            selected_accounts = [
-                raw
-                for raw in valid_accounts
-                if bool(raw.get("taskbar_selected", True))
-            ]
-            for raw in selected_accounts[:2]:
-                if not isinstance(raw, dict):
-                    continue
+            for raw in valid_accounts[:2]:
                 label = str(raw.get("label") or raw.get("id") or "프로필").strip()
                 provider = str(raw.get("provider") or "codex").strip().title()
                 account_enabled = bool(raw.get("enabled", True))
