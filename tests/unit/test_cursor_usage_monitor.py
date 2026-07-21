@@ -1474,6 +1474,42 @@ Resets Aug 13, 2026
         )
         self.assertEqual(local_initials_beat_adjacent.get("profileName"), "JD")
 
+        bare_account_no_adjacent = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="Account">Account</button>'
+                    "<div>Billing</div>"
+                )
+            )
+        )
+        self.assertEqual(bare_account_no_adjacent.get("profileName"), "")
+
+        button_child_fields = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe</span>"
+                    "<span>Team Plan</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(button_child_fields.get("profileName"), "Jane Doe")
+
+        button_child_email = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe</span>"
+                    "<span>jane@example.com</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(button_child_email.get("profileName"), "Jane Doe")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",

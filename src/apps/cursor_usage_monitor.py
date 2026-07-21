@@ -138,7 +138,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
-    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정)$|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?)/i;
+    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제)$|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?)/i;
     // Reject control-like ids: kebab/snake/camel with menu|button|trigger|chip.
     const isChromeControlId = (value) => {
       const lower = String(value || '').toLowerCase();
@@ -200,7 +200,25 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       img.getAttribute('alt') || '',
       img.getAttribute('title') || '',
     ]));
-    const nearbyNames = (node) => {
+    // Leaf texts inside the identity control itself (button children), without
+    // concatenating "Jane Doe" + "Team Plan" into one rejected/wrong candidate.
+    const nodeChildNames = (node) => {
+      const found = [];
+      if (!node || !node.querySelectorAll) return found;
+      for (const img of Array.from(node.querySelectorAll('img[alt], img[title]'))) {
+        if (!isVisible(img) || isExcluded(img)) continue;
+        found.push(img.getAttribute('alt') || '');
+        found.push(img.getAttribute('title') || '');
+      }
+      for (const el of Array.from(node.querySelectorAll('span, div, p, strong, b'))) {
+        if (!isVisible(el) || isExcluded(el)) continue;
+        if (el.closest && el.closest('a, input')) continue;
+        if (el.querySelector && el.querySelector('button, a, input, span, div, p')) continue;
+        found.push(el.innerText || el.textContent || '');
+      }
+      return found;
+    };
+    const nearbyNames = (node, allowChromeAdjacent) => {
       const found = [];
       const pushLeaves = (root, tier) => {
         if (!root || root === node) return;
@@ -218,7 +236,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         }
       };
       // Local chip siblings beat chrome-adjacent sidebar copy. At aside/nav/header
-      // roots, only scan immediate adjacent siblings (containing-child aware).
+      // roots, only scan immediate adjacent siblings for real menu/trigger controls.
       let current = node.parentElement;
       for (let depth = 0; depth < 2 && current; depth += 1, current = current.parentElement) {
         const isChrome = Boolean(
@@ -228,15 +246,17 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           )
         );
         if (isChrome) {
-          const kids = Array.from(current.children);
-          let idx = kids.indexOf(node);
-          if (idx < 0) {
-            idx = kids.findIndex((child) => child.contains && child.contains(node));
-          }
-          if (idx >= 0) {
-            for (const sibling of [kids[idx - 1], kids[idx + 1]].filter(Boolean)) {
-              if (sibling.contains && sibling.contains(node)) continue;
-              pushLeaves(sibling, 'chromeAdjacent');
+          if (allowChromeAdjacent) {
+            const kids = Array.from(current.children);
+            let idx = kids.indexOf(node);
+            if (idx < 0) {
+              idx = kids.findIndex((child) => child.contains && child.contains(node));
+            }
+            if (idx >= 0) {
+              for (const sibling of [kids[idx - 1], kids[idx + 1]].filter(Boolean)) {
+                if (sibling.contains && sibling.contains(node)) continue;
+                pushLeaves(sibling, 'chromeAdjacent');
+              }
             }
           }
           break;
@@ -282,6 +302,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         // Loose user/avatar chrome alone never becomes an identity anchor.
         const isIdentityAnchor = hasAccountProfile || hasStrong;
         if (!isIdentityAnchor && (isMenuButton || looseUserOnly)) continue;
+        // Bare Account/Profile nav labels must not harvest unrelated chromeAdjacent text.
+        const allowChromeAdjacent = isMenuButton || hasStrong;
         const scored = [];
         const pushCandidate = (raw, tier) => {
           const candidate = clean(raw);
@@ -293,13 +315,20 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           scored.push({ value: candidate, tier });
         };
         for (const text of labelledByTexts) pushCandidate(text, 'local');
-        for (const item of nearbyNames(node)) pushCandidate(item.text, item.tier);
+        for (const item of nearbyNames(node, allowChromeAdjacent)) {
+          pushCandidate(item.text, item.tier);
+        }
         for (const text of imageNames(node)) pushCandidate(text, 'local');
         for (const text of attributeNames(node)) pushCandidate(text, 'local');
+        const childTexts = nodeChildNames(node);
+        if (childTexts.length) {
+          for (const text of childTexts) pushCandidate(text, 'local');
+        } else {
+          pushCandidate(node.innerText || node.textContent || '', 'local');
+        }
         // aria/title are chrome metadata; keep only if they look like a display name.
         pushCandidate(ariaLabel, 'chromeMeta');
         pushCandidate(title, 'chromeMeta');
-        pushCandidate(node.innerText || node.textContent || '', 'local');
         if (scored.length) {
           // Prefer higher tiers first. Apply non-initial preference inside each
           // tier only, so local "JD" is not discarded for chromeAdjacent copy.
