@@ -138,7 +138,23 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
-    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제)$|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?)/i;
+    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제)$|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization)/i;
+    const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)/i;
+    const looksLikeDisplayName = (value) => {
+      if (!value || accountChromePhrase.test(value)) return false;
+      const words = String(value).trim().split(/\s+/).filter(Boolean);
+      if (words.length < 1 || words.length > 4) return false;
+      return /^[\p{L}\p{M}\d\s.'-]+$/u.test(value);
+    };
+    const expandCandidates = (raw) => {
+      const cleaned = clean(raw);
+      if (!cleaned) return [];
+      const splitPlan = cleaned.match(
+        /^(.*?)\s+((?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)$/i
+      );
+      if (splitPlan && splitPlan[1]) return [splitPlan[1], splitPlan[2]];
+      return [cleaned];
+    };
     // Reject control-like ids: kebab/snake/camel with menu|button|trigger|chip.
     const isChromeControlId = (value) => {
       const lower = String(value || '').toLowerCase();
@@ -200,11 +216,18 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       img.getAttribute('alt') || '',
       img.getAttribute('title') || '',
     ]));
-    // Leaf texts inside the identity control itself (button children), without
-    // concatenating "Jane Doe" + "Team Plan" into one rejected/wrong candidate.
+    // Leaf texts inside the identity control itself, including direct text nodes
+    // (e.g. "Jane Doe<span>Team Plan</span>") without concatenating siblings.
     const nodeChildNames = (node) => {
       const found = [];
-      if (!node || !node.querySelectorAll) return found;
+      if (!node) return found;
+      for (const child of Array.from(node.childNodes || [])) {
+        if (child.nodeType === 3) {
+          const text = clean(child.textContent || '');
+          if (text) found.push(text);
+        }
+      }
+      if (!node.querySelectorAll) return found;
       for (const img of Array.from(node.querySelectorAll('img[alt], img[title]'))) {
         if (!isVisible(img) || isExcluded(img)) continue;
         found.push(img.getAttribute('alt') || '');
@@ -302,17 +325,21 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         // Loose user/avatar chrome alone never becomes an identity anchor.
         const isIdentityAnchor = hasAccountProfile || hasStrong;
         if (!isIdentityAnchor && (isMenuButton || looseUserOnly)) continue;
-        // Bare Account/Profile nav labels must not harvest unrelated chromeAdjacent text.
-        const allowChromeAdjacent = isMenuButton || hasStrong;
+        // Bare Account/Profile (even with aria-haspopup) must not harvest chromeAdjacent.
+        // Only strong menu/trigger controls may scan aside/nav adjacent siblings.
+        const allowChromeAdjacent = hasStrong;
         const scored = [];
         const pushCandidate = (raw, tier) => {
-          const candidate = clean(raw);
-          if (!candidate || candidate.length > 40 || /@/.test(candidate)) return;
-          if (genericLabel.test(candidate) || usageNoise.test(candidate)) return;
-          if (isChromeControlId(candidate)) return;
-          if (seen.has(candidate)) return;
-          seen.add(candidate);
-          scored.push({ value: candidate, tier });
+          for (const piece of expandCandidates(raw)) {
+            const candidate = clean(piece);
+            if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
+            if (genericLabel.test(candidate) || usageNoise.test(candidate)) continue;
+            if (accountChromePhrase.test(candidate)) continue;
+            if (isChromeControlId(candidate)) continue;
+            if (seen.has(candidate)) continue;
+            seen.add(candidate);
+            scored.push({ value: candidate, tier });
+          }
         };
         for (const text of labelledByTexts) pushCandidate(text, 'local');
         for (const item of nearbyNames(node, allowChromeAdjacent)) {
@@ -338,7 +365,9 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             const items = scored.filter((item) => item.tier === tier);
             if (!items.length) continue;
             const preferred = items.filter((item) => !isInitials(item.value));
-            const pool = preferred.length ? preferred : items;
+            const nonInitial = preferred.length ? preferred : items;
+            const named = nonInitial.filter((item) => looksLikeDisplayName(item.value));
+            const pool = named.length ? named : nonInitial;
             pool.sort((left, right) => right.value.length - left.value.length);
             return pool[0].value;
           }

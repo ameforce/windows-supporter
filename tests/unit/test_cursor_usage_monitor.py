@@ -1510,6 +1510,56 @@ Resets Aug 13, 2026
         )
         self.assertEqual(button_child_email.get("profileName"), "Jane Doe")
 
+        bare_account_menu_adjacent = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="Account" '
+                    'aria-haspopup="menu">Account</button>'
+                    "<div>Organization</div>"
+                )
+            )
+        )
+        self.assertEqual(bare_account_menu_adjacent.get("profileName"), "")
+
+        direct_text_with_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "Jane Doe"
+                    "<span>Team Plan</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(direct_text_with_child.get("profileName"), "Jane Doe")
+
+        member_since_noise = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    "<div><span>Member since July</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(member_since_noise.get("profileName"), "Jane Doe")
+
+        concatenated_plan = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe Team Plan</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(concatenated_plan.get("profileName"), "Jane Doe")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",
