@@ -1422,6 +1422,58 @@ Resets Aug 13, 2026
         )
         self.assertEqual(local_beats_adjacent.get("profileName"), "Jane Doe")
 
+        local_cta_noise = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    "<div><span>Manage your subscription</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(local_cta_noise.get("profileName"), "Jane Doe")
+
+        korean_plan = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>김종인</span></div>"
+                    "<div><span>팀 플랜</span></div>"
+                    '<button type="button" aria-label="사용자 메뉴" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(korean_plan.get("profileName"), "김종인")
+
+        camel_meta = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="accountMenuButton" '
+                    'aria-haspopup="menu" title="user_menu_trigger"></button>'
+                )
+            )
+        )
+        self.assertEqual(camel_meta.get("profileName"), "")
+
+        local_initials_beat_adjacent = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>JD</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                    "<div>Upgrade your subscription</div>"
+                )
+            )
+        )
+        self.assertEqual(local_initials_beat_adjacent.get("profileName"), "JD")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",

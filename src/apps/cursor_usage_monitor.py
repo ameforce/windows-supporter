@@ -138,12 +138,24 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
-    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정)$)/i;
-    // Reject control-like kebab chrome (user-menu-trigger), not display names (anne-marie).
-    const isChromeControlSlug = (value) => (
-      /^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(value)
-      && /(?:^|-)(?:menu|button|trigger|chip|testid|avatar|picture|photo)(?:-|$)/.test(value)
-    );
+    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정)$|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?)/i;
+    // Reject control-like ids: kebab/snake/camel with menu|button|trigger|chip.
+    const isChromeControlId = (value) => {
+      const lower = String(value || '').toLowerCase();
+      if (/^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(lower)
+          && /(?:^|-)(?:menu|button|trigger|chip|testid|avatar|picture|photo)(?:-|$)/.test(lower)) {
+        return true;
+      }
+      if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(lower)
+          && /(?:^|_)(?:menu|button|trigger|chip|testid|avatar)(?:_|$)/.test(lower)) {
+        return true;
+      }
+      if (/^[A-Za-z]+(?:[A-Z][a-z0-9]+)+$/.test(value)
+          && /(?:Menu|Button|Trigger|Chip|Avatar|TestId)/.test(value)) {
+        return true;
+      }
+      return false;
+    };
     const selectors = [
       '[aria-label*="user menu" i]',
       '[aria-label*="account menu" i]',
@@ -275,7 +287,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           const candidate = clean(raw);
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) return;
           if (genericLabel.test(candidate) || usageNoise.test(candidate)) return;
-          if (isChromeControlSlug(candidate)) return;
+          if (isChromeControlId(candidate)) return;
           if (seen.has(candidate)) return;
           seen.add(candidate);
           scored.push({ value: candidate, tier });
@@ -289,16 +301,18 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         pushCandidate(title, 'chromeMeta');
         pushCandidate(node.innerText || node.textContent || '', 'local');
         if (scored.length) {
-          const tierRank = { local: 0, chromeAdjacent: 1, chromeMeta: 2 };
+          // Prefer higher tiers first. Apply non-initial preference inside each
+          // tier only, so local "JD" is not discarded for chromeAdjacent copy.
+          const tierOrder = ['local', 'chromeAdjacent', 'chromeMeta'];
           const isInitials = (value) => /^[A-Za-z]{1,2}$/.test(value);
-          const preferred = scored.filter((item) => !isInitials(item.value));
-          const pool = preferred.length ? preferred : scored;
-          pool.sort((left, right) => {
-            const tierDelta = (tierRank[left.tier] ?? 9) - (tierRank[right.tier] ?? 9);
-            if (tierDelta !== 0) return tierDelta;
-            return right.value.length - left.value.length;
-          });
-          return pool[0].value;
+          for (const tier of tierOrder) {
+            const items = scored.filter((item) => item.tier === tier);
+            if (!items.length) continue;
+            const preferred = items.filter((item) => !isInitials(item.value));
+            const pool = preferred.length ? preferred : items;
+            pool.sort((left, right) => right.value.length - left.value.length);
+            return pool[0].value;
+          }
         }
       }
     }

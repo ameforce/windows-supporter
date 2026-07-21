@@ -68,3 +68,12 @@
 | `user-menu` testid 스킵 | strong cue가 `usermenu`/`user menu`만 허용 | kebab/underscore menu 표기 누락 | `user-menu`/`user_menu` strong cue 허용 |
 
 유사 스캔: `user_menu`, lowercase hyphen display attrs, labelledby-only Account menu, chip+Upgrade adjacent.
+
+### Round-11 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| chip 안 CTA가 이름 압도 | 동일 local tier에서 최장 문자열 | CTA/구독 문구를 noise로 안 거름 | subscription/manage/upgrade(+KO) noise |
+| `팀 플랜`이 짧은 한글 이름 압도 | EN plan만 noise | locale plan 미포함 | `팀/프로/… 플랜` noise |
+| `accountMenuButton` 후보 채택 | kebab-only control filter | camel/snake control id 미차단 | camel/snake control id 거부 |
+| local `JD` < adjacent Upgrade | non-initial을 tier 횡단 적용 | initials 선호가 tier 계약을 깨뜨림 | tier별 non-initial 선호 후 상위 tier 우선 |
