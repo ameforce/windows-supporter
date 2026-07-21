@@ -77,3 +77,14 @@
 | `팀 플랜`이 짧은 한글 이름 압도 | EN plan만 noise | locale plan 미포함 | `팀/프로/… 플랜` noise |
 | `accountMenuButton` 후보 채택 | kebab-only control filter | camel/snake control id 미차단 | camel/snake control id 거부 |
 | local `JD` < adjacent Upgrade | non-initial을 tier 횡단 적용 | initials 선호가 tier 계약을 깨뜨림 | tier별 non-initial 선호 후 상위 tier 우선 |
+
+### Round-16 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| nested wrapper + Privacy Policy → 오탐 | depth≥1 sibling를 unrestricted local로 채택 | footer/legal chrome과 display-name 경계 없음 | depth>0는 `looksLikeDisplayName`만 통과 + privacy/terms noise |
+| hidden `aria-labelledby` cue 무시 | labelledby ref에 `isVisible` 요구 | a11y name은 offscreen이 흔함 | labelledby는 exclude만 검사, visibility 비요구 |
+| `▾`/nav junk fallback | display-name 실패 시 non-initial longest 반환 | return 가드가 soft preference였음 | tier별 `looksLikeDisplayName` 필수 후 선택 |
+| `<span>Jane</span><span>Doe</span>` 부분명 | leaf를 개별 후보만 등록 | split name join 경로 없음 | 2–3 single-word leaf를 join한 전체명 후보 |
+
+유사 스캔: nested name beside wrap>button 유지, Terms/Cookie/개인정보 방침 noise, initials(`JD`)는 display-name으로 허용, Members-only empty menu → 공란.

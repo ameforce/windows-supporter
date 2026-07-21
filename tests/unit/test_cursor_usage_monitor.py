@@ -1630,6 +1630,78 @@ Resets Aug 13, 2026
         )
         self.assertEqual(avatar_only_no_nav.get("profileName"), "")
 
+        nested_privacy_noise = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<div>"
+                    "<div>Privacy Policy</div>"
+                    "<div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(nested_privacy_noise.get("profileName"), "")
+
+        nested_wrapper_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    "<div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(nested_wrapper_name.get("profileName"), "Jane Doe")
+
+        hidden_labelledby_menu = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<span id="hidden-user-menu-label" style="display:none">'
+                    "User menu</span>"
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" '
+                    'aria-labelledby="hidden-user-menu-label" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(hidden_labelledby_menu.get("profileName"), "Jane Doe")
+
+        split_name_leaves = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane</span>"
+                    "<span>Doe</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_name_leaves.get("profileName"), "Jane Doe")
+
+        icon_glyph_only = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>▾</span>"
+                    "</button>"
+                    "<div>Members</div>"
+                )
+            )
+        )
+        self.assertEqual(icon_glyph_only.get("profileName"), "")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",

@@ -138,12 +138,14 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
-    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제|members?|usage|docs?|home|teams?)$|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization)/i;
+    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제|members?|usage|docs?|home|teams?|privacy|terms|cookies?)$|privacy\s*policy|terms\s+of\s+(?:service|use)|cookie\s+policy|(?:개인정보|이용약관|쿠키)\s*(?:처리\s*)?(?:방침|정책)?|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization)/i;
     const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|(?:current|active|selected|switch)\s+account|선택(?:된|한)?\s*계정|(?:현재|활성)\s*계정|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)/i;
     const looksLikeDisplayName = (value) => {
       if (!value || accountChromePhrase.test(value)) return false;
+      if (/^[A-Za-z]{1,2}$/.test(value)) return true;
       const words = String(value).trim().split(/\s+/).filter(Boolean);
       if (words.length < 1 || words.length > 4) return false;
+      if (words.some((word) => word.length === 1 && /[^\p{L}\p{M}]/u.test(word))) return false;
       return /^[\p{L}\p{M}\d\s.'-]+$/u.test(value);
     };
     const expandCandidates = (raw) => {
@@ -201,7 +203,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       for (const id of ids.split(/\s+/)) {
         if (!id) continue;
         const ref = document.getElementById(id);
-        if (!ref || !isVisible(ref) || isExcluded(ref)) continue;
+        // Accessible names may live on offscreen/hidden nodes.
+        if (!ref || isExcluded(ref)) continue;
         texts.push(ref.innerText || ref.textContent || '');
       }
       return texts;
@@ -238,6 +241,16 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (el.closest && el.closest('a, input')) continue;
         if (el.querySelector && el.querySelector('button, a, input, span, div, p')) continue;
         found.push(el.innerText || el.textContent || '');
+      }
+      // Join split name leaves: <span>Jane</span><span>Doe</span> -> "Jane Doe".
+      const tokens = found.map(clean).filter(Boolean);
+      const singleWords = tokens.filter((token) => (
+        token.split(/\s+/).length === 1
+        && /^[\p{L}\p{M}.'-]+$/u.test(token)
+        && !/^[A-Za-z]{1,2}$/.test(token)
+      ));
+      if (singleWords.length >= 2 && singleWords.length <= 3) {
+        found.push(singleWords.join(' '));
       }
       return found;
     };
@@ -287,6 +300,35 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         for (const sibling of Array.from(current.children)) {
           if (sibling === node) continue;
           if (depth > 0 && sibling.contains && sibling.contains(node)) continue;
+          // Nested wrappers still need local siblings (name beside wrap>button),
+          // but depth>0 only keeps display-name shaped leaves so Privacy Policy
+          // / footer chrome next to an empty User menu cannot win.
+          if (depth > 0) {
+            const nested = [];
+            const collect = (root) => {
+              if (!root || root === node) return;
+              if (root.matches && root.matches('button, a, input')) return;
+              for (const img of Array.from(root.querySelectorAll ? root.querySelectorAll('img[alt], img[title]') : [])) {
+                if (!isVisible(img) || isExcluded(img)) continue;
+                nested.push(img.getAttribute('alt') || '');
+                nested.push(img.getAttribute('title') || '');
+              }
+              for (const el of [root, ...Array.from(root.querySelectorAll('span, div, p, strong, b'))]) {
+                if (!isVisible(el) || isExcluded(el)) continue;
+                if (el.closest && el.closest('button, a, input')) continue;
+                if (el.querySelector && el.querySelector('button, a, input, span, div, p')) continue;
+                nested.push(el.innerText || el.textContent || '');
+              }
+            };
+            collect(sibling);
+            for (const text of nested) {
+              const candidate = clean(text);
+              if (candidate && looksLikeDisplayName(candidate)) {
+                found.push({ text: candidate, tier: 'local' });
+              }
+            }
+            continue;
+          }
           pushLeaves(sibling, 'local');
         }
       }
@@ -371,10 +413,11 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           for (const tier of tierOrder) {
             const items = scored.filter((item) => item.tier === tier);
             if (!items.length) continue;
-            const preferred = items.filter((item) => !isInitials(item.value));
-            const nonInitial = preferred.length ? preferred : items;
-            const named = nonInitial.filter((item) => looksLikeDisplayName(item.value));
-            const pool = named.length ? named : nonInitial;
+            // Never return icon/nav junk that fails the display-name guard.
+            const named = items.filter((item) => looksLikeDisplayName(item.value));
+            if (!named.length) continue;
+            const preferred = named.filter((item) => !isInitials(item.value));
+            const pool = preferred.length ? preferred : named;
             pool.sort((left, right) => right.value.length - left.value.length);
             return pool[0].value;
           }
