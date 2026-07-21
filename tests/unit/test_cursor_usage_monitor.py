@@ -2020,6 +2020,43 @@ Resets Aug 13, 2026
         )
         self.assertEqual(split_comma_name.get("profileName"), "Doe, Jane")
 
+        local_rejects_corporation = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    "<div><span>Acme Corporation</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(local_rejects_corporation.get("profileName"), "Jane Doe")
+
+        local_rejects_sign_out = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Sign Out</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(local_rejects_sign_out.get("profileName"), "")
+
+        img_anchor_alt = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<img data-testid="profile-avatar" alt="Jane Doe" '
+                    'src="about:blank" width="28" height="28" />'
+                )
+            )
+        )
+        self.assertEqual(img_anchor_alt.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

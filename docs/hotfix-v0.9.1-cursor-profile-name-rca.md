@@ -143,3 +143,12 @@
 | 5-split / `Doe,`+`Jane` 잘림 | join 상한 4 + comma 미허용 | looksLikeDisplayName보다 좁은 join 문법 | join 상한 8, 이름 구두점/comma leaf 허용 |
 
 유사 스캔: avatar initials는 단독 후보로 남고 longer `Jane Doe` 선호 유지, Business/Owner badge bare strip 후 제외 유지.
+
+### Round-23 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Acme Corporation` / auth chrome이 이름 압도 | local sibling이 letter-only면 display-name 통과 | org/auth chrome 축 누락 | corporation/company/inc… + sign/log out noise |
+| `<img data-testid=profile-avatar alt>` 공란 | `imageNames`가 descendant img만 질의 | anchor가 img 자체인 경로 누락 | self-img alt/title도 후보로 수집 |
+
+유사 스캔: Sign Out만 있는 chip → 공란, LLC/Ltd/GmbH org suffix, profile-avatar img anchor.
