@@ -152,3 +152,12 @@
 | `<img data-testid=profile-avatar alt>` 공란 | `imageNames`가 descendant img만 질의 | anchor가 img 자체인 경로 누락 | self-img alt/title도 후보로 수집 |
 
 유사 스캔: Sign Out만 있는 chip → 공란, LLC/Ltd/GmbH org suffix, profile-avatar img anchor.
+
+### Round-24 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Jane 🌟` 등 emoji/기호 이름 거부 | display-name charset allowlist | Python sanitize가 허용하는 코드포인트를 JS가 선차단 | allowlist 폐기, control/URL 거부 + 최소 1 letter |
+
+유사 스캔: `Jane#1`/`Jane*` 허용, glyph-only/`▾`는 letter 부재로 계속 거부, org/auth chrome 거부는 유지.
+side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 않도록 separator 강제 + leading `_` control id 거부.

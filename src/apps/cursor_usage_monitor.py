@@ -147,10 +147,12 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       const words = String(value).trim().split(/\s+/).filter(Boolean);
       // Allow particle-heavy names (e.g. "Juan Carlos de la Vega").
       if (words.length < 1 || words.length > 8) return false;
-      if (words.some((word) => word.length === 1 && /[^\p{L}\p{M}]/u.test(word))) return false;
-      // Keep common display punctuation across ASCII and Unicode forms:
-      // "Doe, Jane", "O’Connor", "Anne–Marie", "Jean・Luc", "Jane（Work）".
-      return /^[\p{L}\p{M}\d\s.'\-,·・()（）\u2010-\u2015\u2018-\u2019\u201C-\u201D]+$/u.test(value);
+      // Reject controls/URL junk, but do not whitelist code points: emoji and
+      // symbols that Python sanitize_profile_name keeps (e.g. "Jane 🌟") must pass.
+      if (/[\u0000-\u001F\u007F]/.test(value)) return false;
+      if (/[<>{}\\`]|https?:\/\/|www\./i.test(value)) return false;
+      if (!/\p{L}/u.test(value)) return false;
+      return true;
     };
     const expandCandidates = (raw) => {
       let cleaned = clean(raw);
@@ -166,14 +168,15 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       if (accountChromePhrase.test(cleaned)) return [cleaned];
       // Mirror Python sanitize_profile_name prefixes so aria/title values like
       // "Account menu: Jane Doe" become display-name shaped before ranking.
-      // Only strip when a menu/account prefix marker is present.
-      if (/(?:menu|메뉴|[:：])|(?:^(?:my|your|edit|switch|view|open)\s+(?:account|profile))|(?:^(?:내|나의)\s*(?:계정|프로필))|(?:^(?:account|profile|user)\s+menu)|(?:^(?:profile|account|user|프로필|계정)\s*[:：\-])/i.test(cleaned)) {
+      // Require real separators so snake/camel control ids (user_menu_trigger)
+      // are not rewritten into leftovers like "_menu_trigger".
+      if (/(?:^|[^a-z0-9_])(?:menu|메뉴)(?:[^a-z0-9_]|$)|[:：]|(?:^(?:my|your|edit|switch|view|open)\s+(?:account|profile))|(?:^(?:내|나의)\s*(?:계정|프로필))|(?:^(?:account|profile|user)\s+menu)|(?:^(?:profile|account|user|프로필|계정)\s*[:：\-])/i.test(cleaned)) {
         cleaned = cleaned
           .replace(/^(?:account|profile|user)\s+menu\s*[:：\-]?\s*/i, '')
           .replace(/^(?:계정|프로필|사용자)\s*메뉴\s*[:：\-]?\s*/i, '')
           .replace(/^(?:my|your|edit|switch|view|open)\s+(?:account|profile)\s*[:：\-]?\s*/i, '')
           .replace(/^(?:내|나의)\s*(?:계정|프로필)\s*[:：\-]?\s*/i, '')
-          .replace(/^(?:profile|account|user|menu|open|프로필|계정|사용자|메뉴)\s*[:：\-]?\s*/i, '')
+          .replace(/^(?:profile|account|user|menu|open|프로필|계정|사용자|메뉴)(?:\s*[:：\-]\s*|\s+)/i, '')
           .trim();
       }
       if (!cleaned) return [];
@@ -186,7 +189,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           && /(?:^|-)(?:menu|button|trigger|chip|testid|avatar|picture|photo)(?:-|$)/.test(lower)) {
         return true;
       }
-      if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(lower)
+      if (/^_?[a-z0-9]+(?:_[a-z0-9]+)+$/.test(lower)
           && /(?:^|_)(?:menu|button|trigger|chip|testid|avatar)(?:_|$)/.test(lower)) {
         return true;
       }

@@ -1948,6 +1948,30 @@ Resets Aug 13, 2026
             "Jane\uff08Work\uff09",
         )
 
+        emoji_display_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane \U0001f31f</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(emoji_display_name.get("profileName"), "Jane \U0001f31f")
+
+        symbol_display_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane#1</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(symbol_display_name.get("profileName"), "Jane#1")
+
         split_short_initial_name = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
