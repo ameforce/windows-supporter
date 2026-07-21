@@ -134,3 +134,12 @@
 | `O’Connor` / `Anne–Marie` / `Jane（Work）` 거부 | charset이 ASCII/`・`/`()`에 국한 | Unicode 이름 구두점 축 누락 | curly quote·en/em dash·전각 괄호 허용 |
 
 유사 스캔: hyphen/en-dash 계열 `\u2010-\u2015`, quotes `\u2018-\u2019`/`\u201C-\u201D`, split leaf에도 dash/apostrophe 허용.
+
+### Round-22 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `JD`+`Jane`+`Doe` → `JD Jane Doe` | join이 img alt를 text leaf와 섞음 | avatar metadata와 DOM text join 경계 없음 | join은 textLeaves만 사용, img는 단독 후보 |
+| 5-split / `Doe,`+`Jane` 잘림 | join 상한 4 + comma 미허용 | looksLikeDisplayName보다 좁은 join 문법 | join 상한 8, 이름 구두점/comma leaf 허용 |
+
+유사 스캔: avatar initials는 단독 후보로 남고 longer `Jane Doe` 선호 유지, Business/Owner badge bare strip 후 제외 유지.

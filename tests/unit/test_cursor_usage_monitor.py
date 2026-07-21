@@ -1974,6 +1974,52 @@ Resets Aug 13, 2026
         )
         self.assertEqual(split_short_particle_name.get("profileName"), "Li Wei")
 
+        split_ignores_avatar_initials = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img src="about:blank" alt="JD" width="24" height="24" />'
+                    "<span>Jane</span>"
+                    "<span>Doe</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_ignores_avatar_initials.get("profileName"), "Jane Doe")
+
+        split_five_word_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Juan</span>"
+                    "<span>Carlos</span>"
+                    "<span>de</span>"
+                    "<span>la</span>"
+                    "<span>Vega</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(
+            split_five_word_name.get("profileName"),
+            "Juan Carlos de la Vega",
+        )
+
+        split_comma_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Doe,</span>"
+                    "<span>Jane</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_comma_name.get("profileName"), "Doe, Jane")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

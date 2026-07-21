@@ -244,11 +244,17 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     // (e.g. "Jane Doe<span>Team Plan</span>") without concatenating siblings.
     const nodeChildNames = (node) => {
       const found = [];
+      // Join only textual leaves. Image alt/title stay as separate candidates so
+      // avatar initials like "JD" never concatenate into "JD Jane Doe".
+      const textLeaves = [];
       if (!node) return found;
       for (const child of Array.from(node.childNodes || [])) {
         if (child.nodeType === 3) {
           const text = clean(child.textContent || '');
-          if (text) found.push(text);
+          if (text) {
+            found.push(text);
+            textLeaves.push(text);
+          }
         }
       }
       if (!node.querySelectorAll) return found;
@@ -261,24 +267,30 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (!isVisible(el) || isExcluded(el)) continue;
         if (el.closest && el.closest('a, input')) continue;
         if (el.querySelector && el.querySelector('button, a, input, span, div, p')) continue;
-        found.push(el.innerText || el.textContent || '');
+        const text = el.innerText || el.textContent || '';
+        found.push(text);
+        textLeaves.push(text);
       }
       // Join split name leaves: <span>Jane</span><span>Doe</span> -> "Jane Doe".
       // Drop plan/role/status chrome leaves first so "Jane"+"Doe"+"Business|Owner"
       // cannot reconstruct as a longer bogus name.
       const planOrBadgeLeaf = /^(?:team|pro|business|enterprise|free|hobby|plus|ultra|프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비|plan|플랜|owner|admin|trial|member|viewer|guest|moderator|editor|collaborator|manager|관리자|소유자|멤버|체험)$/i;
-      const tokens = found.map(clean).filter(Boolean);
+      const nameLeafChars = /^[\p{L}\p{M}\d.'\-,·・（）\u2010-\u2015\u2018-\u2019\u201C-\u201D]+$/u;
+      const tokens = textLeaves.map(clean).filter(Boolean);
       // Keep short name particles ("J", "Li") when joining split leaves; only
       // require at least one non-initial token so "J"+"D" does not invent a name.
-      const singleWords = tokens.filter((token) => (
-        token.split(/\s+/).length === 1
-        && /^[\p{L}\p{M}.'\-\u2010-\u2015\u2018-\u2019]+$/u.test(token)
-        && !planOrBadgeLeaf.test(token)
-        && !usageNoise.test(token)
-        && !accountChromePhrase.test(token)
-      ));
-      const hasNonInitial = singleWords.some((token) => !/^[A-Za-z]{1,2}$/.test(token));
-      if (hasNonInitial && singleWords.length >= 2 && singleWords.length <= 4) {
+      // Cap matches looksLikeDisplayName (up to 8 words) for multipart names.
+      const singleWords = tokens.filter((token) => {
+        if (token.split(/\s+/).length !== 1 || !nameLeafChars.test(token)) return false;
+        const bare = token.replace(/[,\u2010-\u2015.（）()]+$/u, '');
+        if (!bare) return false;
+        if (planOrBadgeLeaf.test(token) || planOrBadgeLeaf.test(bare)) return false;
+        if (usageNoise.test(token) || usageNoise.test(bare)) return false;
+        if (accountChromePhrase.test(token) || accountChromePhrase.test(bare)) return false;
+        return true;
+      });
+      const hasNonInitial = singleWords.some((token) => !/^[A-Za-z]{1,2}$/.test(token.replace(/[,\u2010-\u2015.（）()]+$/u, '')));
+      if (hasNonInitial && singleWords.length >= 2 && singleWords.length <= 8) {
         found.push(singleWords.join(' '));
       }
       return found;
