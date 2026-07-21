@@ -133,7 +133,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
   ).slice(0, 4).join(' ');
   const collectProfileName = () => {
     const identityCue = /(?:^|[^a-z0-9])(?:profile|account|프로필|계정|avatar|user)(?:[^a-z0-9]|$)|(?:profile|account|avatar|user)(?:menu|button|trigger|chip)/i;
-    const strongMenuCue = /(?:user|account|profile|프로필|계정)\s*menu|(?:user|account|profile)menu/i;
+    const strongMenuCue = /(?:user|account|profile|프로필|계정)\s*menu|(?:user|account|profile)menu|(?:프로필|계정)\s*메뉴/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴)$/i;
     const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra)$)/i;
     const componentSlug = /^[a-z0-9]+(?:-[a-z0-9]+)+$/i;
