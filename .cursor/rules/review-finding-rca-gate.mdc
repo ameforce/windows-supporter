@@ -7,12 +7,19 @@ alwaysApply: true
 
 P0/P1/P2 finding이 나온 뒤에는 `@codex review`와 독립 reviewer subagent를 바로 다시 호출하지 않는다.
 
+## Cursor final review 순서
+
+1. 완성된 head에서 독립 reviewer를 먼저 1회 호출한다.
+2. 독립 리뷰가 `P0=0, P1=0, P2=0`일 때만 `@codex review`를 1회 호출한다.
+3. 독립 리뷰에 P0/P1/P2가 있으면 `@codex review`를 호출하지 않고 RCA 게이트로 수정한다.
+
 ## 금지
 
 - 지적된 줄만 고치고 즉시 재리뷰
 - reviewer 문구를 코드/테스트에 옮겨 넣고 같은 round를 재요청
 - “확인용” incremental / exploratory review 호출
 - finding 해석이나 패치 검증을 독립 reviewer에게 위임
+- 독립 리뷰 미통과 head에서 `@codex review` 호출
 
 ## 새 review key 생성 전 필수
 

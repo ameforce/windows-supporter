@@ -147,7 +147,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       // Allow particle-heavy names (e.g. "Juan Carlos de la Vega").
       if (words.length < 1 || words.length > 8) return false;
       if (words.some((word) => word.length === 1 && /[^\p{L}\p{M}]/u.test(word))) return false;
-      return /^[\p{L}\p{M}\d\s.'-]+$/u.test(value);
+      // Keep common display punctuation: "Doe, Jane", "Jean・Luc", "Jane (Work)".
+      return /^[\p{L}\p{M}\d\s.'\-,·・()]+$/u.test(value);
     };
     const expandCandidates = (raw) => {
       let cleaned = clean(raw);
@@ -266,15 +267,17 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       // cannot reconstruct as a longer bogus name.
       const planOrBadgeLeaf = /^(?:team|pro|business|enterprise|free|hobby|plus|ultra|프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비|plan|플랜|owner|admin|trial|member|viewer|guest|moderator|editor|collaborator|manager|관리자|소유자|멤버|체험)$/i;
       const tokens = found.map(clean).filter(Boolean);
+      // Keep short name particles ("J", "Li") when joining split leaves; only
+      // require at least one non-initial token so "J"+"D" does not invent a name.
       const singleWords = tokens.filter((token) => (
         token.split(/\s+/).length === 1
         && /^[\p{L}\p{M}.'-]+$/u.test(token)
-        && !/^[A-Za-z]{1,2}$/.test(token)
         && !planOrBadgeLeaf.test(token)
         && !usageNoise.test(token)
         && !accountChromePhrase.test(token)
       ));
-      if (singleWords.length >= 2 && singleWords.length <= 3) {
+      const hasNonInitial = singleWords.some((token) => !/^[A-Za-z]{1,2}$/.test(token));
+      if (hasNonInitial && singleWords.length >= 2 && singleWords.length <= 4) {
         found.push(singleWords.join(' '));
       }
       return found;

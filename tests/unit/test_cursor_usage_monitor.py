@@ -1873,6 +1873,68 @@ Resets Aug 13, 2026
         )
         self.assertEqual(avatar_menu_no_alt_no_adjacent.get("profileName"), "")
 
+        punctuated_comma_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Doe, Jane</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(punctuated_comma_name.get("profileName"), "Doe, Jane")
+
+        punctuated_middot_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jean・Luc</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(punctuated_middot_name.get("profileName"), "Jean・Luc")
+
+        punctuated_paren_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane (Work)</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(punctuated_paren_name.get("profileName"), "Jane (Work)")
+
+        split_short_initial_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>J</span>"
+                    "<span>Doe</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_short_initial_name.get("profileName"), "J Doe")
+
+        split_short_particle_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Li</span>"
+                    "<span>Wei</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_short_particle_name.get("profileName"), "Li Wei")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

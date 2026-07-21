@@ -117,3 +117,12 @@
 | Avatar menu + img alt 공란 | looseUserOnly early-continue | local img alt 예외 없음 | menu+avatar/user + display-name alt는 local-only harvest |
 
 유사 스캔: `나의 프로필` adjacent, avatar empty alt는 Feedback chromeAdjacent 불가, multipart ES/EN names.
+
+### Round-20 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Doe, Jane` / `Jean・Luc` / `Jane (Work)` 거부 | display-name charset이 구두점 미허용 | 가드가 letter/digit/space만 허용 | `,` `·` `・` `()` 허용 |
+| `J`+`Doe` / `Li`+`Wei` 잘림 | join이 ASCII 1–2글자 leaf 제외 | initials 배제가 join 경로까지 적용됨 | short leaf 허용, non-initial 1개 이상일 때만 join |
+
+유사 스캔: `J`+`D` only-initial join 불가 유지, Business/Owner badge join 제외 유지.

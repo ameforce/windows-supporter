@@ -60,7 +60,7 @@ class PullRequestReviewContractTest(unittest.TestCase):
         self.assertNotIn("review_evidence_digest", template)
         self.assertNotIn("`<URL> / review `", template)
 
-    def test_agents_contract_requires_complete_head_before_parallel_final_reviews(self) -> None:
+    def test_agents_contract_requires_complete_head_before_sequenced_final_reviews(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
         for required_text in (
@@ -75,12 +75,13 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "top-level zero-finding 댓글",
             "`Reviewed commit` prefix",
             "base ref, 최신 base SHA와 head SHA",
-            "native Codex subagent",
+            "native 독립 review",
             "`gpt-5.6-sol`",
             "reasoning `high`",
-            "동시에 시작",
-            "결과를 격리",
-            "둘 다 terminal",
+            "독립 reviewer 먼저",
+            "통과 후에만",
+            "finding과 결론은 서로 전달하지 않는다",
+            "terminal이 될 때까지",
             "head를 바꾸지 않는다",
             "review key",
             "중복 요청",
@@ -178,7 +179,7 @@ class PullRequestReviewContractTest(unittest.TestCase):
             "무효 finding은 직접 반증",
             "P3 미수정은 허용",
             "미완성 head에는 final review를 요청하지 않는다",
-            "두 final review를 동시에 시작",
+            "독립 reviewer를 먼저 시작하고",
             "동일 review key를 중복 사용하지 않는다",
         ):
             with self.subTest(required_text=required_text):

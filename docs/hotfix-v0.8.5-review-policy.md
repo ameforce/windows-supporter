@@ -22,10 +22,10 @@
 ## final review 불변조건
 
 - 미완성 head에는 final review를 요청하지 않는다.
-- 두 final review를 동시에 시작하고 결과를 격리한다.
-- 두 review가 terminal이 되기 전에는 head를 바꾸지 않는다.
+- Cursor/local에서는 독립 reviewer를 먼저 시작하고, `P0=P1=P2=0`일 때만 `@codex review`를 호출한다. 두 리뷰의 finding/결론은 서로 전달하지 않는다.
+- 각 review가 terminal이 되기 전에는 그 exact head를 바꾸지 않는다.
 - 동일 review key를 중복 사용하지 않는다. connector 명시 오류만 같은 key 1회 재시도를 허용한다.
-- 새 finding으로 head가 바뀌면 main Codex가 RCA와 전체 검증을 다시 끝낸 후 새 key에서 두 review를 반복한다.
+- 새 finding으로 head가 바뀌면 main Codex가 RCA와 전체 검증을 다시 끝낸 후 새 key에서 독립 review를 먼저 반복하고, 통과한 뒤에만 `@codex review`를 반복한다.
 
 ## raw finding 판정 사례
 
