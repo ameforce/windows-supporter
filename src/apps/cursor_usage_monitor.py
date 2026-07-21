@@ -177,7 +177,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             ''
           )
           .replace(
-            /^(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)(?:\.?\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・•●…]\s*|\s+)/i,
+            /^(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)(?:\.?\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・•●○∙…]\s*|\.{2,}|\s+)/i,
             ''
           )
           .replace(
@@ -185,11 +185,12 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             ''
           )
           .replace(
-            /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・•●…]\s*|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
+            /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・•●○∙…]\s*|\.{2,}|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
             ''
           )
           // Drop leftover separators after status removal (bullets/ellipsis included).
-          .replace(/\s*[:：.\[\]\-\u2010-\u2015|/·・•●…]+$/u, '')
+          .replace(/\s*[:：.\[\]\-\u2010-\u2015|/·・•●○∙…]+$/u, '')
+          .replace(/\.{2,}$/u, '')
           .trim();
         return text;
       };
@@ -564,7 +565,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             const normalizeNameWord = (word) => String(word || '')
               .toLowerCase()
               .replace(
-                /^[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・•●…|/]+|[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・•●…|/]+$/gu,
+                /^[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・•●○∙…|/]+|[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・•●○∙…|/]+$/gu,
                 ''
               );
             const nameWords = (value) => clean(value)
@@ -577,6 +578,12 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               || accountChromePhrase.test(word)
               || !/[\p{L}\p{N}]/u.test(word)
             );
+            // Prefer clean display names over siblings that still carry status
+            // separators (○/∙/…/...) after strip failures.
+            const nameChromeResidueScore = (value) => {
+              const hits = String(value || '').match(/[\-\u2010-\u2015|/•●○∙…\[\]]|\.{2,}/g);
+              return hits ? hits.join('').length : 0;
+            };
             const isPrefixName = (shorter, longer) => {
               const shortWords = nameWords(shorter);
               const longWords = nameWords(longer);
@@ -606,6 +613,10 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             pickFrom.sort((left, right) => {
               const bySource = (sourceRank[left.source] ?? 9) - (sourceRank[right.source] ?? 9);
               if (bySource) return bySource;
+              const byResidue = (
+                nameChromeResidueScore(left.value) - nameChromeResidueScore(right.value)
+              );
+              if (byResidue) return byResidue;
               const byOrder = (left.order ?? 0) - (right.order ?? 0);
               if (byOrder) return byOrder;
               return right.value.length - left.value.length;

@@ -233,3 +233,11 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `Jane Doe • Online` → `Jane Doe •`가 clean alt 압도 | strip separator에 bullet/ellipsis 부재 | UI bullet 축 누락 + punct-only extra를 fuller로 인정 | `•●…` separator/trailing cleanup + letter/digit 없는 extra 거부 |
 
 유사 스캔: `●`/`…` trailing status, clean alt vs `• Away`.
+
+### Round-33 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Jane Doe ○`가 clean `Jane Doe` 압도 | punct-only는 containment만 막고 length 정렬은 오염값 선호 | ○/∙/`...` separator 누락 + residue demotion 부재 | separator에 ○∙·`...` 추가, ranking에 chrome residue score 우선 |
+
+유사 스캔: `∙ Away` sibling, glued `Jane Doe...Online`.

@@ -2505,6 +2505,42 @@ Resets Aug 13, 2026
         )
         self.assertEqual(ellipsis_status_strips.get("profileName"), "Jane Doe")
 
+        # Polluted siblings must not beat a clean name via length.
+        white_circle_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe ○ Online</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(white_circle_yields_to_clean.get("profileName"), "Jane Doe")
+
+        bullet_operator_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe ∙ Away</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(bullet_operator_yields_to_clean.get("profileName"), "Jane Doe")
+
+        ascii_ellipsis_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe...Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(ascii_ellipsis_status_strips.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
