@@ -133,9 +133,10 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
   ).slice(0, 4).join(' ');
   const collectProfileName = () => {
     const identityCue = /(?:^|[^a-z0-9])(?:profile|account|프로필|계정|avatar|user|사용자)(?:[^a-z0-9]|$)|(?:profile|account|avatar|user)(?:menu|button|trigger|chip)/i;
-    const strongMenuCue = /(?:user|account|profile|사용자|프로필|계정)\s*menu|(?:user|account|profile)menu|(?:사용자|프로필|계정)\s*메뉴|(?:account|profile|user)(?:-)?(?:trigger|button|chip)/i;
-    const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대/i;
-    const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴)$/i;
+    // Account/profile anchors include menu, trigger/button/chip, and "My account"/"View profile".
+    const strongMenuCue = /(?:user|account|profile|사용자|프로필|계정)\s*menu|(?:user|account|profile)menu|(?:사용자|프로필|계정)\s*메뉴|(?:account|profile|user)(?:[_-])?(?:trigger|button|chip)|(?:my|your|edit|switch|view|open)\s+(?:account|profile)/i;
+    const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add\s+user|teammate/i;
+    const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
     const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정)$)/i;
     // Lowercase kebab ids only; keep Anne-Marie / Jean-Luc style display attrs.
     const componentSlug = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
@@ -200,14 +201,25 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           found.push(el.innerText || el.textContent || '');
         }
       };
-      // Stay inside the account chip / local chrome row. Do not climb to aside/nav
-      // and harvest unrelated sidebar labels.
+      // Stay inside the account chip / local chrome row. At aside/nav/header roots,
+      // only scan immediate adjacent siblings so Overview/Dashboard labels do not
+      // steal identity when the name sits next to the User menu button.
       let current = node.parentElement;
       for (let depth = 0; depth < 2 && current; depth += 1, current = current.parentElement) {
-        if (
+        const isChrome = Boolean(
           current.matches
-          && current.matches('aside, nav, header, main, [role="main"], [role="banner"], [role="navigation"]')
-        ) {
+          && current.matches(
+            'aside, nav, header, main, [role="main"], [role="banner"], [role="navigation"]'
+          )
+        );
+        if (isChrome) {
+          const kids = Array.from(current.children);
+          const idx = kids.indexOf(node);
+          if (idx >= 0) {
+            for (const sibling of [kids[idx - 1], kids[idx + 1]].filter(Boolean)) {
+              pushLeaves(sibling);
+            }
+          }
           break;
         }
         for (const sibling of Array.from(current.children)) {
@@ -231,15 +243,19 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (broadMenu && !hasCue) continue;
         if (!broadMenu && nodeIdentity && !hasCue) continue;
         if (rejectMenu.test(nodeIdentity)) continue;
+        const hasStrong = (
+          strongMenuCue.test(ariaLabel || '')
+          || strongMenuCue.test(testId || '')
+          || strongMenuCue.test(title || '')
+        );
         const isMenuButton = String(node.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu';
-        if (isMenuButton) {
-          const hasStrong = (
-            strongMenuCue.test(ariaLabel || '')
-            || strongMenuCue.test(testId || '')
-            || strongMenuCue.test(title || '')
-          );
-          if (!hasStrong) continue;
-        }
+        // Menu buttons and loose user/avatar CTAs both need an account-menu cue;
+        // otherwise "Add user" / invite chrome can steal profileName.
+        const looseUserAnchor = (
+          /(?:^|[^a-z0-9])(?:user|avatar|사용자)(?:[^a-z0-9]|$)/i.test(nodeIdentity)
+          && !/(?:account|profile|프로필|계정)/i.test(nodeIdentity)
+        );
+        if ((isMenuButton || looseUserAnchor) && !hasStrong) continue;
         const attrCandidates = attributeNames(node).map(clean).filter((candidate) => {
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) return false;
           if (genericLabel.test(candidate) || usageNoise.test(candidate)) return false;

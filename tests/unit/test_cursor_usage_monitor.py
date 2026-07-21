@@ -1180,6 +1180,86 @@ Resets Aug 13, 2026
         )
         self.assertEqual(broad_invite.get("profileName"), "Real Person")
 
+    def test_probe_keeps_identity_variants_and_rejects_loose_user_noise(self) -> None:
+        my_account = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" aria-label="My account" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(my_account.get("profileName"), "Jane Doe")
+
+        view_profile = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" aria-label="View profile" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(view_profile.get("profileName"), "Jane Doe")
+
+        profile_button = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" data-testid="profile_button" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(profile_button.get("profileName"), "Jane Doe")
+
+        add_user = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="Add user">'
+                    "Invite Teammates</button>"
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(add_user.get("profileName"), "Jane Doe")
+
+        generic_avatar = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img src="about:blank" alt="User avatar" width="24" height="24" />'
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(generic_avatar.get("profileName"), "")
+
+        aside_adjacent = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<span>Kim</span>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "<div>Overview</div>"
+                    "<div>Dashboard Settings Extra</div>"
+                )
+            )
+        )
+        self.assertEqual(aside_adjacent.get("profileName"), "Kim")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",
