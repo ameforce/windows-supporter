@@ -2322,6 +2322,64 @@ Resets Aug 13, 2026
         )
         self.assertEqual(first_name_alt_yields_to_last_first.get("profileName"), "Doe, Jane")
 
+        for status_leaf in (
+            "Active",
+            "Idle",
+            "Unavailable",
+            "Available",
+            "온라인",
+            "오프라인",
+            "자리비움",
+        ):
+            status_only = self._evaluate_probe_on_html(
+                self._usage_summary_html(
+                    identity_html=(
+                        '<button type="button" aria-label="User menu" '
+                        'aria-haspopup="menu">'
+                        f"<span>{status_leaf}</span></button>"
+                    )
+                )
+            )
+            self.assertEqual(
+                status_only.get("profileName"),
+                "",
+                msg=f"status leaf {status_leaf!r} must not become profileName",
+            )
+
+        leading_status_yields_to_alt = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe" src="about:blank" width="28" height="28" />'
+                    "<span>Online Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(leading_status_yields_to_alt.get("profileName"), "Jane Doe")
+
+        leading_paren_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>(Online) Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(leading_paren_status_strips.get("profileName"), "Jane Doe")
+
+        colon_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe: Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(colon_status_strips.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

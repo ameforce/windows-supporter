@@ -181,23 +181,27 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           .replace(/^(?:profile|account|user|menu|open|프로필|계정|사용자|메뉴)(?:\s*[:：\-]\s*|\s+)/i, '')
           .trim();
       }
-      // Strip trailing presence/status chrome in common chip forms:
-      // "Jane Doe Online", "Jane Doe (Online)", "Jane Doe - Online",
-      // "Jane Doe Available Now", and punctuated variants.
+      // Strip leading/trailing presence/status chrome in common chip forms:
+      // "Online Jane Doe", "(Online) Jane Doe", "Jane Doe Online",
+      // "Jane Doe (Online)", "Jane Doe: Online", "Jane Doe Available Now".
       cleaned = cleaned
+        .replace(
+          /^\s*[\(（]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s*[\)）]\.?\s*/i,
+          ''
+        )
+        .replace(
+          /^(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)(?:\.?\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)/i,
+          ''
+        )
         .replace(
           /\s*[\(（]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s*[\)）]\.?$/i,
           ''
         )
         .replace(
-          /\s*[\-\u2010-\u2015|/·・]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
+          /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
           ''
         )
-        .replace(
-          /\s+(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
-          ''
-        )
-        .replace(/\s*[\-\u2010-\u2015|/·・]+$/u, '')
+        .replace(/\s*[:：.\-\u2010-\u2015|/·・]+$/u, '')
         .trim();
       if (!cleaned) return [];
       return [cleaned];
@@ -323,6 +327,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (!bare) return false;
         if (planOrBadgeLeaf.test(token) || planOrBadgeLeaf.test(bare)) return false;
         if (usageNoise.test(token) || usageNoise.test(bare)) return false;
+        if (presenceStatusToken.test(token) || presenceStatusToken.test(bare)) return false;
         if (accountChromePhrase.test(token) || accountChromePhrase.test(bare)) return false;
         return true;
       });
@@ -446,6 +451,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           text
           && looksLikeDisplayName(text)
           && !usageNoise.test(text)
+          && !presenceStatusToken.test(text)
           && !accountChromePhrase.test(text)
           && !genericLabel.test(text)
         ));
@@ -476,7 +482,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           for (const piece of expandCandidates(raw)) {
             const candidate = clean(piece);
             if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
-            if (genericLabel.test(candidate) || usageNoise.test(candidate)) continue;
+            if (genericLabel.test(candidate) || usageNoise.test(candidate) || presenceStatusToken.test(candidate)) continue;
             if (accountChromePhrase.test(candidate)) continue;
             if (isChromeControlId(candidate)) continue;
             const existing = scored.find((item) => item.value === candidate);

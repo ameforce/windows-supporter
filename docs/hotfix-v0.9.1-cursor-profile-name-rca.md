@@ -206,3 +206,13 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `alt=Jane` vs `Doe, Jane` | leading-prefix만 domination | Last, First 단어 포함 관계 없음 | contained-name(모든 단어가 fuller에 포함) |
 
 유사 스캔: dirty status leaf가 clean leaf보다 앞서도 strip 후 동일 이름, delete account/지금 이용 가능도 whole-leaf noise.
+
+### Round-30 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Active`/`Idle`/`온라인` 단독 수락 | push가 usageNoise만 검사 | presenceStatusToken과 reject 게이트 분리 | push/avatar/join에 presenceStatusToken 거부 |
+| `Online Jane Doe`가 clean alt 압도 | leading status strip 없음 | trailing-only strip + contained-name | leading paren/bare status strip |
+| `Jane Doe:` 잔여 (P3) | colon separator 미처리 | trailing punct 정리 부족 | `: Online` strip + trailing `:` 제거 |
+
+유사 스캔: `(Online) Jane Doe`, `Offline`/`Unavailable`/`Available`/`자리비움` whole-leaf.
