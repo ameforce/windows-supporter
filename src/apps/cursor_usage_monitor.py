@@ -133,21 +133,26 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
   ).slice(0, 4).join(' ');
   const collectProfileName = () => {
     const identityCue = /(?:^|[^a-z0-9])(?:profile|account|프로필|계정|avatar|user)(?:[^a-z0-9]|$)/i;
+    const strongMenuCue = /(?:user|account|profile|프로필|계정)\s*menu/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴)$/i;
     const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby)\s+plan$)/i;
+    const componentSlug = /^[a-z0-9]+(?:-[a-z0-9]+)+$/i;
     const selectors = [
+      'aside button[aria-haspopup="menu"]',
+      '[aria-label*="user menu" i]',
+      '[aria-label*="account menu" i]',
+      '[aria-label*="profile menu" i]',
       '[data-testid*="profile" i]',
       '[data-testid*="account" i]',
-      '[data-testid*="user" i]',
       '[aria-label*="profile" i]',
       '[aria-label*="account" i]',
       '[aria-label*="프로필" i]',
       '[aria-label*="계정" i]',
+      '[data-testid*="user" i]',
       '[aria-label*="user" i]',
       '[aria-label*="avatar" i]',
       'header button[aria-haspopup="menu"]',
       'nav button[aria-haspopup="menu"]',
-      'aside button[aria-haspopup="menu"]',
       '[role="banner"] button[aria-haspopup="menu"]',
       'button[aria-haspopup="menu"]',
     ];
@@ -166,11 +171,10 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const attributeNames = (node) => ([
       node.getAttribute ? node.getAttribute('data-display-name') : '',
       node.getAttribute ? node.getAttribute('data-user-name') : '',
-      node.getAttribute ? node.getAttribute('data-name') : '',
     ]);
     const imageNames = (node) => Array.from(
       node.querySelectorAll ? node.querySelectorAll('img[alt], img[title]') : []
-    ).flatMap((img) => ([
+    ).filter((img) => isVisible(img) && !isExcluded(img)).flatMap((img) => ([
       img.getAttribute('alt') || '',
       img.getAttribute('title') || '',
     ]));
@@ -211,6 +215,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const seen = new Set();
     for (const selector of selectors) {
       const broadMenu = /aria-haspopup=["']menu["']/.test(selector);
+      const looseUserSelector = /data-testid\*="user"|aria-label\*="user"|aria-label\*="avatar"/.test(selector);
       for (const node of Array.from(document.querySelectorAll(selector))) {
         if (!isVisible(node) || isExcluded(node)) continue;
         const ariaLabel = node.getAttribute ? node.getAttribute('aria-label') : '';
@@ -226,13 +231,24 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (!broadMenu && nodeIdentity && !hasCue) {
           continue;
         }
+        // Loose "user"/"avatar" substring matches must be a real account menu, or an
+        // aside menu button. Avoid invite-user / "all users" chrome stealing identity.
+        if (looseUserSelector) {
+          const asideMenu = Boolean(
+            node.closest && node.closest('aside')
+            && String(node.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu'
+          );
+          if (!strongMenuCue.test(ariaLabel || '') && !strongMenuCue.test(testId || '') && !asideMenu) {
+            continue;
+          }
+        }
         // Chrome labels like "User menu" are identity anchors, not display names.
-        // Prefer data attrs, labelledby, img alt, nearby chrome text, then node text.
+        // Prefer labelledby/nearby/visible img, then display attrs, then node text.
         const rawCandidates = [
-          ...attributeNames(node),
           ...resolveLabelledBy(node),
-          ...imageNames(node),
           ...nearbyNames(node),
+          ...imageNames(node),
+          ...attributeNames(node),
           ariaLabel,
           title,
           node.innerText || node.textContent || '',
@@ -241,6 +257,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           const candidate = clean(raw);
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
           if (genericLabel.test(candidate) || usageNoise.test(candidate)) continue;
+          if (componentSlug.test(candidate)) continue;
           if (seen.has(candidate)) continue;
           seen.add(candidate);
           return candidate;

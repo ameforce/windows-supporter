@@ -1001,7 +1001,8 @@ Resets Aug 13, 2026
         data_named = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
-                    '<button type="button" data-testid="user-chip" '
+                    '<button type="button" data-testid="account-chip" '
+                    'aria-haspopup="menu" '
                     'data-display-name="Dana Scully"></button>'
                 )
             )
@@ -1023,6 +1024,42 @@ Resets Aug 13, 2026
         )
 
         self.assertEqual(probe.get("profileName"), "")
+
+    def test_probe_prefers_user_menu_over_earlier_invite_user_chrome(self) -> None:
+        probe = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" data-testid="invite-user-row">'
+                    "<span>Invite Teammates</span></button>"
+                    '<div class="account-chip">'
+                    "<div><span>Real Person</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+
+        self.assertEqual(probe.get("profileName"), "Real Person")
+
+    def test_probe_ignores_hidden_img_alt_and_component_data_name(self) -> None:
+        probe = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    '<div><span>Visible Name</span></div>'
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu" data-name="user-menu-trigger">'
+                    '<img src="about:blank" alt="Hidden Alt" width="0" height="0" '
+                    'style="display:none" />'
+                    "<span></span>"
+                    "</button>"
+                    "</div>"
+                )
+            )
+        )
+
+        self.assertEqual(probe.get("profileName"), "Visible Name")
 
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
