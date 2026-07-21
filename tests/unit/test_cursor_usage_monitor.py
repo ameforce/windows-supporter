@@ -1029,8 +1029,8 @@ Resets Aug 13, 2026
         probe = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
-                    '<button type="button" data-testid="invite-user-row">'
-                    "<span>Invite Teammates</span></button>"
+                    '<button type="button" data-testid="invite-user-row" '
+                    'aria-haspopup="menu"><span>Invite Teammates</span></button>'
                     '<div class="account-chip">'
                     "<div><span>Real Person</span></div>"
                     '<button type="button" aria-label="User menu" '

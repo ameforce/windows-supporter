@@ -216,6 +216,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     for (const selector of selectors) {
       const broadMenu = /aria-haspopup=["']menu["']/.test(selector);
       const looseUserSelector = /data-testid\*="user"|aria-label\*="user"|aria-label\*="avatar"/.test(selector);
+      const asideMenuSelector = /^aside button\[aria-haspopup/.test(selector);
       for (const node of Array.from(document.querySelectorAll(selector))) {
         if (!isVisible(node) || isExcluded(node)) continue;
         const ariaLabel = node.getAttribute ? node.getAttribute('aria-label') : '';
@@ -231,16 +232,19 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (!broadMenu && nodeIdentity && !hasCue) {
           continue;
         }
-        // Loose "user"/"avatar" substring matches must be a real account menu, or an
-        // aside menu button. Avoid invite-user / "all users" chrome stealing identity.
-        if (looseUserSelector) {
-          const asideMenu = Boolean(
-            node.closest && node.closest('aside')
-            && String(node.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu'
-          );
-          if (!strongMenuCue.test(ariaLabel || '') && !strongMenuCue.test(testId || '') && !asideMenu) {
-            continue;
-          }
+        // Aside/menu-button sweeps still need a real account-menu cue so invite or
+        // settings dropdowns earlier in the sidebar cannot steal the display name.
+        if (asideMenuSelector && !strongMenuCue.test(ariaLabel || '') && !strongMenuCue.test(testId || '')) {
+          continue;
+        }
+        // Loose "user"/"avatar" substring matches must be a real account menu cue.
+        // Avoid invite-user / "all users" chrome stealing identity.
+        if (
+          looseUserSelector
+          && !strongMenuCue.test(ariaLabel || '')
+          && !strongMenuCue.test(testId || '')
+        ) {
+          continue;
         }
         // Chrome labels like "User menu" are identity anchors, not display names.
         // Prefer labelledby/nearby/visible img, then display attrs, then node text.
