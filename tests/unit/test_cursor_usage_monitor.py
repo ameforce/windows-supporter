@@ -902,7 +902,7 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         # Uncued header menus must be skipped; only identity-cued nodes harvest names.
         self.assertRegex(
             CURSOR_USAGE_PAGE_PROBE_SCRIPT,
-            r"if\s*\(\s*broadMenu\s*&&\s*!hasCue\s*\)\s*\{\s*continue\s*;",
+            r"if\s*\(\s*broadMenu\s*&&\s*!hasCue\s*\)\s*continue\s*;",
         )
         self.assertNotIn("document.cookie", lowered)
         self.assertNotIn("localstorage", lowered)
@@ -1140,6 +1140,30 @@ Resets Aug 13, 2026
             )
         )
         self.assertEqual(korean.get("profileName"), "김종인")
+
+        korean_user = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>김종인</span></div>"
+                    '<button type="button" aria-label="사용자 메뉴" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(korean_user.get("profileName"), "김종인")
+
+        attr_hyphen = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" data-testid="account-trigger" '
+                    'aria-haspopup="menu" '
+                    'data-display-name="Anne-Marie"></button>'
+                )
+            )
+        )
+        self.assertEqual(attr_hyphen.get("profileName"), "Anne-Marie")
 
         broad_invite = self._evaluate_probe_on_html(
             self._usage_summary_html(
