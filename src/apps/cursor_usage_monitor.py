@@ -510,14 +510,26 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             if (!named.length) continue;
             const preferred = named.filter((item) => !isInitials(item.value));
             const pool = preferred.length ? preferred : named;
-            pool.sort((left, right) => {
+            // Drop partial names that are word-prefixes of a fuller candidate
+            // (e.g. img alt "John" must not beat visible "John Doe").
+            const isPrefixName = (shorter, longer) => {
+              const shortWords = clean(shorter).toLowerCase().split(/\s+/).filter(Boolean);
+              const longWords = clean(longer).toLowerCase().split(/\s+/).filter(Boolean);
+              if (!shortWords.length || shortWords.length >= longWords.length) return false;
+              return shortWords.every((word, index) => word === longWords[index]);
+            };
+            const undominated = pool.filter((item) => (
+              !pool.some((other) => other !== item && isPrefixName(item.value, other.value))
+            ));
+            const pickFrom = undominated.length ? undominated : pool;
+            pickFrom.sort((left, right) => {
               const bySource = (sourceRank[left.source] ?? 9) - (sourceRank[right.source] ?? 9);
               if (bySource) return bySource;
               const byOrder = (left.order ?? 0) - (right.order ?? 0);
               if (byOrder) return byOrder;
               return right.value.length - left.value.length;
             });
-            return pool[0].value;
+            return pickFrom[0].value;
           }
         }
       }

@@ -2190,6 +2190,44 @@ Resets Aug 13, 2026
         )
         self.assertEqual(split_join_beats_longer_status.get("profileName"), "Jane Doe")
 
+        # Partial img alt must not beat a fuller visible display name.
+        partial_alt_yields_to_full_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="John" src="about:blank" width="28" height="28" />'
+                    "<span>John Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(partial_alt_yields_to_full_name.get("profileName"), "John Doe")
+
+        # Full img alt still wins when the only competing leaf is org chrome.
+        full_alt_beats_org_leaf = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="John Doe" src="about:blank" width="28" height="28" />'
+                    "<span>Acme Labs</span></button>"
+                )
+            )
+        )
+        self.assertEqual(full_alt_beats_org_leaf.get("profileName"), "John Doe")
+
+        # data-display-name partial also yields to fuller visible text.
+        partial_attr_yields_to_full_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu" data-display-name="Mary">'
+                    "<span>Mary Ann</span></button>"
+                )
+            )
+        )
+        self.assertEqual(partial_attr_yields_to_full_name.get("profileName"), "Mary Ann")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

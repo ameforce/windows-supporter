@@ -179,3 +179,11 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | leading org / action·status leaf | labs·delete/available이 display-name 통과 | org/action/status 축 일부 누락 | `\blabs\b` chrome + delete account/available now/online… noise |
 
 유사 스캔: split join(`childJoin`)이 긴 status leaf보다 우선, chromeAdjacent/nearbyLocal은 childText보다 낮음.
+
+### Round-27 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `alt="John"`이 visible `John Doe` 압도 | image sourceRank가 childText보다 높음 | 부분 이름 vs 확장 이름 지배 관계 없음 | 같은 tier에서 word-prefix 후보는 제거하고 fuller 유지 |
+
+유사 스캔: `data-display-name="Mary"` + `Mary Ann`, full alt + org leaf는 alt 유지, initials `JD`는 기존 non-initial 선호 유지.
