@@ -177,7 +177,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             ''
           )
           .replace(
-            /^(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)(?:\.?\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)/i,
+            /^(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)(?:\.?\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・•●…]\s*|\s+)/i,
             ''
           )
           .replace(
@@ -185,10 +185,11 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             ''
           )
           .replace(
-            /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
+            /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・•●…]\s*|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
             ''
           )
-          .replace(/\s*[:：.\[\]\-\u2010-\u2015|/·・]+$/u, '')
+          // Drop leftover separators after status removal (bullets/ellipsis included).
+          .replace(/\s*[:：.\[\]\-\u2010-\u2015|/·・•●…]+$/u, '')
           .trim();
         return text;
       };
@@ -563,7 +564,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             const normalizeNameWord = (word) => String(word || '')
               .toLowerCase()
               .replace(
-                /^[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+|[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+$/gu,
+                /^[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・•●…|/]+|[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・•●…|/]+$/gu,
                 ''
               );
             const nameWords = (value) => clean(value)
@@ -574,6 +575,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               presenceStatusToken.test(word)
               || usageNoise.test(word)
               || accountChromePhrase.test(word)
+              || !/[\p{L}\p{N}]/u.test(word)
             );
             const isPrefixName = (shorter, longer) => {
               const shortWords = nameWords(shorter);

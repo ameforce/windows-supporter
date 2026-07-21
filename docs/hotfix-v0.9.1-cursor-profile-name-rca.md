@@ -225,3 +225,11 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | clean alt가 status 확장 leaf에 패배 | isContainedName이 status extra를 fuller로 인정 | prefix 가드가 contained fallback에 없음 | contained extra에 presence/noise/chrome 거부 + `[]` normalize |
 
 유사 스캔: leading/paren status+plan, Pro Plan Online, bracket `[Online]`.
+
+### Round-32 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Jane Doe • Online` → `Jane Doe •`가 clean alt 압도 | strip separator에 bullet/ellipsis 부재 | UI bullet 축 누락 + punct-only extra를 fuller로 인정 | `•●…` separator/trailing cleanup + letter/digit 없는 extra 거부 |
+
+유사 스캔: `●`/`…` trailing status, clean alt vs `• Away`.

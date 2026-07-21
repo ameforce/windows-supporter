@@ -2460,6 +2460,51 @@ Resets Aug 13, 2026
         )
         self.assertEqual(clean_alt_beats_bracket_status.get("profileName"), "Jane Doe")
 
+        bullet_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe • Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(bullet_status_strips.get("profileName"), "Jane Doe")
+
+        clean_alt_beats_bullet_status = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe" src="about:blank" width="28" height="28" />'
+                    "<span>Jane Doe • Away</span></button>"
+                )
+            )
+        )
+        self.assertEqual(clean_alt_beats_bullet_status.get("profileName"), "Jane Doe")
+
+        black_circle_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe ● Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(black_circle_status_strips.get("profileName"), "Jane Doe")
+
+        ellipsis_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe … Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(ellipsis_status_strips.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
