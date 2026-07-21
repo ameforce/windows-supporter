@@ -88,3 +88,11 @@
 | `<span>Jane</span><span>Doe</span>` 부분명 | leaf를 개별 후보만 등록 | split name join 경로 없음 | 2–3 single-word leaf를 join한 전체명 후보 |
 
 유사 스캔: nested name beside wrap>button 유지, Terms/Cookie/개인정보 방침 noise, initials(`JD`)는 display-name으로 허용, Members-only empty menu → 공란.
+
+### Round-17 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Jane`+`Doe`+`Business` → `Jane Doe Business` | split join이 plan leaf를 이름 토큰에 포함 | join이 sanitize/noise 이전에 동작하고 plan 단일어 제외 없음 | join 전 `planLeaf`·`usageNoise`·account-chrome 토큰 제거 |
+
+유사 스캔: `Team`/`Pro`/`Business` EN plan leaf, 한글 `팀` leaf, 기존 multi-word `Team Plan` splitPlan 경로 유지.

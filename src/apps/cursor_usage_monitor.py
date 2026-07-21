@@ -243,11 +243,17 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         found.push(el.innerText || el.textContent || '');
       }
       // Join split name leaves: <span>Jane</span><span>Doe</span> -> "Jane Doe".
+      // Drop plan/account chrome leaves first so "Jane"+"Doe"+"Business"
+      // cannot reconstruct as "Jane Doe Business".
+      const planLeaf = /^(?:team|pro|business|enterprise|free|hobby|plus|ultra|프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비|plan|플랜)$/i;
       const tokens = found.map(clean).filter(Boolean);
       const singleWords = tokens.filter((token) => (
         token.split(/\s+/).length === 1
         && /^[\p{L}\p{M}.'-]+$/u.test(token)
         && !/^[A-Za-z]{1,2}$/.test(token)
+        && !planLeaf.test(token)
+        && !usageNoise.test(token)
+        && !accountChromePhrase.test(token)
       ));
       if (singleWords.length >= 2 && singleWords.length <= 3) {
         found.push(singleWords.join(' '));

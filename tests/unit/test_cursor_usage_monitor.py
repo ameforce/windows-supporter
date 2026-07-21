@@ -1689,6 +1689,48 @@ Resets Aug 13, 2026
         )
         self.assertEqual(split_name_leaves.get("profileName"), "Jane Doe")
 
+        split_name_with_plan_leaf = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane</span>"
+                    "<span>Doe</span>"
+                    "<span>Business</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_name_with_plan_leaf.get("profileName"), "Jane Doe")
+
+        split_name_with_team_leaf = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane</span>"
+                    "<span>Doe</span>"
+                    "<span>Team</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_name_with_team_leaf.get("profileName"), "Jane Doe")
+
+        split_name_with_korean_plan_leaf = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="사용자 메뉴" '
+                    'aria-haspopup="menu">'
+                    "<span>김</span>"
+                    "<span>종인</span>"
+                    "<span>팀</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_name_with_korean_plan_leaf.get("profileName"), "김 종인")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
