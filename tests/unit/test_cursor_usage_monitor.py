@@ -1821,6 +1821,58 @@ Resets Aug 13, 2026
         )
         self.assertEqual(aria_menu_dash_prefix.get("profileName"), "Jane Doe")
 
+        multipart_display_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Juan Carlos de la Vega</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(
+            multipart_display_name.get("profileName"),
+            "Juan Carlos de la Vega",
+        )
+
+        korean_my_account_adjacent = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<span>김종인</span>"
+                    '<button type="button" aria-label="내 계정">'
+                    "내 계정</button>"
+                )
+            )
+        )
+        self.assertEqual(korean_my_account_adjacent.get("profileName"), "김종인")
+
+        avatar_menu_img_alt = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User avatar" '
+                    'aria-haspopup="menu">'
+                    '<img src="about:blank" alt="Jane Doe" '
+                    'width="24" height="24" />'
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(avatar_menu_img_alt.get("profileName"), "Jane Doe")
+
+        avatar_menu_no_alt_no_adjacent = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<div>Feedback</div>"
+                    '<button type="button" aria-label="User avatar" '
+                    'aria-haspopup="menu">'
+                    '<img src="about:blank" alt="" width="24" height="24" />'
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(avatar_menu_no_alt_no_adjacent.get("profileName"), "")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

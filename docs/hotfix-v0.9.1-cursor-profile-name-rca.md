@@ -107,3 +107,13 @@
 | empty menu + Feedback/Support | 임의 sidebar 단어가 display-name 통과 | chromeAdjacent sanitize가 약함 | 동일 sidebar chrome exact reject |
 
 유사 스캔: Support/Feedback/Upgrade/Subscribe bare CTA, Owner/Trial/Admin badge, `My account - Name` dash prefix, KO 피드백/지원/업그레이드.
+
+### Round-19 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| 5+ word 실명 거부 | `looksLikeDisplayName` words≤4 | particle 이름 미고려 | 상한 8 words |
+| `내 계정` aside sibling 미수집 | KO my-account가 strong 아님 → chromeAdjacent off | EN My account만 strong | strongMenuCue에 `내/나의 계정·프로필` |
+| Avatar menu + img alt 공란 | looseUserOnly early-continue | local img alt 예외 없음 | menu+avatar/user + display-name alt는 local-only harvest |
+
+유사 스캔: `나의 프로필` adjacent, avatar empty alt는 Feedback chromeAdjacent 불가, multipart ES/EN names.
