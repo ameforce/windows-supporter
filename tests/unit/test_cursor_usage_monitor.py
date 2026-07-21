@@ -33,6 +33,23 @@ MONITOR_SOURCE = REPO_ROOT / "src" / "apps" / "cursor_usage_monitor.py"
 
 
 class CursorUsageMonitorUnitTest(unittest.TestCase):
+    _probe_playwright = None
+    _probe_browser = None
+    _probe_browser_lock = threading.Lock()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        with cls._probe_browser_lock:
+            browser = cls._probe_browser
+            playwright = cls._probe_playwright
+            cls._probe_browser = None
+            cls._probe_playwright = None
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
+        super().tearDownClass()
+
     class _Session:
         def __init__(self, results: list[BrowserOperationResult]) -> None:
             self.results = list(results)
@@ -908,10 +925,14 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertNotIn("localstorage", lowered)
         self.assertNotIn("fetch(", lowered)
 
-    def _evaluate_probe_on_html(self, html: str) -> dict[str, object]:
-        from playwright.sync_api import sync_playwright
+    @classmethod
+    def _ensure_probe_browser(cls):
+        with cls._probe_browser_lock:
+            if cls._probe_browser is not None:
+                return cls._probe_browser
+            from playwright.sync_api import sync_playwright
 
-        with sync_playwright() as playwright:
+            playwright = sync_playwright().start()
             browser = None
             last_error: Exception | None = None
             for kwargs in (
@@ -924,13 +945,20 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
                 except Exception as exc:  # pragma: no cover - environment dependent
                     last_error = exc
             if browser is None:
-                self.skipTest(f"playwright browser unavailable: {last_error}")
-            try:
-                page = browser.new_page()
-                page.set_content(html)
-                probe = page.evaluate(CURSOR_USAGE_PAGE_PROBE_SCRIPT)
-            finally:
-                browser.close()
+                playwright.stop()
+                raise unittest.SkipTest(f"playwright browser unavailable: {last_error}")
+            cls._probe_playwright = playwright
+            cls._probe_browser = browser
+            return browser
+
+    def _evaluate_probe_on_html(self, html: str) -> dict[str, object]:
+        browser = self._ensure_probe_browser()
+        page = browser.new_page()
+        try:
+            page.set_content(html)
+            probe = page.evaluate(CURSOR_USAGE_PAGE_PROBE_SCRIPT)
+        finally:
+            page.close()
         self.assertIsInstance(probe, dict)
         return probe
 
@@ -2080,6 +2108,28 @@ Resets Aug 13, 2026
             )
         )
         self.assertEqual(img_anchor_alt.get("profileName"), "Jane Doe")
+
+        chrome_adjacent_rejects_shortcuts = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<div>Keyboard shortcuts</div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"></button>'
+                )
+            )
+        )
+        self.assertEqual(chrome_adjacent_rejects_shortcuts.get("profileName"), "")
+
+        chrome_adjacent_rejects_command_palette = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<div>Command palette</div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"></button>'
+                )
+            )
+        )
+        self.assertEqual(chrome_adjacent_rejects_command_palette.get("profileName"), "")
 
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(

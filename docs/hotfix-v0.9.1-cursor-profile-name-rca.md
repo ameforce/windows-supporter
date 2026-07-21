@@ -161,3 +161,12 @@
 
 유사 스캔: `Jane#1`/`Jane*` 허용, glyph-only/`▾`는 letter 부재로 계속 거부, org/auth chrome 거부는 유지.
 side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 않도록 separator 강제 + leading `_` control id 거부.
+
+### Round-25 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| adjacent `Keyboard shortcuts` 오탐 | nav UI 문구가 display-name 통과 | sidebar command/nav chrome 축 누락 | shortcuts/command palette/preferences… noise |
+| probe fixture마다 browser launch | `_evaluate_probe_on_html`가 호출마다 launch/close | shared browser 부재로 70+회 기동 | class-level browser reuse + page-only cycle |
+
+유사 스캔: Command palette / 단축키 / 환경 설정, Preferences/Appearance.
