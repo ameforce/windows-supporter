@@ -16,6 +16,16 @@
 - 독립 reviewer는 `gpt-5.6-sol`, reasoning `high`, read-only로 고정한다. 구현 중 탐색, 반복 점검, incremental review에 사용하지 않는다. 동일 review key의 중복 요청을 금지한다. connector가 명시적 오류를 반환한 경우에만 같은 key로 1회 재시도할 수 있다.
 - GitHub finding이 있으면 `chatgpt-codex-connector` review object의 `commit_id`가 최신 40자리 head SHA와 일치해야 한다. finding이 없어 connector가 top-level zero-finding 댓글만 남기면 그 댓글의 `Reviewed commit` prefix가 최신 head에 유일하게 해석되고, 바로 앞 review 요청에 full base/head SHA와 review key가 기록돼 있으며 요청 전후 head가 바뀌지 않았음을 확인한다.
 - 두 리뷰의 finding은 `P0/P1/P2/P3`로 정규화한다. P0/P1/P2 중 하나라도 존재하면 병합을 차단하며, 병합 조건은 `P0=0, P1=0, P2=0`이다. GitHub review thread도 unresolved 0이어야 한다. 작성자가 PR 본문에 적은 finding 수, reviewer 이름, digest 또는 Actions status는 실제 리뷰 증거를 대신하지 않는다.
+- 유효한 P0/P1/P2 finding이 하나라도 나오면, 같은 round의 두 final review가 모두 terminal이 된 뒤에만 수정을 시작한다. 수정 중·수정 직후에는 `@codex review`와 독립 reviewer subagent를 호출하지 않는다. finding을 “지적된 줄 패치 → 즉시 재리뷰”로 소비하는 것을 금지한다.
+- finding 처분의 완료 조건(모두 충족해야 새 review key를 만들 수 있다):
+  1. **재현/증거**: 해당 finding을 실제 재현하거나 동등한 직접 증거를 확보한다.
+  2. **RCA**: 직접 원인과 구조적 원인(왜 그 가드/계약이 깨졌는지)을 기록한다. reviewer 문장 재서술만으로 RCA를 대체하지 않는다.
+  3. **유사 결함 스캔**: 같은 성격의 인접 실패 경로(동일 가드, 동일 정규식 축, 동일 DOM 가정, 동일 sanitize 경계, locale/표기 변형, kebab/underscore/camelCase, bare label, wrapper/sibling 변형)를 조사해 같이 잠근다. 발견된 유사 결함은 같은 head에 포함한다.
+  4. **근본 수정**: 원인 경계의 최소 완전 수정을 적용한다. 한 케이스 regex만 덧붙이는 대증 요법은 근본 수정으로 치지 않는다.
+  5. **회귀 잠금**: red test 또는 동등한 증거로 원 finding과 유사 결함을 잠근다.
+  6. **side effect 검증**: 불변조건·실패 모드·인접 경로 테스트, 관련 테스트, 전체 테스트, build, 필요한 runtime을 다시 돌리고, 수정이 기존 통과 계약(허용 앵커, 거부 노이즈, fallback)을 깨지 않았는지 확인한다.
+  7. **자체 diff 검토**: 새 head가 “완성된 head” 조건을 충족한다고 main Codex가 판정한다.
+- 위 1–7을 끝내지 않은 상태에서는 새 round의 `@codex review`·독립 review를 요청하지 않는다. “일단 리뷰에 넣어 확인” 목적의 예비 호출도 금지한다. 독립 reviewer는 final review 전용이며 구현 중 탐색·반복 점검·incremental review·finding 해석용으로 쓰지 않는다.
 - 유효한 P0/P1/P2 finding은 실제 재현 또는 직접 증거를 확보하고, 직접 원인과 구조적 원인, 영향과 인접 실패 경로를 확인한 뒤 red test 또는 동등한 증거로 잠근다. 원인 경계의 최소 완전 수정을 적용하고 불변조건, 실패 모드, side effect 테스트와 관련 테스트, 전체 테스트, build, 필요한 runtime을 다시 검증한다.
 - 지적된 줄만 고치거나 reviewer 문구를 옮겨 즉시 재검토하지 않는다. main Codex가 새 head를 완성됐다고 판정한 뒤에만 새 exact base/head와 새 round의 review key에서 두 final review를 각각 다시 1회 수행한다.
 - P3는 순수 권고이며 병합을 차단하지 않는다. 처분, owner, 만료일 또는 후속 이슈를 요구하지 않는다. P3을 선택적으로 수정할 때도 같은 RCA와 검증 원칙을 적용한다. 보안·인증·개인정보, 데이터·설정 무결성, 공개 호환성, 삭제·업데이트·릴리스 무결성 또는 영향 불확실성을 침해하거나 그 가능성이 있는 finding은 최소 P2로 분류한다. reviewer 간 severity가 다르면 상위 등급을 적용하며 작성자 단독으로 하향할 수 없다.

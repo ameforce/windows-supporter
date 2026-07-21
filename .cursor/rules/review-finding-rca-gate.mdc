@@ -1,0 +1,27 @@
+---
+description: Review finding 후 RCA·유사결함·side-effect 완료 전 재리뷰 금지
+alwaysApply: true
+---
+
+# Review Finding RCA Gate
+
+P0/P1/P2 finding이 나온 뒤에는 `@codex review`와 독립 reviewer subagent를 바로 다시 호출하지 않는다.
+
+## 금지
+
+- 지적된 줄만 고치고 즉시 재리뷰
+- reviewer 문구를 코드/테스트에 옮겨 넣고 같은 round를 재요청
+- “확인용” incremental / exploratory review 호출
+- finding 해석이나 패치 검증을 독립 reviewer에게 위임
+
+## 새 review key 생성 전 필수
+
+1. 재현 또는 직접 증거
+2. 직접 원인 + 구조적 원인 RCA (문장 재서술 금지)
+3. 같은 성격의 인접 실패 경로 스캔 및 동일 head 포함
+4. 원인 경계의 근본 수정 (단일 케이스 대증 요법 금지)
+5. red test로 원 finding + 유사 결함 잠금
+6. side effect: 관련/전체 테스트, build, 필요 runtime, 기존 통과 계약 유지 확인
+7. main agent가 완성된 head로 자체 판정
+
+상세 절차와 병합 조건은 저장소 `AGENTS.md`의 PR 검토 규칙을 따른다.
