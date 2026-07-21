@@ -1560,6 +1560,34 @@ Resets Aug 13, 2026
         )
         self.assertEqual(concatenated_plan.get("profileName"), "Jane Doe")
 
+        current_account_noise = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane</span></div>"
+                    "<div><span>Current account</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(current_account_noise.get("profileName"), "Jane")
+
+        active_account_ko = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>김종인</span></div>"
+                    "<div><span>현재 계정</span></div>"
+                    '<button type="button" aria-label="사용자 메뉴" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(active_account_ko.get("profileName"), "김종인")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",

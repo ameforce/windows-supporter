@@ -139,7 +139,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
     const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제)$|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization)/i;
-    const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)/i;
+    const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|(?:current|active|selected|switch)\s+account|(?:현재|선택|활성)\s*계정|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)/i;
     const looksLikeDisplayName = (value) => {
       if (!value || accountChromePhrase.test(value)) return false;
       const words = String(value).trim().split(/\s+/).filter(Boolean);
