@@ -912,7 +912,19 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
+            browser = None
+            last_error: Exception | None = None
+            for kwargs in (
+                {"channel": "chrome", "headless": True},
+                {"headless": True},
+            ):
+                try:
+                    browser = playwright.chromium.launch(**kwargs)
+                    break
+                except Exception as exc:  # pragma: no cover - environment dependent
+                    last_error = exc
+            if browser is None:
+                self.skipTest(f"playwright browser unavailable: {last_error}")
             try:
                 page = browser.new_page()
                 page.set_content(html)
@@ -1060,6 +1072,34 @@ Resets Aug 13, 2026
         )
 
         self.assertEqual(probe.get("profileName"), "Visible Name")
+
+    def test_probe_keeps_hyphenated_display_name_and_prefers_full_name(self) -> None:
+        hyphen = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Anne-Marie</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(hyphen.get("profileName"), "Anne-Marie")
+
+        full = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>JD</span></div>"
+                    "<div><span>John Doe</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(full.get("profileName"), "John Doe")
 
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (

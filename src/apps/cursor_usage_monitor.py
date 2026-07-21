@@ -248,23 +248,37 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         }
         // Chrome labels like "User menu" are identity anchors, not display names.
         // Prefer labelledby/nearby/visible img, then display attrs, then node text.
+        const attrCandidates = attributeNames(node).map(clean).filter((candidate) => {
+          if (!candidate || candidate.length > 40 || /@/.test(candidate)) return false;
+          if (genericLabel.test(candidate) || usageNoise.test(candidate)) return false;
+          // Component-like attr values only; do not apply to visible DOM names.
+          if (componentSlug.test(candidate)) return false;
+          return true;
+        });
         const rawCandidates = [
           ...resolveLabelledBy(node),
           ...nearbyNames(node),
           ...imageNames(node),
-          ...attributeNames(node),
+          ...attrCandidates,
           ariaLabel,
           title,
           node.innerText || node.textContent || '',
         ];
+        const accepted = [];
         for (const raw of rawCandidates) {
           const candidate = clean(raw);
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
           if (genericLabel.test(candidate) || usageNoise.test(candidate)) continue;
-          if (componentSlug.test(candidate)) continue;
           if (seen.has(candidate)) continue;
           seen.add(candidate);
-          return candidate;
+          accepted.push(candidate);
+        }
+        if (accepted.length) {
+          const isInitials = (value) => /^[A-Za-z]{1,2}$/.test(value);
+          const preferred = accepted.filter((value) => !isInitials(value));
+          const pool = preferred.length ? preferred : accepted;
+          pool.sort((left, right) => right.length - left.length);
+          return pool[0];
         }
       }
     }
