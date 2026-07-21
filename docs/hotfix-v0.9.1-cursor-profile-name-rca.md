@@ -196,3 +196,13 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `Jane Doe Online`이 full alt 압도 | status 확장을 fuller로 취급 | trailing presence 축 누락 | expandCandidates status strip + prefix extra에 presence/noise 거부 |
 
 유사 스캔: Away/Busy/Offline, 단독 status-suffix leaf → 이름만 남김.
+
+### Round-29 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `(Online)` / `- Online` / `Online.` 잔존 | trailing bare token strip만 존재 | wrapper/separator/punct 축 누락 | paren·separator·punct·multi-word status strip |
+| `Jane Doe Available Now` 전체 거부 | unanchored `available now` noise | 연결 status를 strip하지 않고 substring reject | noise strip + noise는 whole-leaf만 |
+| `alt=Jane` vs `Doe, Jane` | leading-prefix만 domination | Last, First 단어 포함 관계 없음 | contained-name(모든 단어가 fuller에 포함) |
+
+유사 스캔: dirty status leaf가 clean leaf보다 앞서도 strip 후 동일 이름, delete account/지금 이용 가능도 whole-leaf noise.

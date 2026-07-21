@@ -2265,6 +2265,63 @@ Resets Aug 13, 2026
         )
         self.assertEqual(status_suffix_alone_strips.get("profileName"), "Jane Doe")
 
+        paren_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe (Online)</span></button>"
+                )
+            )
+        )
+        self.assertEqual(paren_status_strips.get("profileName"), "Jane Doe")
+
+        dashed_status_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe - Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(dashed_status_strips.get("profileName"), "Jane Doe")
+
+        dirty_status_before_clean_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe (Online)</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(dirty_status_before_clean_name.get("profileName"), "Jane Doe")
+
+        concatenated_available_now_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe Available Now</span></button>"
+                )
+            )
+        )
+        self.assertEqual(concatenated_available_now_strips.get("profileName"), "Jane Doe")
+
+        first_name_alt_yields_to_last_first = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane" src="about:blank" width="28" height="28" />'
+                    "<span>Doe, Jane</span></button>"
+                )
+            )
+        )
+        self.assertEqual(first_name_alt_yields_to_last_first.get("profileName"), "Doe, Jane")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
