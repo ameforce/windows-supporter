@@ -96,3 +96,14 @@
 | `Jane`+`Doe`+`Business` → `Jane Doe Business` | split join이 plan leaf를 이름 토큰에 포함 | join이 sanitize/noise 이전에 동작하고 plan 단일어 제외 없음 | join 전 `planLeaf`·`usageNoise`·account-chrome 토큰 제거 |
 
 유사 스캔: `Team`/`Pro`/`Business` EN plan leaf, 한글 `팀` leaf, 기존 multi-word `Team Plan` splitPlan 경로 유지.
+
+### Round-18 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| chromeAdjacent `Upgrade` > `Kim` | bare CTA가 usageNoise 밖 | CTA/sidebar 단일어 목록 불완전 | Upgrade/Feedback/Support 등 sidebar chrome exact reject |
+| `Jane Doe Owner/Trial` join | role/status badge가 planLeaf 밖 | badge 축이 plan-only였음 | planOrBadgeLeaf에 Owner/Trial/Admin… |
+| `Account menu: Jane Doe` 공란 | prefix 붙은 aria가 looksLikeDisplayName 실패 | JS가 Python sanitize prefix strip을 미러하지 않음 | expandCandidates에서 menu/account prefix strip |
+| empty menu + Feedback/Support | 임의 sidebar 단어가 display-name 통과 | chromeAdjacent sanitize가 약함 | 동일 sidebar chrome exact reject |
+
+유사 스캔: Support/Feedback/Upgrade/Subscribe bare CTA, Owner/Trial/Admin badge, `My account - Name` dash prefix, KO 피드백/지원/업그레이드.

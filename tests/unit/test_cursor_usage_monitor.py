@@ -1731,6 +1731,96 @@ Resets Aug 13, 2026
         )
         self.assertEqual(split_name_with_korean_plan_leaf.get("profileName"), "김 종인")
 
+        split_name_with_owner_badge = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane</span>"
+                    "<span>Doe</span>"
+                    "<span>Owner</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_name_with_owner_badge.get("profileName"), "Jane Doe")
+
+        split_name_with_trial_badge = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane</span>"
+                    "<span>Doe</span>"
+                    "<span>Trial</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(split_name_with_trial_badge.get("profileName"), "Jane Doe")
+
+        chrome_adjacent_prefers_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<aside>"
+                    "<span>Kim</span>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"></button>'
+                    "<div>Upgrade</div>"
+                    "</aside>"
+                )
+            )
+        )
+        self.assertEqual(chrome_adjacent_prefers_name.get("profileName"), "Kim")
+
+        chrome_adjacent_rejects_feedback = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<aside>"
+                    "<div>Feedback</div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"></button>'
+                    "</aside>"
+                )
+            )
+        )
+        self.assertEqual(chrome_adjacent_rejects_feedback.get("profileName"), "")
+
+        chrome_adjacent_rejects_support = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<aside>"
+                    "<div>Support</div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"></button>'
+                    "</aside>"
+                )
+            )
+        )
+        self.assertEqual(chrome_adjacent_rejects_support.get("profileName"), "")
+
+        aria_menu_prefix_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" '
+                    'aria-label="Account menu: Jane Doe" '
+                    'aria-haspopup="menu"></button>'
+                )
+            )
+        )
+        self.assertEqual(aria_menu_prefix_name.get("profileName"), "Jane Doe")
+
+        aria_menu_dash_prefix = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" '
+                    'aria-label="My account - Jane Doe" '
+                    'aria-haspopup="menu"></button>'
+                )
+            )
+        )
+        self.assertEqual(aria_menu_dash_prefix.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

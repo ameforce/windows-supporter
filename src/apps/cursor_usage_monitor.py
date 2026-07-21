@@ -138,7 +138,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
-    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제|members?|usage|docs?|home|teams?|privacy|terms|cookies?)$|privacy\s*policy|terms\s+of\s+(?:service|use)|cookie\s+policy|(?:개인정보|이용약관|쿠키)\s*(?:처리\s*)?(?:방침|정책)?|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization)/i;
+    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제|members?|usage|docs?|home|teams?|privacy|terms|cookies?|upgrade|manage|subscribe|buy|feedback|support|community|contact|pricing|learn|blog|notifications?|invite|trial|owner|admin|viewer|guest|moderator|editor|collaborator|manager|도움말|피드백|지원|업그레이드|구독|관리자|소유자|멤버|체험)$|privacy\s*policy|terms\s+of\s+(?:service|use)|cookie\s+policy|(?:개인정보|이용약관|쿠키)\s*(?:처리\s*)?(?:방침|정책)?|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization|get\s*started)/i;
     const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|(?:current|active|selected|switch)\s+account|선택(?:된|한)?\s*계정|(?:현재|활성)\s*계정|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)/i;
     const looksLikeDisplayName = (value) => {
       if (!value || accountChromePhrase.test(value)) return false;
@@ -149,12 +149,30 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       return /^[\p{L}\p{M}\d\s.'-]+$/u.test(value);
     };
     const expandCandidates = (raw) => {
-      const cleaned = clean(raw);
+      let cleaned = clean(raw);
       if (!cleaned) return [];
+      // Split concatenated plan suffixes before account-chrome short-circuit so
+      // "Jane Doe Team Plan" still yields the display-name piece.
       const splitPlan = cleaned.match(
         /^(.*?)\s+((?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)$/i
       );
       if (splitPlan && splitPlan[1]) return [splitPlan[1], splitPlan[2]];
+      // Do not rewrite account-state chrome ("Current account") into bare
+      // leftovers like "Current" before noise filters run.
+      if (accountChromePhrase.test(cleaned)) return [cleaned];
+      // Mirror Python sanitize_profile_name prefixes so aria/title values like
+      // "Account menu: Jane Doe" become display-name shaped before ranking.
+      // Only strip when a menu/account prefix marker is present.
+      if (/(?:menu|메뉴|[:：])|(?:^(?:my|your|edit|switch|view|open)\s+(?:account|profile))|(?:^(?:내|나의)\s*(?:계정|프로필))|(?:^(?:account|profile|user)\s+menu)|(?:^(?:profile|account|user|프로필|계정)\s*[:：\-])/i.test(cleaned)) {
+        cleaned = cleaned
+          .replace(/^(?:account|profile|user)\s+menu\s*[:：\-]?\s*/i, '')
+          .replace(/^(?:계정|프로필|사용자)\s*메뉴\s*[:：\-]?\s*/i, '')
+          .replace(/^(?:my|your|edit|switch|view|open)\s+(?:account|profile)\s*[:：\-]?\s*/i, '')
+          .replace(/^(?:내|나의)\s*(?:계정|프로필)\s*[:：\-]?\s*/i, '')
+          .replace(/^(?:profile|account|user|menu|open|프로필|계정|사용자|메뉴)\s*[:：\-]?\s*/i, '')
+          .trim();
+      }
+      if (!cleaned) return [];
       return [cleaned];
     };
     // Reject control-like ids: kebab/snake/camel with menu|button|trigger|chip.
@@ -243,15 +261,15 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         found.push(el.innerText || el.textContent || '');
       }
       // Join split name leaves: <span>Jane</span><span>Doe</span> -> "Jane Doe".
-      // Drop plan/account chrome leaves first so "Jane"+"Doe"+"Business"
-      // cannot reconstruct as "Jane Doe Business".
-      const planLeaf = /^(?:team|pro|business|enterprise|free|hobby|plus|ultra|프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비|plan|플랜)$/i;
+      // Drop plan/role/status chrome leaves first so "Jane"+"Doe"+"Business|Owner"
+      // cannot reconstruct as a longer bogus name.
+      const planOrBadgeLeaf = /^(?:team|pro|business|enterprise|free|hobby|plus|ultra|프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비|plan|플랜|owner|admin|trial|member|viewer|guest|moderator|editor|collaborator|manager|관리자|소유자|멤버|체험)$/i;
       const tokens = found.map(clean).filter(Boolean);
       const singleWords = tokens.filter((token) => (
         token.split(/\s+/).length === 1
         && /^[\p{L}\p{M}.'-]+$/u.test(token)
         && !/^[A-Za-z]{1,2}$/.test(token)
-        && !planLeaf.test(token)
+        && !planOrBadgeLeaf.test(token)
         && !usageNoise.test(token)
         && !accountChromePhrase.test(token)
       ));
