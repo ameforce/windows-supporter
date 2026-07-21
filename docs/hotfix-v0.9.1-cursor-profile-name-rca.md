@@ -58,6 +58,13 @@
 
 앵커 판정을 `reject → account/profile cue ∪ strong control → loose user 단독 거부`로 정리하고, chrome root는 containing-child 기준 인접 sibling만 스캔하며, `componentSlug`/generic/usageNoise를 모든 후보에 동일 적용한다.
 
-### side effect 검증 항목
+### Round-10 finding 묶음 RCA
 
-기존 User menu / 한글 메뉴 / hyphenated display name / invite 우선순위 / initials+Pro / camelCase userMenu 회귀 테스트 유지.
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| local name < adjacent sidebar copy | longest-string만으로 선택 | 후보 출처(tier) 없음 | local > chromeAdjacent > chromeMeta 후 길이 |
+| aria-labelledby menu cue 무시 | cue를 aria/title/testid만 사용 | a11y label 경로 누락 | labelledby를 identity/strong cue에 포함 |
+| `anne-marie` slug 거부 | 모든 후보에 전역 kebab 거부 | display name과 control id 미분리 | control 어휘(menu/button/trigger…) 있는 kebab만 거부 |
+| `user-menu` testid 스킵 | strong cue가 `usermenu`/`user menu`만 허용 | kebab/underscore menu 표기 누락 | `user-menu`/`user_menu` strong cue 허용 |
+
+유사 스캔: `user_menu`, lowercase hyphen display attrs, labelledby-only Account menu, chip+Upgrade adjacent.

@@ -134,13 +134,16 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
   const collectProfileName = () => {
     const identityCue = /(?:^|[^a-z0-9])(?:profile|account|프로필|계정|avatar|user|사용자)(?:[^a-z0-9]|$)|(?:profile|account|avatar|user)(?:menu|button|trigger|chip)/i;
     // Account/profile anchors include menu, trigger/button/chip, and "My account"/"View profile".
-    const strongMenuCue = /(?:user|account|profile|사용자|프로필|계정)\s*menu|(?:user|account|profile)menu|(?:사용자|프로필|계정)\s*메뉴|(?:account|profile|user)(?:[_-])?(?:trigger|button|chip)|(?:my|your|edit|switch|view|open)\s+(?:account|profile)/i;
+    const strongMenuCue = /(?:user|account|profile|사용자|프로필|계정)\s*menu|(?:user|account|profile)[-_]?menu|(?:사용자|프로필|계정)\s*메뉴|(?:account|profile|user)(?:[_-])?(?:trigger|button|chip)|(?:my|your|edit|switch|view|open)\s+(?:account|profile)/i;
     const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
     const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정)$)/i;
-    // Lowercase kebab ids only; keep Anne-Marie / Jean-Luc style display attrs.
-    const componentSlug = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
+    // Reject control-like kebab chrome (user-menu-trigger), not display names (anne-marie).
+    const isChromeControlSlug = (value) => (
+      /^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(value)
+      && /(?:^|-)(?:menu|button|trigger|chip|testid|avatar|picture|photo)(?:-|$)/.test(value)
+    );
     const selectors = [
       '[aria-label*="user menu" i]',
       '[aria-label*="account menu" i]',
@@ -187,24 +190,23 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     ]));
     const nearbyNames = (node) => {
       const found = [];
-      const pushLeaves = (root) => {
+      const pushLeaves = (root, tier) => {
         if (!root || root === node) return;
         if (root.matches && root.matches('button, a, input')) return;
         for (const img of Array.from(root.querySelectorAll ? root.querySelectorAll('img[alt], img[title]') : [])) {
           if (!isVisible(img) || isExcluded(img)) continue;
-          found.push(img.getAttribute('alt') || '');
-          found.push(img.getAttribute('title') || '');
+          found.push({ text: img.getAttribute('alt') || '', tier });
+          found.push({ text: img.getAttribute('title') || '', tier });
         }
         for (const el of [root, ...Array.from(root.querySelectorAll('span, div, p, strong, b'))]) {
           if (!isVisible(el) || isExcluded(el)) continue;
           if (el.closest && el.closest('button, a, input')) continue;
           if (el.querySelector && el.querySelector('button, a, input, span, div, p')) continue;
-          found.push(el.innerText || el.textContent || '');
+          found.push({ text: el.innerText || el.textContent || '', tier });
         }
       };
-      // Stay inside the account chip / local chrome row. At aside/nav/header roots,
-      // only scan immediate adjacent siblings so Overview/Dashboard labels do not
-      // steal identity when the name sits next to the User menu button.
+      // Local chip siblings beat chrome-adjacent sidebar copy. At aside/nav/header
+      // roots, only scan immediate adjacent siblings (containing-child aware).
       let current = node.parentElement;
       for (let depth = 0; depth < 2 && current; depth += 1, current = current.parentElement) {
         const isChrome = Boolean(
@@ -222,7 +224,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           if (idx >= 0) {
             for (const sibling of [kids[idx - 1], kids[idx + 1]].filter(Boolean)) {
               if (sibling.contains && sibling.contains(node)) continue;
-              pushLeaves(sibling);
+              pushLeaves(sibling, 'chromeAdjacent');
             }
           }
           break;
@@ -230,7 +232,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         for (const sibling of Array.from(current.children)) {
           if (sibling === node) continue;
           if (depth > 0 && sibling.contains && sibling.contains(node)) continue;
-          pushLeaves(sibling);
+          pushLeaves(sibling, 'local');
         }
       }
       return found;
@@ -243,7 +245,11 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         const ariaLabel = node.getAttribute ? node.getAttribute('aria-label') : '';
         const title = node.getAttribute ? node.getAttribute('title') : '';
         const testId = node.getAttribute ? node.getAttribute('data-testid') : '';
-        const nodeIdentity = clean([testId, ariaLabel, title].join(' ')).toLowerCase();
+        const labelledByTexts = resolveLabelledBy(node);
+        // Include aria-labelledby text in cue gates (a11y-only menu labels).
+        const nodeIdentity = clean(
+          [testId, ariaLabel, title, ...labelledByTexts].join(' ')
+        ).toLowerCase();
         const hasCue = identityCue.test(nodeIdentity);
         if (broadMenu && !hasCue) continue;
         if (!broadMenu && nodeIdentity && !hasCue) continue;
@@ -252,6 +258,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           strongMenuCue.test(ariaLabel || '')
           || strongMenuCue.test(testId || '')
           || strongMenuCue.test(title || '')
+          || labelledByTexts.some((text) => strongMenuCue.test(text || ''))
         );
         const hasAccountProfile = accountProfileCue.test(nodeIdentity);
         const isMenuButton = String(node.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu';
@@ -263,37 +270,35 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         // Loose user/avatar chrome alone never becomes an identity anchor.
         const isIdentityAnchor = hasAccountProfile || hasStrong;
         if (!isIdentityAnchor && (isMenuButton || looseUserOnly)) continue;
-        const attrCandidates = attributeNames(node).map(clean).filter((candidate) => {
-          if (!candidate || candidate.length > 40 || /@/.test(candidate)) return false;
-          if (genericLabel.test(candidate) || usageNoise.test(candidate)) return false;
-          if (componentSlug.test(candidate)) return false;
-          return true;
-        });
-        const rawCandidates = [
-          ...resolveLabelledBy(node),
-          ...nearbyNames(node),
-          ...imageNames(node),
-          ...attrCandidates,
-          ariaLabel,
-          title,
-          node.innerText || node.textContent || '',
-        ];
-        const accepted = [];
-        for (const raw of rawCandidates) {
+        const scored = [];
+        const pushCandidate = (raw, tier) => {
           const candidate = clean(raw);
-          if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
-          if (genericLabel.test(candidate) || usageNoise.test(candidate)) continue;
-          if (componentSlug.test(candidate)) continue;
-          if (seen.has(candidate)) continue;
+          if (!candidate || candidate.length > 40 || /@/.test(candidate)) return;
+          if (genericLabel.test(candidate) || usageNoise.test(candidate)) return;
+          if (isChromeControlSlug(candidate)) return;
+          if (seen.has(candidate)) return;
           seen.add(candidate);
-          accepted.push(candidate);
-        }
-        if (accepted.length) {
+          scored.push({ value: candidate, tier });
+        };
+        for (const text of labelledByTexts) pushCandidate(text, 'local');
+        for (const item of nearbyNames(node)) pushCandidate(item.text, item.tier);
+        for (const text of imageNames(node)) pushCandidate(text, 'local');
+        for (const text of attributeNames(node)) pushCandidate(text, 'local');
+        // aria/title are chrome metadata; keep only if they look like a display name.
+        pushCandidate(ariaLabel, 'chromeMeta');
+        pushCandidate(title, 'chromeMeta');
+        pushCandidate(node.innerText || node.textContent || '', 'local');
+        if (scored.length) {
+          const tierRank = { local: 0, chromeAdjacent: 1, chromeMeta: 2 };
           const isInitials = (value) => /^[A-Za-z]{1,2}$/.test(value);
-          const preferred = accepted.filter((value) => !isInitials(value));
-          const pool = preferred.length ? preferred : accepted;
-          pool.sort((left, right) => right.length - left.length);
-          return pool[0];
+          const preferred = scored.filter((item) => !isInitials(item.value));
+          const pool = preferred.length ? preferred : scored;
+          pool.sort((left, right) => {
+            const tierDelta = (tierRank[left.tier] ?? 9) - (tierRank[right.tier] ?? 9);
+            if (tierDelta !== 0) return tierDelta;
+            return right.value.length - left.value.length;
+          });
+          return pool[0].value;
         }
       }
     }
