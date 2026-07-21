@@ -1588,6 +1588,48 @@ Resets Aug 13, 2026
         )
         self.assertEqual(active_account_ko.get("profileName"), "김종인")
 
+        selected_account_ko = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>김</span></div>"
+                    "<div><span>선택된 계정</span></div>"
+                    '<button type="button" aria-label="사용자 메뉴" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(selected_account_ko.get("profileName"), "김")
+
+        tier_dedupe = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    "<span>Jane Doe</span>"
+                    '<div class="account-chip">'
+                    '<div><img src="about:blank" alt="Jane Doe" width="24" height="24" /></div>'
+                    "<div><span>JD</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(tier_dedupe.get("profileName"), "Jane Doe")
+
+        avatar_only_no_nav = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img src="about:blank" alt="" width="24" height="24" />'
+                    "</button>"
+                    "<div>Members</div>"
+                )
+            )
+        )
+        self.assertEqual(avatar_only_no_nav.get("profileName"), "")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",
