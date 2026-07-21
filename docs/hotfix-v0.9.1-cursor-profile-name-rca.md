@@ -170,3 +170,12 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | probe fixture마다 browser launch | `_evaluate_probe_on_html`가 호출마다 launch/close | shared browser 부재로 70+회 기동 | class-level browser reuse + page-only cycle |
 
 유사 스캔: Command palette / 단축키 / 환경 설정, Preferences/Appearance.
+
+### Round-26 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| local `Acme Labs`/`Delete account`/`Available Now`가 `Jane Doe` 압도 | 같은 tier에서 `length` 정렬 | 출처/DOM 순서 없이 longest-wins | sourceRank(labelledBy→join→childText→nearby) + DOM order; length는 최후 타이브레이크 |
+| leading org / action·status leaf | labs·delete/available이 display-name 통과 | org/action/status 축 일부 누락 | `\blabs\b` chrome + delete account/available now/online… noise |
+
+유사 스캔: split join(`childJoin`)이 긴 status leaf보다 우선, chromeAdjacent/nearbyLocal은 childText보다 낮음.

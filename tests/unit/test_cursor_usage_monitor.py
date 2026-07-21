@@ -2131,6 +2131,65 @@ Resets Aug 13, 2026
         )
         self.assertEqual(chrome_adjacent_rejects_command_palette.get("profileName"), "")
 
+        # Longer unrelated local leaves must not beat the earlier display name.
+        local_name_beats_workspace = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe</span><span>Acme Labs</span></button>"
+                )
+            )
+        )
+        self.assertEqual(local_name_beats_workspace.get("profileName"), "Jane Doe")
+
+        local_name_beats_delete_account = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe</span><span>Delete account</span></button>"
+                )
+            )
+        )
+        self.assertEqual(local_name_beats_delete_account.get("profileName"), "Jane Doe")
+
+        local_name_beats_status = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe</span><span>Available Now</span></button>"
+                )
+            )
+        )
+        self.assertEqual(local_name_beats_status.get("profileName"), "Jane Doe")
+
+        # Org leaf before the name still loses via labs chrome rejection.
+        local_name_beats_leading_org = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Acme Labs</span><span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(local_name_beats_leading_org.get("profileName"), "Jane Doe")
+
+        # Split-name join still outranks a longer unrelated leaf.
+        split_join_beats_longer_status = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane</span><span>Doe</span>"
+                    "<span>Available Now</span></button>"
+                )
+            )
+        )
+        self.assertEqual(split_join_beats_longer_status.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

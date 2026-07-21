@@ -138,9 +138,9 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|sign out|log out|logout|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
-    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제|members?|usage|docs?|home|teams?|privacy|terms|cookies?|upgrade|manage|subscribe|buy|feedback|support|community|contact|pricing|learn|blog|notifications?|invite|trial|owner|admin|viewer|guest|moderator|editor|collaborator|manager|도움말|피드백|지원|업그레이드|구독|관리자|소유자|멤버|체험)$|privacy\s*policy|terms\s+of\s+(?:service|use)|cookie\s+policy|(?:개인정보|이용약관|쿠키)\s*(?:처리\s*)?(?:방침|정책)?|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization|get\s*started|sign\s*out|log\s*out|\blogout\b|keyboard\s+shortcuts?|\bshortcuts?\b|command\s+palette|keybindings?|preferences?|appearance|quick\s+open|단축키|명령\s*팔레트|환경\s*설정)/i;
+    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제|members?|usage|docs?|home|teams?|privacy|terms|cookies?|upgrade|manage|subscribe|buy|feedback|support|community|contact|pricing|learn|blog|notifications?|invite|trial|owner|admin|viewer|guest|moderator|editor|collaborator|manager|도움말|피드백|지원|업그레이드|구독|관리자|소유자|멤버|체험)$|privacy\s*policy|terms\s+of\s+(?:service|use)|cookie\s+policy|(?:개인정보|이용약관|쿠키)\s*(?:처리\s*)?(?:방침|정책)?|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization|get\s*started|sign\s*out|log\s*out|\blogout\b|keyboard\s+shortcuts?|\bshortcuts?\b|command\s+palette|keybindings?|preferences?|appearance|quick\s+open|단축키|명령\s*팔레트|환경\s*설정|delete\s+account|available\s+now|^(?:online|offline|away|busy)$|계정\s*삭제|지금\s*이용\s*가능)/i;
     // Org/legal suffixes and auth chrome that sit beside identity controls.
-    const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|(?:current|active|selected|switch)\s+account|선택(?:된|한)?\s*계정|(?:현재|활성)\s*계정|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜|\b(?:corporation|company|incorporated|inc\.?|llc|ltd\.?|gmbh|corp\.?)\b)/i;
+    const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|(?:current|active|selected|switch)\s+account|선택(?:된|한)?\s*계정|(?:현재|활성)\s*계정|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜|\b(?:corporation|company|incorporated|inc\.?|llc|ltd\.?|gmbh|corp\.?|labs)\b)/i;
     const looksLikeDisplayName = (value) => {
       if (!value || accountChromePhrase.test(value)) return false;
       if (/^[A-Za-z]{1,2}$/.test(value)) return true;
@@ -258,6 +258,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     };
     // Leaf texts inside the identity control itself, including direct text nodes
     // (e.g. "Jane Doe<span>Team Plan</span>") without concatenating siblings.
+    // Returns {text, source} so joins outrank unrelated longer sibling leaves.
     const nodeChildNames = (node) => {
       const found = [];
       // Join only textual leaves. Image alt/title stay as separate candidates so
@@ -268,7 +269,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (child.nodeType === 3) {
           const text = clean(child.textContent || '');
           if (text) {
-            found.push(text);
+            found.push({ text, source: 'childText' });
             textLeaves.push(text);
           }
         }
@@ -276,15 +277,15 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       if (!node.querySelectorAll) return found;
       for (const img of Array.from(node.querySelectorAll('img[alt], img[title]'))) {
         if (!isVisible(img) || isExcluded(img)) continue;
-        found.push(img.getAttribute('alt') || '');
-        found.push(img.getAttribute('title') || '');
+        found.push({ text: img.getAttribute('alt') || '', source: 'image' });
+        found.push({ text: img.getAttribute('title') || '', source: 'image' });
       }
       for (const el of Array.from(node.querySelectorAll('span, div, p, strong, b'))) {
         if (!isVisible(el) || isExcluded(el)) continue;
         if (el.closest && el.closest('a, input')) continue;
         if (el.querySelector && el.querySelector('button, a, input, span, div, p')) continue;
         const text = el.innerText || el.textContent || '';
-        found.push(text);
+        found.push({ text, source: 'childText' });
         textLeaves.push(text);
       }
       // Join split name leaves: <span>Jane</span><span>Doe</span> -> "Jane Doe".
@@ -307,7 +308,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       });
       const hasNonInitial = singleWords.some((token) => !/^[A-Za-z]{1,2}$/.test(token.replace(/[,\u2010-\u2015.（）()]+$/u, '')));
       if (hasNonInitial && singleWords.length >= 2 && singleWords.length <= 8) {
-        found.push(singleWords.join(' '));
+        found.push({ text: singleWords.join(' '), source: 'childJoin' });
       }
       return found;
     };
@@ -439,7 +440,19 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         const allowChromeAdjacent = hasStrong;
         const scored = [];
         const tierRank = { local: 0, chromeAdjacent: 1, chromeMeta: 2 };
-        const pushCandidate = (raw, tier) => {
+        // Within a tier, longer unrelated metadata must not beat the real name.
+        // Prefer identity sources and earlier DOM order; length is last resort.
+        const sourceRank = {
+          labelledBy: 0,
+          image: 1,
+          attribute: 2,
+          childJoin: 3,
+          childText: 4,
+          nearbyLocal: 5,
+          chromeAdjacent: 6,
+          chromeMeta: 7,
+        };
+        const pushCandidate = (raw, tier, source) => {
           for (const piece of expandCandidates(raw)) {
             const candidate = clean(piece);
             if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
@@ -451,28 +464,39 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               if ((tierRank[tier] ?? 9) < (tierRank[existing.tier] ?? 9)) {
                 existing.tier = tier;
               }
+              if ((sourceRank[source] ?? 9) < (sourceRank[existing.source] ?? 9)) {
+                existing.source = source;
+              }
               continue;
             }
-            scored.push({ value: candidate, tier });
+            scored.push({
+              value: candidate,
+              tier,
+              source,
+              order: scored.length,
+            });
           }
         };
         // Register local identity sources before chromeAdjacent so duplicates keep
         // the higher-priority local tier.
-        for (const text of labelledByTexts) pushCandidate(text, 'local');
-        for (const text of imageNames(node)) pushCandidate(text, 'local');
-        for (const text of attributeNames(node)) pushCandidate(text, 'local');
+        for (const text of labelledByTexts) pushCandidate(text, 'local', 'labelledBy');
+        for (const text of imageNames(node)) pushCandidate(text, 'local', 'image');
+        for (const text of attributeNames(node)) pushCandidate(text, 'local', 'attribute');
         const childTexts = nodeChildNames(node);
         if (childTexts.length) {
-          for (const text of childTexts) pushCandidate(text, 'local');
+          for (const item of childTexts) {
+            pushCandidate(item.text, 'local', item.source || 'childText');
+          }
         } else {
-          pushCandidate(node.innerText || node.textContent || '', 'local');
+          pushCandidate(node.innerText || node.textContent || '', 'local', 'childText');
         }
         for (const item of nearbyNames(node, allowChromeAdjacent)) {
-          pushCandidate(item.text, item.tier);
+          const source = item.tier === 'chromeAdjacent' ? 'chromeAdjacent' : 'nearbyLocal';
+          pushCandidate(item.text, item.tier, source);
         }
         // aria/title are chrome metadata; keep only if they look like a display name.
-        pushCandidate(ariaLabel, 'chromeMeta');
-        pushCandidate(title, 'chromeMeta');
+        pushCandidate(ariaLabel, 'chromeMeta', 'chromeMeta');
+        pushCandidate(title, 'chromeMeta', 'chromeMeta');
         if (scored.length) {
           // Prefer higher tiers first. Apply non-initial preference inside each
           // tier only, so local "JD" is not discarded for chromeAdjacent copy.
@@ -486,7 +510,13 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             if (!named.length) continue;
             const preferred = named.filter((item) => !isInitials(item.value));
             const pool = preferred.length ? preferred : named;
-            pool.sort((left, right) => right.value.length - left.value.length);
+            pool.sort((left, right) => {
+              const bySource = (sourceRank[left.source] ?? 9) - (sourceRank[right.source] ?? 9);
+              if (bySource) return bySource;
+              const byOrder = (left.order ?? 0) - (right.order ?? 0);
+              if (byOrder) return byOrder;
+              return right.value.length - left.value.length;
+            });
             return pool[0].value;
           }
         }
