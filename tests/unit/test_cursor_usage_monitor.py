@@ -2639,6 +2639,112 @@ Resets Aug 13, 2026
         )
         self.assertEqual(spaced_ascii_dash_org_yields_to_clean.get("profileName"), "Jane Doe")
 
+        # One-sided spaced separators are still chrome residue (not in-word).
+        onesided_en_dash_left_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe –Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            onesided_en_dash_left_yields_to_clean.get("profileName"),
+            "Jane Doe",
+        )
+
+        onesided_en_dash_right_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe– Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            onesided_en_dash_right_yields_to_clean.get("profileName"),
+            "Jane Doe",
+        )
+
+        onesided_em_dash_left_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe —Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            onesided_em_dash_left_yields_to_clean.get("profileName"),
+            "Jane Doe",
+        )
+
+        onesided_ascii_dash_left_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe -Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            onesided_ascii_dash_left_yields_to_clean.get("profileName"),
+            "Jane Doe",
+        )
+
+        onesided_ascii_dash_right_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe- Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            onesided_ascii_dash_right_yields_to_clean.get("profileName"),
+            "Jane Doe",
+        )
+
+        onesided_middot_left_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe ·Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            onesided_middot_left_yields_to_clean.get("profileName"),
+            "Jane Doe",
+        )
+
+        onesided_middot_right_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe· Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            onesided_middot_right_yields_to_clean.get("profileName"),
+            "Jane Doe",
+        )
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

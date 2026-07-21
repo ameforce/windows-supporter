@@ -259,3 +259,11 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `Jane Doe – Acme`가 clean 압도 | hyphen 전면 제외로 spaced dash residue 미감점 | in-word vs spaced dash 축 미분리 | spaced `-`/`\u2010-\u2015`도 middot과 동일 residue |
 
 유사 스캔: em dash / ASCII ` - `, `Anne-Marie` 유지.
+
+### Round-36 finding 처분 RCA
+
+| Finding | 직접 원인 | 구조적 원인 | 근본 수정 |
+|---|---|---|---|
+| `Jane Doe –Acme` / `Jane Doe– Acme`가 clean 승리 | residue가 양쪽 공백 형태만 점수화 | in-word vs separator를 '양쪽 whitespace'로만 근사 | letter/digit 경계가 한쪽이라도 깨진 dash/middot를 residue |
+
+인접 스캔: em/ASCII one-sided, middot one-sided, `Anne-Marie` 유지, both-side spaced 유지.

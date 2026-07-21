@@ -581,14 +581,17 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             );
             // Prefer clean display names over siblings that still carry status
             // separators after strip failures. In-word hyphens (Anne-Marie) and
-            // glued middots are not chrome; spaced dashes/middots are.
+            // fully glued middots are not chrome; a dash/middot with a non-word
+            // boundary on either side (Jane Doe –Acme / Jane Doe– Acme) is.
             const nameChromeResidueScore = (value) => {
               const text = String(value || '');
               let score = 0;
               const bullets = text.match(/[|/•●○∙…\[\]]|\.{2,}/g);
               if (bullets) score += bullets.join('').length;
-              const spacedSep = text.match(/(?:^|\s)[\-\u2010-\u2015·・](?=\s|$)/g);
-              if (spacedSep) score += spacedSep.length;
+              const boundarySep = text.match(
+                /(?<![\p{L}\p{N}])[\-\u2010-\u2015·・]|[\-\u2010-\u2015·・](?![\p{L}\p{N}])/gu
+              );
+              if (boundarySep) score += boundarySep.length;
               return score;
             };
             const isPrefixName = (shorter, longer) => {
