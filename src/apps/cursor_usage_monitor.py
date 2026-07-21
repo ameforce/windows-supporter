@@ -147,8 +147,9 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       // Allow particle-heavy names (e.g. "Juan Carlos de la Vega").
       if (words.length < 1 || words.length > 8) return false;
       if (words.some((word) => word.length === 1 && /[^\p{L}\p{M}]/u.test(word))) return false;
-      // Keep common display punctuation: "Doe, Jane", "Jean・Luc", "Jane (Work)".
-      return /^[\p{L}\p{M}\d\s.'\-,·・()]+$/u.test(value);
+      // Keep common display punctuation across ASCII and Unicode forms:
+      // "Doe, Jane", "O’Connor", "Anne–Marie", "Jean・Luc", "Jane（Work）".
+      return /^[\p{L}\p{M}\d\s.'\-,·・()（）\u2010-\u2015\u2018-\u2019\u201C-\u201D]+$/u.test(value);
     };
     const expandCandidates = (raw) => {
       let cleaned = clean(raw);
@@ -271,7 +272,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       // require at least one non-initial token so "J"+"D" does not invent a name.
       const singleWords = tokens.filter((token) => (
         token.split(/\s+/).length === 1
-        && /^[\p{L}\p{M}.'-]+$/u.test(token)
+        && /^[\p{L}\p{M}.'\-\u2010-\u2015\u2018-\u2019]+$/u.test(token)
         && !planOrBadgeLeaf.test(token)
         && !usageNoise.test(token)
         && !accountChromePhrase.test(token)

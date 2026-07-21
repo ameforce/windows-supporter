@@ -126,3 +126,11 @@
 | `J`+`Doe` / `Li`+`Wei` 잘림 | join이 ASCII 1–2글자 leaf 제외 | initials 배제가 join 경로까지 적용됨 | short leaf 허용, non-initial 1개 이상일 때만 join |
 
 유사 스캔: `J`+`D` only-initial join 불가 유지, Business/Owner badge join 제외 유지.
+
+### Round-21 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `O’Connor` / `Anne–Marie` / `Jane（Work）` 거부 | charset이 ASCII/`・`/`()`에 국한 | Unicode 이름 구두점 축 누락 | curly quote·en/em dash·전각 괄호 허용 |
+
+유사 스캔: hyphen/en-dash 계열 `\u2010-\u2015`, quotes `\u2018-\u2019`/`\u201C-\u201D`, split leaf에도 dash/apostrophe 허용.

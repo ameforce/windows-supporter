@@ -1909,6 +1909,45 @@ Resets Aug 13, 2026
         )
         self.assertEqual(punctuated_paren_name.get("profileName"), "Jane (Work)")
 
+        punctuated_curly_apostrophe = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>O\u2019Connor</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(punctuated_curly_apostrophe.get("profileName"), "O\u2019Connor")
+
+        punctuated_en_dash_name = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Anne\u2013Marie</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(punctuated_en_dash_name.get("profileName"), "Anne\u2013Marie")
+
+        punctuated_fullwidth_paren = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane\uff08Work\uff09</span>"
+                    "</button>"
+                )
+            )
+        )
+        self.assertEqual(
+            punctuated_fullwidth_paren.get("profileName"),
+            "Jane\uff08Work\uff09",
+        )
+
         split_short_initial_name = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
