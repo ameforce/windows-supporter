@@ -132,19 +132,82 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     /^(sign in|log in|continue with google|로그인)$/i.test(text)
   ).slice(0, 4).join(' ');
   const collectProfileName = () => {
-    const identityCue = /(profile|account|프로필|계정|avatar|user)/i;
+    const identityCue = /(?:^|[^a-z0-9])(?:profile|account|프로필|계정|avatar|user)(?:[^a-z0-9]|$)/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴)$/i;
+    const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby)\s+plan$)/i;
     const selectors = [
       '[data-testid*="profile" i]',
       '[data-testid*="account" i]',
+      '[data-testid*="user" i]',
       '[aria-label*="profile" i]',
       '[aria-label*="account" i]',
       '[aria-label*="프로필" i]',
       '[aria-label*="계정" i]',
+      '[aria-label*="user" i]',
+      '[aria-label*="avatar" i]',
       'header button[aria-haspopup="menu"]',
       'nav button[aria-haspopup="menu"]',
+      'aside button[aria-haspopup="menu"]',
+      '[role="banner"] button[aria-haspopup="menu"]',
       'button[aria-haspopup="menu"]',
     ];
+    const resolveLabelledBy = (node) => {
+      const ids = clean(node.getAttribute ? (node.getAttribute('aria-labelledby') || '') : '');
+      if (!ids) return [];
+      const texts = [];
+      for (const id of ids.split(/\s+/)) {
+        if (!id) continue;
+        const ref = document.getElementById(id);
+        if (!ref || !isVisible(ref) || isExcluded(ref)) continue;
+        texts.push(ref.innerText || ref.textContent || '');
+      }
+      return texts;
+    };
+    const attributeNames = (node) => ([
+      node.getAttribute ? node.getAttribute('data-display-name') : '',
+      node.getAttribute ? node.getAttribute('data-user-name') : '',
+      node.getAttribute ? node.getAttribute('data-name') : '',
+    ]);
+    const imageNames = (node) => Array.from(
+      node.querySelectorAll ? node.querySelectorAll('img[alt], img[title]') : []
+    ).flatMap((img) => ([
+      img.getAttribute('alt') || '',
+      img.getAttribute('title') || '',
+    ]));
+    const nearbyNames = (node) => {
+      const found = [];
+      const chromeRoot = node.closest
+        ? node.closest('aside, nav, header, [role="banner"], [role="navigation"]')
+        : null;
+      const pushLeaves = (root) => {
+        if (!root || root === node) return;
+        if (root.matches && root.matches('button, a, input')) return;
+        for (const img of Array.from(root.querySelectorAll ? root.querySelectorAll('img[alt], img[title]') : [])) {
+          if (!isVisible(img) || isExcluded(img)) continue;
+          found.push(img.getAttribute('alt') || '');
+          found.push(img.getAttribute('title') || '');
+        }
+        for (const el of [root, ...Array.from(root.querySelectorAll('span, div, p, strong, b'))]) {
+          if (!isVisible(el) || isExcluded(el)) continue;
+          if (el.closest && el.closest('button, a, input')) continue;
+          if (el.querySelector && el.querySelector('button, a, input, span, div, p')) continue;
+          found.push(el.innerText || el.textContent || '');
+        }
+      };
+      let current = node.parentElement;
+      for (let depth = 0; depth < 3 && current; depth += 1, current = current.parentElement) {
+        // Cursor mounts the dashboard sidebar inside main; do not abort on main.
+        if (chromeRoot && current !== chromeRoot && !chromeRoot.contains(current)) break;
+        for (const sibling of Array.from(current.children)) {
+          if (sibling === node) continue;
+          if (sibling.matches && sibling.matches('main, [role="main"], table, [role="grid"], [role="row"]')) continue;
+          if (depth > 0 && sibling.contains && sibling.contains(node)) continue;
+          pushLeaves(sibling);
+        }
+        if (chromeRoot && current === chromeRoot) break;
+      }
+      return found;
+    };
     const seen = new Set();
     for (const selector of selectors) {
       const broadMenu = /aria-haspopup=["']menu["']/.test(selector);
@@ -163,11 +226,21 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         if (!broadMenu && nodeIdentity && !hasCue) {
           continue;
         }
-        const rawCandidates = [ariaLabel, title, node.innerText || node.textContent || ''];
+        // Chrome labels like "User menu" are identity anchors, not display names.
+        // Prefer data attrs, labelledby, img alt, nearby chrome text, then node text.
+        const rawCandidates = [
+          ...attributeNames(node),
+          ...resolveLabelledBy(node),
+          ...imageNames(node),
+          ...nearbyNames(node),
+          ariaLabel,
+          title,
+          node.innerText || node.textContent || '',
+        ];
         for (const raw of rawCandidates) {
           const candidate = clean(raw);
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
-          if (genericLabel.test(candidate)) continue;
+          if (genericLabel.test(candidate) || usageNoise.test(candidate)) continue;
           if (seen.has(candidate)) continue;
           seen.add(candidate);
           return candidate;

@@ -893,6 +893,10 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertIn("aria-label", lowered)
         self.assertIn("genericlabel", lowered)
         self.assertIn("broadmenu", lowered)
+        self.assertIn("nearbynames", lowered)
+        self.assertIn("imagenames", lowered)
+        self.assertIn("resolvelabelledby", lowered)
+        self.assertIn('[data-testid*="user" i]'.lower(), lowered)
         self.assertIn(r"(?:account|profile|user)\s+menu", lowered)
         self.assertIn(r"(?:my|your|edit|switch|view|open)\s+(?:account|profile)", lowered)
         # Uncued header menus must be skipped; only identity-cued nodes harvest names.
@@ -903,6 +907,122 @@ class CursorUsageMonitorUnitTest(unittest.TestCase):
         self.assertNotIn("document.cookie", lowered)
         self.assertNotIn("localstorage", lowered)
         self.assertNotIn("fetch(", lowered)
+
+    def _evaluate_probe_on_html(self, html: str) -> dict[str, object]:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(html)
+                probe = page.evaluate(CURSOR_USAGE_PAGE_PROBE_SCRIPT)
+            finally:
+                browser.close()
+        self.assertIsInstance(probe, dict)
+        return probe
+
+    @staticmethod
+    def _usage_summary_html(*, identity_html: str) -> str:
+        # Cursor mounts the dashboard sidebar inside main; fixtures must too.
+        return f"""<!doctype html>
+<html><body>
+<main role="main">
+  <aside>{identity_html}</aside>
+  <div><span>Your included usage</span>
+    <div>US$4.00
+/ US$20.00
+Billing cycle
+Resets Aug 13, 2026
+</div>
+  </div>
+  <div><span>On-Demand Usage</span>
+    <div>OFF</div>
+  </div>
+  <button type="button" aria-label="Usage events for all users">Showing token usage</button>
+</main>
+</body></html>"""
+
+    def test_probe_harvests_nearby_name_from_user_menu_chrome(self) -> None:
+        # Red: Cursor dashboard exposes "User menu" chrome without the display
+        # name in aria-label; the visible name sits next to the identity control.
+        probe = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    '<div><img src="about:blank" alt="종인 김" width="28" height="28" /></div>'
+                    '<div><div><span>종인 김</span></div>'
+                    '<div><span>Team Plan</span></div></div>'
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span></span>"
+                    "</button>"
+                    "</div>"
+                )
+            )
+        )
+
+        self.assertEqual(probe.get("profileName"), "종인 김")
+        blocks = probe.get("metricBlocks") or []
+        self.assertTrue(
+            any(
+                isinstance(block, dict)
+                and block.get("metric_key") == "cursor_account_summary"
+                for block in blocks
+            )
+        )
+
+    def test_probe_harvests_img_alt_from_user_menu_anchor(self) -> None:
+        probe = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu" data-testid="user-menu">'
+                    '<img src="about:blank" alt="Bob Builder" width="24" height="24" />'
+                    "</button>"
+                )
+            )
+        )
+
+        self.assertEqual(probe.get("profileName"), "Bob Builder")
+
+    def test_probe_harvests_aria_labelledby_and_data_display_name(self) -> None:
+        labelled = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<span id="cursor-user-label">Carol Danvers</span>'
+                    '<button type="button" data-testid="account-trigger" '
+                    'aria-labelledby="cursor-user-label"></button>'
+                )
+            )
+        )
+        self.assertEqual(labelled.get("profileName"), "Carol Danvers")
+
+        data_named = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" data-testid="user-chip" '
+                    'data-display-name="Dana Scully"></button>'
+                )
+            )
+        )
+        self.assertEqual(data_named.get("profileName"), "Dana Scully")
+
+    def test_probe_ignores_uncued_menu_and_email_only_identity(self) -> None:
+        probe = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="Notifications" '
+                    'aria-haspopup="menu"><span>Secret Name</span></button>'
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu" data-testid="user-menu">'
+                    '<span>alice@example.com</span>'
+                    "</button>"
+                )
+            )
+        )
+
+        self.assertEqual(probe.get("profileName"), "")
 
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
