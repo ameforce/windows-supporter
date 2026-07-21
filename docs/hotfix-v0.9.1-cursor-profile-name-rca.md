@@ -251,3 +251,11 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `○ Jane Doe` 잔존 | trailing-only leftover strip | leading orphan separator 축 누락 | leading orphan separator strip |
 
 유사 스캔: `○ Acme` sibling, `Jane Doe · Foo`, leading `•`/`∙`.
+
+### Round-35 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Jane Doe – Acme`가 clean 압도 | hyphen 전면 제외로 spaced dash residue 미감점 | in-word vs spaced dash 축 미분리 | spaced `-`/`\u2010-\u2015`도 middot과 동일 residue |
+
+유사 스캔: em dash / ASCII ` - `, `Anne-Marie` 유지.

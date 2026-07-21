@@ -2602,6 +2602,43 @@ Resets Aug 13, 2026
         )
         self.assertEqual(spaced_middot_org_yields_to_clean.get("profileName"), "Jane Doe")
 
+        # Spaced dashes are chrome separators; in-word hyphens stay names.
+        spaced_en_dash_org_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe – Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(spaced_en_dash_org_yields_to_clean.get("profileName"), "Jane Doe")
+
+        spaced_em_dash_org_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe — Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(spaced_em_dash_org_yields_to_clean.get("profileName"), "Jane Doe")
+
+        spaced_ascii_dash_org_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe - Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(spaced_ascii_dash_org_yields_to_clean.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

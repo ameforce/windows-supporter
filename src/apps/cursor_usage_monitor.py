@@ -580,15 +580,15 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               || !/[\p{L}\p{N}]/u.test(word)
             );
             // Prefer clean display names over siblings that still carry status
-            // separators (○/∙/…/...) after strip failures. Hyphenated names are
-            // not chrome; spaced middots are (status separator form).
+            // separators after strip failures. In-word hyphens (Anne-Marie) and
+            // glued middots are not chrome; spaced dashes/middots are.
             const nameChromeResidueScore = (value) => {
               const text = String(value || '');
               let score = 0;
               const bullets = text.match(/[|/•●○∙…\[\]]|\.{2,}/g);
               if (bullets) score += bullets.join('').length;
-              const spacedMiddot = text.match(/(?:^|\s)[·・](?=\s|$)/g);
-              if (spacedMiddot) score += spacedMiddot.length;
+              const spacedSep = text.match(/(?:^|\s)[\-\u2010-\u2015·・](?=\s|$)/g);
+              if (spacedSep) score += spacedSep.length;
               return score;
             };
             const isPrefixName = (shorter, longer) => {
