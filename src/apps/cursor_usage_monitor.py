@@ -135,7 +135,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const identityCue = /(?:^|[^a-z0-9])(?:profile|account|프로필|계정|avatar|user|사용자)(?:[^a-z0-9]|$)|(?:profile|account|avatar|user)(?:menu|button|trigger|chip)/i;
     // Account/profile anchors include menu, trigger/button/chip, and "My account"/"View profile".
     const strongMenuCue = /(?:user|account|profile|사용자|프로필|계정)\s*menu|(?:user|account|profile)menu|(?:사용자|프로필|계정)\s*메뉴|(?:account|profile|user)(?:[_-])?(?:trigger|button|chip)|(?:my|your|edit|switch|view|open)\s+(?:account|profile)/i;
-    const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add\s+user|teammate/i;
+    const accountProfileCue = /(?:^|[^a-z0-9])(?:account|profile|프로필|계정)(?:[^a-z0-9]|$)|(?:내|나의)\s*(?:계정|프로필)/i;
+    const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
     const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정)$)/i;
     // Lowercase kebab ids only; keep Anne-Marie / Jean-Luc style display attrs.
@@ -214,9 +215,13 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
         );
         if (isChrome) {
           const kids = Array.from(current.children);
-          const idx = kids.indexOf(node);
+          let idx = kids.indexOf(node);
+          if (idx < 0) {
+            idx = kids.findIndex((child) => child.contains && child.contains(node));
+          }
           if (idx >= 0) {
             for (const sibling of [kids[idx - 1], kids[idx + 1]].filter(Boolean)) {
+              if (sibling.contains && sibling.contains(node)) continue;
               pushLeaves(sibling);
             }
           }
@@ -248,14 +253,16 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           || strongMenuCue.test(testId || '')
           || strongMenuCue.test(title || '')
         );
+        const hasAccountProfile = accountProfileCue.test(nodeIdentity);
         const isMenuButton = String(node.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu';
-        // Menu buttons and loose user/avatar CTAs both need an account-menu cue;
-        // otherwise "Add user" / invite chrome can steal profileName.
-        const looseUserAnchor = (
+        const looseUserOnly = (
           /(?:^|[^a-z0-9])(?:user|avatar|사용자)(?:[^a-z0-9]|$)/i.test(nodeIdentity)
-          && !/(?:account|profile|프로필|계정)/i.test(nodeIdentity)
+          && !hasAccountProfile
         );
-        if ((isMenuButton || looseUserAnchor) && !hasStrong) continue;
+        // Contract: account/profile family OR strong control form may harvest.
+        // Loose user/avatar chrome alone never becomes an identity anchor.
+        const isIdentityAnchor = hasAccountProfile || hasStrong;
+        if (!isIdentityAnchor && (isMenuButton || looseUserOnly)) continue;
         const attrCandidates = attributeNames(node).map(clean).filter((candidate) => {
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) return false;
           if (genericLabel.test(candidate) || usageNoise.test(candidate)) return false;
@@ -276,6 +283,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           const candidate = clean(raw);
           if (!candidate || candidate.length > 40 || /@/.test(candidate)) continue;
           if (genericLabel.test(candidate) || usageNoise.test(candidate)) continue;
+          if (componentSlug.test(candidate)) continue;
           if (seen.has(candidate)) continue;
           seen.add(candidate);
           accepted.push(candidate);

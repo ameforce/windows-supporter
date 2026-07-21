@@ -1260,6 +1260,116 @@ Resets Aug 13, 2026
         )
         self.assertEqual(aside_adjacent.get("profileName"), "Kim")
 
+        bare_account = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="Account" '
+                    'aria-haspopup="menu"><span>Jane Doe</span></button>'
+                )
+            )
+        )
+        self.assertEqual(bare_account.get("profileName"), "Jane Doe")
+
+        bare_profile = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="Profile" '
+                    'aria-haspopup="menu"><span>Jane Doe</span></button>'
+                )
+            )
+        )
+        self.assertEqual(bare_profile.get("profileName"), "Jane Doe")
+
+        testid_account = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" data-testid="account" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(testid_account.get("profileName"), "Jane Doe")
+
+        korean_account = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>김종인</span></div>"
+                    '<button type="button" aria-label="내 계정" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(korean_account.get("profileName"), "김종인")
+
+        korean_my_profile = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>김종인</span></div>"
+                    '<button type="button" aria-label="나의 프로필" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(korean_my_profile.get("profileName"), "김종인")
+
+        add_user_trigger = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" data-testid="add-user-trigger" '
+                    'aria-haspopup="menu"><span>Invite Teammates</span></button>'
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(add_user_trigger.get("profileName"), "Jane Doe")
+
+        add_user_underscore = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" data-testid="add_user_button" '
+                    'aria-haspopup="menu"><span>Invite Teammates</span></button>'
+                    '<div class="account-chip">'
+                    "<div><span>Jane Doe</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(add_user_underscore.get("profileName"), "Jane Doe")
+
+        wrapped_adjacent = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div><button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button></div>'
+                    "<span>Jane</span>"
+                )
+            )
+        )
+        self.assertEqual(wrapped_adjacent.get("profileName"), "Jane")
+
+        slug_only = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="user-menu-trigger" '
+                    'aria-haspopup="menu" title="account-menu-button"></button>'
+                )
+            )
+        )
+        self.assertEqual(slug_only.get("profileName"), "")
+
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
             "Account menu",

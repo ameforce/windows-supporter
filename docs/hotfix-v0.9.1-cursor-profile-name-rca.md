@@ -29,3 +29,35 @@
 
 - private API / cookie / email / Usage Events 표 수집은 하지 않는다.
 - 표시명이 DOM에 없으면 기존처럼 `Cursor N` fallback을 유지한다.
+
+## Round finding 묶음 RCA (identity gate thrash)
+
+### 증상
+
+이중 final review에서 identity harvest 가드가 라운드마다 다른 DOM 표기(`My account`, bare `Account`, `내 계정`, `add-user-trigger`, chrome wrapper sibling, kebab aria/title)에 대해 번갈아 회귀했다.
+
+### 직접 원인
+
+앵커 수락을 “menu/trigger 문자열 유무” 한 축으로 좁히거나, chrome root에서 sibling scan을 끄거나, reject/slug를 일부 후보 경로에만 적용하는 부분 가드가 누적됨.
+
+### 구조 원인
+
+`collectProfileName`가 (1) 노이즈 거부 (2) account/profile 가족 앵커 (3) strong control 표기 (4) loose user/avatar 제외 (5) 후보 sanitize를 한 계약으로 고정하지 않고, finding마다 regex/early-continue를 덧붙이는 대증 구조였음.
+
+### 유사 결함 스캔
+
+| 축 | 케이스 | 기대 |
+|---|---|---|
+| account/profile 가족 | bare Account/Profile, `data-testid=account`, `내 계정`/`나의 프로필` | 인접/내부 표시명 harvest |
+| strong control | User menu, account-trigger, profile_button, userMenu | harvest |
+| loose user 노이즈 | Add user, invite-user-row, add-user-trigger | 거부 후 실제 User menu로 진행 |
+| chrome geometry | chip 내부, aside 직계 sibling, wrapper+adjacent name | 이름 수집, Overview 미선택 |
+| candidate sanitize | User avatar alt, kebab aria/title only | 공란 → Cursor N fallback |
+
+### 근본 수정
+
+앵커 판정을 `reject → account/profile cue ∪ strong control → loose user 단독 거부`로 정리하고, chrome root는 containing-child 기준 인접 sibling만 스캔하며, `componentSlug`/generic/usageNoise를 모든 후보에 동일 적용한다.
+
+### side effect 검증 항목
+
+기존 User menu / 한글 메뉴 / hyphenated display name / invite 우선순위 / initials+Pro / camelCase userMenu 회귀 테스트 유지.
