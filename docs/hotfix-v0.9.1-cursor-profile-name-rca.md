@@ -187,3 +187,12 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `alt="John"`이 visible `John Doe` 압도 | image sourceRank가 childText보다 높음 | 부분 이름 vs 확장 이름 지배 관계 없음 | 같은 tier에서 word-prefix 후보는 제거하고 fuller 유지 |
 
 유사 스캔: `data-display-name="Mary"` + `Mary Ann`, full alt + org leaf는 alt 유지, initials `JD`는 기존 non-initial 선호 유지.
+
+### Round-28 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `alt=Doe` vs `Doe, Jane` 미확장 | prefix 비교가 raw token | 구두점 정규화 없음 | token edge punct strip 후 비교 |
+| `Jane Doe Online`이 full alt 압도 | status 확장을 fuller로 취급 | trailing presence 축 누락 | expandCandidates status strip + prefix extra에 presence/noise 거부 |
+
+유사 스캔: Away/Busy/Offline, 단독 status-suffix leaf → 이름만 남김.

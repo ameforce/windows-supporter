@@ -139,6 +139,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
     const rejectMenu = /invite|notification|language|workspace|usage events|알림|초대|add[-_\s]?users?|manage[-_\s]?users?|remove[-_\s]?users?|teammate/i;
     const genericLabel = /^(?:sign in|log in|sign out|log out|logout|settings|설정|로그아웃|로그인|help|en|account|profile|menu|avatar|user|프로필|계정|메뉴|open|close|(?:my|your|edit|switch|view|open)\s+(?:account|profile)(?:\s+menu)?|(?:account|profile|user)\s+menu|(?:내|나의)\s*(?:계정|프로필)|계정\s*메뉴|프로필\s*메뉴|사용자\s*메뉴|user\s+avatar|profile\s+picture|avatar\s+(?:image|photo)|profile\s+photo)$/i;
     const usageNoise = /(?:included usage|on-demand|billing cycle|usage events|resets?|\$\s*\d|your included|결제\s*주기|초기화|^(?:on|off|enabled|disabled|활성|비활성)$|^(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan$|^(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$|^(?:pro|plus|team|business|enterprise|free|hobby|ultra|dashboard|overview|settings|설정|billing|결제|members?|usage|docs?|home|teams?|privacy|terms|cookies?|upgrade|manage|subscribe|buy|feedback|support|community|contact|pricing|learn|blog|notifications?|invite|trial|owner|admin|viewer|guest|moderator|editor|collaborator|manager|도움말|피드백|지원|업그레이드|구독|관리자|소유자|멤버|체험)$|privacy\s*policy|terms\s+of\s+(?:service|use)|cookie\s+policy|(?:개인정보|이용약관|쿠키)\s*(?:처리\s*)?(?:방침|정책)?|(?:manage|upgrade|open)\s+(?:your\s+)?(?:subscription|plan|account|billing)|(?:구독|업그레이드|플랜)\s*(?:관리|변경)?|subscription|teammates?|member\s+since|joined\b|organization|get\s*started|sign\s*out|log\s*out|\blogout\b|keyboard\s+shortcuts?|\bshortcuts?\b|command\s+palette|keybindings?|preferences?|appearance|quick\s+open|단축키|명령\s*팔레트|환경\s*설정|delete\s+account|available\s+now|^(?:online|offline|away|busy)$|계정\s*삭제|지금\s*이용\s*가능)/i;
+    // Presence/status tokens that trail display names on account chips.
+    const presenceStatusToken = /^(?:online|offline|away|busy|active|idle|available|unavailable|온라인|오프라인|자리비움)$/i;
     // Org/legal suffixes and auth chrome that sit beside identity controls.
     const accountChromePhrase = /(?:member\s+since|joined\b|organization|workspace|(?:current|active|selected|switch)\s+account|선택(?:된|한)?\s*계정|(?:현재|활성)\s*계정|\b(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan\b|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜|\b(?:corporation|company|incorporated|inc\.?|llc|ltd\.?|gmbh|corp\.?|labs)\b)/i;
     const looksLikeDisplayName = (value) => {
@@ -179,6 +181,11 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           .replace(/^(?:profile|account|user|menu|open|프로필|계정|사용자|메뉴)(?:\s*[:：\-]\s*|\s+)/i, '')
           .trim();
       }
+      // Strip trailing presence status so "Jane Doe Online" stays name-shaped.
+      cleaned = cleaned.replace(
+        /\s+(?:online|offline|away|busy|active|idle|available|unavailable|온라인|오프라인|자리비움)$/i,
+        ''
+      ).trim();
       if (!cleaned) return [];
       return [cleaned];
     };
@@ -512,11 +519,32 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             const pool = preferred.length ? preferred : named;
             // Drop partial names that are word-prefixes of a fuller candidate
             // (e.g. img alt "John" must not beat visible "John Doe").
+            // Normalize token punctuation ("Doe," vs "Doe") and reject extensions
+            // that only add presence/status chrome ("Jane Doe Online").
+            const normalizeNameWord = (word) => String(word || '')
+              .toLowerCase()
+              .replace(
+                /^[,.\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+|[,.\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+$/gu,
+                ''
+              );
+            const nameWords = (value) => clean(value)
+              .split(/\s+/)
+              .map(normalizeNameWord)
+              .filter(Boolean);
             const isPrefixName = (shorter, longer) => {
-              const shortWords = clean(shorter).toLowerCase().split(/\s+/).filter(Boolean);
-              const longWords = clean(longer).toLowerCase().split(/\s+/).filter(Boolean);
+              const shortWords = nameWords(shorter);
+              const longWords = nameWords(longer);
               if (!shortWords.length || shortWords.length >= longWords.length) return false;
-              return shortWords.every((word, index) => word === longWords[index]);
+              if (!shortWords.every((word, index) => word === longWords[index])) return false;
+              const extra = longWords.slice(shortWords.length);
+              if (extra.some((word) => (
+                presenceStatusToken.test(word)
+                || usageNoise.test(word)
+                || accountChromePhrase.test(word)
+              ))) {
+                return false;
+              }
+              return true;
             };
             const undominated = pool.filter((item) => (
               !pool.some((other) => other !== item && isPrefixName(item.value, other.value))

@@ -2228,6 +2228,43 @@ Resets Aug 13, 2026
         )
         self.assertEqual(partial_attr_yields_to_full_name.get("profileName"), "Mary Ann")
 
+        # Comma-form visible names still dominate punctuated partial alts.
+        comma_name_beats_partial_alt = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Doe" src="about:blank" width="28" height="28" />'
+                    "<span>Doe, Jane</span></button>"
+                )
+            )
+        )
+        self.assertEqual(comma_name_beats_partial_alt.get("profileName"), "Doe, Jane")
+
+        # Trusted full alt must not lose to a status-suffixed visible leaf.
+        full_alt_beats_status_suffix = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe" src="about:blank" width="28" height="28" />'
+                    "<span>Jane Doe Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(full_alt_beats_status_suffix.get("profileName"), "Jane Doe")
+
+        status_suffix_alone_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe Away</span></button>"
+                )
+            )
+        )
+        self.assertEqual(status_suffix_alone_strips.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
