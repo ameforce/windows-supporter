@@ -622,13 +622,15 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               !pool.some((other) => other !== item && isContainedName(item.value, other.value))
             ));
             const pickFrom = undominated.length ? undominated : pool;
+            // Within a tier, chrome residue outranks source priority so a dirty
+            // image/labelledBy/attribute cannot beat a clean childText sibling.
             pickFrom.sort((left, right) => {
-              const bySource = (sourceRank[left.source] ?? 9) - (sourceRank[right.source] ?? 9);
-              if (bySource) return bySource;
               const byResidue = (
                 nameChromeResidueScore(left.value) - nameChromeResidueScore(right.value)
               );
               if (byResidue) return byResidue;
+              const bySource = (sourceRank[left.source] ?? 9) - (sourceRank[right.source] ?? 9);
+              if (bySource) return bySource;
               const byOrder = (left.order ?? 0) - (right.order ?? 0);
               if (byOrder) return byOrder;
               return right.value.length - left.value.length;

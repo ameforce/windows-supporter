@@ -2745,6 +2745,117 @@ Resets Aug 13, 2026
             "Jane Doe",
         )
 
+        # Cross-source: residue must outrank image/attr/labelledBy priority.
+        dirty_img_alt_yields_to_clean_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe –Acme" src="about:blank" '
+                    'width="28" height="28" />'
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            dirty_img_alt_yields_to_clean_child.get("profileName"),
+            "Jane Doe",
+        )
+
+        dirty_pipe_img_yields_to_clean_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe | Acme" src="about:blank" '
+                    'width="28" height="28" />'
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            dirty_pipe_img_yields_to_clean_child.get("profileName"),
+            "Jane Doe",
+        )
+
+        dirty_circle_img_yields_to_clean_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe ○ Acme" src="about:blank" '
+                    'width="28" height="28" />'
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            dirty_circle_img_yields_to_clean_child.get("profileName"),
+            "Jane Doe",
+        )
+
+        dirty_attr_yields_to_clean_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu" '
+                    'data-display-name="Jane Doe –Acme">'
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            dirty_attr_yields_to_clean_child.get("profileName"),
+            "Jane Doe",
+        )
+
+        dirty_labelledby_yields_to_clean_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<span id="dirty-profile-name">Jane Doe –Acme</span>'
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu" '
+                    'aria-labelledby="dirty-profile-name">'
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            dirty_labelledby_yields_to_clean_child.get("profileName"),
+            "Jane Doe",
+        )
+
+        # Clean higher-priority sources must still beat dirty child text.
+        clean_img_beats_dirty_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe" src="about:blank" '
+                    'width="28" height="28" />'
+                    "<span>Jane Doe –Acme</span></button>"
+                )
+            )
+        )
+        self.assertEqual(clean_img_beats_dirty_child.get("profileName"), "Jane Doe")
+
+        # In-word hyphen in image alt must still win over a spaced twin.
+        hyphen_img_beats_spaced_child = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Anne-Marie" src="about:blank" '
+                    'width="28" height="28" />'
+                    "<span>Anne Marie</span></button>"
+                )
+            )
+        )
+        self.assertEqual(
+            hyphen_img_beats_spaced_child.get("profileName"),
+            "Anne-Marie",
+        )
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

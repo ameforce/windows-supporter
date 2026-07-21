@@ -267,3 +267,11 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `Jane Doe –Acme` / `Jane Doe– Acme`가 clean 승리 | residue가 양쪽 공백 형태만 점수화 | in-word vs separator를 '양쪽 whitespace'로만 근사 | letter/digit 경계가 한쪽이라도 깨진 dash/middot를 residue |
 
 인접 스캔: em/ASCII one-sided, middot one-sided, `Anne-Marie` 유지, both-side spaced 유지.
+
+### Round-37 finding 처분 RCA
+
+| Finding | 직접 원인 | 구조적 원인 | 근본 수정 |
+|---|---|---|---|
+| dirty `image`/`attribute`/`labelledBy`가 clean `childText` 승리 | within-tier sort가 `sourceRank`를 residue보다 우선 | residue demotion이 same-source 가정에 묶임 | tier 안에서 residue → source → order → length |
+
+인접 스캔: pipe/○ polluted alt, dirty data-display-name/labelledby, clean img vs dirty child, `Anne-Marie` img 유지.
