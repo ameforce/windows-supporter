@@ -216,3 +216,12 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `Jane Doe:` 잔여 (P3) | colon separator 미처리 | trailing punct 정리 부족 | `: Online` strip + trailing `:` 제거 |
 
 유사 스캔: `(Online) Jane Doe`, `Offline`/`Unavailable`/`Available`/`자리비움` whole-leaf.
+
+### Round-31 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `… Online Team Plan`에 status 잔존 / `… Plan Away` 공란 | plan/chrome short-circuit이 status strip보다 앞섬 | cleanup 파이프라인 순서 역전 | stripPresenceChrome을 plan split·chrome 전에 적용 + plan 직전 status 제거 |
+| clean alt가 status 확장 leaf에 패배 | isContainedName이 status extra를 fuller로 인정 | prefix 가드가 contained fallback에 없음 | contained extra에 presence/noise/chrome 거부 + `[]` normalize |
+
+유사 스캔: leading/paren status+plan, Pro Plan Online, bracket `[Online]`.

@@ -157,14 +157,55 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
       return true;
     };
     const expandCandidates = (raw) => {
-      let cleaned = clean(raw);
+      // Shared presence/status cleanup so plan-split / chrome short-circuits cannot
+      // preserve "Jane Doe Online" or drop "Jane Doe Team Plan Away".
+      const stripPresenceChrome = (value) => {
+        let text = clean(value);
+        if (!text) return '';
+        text = text
+          // Status immediately before a trailing plan suffix.
+          .replace(
+            /\s*[\(\[（]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s*[\)\]）]\s+(?=(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$)/i,
+            ' '
+          )
+          .replace(
+            /\s+(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s+(?=(?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜$)/i,
+            ' '
+          )
+          .replace(
+            /^\s*[\(\[（]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s*[\)\]）]\.?\s*/i,
+            ''
+          )
+          .replace(
+            /^(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)(?:\.?\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)/i,
+            ''
+          )
+          .replace(
+            /\s*[\(\[（]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s*[\)\]）]\.?$/i,
+            ''
+          )
+          .replace(
+            /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
+            ''
+          )
+          .replace(/\s*[:：.\[\]\-\u2010-\u2015|/·・]+$/u, '')
+          .trim();
+        return text;
+      };
+      let cleaned = stripPresenceChrome(raw);
       if (!cleaned) return [];
       // Split concatenated plan suffixes before account-chrome short-circuit so
       // "Jane Doe Team Plan" still yields the display-name piece.
       const splitPlan = cleaned.match(
         /^(.*?)\s+((?:team|pro|business|enterprise|free|hobby|plus|ultra)\s+plan|(?:프로|팀|비즈니스|엔터프라이즈|플러스|울트라|프리|하비)\s*플랜)$/i
       );
-      if (splitPlan && splitPlan[1]) return [splitPlan[1], splitPlan[2]];
+      if (splitPlan && splitPlan[1]) {
+        const namePart = stripPresenceChrome(splitPlan[1]);
+        const pieces = [];
+        if (namePart) pieces.push(namePart);
+        pieces.push(splitPlan[2]);
+        return pieces;
+      }
       // Do not rewrite account-state chrome ("Current account") into bare
       // leftovers like "Current" before noise filters run.
       if (accountChromePhrase.test(cleaned)) return [cleaned];
@@ -180,29 +221,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
           .replace(/^(?:내|나의)\s*(?:계정|프로필)\s*[:：\-]?\s*/i, '')
           .replace(/^(?:profile|account|user|menu|open|프로필|계정|사용자|메뉴)(?:\s*[:：\-]\s*|\s+)/i, '')
           .trim();
+        cleaned = stripPresenceChrome(cleaned);
       }
-      // Strip leading/trailing presence/status chrome in common chip forms:
-      // "Online Jane Doe", "(Online) Jane Doe", "Jane Doe Online",
-      // "Jane Doe (Online)", "Jane Doe: Online", "Jane Doe Available Now".
-      cleaned = cleaned
-        .replace(
-          /^\s*[\(（]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s*[\)）]\.?\s*/i,
-          ''
-        )
-        .replace(
-          /^(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)(?:\.?\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)/i,
-          ''
-        )
-        .replace(
-          /\s*[\(（]\s*(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\s*[\)）]\.?$/i,
-          ''
-        )
-        .replace(
-          /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・]\s*|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
-          ''
-        )
-        .replace(/\s*[:：.\-\u2010-\u2015|/·・]+$/u, '')
-        .trim();
       if (!cleaned) return [];
       return [cleaned];
     };
@@ -543,36 +563,39 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             const normalizeNameWord = (word) => String(word || '')
               .toLowerCase()
               .replace(
-                /^[,.\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+|[,.\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+$/gu,
+                /^[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+|[,.\[\]\u2010-\u2015\u2018-\u2019\u201C-\u201D'()（）·・]+$/gu,
                 ''
               );
             const nameWords = (value) => clean(value)
               .split(/\s+/)
               .map(normalizeNameWord)
               .filter(Boolean);
+            const isStatusOrNoiseWord = (word) => (
+              presenceStatusToken.test(word)
+              || usageNoise.test(word)
+              || accountChromePhrase.test(word)
+            );
             const isPrefixName = (shorter, longer) => {
               const shortWords = nameWords(shorter);
               const longWords = nameWords(longer);
               if (!shortWords.length || shortWords.length >= longWords.length) return false;
               if (!shortWords.every((word, index) => word === longWords[index])) return false;
               const extra = longWords.slice(shortWords.length);
-              if (extra.some((word) => (
-                presenceStatusToken.test(word)
-                || usageNoise.test(word)
-                || accountChromePhrase.test(word)
-              ))) {
-                return false;
-              }
+              if (extra.some(isStatusOrNoiseWord)) return false;
               return true;
             };
             // Also treat single-/multi-word partials as dominated when all of their
             // words appear inside a fuller candidate ("Jane" vs "Doe, Jane").
+            // Status/noise extras must not count as a fuller name.
             const isContainedName = (shorter, longer) => {
               if (isPrefixName(shorter, longer)) return true;
               const shortWords = nameWords(shorter);
               const longWords = nameWords(longer);
               if (!shortWords.length || shortWords.length >= longWords.length) return false;
-              return shortWords.every((word) => longWords.includes(word));
+              if (!shortWords.every((word) => longWords.includes(word))) return false;
+              const extra = longWords.filter((word) => !shortWords.includes(word));
+              if (extra.some(isStatusOrNoiseWord)) return false;
+              return true;
             };
             const undominated = pool.filter((item) => (
               !pool.some((other) => other !== item && isContainedName(item.value, other.value))

@@ -2380,6 +2380,86 @@ Resets Aug 13, 2026
         )
         self.assertEqual(colon_status_strips.get("profileName"), "Jane Doe")
 
+        # Name + status + plan on one leaf must keep the display name.
+        status_before_plan = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe Online Team Plan</span></button>"
+                )
+            )
+        )
+        self.assertEqual(status_before_plan.get("profileName"), "Jane Doe")
+
+        leading_status_before_plan = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Online Jane Doe Team Plan</span></button>"
+                )
+            )
+        )
+        self.assertEqual(leading_status_before_plan.get("profileName"), "Jane Doe")
+
+        paren_status_before_plan = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe (Online) Team Plan</span></button>"
+                )
+            )
+        )
+        self.assertEqual(paren_status_before_plan.get("profileName"), "Jane Doe")
+
+        plan_then_status = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe Team Plan Away</span></button>"
+                )
+            )
+        )
+        self.assertEqual(plan_then_status.get("profileName"), "Jane Doe")
+
+        pro_plan_then_status = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe Pro Plan Online</span></button>"
+                )
+            )
+        )
+        self.assertEqual(pro_plan_then_status.get("profileName"), "Jane Doe")
+
+        clean_alt_beats_status_plan_leaf = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe" src="about:blank" width="28" height="28" />'
+                    "<span>Jane Doe Online Team Plan</span></button>"
+                )
+            )
+        )
+        self.assertEqual(clean_alt_beats_status_plan_leaf.get("profileName"), "Jane Doe")
+
+        clean_alt_beats_bracket_status = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    '<img alt="Jane Doe" src="about:blank" width="28" height="28" />'
+                    "<span>Jane Doe [Online]</span></button>"
+                )
+            )
+        )
+        self.assertEqual(clean_alt_beats_bracket_status.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
