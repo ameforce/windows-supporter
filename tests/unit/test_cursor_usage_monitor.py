@@ -1013,7 +1013,7 @@ Resets Aug 13, 2026
         data_named = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(
-                    '<button type="button" data-testid="account-chip" '
+                    '<button type="button" data-testid="accountMenu" '
                     'aria-haspopup="menu" '
                     'data-display-name="Dana Scully"></button>'
                 )
@@ -1100,6 +1100,48 @@ Resets Aug 13, 2026
             )
         )
         self.assertEqual(full.get("profileName"), "John Doe")
+
+        initials_only = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>JD</span></div>"
+                    "<div><span>Pro</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(initials_only.get("profileName"), "JD")
+
+        camel = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<div class="account-chip">'
+                    "<div><span>Camel Case</span></div>"
+                    '<button type="button" data-testid="userMenu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(camel.get("profileName"), "Camel Case")
+
+        broad_invite = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" data-testid="invite-user-row" '
+                    'aria-haspopup="menu"><span>Invite Teammates</span></button>'
+                    '<div class="account-chip">'
+                    "<div><span>Real Person</span></div>"
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu"><span></span></button>'
+                    "</div>"
+                )
+            )
+        )
+        self.assertEqual(broad_invite.get("profileName"), "Real Person")
 
     def test_collector_rejects_chrome_aria_profile_name_candidates(self) -> None:
         for chrome_name in (
