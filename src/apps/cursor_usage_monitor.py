@@ -188,7 +188,8 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
             /(?:\s*[:：]\s*|\s*[\-\u2010-\u2015|/·・•●○∙…]\s*|\.{2,}|\s+)(?:online|offline|away|busy|active|idle|unavailable|available(?:\s+now)?|온라인|오프라인|자리비움|지금\s*이용\s*가능)\.?$/i,
             ''
           )
-          // Drop leftover separators after status removal (bullets/ellipsis included).
+          // Drop leftover separators after status removal (leading orphans included).
+          .replace(/^\s*[\-\u2010-\u2015|/·・•●○∙…\[\]]+\s*/u, '')
           .replace(/\s*[:：.\[\]\-\u2010-\u2015|/·・•●○∙…]+$/u, '')
           .replace(/\.{2,}$/u, '')
           .trim();
@@ -579,10 +580,16 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               || !/[\p{L}\p{N}]/u.test(word)
             );
             // Prefer clean display names over siblings that still carry status
-            // separators (○/∙/…/...) after strip failures.
+            // separators (○/∙/…/...) after strip failures. Hyphenated names are
+            // not chrome; spaced middots are (status separator form).
             const nameChromeResidueScore = (value) => {
-              const hits = String(value || '').match(/[\-\u2010-\u2015|/•●○∙…\[\]]|\.{2,}/g);
-              return hits ? hits.join('').length : 0;
+              const text = String(value || '');
+              let score = 0;
+              const bullets = text.match(/[|/•●○∙…\[\]]|\.{2,}/g);
+              if (bullets) score += bullets.join('').length;
+              const spacedMiddot = text.match(/(?:^|\s)[·・](?=\s|$)/g);
+              if (spacedMiddot) score += spacedMiddot.length;
+              return score;
             };
             const isPrefixName = (shorter, longer) => {
               const shortWords = nameWords(shorter);
@@ -591,11 +598,12 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               if (!shortWords.every((word, index) => word === longWords[index])) return false;
               const extra = longWords.slice(shortWords.length);
               if (extra.some(isStatusOrNoiseWord)) return false;
+              if (nameChromeResidueScore(longer) > nameChromeResidueScore(shorter)) return false;
               return true;
             };
             // Also treat single-/multi-word partials as dominated when all of their
             // words appear inside a fuller candidate ("Jane" vs "Doe, Jane").
-            // Status/noise extras must not count as a fuller name.
+            // Status/noise extras and chrome-separator residue must not count as fuller.
             const isContainedName = (shorter, longer) => {
               if (isPrefixName(shorter, longer)) return true;
               const shortWords = nameWords(shorter);
@@ -604,6 +612,7 @@ CURSOR_USAGE_PAGE_PROBE_SCRIPT = r"""
               if (!shortWords.every((word) => longWords.includes(word))) return false;
               const extra = longWords.filter((word) => !shortWords.includes(word));
               if (extra.some(isStatusOrNoiseWord)) return false;
+              if (nameChromeResidueScore(longer) > nameChromeResidueScore(shorter)) return false;
               return true;
             };
             const undominated = pool.filter((item) => (

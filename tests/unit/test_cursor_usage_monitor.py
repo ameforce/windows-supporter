@@ -2541,6 +2541,67 @@ Resets Aug 13, 2026
         )
         self.assertEqual(ascii_ellipsis_status_strips.get("profileName"), "Jane Doe")
 
+        # Residue-bearing longer siblings must not dominate a clean name.
+        residue_org_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe ○ Northwind</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(residue_org_yields_to_clean.get("profileName"), "Jane Doe")
+
+        residue_acme_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe ○ Acme</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(residue_acme_yields_to_clean.get("profileName"), "Jane Doe")
+
+        # Hyphenated display names must not lose to a spaced twin.
+        hyphenated_beats_spaced = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Anne-Marie</span>"
+                    "<span>Anne Marie</span></button>"
+                )
+            )
+        )
+        self.assertEqual(hyphenated_beats_spaced.get("profileName"), "Anne-Marie")
+
+        leading_orphan_circle_strips = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>○ Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(leading_orphan_circle_strips.get("profileName"), "Jane Doe")
+
+        spaced_middot_org_yields_to_clean = self._evaluate_probe_on_html(
+            self._usage_summary_html(
+                identity_html=(
+                    '<button type="button" aria-label="User menu" '
+                    'aria-haspopup="menu">'
+                    "<span>Jane Doe · Foo</span>"
+                    "<span>Jane Doe</span></button>"
+                )
+            )
+        )
+        self.assertEqual(spaced_middot_org_yields_to_clean.get("profileName"), "Jane Doe")
+
         icon_glyph_only = self._evaluate_probe_on_html(
             self._usage_summary_html(
                 identity_html=(

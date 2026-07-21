@@ -241,3 +241,13 @@ side effect: prefix strip이 `user_menu_trigger` → `_menu_trigger`로 찢지 �
 | `Jane Doe ○`가 clean `Jane Doe` 압도 | punct-only는 containment만 막고 length 정렬은 오염값 선호 | ○/∙/`...` separator 누락 + residue demotion 부재 | separator에 ○∙·`...` 추가, ranking에 chrome residue score 우선 |
 
 유사 스캔: `∙ Away` sibling, glued `Jane Doe...Online`.
+
+### Round-34 finding 묶음 RCA
+
+| Finding | 직접 원인 | 구조 원인 | 근본 수정 |
+|---|---|---|---|
+| `Jane Doe ○ Northwind`가 clean 압도 | contained가 residue 무시하고 제거 | residue sort 전에 domination | prefix/contained에 residue 증가 시 비지배 |
+| `Anne-Marie` → `Anne Marie` | residue가 hyphen을 chrome으로 감점 | hyphen vs bullet 축 혼동 | hyphen 제외, spaced `·`/`・`만 residue |
+| `○ Jane Doe` 잔존 | trailing-only leftover strip | leading orphan separator 축 누락 | leading orphan separator strip |
+
+유사 스캔: `○ Acme` sibling, `Jane Doe · Foo`, leading `•`/`∙`.
