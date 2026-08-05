@@ -52,7 +52,7 @@
 
 1. **stale cache 가설 — 확정.** live DOM에는 5시간 metric이 없었지만 persisted snapshot에는 과거 `0%`와 새 `captured_at`이 함께 있었다. field-level backfill이 source 부재를 파싱 실패로 취급했다.
 2. **percentage 의미 반전 가설 — 확정.** parser가 `used`, `remaining`, `used / limit` qualifier를 제거했고 표시 계층은 모든 숫자를 remaining으로 간주했다. explicit-used와 ratio 회귀 테스트가 수정 전 각각 반전된 값을 재현했다.
-3. **Windows/WSL 혼동 가설 — 배제, multi-account/reset 및 전환 race 가설 — 확정.** 실행 중 앱은 Windows native `CODEX_HOME`과 main physical worktree EXE를 사용했고 WSL은 별도 binary/home/session이었다. 실제 web/Windows source의 reset은 일치했지만, 리뷰의 동일-reset 다계정 재현에서는 reset만으로 두 계정이 모두 덮였고, 계정 전환 전 시작한 장기 rollout이 전환 후 event를 쓰면 새 auth ID가 붙을 수 있었다. stable account ID exact match와 auth-change/session-start/event 시간 경계를 추가해 닫았다.
+3. **Windows/WSL 혼동 가설 — 배제, multi-account/reset 및 전환 race 가설 — 확정.** 실행 중 앱은 Windows native `CODEX_HOME`과 main physical worktree EXE를 사용했고 WSL은 별도 binary/home/session이었다. 실제 web/Windows source의 reset은 일치했지만, 동일-reset 다계정 재현에서는 reset만으로 두 계정이 모두 덮였고, 계정 전환 전 시작한 장기 rollout이 전환 후 event를 쓰면 새 auth ID가 붙을 수 있었다. stable account ID exact match와 auth-change/session-start/event 시간 경계를 추가해 닫았다.
 4. **API/CLI 포맷 및 analytics 지연 가설 — 확정.** 실제 payload는 `primary.window_minutes=10080`, `secondary=null`이었고 web analytics가 rollout보다 낮은 used 값을 보였다. 위치가 아니라 `window_minutes`로 시간창을 판별하고 동일 reset/time에서 local event를 authoritative current 값으로 사용했다.
 
 ## 검증

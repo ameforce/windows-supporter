@@ -53,7 +53,7 @@ v0.8.0의 provider 일반화가 저장 모델, 수집 생명주기, 표시 메�
 - add/delete/provider switch/settings rollback은 기존 owner의 종료가 확인되기 전 같은 프로필 경로에 새 owner를 정상 게시하지 않는다.
 - 공개 CLI나 외부 설정 API를 비호환 변경하지 않는다.
 
-## 구현 후 리뷰에서 보강한 경합 방어
+## 구현 후 보강한 경합 방어
 
 - refresh enqueue와 shutdown은 atomic cancel/token 경계를 공유하고, settings lock을 잡은 채 worker quiesce를 기다리지 않는다.
 - startup·dispatch·queue-put 사이 취소 창을 닫고, shutdown 뒤 queued callback이 child state를 부활시키지 못하게 worker epoch와 manager token을 검증한다.
@@ -81,7 +81,7 @@ v0.8.0의 provider 일반화가 저장 모델, 수집 생명주기, 표시 메�
 - 런타임: cached success→transient error→recovery, auth, profile-in-use, retry exhaustion, global serial collection, 삭제/provider switch race, batch 예외 격리.
 - UI: 1/3/10 mixed profiles, 긴 한국어·영문 이름, 작은 창, 100/125/150% Tk scaling, keyboard/mouse wheel scroll, taskbar 선택 정확히 2개.
 
-`40f71fd785036a571713c643bb907f6a255a7bac`의 917-test/build/capture 수치는 **초기 task PR의 역사적 증거**일 뿐, 현재 hotfix tip 또는 release closure 증거가 아니다. 현재 release 전 final evidence는 모든 task PR merge 뒤 hotfix exact tip에서 새로 실행해 기록한다. task PR base/head가 바뀌면 해당 PR의 review·test·build·visual 증거는 stale이며 같은 exact pair에서 다시 확인한다.
+`40f71fd785036a571713c643bb907f6a255a7bac`의 917-test/build/capture 수치는 **초기 task PR의 역사적 증거**일 뿐, 현재 hotfix tip 또는 release closure 증거가 아니다. 현재 release 전 final evidence는 모든 task PR merge 뒤 hotfix tip에서 새로 실행해 기록한다. task PR base/head가 바뀌면 test·build·visual 증거를 새 commit 기준으로 다시 확인한다.
 
 ## 검증 한계
 

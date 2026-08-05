@@ -16,7 +16,7 @@
 - actual 100% 완료: `600x362`, SHA256 `081C1FC6EC6F41CBA8F0148796E8E5146D55BC9A6448DF503EDF01249E4F71B4`
 - actual 150% 긴 문자열: `899x706`, SHA256 `8924AF5094B3A2DDAFCE4D5954B5D58A728875A9937A1144AA32E41E4BA333A6`
 
-참조는 고해상도 방향성 mock이고 실제 구현은 기존 제품의 600px 정보 구조와 Segoe UI 크기를 보존하므로 원시 픽셀 일치율은 합격 기준으로 사용하지 않았다. 두 독립 reviewer에는 참조 2장과 fresh actual 상태 캡처를 같은 검토 packet으로 제공했다.
+참조는 고해상도 방향성 mock이고 실제 구현은 기존 제품의 600px 정보 구조와 Segoe UI 크기를 보존하므로 원시 픽셀 일치율은 합격 기준으로 사용하지 않았다. 참조 2장과 fresh actual 상태 캡처를 같은 비교 자료로 사용했다.
 
 ## 자동·행동 검증
 
@@ -27,10 +27,10 @@
 - 200% canary: 고정 timeline 간격 문제를 발견해 실제 label 요청 높이 기반으로 수정 후 재현 캡처 통과
 - 최초 map: `withdraw → 구성 → overrideredirect → deiconify`, map 후 0% progress track 재그리기 검증
 
-## 독립 검토
+## 결함 보강
 
-- pixel/layout reviewer: 최종 `matrix-final6` PASS, blocking issue 없음
-- code-level reviewer: 음수 geometry 결함을 1차 발견; 수정 후 최종 `matrix-final6` 재검토 PASS, blocking issue 없음
+- 최종 `matrix-final6`에서 pixel/layout 기준을 모두 통과했다.
+- 음수 geometry 결함을 수정한 뒤 `matrix-final6`를 다시 실행해 통과했다.
 
 ## 잔여 위험
 
