@@ -16,6 +16,7 @@ class WindowsSupporterMainUI:
     _TAB_AI_USAGE = "ai_usage"
     _TAB_CODEX = "codex_usage"
     _TAB_UPDATE = "update"
+    _TAB_POWER = "power"
     _KAKAO_RETRY_DELAY_MS = 500
 
     def __init__(
@@ -26,12 +27,14 @@ class WindowsSupporterMainUI:
         event_queue: Any = None,
         updater: Any = None,
         state_path: str | None = None,
+        lid_power_policy: Any = None,
     ) -> None:
         self._root = root
         self._startup_manager = startup_manager
         self._monitor = monitor
         self._event_queue = event_queue
         self._updater = updater
+        self._lid_power_policy = lid_power_policy
         self._state_path = state_path
 
         self._tk = None
@@ -48,6 +51,7 @@ class WindowsSupporterMainUI:
         self._tab_ai_usage = None
         self._tab_codex = None
         self._tab_update = None
+        self._tab_power = None
 
         self._dashboard_view = None
         self._dashboard_built = False
@@ -63,6 +67,8 @@ class WindowsSupporterMainUI:
         self._codex_built = False
         self._update_view = None
         self._update_built = False
+        self._power_view = None
+        self._power_built = False
         self._current_tab = None
         self._tab_sizes = {
             self._TAB_DASHBOARD: (1000, 480),
@@ -71,6 +77,7 @@ class WindowsSupporterMainUI:
             self._TAB_WRIKE: (840, 580),
             self._TAB_AI_USAGE: (1000, 560),
             self._TAB_UPDATE: (760, 420),
+            self._TAB_POWER: (800, 420),
         }
         self._tab_minsizes = {
             self._TAB_DASHBOARD: (940, 480),
@@ -79,6 +86,7 @@ class WindowsSupporterMainUI:
             self._TAB_WRIKE: (800, 520),
             self._TAB_AI_USAGE: (960, 540),
             self._TAB_UPDATE: (720, 380),
+            self._TAB_POWER: (720, 380),
         }
 
         self._lazy_import_tk()
@@ -163,6 +171,11 @@ class WindowsSupporterMainUI:
         self.show(self._TAB_UPDATE)
         return
 
+    def show_power_settings(self) -> None:
+        if self._tab_power is not None:
+            self.show(self._TAB_POWER)
+        return
+
     def _lazy_import_tk(self) -> None:
         if self._tk is not None and self._ttk is not None:
             return
@@ -244,6 +257,9 @@ class WindowsSupporterMainUI:
         tab_wrike = ttk.Frame(notebook)
         tab_ai_usage = ttk.Frame(notebook)
         tab_update = ttk.Frame(notebook)
+        tab_power = None
+        if bool(getattr(self._lid_power_policy, "is_supported", False)):
+            tab_power = ttk.Frame(notebook)
         self._tab_dashboard = tab_dashboard
         self._tab_startup = tab_startup
         self._tab_kakao = tab_kakao
@@ -251,6 +267,7 @@ class WindowsSupporterMainUI:
         self._tab_ai_usage = tab_ai_usage
         self._tab_codex = tab_ai_usage
         self._tab_update = tab_update
+        self._tab_power = tab_power
 
         notebook.add(tab_dashboard, text="Dashboard")
         notebook.add(tab_startup, text="Startup Apps")
@@ -258,6 +275,8 @@ class WindowsSupporterMainUI:
         notebook.add(tab_wrike, text="Wrike")
         notebook.add(tab_ai_usage, text="AI 사용량")
         notebook.add(tab_update, text="Update")
+        if tab_power is not None:
+            notebook.add(tab_power, text="전원")
 
         try:
             notebook.bind("<<NotebookTabChanged>>", lambda _e: self._ensure_selected_tab_built())
@@ -271,6 +290,11 @@ class WindowsSupporterMainUI:
             ttk.Label(tab_wrike, text="Wrike 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_ai_usage, text="AI 사용량 설정을 여는 중...").pack(padx=12, pady=12)
             ttk.Label(tab_update, text="Update 설정을 여는 중...").pack(padx=12, pady=12)
+            if tab_power is not None:
+                ttk.Label(tab_power, text="클램쉘 전원 설정을 여는 중...").pack(
+                    padx=12,
+                    pady=12,
+                )
         except Exception:
             pass
         return
@@ -323,17 +347,26 @@ class WindowsSupporterMainUI:
             except Exception:
                 pass
             return
+        if t in {"power", "lid_power", "clamshell"} and self._tab_power is not None:
+            try:
+                nb.select(self._tab_power)
+            except Exception:
+                pass
+            return
         return
 
     def _valid_tab_keys(self) -> tuple[str, ...]:
-        return (
+        values = [
             self._TAB_DASHBOARD,
             self._TAB_STARTUP,
             self._TAB_KAKAO,
             self._TAB_WRIKE,
             self._TAB_AI_USAGE,
             self._TAB_UPDATE,
-        )
+        ]
+        if self._tab_power is not None:
+            values.append(self._TAB_POWER)
+        return tuple(values)
 
     def _load_last_tab(self) -> str:
         return load_last_tab(
@@ -473,6 +506,8 @@ class WindowsSupporterMainUI:
                 new_tab = self._TAB_AI_USAGE
             elif self._tab_update is not None and cur == str(self._tab_update):
                 new_tab = self._TAB_UPDATE
+            elif self._tab_power is not None and cur == str(self._tab_power):
+                new_tab = self._TAB_POWER
 
             if new_tab is None:
                 return
@@ -504,6 +539,8 @@ class WindowsSupporterMainUI:
                 self._ensure_ai_usage_built()
             elif new_tab == self._TAB_UPDATE:
                 self._ensure_update_built()
+            elif new_tab == self._TAB_POWER:
+                self._ensure_power_built()
 
             self._apply_tab_geometry(new_tab)
             self._current_tab = new_tab
@@ -1015,6 +1052,26 @@ class WindowsSupporterMainUI:
             self._update_built = True
         except Exception:
             self._update_built = False
+        return
+
+    def _ensure_power_built(self) -> None:
+        if (
+            self._power_built
+            or self._tab_power is None
+            or self._lid_power_policy is None
+        ):
+            return
+        try:
+            from src.apps.lid_power_settings_ui import LidPowerSettingsView
+
+            self._power_view = LidPowerSettingsView(
+                self._root,
+                self._lid_power_policy,
+            )
+            self._power_view.mount(self._tab_power)
+            self._power_built = True
+        except Exception:
+            self._power_built = False
         return
 
     def _ensure_kakao_built(self) -> None:

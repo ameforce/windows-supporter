@@ -11,6 +11,11 @@ from ctypes import wintypes
 import win32api
 import win32con
 import win32gui
+
+from src.utils.windows_power import (
+    PBT_POWERSETTINGCHANGE as _PBT_POWERSETTINGCHANGE,
+    PowerNotificationRegistration,
+)
 try:
     import win32ts
 except Exception:
@@ -100,6 +105,10 @@ class SystemTrayIcon:
         icon_path: str | None = None,
         on_session_unlock: Callable[[], None] | None = None,
         on_display_topology_change: Callable[[str], None] | None = None,
+        on_power_setting_change: Callable[[str, object], None] | None = None,
+        on_power_resume: Callable[[], None] | None = None,
+        on_power_notification_failure: Callable[[str], None] | None = None,
+        power_notifications_enabled: bool = False,
     ) -> None:
         self._tooltip = str(tooltip) if tooltip else "Windows Supporter"
         self._on_open_settings = on_open_settings
@@ -116,6 +125,10 @@ class SystemTrayIcon:
         self._icon_path = str(icon_path).strip() if icon_path else None
         self._on_session_unlock = on_session_unlock
         self._on_display_topology_change = on_display_topology_change
+        self._on_power_setting_change = on_power_setting_change
+        self._on_power_resume = on_power_resume
+        self._on_power_notification_failure = on_power_notification_failure
+        self._power_notifications_enabled = bool(power_notifications_enabled)
 
         self._hwnd: int | None = None
         self._thread: threading.Thread | None = None
@@ -127,6 +140,7 @@ class SystemTrayIcon:
         self._hicon_owned = False
         self._last_menu_time = 0.0
         self._wts_registered = False
+        self._power_registration: PowerNotificationRegistration | None = None
         return
 
     def start(self) -> None:
@@ -150,6 +164,12 @@ class SystemTrayIcon:
                 win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
             except Exception:
                 pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=5.0)
+            except Exception:
+                pass
         return
 
     def _run(self) -> None:
@@ -161,6 +181,8 @@ class SystemTrayIcon:
                 self._hwnd = None
             except Exception:
                 pass
+        finally:
+            self._thread = None
         return
 
     def _create_window(self) -> None:
@@ -207,6 +229,7 @@ class SystemTrayIcon:
         win32gui.UpdateWindow(hwnd)
         self._add_icon()
         self._register_session_notifications()
+        self._register_power_notifications()
         return
 
     def _add_icon(self) -> None:
@@ -302,6 +325,7 @@ class SystemTrayIcon:
         return 0
 
     def _on_destroy(self, hwnd: int, msg: int, wparam: int, lparam: int):
+        self._unregister_power_notifications()
         self._unregister_session_notifications()
         try:
             self._remove_icon()
@@ -359,6 +383,41 @@ class SystemTrayIcon:
         self._wts_registered = False
         return
 
+    def _register_power_notifications(self) -> None:
+        if not self._power_notifications_enabled or self._power_registration is not None:
+            return
+        hwnd = self._hwnd
+        callback = self._on_power_setting_change
+        if not hwnd or callback is None:
+            return
+        registration = PowerNotificationRegistration(callback)
+        try:
+            registration.register(int(hwnd))
+        except Exception as exc:
+            try:
+                registration.unregister()
+            except Exception:
+                pass
+            failure = self._on_power_notification_failure
+            if failure is not None:
+                try:
+                    failure(f"{type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
+            return
+        self._power_registration = registration
+
+    def _unregister_power_notifications(self) -> None:
+        registration = self._power_registration
+        if registration is None:
+            return
+        self._power_registration = None
+        try:
+            registration.unregister()
+        except Exception:
+            pass
+        return
+
     def _on_session_change(self, hwnd: int, msg: int, wparam: int, lparam: int):
         try:
             event = int(wparam)
@@ -394,11 +453,25 @@ class SystemTrayIcon:
             event = int(wparam)
         except Exception:
             event = 0
+        if event == int(_PBT_POWERSETTINGCHANGE):
+            registration = self._power_registration
+            if registration is not None:
+                try:
+                    registration.handle_message(int(lparam))
+                except Exception:
+                    pass
+            return 1
         if event in {
             int(_PBT_APMRESUMEAUTOMATIC),
             int(_PBT_APMRESUMESUSPEND),
             int(_PBT_APMRESUMECRITICAL),
         }:
+            callback = self._on_power_resume
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:
+                    pass
             self._notify_display_topology_change("power_resume")
         return 1
 
