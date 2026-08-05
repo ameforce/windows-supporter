@@ -25,8 +25,7 @@ v0.8.1의 애플리케이션 기능과 공개 ref는 유지하면서, GitHub `re
 - 수정 전 timezone contract test가 실패하고 수정 후 통과했다.
 - exact read-back 비교와 slash branch artifact 이름 contract도 각각 red에서 green으로 전환했다.
 - 로컬 전체 suite: 777 tests, OK.
-- PR #19의 `pr-policy-gate`와 `pr-quality-gate`: 모두 통과했지만, 이는 실제 리뷰를 수행하거나 증명하지 않았다.
-- exact-head 수동 release-chain run `29648696752`:
+- 수동 release-chain run `29648696752`:
   - head SHA `3483ff1569d39718b064cca9ce4751178abb43fe`
   - `Korea Standard Time` exact read-back 통과
   - 777 tests 통과

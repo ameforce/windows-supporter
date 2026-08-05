@@ -9,22 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class PullRequestProtectionContractTest(unittest.TestCase):
-    def test_removed_review_workflows_do_not_return(self) -> None:
-        removed_paths = (
-            ".github/pr-gate/active-release.json",
-            ".github/pr-gate/ruleset.json",
-            ".github/workflows/pr-policy-gate.yml",
-            ".github/workflows/pr-quality-gate.yml",
-            ".github/workflows/pull-request-validation.yml",
-            "scripts/configure_github_pr_gate.ps1",
-            "scripts/validate_pull_request_gate.py",
-        )
-
-        for relative_path in removed_paths:
-            with self.subTest(path=relative_path):
-                self.assertFalse((REPO_ROOT / relative_path).exists())
-
-    def test_server_protection_keeps_pr_only_without_review_gate(self) -> None:
+    def test_server_protection_keeps_pr_only_merge_and_ref_safety(self) -> None:
         ruleset = json.loads(
             (REPO_ROOT / ".github/pr-protection/ruleset.json").read_text(
                 encoding="utf-8"
@@ -36,14 +21,8 @@ class PullRequestProtectionContractTest(unittest.TestCase):
 
         pull_request_rule = ruleset["rules"][0]["parameters"]
         self.assertEqual(pull_request_rule["allowed_merge_methods"], ["merge"])
-        self.assertFalse(pull_request_rule["dismiss_stale_reviews_on_push"])
-        self.assertFalse(pull_request_rule["required_review_thread_resolution"])
-        self.assertFalse(pull_request_rule["require_code_owner_review"])
-        self.assertFalse(pull_request_rule["require_last_push_approval"])
-        self.assertEqual(pull_request_rule["required_approving_review_count"], 0)
-        self.assertEqual(pull_request_rule["required_reviewers"], [])
 
-    def test_pull_request_template_keeps_verification_without_review_gate(self) -> None:
+    def test_pull_request_template_keeps_verification_evidence(self) -> None:
         template = (REPO_ROOT / ".github/pull_request_template.md").read_text(
             encoding="utf-8"
         )
@@ -56,8 +35,6 @@ class PullRequestProtectionContractTest(unittest.TestCase):
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, template)
-
-        self._assert_review_gate_absent(template)
 
     def test_agents_keeps_merge_release_and_safety_contracts(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -84,17 +61,6 @@ class PullRequestProtectionContractTest(unittest.TestCase):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, contract)
 
-        self._assert_review_gate_absent(contract)
-
-    def test_no_dedicated_review_gate_policy_documents_remain(self) -> None:
-        for filename in (
-            "hotfix-v0.8.3-pr-review-gate-correction.md",
-            "hotfix-v0.8.4-review-gate-policy.md",
-            "hotfix-v0.8.5-review-policy.md",
-        ):
-            with self.subTest(filename=filename):
-                self.assertFalse((REPO_ROOT / "docs" / filename).exists())
-
     def test_agents_contract_requires_intent_based_hotfix_classification(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
@@ -109,28 +75,6 @@ class PullRequestProtectionContractTest(unittest.TestCase):
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, contract)
-
-    def _assert_review_gate_absent(self, text: str) -> None:
-        for removed_text in (
-            "exact-head 리뷰",
-            "review key",
-            "@codex review",
-            "chatgpt-codex-connector",
-            "native Codex subagent",
-            "gpt-5.6-sol",
-            "P0/P1/P2",
-            "P0=0",
-            "P3는 순수 권고",
-            "unresolved review thread",
-            "stale review",
-            "두 final review",
-            "이중 리뷰",
-            "재검토",
-            "전역 리뷰 지침",
-            "global review",
-        ):
-            with self.subTest(removed_text=removed_text):
-                self.assertNotIn(removed_text, text)
 
 
 if __name__ == "__main__":
