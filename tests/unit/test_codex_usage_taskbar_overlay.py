@@ -318,11 +318,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(weekly_metric["normal_max_percent"], 61)
         self.assertEqual(
             weekly_metric["normal_guidance_text"],
-            "N 58~61% / +00d 12h 00m",
+            "N 58~61% / 00d 12h 00m",
         )
         self.assertEqual(
             weekly_metric["normal_guidance_short_text"],
-            "N 58~61%/+12h",
+            "N 58~61% / 00d 12h 00m",
         )
         self.assertEqual(weekly_metric["normal_transition_seconds"], 12 * 60 * 60)
         self.assertEqual(weekly_metric["reset_direction"], "shortage")
@@ -347,7 +347,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             with_five_hour["bars"][0]["metrics"][0]["normal_guidance_text"],
-            "N 60~64% / +00d 00h 30m",
+            "N 60~64% / 00d 00h 30m",
         )
 
     def test_codex_guidance_collapses_a_single_percent_normal_target(self):
@@ -385,7 +385,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(metric["normal_max_percent"], 88)
         self.assertEqual(
             metric["normal_guidance_text"],
-            "N 88% / +00d 09h 15m",
+            "N 88% / 00d 09h 15m",
         )
 
     def test_datetime_precision_uses_hour_minute_countdown_within_same_day(self):
@@ -833,7 +833,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             first_metrics[0]["normal_guidance_text"],
-            "N 37~43% / +00d 00h 20m",
+            "N 37~43% / 00d 00h 20m",
         )
 
         first_metrics = second_model["bars"][0]["metrics"]
@@ -1987,8 +1987,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "color": "#f59e0b",
             "reset_text": "04d 00h 00m 00s",
             "reset_short_text": "04d 00h 00m 00s",
-            "normal_guidance_text": "N 58~61% / +00d 12h 00m",
-            "normal_guidance_short_text": "N 58~61%/+12h",
+            "normal_guidance_text": "N 58~61% / 00d 12h 00m",
+            "normal_guidance_short_text": "N 58~61% / 00d 12h 00m",
             "reset_color": "#ef4444",
         }
 
@@ -2008,7 +2008,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         guidance_op = [
             op
             for op in drawn_text_ops
-            if op[2].get("text") == "N 58~61% / +00d 12h 00m"
+            if op[2].get("text") == "N 58~61% / 00d 12h 00m"
         ][0]
 
         self.assertEqual(reset_op[2].get("fill"), "#ef4444")
@@ -2035,19 +2035,19 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         metric = {
             "reset_text": "04d 03h 49m 00s",
             "reset_short_text": "04d 03h 49m 00s",
-            "normal_guidance_text": "N 87% / +00d 09h 15m",
-            "normal_guidance_short_text": "N 87%/+9h 15m",
+            "normal_guidance_text": "N 87% / 00d 09h 15m",
+            "normal_guidance_short_text": "N 87% / 00d 09h 15m",
         }
 
         detail, short = taskbar_overlay._metric_guidance_texts(metric)
 
         self.assertEqual(
             detail,
-            "04d 03h 49m 00s | N 87% / +00d 09h 15m",
+            "04d 03h 49m 00s | N 87% / 00d 09h 15m",
         )
         self.assertEqual(
             short,
-            "04d 03h 49m 00s | N 87%/+9h 15m",
+            "04d 03h 49m 00s | N 87% / 00d 09h 15m",
         )
 
     def test_metric_layout_reserves_right_breathing_room(self):
@@ -2057,7 +2057,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 {
                     "metric_key": "weekly_limit",
                     "reset_text": "04d 03h 49m 00s",
-                    "normal_guidance_text": "N 87% / +00d 09h 15m",
+                    "normal_guidance_text": "N 87% / 00d 09h 15m",
                 },
             ),
         )
