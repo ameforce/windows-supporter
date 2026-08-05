@@ -318,11 +318,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(weekly_metric["normal_max_percent"], 61)
         self.assertEqual(
             weekly_metric["normal_guidance_text"],
-            "정상 58~61% · 무사용 12h 후",
+            "정상 기준 58~61% · 추가 사용 없으면 12시간 후 정상",
         )
         self.assertEqual(
             weekly_metric["normal_guidance_short_text"],
-            "58~61% · +12h",
+            "정상 58~61% · 무사용 12시간 후",
         )
         self.assertEqual(weekly_metric["normal_transition_seconds"], 12 * 60 * 60)
         self.assertEqual(weekly_metric["reset_direction"], "shortage")
@@ -347,7 +347,45 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             with_five_hour["bars"][0]["metrics"][0]["normal_guidance_text"],
-            "정상 60~64% · 무사용 30m 후",
+            "정상 기준 60~64% · 추가 사용 없으면 30분 후 정상",
+        )
+
+    def test_codex_guidance_collapses_a_single_percent_normal_target(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "codex-1",
+                    "provider": "codex",
+                    "label": "Codex",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "metrics": [
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 82,
+                            "value_text": "82%",
+                            "reset_at": "2026-07-25T18:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            now=datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc),
+        )
+
+        metric = model["bars"][0]["metrics"][0]
+        self.assertEqual(metric["normal_min_percent"], 88)
+        self.assertEqual(metric["normal_max_percent"], 88)
+        self.assertEqual(
+            metric["normal_guidance_text"],
+            "정상 기준 88% · 추가 사용 없으면 9시간 15분 후 정상",
         )
 
     def test_datetime_precision_uses_hour_minute_countdown_within_same_day(self):
@@ -795,7 +833,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             first_metrics[0]["normal_guidance_text"],
-            "정상 37~43% · 무사용 20m 후",
+            "정상 기준 37~43% · 추가 사용 없으면 20분 후 정상",
         )
 
         first_metrics = second_model["bars"][0]["metrics"]
@@ -824,7 +862,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             [metric["reset_badge_short_label"] for metric in second_metrics],
             ["남", "남"],
         )
-        self.assertEqual(first_metrics[0]["normal_guidance_text"], "정상 17~25% · 사용 필요")
+        self.assertEqual(
+            first_metrics[0]["normal_guidance_text"],
+            "정상 기준 17~25% · 현재 사용 여유",
+        )
 
     def test_model_marks_fast_early_weekly_burn_as_shortage(self):
         runtime = self._runtime()
@@ -1936,7 +1977,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(reset_text[1][0] - value_text[1][0], 4)
         self.assertLessEqual(reset_text[1][0] + 66, 20 + 186)
 
-    def test_draw_metric_segment_prefers_normal_guidance_over_reset_countdown(self):
+    def test_draw_metric_segment_keeps_reset_countdown_with_normal_guidance(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
         canvas = _FakeCanvas()
         metric = {
@@ -1946,19 +1987,22 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "color": "#f59e0b",
             "reset_text": "04d 00h 00m 00s",
             "reset_short_text": "04d 00h 00m 00s",
-            "normal_guidance_text": "정상 58~61% · 무사용 12h 후",
-            "normal_guidance_short_text": "58~61% · +12h",
+            "normal_guidance_text": "정상 기준 58~61% · 추가 사용 없으면 12시간 후 정상",
+            "normal_guidance_short_text": "정상 58~61% · 무사용 12시간 후",
             "reset_color": "#ef4444",
         }
 
-        overlay._draw_metric_segment(canvas, metric, 20, 2, 300, 15)
+        overlay._draw_metric_segment(canvas, metric, 20, 2, 500, 15)
 
         drawn_texts = [
             str(op[2].get("text") or "")
             for op in canvas.ops
             if op[0] == "text"
         ]
-        self.assertIn("정상 58~61% · 무사용 12h 후", drawn_texts)
+        self.assertIn(
+            "초기화까지 4일 · 정상 기준 58~61% · 추가 사용 없으면 12시간 후 정상",
+            drawn_texts,
+        )
         self.assertNotIn("04d 00h 00m 00s", drawn_texts)
 
     def test_model_preserves_minutes_in_day_scale_reset_text(self):
