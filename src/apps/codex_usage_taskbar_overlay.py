@@ -174,9 +174,12 @@ _RESET_BADGE_HEIGHT_PX = 11
 _RESET_BADGE_MIN_WIDTH_PX = 14
 _RESET_BADGE_TIME_GAP_PX = 5
 _RESET_BADGE_OUTLINE_WIDTH_PX = 1
+_METRIC_CONTEXT_SEPARATOR_COLOR = "#64748b"
+_NORMAL_GUIDANCE_COLOR = "#4ade80"
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
 _SEGMENT_RIGHT_PADDING_PX = 2
+_OVERLAY_RIGHT_PADDING_PX = 10
 _METRIC_PROGRESS_MIN_WIDTH_PX = 28
 _METRIC_PROGRESS_PREFERRED_WIDTH_PX = 36
 _METRIC_PROGRESS_MAX_WIDTH_PX = 48
@@ -624,49 +627,74 @@ def _metric_guidance_texts(metric: dict[str, Any]) -> tuple[str, str]:
     if not (guidance_detail_text or guidance_short_text):
         return raw_reset_detail_text, raw_reset_short_text
 
-    reset_detail_text = _friendly_reset_text(raw_reset_detail_text, compact=False)
-    reset_short_text = _friendly_reset_text(raw_reset_short_text, compact=True)
     detail_text = _join_metric_context(
-        reset_detail_text,
+        raw_reset_detail_text,
         guidance_detail_text,
     )
     short_text = _join_metric_context(
-        reset_short_text,
+        raw_reset_short_text,
         guidance_short_text,
     )
     return detail_text, short_text
 
 
 def _join_metric_context(reset_text: str, guidance_text: str) -> str:
-    return " · ".join(part for part in (reset_text, guidance_text) if part)
+    return " | ".join(part for part in (reset_text, guidance_text) if part)
 
 
-def _friendly_reset_text(text: str, *, compact: bool) -> str:
-    value = str(text or "").strip()
-    if not value:
-        return ""
+def _split_metric_context_text(text: str) -> tuple[str, str]:
+    reset_text, separator, guidance_text = str(text or "").partition(" | ")
+    if not separator:
+        return reset_text, ""
+    return reset_text, guidance_text
 
-    match = re.fullmatch(
-        r"(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?",
-        value,
-        flags=re.IGNORECASE,
-    )
-    if match is None:
-        return value
 
-    parts = [
-        f"{amount}{label}"
-        for amount, label in zip(
-            (int(part or 0) for part in match.groups()),
-            ("일", "시간", "분", "초"),
+def _inline_text_width(text: str) -> int:
+    return sum(9 if ord(character) > 127 else 5 for character in str(text or ""))
+
+
+def _draw_metric_context_text(
+    canvas: Any,
+    text: str,
+    *,
+    x: int,
+    center_y: int,
+    reset_color: str,
+) -> int:
+    reset_text, guidance_text = _split_metric_context_text(text)
+    cursor_x = int(x)
+    font = ("Segoe UI", 6, "bold")
+    if reset_text:
+        canvas.create_text(
+            cursor_x,
+            center_y,
+            anchor="w",
+            fill=reset_color,
+            font=font,
+            text=reset_text,
         )
-        if amount > 0
-    ]
-    if not parts:
-        parts = ["0초"]
-    if compact:
-        parts = parts[:2]
-    return f"{'리셋' if compact else '초기화까지'} {' '.join(parts)}"
+        cursor_x += _inline_text_width(reset_text)
+    if guidance_text:
+        separator_x = cursor_x + 5
+        canvas.create_text(
+            separator_x,
+            center_y,
+            anchor="w",
+            fill=_METRIC_CONTEXT_SEPARATOR_COLOR,
+            font=font,
+            text="|",
+        )
+        cursor_x = separator_x + _inline_text_width("|") + 5
+        canvas.create_text(
+            cursor_x,
+            center_y,
+            anchor="w",
+            fill=_NORMAL_GUIDANCE_COLOR,
+            font=font,
+            text=guidance_text,
+        )
+        cursor_x += _inline_text_width(guidance_text)
+    return cursor_x
 
 
 def _metric_fits_badge_mode(
@@ -778,7 +806,7 @@ def _metric_row_layout_for_overlay_width(
     label_width = _label_width_for_overlay_width(overlay_width)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
-    metrics_width = max(0, overlay_width - metrics_x - 4)
+    metrics_width = max(0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX)
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
     segment_width = _metric_segment_width_for_metrics_width(
         metrics_width,
@@ -2304,22 +2332,20 @@ class CodexUsageTaskbarOverlay:
             )
             time_text = str(badge_fit["time_text"] or "")
             if time_text:
-                canvas.create_text(
-                    badge_right_x + _RESET_BADGE_TIME_GAP_PX,
-                    center_y,
-                    anchor="w",
-                    fill=reset_color,
-                    font=("Segoe UI", 6, "bold"),
-                    text=time_text,
+                _draw_metric_context_text(
+                    canvas,
+                    time_text,
+                    x=badge_right_x + _RESET_BADGE_TIME_GAP_PX,
+                    center_y=center_y,
+                    reset_color=reset_color,
                 )
         elif show_reset:
-            canvas.create_text(
-                reset_text_x,
-                center_y,
-                anchor="w",
-                fill=reset_color,
-                font=("Segoe UI", 6, "bold"),
-                text=display_reset_text,
+            _draw_metric_context_text(
+                canvas,
+                display_reset_text,
+                x=reset_text_x,
+                center_y=center_y,
+                reset_color=reset_color,
             )
         return
 
@@ -4635,17 +4661,14 @@ def _build_normal_guidance(
         else f"{normal_min_percent}~{normal_max_percent}%"
     )
     if direction == _RESET_DIRECTION_SHORTAGE:
-        text = (
-            f"정상 기준 {range_text} · "
-            f"추가 사용 없으면 {transition_text} 후 정상"
+        text = f"N {range_text} / +{transition_text}"
+        short_text = (
+            f"N {range_text}/+"
+            f"{_format_guidance_duration_short(normal_transition_seconds)}"
         )
-        short_text = f"정상 {range_text} · 무사용 {transition_text} 후"
-    elif direction == _RESET_DIRECTION_SURPLUS:
-        text = f"정상 기준 {range_text} · 현재 사용 여유"
-        short_text = f"여유 · 정상 {range_text}"
     else:
-        text = f"정상 범위 {range_text} · 현재 정상"
-        short_text = f"정상 {range_text}"
+        text = f"N {range_text}"
+        short_text = text
     return {
         "direction": direction,
         "normal_min_percent": normal_min_percent,
@@ -4657,22 +4680,21 @@ def _build_normal_guidance(
 
 
 def _format_guidance_duration(seconds: int) -> str:
-    remaining = max(0, int(seconds))
-    if remaining >= 86400:
-        days = remaining // 86400
-        hours = int(math.ceil((remaining % 86400) / 3600.0))
-        if hours >= 24:
-            days += 1
-            hours = 0
-        return f"{days}일" if hours == 0 else f"{days}일 {hours}시간"
-    if remaining >= 3600:
-        hours = remaining // 3600
-        minutes = int(math.ceil((remaining % 3600) / 60.0))
-        if minutes >= 60:
-            hours += 1
-            minutes = 0
-        return f"{hours}시간" if minutes == 0 else f"{hours}시간 {minutes}분"
-    return f"{max(1, int(math.ceil(remaining / 60.0)))}분"
+    total_minutes = max(1, int(math.ceil(max(0, int(seconds)) / 60.0)))
+    days, remaining_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    return f"{days:02d}d {hours:02d}h {minutes:02d}m"
+
+
+def _format_guidance_duration_short(seconds: int) -> str:
+    total_minutes = max(1, int(math.ceil(max(0, int(seconds)) / 60.0)))
+    days, remaining_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    if days:
+        return f"{days}d" if not hours else f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h" if not minutes else f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def _snapshot_reset_direction(
