@@ -8,22 +8,11 @@
 - 진단 중 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Windows Supporter`가 `.codex\worktrees\...` 아래를 가리키면 정상 상태가 아니다. main 물리 worktree 빌드 산출물을 기준으로 재등록되도록 수정하고 검증한다.
 - 원격 배포나 SSH 진단에서 main 물리 worktree에 `git pull`, `git reset`, `git switch`, `git merge` 같은 HEAD/working-tree 변경 명령을 실행하기 전에 원격 Windows 세션의 Git GUI(Fork.exe, GitHub Desktop, SourceTree, GitKraken, TortoiseGitProc.exe)가 해당 checkout을 감시 중인지 확인한다. 실행 중이면 Git GUI를 정상 종료하거나, 사용자가 열어둬야 하는 상황이면 main worktree를 직접 변경하지 않는 절차로 우회한다. Fork가 열린 상태에서 외부 Git 명령으로 HEAD를 바꾸면 Fork/libgit2가 `[bug] head ... != ...` Git Error 팝업을 띄울 수 있다.
 
-## PR 검토 및 보호 규칙
+## PR 및 보호 규칙
 
-- 일반 구현은 `hotfix/vX.Y.Z` 또는 `release/vX.Y.Z`에서 task branch를 만들고, 해당 버전형 branch를 base로 하는 PR을 통해서만 합친다. 일반 task branch는 `task/`, `feat/`, `fix/`, `chore/`, `refact/` 중 하나의 prefix를 사용하고, 리뷰·릴리스 정책 변경에는 `policy/`를 사용할 수 있다.
-- main Codex는 final review 전에 RCA, red test, 구현, 인접 경로 조사, 관련 테스트, 전체 테스트, build, 필요한 runtime 검증, 자체 diff 검토, base 안정화를 직접 완료한다. 이 조건을 충족하지 않은 미완성 head에는 final review를 요청하지 않는다. 이 조건을 충족한 commit만 완성된 head로 판정한다.
-- 완성된 head에서 정확한 base ref, 최신 base SHA와 head SHA를 기록하고 `repo:base_sha:head_sha:round` 형식의 review key를 만든다. 같은 exact base/head에서 GitHub `@codex review` 1회와 native Codex subagent의 독립 review 1회를 동시에 시작하고 결과를 격리한다. 서로의 finding이나 결론을 전달하지 않으며 둘 다 terminal이 될 때까지 head를 바꾸지 않는다.
-- 독립 reviewer는 `gpt-5.6-sol`, reasoning `high`, read-only로 고정한다. 구현 중 탐색, 반복 점검, incremental review에 사용하지 않는다. 동일 review key의 중복 요청을 금지한다. connector가 명시적 오류를 반환한 경우에만 같은 key로 1회 재시도할 수 있다.
-- GitHub finding이 있으면 `chatgpt-codex-connector` review object의 `commit_id`가 최신 40자리 head SHA와 일치해야 한다. finding이 없어 connector가 top-level zero-finding 댓글만 남기면 그 댓글의 `Reviewed commit` prefix가 최신 head에 유일하게 해석되고, 바로 앞 review 요청에 full base/head SHA와 review key가 기록돼 있으며 요청 전후 head가 바뀌지 않았음을 확인한다.
-- 두 리뷰의 finding은 `P0/P1/P2/P3`로 정규화한다. P0/P1/P2 중 하나라도 존재하면 병합을 차단하며, 병합 조건은 `P0=0, P1=0, P2=0`이다. GitHub review thread도 unresolved 0이어야 한다. 작성자가 PR 본문에 적은 finding 수, reviewer 이름, digest 또는 Actions status는 실제 리뷰 증거를 대신하지 않는다.
-- 유효한 P0/P1/P2 finding은 실제 재현 또는 직접 증거를 확보하고, 직접 원인과 구조적 원인, 영향과 인접 실패 경로를 확인한 뒤 red test 또는 동등한 증거로 잠근다. 원인 경계의 최소 완전 수정을 적용하고 불변조건, 실패 모드, side effect 테스트와 관련 테스트, 전체 테스트, build, 필요한 runtime을 다시 검증한다.
-- 지적된 줄만 고치거나 reviewer 문구를 옮겨 즉시 재검토하지 않는다. main Codex가 새 head를 완성됐다고 판정한 뒤에만 새 exact base/head와 새 round의 review key에서 두 final review를 각각 다시 1회 수행한다.
-- P3는 순수 권고이며 병합을 차단하지 않는다. 처분, owner, 만료일 또는 후속 이슈를 요구하지 않는다. P3을 선택적으로 수정할 때도 같은 RCA와 검증 원칙을 적용한다. 보안·인증·개인정보, 데이터·설정 무결성, 공개 호환성, 삭제·업데이트·릴리스 무결성 또는 영향 불확실성을 침해하거나 그 가능성이 있는 finding은 최소 P2로 분류한다. reviewer 간 severity가 다르면 상위 등급을 적용하며 작성자 단독으로 하향할 수 없다.
-- 리뷰 뒤 push로 head SHA가 바뀌거나 base SHA가 이동하면 이전 GitHub Codex review와 독립 review를 모두 stale로 처리한다. 새 head를 다시 완성한 뒤 새 exact base/head와 새 review key에서 두 review를 반복한다. 최종 두 리뷰가 같은 최신 base/head 쌍을 검토하지 않았다면 merge하지 않는다.
-- 테스트, 정적 검사, 빌드, Windows 실제 실행, `release-chain-gate`는 리뷰와 별개의 검증 증거다. GitHub Actions 성공만으로 리뷰 완료를 선언하지 않는다.
-- merge 직전에 PR의 base ref/SHA와 head SHA, 두 리뷰 대상 base/head, `P0=0, P1=0, P2=0`, unresolved thread 0을 다시 확인한다. base와 head가 모두 기대값일 때만 `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>` 또는 동등한 API precondition으로 병합한다. 별도 PR validation workflow는 사용하지 않는다. 최종 확인과 merge 사이에는 같은 base에 다른 PR을 merge하지 않는다. 이어 `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
-- `AGENTS.md`, 리뷰 절차, workflow, ruleset을 바꾸는 PR에도 같은 이중 리뷰 절차를 적용한다. 리뷰를 실제로 수행하지 않는 workflow나 self-attestation validator를 리뷰 gate라는 이름으로 도입하지 않는다.
-- `.github/pr-protection/ruleset.json`은 `hotfix/*`와 `release/*`에 PR-only merge, stale review dismiss, unresolved thread 해소, force-push·deletion 보호만 적용한다. 이 ruleset은 이중 리뷰를 실행하거나 증명하지 않으며 required status check를 두지 않는다.
+- 일반 구현은 `hotfix/vX.Y.Z` 또는 `release/vX.Y.Z`에서 task branch를 만들고, 해당 버전형 branch를 base로 하는 PR을 통해서만 합친다. 일반 task branch는 `task/`, `feat/`, `fix/`, `chore/`, `refact/` 중 하나의 prefix를 사용하고, 릴리스 정책 변경에는 `policy/`를 사용할 수 있다.
+- merge 직전에 PR의 base ref/SHA와 head SHA를 다시 확인한다. base와 head가 모두 기대값일 때만 `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>` 또는 동등한 API precondition으로 병합한다. 별도 PR validation workflow는 사용하지 않는다. 최종 확인과 merge 사이에는 같은 base에 다른 PR을 merge하지 않는다. 이어 `state=MERGED`, `mergedAt`, base branch, head SHA, merge commit을 확인한다. closed-unmerged는 완료로 인정하지 않는다.
+- `.github/pr-protection/ruleset.json`은 `hotfix/*`와 `release/*`에 PR-only merge와 force-push·deletion 보호를 적용하며 required status check를 두지 않는다.
 - 공개된 `main`, `develop`, tag의 잘못된 이력은 revert 또는 다음 patch release로 교정한다. 정상 release 절차에서 `--force-with-lease`로 공개 ref를 다시 쓰지 않는다.
 
 이 레포에서 수정사항이 생기면 아래 순서를 항상 지킨다.
@@ -59,10 +48,10 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
    - `main` 또는 `develop`에 직접 커밋하지 않는다. 실수로 직접 커밋했으면 그 커밋을 버전형 `hotfix/vX.Y.Z` 브랜치 tip으로 옮기고 main/develop merge commit을 다시 만든다.
    - 브랜치명이나 커밋 경로가 이 규칙과 맞지 않으면 새 설명형 브랜치를 만들지 말고, 현재 핫픽스 버전 또는 사용자가 명시한 버전의 `hotfix/vX.Y.Z`로 복구한다.
    - 진행 중인 핫픽스를 검토하거나 수정하는 과정에서 `AGENTS.md` 같은 절차 보강이 필요해졌다면 새 패치 버전을 만들지 말고 같은 `hotfix/vX.Y.Z` 대상 task PR에 포함한다.
-   - task PR은 위의 exact-head 이중 리뷰를 통과한 뒤 테스트·빌드 검증을 별도로 완료하고 merge한다.
+   - task PR은 테스트·빌드 검증을 완료한 뒤 merge한다.
    - 서로 다른 원인/롤백 단위는 커밋을 분리한다.
    - 커밋 메시지는 `fix|feat|chore|refact: ...` 형식을 따른다.
-3. 모든 task PR이 병합되고 exact-head 리뷰 증거가 최신임을 확인한 뒤 `main`으로 돌아와 `hotfix/vX.Y.Z`를 `--no-ff`로 merge하고 annotated `vX.Y.Z` 태그를 만든다.
+3. 모든 task PR이 병합된 뒤 `main`으로 돌아와 `hotfix/vX.Y.Z`를 `--no-ff`로 merge하고 annotated `vX.Y.Z` 태그를 만든다.
    - merge commit 메시지는 기본 형태인 `Merge branch 'hotfix/vX.Y.Z'`를 유지한다.
    - 최종 릴리즈 빌드는 dirty build가 아니라 태그가 붙은 clean `main`에서 만든다.
 4. `main` 태그 기준으로 검증과 빌드를 수행하고, 해당 SHA의 `release-chain-gate` 성공을 확인한다.

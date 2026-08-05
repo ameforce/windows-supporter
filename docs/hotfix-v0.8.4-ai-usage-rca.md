@@ -13,7 +13,7 @@ v0.8.4는 기존 AI 사용량 기능의 의도한 동작을 복구하는 hotfix�
 
 v0.8.0의 provider 일반화가 저장 모델, 수집 생명주기, 표시 메트릭, 상태 투영, UI 재구성까지 하나의 provider-neutral 계약으로 완성되지 않았다. 저장 상한과 표시 상한이 결합됐고, Codex 전용 필드와 고정 UI 행이 Cursor 경로에 남았으며, 수집 실패의 내부 상태가 사용자 상태로 바로 노출됐다. provider 변경도 child monitor, snapshot, label, metric UI를 한 트랜잭션으로 교체하지 않았다.
 
-구현 후 exact-head 독립 리뷰에서는 child/browser worker 종료의 성공 여부가 일부 경로에서 증명되지 않는 문제도 확인됐다. `shutdown()`의 암묵적 `None`을 성공처럼 취급하거나, 종료를 기다리는 동안 settings/refresh lock 순서를 뒤집거나, URL·provider 변경 중 살아 있는 기존 owner 위에 새 session/child를 게시할 수 있었다. 최종 구현은 session → provider monitor → multi-manager 전 구간에서 명시적 `bool` 종료 계약을 사용하고, 결과가 정확히 `True`가 아니면 unsettled child와 recovery-pending 상태로 격리한다.
+구현 후 자체 점검에서는 child/browser worker 종료의 성공 여부가 일부 경로에서 증명되지 않는 문제도 확인됐다. `shutdown()`의 암묵적 `None`을 성공처럼 취급하거나, 종료를 기다리는 동안 settings/refresh lock 순서를 뒤집거나, URL·provider 변경 중 살아 있는 기존 owner 위에 새 session/child를 게시할 수 있었다. 최종 구현은 session → provider monitor → multi-manager 전 구간에서 명시적 `bool` 종료 계약을 사용하고, 결과가 정확히 `True`가 아니면 unsettled child와 recovery-pending 상태로 격리한다.
 
 ## 이슈별 판정 및 수정
 

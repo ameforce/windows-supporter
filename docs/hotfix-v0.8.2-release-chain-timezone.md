@@ -1,7 +1,5 @@
 # v0.8.2 release-chain 시간대 hotfix
 
-> `v0.8.3` 교정: 아래의 `pr-policy-gate`와 `pr-quality-gate` 성공은 CI 결과일 뿐 실제 PR 리뷰 증거가 아니었다. PR #19와 #20에는 `chatgpt-codex-connector` review가 없었다. 관련 Actions 리뷰 흉내와 self-attestation은 `v0.8.3`에서 제거한다.
-
 ## 목적
 
 v0.8.1의 애플리케이션 기능과 공개 ref는 유지하면서, GitHub `release-chain-gate`가 Windows runner의 로컬 시간대 차이 때문에 실패한 문제를 다음 patch release에서 교정한다.
