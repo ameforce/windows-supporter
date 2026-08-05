@@ -1,8 +1,8 @@
-# Hotfix v0.0.3 WATCH follow-ups
+# Hotfix v0.0.3 deferred follow-ups
 
 This hotfix intentionally stays limited to the Kakao worker latch cleanup and
-the empty-monitor selector retry/rehydration path. The review `WATCH` items
-below remain out of scope so the hotfix keeps a small, verifiable risk surface.
+the empty-monitor selector retry/rehydration path. The items below remain out
+of scope so the hotfix keeps a small, verifiable risk surface.
 
 ## PR checklist
 
@@ -19,13 +19,13 @@ below remain out of scope so the hotfix keeps a small, verifiable risk surface.
 
 ## Deferral rationale
 
-- The three items are review `WATCH` findings, not the HIGH/MEDIUM defects that
-  can leave Kakao refresh or the embedded Kakao tab in a stuck state.
+- The three items do not cause the Kakao refresh or embedded Kakao tab to
+  remain stuck.
 - Each item needs separate coverage or migration policy before code changes:
   legacy Kakao helper cleanup needs snapshot/plan/apply path confidence, Codex
   metric cleanup needs a registry/alias contract, and old `code_review`
   compatibility needs an explicit state-policy decision.
 - Handling them in this hotfix would widen the touched files beyond
-  `KakaoManager.py`, `main_ui.py`, and focused regression tests, making review
-  and rollback harder.
+  `KakaoManager.py`, `main_ui.py`, and focused regression tests, making
+  verification and rollback harder.
 
