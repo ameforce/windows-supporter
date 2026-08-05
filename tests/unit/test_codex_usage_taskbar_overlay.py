@@ -281,6 +281,75 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             (),
         )
 
+    def test_codex_guidance_only_uses_currently_reported_metrics(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "codex-1",
+                    "provider": "codex",
+                    "label": "Codex",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "metrics": [
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 50,
+                            "value_text": "50%",
+                            "reset_at": "2026-07-23T15:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        }
+                    ],
+                }
+            ],
+        }
+        now = datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc)
+
+        weekly_only = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        self.assertEqual(
+            [metric["metric_key"] for metric in weekly_only["bars"][0]["metrics"]],
+            ["weekly_limit"],
+        )
+        weekly_metric = weekly_only["bars"][0]["metrics"][0]
+        self.assertEqual(weekly_metric["normal_min_percent"], 58)
+        self.assertEqual(weekly_metric["normal_max_percent"], 61)
+        self.assertEqual(
+            weekly_metric["normal_guidance_text"],
+            "정상 58~61% · 무사용 12h 후",
+        )
+        self.assertEqual(
+            weekly_metric["normal_guidance_short_text"],
+            "58~61% · +12h",
+        )
+        self.assertEqual(weekly_metric["normal_transition_seconds"], 12 * 60 * 60)
+        self.assertEqual(weekly_metric["reset_direction"], "shortage")
+
+        runtime["profiles"][0]["metrics"].insert(
+            0,
+            {
+                "key": "five_hour_limit",
+                "short_label": "5H",
+                "percent": 50,
+                "value_text": "50%",
+                "reset_at": "2026-07-19T18:00:00+00:00",
+                "reset_precision": "datetime",
+                "state": "ready",
+            },
+        )
+        with_five_hour = build_codex_usage_taskbar_overlay_model(runtime, now=now)
+
+        self.assertEqual(
+            [metric["metric_key"] for metric in with_five_hour["bars"][0]["metrics"]],
+            ["five_hour_limit", "weekly_limit"],
+        )
+        self.assertEqual(
+            with_five_hour["bars"][0]["metrics"][0]["normal_guidance_text"],
+            "정상 60~64% · 무사용 30m 후",
+        )
+
     def test_datetime_precision_uses_hour_minute_countdown_within_same_day(self):
         runtime = {
             "enabled": True,
@@ -608,15 +677,15 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ["00d 04h 12m 00s", "00d 05h 59m 00s", "00d 00h 45m 00s", "00d 06h 07m 00s"],
         )
         self.assertEqual(reset_short_texts, reset_texts)
-        self.assertEqual(reset_colors, ["#ef4444", "#f59e0b", "#f59e0b", "#22c55e"])
-        self.assertEqual(reset_states, ["urgent", "warning", "warning", "stable"])
+        self.assertEqual(reset_colors, ["#ef4444", "#f59e0b", "#f59e0b", "#f59e0b"])
+        self.assertEqual(reset_states, ["urgent", "warning", "warning", "warning"])
         self.assertEqual(
             [
                 metric["reset_direction"]
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["shortage", "surplus", "surplus", "on_track"],
+            ["shortage", "surplus", "surplus", "surplus"],
         )
         self.assertEqual(
             [
@@ -624,7 +693,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["↓", "↑", "↑", "="],
+            ["↓", "↑", "↑", "↑"],
         )
         self.assertEqual(
             [
@@ -632,7 +701,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["부족", "남음", "남음", "정상"],
+            ["부족", "남음", "남음", "남음"],
         )
         self.assertEqual(
             [
@@ -640,7 +709,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["부", "남", "남", "정"],
+            ["부", "남", "남", "남"],
         )
         self.assertEqual(
             [
@@ -648,7 +717,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["#7f1d1d", "#78350f", "#78350f", "#064e3b"],
+            ["#7f1d1d", "#78350f", "#78350f", "#78350f"],
         )
         self.assertEqual(
             [
@@ -656,7 +725,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["#ef4444", "#f59e0b", "#f59e0b", "#22c55e"],
+            ["#ef4444", "#f59e0b", "#f59e0b", "#f59e0b"],
         )
         self.assertEqual(
             [
@@ -664,14 +733,14 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for bar in model["bars"]
                 for metric in bar["metrics"]
             ],
-            ["#fee2e2", "#fef3c7", "#fef3c7", "#dcfce7"],
+            ["#fee2e2", "#fef3c7", "#fef3c7", "#fef3c7"],
         )
 
-    def test_model_uses_snapshot_only_tags_independent_of_history_and_now(self):
+    def test_model_recomputes_normal_guidance_as_time_passes_without_new_snapshot(self):
         runtime = self._runtime()
         snapshot = {
             "captured_at": "2026-06-01T13:00:00+09:00",
-            "five_hour_limit": "46%",
+            "five_hour_limit": "30%",
             "weekly_limit": "80%",
             "five_hour_limit_reset_at": "2026-06-01T15:00:00+09:00",
             "weekly_limit_reset_at": "2026-06-02T13:00:00+09:00",
@@ -711,28 +780,51 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             second_metrics = model["bars"][1]["metrics"]
             self.assertEqual(
                 [metric["reset_direction"] for metric in first_metrics],
-                ["on_track", "surplus"],
-            )
-            self.assertEqual(
-                [metric["reset_badge_label"] for metric in first_metrics],
-                ["정상", "남음"],
-            )
-            self.assertEqual(
-                [metric["reset_badge_short_label"] for metric in first_metrics],
-                ["정", "남"],
-            )
-            self.assertEqual(
                 [metric["reset_direction"] for metric in second_metrics],
-                ["on_track", "surplus"],
             )
-            self.assertEqual(
-                [metric["reset_badge_label"] for metric in second_metrics],
-                ["정상", "남음"],
-            )
-            self.assertEqual(
-                [metric["reset_badge_short_label"] for metric in second_metrics],
-                ["정", "남"],
-            )
+
+        first_metrics = first_model["bars"][0]["metrics"]
+        second_metrics = first_model["bars"][1]["metrics"]
+        self.assertEqual(
+            [metric["reset_direction"] for metric in first_metrics],
+            ["shortage", "surplus"],
+        )
+        self.assertEqual(
+            [metric["reset_direction"] for metric in second_metrics],
+            ["shortage", "surplus"],
+        )
+        self.assertEqual(
+            first_metrics[0]["normal_guidance_text"],
+            "정상 37~43% · 무사용 20m 후",
+        )
+
+        first_metrics = second_model["bars"][0]["metrics"]
+        second_metrics = second_model["bars"][1]["metrics"]
+        self.assertEqual(
+            [metric["reset_direction"] for metric in first_metrics],
+            ["surplus", "surplus"],
+        )
+        self.assertEqual(
+            [metric["reset_badge_label"] for metric in first_metrics],
+            ["남음", "남음"],
+        )
+        self.assertEqual(
+            [metric["reset_badge_short_label"] for metric in first_metrics],
+            ["남", "남"],
+        )
+        self.assertEqual(
+            [metric["reset_direction"] for metric in second_metrics],
+            ["surplus", "surplus"],
+        )
+        self.assertEqual(
+            [metric["reset_badge_label"] for metric in second_metrics],
+            ["남음", "남음"],
+        )
+        self.assertEqual(
+            [metric["reset_badge_short_label"] for metric in second_metrics],
+            ["남", "남"],
+        )
+        self.assertEqual(first_metrics[0]["normal_guidance_text"], "정상 17~25% · 사용 필요")
 
     def test_model_marks_fast_early_weekly_burn_as_shortage(self):
         runtime = self._runtime()
@@ -1843,6 +1935,31 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(value_text[2].get("anchor"), "e")
         self.assertGreaterEqual(reset_text[1][0] - value_text[1][0], 4)
         self.assertLessEqual(reset_text[1][0] + 66, 20 + 186)
+
+    def test_draw_metric_segment_prefers_normal_guidance_over_reset_countdown(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        metric = {
+            "key": "7D",
+            "percent": 50,
+            "value_text": "50%",
+            "color": "#f59e0b",
+            "reset_text": "04d 00h 00m 00s",
+            "reset_short_text": "04d 00h 00m 00s",
+            "normal_guidance_text": "정상 58~61% · 무사용 12h 후",
+            "normal_guidance_short_text": "58~61% · +12h",
+            "reset_color": "#ef4444",
+        }
+
+        overlay._draw_metric_segment(canvas, metric, 20, 2, 300, 15)
+
+        drawn_texts = [
+            str(op[2].get("text") or "")
+            for op in canvas.ops
+            if op[0] == "text"
+        ]
+        self.assertIn("정상 58~61% · 무사용 12h 후", drawn_texts)
+        self.assertNotIn("04d 00h 00m 00s", drawn_texts)
 
     def test_model_preserves_minutes_in_day_scale_reset_text(self):
         runtime = self._runtime()
