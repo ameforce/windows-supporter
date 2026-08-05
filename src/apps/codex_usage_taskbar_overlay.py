@@ -4661,11 +4661,8 @@ def _build_normal_guidance(
         else f"{normal_min_percent}~{normal_max_percent}%"
     )
     if direction == _RESET_DIRECTION_SHORTAGE:
-        text = f"N {range_text} / +{transition_text}"
-        short_text = (
-            f"N {range_text}/+"
-            f"{_format_guidance_duration_short(normal_transition_seconds)}"
-        )
+        text = f"N {range_text} / {transition_text}"
+        short_text = text
     else:
         text = f"N {range_text}"
         short_text = text
@@ -4684,17 +4681,6 @@ def _format_guidance_duration(seconds: int) -> str:
     days, remaining_minutes = divmod(total_minutes, 24 * 60)
     hours, minutes = divmod(remaining_minutes, 60)
     return f"{days:02d}d {hours:02d}h {minutes:02d}m"
-
-
-def _format_guidance_duration_short(seconds: int) -> str:
-    total_minutes = max(1, int(math.ceil(max(0, int(seconds)) / 60.0)))
-    days, remaining_minutes = divmod(total_minutes, 24 * 60)
-    hours, minutes = divmod(remaining_minutes, 60)
-    if days:
-        return f"{days}d" if not hours else f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h" if not minutes else f"{hours}h {minutes}m"
-    return f"{minutes}m"
 
 
 def _snapshot_reset_direction(
