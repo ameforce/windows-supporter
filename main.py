@@ -16,6 +16,10 @@ from collections.abc import Mapping, Sequence
 from src.utils.LibConnector import LibConnector
 from src.apps.Monitor import Monitor
 from src.apps.main_ui import WindowsSupporterMainUI
+from src.apps.lid_power_policy import (
+    LidPowerPolicyService,
+    run_lid_power_special_mode,
+)
 from src.utils.StartReg import StartReg
 from src.apps.startup_apps import StartupAppManager
 from src.apps.codex_usage_playwright_process import run_process_boundary_smoke
@@ -303,6 +307,13 @@ def _run_main_app() -> None:
         codex_timeout_recovery_handler=_request_codex_timeout_recovery_restart,
     )
     startup_manager = StartupAppManager()
+    try:
+        lid_power_policy = LidPowerPolicyService.create_default(
+            exclusive_instance=True,
+        )
+        lid_power_policy.start()
+    except Exception:
+        lid_power_policy = None
     updater = WindowsSupporterUpdater(
         root=root,
         event_queue=event_queue,
@@ -316,6 +327,7 @@ def _run_main_app() -> None:
         monitor,
         event_queue=event_queue,
         updater=updater,
+        lid_power_policy=lid_power_policy,
     )
     try:
         setattr(root, "_ws_main_ui", main_ui)
@@ -381,6 +393,22 @@ def _run_main_app() -> None:
         on_exit=lambda: event_queue.put(root.quit),
         on_session_unlock=_on_session_unlock,
         on_display_topology_change=_on_display_topology_change,
+        on_power_setting_change=(
+            lid_power_policy.handle_power_setting
+            if lid_power_policy is not None
+            else None
+        ),
+        on_power_resume=(
+            lid_power_policy.on_resume if lid_power_policy is not None else None
+        ),
+        on_power_notification_failure=(
+            lid_power_policy.notification_failure
+            if lid_power_policy is not None
+            else None
+        ),
+        power_notifications_enabled=bool(
+            lid_power_policy is not None and lid_power_policy.is_supported
+        ),
     )
     try:
         tray.start()
@@ -406,6 +434,11 @@ def _run_main_app() -> None:
         except Exception:
             pass
         try:
+            if lid_power_policy is not None:
+                lid_power_policy.shutdown()
+        except Exception:
+            pass
+        try:
             if tray is not None:
                 tray.stop()
         except Exception:
@@ -428,4 +461,8 @@ def _run_main_app() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    special_exit = run_lid_power_special_mode(sys.argv[1:])
+    if special_exit is None:
+        main()
+    else:
+        raise SystemExit(int(special_exit))
