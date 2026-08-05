@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -232,6 +233,11 @@ _METRIC_RENDER_SIGNATURE_KEYS = (
     "state",
     "reset_text",
     "reset_short_text",
+    "normal_min_percent",
+    "normal_max_percent",
+    "normal_transition_seconds",
+    "normal_guidance_text",
+    "normal_guidance_short_text",
     "reset_color",
     "reset_state",
     "reset_direction",
@@ -605,6 +611,21 @@ def _visible_metrics_for_taskbar_bar(bar: dict[str, Any]) -> tuple[dict[str, Any
     return tuple(metrics[:2])
 
 
+def _metric_guidance_texts(metric: dict[str, Any]) -> tuple[str, str]:
+    metric_dict = metric if isinstance(metric, dict) else {}
+    detail_text = str(
+        metric_dict.get("normal_guidance_text")
+        or metric_dict.get("reset_text")
+        or ""
+    )
+    short_text = str(
+        metric_dict.get("normal_guidance_short_text")
+        or metric_dict.get("reset_short_text")
+        or detail_text
+    )
+    return detail_text, short_text
+
+
 def _metric_fits_badge_mode(
     metric: dict[str, Any],
     segment_width: int,
@@ -613,8 +634,7 @@ def _metric_fits_badge_mode(
 ) -> bool:
     metric_dict = metric if isinstance(metric, dict) else {}
     mode = _normalized_badge_mode(badge_mode)
-    detail_text = str(metric_dict.get("reset_text") or "")
-    short_text = str(metric_dict.get("reset_short_text") or detail_text)
+    detail_text, short_text = _metric_guidance_texts(metric_dict)
     badge_label = str(metric_dict.get("reset_badge_label") or "")
     badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
     has_reset_badge = bool(badge_label or badge_short_label)
@@ -741,8 +761,7 @@ def _required_metric_segment_width(
     badge_mode: str = "any",
 ) -> int:
     metric_dict = metric if isinstance(metric, dict) else {}
-    detail_text = str(metric_dict.get("reset_text") or "")
-    short_text = str(metric_dict.get("reset_short_text") or detail_text)
+    detail_text, short_text = _metric_guidance_texts(metric_dict)
     badge_label = str(metric_dict.get("reset_badge_label") or "")
     badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
     has_reset_badge = bool(badge_label or badge_short_label)
@@ -2135,8 +2154,7 @@ class CodexUsageTaskbarOverlay:
         center_y = y + row_height // 2
         label = str(metric.get("key") or "")
         value_text = str(metric.get("value_text") or "--")
-        reset_text = str(metric.get("reset_text") or "")
-        reset_short_text = str(metric.get("reset_short_text") or reset_text)
+        reset_text, reset_short_text = _metric_guidance_texts(metric)
         reset_color = str(metric.get("reset_color") or "#94a3b8")
         reset_marker = str(metric.get("reset_marker") or "")
         reset_badge_label = str(metric.get("reset_badge_label") or "")
@@ -4444,6 +4462,12 @@ def _build_metric(
         reset_precision=reset_precision,
         now=now,
     )
+    normal_guidance = _build_normal_guidance(
+        metric_key=key,
+        current_percent=percent,
+        reset_at_value=reset_at_value,
+        now=now,
+    )
     snapshot_reset_direction = _snapshot_reset_direction(
         metric_key=key,
         current_percent=percent,
@@ -4462,7 +4486,10 @@ def _build_metric(
     }
     reset_info_direction = str(reset_info.get("direction") or "")
     if enabled:
-        if snapshot_reset_direction in known_reset_directions:
+        guidance_direction = str(normal_guidance.get("direction") or "")
+        if guidance_direction in known_reset_directions:
+            reset_direction = guidance_direction
+        elif snapshot_reset_direction in known_reset_directions:
             reset_direction = snapshot_reset_direction
         elif reset_info_direction in known_reset_directions:
             reset_direction = reset_info_direction
@@ -4481,6 +4508,13 @@ def _build_metric(
         "color": color,
         "reset_text": reset_info["text"],
         "reset_short_text": reset_info["short_text"],
+        "normal_min_percent": normal_guidance.get("normal_min_percent"),
+        "normal_max_percent": normal_guidance.get("normal_max_percent"),
+        "normal_transition_seconds": normal_guidance.get(
+            "normal_transition_seconds"
+        ),
+        "normal_guidance_text": str(normal_guidance.get("text") or ""),
+        "normal_guidance_short_text": str(normal_guidance.get("short_text") or ""),
         "reset_state": reset_state,
         "reset_color": reset_color,
         "reset_direction": reset_direction,
@@ -4493,6 +4527,98 @@ def _build_metric(
         "flash": False,
         "flash_phase": False,
     }
+
+
+def _build_normal_guidance(
+    *,
+    metric_key: str,
+    current_percent: int | None,
+    reset_at_value: Any,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    unavailable = {
+        "direction": _RESET_DIRECTION_UNKNOWN,
+        "normal_min_percent": None,
+        "normal_max_percent": None,
+        "normal_transition_seconds": None,
+        "text": "",
+        "short_text": "",
+    }
+    if current_percent is None:
+        return unavailable
+    reset_at = _parse_reset_datetime(reset_at_value)
+    window_seconds = _snapshot_window_seconds(metric_key)
+    if reset_at is None or window_seconds is None:
+        return unavailable
+    current = _reset_now(reset_at, now)
+    remaining_seconds = (reset_at - current).total_seconds()
+    if remaining_seconds < 0.0 or remaining_seconds > float(window_seconds):
+        return unavailable
+
+    remaining_ratio = remaining_seconds / float(window_seconds)
+    lower_bound = 100.0 * remaining_ratio
+    upper_bound = (
+        _SNAPSHOT_ON_TRACK_MAX_PROJECTED_REMAINING_PERCENT
+        + (
+            100.0 - _SNAPSHOT_ON_TRACK_MAX_PROJECTED_REMAINING_PERCENT
+        )
+        * remaining_ratio
+    )
+    normal_min_percent = max(
+        0,
+        min(100, int(math.ceil(lower_bound - 1e-9))),
+    )
+    normal_max_percent = max(
+        normal_min_percent,
+        min(100, int(math.floor(upper_bound + 1e-9))),
+    )
+    remaining_percent = max(0, min(100, int(current_percent)))
+    normal_transition_seconds: int | None = None
+    suffix = ""
+    short_suffix = ""
+    if remaining_percent < normal_min_percent:
+        direction = _RESET_DIRECTION_SHORTAGE
+        transition_seconds = remaining_seconds - (
+            float(remaining_percent) / 100.0 * float(window_seconds)
+        )
+        normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
+        transition_text = _format_guidance_duration(normal_transition_seconds)
+        suffix = f" · 무사용 {transition_text} 후"
+        short_suffix = f" · +{transition_text}"
+    elif remaining_percent > normal_max_percent:
+        direction = _RESET_DIRECTION_SURPLUS
+        suffix = " · 사용 필요"
+    else:
+        direction = _RESET_DIRECTION_ON_TRACK
+
+    range_text = f"{normal_min_percent}~{normal_max_percent}%"
+    return {
+        "direction": direction,
+        "normal_min_percent": normal_min_percent,
+        "normal_max_percent": normal_max_percent,
+        "normal_transition_seconds": normal_transition_seconds,
+        "text": f"정상 {range_text}{suffix}",
+        "short_text": f"{range_text}{short_suffix}",
+    }
+
+
+def _format_guidance_duration(seconds: int) -> str:
+    remaining = max(0, int(seconds))
+    if remaining >= 86400:
+        days = remaining // 86400
+        hours = int(math.ceil((remaining % 86400) / 3600.0))
+        if hours >= 24:
+            days += 1
+            hours = 0
+        return f"{days}d" if hours == 0 else f"{days}d {hours}h"
+    if remaining >= 3600:
+        hours = remaining // 3600
+        minutes = int(math.ceil((remaining % 3600) / 60.0))
+        if minutes >= 60:
+            hours += 1
+            minutes = 0
+        return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
+    return f"{max(1, int(math.ceil(remaining / 60.0)))}m"
 
 
 def _snapshot_reset_direction(
