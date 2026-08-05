@@ -613,17 +613,60 @@ def _visible_metrics_for_taskbar_bar(bar: dict[str, Any]) -> tuple[dict[str, Any
 
 def _metric_guidance_texts(metric: dict[str, Any]) -> tuple[str, str]:
     metric_dict = metric if isinstance(metric, dict) else {}
-    detail_text = str(
-        metric_dict.get("normal_guidance_text")
+    raw_reset_detail_text = str(metric_dict.get("reset_text") or "")
+    raw_reset_short_text = str(
+        metric_dict.get("reset_short_text")
         or metric_dict.get("reset_text")
         or ""
     )
-    short_text = str(
-        metric_dict.get("normal_guidance_short_text")
-        or metric_dict.get("reset_short_text")
-        or detail_text
+    guidance_detail_text = str(metric_dict.get("normal_guidance_text") or "")
+    guidance_short_text = str(metric_dict.get("normal_guidance_short_text") or "")
+    if not (guidance_detail_text or guidance_short_text):
+        return raw_reset_detail_text, raw_reset_short_text
+
+    reset_detail_text = _friendly_reset_text(raw_reset_detail_text, compact=False)
+    reset_short_text = _friendly_reset_text(raw_reset_short_text, compact=True)
+    detail_text = _join_metric_context(
+        reset_detail_text,
+        guidance_detail_text,
+    )
+    short_text = _join_metric_context(
+        reset_short_text,
+        guidance_short_text,
     )
     return detail_text, short_text
+
+
+def _join_metric_context(reset_text: str, guidance_text: str) -> str:
+    return " · ".join(part for part in (reset_text, guidance_text) if part)
+
+
+def _friendly_reset_text(text: str, *, compact: bool) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+
+    match = re.fullmatch(
+        r"(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return value
+
+    parts = [
+        f"{amount}{label}"
+        for amount, label in zip(
+            (int(part or 0) for part in match.groups()),
+            ("일", "시간", "분", "초"),
+        )
+        if amount > 0
+    ]
+    if not parts:
+        parts = ["0초"]
+    if compact:
+        parts = parts[:2]
+    return f"{'리셋' if compact else '초기화까지'} {' '.join(parts)}"
 
 
 def _metric_fits_badge_mode(
@@ -4574,8 +4617,6 @@ def _build_normal_guidance(
     )
     remaining_percent = max(0, min(100, int(current_percent)))
     normal_transition_seconds: int | None = None
-    suffix = ""
-    short_suffix = ""
     if remaining_percent < normal_min_percent:
         direction = _RESET_DIRECTION_SHORTAGE
         transition_seconds = remaining_seconds - (
@@ -4583,22 +4624,35 @@ def _build_normal_guidance(
         )
         normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
         transition_text = _format_guidance_duration(normal_transition_seconds)
-        suffix = f" · 무사용 {transition_text} 후"
-        short_suffix = f" · +{transition_text}"
     elif remaining_percent > normal_max_percent:
         direction = _RESET_DIRECTION_SURPLUS
-        suffix = " · 사용 필요"
     else:
         direction = _RESET_DIRECTION_ON_TRACK
 
-    range_text = f"{normal_min_percent}~{normal_max_percent}%"
+    range_text = (
+        f"{normal_min_percent}%"
+        if normal_min_percent == normal_max_percent
+        else f"{normal_min_percent}~{normal_max_percent}%"
+    )
+    if direction == _RESET_DIRECTION_SHORTAGE:
+        text = (
+            f"정상 기준 {range_text} · "
+            f"추가 사용 없으면 {transition_text} 후 정상"
+        )
+        short_text = f"정상 {range_text} · 무사용 {transition_text} 후"
+    elif direction == _RESET_DIRECTION_SURPLUS:
+        text = f"정상 기준 {range_text} · 현재 사용 여유"
+        short_text = f"여유 · 정상 {range_text}"
+    else:
+        text = f"정상 범위 {range_text} · 현재 정상"
+        short_text = f"정상 {range_text}"
     return {
         "direction": direction,
         "normal_min_percent": normal_min_percent,
         "normal_max_percent": normal_max_percent,
         "normal_transition_seconds": normal_transition_seconds,
-        "text": f"정상 {range_text}{suffix}",
-        "short_text": f"{range_text}{short_suffix}",
+        "text": text,
+        "short_text": short_text,
     }
 
 
@@ -4610,15 +4664,15 @@ def _format_guidance_duration(seconds: int) -> str:
         if hours >= 24:
             days += 1
             hours = 0
-        return f"{days}d" if hours == 0 else f"{days}d {hours}h"
+        return f"{days}일" if hours == 0 else f"{days}일 {hours}시간"
     if remaining >= 3600:
         hours = remaining // 3600
         minutes = int(math.ceil((remaining % 3600) / 60.0))
         if minutes >= 60:
             hours += 1
             minutes = 0
-        return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
-    return f"{max(1, int(math.ceil(remaining / 60.0)))}m"
+        return f"{hours}시간" if minutes == 0 else f"{hours}시간 {minutes}분"
+    return f"{max(1, int(math.ceil(remaining / 60.0)))}분"
 
 
 def _snapshot_reset_direction(
