@@ -318,11 +318,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(weekly_metric["normal_max_percent"], 61)
         self.assertEqual(
             weekly_metric["normal_guidance_text"],
-            "정상 기준 58~61% · 추가 사용 없으면 12시간 후 정상",
+            "N 58~61% / +00d 12h 00m",
         )
         self.assertEqual(
             weekly_metric["normal_guidance_short_text"],
-            "정상 58~61% · 무사용 12시간 후",
+            "N 58~61%/+12h",
         )
         self.assertEqual(weekly_metric["normal_transition_seconds"], 12 * 60 * 60)
         self.assertEqual(weekly_metric["reset_direction"], "shortage")
@@ -347,7 +347,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             with_five_hour["bars"][0]["metrics"][0]["normal_guidance_text"],
-            "정상 기준 60~64% · 추가 사용 없으면 30분 후 정상",
+            "N 60~64% / +00d 00h 30m",
         )
 
     def test_codex_guidance_collapses_a_single_percent_normal_target(self):
@@ -385,7 +385,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(metric["normal_max_percent"], 88)
         self.assertEqual(
             metric["normal_guidance_text"],
-            "정상 기준 88% · 추가 사용 없으면 9시간 15분 후 정상",
+            "N 88% / +00d 09h 15m",
         )
 
     def test_datetime_precision_uses_hour_minute_countdown_within_same_day(self):
@@ -833,7 +833,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             first_metrics[0]["normal_guidance_text"],
-            "정상 기준 37~43% · 추가 사용 없으면 20분 후 정상",
+            "N 37~43% / +00d 00h 20m",
         )
 
         first_metrics = second_model["bars"][0]["metrics"]
@@ -864,7 +864,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             first_metrics[0]["normal_guidance_text"],
-            "정상 기준 17~25% · 현재 사용 여유",
+            "N 17~25%",
         )
 
     def test_model_marks_fast_early_weekly_burn_as_shortage(self):
@@ -1987,23 +1987,87 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "color": "#f59e0b",
             "reset_text": "04d 00h 00m 00s",
             "reset_short_text": "04d 00h 00m 00s",
-            "normal_guidance_text": "정상 기준 58~61% · 추가 사용 없으면 12시간 후 정상",
-            "normal_guidance_short_text": "정상 58~61% · 무사용 12시간 후",
+            "normal_guidance_text": "N 58~61% / +00d 12h 00m",
+            "normal_guidance_short_text": "N 58~61%/+12h",
             "reset_color": "#ef4444",
         }
 
         overlay._draw_metric_segment(canvas, metric, 20, 2, 500, 15)
 
-        drawn_texts = [
-            str(op[2].get("text") or "")
+        drawn_text_ops = [
+            op
             for op in canvas.ops
             if op[0] == "text"
         ]
-        self.assertIn(
-            "초기화까지 4일 · 정상 기준 58~61% · 추가 사용 없으면 12시간 후 정상",
-            drawn_texts,
+        reset_op = [
+            op for op in drawn_text_ops if op[2].get("text") == "04d 00h 00m 00s"
+        ][0]
+        separator_op = [
+            op for op in drawn_text_ops if op[2].get("text") == "|"
+        ][0]
+        guidance_op = [
+            op
+            for op in drawn_text_ops
+            if op[2].get("text") == "N 58~61% / +00d 12h 00m"
+        ][0]
+
+        self.assertEqual(reset_op[2].get("fill"), "#ef4444")
+        self.assertEqual(separator_op[2].get("fill"), "#64748b")
+        self.assertEqual(guidance_op[2].get("fill"), "#4ade80")
+        self.assertLess(reset_op[1][0], separator_op[1][0])
+        self.assertLess(separator_op[1][0], guidance_op[1][0])
+        self.assertNotIn(
+            "리셋",
+            " ".join(str(op[2].get("text") or "") for op in drawn_text_ops),
         )
-        self.assertNotIn("04d 00h 00m 00s", drawn_texts)
+        guidance_right = (
+            int(guidance_op[1][0])
+            + taskbar_overlay._inline_text_width(
+                str(guidance_op[2].get("text") or "")
+            )
+        )
+        self.assertLessEqual(
+            guidance_right,
+            20 + 500 - taskbar_overlay._SEGMENT_RIGHT_PADDING_PX,
+        )
+
+    def test_metric_guidance_keeps_raw_reset_format_and_pipe_separator(self):
+        metric = {
+            "reset_text": "04d 03h 49m 00s",
+            "reset_short_text": "04d 03h 49m 00s",
+            "normal_guidance_text": "N 87% / +00d 09h 15m",
+            "normal_guidance_short_text": "N 87%/+9h 15m",
+        }
+
+        detail, short = taskbar_overlay._metric_guidance_texts(metric)
+
+        self.assertEqual(
+            detail,
+            "04d 03h 49m 00s | N 87% / +00d 09h 15m",
+        )
+        self.assertEqual(
+            short,
+            "04d 03h 49m 00s | N 87%/+9h 15m",
+        )
+
+    def test_metric_layout_reserves_right_breathing_room(self):
+        row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
+            500,
+            (
+                {
+                    "metric_key": "weekly_limit",
+                    "reset_text": "04d 03h 49m 00s",
+                    "normal_guidance_text": "N 87% / +00d 09h 15m",
+                },
+            ),
+        )
+        metrics_right = row_layout.metrics_x + row_layout.metrics_width
+
+        self.assertLessEqual(
+            metrics_right,
+            500 - taskbar_overlay._OVERLAY_RIGHT_PADDING_PX,
+        )
+        self.assertGreaterEqual(taskbar_overlay._OVERLAY_RIGHT_PADDING_PX, 10)
 
     def test_model_preserves_minutes_in_day_scale_reset_text(self):
         runtime = self._runtime()
@@ -3620,7 +3684,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 534)
+        self.assertEqual(width, 540)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
@@ -3655,7 +3719,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
     def test_overlay_badge_mode_resolves_full_or_short_from_row_layouts(self):
         metrics = self._row_badge_metrics()
 
-        full_layout = taskbar_overlay._metric_row_layout_for_overlay_width(500, metrics)
+        full_layout = taskbar_overlay._metric_row_layout_for_overlay_width(506, metrics)
         short_layout = taskbar_overlay._metric_row_layout_for_overlay_width(414, metrics)
 
         self.assertEqual(
@@ -3702,7 +3766,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertNotIn("남음", texts)
 
     def test_draw_uses_full_row_badges_when_full_mode_fits(self):
-        texts = self._draw_row_badge_texts(500)
+        texts = self._draw_row_badge_texts(506)
 
         self.assertIn("부족", texts)
         self.assertIn("남음", texts)
