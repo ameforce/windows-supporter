@@ -4194,8 +4194,26 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(overlay.refresh())
 
         scheduled = {callback.__name__: delay for delay, callback in root.after_calls}
+        self.assertEqual(scheduled.get("_content_tick"), 1000)
         self.assertGreaterEqual(scheduled.get("_keepalive_tick", 0), 1000)
         self.assertEqual(scheduled.get("_geometry_monitor_tick"), 500)
+
+    def test_hide_cancels_the_dedicated_content_tick(self):
+        root = _FakeRoot()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        self.assertTrue(overlay.refresh())
+        content_after_id = overlay._content_after_id
+
+        overlay.hide()
+
+        self.assertIsNone(overlay._content_after_id)
+        self.assertIn(content_after_id, root.after_cancel_calls)
 
     def test_refresh_suppresses_overlay_while_fullscreen_is_active(self):
         root = _FakeRoot()
@@ -4845,6 +4863,88 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertIn("account_1:five_hour_limit", overlay._flash_until)
         self.assertIsNotNone(overlay._geometry_after_id)
+
+    def test_content_tick_advances_countdown_when_usage_stays_at_100_percent(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        geometry = {
+            "x": 908,
+            "y": 1041,
+            "width": 420,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+        }
+        reset_at = datetime(2026, 8, 16, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+        first_now = reset_at - timedelta(days=7)
+        second_now = first_now + timedelta(seconds=1)
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "account_1",
+                    "profile_id": "account_1",
+                    "provider": "codex",
+                    "label": "Codex 1",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "fresh",
+                    "provider_status": "ready",
+                    "runtime": {
+                        "monitor_state": "idle",
+                        "session_state": "logged_in",
+                        "collect_inflight": False,
+                    },
+                    "last_snapshot": {
+                        "captured_at": first_now.isoformat(),
+                        "weekly_limit": "100%",
+                        "weekly_limit_reset_at": reset_at.isoformat(),
+                    },
+                    "metrics": [
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 100,
+                            "value_text": "100%",
+                            "reset_at": reset_at.isoformat(),
+                            "state": "ready",
+                        }
+                    ],
+                }
+            ],
+        }
+        first_model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            geometry=geometry,
+            now=first_now,
+        )
+        first_metric = first_model["bars"][0]["metrics"][0]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            lambda: runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+        )
+        overlay._window = window
+        overlay._window_visible = True
+        overlay._last_model = first_model
+        overlay._last_metric_values = {"account_1:weekly_limit": "100%"}
+
+        with patch.object(
+            taskbar_overlay,
+            "_current_overlay_datetime",
+            return_value=second_now,
+        ):
+            overlay._content_tick()
+
+        self.assertEqual(len(window.draw_calls), 1)
+        second_metric = overlay._last_model["bars"][0]["metrics"][0]
+        self.assertEqual(first_metric["value_text"], second_metric["value_text"])
+        self.assertEqual(first_metric["value_text"], "100%")
+        self.assertNotEqual(first_metric["reset_text"], second_metric["reset_text"])
+        self.assertEqual(second_metric["reset_text"], "06d 23h 59m 59s")
+        self.assertIsNotNone(overlay._content_after_id)
 
     def test_geometry_monitor_hard_resample_keeps_unchanged_visible_window_still(self):
         root = _FakeRoot()
