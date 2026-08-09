@@ -61,6 +61,7 @@ _TASKBAR_SAMPLE_STEP_PX = 4
 _OCCUPIED_DILATION_PX = 24
 _FLASH_DURATION_SEC = 1.0
 _FLASH_TICK_MS = 1000
+_CONTENT_TICK_MS = 1000
 _KEEPALIVE_TICK_MS = 2000
 _GEOMETRY_MONITOR_TICK_MS = 500
 _GEOMETRY_MONITOR_HARD_RESAMPLE_SEC = 0.5
@@ -1070,6 +1071,7 @@ class CodexUsageTaskbarOverlay:
         self._flash_until: dict[str, float] = {}
         self._last_model: dict[str, Any] | None = None
         self._flash_after_id = None
+        self._content_after_id = None
         self._keepalive_after_id = None
         self._geometry_after_id = None
         self._last_geometry_hard_resample_at = 0.0
@@ -1144,6 +1146,7 @@ class CodexUsageTaskbarOverlay:
             and _overlay_render_signature(previous_model) == _overlay_render_signature(model)
         ):
             self._last_model = model
+            self._schedule_content_tick()
             self._schedule_keepalive_tick()
             self._schedule_geometry_monitor_tick()
             return True
@@ -1157,6 +1160,7 @@ class CodexUsageTaskbarOverlay:
             except Exception:
                 self._last_geometry_hard_resample_at = 0.0
         self._schedule_keepalive_tick()
+        self._schedule_content_tick()
         self._schedule_geometry_monitor_tick()
         self._schedule_flash_tick_if_needed()
         try:
@@ -1181,6 +1185,7 @@ class CodexUsageTaskbarOverlay:
             pass
         self._window_visible = False
         self._cancel_flash_tick()
+        self._cancel_content_tick()
         self._cancel_keepalive_tick()
         self._cancel_geometry_monitor_tick()
         self._clear_pending_regression_geometry()
@@ -1198,6 +1203,7 @@ class CodexUsageTaskbarOverlay:
                 pass
         self._window_visible = False
         self._cancel_flash_tick()
+        self._cancel_content_tick()
         self._clear_pending_regression_geometry()
         self._clear_pending_side_transition()
         self._schedule_geometry_monitor_tick()
@@ -1367,6 +1373,77 @@ class CodexUsageTaskbarOverlay:
                 pass
         return
 
+    def _schedule_content_tick(self, delay_ms: int | None = None) -> None:
+        if self._content_after_id is not None:
+            return
+        scheduler = getattr(self._root, "after", None)
+        if not callable(scheduler):
+            return
+        try:
+            self._content_after_id = scheduler(
+                _CONTENT_TICK_MS if delay_ms is None else int(delay_ms),
+                self._content_tick,
+            )
+        except Exception:
+            self._content_after_id = None
+        return
+
+    def _content_tick(self) -> None:
+        self._content_after_id = None
+        previous_model = self._last_model
+        if not isinstance(previous_model, dict):
+            return
+        if not bool(previous_model.get("visible", True)):
+            return
+        window = self._window
+        if window is None or not bool(self._window_visible):
+            return
+        try:
+            runtime = self._runtime_getter()
+        except Exception:
+            runtime = {}
+        geometry = previous_model.get("geometry", {})
+        if not isinstance(geometry, dict):
+            geometry = {}
+        updated_model = build_codex_usage_taskbar_overlay_model(
+            runtime,
+            geometry=geometry,
+            now=_current_overlay_datetime(),
+        )
+        if not bool(updated_model.get("visible", True)):
+            self._last_model = updated_model
+            self.hide()
+            return
+        if self._is_fullscreen_active(window, geometry):
+            self._last_model = updated_model
+            self._suppress_for_fullscreen()
+            return
+        if _overlay_render_signature(previous_model) != _overlay_render_signature(
+            updated_model
+        ):
+            self._update_metric_change_flash(updated_model)
+            self._draw(updated_model)
+            self._last_model = updated_model
+            self._schedule_flash_tick_if_needed()
+            self._force_native_repaint(window)
+        else:
+            self._last_model = updated_model
+        self._schedule_content_tick()
+        return
+
+    def _cancel_content_tick(self) -> None:
+        after_id = self._content_after_id
+        self._content_after_id = None
+        if after_id is None:
+            return
+        canceller = getattr(self._root, "after_cancel", None)
+        if callable(canceller):
+            try:
+                canceller(after_id)
+            except Exception:
+                pass
+        return
+
     def _schedule_keepalive_tick(self, delay_ms: int | None = None) -> None:
         if self._keepalive_after_id is not None:
             return
@@ -1507,6 +1584,7 @@ class CodexUsageTaskbarOverlay:
                 self._draw(updated_model)
                 self._last_model = updated_model
                 self._schedule_flash_tick_if_needed()
+                self._schedule_content_tick()
                 try:
                     window.deiconify()
                 except Exception:
@@ -1518,6 +1596,7 @@ class CodexUsageTaskbarOverlay:
                 else:
                     self.hide()
                 return
+        self._schedule_content_tick()
         self._schedule_geometry_monitor_tick()
         return
 
@@ -2421,6 +2500,7 @@ class CodexUsageTaskbarOverlay:
                 pass
         self._window_visible = False
         self._cancel_flash_tick()
+        self._cancel_content_tick()
         self._schedule_keepalive_tick(delay_ms=_FULLSCREEN_POLL_MS)
         return
 
