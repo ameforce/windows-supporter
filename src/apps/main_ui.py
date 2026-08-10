@@ -36,6 +36,8 @@ class WindowsSupporterMainUI:
         self._updater = updater
         self._lid_power_policy = lid_power_policy
         self._state_path = state_path
+        self._power_status_refresh_lock = threading.Lock()
+        self._power_status_refresh_pending = False
 
         self._tk = None
         self._ttk = None
@@ -92,6 +94,7 @@ class WindowsSupporterMainUI:
         self._lazy_import_tk()
         self._build_shell()
         self._attach_updater_status_callback()
+        self._attach_lid_power_status_callback()
         return
 
     def _ui_post(self, fn) -> bool:
@@ -541,6 +544,7 @@ class WindowsSupporterMainUI:
                 self._ensure_update_built()
             elif new_tab == self._TAB_POWER:
                 self._ensure_power_built()
+                self._refresh_power_view()
 
             self._apply_tab_geometry(new_tab)
             self._current_tab = new_tab
@@ -578,6 +582,49 @@ class WindowsSupporterMainUI:
             return
         try:
             setter(self._refresh_update_surfaces)
+        except Exception:
+            pass
+        return
+
+    def _attach_lid_power_status_callback(self) -> None:
+        policy = self._lid_power_policy
+        setter = getattr(policy, "set_status_changed_callback", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self._queue_power_status_refresh)
+        except Exception:
+            pass
+        return
+
+    def _queue_power_status_refresh(self) -> None:
+        queue_obj = self._event_queue
+        if queue_obj is None:
+            return
+        with self._power_status_refresh_lock:
+            if self._power_status_refresh_pending:
+                return
+            self._power_status_refresh_pending = True
+        try:
+            queue_obj.put(self._drain_power_status_refresh)
+        except Exception:
+            with self._power_status_refresh_lock:
+                self._power_status_refresh_pending = False
+        return
+
+    def _drain_power_status_refresh(self) -> None:
+        with self._power_status_refresh_lock:
+            self._power_status_refresh_pending = False
+        self._refresh_power_view()
+        return
+
+    def _refresh_power_view(self) -> None:
+        view = self._power_view
+        refresh = getattr(view, "refresh", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
         except Exception:
             pass
         return

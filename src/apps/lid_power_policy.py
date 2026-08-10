@@ -295,31 +295,41 @@ class LidPowerPolicyController:
         self._ac_clamshell_session = False
 
     def _fail(self, exc: Exception) -> None:
-        self._enabled = False
-        self._ac_clamshell_session = False
+        with self._lock:
+            self._enabled = False
+            self._ac_clamshell_session = False
         try:
             self._lease.shutdown()
         except Exception:
             pass
         if self._on_failure is not None:
-            self._on_failure(f"{type(exc).__name__}: {exc}")
+            try:
+                self._on_failure(f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
 
     def set_enabled(self, enabled: bool) -> None:
+        failure = None
         with self._lock:
             value = bool(enabled)
             if not value and self._enabled and self._ac_clamshell_session:
                 try:
                     self._lease.end_ac_clamshell_session()
                 except Exception as exc:
-                    self._fail(exc)
-                    return
-            self._enabled = value
-            self._lid_open = None
-            self._power_source = None
-            self._battery_percent = None
-            self._ac_clamshell_session = False
+                    failure = exc
+            if failure is not None:
+                pass
+            else:
+                self._enabled = value
+                self._lid_open = None
+                self._power_source = None
+                self._battery_percent = None
+                self._ac_clamshell_session = False
+        if failure is not None:
+            self._fail(failure)
 
     def on_lid_state(self, is_open: bool) -> None:
+        failure = None
         with self._lock:
             if not self._enabled:
                 return
@@ -340,9 +350,12 @@ class LidPowerPolicyController:
                     self._lease.begin_ac_clamshell_session()
                     self._ac_clamshell_session = True
             except Exception as exc:
-                self._fail(exc)
+                failure = exc
+        if failure is not None:
+            self._fail(failure)
 
     def on_power_source(self, source: str) -> None:
+        failure = None
         with self._lock:
             if not self._enabled:
                 return
@@ -365,17 +378,19 @@ class LidPowerPolicyController:
                     self._ac_clamshell_session = False
                     self._request_sleep("low_battery")
                 except Exception as exc:
-                    self._fail(exc)
-                return
-            if normalized == "short_term":
+                    failure = exc
+            elif normalized == "short_term":
                 try:
                     if self._ac_clamshell_session:
                         self._lease.end_ac_clamshell_session()
                     self._ac_clamshell_session = False
                 except Exception as exc:
-                    self._fail(exc)
+                    failure = exc
+        if failure is not None:
+            self._fail(failure)
 
     def on_battery_percent(self, percent: int) -> None:
+        failure = None
         with self._lock:
             if not self._enabled:
                 return
@@ -393,18 +408,24 @@ class LidPowerPolicyController:
                 self._ac_clamshell_session = False
                 self._request_sleep("low_battery")
             except Exception as exc:
-                self._fail(exc)
+                failure = exc
+        if failure is not None:
+            self._fail(failure)
 
     def on_active_scheme_changed(self) -> None:
+        failure = None
         with self._lock:
             if not self._enabled:
                 return
             try:
                 self._lease.reconcile_active_scheme()
             except Exception as exc:
-                self._fail(exc)
+                failure = exc
+        if failure is not None:
+            self._fail(failure)
 
     def on_resume(self) -> None:
+        failure = None
         with self._lock:
             if not self._enabled:
                 return
@@ -412,12 +433,14 @@ class LidPowerPolicyController:
                 if self._ac_clamshell_session:
                     self._lease.end_ac_clamshell_session()
             except Exception as exc:
-                self._fail(exc)
-                return
-            self._lid_open = None
-            self._power_source = None
-            self._battery_percent = None
-            self._ac_clamshell_session = False
+                failure = exc
+            if failure is None:
+                self._lid_open = None
+                self._power_source = None
+                self._battery_percent = None
+                self._ac_clamshell_session = False
+        if failure is not None:
+            self._fail(failure)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -446,6 +469,8 @@ class LidPowerPolicyService:
         self._settings_path = Path(settings_path) if settings_path is not None else None
         self._settings_enabled = self._load_enabled()
         self._lock = threading.RLock()
+        self._status_changed_callback: Callable[[], None] | None = None
+        self._status_mutation_depth = 0
         self._runtime_enabled = False
         self._last_error: str | None = None
         self._observed_lid: int | None = None
@@ -538,22 +563,81 @@ class LidPowerPolicyService:
             },
         )
 
-    def _on_controller_failure(self, message: str) -> None:
+    def set_status_changed_callback(
+        self,
+        callback: Callable[[], None] | None,
+    ) -> None:
         with self._lock:
-            self._last_error = str(message)
-            self._runtime_enabled = False
-            self._settings_enabled = False
+            self._status_changed_callback = callback if callable(callback) else None
+
+    def _settings_snapshot_locked(self) -> dict:
+        snapshot = self._controller.snapshot()
+        snapshot.update(
+            {
+                "supported": self.is_supported,
+                "support_reason": self.capabilities.reason,
+                "enabled": bool(self._settings_enabled),
+                "runtime_enabled": bool(self._runtime_enabled),
+                "last_error": self._last_error,
+                "lid_open": (
+                    None
+                    if self._observed_lid is None
+                    else bool(self._observed_lid)
+                ),
+                "power_source": self._observed_power_source(),
+                "battery_percent": self._observed_battery,
+            }
+        )
+        return snapshot
+
+    def _run_status_mutation(self, action):
+        callback = None
+        result = None
+        failure = None
+        with self._lock:
+            is_outermost = self._status_mutation_depth == 0
+            before = self._settings_snapshot_locked() if is_outermost else None
+            self._status_mutation_depth += 1
             try:
-                self._save_enabled(False)
+                result = action()
+            except Exception as exc:
+                failure = exc
+            finally:
+                self._status_mutation_depth -= 1
+                if (
+                    is_outermost
+                    and before != self._settings_snapshot_locked()
+                ):
+                    callback = self._status_changed_callback
+        if callback is not None:
+            try:
+                callback()
             except Exception:
                 pass
+        if failure is not None:
+            raise failure
+        return result
+
+    def _record_controller_failure_locked(self, message: str) -> None:
+        self._last_error = str(message)
+        self._runtime_enabled = False
+        self._settings_enabled = False
+        try:
+            self._save_enabled(False)
+        except Exception:
+            pass
+
+    def _on_controller_failure(self, message: str) -> None:
+        self._run_status_mutation(
+            lambda: self._record_controller_failure_locked(message)
+        )
 
     def start(self) -> None:
         if self._settings_enabled and self.is_supported:
             self.update_enabled(True)
 
     def update_enabled(self, enabled: bool) -> tuple[bool, str | None]:
-        with self._lock:
+        def update() -> tuple[bool, str | None]:
             value = bool(enabled)
             if value and not self.is_supported:
                 return False, self.capabilities.reason
@@ -594,11 +678,12 @@ class LidPowerPolicyService:
                 except Exception:
                     pass
                 return False, self._last_error
+        return self._run_status_mutation(update)
 
     def handle_power_setting(self, kind: str, value: object) -> None:
         if not self.is_supported:
             return
-        with self._lock:
+        def handle() -> None:
             try:
                 if kind == "lid" and value in {0, 1}:
                     self._observed_lid = int(value)
@@ -623,13 +708,15 @@ class LidPowerPolicyService:
                     self._controller.on_active_scheme_changed()
             except Exception as exc:
                 self._on_controller_failure(f"{type(exc).__name__}: {exc}")
+        self._run_status_mutation(handle)
 
     def on_resume(self) -> None:
-        with self._lock:
+        def resume() -> None:
             self._observed_lid = None
             self._observed_acdc = None
             self._observed_battery = None
             self._controller.on_resume()
+        self._run_status_mutation(resume)
 
     def _observed_power_source(self) -> str | None:
         if self._observed_acdc is None:
@@ -639,32 +726,26 @@ class LidPowerPolicyService:
         )
 
     def notification_failure(self, message: str) -> None:
-        self._on_controller_failure(str(message or "notification registration failed"))
-        try:
-            self._controller.set_enabled(False)
-        except Exception:
-            pass
-        try:
-            self._lease.shutdown()
-        except Exception:
-            pass
+        def fail() -> None:
+            self._record_controller_failure_locked(
+                str(message or "notification registration failed")
+            )
+            try:
+                self._controller.set_enabled(False)
+            except Exception:
+                pass
+            try:
+                self._lease.shutdown()
+            except Exception:
+                pass
+        self._run_status_mutation(fail)
 
     def get_settings_snapshot(self) -> dict:
         with self._lock:
-            snapshot = self._controller.snapshot()
-            snapshot.update(
-                {
-                    "supported": self.is_supported,
-                    "support_reason": self.capabilities.reason,
-                    "enabled": bool(self._settings_enabled),
-                    "runtime_enabled": bool(self._runtime_enabled),
-                    "last_error": self._last_error,
-                }
-            )
-            return snapshot
+            return self._settings_snapshot_locked()
 
     def shutdown(self) -> None:
-        with self._lock:
+        def shutdown() -> None:
             try:
                 self._controller.set_enabled(False)
             finally:
@@ -672,6 +753,7 @@ class LidPowerPolicyService:
                     self._lease.shutdown()
                 finally:
                     self._runtime_enabled = False
+        self._run_status_mutation(shutdown)
 
 
 class _NoopLease:
