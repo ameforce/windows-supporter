@@ -311,7 +311,6 @@ def _run_main_app() -> None:
         lid_power_policy = LidPowerPolicyService.create_default(
             exclusive_instance=True,
         )
-        lid_power_policy.start()
     except Exception:
         lid_power_policy = None
     updater = WindowsSupporterUpdater(
@@ -331,6 +330,11 @@ def _run_main_app() -> None:
     )
     try:
         setattr(root, "_ws_main_ui", main_ui)
+    except Exception:
+        pass
+    try:
+        if lid_power_policy is not None:
+            lid_power_policy.start()
     except Exception:
         pass
     try:
@@ -434,13 +438,19 @@ def _run_main_app() -> None:
         except Exception:
             pass
         try:
-            if lid_power_policy is not None:
-                lid_power_policy.shutdown()
+            setter = getattr(lid_power_policy, "set_status_changed_callback", None)
+            if callable(setter):
+                setter(None)
         except Exception:
             pass
         try:
             if tray is not None:
                 tray.stop()
+        except Exception:
+            pass
+        try:
+            if lid_power_policy is not None:
+                lid_power_policy.shutdown()
         except Exception:
             pass
         try:
