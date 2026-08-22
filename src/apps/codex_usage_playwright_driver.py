@@ -333,6 +333,13 @@ class CodexUsagePlaywrightDriver:
     def _launch_context(self, *, headless: bool) -> PageLike:
         if self._playwright is None:
             raise DriverOperationError("playwright unavailable")
+        args = [
+            "--disable-extensions",
+            "--disable-notifications",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        ignore_default_args = ["--enable-automation"]
+        user_agent = self._cached_user_agent if headless else None
         context = self._run_stage(
             "context_launch",
             lambda: self._playwright.chromium.launch_persistent_context(
@@ -340,8 +347,9 @@ class CodexUsagePlaywrightDriver:
                 channel="chrome",
                 headless=headless,
                 chromium_sandbox=True,
-                args=["--disable-extensions", "--disable-notifications"],
-                user_agent=self._cached_user_agent,
+                args=args,
+                ignore_default_args=ignore_default_args,
+                user_agent=user_agent,
                 timeout=float(self._config.navigation_timeout_ms),
             ),
         )

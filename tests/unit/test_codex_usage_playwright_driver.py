@@ -29,6 +29,7 @@ class LaunchCall(TypedDict):
     headless: bool
     chromium_sandbox: bool
     args: list[str]
+    ignore_default_args: list[str]
     user_agent: str | None
     timeout: float
 
@@ -133,6 +134,7 @@ class FakeChromium:
         headless: bool,
         chromium_sandbox: bool,
         args: list[str],
+        ignore_default_args: list[str],
         user_agent: str | None,
         timeout: float,
     ) -> FakeContext:
@@ -143,6 +145,7 @@ class FakeChromium:
                 headless=headless,
                 chromium_sandbox=chromium_sandbox,
                 args=args,
+                ignore_default_args=ignore_default_args,
                 user_agent=user_agent,
                 timeout=timeout,
             )
@@ -256,6 +259,58 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         self.assertTrue(all(call["channel"] == "chrome" for call in chromium.calls))
         self.assertEqual(chromium.calls[1]["user_agent"], "Chrome/140")
         self.assertEqual([name for name, _url in ready_page.calls], ["reload", "reload"])
+
+    def test_headless_launch_suppresses_browser_automation_fingerprints(self) -> None:
+        driver, chromium, _controller = make_driver([FakeContext([FakePage()])])
+
+        _ = driver.collect()
+
+        self.assertEqual(len(chromium.calls), 1)
+        call = chromium.calls[0]
+        self.assertIn("--disable-blink-features=AutomationControlled", call["args"])
+        self.assertIn("--enable-automation", call["ignore_default_args"])
+        self.assertNotIn("--enable-automation", call["args"])
+
+    def test_headed_login_launch_hides_automation_signals_and_uses_natural_user_agent(self) -> None:
+        login_page = FakePage(
+            url="about:blank",
+            probe={"url": USAGE_URL, "mainText": "Log in", "metricBlocks": []},
+        )
+        driver, chromium, _controller = make_driver([FakeContext([login_page])])
+
+        result = driver.open_login()
+
+        self.assertEqual(result.error, BrowserErrorCode.LOGIN_REQUIRED.value)
+        call = chromium.calls[-1]
+        self.assertFalse(call["headless"])
+        self.assertIsNone(call["user_agent"])
+        self.assertIn("--disable-blink-features=AutomationControlled", call["args"])
+        self.assertIn("--enable-automation", call["ignore_default_args"])
+        self.assertNotIn("--enable-automation", call["args"])
+
+    def test_headed_login_does_not_inherit_cached_headless_user_agent(self) -> None:
+        first = FakeContext([FakePage(user_agent="HeadlessChrome/140")])
+        ready_page = FakePage(user_agent="Chrome/140")
+        login_page = FakePage(
+            url="about:blank",
+            probe={"url": USAGE_URL, "mainText": "Log in", "metricBlocks": []},
+        )
+        driver, chromium, _controller = make_driver(
+            [first, FakeContext([ready_page]), FakeContext([login_page])]
+        )
+
+        _ = driver.collect()
+        _ = driver.open_login()
+
+        self.assertEqual(len(chromium.calls), 3)
+        self.assertEqual(chromium.calls[1]["user_agent"], "Chrome/140")
+        self.assertIsNone(chromium.calls[2]["user_agent"])
+        for headless_call in chromium.calls[:2]:
+            self.assertIn(
+                "--disable-blink-features=AutomationControlled",
+                headless_call["args"],
+            )
+            self.assertIn("--enable-automation", headless_call["ignore_default_args"])
 
     def test_collect_retries_page_then_context_once(self) -> None:
         first_page = FakePage(url="https://example.com", failures=1)
