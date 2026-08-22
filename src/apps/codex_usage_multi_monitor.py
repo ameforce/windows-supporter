@@ -1257,9 +1257,12 @@ class CodexUsageMultiMonitor:
             return self.__child(self.__default_account_id).get_last_snapshot()
 
     def on_display_topology_changed(self, reason: str = "display_change") -> None:
+        # Every topology transition can destroy/recreate shell tray windows and
+        # change the effective DPI scale, so always purge stale placement state
+        # and rebind the native owner regardless of the specific reason.
         self.__refresh_taskbar_progress(
-            invalidate_geometry=True,
-            rebind_native_owner=str(reason or "") == "taskbar_created",
+            topology_reset=True,
+            rebind_native_owner=True,
         )
         return
 
@@ -1416,6 +1419,7 @@ class CodexUsageMultiMonitor:
         *,
         invalidate_geometry: bool = False,
         rebind_native_owner: bool = False,
+        topology_reset: bool = False,
     ) -> None:
         if bool(self.__closing) or self.__root is None:
             return
@@ -1434,7 +1438,15 @@ class CodexUsageMultiMonitor:
                         rebind = getattr(progress, "invalidate_native_owner", None)
                         if callable(rebind):
                             rebind()
-                    if bool(invalidate_geometry):
+                    if bool(topology_reset):
+                        resetter = getattr(
+                            progress,
+                            "prepare_for_display_topology_change",
+                            None,
+                        )
+                        if callable(resetter):
+                            resetter()
+                    elif bool(invalidate_geometry):
                         invalidator = getattr(progress, "invalidate_geometry", None)
                         if callable(invalidator):
                             invalidator()

@@ -134,6 +134,8 @@ class _FakeTaskbarOverlay:
         self.refresh_calls = 0
         self.hide_calls = 0
         self.invalidate_geometry_calls = 0
+        self.invalidate_native_owner_calls = 0
+        self.topology_reset_calls = 0
         self.runtime_snapshots = []
         self.instances.append(self)
 
@@ -148,6 +150,14 @@ class _FakeTaskbarOverlay:
 
     def invalidate_geometry(self):
         self.invalidate_geometry_calls += 1
+        return None
+
+    def invalidate_native_owner(self):
+        self.invalidate_native_owner_calls += 1
+        return None
+
+    def prepare_for_display_topology_change(self):
+        self.topology_reset_calls += 1
         return None
 
 
@@ -4359,9 +4369,46 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             manager.on_display_topology_changed("display_change")
 
+            overlay = _FakeTaskbarOverlay.instances[0]
             self.assertEqual(len(_FakeTaskbarOverlay.instances), 1)
-            self.assertEqual(_FakeTaskbarOverlay.instances[0].invalidate_geometry_calls, 1)
-            self.assertEqual(_FakeTaskbarOverlay.instances[0].refresh_calls, 2)
+            self.assertEqual(overlay.topology_reset_calls, 1)
+            self.assertEqual(overlay.invalidate_native_owner_calls, 1)
+            self.assertEqual(overlay.invalidate_geometry_calls, 0)
+            self.assertEqual(overlay.refresh_calls, 2)
+
+    def test_display_topology_change_resets_overlay_for_every_reason(self):
+        for reason in (
+            "display_change",
+            "dpi_change",
+            "device_change",
+            "remote_connect",
+            "remote_disconnect",
+            "console_disconnect",
+            "session_unlock",
+            "power_resume",
+            "taskbar_created",
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                _FakeTaskbarOverlay.instances = []
+                manager, _children = self._build_manager(
+                    tmp,
+                    taskbar_progress_factory=_FakeTaskbarOverlay,
+                )
+                manager.attach(object(), event_queue=None)
+
+                manager.on_display_topology_changed(reason)
+
+                overlay = _FakeTaskbarOverlay.instances[0]
+                self.assertEqual(
+                    overlay.topology_reset_calls,
+                    1,
+                    f"reason={reason}",
+                )
+                self.assertEqual(
+                    overlay.invalidate_native_owner_calls,
+                    1,
+                    f"reason={reason}",
+                )
 
     def test_update_settings_refreshes_taskbar_overlay_after_disabling_manager(self):
         with tempfile.TemporaryDirectory() as tmp:
