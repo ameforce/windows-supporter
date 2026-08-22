@@ -375,7 +375,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(value_label.grid_kwargs.get("sticky"), "w")
         self.assertGreater(int(value_label.kwargs.get("wraplength", 0)), 0)
 
-    def test_account_metric_rows_use_compact_two_cell_layout(self) -> None:
+    def test_account_metric_rows_align_values_in_label_value_grid(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         fake_tk = _FakeTk()
         view._tk = fake_tk
@@ -386,16 +386,36 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         )
 
         self.assertIn("captured_at", metric_vars)
-        metric_columns = {label.grid_kwargs.get("column") for label in fake_tk.labels}
-        self.assertEqual(metric_columns, {0, 1})
-        self.assertTrue(all(label.grid_kwargs.get("sticky") == "we" for label in fake_tk.labels))
+        # 라벨-값-라벨-값 4열: 값이 항상 홀수 열에 정렬되어 눈이 열을 따라
+        # 훑을 수 있어야 한다.
+        label_cells = [
+            label
+            for label in fake_tk.labels
+            if label.kwargs.get("text")
+        ]
+        value_cells = [
+            label
+            for label in fake_tk.labels
+            if label.kwargs.get("textvariable") is not None
+        ]
+        self.assertEqual(
+            {label.grid_kwargs.get("column") for label in label_cells},
+            {0, 2},
+        )
+        self.assertEqual(
+            {label.grid_kwargs.get("column") for label in value_cells},
+            {1, 3},
+        )
         self.assertTrue(
-            all(int(label.kwargs.get("wraplength", 0)) <= 190 for label in fake_tk.labels)
+            all(label.kwargs.get("anchor") == "e" for label in label_cells)
+        )
+        self.assertTrue(
+            all(int(label.kwargs.get("wraplength", 0)) <= 260 for label in value_cells)
         )
 
-        captured_display = fake_tk.labels[0].kwargs.get("textvariable")
+        captured_display = value_cells[0].kwargs.get("textvariable")
         metric_vars["captured_at"].set("2026-06-25 09:07:55")
-        self.assertEqual(captured_display.get(), "최근 확인 시각: 2026-06-25 09:07:55")
+        self.assertEqual(captured_display.get(), "2026-06-25 09:07:55")
 
     def test_cursor_metric_rows_use_included_reset_and_on_demand_contract(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
@@ -412,9 +432,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             set(metric_vars),
             {"captured_at", "included_usage", "billing_reset_at", "on_demand_status"},
         )
-        self.assertEqual(display_vars["included_usage"].get(), "포함 사용량: -")
-        self.assertEqual(display_vars["billing_reset_at"].get(), "결제 주기 초기화: -")
-        self.assertEqual(display_vars["on_demand_status"].get(), "온디맨드: -")
+        self.assertEqual(display_vars["included_usage"].get(), "-")
+        self.assertEqual(display_vars["billing_reset_at"].get(), "-")
+        self.assertEqual(display_vars["on_demand_status"].get(), "-")
         self.assertGreaterEqual(
             int(fake_tk.labels[-1].kwargs.get("wraplength", 0)),
             300,
@@ -422,7 +442,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         metric_vars["on_demand_status"].set("활성화 · US$8.20\u00a0사용")
         self.assertEqual(
             display_vars["on_demand_status"].get(),
-            "온디맨드: 활성화 · US$8.20\u00a0사용",
+            "활성화 · US$8.20\u00a0사용",
         )
 
     def test_usage_metric_values_are_localized_without_changing_amounts(self) -> None:
@@ -556,7 +576,11 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(len(fake_tk.canvases), 1)
         self.assertEqual(len(fake_ttk.scrollbars), 1)
         texts = [label.kwargs.get("text") for label in fake_tk.labels]
-        self.assertIn("작업표시줄 표시", texts)
+        checkbox_texts = [
+            checkbutton.kwargs.get("text") for checkbutton in fake_tk.checkbuttons
+        ]
+        self.assertIn("모니터링 사용", checkbox_texts)
+        self.assertIn("작업표시줄 오버레이", checkbox_texts)
         self.assertIn("사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 2개)", texts)
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
@@ -1857,8 +1881,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(button_texts.count("연결"), 2)
         self.assertEqual(button_texts.count("연결 해제"), 2)
         self.assertEqual(button_texts.count("새로고침"), 2)
-        self.assertIn("아래로", button_texts)
-        self.assertIn("위로", button_texts)
+        self.assertIn("▲", button_texts)
+        self.assertIn("▼", button_texts)
 
     def test_refresh_runtime_status_updates_each_account_status_independently(self) -> None:
         class _FakeMonitor:
