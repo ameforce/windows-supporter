@@ -302,9 +302,10 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
         self.assertEqual(geometry["coordinate_basis"], "physical_px")
         self.assertEqual(geometry["_geometry_basis"], "global_physical_px")
 
-    def test_taskbar_created_rebinds_secondary_overlay_to_recreated_secondary_owner(self):
+    def test_taskbar_created_rebinds_logical_target_to_recreated_secondary_taskbar(self):
         desktop = _Desktop()
         overlay, _root, _window = _refresh_with_desktop(desktop)
+        self.assertEqual(overlay._active_taskbar_hwnd, 20)
         desktop.taskbars.pop(20)
         desktop.taskbars[21] = (
             "Shell_SecondaryTrayWnd",
@@ -329,7 +330,11 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
             taskbar_overlay,
             "win32api",
             _FakeWin32Api(desktop),
-        ), patch.object(taskbar_overlay, "win32con", _FakeWin32Con), patch.object(
+        ), patch.object(
+            taskbar_overlay,
+            "win32con",
+            _FakeWin32Con,
+        ), patch.object(
             taskbar_overlay.ctypes,
             "windll",
             RecordingWindll(),
@@ -337,8 +342,12 @@ class CodexUsageTaskbarOverlayMultiMonitorTest(unittest.TestCase):
         ):
             overlay.invalidate_native_owner()
 
+        # The recreated secondary taskbar becomes the logical target only.
+        # Ownership must stay bound to a process-local owner window so shell
+        # tray teardown can never cascade-destroy the overlay again.
         self.assertEqual(overlay._active_taskbar_hwnd, 21)
-        self.assertEqual(recording_user32.owner_calls[-1], (200, -8, 21))
+        for _hwnd, _index, value in recording_user32.owner_calls:
+            self.assertNotIn(value, {10, 20, 21})
 
     def test_geometry_monitor_relocates_existing_primary_overlay_when_fullscreen_starts(self):
         desktop = _Desktop()

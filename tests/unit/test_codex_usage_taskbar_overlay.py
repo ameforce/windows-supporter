@@ -2212,7 +2212,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             self.assertEqual(_get_window_handle(FakeWindow()), 111)
             self.assertEqual(fake_user32.last_call, (222, 2))
 
-    def test_prepare_native_window_binds_overlay_owner_to_shell_taskbar(self):
+    def test_prepare_native_window_never_owns_overlay_to_shell_tray_windows(self):
         class FakeWindow:
             def winfo_id(self):
                 return 222
@@ -2262,11 +2262,99 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             with patch.object(taskbar_overlay.ctypes, "windll", FakeWindll()):
                 overlay._prepare_native_window(FakeWindow())
 
-        self.assertEqual(fake_win32gui.find_calls, [("Shell_TrayWnd", None)])
-        self.assertEqual(fake_user32.owner_calls, [(111, -8, 555)])
+        # Shell tray teardown must never be able to cascade-destroy the overlay,
+        # so ownership is bound to a process-local owner window instead.
+        self.assertEqual(fake_win32gui.find_calls, [])
+        self.assertEqual(fake_user32.owner_calls, [])
 
-    def test_invalidate_native_owner_rebinds_existing_window_after_taskbar_created(self):
+    def test_prepare_native_window_binds_overlay_to_process_local_owner(self):
         class FakeWindow:
+            def winfo_id(self):
+                return 222
+
+        class FakeUser32:
+            def __init__(self):
+                self.owner_calls = []
+
+            def GetAncestor(self, hwnd, _flag):
+                return 111
+
+            def SetWindowLongPtrW(self, hwnd, index, value):
+                self.owner_calls.append((int(hwnd), int(index), int(value)))
+                return 0
+
+        fake_user32 = FakeUser32()
+
+        class FakeWindll:
+            user32 = fake_user32
+
+        OWNER_HWND = 888
+        OWNER_ATOM = 9
+
+        class FakeWin32Api:
+            def GetModuleHandle(self, _name):
+                return 4321
+
+        class FakeWin32Gui:
+            def __init__(self):
+                self.create_ex_calls = []
+
+            def WNDCLASS(self):
+                return type("WNDCLASS", (), {})()
+
+            def RegisterClass(self, _wc):
+                return OWNER_ATOM
+
+            def DefWindowProc(self, *_args):
+                return 0
+
+            def CreateWindowEx(self, *args):
+                self.create_ex_calls.append(args)
+                return OWNER_HWND
+
+            def IsWindow(self, hwnd):
+                return int(hwnd) == OWNER_HWND
+
+            def GetWindowLong(self, _hwnd, _index):
+                return 0
+
+            def SetWindowLong(self, _hwnd, _index, _value):
+                return 0
+
+        class FakeWin32Con:
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_POPUP = 0x80000000
+
+        fake_win32gui = FakeWin32Gui()
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            window_factory=lambda _root: FakeWindow(),
+        )
+
+        with patch.object(taskbar_overlay, "win32gui", fake_win32gui), patch.object(
+            taskbar_overlay,
+            "win32api",
+            FakeWin32Api(),
+        ), patch.object(taskbar_overlay, "win32con", FakeWin32Con):
+            with patch.object(taskbar_overlay.ctypes, "windll", FakeWindll()):
+                overlay._prepare_native_window(FakeWindow())
+
+        self.assertEqual(overlay._native_owner_hwnd, OWNER_HWND)
+        self.assertEqual(fake_user32.owner_calls, [(111, -8, OWNER_HWND)])
+        self.assertNotIn(
+            fake_user32.owner_calls[0][2],
+            {10, 20, 30, 555, 777},
+        )
+
+    def test_invalidate_native_owner_resolves_logical_target_without_shell_ownership(self):
+        class FakeWindow:
+            def winfo_exists(self):
+                return True
+
             def winfo_id(self):
                 return 222
 
@@ -2293,20 +2381,53 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             def SetWindowLong(self, _hwnd, _index, _value):
                 return 0
 
-            def FindWindow(self, class_name, title):
-                self.find_call = (str(class_name), title)
-                return 777
-
         class FakeWin32Con:
             GWL_EXSTYLE = -20
             WS_EX_APPWINDOW = 0x00040000
             WS_EX_NOACTIVATE = 0x08000000
             WS_EX_TOOLWINDOW = 0x00000080
 
+        TASKBAR_HWND = 444
+        monitor = TaskbarMonitorSnapshot(
+            handle=1,
+            device=r"\\.\DISPLAY1",
+            display_num=1,
+            is_primary=True,
+            monitor=(0, 0, 1920, 1080),
+            work=(0, 0, 1920, 1040),
+        )
+        target = TaskbarOverlayTarget(
+            monitor=monitor,
+            taskbar_hwnd=TASKBAR_HWND,
+            taskbar_class="Shell_TrayWnd",
+            taskbar_rect=(0, 1040, 1920, 1080),
+            taskbar_visible=True,
+            orientation="bottom",
+            orientation_source="work_area_reserved",
+            orientation_confidence="high",
+            displayable=True,
+            displayable_reason="displayable",
+            fallback_reason="",
+            rca_class="displayable_horizontal_taskbar",
+        )
         fake_win32gui = FakeWin32Gui()
-        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        overlay = CodexUsageTaskbarOverlay(
+            _FakeRoot(),
+            self._runtime,
+            taskbar_target_getter=lambda: (target,),
+        )
         overlay._window = FakeWindow()
-        overlay._active_taskbar_hwnd = 555
+        # Geometry overlapping the target monitor makes the rebind resolver
+        # deterministically select TASKBAR_HWND as the logical taskbar target.
+        overlay._last_model = {
+            "geometry": {
+                "x": 700,
+                "y": 1040,
+                "width": 500,
+                "height": 36,
+                "visible": True,
+            }
+        }
 
         with patch.object(taskbar_overlay, "win32gui", fake_win32gui), patch.object(
             taskbar_overlay,
@@ -2316,9 +2437,125 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             with patch.object(taskbar_overlay.ctypes, "windll", FakeWindll()):
                 overlay.invalidate_native_owner()
 
-        self.assertEqual(overlay._active_taskbar_hwnd, 777)
-        self.assertEqual(fake_win32gui.find_call, ("Shell_TrayWnd", None))
-        self.assertEqual(fake_user32.owner_calls, [(111, -8, 777)])
+        self.assertEqual(overlay._active_taskbar_hwnd, TASKBAR_HWND)
+        # The shell taskbar hwnd stays a logical target only; any actual owner
+        # write must reference the process-local owner, never the tray window.
+        for _hwnd, _index, value in fake_user32.owner_calls:
+            self.assertNotEqual(value, TASKBAR_HWND)
+
+    def test_refresh_recreates_surface_after_external_hwnd_destroy(self):
+        class _MortalWindow(_FakeWindow):
+            def __init__(self):
+                super().__init__()
+                self.alive = True
+                self.destroy_calls = 0
+
+            def winfo_exists(self):
+                return bool(self.alive)
+
+            def destroy(self):
+                self.destroy_calls += 1
+                self.alive = False
+
+        created = []
+
+        def factory(_root):
+            window = _MortalWindow()
+            created.append(window)
+            return window
+
+        root = _FakeRoot()
+        runtime = self._runtime()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            lambda: runtime,
+            window_factory=factory,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+
+        self.assertTrue(overlay.refresh())
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(created[0].draw_calls), 1)
+
+        # Simulate explorer tray teardown destroying the HWND behind Tk's back;
+        # the next refresh must rebuild the surface instead of dying forever.
+        created[0].alive = False
+        runtime["accounts"][0]["last_snapshot"]["five_hour_limit"] = "51%"
+        self.assertTrue(overlay.refresh())
+        self.assertEqual(len(created), 2)
+        self.assertEqual(created[0].destroy_calls, 1)
+        self.assertEqual(len(created[1].draw_calls), 1)
+
+    def test_content_tick_survives_surface_failure_and_keeps_scheduling(self):
+        class _BreakableWindow(_FakeWindow):
+            def __init__(self):
+                super().__init__()
+                self.fail_draw = False
+
+            def draw_model(self, model):
+                if self.fail_draw:
+                    raise RuntimeError("native surface destroyed")
+                return super().draw_model(model)
+
+        root = _FakeRoot()
+        window = _BreakableWindow()
+        runtime = self._runtime()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            lambda: runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+
+        overlay.refresh()
+        baseline_draws = len(window.draw_calls)
+
+        runtime["accounts"][0]["last_snapshot"]["weekly_limit"] = "77%"
+        window.fail_draw = True
+        scheduled_before = len(root.after_calls)
+        overlay._content_after_id = None
+        overlay._content_tick()
+
+        rescheduled = [
+            callback
+            for _delay, callback in root.after_calls[scheduled_before:]
+            if getattr(callback, "__name__", "") == "_content_tick"
+        ]
+        self.assertTrue(rescheduled)
+        self.assertIsNone(overlay._window)
+
+        window.fail_draw = False
+        self.assertTrue(overlay.refresh())
+        self.assertGreater(len(window.draw_calls), baseline_draws)
+
+    def test_prepare_for_display_topology_change_drops_stale_render_state(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        runtime = self._runtime()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            lambda: runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+
+        overlay.refresh()
+        self.assertIsNotNone(overlay._last_model)
+        overlay._flash_until["account_1:weekly_limit"] = 5.0
+        overlay._last_metric_values["account_1:weekly_limit"] = "52%"
+        overlay._pending_regression_geometry = {"x": 12}
+
+        overlay.prepare_for_display_topology_change()
+
+        self.assertIsNone(overlay._last_model)
+        self.assertEqual(overlay._flash_until, {})
+        self.assertEqual(overlay._last_metric_values, {})
+        self.assertIsNone(overlay._pending_regression_geometry)
+        self.assertIsNone(overlay._cached_geometry_context)
+        self.assertTrue(overlay._geometry_invalidated)
 
     def test_refresh_updates_changed_metric_with_flash_timer(self):
         root = _FakeRoot()
