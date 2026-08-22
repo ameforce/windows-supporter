@@ -84,6 +84,7 @@ class ChromiumProtocol(Protocol):
         headless: bool,
         chromium_sandbox: bool,
         args: list[str],
+        ignore_default_args: list[str],
         user_agent: str | None,
         timeout: float,
     ) -> ContextProtocol: ...
