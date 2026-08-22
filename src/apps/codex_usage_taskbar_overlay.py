@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -73,6 +74,12 @@ _SLOT_SIDE_LEFT = "left"
 _SLOT_SIDE_RIGHT = "right"
 _FULLSCREEN_POLL_MS = 500
 _GWLP_HWNDPARENT = -8
+# The overlay must never be owned by a shell tray window: explorer destroys
+# Shell_SecondaryTrayWnd/Shell_TrayWnd on RDP connect/disconnect and monitor
+# add/remove, and Win32 cascade-destroys owned windows with their owner. A
+# process-local hidden owner keeps the owned-window semantics without exposing
+# the overlay to shell teardown.
+_NATIVE_OWNER_CLASS_PREFIX = "WindowsSupporterOverlayOwner_"
 _TASKBAR_METRICS = (
     ("five_hour_limit", "5h"),
     ("weekly_limit", "7d"),
@@ -1087,6 +1094,7 @@ class CodexUsageTaskbarOverlay:
         self._fullscreen_suppressed = False
         self._window_visible = False
         self._active_taskbar_hwnd = 0
+        self._native_owner_hwnd = 0
         return
 
     def refresh(self) -> bool:
@@ -1150,9 +1158,19 @@ class CodexUsageTaskbarOverlay:
             self._schedule_keepalive_tick()
             self._schedule_geometry_monitor_tick()
             return True
-        self._apply_geometry(window, geometry)
-        self._update_metric_change_flash(model)
-        self._draw(model)
+        try:
+            self._apply_geometry(window, geometry)
+            self._update_metric_change_flash(model)
+            self._draw(model)
+        except Exception:
+            # A destroyed native surface must never kill the caller or the tick
+            # loops; drop the surface and retry on the next geometry tick.
+            self._recover_broken_surface()
+            self._last_model = model
+            self._schedule_geometry_monitor_tick(
+                delay_ms=max(100, int(_GEOMETRY_MONITOR_TICK_MS))
+            )
+            return False
         self._last_model = model
         if self._last_geometry_hard_resample_at <= 0.0:
             try:
@@ -1217,10 +1235,23 @@ class CodexUsageTaskbarOverlay:
         self._clear_pending_side_transition()
         return
 
+    def prepare_for_display_topology_change(self) -> None:
+        """Drop every cached placement/render state derived from the old display space.
+
+        RDP connect/disconnect and monitor add/remove can change the effective DPI
+        scale of this (DPI-unaware) process mid-flight, so coordinates captured
+        before the change must never feed slot selection or regression stabilization.
+        """
+        self.invalidate_geometry()
+        self._last_metric_values.clear()
+        self._flash_until.clear()
+        self._last_model = None
+        return
+
     def invalidate_native_owner(self) -> None:
         self._active_taskbar_hwnd = self._native_owner_taskbar_hwnd_for_rebind()
         window = self._window
-        if window is None:
+        if window is None or not self._window_is_alive(window):
             return
         self._prepare_native_window(window)
         return
@@ -1399,36 +1430,42 @@ class CodexUsageTaskbarOverlay:
         if window is None or not bool(self._window_visible):
             return
         try:
-            runtime = self._runtime_getter()
+            try:
+                runtime = self._runtime_getter()
+            except Exception:
+                runtime = {}
+            geometry = previous_model.get("geometry", {})
+            if not isinstance(geometry, dict):
+                geometry = {}
+            updated_model = build_codex_usage_taskbar_overlay_model(
+                runtime,
+                geometry=geometry,
+                now=_current_overlay_datetime(),
+            )
+            if not bool(updated_model.get("visible", True)):
+                self._last_model = updated_model
+                self.hide()
+                return
+            if self._is_fullscreen_active(window, geometry):
+                self._last_model = updated_model
+                self._suppress_for_fullscreen()
+                return
+            if _overlay_render_signature(previous_model) != _overlay_render_signature(
+                updated_model
+            ):
+                self._update_metric_change_flash(updated_model)
+                self._draw(updated_model)
+                self._last_model = updated_model
+                self._schedule_flash_tick_if_needed()
+                self._force_native_repaint(window)
+            else:
+                self._last_model = updated_model
         except Exception:
-            runtime = {}
-        geometry = previous_model.get("geometry", {})
-        if not isinstance(geometry, dict):
-            geometry = {}
-        updated_model = build_codex_usage_taskbar_overlay_model(
-            runtime,
-            geometry=geometry,
-            now=_current_overlay_datetime(),
-        )
-        if not bool(updated_model.get("visible", True)):
-            self._last_model = updated_model
-            self.hide()
-            return
-        if self._is_fullscreen_active(window, geometry):
-            self._last_model = updated_model
-            self._suppress_for_fullscreen()
-            return
-        if _overlay_render_signature(previous_model) != _overlay_render_signature(
-            updated_model
-        ):
-            self._update_metric_change_flash(updated_model)
-            self._draw(updated_model)
-            self._last_model = updated_model
-            self._schedule_flash_tick_if_needed()
-            self._force_native_repaint(window)
-        else:
-            self._last_model = updated_model
-        self._schedule_content_tick()
+            self._recover_broken_surface()
+        finally:
+            if self._window is not None and not self._window_is_alive(self._window):
+                self._discard_dead_window(self._window)
+        self._schedule_content_tick(delay_ms=_CONTENT_TICK_MS)
         return
 
     def _cancel_content_tick(self) -> None:
@@ -1467,20 +1504,27 @@ class CodexUsageTaskbarOverlay:
             return
         if not bool(model.get("visible", True)):
             return
-        if self._is_fullscreen_active(window, model.get("geometry")):
-            self.invalidate_geometry()
-            self.refresh()
-            return
-        if bool(self._fullscreen_suppressed):
-            self._fullscreen_suppressed = False
-            self.refresh()
-            return
-        if window is None:
-            return
-        native_visible = self._is_native_z_order_visible(window)
-        if not native_visible:
-            self._reassert_native_z_order(window)
-            self._force_native_repaint(window)
+        try:
+            if self._is_fullscreen_active(window, model.get("geometry")):
+                self.invalidate_geometry()
+                self.refresh()
+                return
+            if bool(self._fullscreen_suppressed):
+                self._fullscreen_suppressed = False
+                self.refresh()
+                return
+            window = self._window
+            if window is None:
+                return
+            native_visible = self._is_native_z_order_visible(window)
+            if not native_visible:
+                self._reassert_native_z_order(window)
+                self._force_native_repaint(window)
+        except Exception:
+            self._recover_broken_surface()
+        finally:
+            if self._window is not None and not self._window_is_alive(self._window):
+                self._discard_dead_window(self._window)
         self._schedule_keepalive_tick()
         return
 
@@ -1578,13 +1622,21 @@ class CodexUsageTaskbarOverlay:
                     self._last_model = updated_model
                     self._schedule_geometry_monitor_tick()
                     return
-                if geometry_changed:
-                    self._apply_geometry(window, geometry)
-                self._update_metric_change_flash(updated_model)
-                self._draw(updated_model)
-                self._last_model = updated_model
-                self._schedule_flash_tick_if_needed()
-                self._schedule_content_tick()
+                try:
+                    if geometry_changed:
+                        self._apply_geometry(window, geometry)
+                    self._update_metric_change_flash(updated_model)
+                    self._draw(updated_model)
+                    self._last_model = updated_model
+                    self._schedule_flash_tick_if_needed()
+                    self._schedule_content_tick()
+                except Exception:
+                    # Shell teardown can destroy the native surface mid-tick;
+                    # recover the surface and retry instead of dying silently.
+                    self._recover_broken_surface()
+                    self._last_model = updated_model
+                    self._schedule_geometry_monitor_tick(delay_ms=_GEOMETRY_MONITOR_TICK_MS)
+                    return
                 try:
                     window.deiconify()
                 except Exception:
@@ -2144,7 +2196,51 @@ class CodexUsageTaskbarOverlay:
         except Exception:
             return None
 
+    def _window_is_alive(self, window: Any) -> bool:
+        if window is None:
+            return False
+        exists = getattr(window, "winfo_exists", None)
+        if not callable(exists):
+            return True
+        try:
+            return bool(exists())
+        except Exception:
+            return False
+
+    def _discard_dead_window(self, window: Any | None = None) -> None:
+        target = self._window if window is None else window
+        if target is not None:
+            destroy = getattr(target, "destroy", None)
+            if callable(destroy):
+                try:
+                    destroy()
+                except Exception:
+                    pass
+        if self._window is target or window is None:
+            self._window = None
+            self._canvas = None
+            self._window_visible = False
+        return
+
+    def _recover_broken_surface(self) -> None:
+        """Drop a dead or unrenderable overlay surface so the next refresh rebuilds it.
+
+        Shell tray teardown (RDP connect/disconnect, monitor add/remove) can destroy
+        the native HWND behind Tk's back; without this recovery every subsequent
+        draw raised TclError and permanently killed the tick loops until restart.
+        """
+        window = self._window
+        if window is None:
+            return
+        if not self._window_is_alive(window):
+            self._discard_dead_window(window)
+            return
+        self._discard_dead_window(window)
+        return
+
     def _ensure_window(self):
+        if self._window is not None and not self._window_is_alive(self._window):
+            self._discard_dead_window(self._window)
         if self._window is not None:
             return self._window
         factory = self._window_factory
@@ -2444,17 +2540,18 @@ class CodexUsageTaskbarOverlay:
         return
 
     def _bind_native_owner_to_taskbar(self, hwnd: int) -> None:
+        """Bind the overlay to a process-local owner, never to a shell tray window.
+
+        `_active_taskbar_hwnd` stays the logical taskbar target for telemetry and
+        rebind resolution only. Owning the overlay with Shell_TrayWnd /
+        Shell_SecondaryTrayWnd let explorer's tray teardown (RDP connect/disconnect,
+        monitor add/remove) cascade-destroy the overlay behind Tk's back.
+        """
         if hwnd <= 0 or win32gui is None or not hasattr(ctypes, "windll"):
             return
-        taskbar_hwnd = int(self._active_taskbar_hwnd or 0)
-        if taskbar_hwnd <= 0:
-            try:
-                taskbar_hwnd = int(win32gui.FindWindow("Shell_TrayWnd", None) or 0)
-            except Exception:
-                taskbar_hwnd = 0
-        if taskbar_hwnd <= 0 or taskbar_hwnd == int(hwnd):
+        owner_hwnd = self._ensure_native_owner_window()
+        if owner_hwnd <= 0 or owner_hwnd == int(hwnd):
             return
-        self._active_taskbar_hwnd = int(taskbar_hwnd)
         try:
             setter = getattr(ctypes.windll.user32, "SetWindowLongPtrW", None)
             if setter is None:
@@ -2467,10 +2564,63 @@ class CodexUsageTaskbarOverlay:
                     setter.restype = wintypes.HWND
             except Exception:
                 pass
-            setter(int(hwnd), int(_GWLP_HWNDPARENT), int(taskbar_hwnd))
+            setter(int(hwnd), int(_GWLP_HWNDPARENT), int(owner_hwnd))
         except Exception:
             pass
         return
+
+    def _ensure_native_owner_window(self) -> int:
+        if int(self._native_owner_hwnd) > 0:
+            is_window = getattr(win32gui, "IsWindow", None)
+            if callable(is_window):
+                try:
+                    if bool(is_window(int(self._native_owner_hwnd))):
+                        return int(self._native_owner_hwnd)
+                except Exception:
+                    pass
+                else:
+                    self._native_owner_hwnd = 0
+            else:
+                return int(self._native_owner_hwnd)
+        if win32gui is None or win32con is None or win32api is None:
+            return 0
+        class_name = f"{_NATIVE_OWNER_CLASS_PREFIX}{os.getpid()}"
+        instance = 0
+        atom = 0
+        hwnd = 0
+        try:
+            instance = int(win32api.GetModuleHandle(None) or 0)
+            wc = win32gui.WNDCLASS()
+            wc.hInstance = instance
+            wc.lpszClassName = class_name
+            wc.lpfnWndProc = win32gui.DefWindowProc
+            try:
+                atom = int(win32gui.RegisterClass(wc) or 0)
+            except Exception:
+                already_registered = getattr(win32gui, "GetClassInfo", None)
+                if callable(already_registered):
+                    try:
+                        registered = already_registered(instance, class_name)
+                        atom = int(registered[0] or 0)
+                    except Exception:
+                        atom = 0
+                else:
+                    atom = 0
+            ex_style = int(getattr(win32con, "WS_EX_TOOLWINDOW", 0x00000080)) | int(
+                getattr(win32con, "WS_EX_NOACTIVATE", 0x08000000)
+            )
+            style = int(getattr(win32con, "WS_POPUP", 0x80000000))
+            creator = getattr(win32gui, "CreateWindowEx", None)
+            if not callable(creator):
+                return 0
+            if atom > 0:
+                hwnd = int(creator(ex_style, atom, "", style, 0, 0, 0, 0, 0, 0, instance, None) or 0)
+            else:
+                hwnd = int(creator(ex_style, class_name, "", style, 0, 0, 0, 0, 0, 0, instance, None) or 0)
+        except Exception:
+            return 0
+        self._native_owner_hwnd = int(hwnd)
+        return self._native_owner_hwnd
 
     def _is_fullscreen_active(
         self,
