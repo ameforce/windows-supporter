@@ -256,6 +256,8 @@ class CodexUsagePlaywrightDriver:
                     login_window_open=True,
                 )
             if probe is None or not self._probe_is_authenticated(probe):
+                probe = self._recover_post_login_landing(page)
+            if probe is None or not self._probe_is_authenticated(probe):
                 return self._fail(BrowserErrorCode.LOGIN_REQUIRED.value, state=BrowserState.HEADED_LOGIN, login_window_open=True)
             self._close_context()
             _ = self._ensure_context(headless=True)
@@ -337,6 +339,7 @@ class CodexUsagePlaywrightDriver:
             "--disable-extensions",
             "--disable-notifications",
             "--disable-blink-features=AutomationControlled",
+            "--test-type",
         ]
         ignore_default_args = ["--enable-automation"]
         user_agent = self._cached_user_agent if headless else None
@@ -407,6 +410,36 @@ class CodexUsagePlaywrightDriver:
         if any(token in main_text for token in ("log in", "sign in", "로그인")):
             return False
         return bool(probe.get("metricBlocks")) or any(token in main_text for token in ("usage", "limit", "사용", "한도"))
+
+    def _recover_post_login_landing(self, page: PageLike) -> UsageProbePayload | None:
+        try:
+            current_url = str(page.url)
+        except (OSError, RuntimeError, _playwright_error_type()):
+            return None
+        lowered = current_url.lower()
+        if any(token in lowered for token in ("/login", "/auth", "signin", "sign-in")):
+            return None
+        host = urlsplit(current_url).netloc.lower()
+        if host.endswith(("accounts.google.com", "auth.openai.com")):
+            return None
+        if _canonical_usage_url(current_url) == _canonical_usage_url(self._config.usage_url):
+            return None
+        try:
+            self._run_stage(
+                "navigation",
+                lambda: page.goto(
+                    self._config.usage_url,
+                    timeout=self._config.navigation_timeout_ms,
+                    wait_until="domcontentloaded",
+                ),
+            )
+            return self._run_stage(
+                "evaluate_probe",
+                lambda: self._evaluate_probe_until_ready(page),
+            )
+        except (OSError, RuntimeError, _playwright_error_type()):
+            self._log("post-login landing recovery navigation failed")
+            return None
 
     def _evaluate_probe_until_ready(self, page: PageLike) -> UsageProbePayload | None:
         last_probe: UsageProbePayload | None = None
