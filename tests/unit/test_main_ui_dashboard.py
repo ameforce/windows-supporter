@@ -313,8 +313,10 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             path = os.path.join(tmp, "main_ui_state.json")
             ui, _, _, _, _ = self._build_ui(path)
 
-            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (1000, 480))
-            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (940, 480))
+            # 6개 기능 섹션이 2열 카드로 배치되므로 기본 높이는 스크롤
+            # 없이 전체 요약이 보이는 크기를 따른다.
+            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (1080, 660))
+            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (940, 500))
 
     def test_show_restores_persisted_valid_tab(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -939,6 +941,43 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertEqual(view._dashboard_scroll_units(120), -1)
         self.assertEqual(view._dashboard_scroll_units(-120), 1)
         self.assertEqual(view._dashboard_scroll_units(0), 0)
+
+    def test_dashboard_cards_lay_out_in_two_columns_and_collapse_when_narrow(self):
+        class _Grid:
+            def __init__(self):
+                self.width = 0
+                self.columns = {}
+
+            def winfo_width(self):
+                return self.width
+
+            def columnconfigure(self, index, **kwargs):
+                self.columns[int(index)] = dict(kwargs)
+
+        class _Card:
+            def __init__(self):
+                self.grid_kwargs = {}
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        grid = _Grid()
+        cards = [_Card() for _ in range(6)]
+
+        view._layout_dashboard_cards(grid, cards, available_width=900)
+        self.assertEqual(
+            [(card.grid_kwargs["row"], card.grid_kwargs["column"]) for card in cards],
+            [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+        )
+
+        view._layout_dashboard_cards(grid, cards, available_width=640)
+        self.assertEqual(
+            [(card.grid_kwargs["row"], card.grid_kwargs["column"]) for card in cards],
+            [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)],
+        )
+        self.assertEqual(grid.columns[0].get("weight"), 1)
+        self.assertEqual(grid.columns[1].get("weight"), 0)
 
     def test_dashboard_scroll_binds_wheel_to_card_children(self):
         class _Widget:

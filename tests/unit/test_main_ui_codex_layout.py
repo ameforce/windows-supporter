@@ -113,10 +113,33 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
 
         width, height = ui._tab_sizes.get(ui._TAB_AI_USAGE)
         min_width, min_height = ui._tab_minsizes.get(ui._TAB_AI_USAGE)
-        self.assertGreaterEqual(width, 980)
-        self.assertLessEqual(height, 620)
+        # 프로필 2개(2열 카드) 콘텐츠 요구 높이가 ~740px이므로 기본 창은
+        # 스크롤 없이 주요 항목이 보이는 크기여야 한다.
+        self.assertGreaterEqual(width, 1100)
+        self.assertGreaterEqual(height, 740)
         self.assertGreaterEqual(min_width, 940)
-        self.assertLessEqual(min_height, 580)
+        self.assertLessEqual(min_height, 600)
+
+    def test_ui_scale_clamps_tk_scaling_ratio(self) -> None:
+        with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
+            with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
+                ui = WindowsSupporterMainUI(root=object(), startup_manager=object(), monitor=object())
+
+        self.assertEqual(ui._ui_scale(), 1.0)
+
+        class _TkBridge:
+            def call(self, *_args):
+                return 2.0
+
+        ui._root = type("Root", (), {"tk": _TkBridge()})()
+        self.assertAlmostEqual(ui._ui_scale(), 1.5)
+
+        class _HugeBridge:
+            def call(self, *_args):
+                return 99.0
+
+        ui._root = type("Root", (), {"tk": _HugeBridge()})()
+        self.assertEqual(ui._ui_scale(), 3.0)
 
     def test_ai_usage_geometry_is_capped_to_current_monitor_work_area(self) -> None:
         class _GeometryRoot(_FakeRoot):

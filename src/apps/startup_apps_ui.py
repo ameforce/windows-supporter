@@ -301,6 +301,18 @@ class StartupAppsWindow:
         tree = ttk.Treeview(
             tree_frame,
             columns=cols,
+            # 요약 목록은 스캔 가능한 핵심 열만 보여준다. PID/App ID/
+            # Shortcut/Exe 세부 열은 요구 폭을 1400px 이상으로 밀어서
+            # 일반 창 폭에서 핵심 열까지 압축시켰다. 전체 값은 편집
+            # 대화상자(모든 필드 노출)에서 확인한다.
+            displaycolumns=(
+                "enabled",
+                "app",
+                "running",
+                "type",
+                "hide",
+                "profile",
+            ),
             show="headings",
             selectmode="browse",
             style="WS.Treeview",

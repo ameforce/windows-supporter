@@ -111,32 +111,107 @@ class DashboardView:
         ).pack(side="left")
         ttk.Button(header_inner, text="새로고침", command=self.refresh).pack(side="right")
 
-        content_card = tk.Frame(
-            container,
-            bg=card_bg,
-            highlightthickness=1,
-            highlightbackground=border,
+        # 기능 섹션은 2열 카드 그리드로 배치한다. 세로 나열은 요약 화면을
+        # 스크롤 없이 한눈에 보려는 대시보드 목적과 맞지 않았다.
+        grid = tk.Frame(container, bg=bg)
+        grid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        section_cards: list[Any] = []
+        for column in (0, 1):
+            grid.columnconfigure(column, weight=1, uniform="dashboard_section")
+
+        self._add_startup_section(
+            grid, section_cards, text=text, bg=card_bg, border=border
         )
-        content_card.pack(fill="x", expand=False, padx=12, pady=(0, 12))
-
-        body = tk.Frame(content_card, bg=card_bg)
-        body.pack(fill="x", expand=False, padx=14, pady=10)
-
-        self._add_startup_section(body, text=text, bg=card_bg, border=border)
-        self._add_separator(body, border=border, bg=card_bg)
-        self._add_ai_usage_section(body, text=text, bg=card_bg, border=border)
-        self._add_separator(body, border=border, bg=card_bg)
-        self._add_kakao_section(body, text=text, bg=card_bg, border=border)
-        self._add_separator(body, border=border, bg=card_bg)
-        self._add_wrike_section(body, text=text, bg=card_bg, border=border)
-        self._add_separator(body, border=border, bg=card_bg)
-        self._add_background_section(body, text=text, bg=card_bg, border=border)
-        self._add_separator(body, border=border, bg=card_bg)
-        self._add_update_section(body, text=text, bg=card_bg, border=border)
+        self._add_ai_usage_section(
+            grid, section_cards, text=text, bg=card_bg, border=border
+        )
+        self._add_kakao_section(
+            grid, section_cards, text=text, bg=card_bg, border=border
+        )
+        self._add_wrike_section(
+            grid, section_cards, text=text, bg=card_bg, border=border
+        )
+        self._add_background_section(
+            grid, section_cards, text=text, bg=card_bg, border=border
+        )
+        self._add_update_section(
+            grid, section_cards, text=text, bg=card_bg, border=border
+        )
+        self._layout_dashboard_cards(grid, section_cards)
+        try:
+            grid.bind(
+                "<Configure>",
+                lambda event: self._layout_dashboard_cards(
+                    grid,
+                    section_cards,
+                    available_width=int(getattr(event, "width", 0) or 0),
+                ),
+                add="+",
+            )
+        except TypeError:
+            try:
+                grid.bind(
+                    "<Configure>",
+                    lambda event: self._layout_dashboard_cards(
+                        grid,
+                        section_cards,
+                        available_width=int(getattr(event, "width", 0) or 0),
+                    ),
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         self.refresh()
         self._bind_dashboard_scroll_targets()
         sync_scroll_region()
+        return
+
+    def _layout_dashboard_cards(
+        self,
+        grid: Any,
+        cards: list[Any],
+        *,
+        available_width: int | None = None,
+    ) -> None:
+        width = int(available_width or 0)
+        if width <= 1:
+            try:
+                width = int(grid.winfo_width())
+            except Exception:
+                width = 0
+        columns = 1 if width > 1 and width < 700 else 2
+        if getattr(grid, "_windows_supporter_dashboard_columns", None) == columns:
+            return
+        try:
+            grid._windows_supporter_dashboard_columns = columns
+        except Exception:
+            pass
+        for column in (0, 1):
+            try:
+                grid.columnconfigure(
+                    column,
+                    weight=1 if column < columns else 0,
+                    uniform="dashboard_section" if column < columns else "",
+                )
+            except Exception:
+                pass
+        for index, card in enumerate(cards):
+            try:
+                card.grid(
+                    row=index // columns,
+                    column=index % columns,
+                    sticky="nwe",
+                    padx=(0, 6)
+                    if columns > 1 and index % columns == 0
+                    else (6, 0)
+                    if columns > 1
+                    else 0,
+                    pady=(0, 8),
+                )
+            except Exception:
+                pass
         return
 
     @staticmethod
@@ -238,6 +313,7 @@ class DashboardView:
     def _add_startup_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         text: str,
         bg: str,
@@ -245,6 +321,7 @@ class DashboardView:
     ) -> None:
         self._add_section(
             parent,
+            section_cards,
             key="startup",
             title="Startup Apps",
             text=text,
@@ -258,6 +335,7 @@ class DashboardView:
     def _add_ai_usage_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         text: str,
         bg: str,
@@ -265,6 +343,7 @@ class DashboardView:
     ) -> None:
         self._add_section(
             parent,
+            section_cards,
             key="ai_usage",
             title="AI 사용량",
             text=text,
@@ -278,17 +357,19 @@ class DashboardView:
     def _add_codex_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         text: str,
         bg: str,
         border: str,
     ) -> None:
-        self._add_ai_usage_section(parent, text=text, bg=bg, border=border)
+        self._add_ai_usage_section(parent, section_cards, text=text, bg=bg, border=border)
         return
 
     def _add_kakao_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         text: str,
         bg: str,
@@ -296,6 +377,7 @@ class DashboardView:
     ) -> None:
         self._add_section(
             parent,
+            section_cards,
             key="kakao",
             title="KakaoTalk",
             text=text,
@@ -309,6 +391,7 @@ class DashboardView:
     def _add_wrike_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         text: str,
         bg: str,
@@ -316,6 +399,7 @@ class DashboardView:
     ) -> None:
         self._add_section(
             parent,
+            section_cards,
             key="wrike",
             title="Wrike",
             text=text,
@@ -329,6 +413,7 @@ class DashboardView:
     def _add_background_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         text: str,
         bg: str,
@@ -336,6 +421,7 @@ class DashboardView:
     ) -> None:
         self._add_section(
             parent,
+            section_cards,
             key="background",
             title="Background",
             text=text,
@@ -349,6 +435,7 @@ class DashboardView:
     def _add_update_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         text: str,
         bg: str,
@@ -356,46 +443,59 @@ class DashboardView:
     ) -> None:
         tk = self._tk
         ttk = self._ttk
-        frame = tk.Frame(parent, bg=bg)
-        frame.pack(fill="x")
+        card = tk.Frame(
+            parent,
+            bg=bg,
+            highlightthickness=1,
+            highlightbackground=border,
+        )
+        if section_cards is not None:
+            section_cards.append(card)
+        inner = tk.Frame(card, bg=bg)
+        inner.pack(fill="x", padx=12, pady=10)
+        title_row = tk.Frame(inner, bg=bg)
+        title_row.pack(fill="x")
         tk.Label(
-            frame,
+            title_row,
             text="Update",
             bg=bg,
             fg=text,
             font=("Segoe UI", 10, "bold"),
-        ).pack(anchor="w")
-        row = tk.Frame(frame, bg=bg)
-        row.pack(fill="x", pady=(3, 0))
+        ).pack(side="left")
+        row = tk.Frame(inner, bg=bg)
+        row.pack(fill="x", pady=(4, 0))
         try:
             row.columnconfigure(0, weight=1)
         except Exception:
             pass
         status_frame = tk.Frame(row, bg=bg)
-        status_frame.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        status_frame.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        buttons = tk.Frame(row, bg=bg)
+        buttons.grid(row=0, column=1, sticky="e")
         try:
             status_frame.configure(cursor="hand2")
             self._bind_click(status_frame, "update.settings")
         except Exception:
             pass
         ttk.Button(
-            row,
-            text="자동 업데이트",
-            width=14,
-            command=lambda: self._invoke("update.settings"),
-        ).grid(row=0, column=1, sticky="e", padx=(0, 6))
-        ttk.Button(
-            row,
+            buttons,
             text="업데이트 확인",
-            width=14,
+            width=12,
             command=lambda: self._invoke("update.check"),
-        ).grid(row=0, column=2, sticky="e")
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            buttons,
+            text="자동 업데이트",
+            width=12,
+            command=lambda: self._invoke("update.settings"),
+        ).pack(side="left")
         self._status_frames["update"] = status_frame
         return
 
     def _add_section(
         self,
         parent: Any,
+        section_cards: list[Any] | None = None,
         *,
         key: str,
         title: str,
@@ -407,42 +507,48 @@ class DashboardView:
     ) -> None:
         tk = self._tk
         ttk = self._ttk
-        frame = tk.Frame(parent, bg=bg, cursor="hand2" if settings_callback else "")
-        frame.pack(fill="x")
+        card = tk.Frame(
+            parent,
+            bg=bg,
+            highlightthickness=1,
+            highlightbackground=border,
+            cursor="hand2" if settings_callback else "",
+        )
+        if section_cards is not None:
+            section_cards.append(card)
+        inner = tk.Frame(card, bg=bg)
+        inner.pack(fill="x", padx=12, pady=10)
+        title_row = tk.Frame(inner, bg=bg)
+        title_row.pack(fill="x")
         title_label = tk.Label(
-            frame,
+            title_row,
             text=str(title),
             bg=bg,
             fg=text,
             font=("Segoe UI", 10, "bold"),
             cursor="hand2" if settings_callback else "",
         )
-        title_label.pack(anchor="w")
-        row = tk.Frame(frame, bg=bg)
-        row.pack(fill="x", pady=(3, 0))
+        title_label.pack(side="left")
+        btn = ttk.Button(
+            title_row,
+            text="활성화",
+            width=10,
+            command=lambda n=toggle_callback: self._invoke(n),
+        )
+        btn.pack(side="right")
+        row = tk.Frame(inner, bg=bg)
+        row.pack(fill="x", pady=(4, 0))
         try:
             row.columnconfigure(0, weight=1)
         except Exception:
             pass
         status_frame = tk.Frame(row, bg=bg, cursor="hand2" if settings_callback else "")
         status_frame.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        btn = ttk.Button(
-            row,
-            text="활성화",
-            width=10,
-            command=lambda n=toggle_callback: self._invoke(n),
-        )
-        btn.grid(row=0, column=1, sticky="e")
         self._status_frames[str(key)] = status_frame
         self._toggle_buttons[str(key)] = btn
         if settings_callback:
-            for widget in (frame, title_label, row, status_frame):
+            for widget in (card, title_label, row, status_frame):
                 self._bind_click(widget, settings_callback)
-        return
-
-    def _add_separator(self, parent: Any, *, border: str, bg: str) -> None:
-        tk = self._tk
-        tk.Frame(parent, bg=border, height=1).pack(fill="x", pady=7)
         return
 
     def _bind_click(self, widget: Any, callback_name: str) -> None:

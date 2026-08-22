@@ -72,23 +72,26 @@ class WindowsSupporterMainUI:
         self._power_view = None
         self._power_built = False
         self._current_tab = None
+        # 탭 기본 크기는 각 탭 콘텐츠의 요구 크기(스크롤 없이 주요 항목이
+        # 보이는 크기)를 기준으로 한다. _apply_tab_geometry가 모니터 작업
+        # 영역으로 상한을 걸고 _ui_scale이 Tk scaling 배율을 보정한다.
         self._tab_sizes = {
-            self._TAB_DASHBOARD: (1000, 480),
-            self._TAB_STARTUP: (1000, 560),
-            self._TAB_KAKAO: (700, 340),
-            self._TAB_WRIKE: (840, 580),
-            self._TAB_AI_USAGE: (1000, 560),
-            self._TAB_UPDATE: (760, 420),
-            self._TAB_POWER: (800, 420),
+            self._TAB_DASHBOARD: (1080, 660),
+            self._TAB_STARTUP: (1160, 660),
+            self._TAB_KAKAO: (800, 460),
+            self._TAB_WRIKE: (920, 640),
+            self._TAB_AI_USAGE: (1180, 780),
+            self._TAB_UPDATE: (880, 520),
+            self._TAB_POWER: (880, 540),
         }
         self._tab_minsizes = {
-            self._TAB_DASHBOARD: (940, 480),
-            self._TAB_STARTUP: (940, 520),
-            self._TAB_KAKAO: (620, 300),
-            self._TAB_WRIKE: (800, 520),
-            self._TAB_AI_USAGE: (960, 540),
-            self._TAB_UPDATE: (720, 380),
-            self._TAB_POWER: (720, 380),
+            self._TAB_DASHBOARD: (940, 500),
+            self._TAB_STARTUP: (960, 540),
+            self._TAB_KAKAO: (700, 360),
+            self._TAB_WRIKE: (800, 540),
+            self._TAB_AI_USAGE: (960, 560),
+            self._TAB_UPDATE: (760, 420),
+            self._TAB_POWER: (760, 440),
         }
 
         self._lazy_import_tk()
@@ -205,12 +208,19 @@ class WindowsSupporterMainUI:
         except Exception:
             pass
         try:
-            w, h = self._tab_sizes.get(self._TAB_DASHBOARD, (1000, 480))
+            w, h = self._scaled_size(
+                self._tab_sizes.get(self._TAB_DASHBOARD, (1080, 660))
+            )
+            work_width, work_height = self._work_area_size()
+            w = min(int(w), max(320, int(work_width) - 32))
+            h = min(int(h), max(280, int(work_height) - 48))
             root.geometry(f"{int(w)}x{int(h)}")
         except Exception:
             pass
         try:
-            mw, mh = self._tab_minsizes.get(self._TAB_DASHBOARD, (940, 480))
+            mw, mh = self._scaled_size(
+                self._tab_minsizes.get(self._TAB_DASHBOARD, (940, 500))
+            )
             root.minsize(int(mw), int(mh))
         except Exception:
             pass
@@ -399,6 +409,31 @@ class WindowsSupporterMainUI:
         self._tab_sizes[tab_key] = (w, h)
         return
 
+    def _ui_scale(self) -> float:
+        """Tk scaling(포인트→픽셀) 비율을 96dpi 기준 상대 배율로 바꾼다.
+
+        고배율 디스플레이에서 고정 픽셀 창이 실제보다 작게 보이는 문제를
+        막기 위해 기본/최소 창 크기에 이 배율을 곱한다. Tk를 읽을 수 없는
+        테스트 더블에서는 1.0으로 둔다.
+        """
+        root = self._root
+        try:
+            scaling = float(root.tk.call("tk", "scaling"))
+        except Exception:
+            return 1.0
+        base = 96.0 / 72.0
+        if scaling <= 0 or base <= 0:
+            return 1.0
+        return max(1.0, min(3.0, scaling / base))
+
+    def _scaled_size(self, size: tuple[int, int] | list[int]) -> tuple[int, int]:
+        scale = self._ui_scale()
+        try:
+            width, height = int(size[0]), int(size[1])
+        except Exception:
+            return (1, 1)
+        return (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+
     def _apply_tab_geometry(self, tab_key: str) -> None:
         root = self._root
         try:
@@ -407,13 +442,14 @@ class WindowsSupporterMainUI:
             size = None
         if not size:
             return
-        w, h = size
+        w, h = self._scaled_size(size)
         if int(w) <= 0 or int(h) <= 0:
             return
         try:
             min_size = self._tab_minsizes.get(tab_key) or (1, 1)
         except Exception:
             min_size = (1, 1)
+        min_width, min_height = self._scaled_size(min_size)
         work_width, work_height = self._work_area_size()
         max_width = max(320, int(work_width) - 32)
         max_height = max(280, int(work_height) - 48)
