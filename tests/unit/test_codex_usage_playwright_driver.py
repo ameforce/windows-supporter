@@ -267,9 +267,18 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
 
         self.assertEqual(len(chromium.calls), 1)
         call = chromium.calls[0]
-        self.assertIn("--disable-blink-features=AutomationControlled", call["args"])
         self.assertIn("--enable-automation", call["ignore_default_args"])
         self.assertNotIn("--enable-automation", call["args"])
+        self.assertIn(
+            "--disable-blink-features=AutomationControlled",
+            call["args"],
+            "navigator.webdriver must stay false for google oauth sign-in",
+        )
+        self.assertIn(
+            "--test-type",
+            call["args"],
+            "chrome bad-flags prompt must be suppressed while the flag is in use",
+        )
 
     def test_headed_login_launch_hides_automation_signals_and_uses_natural_user_agent(self) -> None:
         login_page = FakePage(
@@ -284,9 +293,10 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         call = chromium.calls[-1]
         self.assertFalse(call["headless"])
         self.assertIsNone(call["user_agent"])
-        self.assertIn("--disable-blink-features=AutomationControlled", call["args"])
         self.assertIn("--enable-automation", call["ignore_default_args"])
         self.assertNotIn("--enable-automation", call["args"])
+        self.assertIn("--disable-blink-features=AutomationControlled", call["args"])
+        self.assertIn("--test-type", call["args"])
 
     def test_headed_login_does_not_inherit_cached_headless_user_agent(self) -> None:
         first = FakeContext([FakePage(user_agent="HeadlessChrome/140")])
@@ -306,11 +316,64 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         self.assertEqual(chromium.calls[1]["user_agent"], "Chrome/140")
         self.assertIsNone(chromium.calls[2]["user_agent"])
         for headless_call in chromium.calls[:2]:
-            self.assertIn(
-                "--disable-blink-features=AutomationControlled",
-                headless_call["args"],
-            )
             self.assertIn("--enable-automation", headless_call["ignore_default_args"])
+
+    def test_poll_login_recovers_when_oauth_lands_on_authenticated_home(self) -> None:
+        home_probe: UsageProbePayload = {
+            "url": "https://chatgpt.com/",
+            "title": "ChatGPT",
+            "mainText": "지금 무슨 생각을 하시나요?",
+            "metricBlocks": [],
+        }
+        probes = (
+            [{"url": USAGE_URL, "mainText": "Log in", "metricBlocks": []}]
+            + [dict(home_probe)] * 21
+            + [PROBE]
+        )
+        login_page = FakePage(url=USAGE_URL, probes=probes)
+        headed = FakeContext([login_page])
+        headless = FakeContext([FakePage()])
+        driver, chromium, _controller = make_driver([headed, headless])
+        _ = driver.open_login()
+        login_page.url = "https://chatgpt.com/"
+
+        result = driver.poll_login()
+
+        self.assertEqual(result.error, None)
+        self.assertEqual(result.probe, PROBE)
+        self.assertEqual(
+            login_page.calls,
+            [("goto", USAGE_URL), ("goto", USAGE_URL)],
+            "poll must steer an authenticated non-usage landing page back to the usage url",
+        )
+        self.assertTrue(headed.closed)
+        self.assertEqual(len(chromium.calls), 2)
+        self.assertFalse(chromium.calls[0]["headless"])
+        self.assertTrue(chromium.calls[1]["headless"])
+        self.assertEqual(driver.get_runtime_status().state, BrowserState.HEADLESS_READY)
+
+    def test_poll_login_does_not_steer_while_user_is_mid_login(self) -> None:
+        login_probe: UsageProbePayload = {
+            "url": USAGE_URL,
+            "title": "로그인 - Google 계정",
+            "mainText": "Log in",
+            "metricBlocks": [],
+        }
+        login_page = FakePage(url=USAGE_URL, probe=login_probe)
+        headed = FakeContext([login_page])
+        driver, chromium, _controller = make_driver([headed])
+        _ = driver.open_login()
+        login_page.url = "https://accounts.google.com/v3/signin/challenge/pwd"
+
+        result = driver.poll_login()
+
+        self.assertEqual(result.error, BrowserErrorCode.LOGIN_REQUIRED.value)
+        self.assertEqual(login_page.calls, [("goto", USAGE_URL)])
+        self.assertFalse(headed.closed)
+        status = driver.get_runtime_status()
+        self.assertEqual(status.state, BrowserState.HEADED_LOGIN)
+        self.assertTrue(status.login_window_open)
+        self.assertEqual(len(chromium.calls), 1)
 
     def test_collect_retries_page_then_context_once(self) -> None:
         first_page = FakePage(url="https://example.com", failures=1)
