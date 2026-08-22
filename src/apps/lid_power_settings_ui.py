@@ -39,9 +39,9 @@ class LidPowerSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
-        card.pack(fill="x", padx=12, pady=12)
+        card.pack(fill="both", expand=True, padx=12, pady=12)
         body = tk.Frame(card, bg=card_bg)
-        body.pack(fill="x", padx=14, pady=12)
+        body.pack(fill="x", padx=14, pady=12, anchor="n")
 
         tk.Label(
             body,

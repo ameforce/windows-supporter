@@ -276,50 +276,36 @@ class CodexUsageSettingsView:
 
         row = 0
 
-        tk.Label(
-            body,
-            text="모니터링",
-            bg=card_bg,
-            fg="#111827",
-            font=("Segoe UI", 9, "bold"),
-        ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
-        tk.Checkbutton(
-            body,
-            variable=self._enabled_var,
-            bg=card_bg,
-            activebackground=card_bg,
-            selectcolor=card_bg,
-            fg="#111827",
-            activeforeground="#111827",
-            font=("Segoe UI", 9),
-        ).grid(row=row, column=1, sticky="w", pady=2)
-        tk.Label(
-            body,
-            text="작업표시줄 표시",
-            bg=card_bg,
-            fg="#111827",
-            font=("Segoe UI", 9, "bold"),
-        ).grid(row=row, column=2, sticky="e", padx=(18, 8), pady=2)
-        tk.Checkbutton(
-            body,
-            variable=self._taskbar_overlay_var,
-            bg=card_bg,
-            activebackground=card_bg,
-            selectcolor=card_bg,
-            fg="#111827",
-            activeforeground="#111827",
-            font=("Segoe UI", 9),
-        ).grid(row=row, column=3, sticky="w", pady=2)
+        # 기본 설정: 체크박스가 라벨 텍스트를 직접 담아 컨트롤-라벨 연결이
+        # 한눈에 보이게 한다. 라벨만 따로 떨어뜨리는 이전 배치는 어떤
+        # 체크박스가 어떤 라벨인지 추적하게 만들었다.
+        for column, (checkbox_text, target_var) in enumerate(
+            (
+                ("모니터링 사용", self._enabled_var),
+                ("작업표시줄 오버레이", self._taskbar_overlay_var),
+            )
+        ):
+            tk.Checkbutton(
+                body,
+                text=checkbox_text,
+                variable=target_var,
+                bg=card_bg,
+                activebackground=card_bg,
+                selectcolor=card_bg,
+                fg="#111827",
+                activeforeground="#111827",
+                font=("Segoe UI", 9),
+            ).grid(row=row, column=column * 2, columnspan=2, sticky="w", pady=3)
         row += 1
 
         tk.Label(
             body,
-            text="주기(초)",
+            text="조회 주기(초)",
             bg=card_bg,
-            fg="#111827",
+            fg="#374151",
             font=("Segoe UI", 9),
         ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
-        ttk.Entry(body, textvariable=self._interval_var, width=12).grid(
+        ttk.Entry(body, textvariable=self._interval_var, width=10).grid(
             row=row,
             column=1,
             sticky="w",
@@ -474,7 +460,7 @@ class CodexUsageSettingsView:
             except Exception:
                 pass
             header = tk.Frame(card, bg=card_bg)
-            header.grid(row=0, column=0, sticky="we", padx=8, pady=(4, 1))
+            header.grid(row=0, column=0, sticky="we", padx=8, pady=(6, 1))
             try:
                 header.columnconfigure(0, weight=1)
             except Exception:
@@ -485,27 +471,30 @@ class CodexUsageSettingsView:
                 textvariable=label_var,
                 bg=card_bg,
                 fg="#111827",
-                font=("Segoe UI", 9, "bold"),
+                font=("Segoe UI", 10, "bold"),
                 anchor="w",
                 justify="left",
-                wraplength=360,
+                wraplength=self._scaled_wrap_length(340),
             )
-            profile_label.grid(row=0, column=0, sticky="we", pady=(0, 2))
+            profile_label.grid(row=0, column=0, sticky="w")
 
-            controls = tk.Frame(header, bg=card_bg)
-            controls.grid(row=1, column=0, sticky="w", pady=(0, 2))
+            # provider 선택은 프로필 제목과 같은 행 오른쪽에 둬서 카드의
+            # 소유권을 먼저 읽고 조작 순서를 나중에 읽게 한다.
             provider_box_factory = getattr(ttk, "Combobox", None)
             if callable(provider_box_factory):
                 provider_box = provider_box_factory(
-                    controls,
+                    header,
                     textvariable=provider_var,
                     values=("codex", "cursor"),
                     state="readonly",
                     width=8,
                 )
             else:
-                provider_box = ttk.Entry(controls, textvariable=provider_var, width=8)
-            provider_box.pack(side="left", padx=(5, 2))
+                provider_box = ttk.Entry(header, textvariable=provider_var, width=8)
+            provider_box.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+            controls = tk.Frame(header, bg=card_bg)
+            controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 2))
             tk.Checkbutton(
                 controls,
                 text="수집",
@@ -516,10 +505,10 @@ class CodexUsageSettingsView:
                 fg="#111827",
                 activeforeground="#111827",
                 font=("Segoe UI", 9),
-            ).pack(side="left", padx=(5, 3))
+            ).pack(side="left", padx=(0, 10))
             tk.Checkbutton(
                 controls,
-                text="표시",
+                text="작업표시줄 표시",
                 variable=selected_var,
                 bg=card_bg,
                 activebackground=card_bg,
@@ -528,56 +517,56 @@ class CodexUsageSettingsView:
                 activeforeground="#111827",
                 font=("Segoe UI", 9),
                 command=lambda aid=account_id: self._on_taskbar_selection_changed(aid),
-            ).pack(side="left", padx=(2, 3))
+            ).pack(side="left", padx=(0, 3))
 
-            actions = tk.Frame(header, bg=card_bg)
-            actions.grid(row=2, column=0, sticky="w", pady=(0, 2))
+            actions = tk.Frame(card, bg=card_bg)
+            actions.grid(row=1, column=0, sticky="we", padx=8, pady=(0, 2))
             if len(ordered_accounts) > 1:
                 if index > 0:
                     ttk.Button(
                         actions,
-                        text="위로",
-                        width=6,
+                        text="▲",
+                        width=3,
                         command=lambda aid=account_id: self._on_move_account(aid, -1),
-                    ).pack(side="left", padx=(4, 0))
+                    ).pack(side="left", padx=(0, 3))
                 if index < len(ordered_accounts) - 1:
                     ttk.Button(
                         actions,
-                        text="아래로",
-                        width=6,
+                        text="▼",
+                        width=3,
                         command=lambda aid=account_id: self._on_move_account(aid, 1),
-                    ).pack(side="left", padx=(4, 0))
+                    ).pack(side="left", padx=(0, 3))
             query_button = ttk.Button(
                 actions,
                 text="새로고침",
                 width=8,
                 command=lambda aid=account_id: self._on_account_query(aid),
             )
-            query_button.pack(side="left", padx=(4, 0))
+            query_button.pack(side="left", padx=(0, 3))
             login_button = ttk.Button(
                 actions,
                 text="연결",
                 width=6,
                 command=lambda aid=account_id: self._on_account_login(aid),
             )
-            login_button.pack(side="left", padx=(4, 0))
+            login_button.pack(side="left", padx=(0, 3))
             logout_button = ttk.Button(
                 actions,
                 text="연결 해제",
                 width=8,
                 command=lambda aid=account_id: self._on_account_release_profile(aid),
             )
-            logout_button.pack(side="left")
+            logout_button.pack(side="left", padx=(0, 3))
             ttk.Button(
                 actions,
                 text="삭제",
                 width=6,
                 command=lambda aid=account_id, name=label: self._on_delete_profile(aid, name),
-            ).pack(side="left", padx=(4, 0))
+            ).pack(side="left")
             self._account_query_buttons[account_id] = query_button
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
-            detail_row = 1
+            detail_row = 2
             status_var = tk.StringVar(value="조회 상태: -")
             snapshot_var = tk.StringVar(value="값 상태: -")
             self._account_status_vars[account_id] = status_var
@@ -587,11 +576,11 @@ class CodexUsageSettingsView:
                     card,
                     textvariable=value_var,
                     bg=card_bg,
-                    fg="#1F2937",
+                    fg="#6B7280",
                     font=("Segoe UI", 8),
                     anchor="w",
                     justify="left",
-                    wraplength=330,
+                    wraplength=self._scaled_wrap_length(330),
                 ).grid(
                     row=detail_row,
                     column=0,
@@ -609,8 +598,12 @@ class CodexUsageSettingsView:
                 pady=(1, 3),
             )
             try:
-                metric_grid.columnconfigure(0, weight=1)
+                # 라벨-값-라벨-값 4열: 값들이 같은 열에 정렬되어야 한눈에
+                # 스캔된다. 라벨 열은 내용에 맞고 값 열이 남은 폭을 가진다.
+                metric_grid.columnconfigure(0, weight=0)
                 metric_grid.columnconfigure(1, weight=1)
+                metric_grid.columnconfigure(2, weight=0)
+                metric_grid.columnconfigure(3, weight=1)
             except Exception:
                 pass
             metric_vars, display_vars = self._build_account_metric_rows(
@@ -707,8 +700,8 @@ class CodexUsageSettingsView:
 
         runtime_grid = tk.Frame(body, bg=card_bg)
         runtime_grid.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 0))
-        runtime_grid.columnconfigure(1, minsize=210)
-        runtime_grid.columnconfigure(3, minsize=250)
+        runtime_grid.columnconfigure(1, weight=1)
+        runtime_grid.columnconfigure(3, weight=1)
 
         runtime_row = 0
         self._add_value_row(runtime_grid, runtime_row, "조회 상태", self._collect_state_var, card_bg)
@@ -841,6 +834,26 @@ class CodexUsageSettingsView:
                 pass
         return
 
+    def _wrap_scale(self) -> float:
+        """Tk scaling을 96dpi 기준 상대 배율로 바꾼다. wraplength 등 고정
+        픽셀값이 고배율 디스플레이에서 너무 일찍 줄바꿈하지 않게 한다."""
+        widget = self._scroll_body or self._win or self._parent
+        try:
+            scaling = float(widget.tk.call("tk", "scaling"))
+        except Exception:
+            return 1.0
+        base = 96.0 / 72.0
+        if scaling <= 0 or base <= 0:
+            return 1.0
+        return max(1.0, min(3.0, scaling / base))
+
+    def _scaled_wrap_length(self, base_length: int) -> int:
+        try:
+            scale = self._wrap_scale()
+        except Exception:
+            scale = 1.0
+        return max(1, int(round(int(base_length) * scale)))
+
     def _build_account_metric_rows(
         self,
         parent: Any,
@@ -874,45 +887,42 @@ class CodexUsageSettingsView:
         metric_vars: dict[str, Any] = {}
         display_vars: dict[str, Any] = {}
         for row_index, row in enumerate(rows):
-            for column, (key, label) in enumerate(row):
+            for pair_index, (key, label) in enumerate(row):
                 value_var = tk.StringVar(value="-")
-                display_var = tk.StringVar(value=f"{label}: -")
+                display_var = tk.StringVar(value="-")
                 metric_vars[key] = value_var
                 display_vars[key] = display_var
                 self._bind_metric_display_value(
-                    label,
                     value_var,
                     display_var,
                 )
-                cell = self._add_metric_cell(
+                cells = self._add_metric_cell(
                     parent,
                     row_index,
-                    column,
+                    pair_index,
+                    label,
                     display_var,
                     bg,
-                    wraplength=300 if key == "on_demand_status" else 180,
+                    wraplength=self._scaled_wrap_length(
+                        320 if key == "on_demand_status" else 200
+                    ),
                 )
-                if account_id and cell is not None:
-                    self._account_metric_cells.setdefault(account_id, {})[key] = cell
+                if account_id and cells is not None:
+                    self._account_metric_cells.setdefault(account_id, {})[key] = cells
         return metric_vars, display_vars
 
     def _bind_metric_display_value(
         self,
-        label: str,
         value_var: Any,
         display_var: Any,
-        *,
-        keep_together: bool = False,
     ) -> None:
         def sync(*_args: Any) -> None:
             try:
                 raw = str(value_var.get() or "").strip()
             except Exception:
                 raw = ""
-            value = raw if raw else "-"
-            separator = "\u00a0" if keep_together and value != "-" else " "
             try:
-                display_var.set(f"{label}:{separator}{value}")
+                display_var.set(raw if raw else "-")
             except Exception:
                 pass
 
@@ -927,28 +937,52 @@ class CodexUsageSettingsView:
         self,
         parent: Any,
         row: int,
-        column: int,
+        pair_index: int,
+        label: str,
         display_var: Any,
         bg: str,
         *,
-        wraplength: int = 180,
-    ) -> Any:
+        wraplength: int = 200,
+    ) -> tuple[Any, Any] | None:
         tk = self._tk
         if tk is None:
             return None
-        padx = (0, 8) if int(column) == 0 else (8, 0)
-        cell = tk.Label(
+        column = int(pair_index)
+        label_pad = (0, 6) if column == 0 else (18, 6)
+        label_cell = tk.Label(
+            parent,
+            text=str(label),
+            bg=bg,
+            fg="#6B7280",
+            font=("Segoe UI", 9),
+            anchor="e",
+            justify="right",
+        )
+        label_cell.grid(
+            row=row,
+            column=column * 2,
+            sticky="e",
+            padx=label_pad,
+            pady=1,
+        )
+        value_cell = tk.Label(
             parent,
             textvariable=display_var,
             bg=bg,
-            fg="#1F2937",
-            font=("Segoe UI", 8),
+            fg="#111827",
+            font=("Segoe UI", 9),
             anchor="w",
             justify="left",
             wraplength=max(1, int(wraplength)),
         )
-        cell.grid(row=row, column=column, sticky="we", padx=padx, pady=1)
-        return cell
+        value_cell.grid(
+            row=row,
+            column=column * 2 + 1,
+            sticky="w",
+            padx=(6, 0) if column else (6, 12),
+            pady=1,
+        )
+        return (label_cell, value_cell)
 
     def _add_value_row(
         self,
@@ -968,18 +1002,18 @@ class CodexUsageSettingsView:
             parent,
             text=label,
             bg=bg,
-            fg="#111827",
+            fg="#6B7280",
             font=("Segoe UI", 9),
         ).grid(row=row, column=column, sticky="w", padx=label_pad, pady=1)
         tk.Label(
             parent,
             textvariable=value_var,
             bg=bg,
-            fg="#1F2937",
+            fg="#111827",
             font=("Segoe UI", 9),
             anchor="w",
             justify="left",
-            wraplength=250 if column else 220,
+            wraplength=self._scaled_wrap_length(250 if column else 220),
         ).grid(row=row, column=column + 1, sticky="w", padx=value_pad, pady=1)
         return
 
@@ -2637,6 +2671,14 @@ class CodexUsageSettingsView:
                     pass
         return
 
+    @staticmethod
+    def _metric_cell_widgets(cell: Any) -> tuple[Any, ...]:
+        if isinstance(cell, (list, tuple)):
+            return tuple(item for item in cell if item is not None)
+        if cell is None:
+            return ()
+        return (cell,)
+
     def _update_account_metric_visibility(
         self,
         account_id: str,
@@ -2667,13 +2709,14 @@ class CodexUsageSettingsView:
             cell = cells.get(key)
             if cell is None:
                 continue
-            try:
-                if visible:
-                    cell.grid()
-                else:
-                    cell.grid_remove()
-            except Exception:
-                pass
+            for widget in self._metric_cell_widgets(cell):
+                try:
+                    if visible:
+                        widget.grid()
+                    else:
+                        widget.grid_remove()
+                except Exception:
+                    pass
         return
 
     def _start_runtime_refresh(self) -> None:
