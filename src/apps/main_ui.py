@@ -18,6 +18,11 @@ class WindowsSupporterMainUI:
     _TAB_UPDATE = "update"
     _TAB_POWER = "power"
     _KAKAO_RETRY_DELAY_MS = 500
+    # 96dpi 기준 기본 UI 배율. 고해상도 디스플레이를 100% 배율로 쓰는
+    # 환경(예: 2560x1440)에서 Tk 기본 scaling(1.333)은 본문을 10~12px로
+    # 렌더링해 사실상 읽을 수 없다. 폰트·위젯을 이 배율만큼 키우고
+    # 창 크기는 _ui_scale이 같은 비율로 따라간다.
+    _UI_BASE_SCALE = 1.25
 
     def __init__(
         self,
@@ -196,6 +201,30 @@ class WindowsSupporterMainUI:
         self._ttk = ttk
         return
 
+    def _apply_base_ui_scaling(self) -> None:
+        """Tk 기본 scaling에 최소 UI 배율을 보장한다.
+
+        폰트는 위젯 생성 시점의 scaling으로 픽셀 크기가 정해지므로 어떤
+        위젯도 만들기 전에 호출해야 한다. 시스템이 이미 더 높은 scaling을
+        보고하면(고배율 디스플레이) 그 값을 유지한다.
+        """
+        root = self._root
+        try:
+            current = float(root.tk.call("tk", "scaling"))
+        except Exception:
+            return
+        base = 96.0 / 72.0
+        if base <= 0:
+            return
+        target = max(current, base * self._UI_BASE_SCALE)
+        if target <= current + 1e-9:
+            return
+        try:
+            root.tk.call("tk", "scaling", target)
+        except Exception:
+            pass
+        return
+
     def _build_shell(self) -> None:
         tk = self._tk
         ttk = self._ttk
@@ -203,6 +232,7 @@ class WindowsSupporterMainUI:
             return
 
         root = self._root
+        self._apply_base_ui_scaling()
         try:
             root.title("Windows Supporter")
         except Exception:

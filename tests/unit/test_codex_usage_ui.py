@@ -661,6 +661,48 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(view._profile_card_column_count(widget), 1)
         self.assertEqual(view._profile_card_column_count(object()), 2)
 
+    def test_single_profile_card_spans_full_width(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        class _TkBridge:
+            def call(self, *_args):
+                return 4.0 / 3.0
+
+        widget = type("Widget", (), {"tk": _TkBridge()})()
+
+        # 카드가 하나뿐이면 2열 그리드 좌측 절반만 차지하는 레이아웃이
+        # 되지 않도록 넉넉한 폭에서도 1열을 유지한다.
+        self.assertEqual(
+            view._profile_card_column_count(
+                widget,
+                available_width=900,
+                card_count=1,
+            ),
+            1,
+        )
+        self.assertEqual(
+            view._profile_card_column_count(
+                widget,
+                available_width=900,
+                card_count=2,
+            ),
+            2,
+        )
+
+    def test_reflow_profile_cards_uses_card_count(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        cards = _FakeWidget()
+        cards.tk = type("TkBridge", (), {"call": lambda _self, *_args: 4.0 / 3.0})()
+        single_card = [_FakeWidget()]
+
+        view._reflow_profile_cards(cards, single_card, available_width=820)
+        self.assertEqual(single_card[0].grid_kwargs["column"], 0)
+        self.assertEqual(cards.grid_kwargs.get("column") if hasattr(cards, "grid_kwargs") else None, None)
+        try:
+            self.assertEqual(cards._windows_supporter_profile_columns, 1)
+        except AttributeError:
+            self.fail("reflow should record the applied column count")
+
     def test_profile_cards_collapse_to_one_column_when_viewport_is_narrow(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
 

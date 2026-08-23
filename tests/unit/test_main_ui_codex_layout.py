@@ -141,6 +141,45 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._root = type("Root", (), {"tk": _HugeBridge()})()
         self.assertEqual(ui._ui_scale(), 3.0)
 
+    def test_base_ui_scaling_raises_default_font_scale_before_widgets(self) -> None:
+        with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
+            with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
+                ui = WindowsSupporterMainUI(root=object(), startup_manager=object(), monitor=object())
+
+        calls: list[tuple[str, float]] = []
+
+        class _TkBridge:
+            def call(self, *args):
+                if len(args) >= 3:
+                    calls.append((str(args[0]) + ":" + str(args[1]), float(args[2])))
+                    return None
+                return 96.0 / 72.0
+
+        ui._root = type("Root", (), {"tk": _TkBridge()})()
+        ui._apply_base_ui_scaling()
+
+        base = 96.0 / 72.0
+        expected = base * ui._UI_BASE_SCALE
+        self.assertEqual(calls, [("tk:scaling", expected)])
+
+        # 시스템 scaling이 이미 더 높으면 그 값을 유지한다.
+        calls.clear()
+
+        class _HighDpiBridge:
+            def call(self, *args):
+                if len(args) >= 3:
+                    calls.append(("set", float(args[2])))
+                    return None
+                return 2.0
+
+        ui._root = type("Root", (), {"tk": _HighDpiBridge()})()
+        ui._apply_base_ui_scaling()
+        self.assertEqual(calls, [])
+
+        # tk에 접근할 수 없는 테스트 더블은 조용히 무시한다.
+        ui._root = object()
+        ui._apply_base_ui_scaling()
+
     def test_ai_usage_geometry_is_capped_to_current_monitor_work_area(self) -> None:
         class _GeometryRoot(_FakeRoot):
             def __init__(self):
