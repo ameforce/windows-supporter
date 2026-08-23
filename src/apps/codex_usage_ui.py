@@ -405,18 +405,21 @@ class CodexUsageSettingsView:
         row += 1
         cards = tk.Frame(body, bg=card_bg)
         cards.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 2))
-        card_columns = self._profile_card_column_count(body)
+        ordered_accounts = [
+            raw
+            for raw in accounts
+            if isinstance(raw, dict) and str(raw.get("id", "") or "").strip()
+        ]
+        card_columns = self._profile_card_column_count(
+            body,
+            card_count=len(ordered_accounts),
+        )
         card_widgets: list[Any] = []
         try:
             for column in range(card_columns):
                 cards.columnconfigure(column, weight=1)
         except Exception:
             pass
-        ordered_accounts = [
-            raw
-            for raw in accounts
-            if isinstance(raw, dict) and str(raw.get("id", "") or "").strip()
-        ]
         self._account_order = [
             str(raw.get("id", "") or "").strip()
             for raw in ordered_accounts
@@ -782,6 +785,7 @@ class CodexUsageSettingsView:
         widget: Any,
         *,
         available_width: int | None = None,
+        card_count: int | None = None,
     ) -> int:
         try:
             scaling = float(widget.tk.call("tk", "scaling"))
@@ -793,7 +797,13 @@ class CodexUsageSettingsView:
                 width = int(widget.winfo_width())
             except Exception:
                 width = 0
-        return 1 if scaling >= 1.65 or (width > 1 and width < 760) else 2
+        columns = 1 if scaling >= 1.65 or (width > 1 and width < 760) else 2
+        # 카드가 하나뿐이면 2열 그리드의 좌측 절반만 차지해 우측이 텅
+        # 빈 레이아웃이 된다. 단일 프로필(가장 흔한 기본 상태)은 전체
+        # 폭을 쓴다.
+        if card_count is not None and int(card_count) <= 1:
+            columns = 1
+        return columns
 
     def _reflow_profile_cards(
         self,
@@ -805,6 +815,7 @@ class CodexUsageSettingsView:
         columns = self._profile_card_column_count(
             cards,
             available_width=available_width,
+            card_count=len(card_widgets),
         )
         if getattr(cards, "_windows_supporter_profile_columns", None) == columns:
             return
