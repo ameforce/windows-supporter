@@ -23,6 +23,14 @@ class WrikeSettingsView:
         self._status_label = None
         self._show_token_var = None
         self._token_entry = None
+        self._break_button_var = None
+        self._lunch_enabled_var = None
+        self._lunch_start_var = None
+        self._lunch_end_var = None
+        self._ical_url_var = None
+        self._ical_keywords_var = None
+        self._ical_interval_var = None
+        self._ical_dirty = False
         self._folder_path_frame = None
         self._folder_levels: list[dict] = []
         self._folder_path_label = None
@@ -91,6 +99,13 @@ class WrikeSettingsView:
 
         btn_row = tk.Frame(title_row, bg=card_bg)
         btn_row.pack(side="right")
+        self._break_button_var = tk.StringVar(value="휴게 시작")
+        self._ical_dirty = False
+        ttk.Button(
+            btn_row,
+            textvariable=self._break_button_var,
+            command=self._on_toggle_break,
+        ).pack(side="right", padx=(0, 8))
         ttk.Button(btn_row, text="토큰 지우기", command=self._on_clear_token).pack(
             side="right", padx=(0, 8)
         )
@@ -201,6 +216,66 @@ class WrikeSettingsView:
 
         add_label("모니터링 주기(초)")
         add_entry(self._monitor_interval_var)
+        row += 1
+
+        self._lunch_enabled_var = tk.BooleanVar(value=True)
+        self._lunch_start_var = tk.StringVar(value="12:00")
+        self._lunch_end_var = tk.StringVar(value="13:00")
+        self._ical_url_var = tk.StringVar(value="")
+        self._ical_keywords_var = tk.StringVar(value="")
+        self._ical_interval_var = tk.StringVar(value="15")
+
+        tk.Label(
+            content,
+            text="── 휴게 시간 · 구글 캘린더 ──",
+            bg=card_bg,
+            fg="#2563EB",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        row += 1
+
+        add_label("점심 휴게 자동 차감")
+        tk.Checkbutton(
+            content,
+            variable=self._lunch_enabled_var,
+            bg=card_bg,
+            activebackground=card_bg,
+            selectcolor=card_bg,
+            fg="#111827",
+            activeforeground="#111827",
+            font=("Segoe UI", 9),
+        ).grid(row=row, column=1, sticky="w", pady=6)
+        row += 1
+
+        add_label("점심 시간대(HH:MM~HH:MM)")
+        lunch_frame = tk.Frame(content, bg=card_bg)
+        lunch_frame.grid(row=row, column=1, sticky="we", pady=6)
+        ttk.Entry(lunch_frame, textvariable=self._lunch_start_var, width=8).pack(side="left")
+        tk.Label(lunch_frame, text="~", bg=card_bg, fg=text_muted, font=("Segoe UI", 9)).pack(
+            side="left", padx=4
+        )
+        ttk.Entry(lunch_frame, textvariable=self._lunch_end_var, width=8).pack(side="left")
+        row += 1
+
+        add_label("캘린더 비공개 iCal URL")
+        ical_entry_holder = add_entry(self._ical_url_var, show="*")
+        try:
+            ical_entry_holder.bind(
+                "<KeyRelease>", lambda _event: setattr(self, "_ical_dirty", True)
+            )
+        except Exception:
+            pass
+        ttk.Button(content, text="지우기", command=self._on_clear_ical).grid(
+            row=row, column=2, sticky="w", padx=(8, 0)
+        )
+        row += 1
+
+        add_label("헬스장 키워드(쉼표 구분)")
+        add_entry(self._ical_keywords_var)
+        row += 1
+
+        add_label("캘린더 조회 주기(분)")
+        add_entry(self._ical_interval_var)
         row += 1
 
         tk.Label(
@@ -359,6 +434,24 @@ class WrikeSettingsView:
             except Exception:
                 pass
             try:
+                snapshot = settings if isinstance(settings, dict) else {}
+                self._lunch_enabled_var.set(bool(snapshot.get("lunch_break_enabled", True)))
+                lunch_start = max(0, min(1439, int(snapshot.get("lunch_start_min", 720))))
+                lunch_end = max(1, min(1440, int(snapshot.get("lunch_end_min", 780))))
+                self._lunch_start_var.set(self._format_minutes_as_hhmm(lunch_start))
+                self._lunch_end_var.set(self._format_minutes_as_hhmm(lunch_end))
+                keywords = [
+                    str(item or "").strip()
+                    for item in list(snapshot.get("break_keywords") or [])
+                    if str(item or "").strip()
+                ]
+                self._ical_keywords_var.set(", ".join(keywords))
+                poll_minutes = int(round(float(snapshot.get("ical_poll_interval_sec", 900)) / 60.0))
+                self._ical_interval_var.set(str(max(5, min(360, poll_minutes))))
+                self._refresh_break_button_label(snapshot.get("manual_break_state"))
+            except Exception:
+                pass
+            try:
                 self._status_var.set("")
             except Exception:
                 pass
@@ -378,6 +471,98 @@ class WrikeSettingsView:
             self._set_status("토큰 삭제 완료", level="ok")
         else:
             self._set_status(f"토큰 삭제 실패: {err}", level="error")
+        return
+
+    def _format_minutes_as_hhmm(self, minutes: int) -> str:
+        try:
+            total = int(minutes)
+        except Exception:
+            return "12:00"
+        total = max(0, min(1440, total))
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    def _parse_hhmm(self, text: str, label: str) -> tuple[int | None, str | None]:
+        raw = str(text or "").strip()
+        parts = raw.split(":")
+        if len(parts) != 2:
+            return None, f"{label} 형식은 HH:MM 입니다."
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+        except Exception:
+            return None, f"{label} 값이 올바르지 않습니다."
+        if hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
+            return None, f"{label} 값이 올바르지 않습니다."
+        return hours * 60 + minutes, None
+
+    def _strict_positive_int(self, text: str, label: str) -> tuple[int, str | None]:
+        raw = str(text or "").strip()
+        if not raw:
+            return 0, f"{label} 값을 입력해 주세요."
+        try:
+            value = int(raw)
+        except Exception:
+            return 0, f"{label} 값이 정수가 아닙니다."
+        if value <= 0:
+            return 0, f"{label} 값은 0보다 커야 합니다."
+        return value, None
+
+    def _refresh_break_button_label(self, state: Any) -> None:
+        var = self._break_button_var
+        if var is None:
+            return
+        data = dict(state) if isinstance(state, dict) else {}
+        try:
+            if bool(data.get("active")):
+                started_at = str(data.get("started_at", "") or "")
+                hhmm = started_at[11:16] if len(started_at) >= 16 else ""
+                ongoing = int(data.get("ongoing_minutes", 0) or 0)
+                text = "휴게 종료"
+                if hhmm:
+                    text += f"({hhmm}"
+                    if ongoing > 0:
+                        text += f" · {ongoing}분"
+                    text += ")"
+                var.set(text)
+            else:
+                completed = int(data.get("completed_minutes", 0) or 0)
+                var.set(f"휴게 시작 · 누적 {completed}분")
+        except Exception:
+            try:
+                var.set("휴게 시작")
+            except Exception:
+                pass
+        return
+
+    def _on_toggle_break(self) -> None:
+        def worker():
+            try:
+                return self._wrike.toggle_manual_break()
+            except Exception as exc:
+                return {"message": f"휴게 토글 실패: {exc}"}
+
+        def apply_result(result) -> None:
+            state = result if isinstance(result, dict) else {}
+            message = str(state.get("message") or "").strip()
+            level = "ok" if message and not message.startswith("휴게 토글 실패") else "error"
+            try:
+                if message:
+                    self._set_status(message, level=level)
+            except Exception:
+                pass
+            self._refresh_break_button_label(state)
+
+        self._run_bg(worker, apply_result)
+        return
+
+    def _on_clear_ical(self) -> None:
+        ok, err = self._wrike.update_settings({"clear_ical_url": True})
+        if ok:
+            self._ical_url_var.set("")
+            self._ical_dirty = False
+            self._set_status("캘린더 URL 삭제 완료", level="ok")
+        else:
+            self._set_status(f"URL 삭제 실패: {err}", level="error")
         return
 
     def _on_reload(self) -> None:
@@ -478,6 +663,11 @@ class WrikeSettingsView:
             self._tooltip_var,
             self._monitor_enabled_var,
             self._monitor_interval_var,
+            self._lunch_enabled_var,
+            self._lunch_start_var,
+            self._lunch_end_var,
+            self._ical_keywords_var,
+            self._ical_interval_var,
         ):
             self._bind_autosave_var(var)
         return
@@ -536,6 +726,43 @@ class WrikeSettingsView:
         monitor_enabled = bool(self._monitor_enabled_var.get())
         interval_text = str(self._monitor_interval_var.get() or "").strip()
 
+        lunch_enabled = (
+            bool(self._lunch_enabled_var.get()) if self._lunch_enabled_var is not None else True
+        )
+        lunch_start_text = (
+            str(self._lunch_start_var.get() or "") if self._lunch_start_var is not None else "12:00"
+        )
+        lunch_end_text = (
+            str(self._lunch_end_var.get() or "") if self._lunch_end_var is not None else "13:00"
+        )
+        keywords_raw = (
+            str(self._ical_keywords_var.get() or "")
+            if self._ical_keywords_var is not None
+            else ""
+        )
+        poll_text = (
+            str(self._ical_interval_var.get() or "")
+            if self._ical_interval_var is not None
+            else "15"
+        )
+
+        lunch_start_min, error = self._parse_hhmm(lunch_start_text, "점심 시작 시간")
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+        lunch_end_min, error = self._parse_hhmm(lunch_end_text, "점심 종료 시간")
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+        if int(lunch_end_min) <= int(lunch_start_min):
+            self._set_status("저장 실패: 점심 종료 시간은 시작 시간 이후여야 합니다.", level="error")
+            return
+        parsed_keywords = [piece.strip() for piece in keywords_raw.split(",") if piece.strip()]
+        poll_minutes, error = self._strict_positive_int(poll_text, "캘린더 조회 주기(분)")
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+
         daily_hours, error = self._strict_positive_float(daily_text, "일 목표 시간")
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
@@ -552,15 +779,22 @@ class WrikeSettingsView:
         daily_minutes = int(round(daily_hours * 60))
         tooltip_ms = int(round(tooltip_sec * 1000))
 
-        ok, err = self._wrike.update_settings(
-            {
-                "api_token": token,
-                "daily_target_minutes": daily_minutes,
-                "tooltip_duration_ms": tooltip_ms,
-                "monitor_enabled": monitor_enabled,
-                "monitor_interval_sec": interval_sec,
-            }
-        )
+        save_payload = {
+            "api_token": token,
+            "daily_target_minutes": daily_minutes,
+            "tooltip_duration_ms": tooltip_ms,
+            "monitor_enabled": monitor_enabled,
+            "monitor_interval_sec": interval_sec,
+            "lunch_break_enabled": lunch_enabled,
+            "lunch_start_min": int(lunch_start_min),
+            "lunch_end_min": int(lunch_end_min),
+            "break_keywords": parsed_keywords,
+            "ical_poll_interval_sec": int(poll_minutes) * 60,
+        }
+        if self._ical_dirty:
+            save_payload["ical_url"] = str(self._ical_url_var.get() or "").strip()
+
+        ok, err = self._wrike.update_settings(save_payload)
         try:
             if ok:
                 self._set_status("저장됨", level="ok")
