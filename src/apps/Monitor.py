@@ -249,6 +249,7 @@ class Monitor:
         kb.add_hotkey("ctrl+alt+c", safe(self.__on_ctrl_alt_c), suppress=False)
         kb.add_hotkey("ctrl+alt+k", safe(self.__on_ctrl_alt_k), suppress=False)
         kb.add_hotkey("ctrl+alt+w", safe(self.__on_ctrl_alt_w), suppress=False)
+        kb.add_hotkey("ctrl+alt+b", safe(self.__on_ctrl_alt_b), suppress=False)
         return
 
     def __reset_hotkeys(self) -> None:
@@ -548,6 +549,25 @@ class Monitor:
                     wrike.attach(root)
                     self.__wrike_attached = True
                 wrike.show_weekly_timelog_summary(root)
+            except Exception:
+                return
+            return
+
+        self.__ui_post(ui_task)
+        return
+
+    def __on_ctrl_alt_b(self) -> None:
+        wrike = self.__ensure_wrike()
+
+        def ui_task() -> None:
+            root = self.__root
+            if root is None:
+                return
+            try:
+                if not self.__wrike_attached:
+                    wrike.attach(root)
+                    self.__wrike_attached = True
+                wrike.toggle_manual_break()
             except Exception:
                 return
             return
