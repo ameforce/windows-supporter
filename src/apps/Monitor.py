@@ -64,6 +64,13 @@ class Monitor:
         if not self.__background_enabled:
             return
         self.__reset_hotkeys()
+        wrike = self.__wrike
+        hook = getattr(wrike, "on_session_unlock", None)
+        if callable(hook):
+            try:
+                hook()
+            except Exception:
+                pass
         self.on_display_topology_changed("session_unlock")
         return
 
@@ -90,6 +97,14 @@ class Monitor:
 
     def shutdown(self) -> None:
         self.__stop_background_tasks()
+        wrike = self.__wrike
+        wrike_shutdown = getattr(wrike, "shutdown", None)
+        if callable(wrike_shutdown):
+            try:
+                wrike_shutdown()
+            except Exception:
+                pass
+        self.__wrike_attached = False
         codex = self.__codex_usage
         shutdown = getattr(codex, "shutdown", None)
         if callable(shutdown):
@@ -190,9 +205,14 @@ class Monitor:
         except Exception:
             pass
         try:
+            wrike = self.__ensure_wrike()
             if not self.__wrike_attached:
-                self.__ensure_wrike().attach(root)
+                wrike.attach(root)
                 self.__wrike_attached = True
+            else:
+                starter = getattr(wrike, "start_background", None)
+                if callable(starter):
+                    starter()
         except Exception:
             pass
         try:
@@ -455,6 +475,13 @@ class Monitor:
         self.__foreground_hotkey_handles = []
         self.__foreground_hotkey_profile = None
         self.__hotkeys_registered = False
+        wrike = self.__wrike
+        stop_wrike = getattr(wrike, "stop_background", None)
+        if callable(stop_wrike):
+            try:
+                stop_wrike()
+            except Exception:
+                pass
         return
 
     def __safe_hotkey(self, cb):
@@ -537,14 +564,24 @@ class Monitor:
         self.__ui_post(ui_task)
         return
 
+    def show_worktime_quick_panel(self) -> None:
+        """Queue the same Wrike Quick Panel action used by Ctrl+Alt+W."""
+
+        self.__on_ctrl_alt_w()
+        return
+
     def __on_ctrl_alt_w(self) -> None:
-        wrike = self.__ensure_wrike()
+        if not self.__background_enabled:
+            return
 
         def ui_task() -> None:
+            if not self.__background_enabled:
+                return
             root = self.__root
             if root is None:
                 return
             try:
+                wrike = self.__ensure_wrike()
                 if not self.__wrike_attached:
                     wrike.attach(root)
                     self.__wrike_attached = True

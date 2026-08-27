@@ -136,6 +136,37 @@ def vacation_credit_minutes(
     return min(target, int(total_seconds // 60))
 
 
+def composed_vacation_credit_minutes(
+    target_minutes: int,
+    break_intervals: list[BreakInterval],
+    vacation_intervals: list[BreakInterval],
+    now: datetime,
+    *,
+    all_day: bool = False,
+) -> int:
+    """Credit only timed vacation that is not already covered by a break."""
+
+    try:
+        target = max(0, int(target_minutes))
+    except Exception:
+        return 0
+    if all_day:
+        return target
+    base_seconds = sum(
+        max(0.0, (end - start).total_seconds())
+        for start, end in merge_intervals(list(break_intervals or []), now)
+    )
+    combined_seconds = sum(
+        max(0.0, (end - start).total_seconds())
+        for start, end in merge_intervals(
+            [*(break_intervals or []), *(vacation_intervals or [])],
+            now,
+        )
+    )
+    unique_vacation_seconds = max(0.0, combined_seconds - base_seconds)
+    return min(target, int(unique_vacation_seconds // 60))
+
+
 # Descriptive aliases retained for callers that prefer an explicit verb.
 compute_vacation_credit_minutes = vacation_credit_minutes
 calculate_vacation_credit_minutes = vacation_credit_minutes
@@ -356,17 +387,47 @@ class WorkdayOverview:
     target_minutes: int = 0
     vacation_minutes: int = 0
     effective_target_minutes: int = 0
+    recorded_minutes: int | None = None
+    expected_now_minutes: int = 0
+    realtime_delta_minutes: int | None = None
+    recorded_available: bool = False
+    vacation_available: bool = True
+    vacation_state: str = "unconfigured"
+    expected_available: bool = True
+
+    @property
+    def actual_minutes(self) -> int | None:
+        """Wrike-recorded minutes used as the realtime actual value."""
+        return self.recorded_minutes
 
     def as_lines(self, now: datetime) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = []
-        if self.clock_in is not None:
-            head = (
-                f"출근 {format_hhmm(self.clock_in)} · 실시간 순근무 "
-                f"{format_minutes(self.net_elapsed_minutes)}"
-            )
+        if self.recorded_available and self.recorded_minutes is not None:
+            recorded_text = format_minutes(self.recorded_minutes)
+            recorded_color = COLOR_ACCENT
         else:
-            head = "출근 - · 실시간 순근무 -"
-        lines.append((head, COLOR_ACCENT))
+            recorded_text = "조회 불가"
+            recorded_color = COLOR_MUTED
+        expected_text = (
+            format_minutes(self.expected_now_minutes)
+            if self.expected_available
+            else "조회 불가"
+        )
+        lines.append((
+            f"Wrike 기록 {recorded_text} · 현재 기대 {expected_text}",
+            recorded_color if self.expected_available else COLOR_MUTED,
+        ))
+
+        if self.clock_in is not None:
+            reference = format_minutes(self.net_elapsed_minutes)
+            clock_text = format_hhmm(self.clock_in)
+        else:
+            reference = "-"
+            clock_text = "-"
+        lines.append((
+            f"출근 {clock_text} · 출근 후 순경과 {reference}",
+            COLOR_ACCENT,
+        ))
 
         breakdown = self.break_labels if self.break_labels else "없음"
         active_note = " · 휴게 진행 중" if self.manual_break_active else ""
@@ -375,23 +436,39 @@ class WorkdayOverview:
             COLOR_MUTED,
         ))
 
-        lines.append((
-            f"휴가 차감 {format_minutes(self.vacation_minutes)} · "
-            f"적용 목표 {format_minutes(self.effective_target_minutes)}",
-            COLOR_MUTED,
-        ))
-
         quit_text = format_hhmm(self.projected_quit)
-        lines.append((f"예상 퇴근 {quit_text}", COLOR_ACCENT))
-
-        remain = int(self.remaining_net_minutes)
-        basis = f" ({format_hhmm(now)} 기준)"
-        if remain > 0:
-            lines.append((f"잔여 부족 {format_minutes(remain)}{basis}", COLOR_WARN))
-        elif remain == 0:
-            lines.append(("목표 달성", COLOR_OK))
+        if self.vacation_available:
+            vacation_line = (
+                f"휴가 차감 {format_minutes(self.vacation_minutes)} · "
+                f"적용 목표 {format_minutes(self.effective_target_minutes)} · "
+                f"예상 퇴근 {quit_text}"
+            )
         else:
-            lines.append((f"초과 {format_minutes(-remain)}{basis}", COLOR_OK))
+            vacation_line = (
+                f"휴가 확인 {self.vacation_state or 'error'} · "
+                "적용 목표 조회 불가 · 예상 퇴근 -"
+            )
+        lines.append((vacation_line, COLOR_MUTED))
+
+        basis = f" ({format_hhmm(now)})"
+        if (
+            not self.expected_available
+            or not self.recorded_available
+            or self.realtime_delta_minutes is None
+        ):
+            lines.append((f"현재 기준 조회 불가{basis}", COLOR_MUTED))
+        elif self.realtime_delta_minutes < 0:
+            lines.append((
+                f"현재 기준 부족 {format_minutes(-self.realtime_delta_minutes)}{basis}",
+                COLOR_WARN,
+            ))
+        elif self.realtime_delta_minutes > 0:
+            lines.append((
+                f"현재 기준 초과 {format_minutes(self.realtime_delta_minutes)}{basis}",
+                COLOR_OK,
+            ))
+        else:
+            lines.append((f"현재 기준 딱 맞음{basis}", COLOR_OK))
         return lines
 
 
@@ -401,27 +478,74 @@ def build_workday_overview(
     clock_in: datetime | None,
     target_minutes: int,
     intervals: list[BreakInterval],
-    vacation_minutes: int = 0,
+    vacation_intervals: list[BreakInterval] | None = None,
+    vacation_all_day: bool = False,
+    vacation_minutes: int | None = None,
+    vacation_available: bool = True,
+    vacation_state: str = "unconfigured",
     recorded_minutes: int | None = None,
 ) -> WorkdayOverview:
-    # Compatibility only: live calculations deliberately ignore Wrike-recorded
-    # time and derive remaining work directly from elapsed net work.
-    _ = recorded_minutes
     try:
         target = max(0, int(target_minutes))
     except Exception:
         target = 0
-    try:
-        vacation = max(0, int(vacation_minutes))
-    except Exception:
-        vacation = 0
-    effective_target = max(0, target - vacation)
+    availability = vacation_available is True
+    base_intervals = list(intervals or [])
+    timed_vacation = list(vacation_intervals or [])
+    use_composed_vacation = bool(vacation_all_day) or vacation_intervals is not None
 
-    break_total = total_break_minutes_within(intervals, clock_in, now, now)
-    net = compute_net_elapsed_minutes(now, clock_in, intervals)
-    break_labels, active = _merged_break_labels(intervals, clock_in, now)
+    if availability and use_composed_vacation:
+        vacation = composed_vacation_credit_minutes(
+            target,
+            base_intervals,
+            timed_vacation,
+            now,
+            all_day=vacation_all_day,
+        )
+    else:
+        try:
+            vacation = max(0, int(vacation_minutes or 0))
+        except Exception:
+            vacation = 0
+    state = str(vacation_state or "error").strip().lower() or "error"
+    effective_target = max(0, target - vacation) if availability else target
+    progress_intervals = (
+        [*base_intervals, *timed_vacation]
+        if availability and not vacation_all_day
+        else base_intervals
+    )
+
+    actual: int | None = None
+    if recorded_minutes is not None:
+        try:
+            actual = max(0, int(recorded_minutes))
+        except Exception:
+            actual = None
+
+    break_total = total_break_minutes_within(
+        progress_intervals,
+        clock_in,
+        now,
+        now,
+    )
+    net = compute_net_elapsed_minutes(now, clock_in, progress_intervals)
+    break_labels, active = _merged_break_labels(
+        progress_intervals,
+        clock_in,
+        now,
+    )
+    expected_now = min(effective_target, net) if availability else 0
+    realtime_delta = (
+        None if actual is None or not availability else actual - expected_now
+    )
+    # Compatibility reference retained for existing callers: unlike
+    # expected_now, this value remains based on uncapped wall-clock net time.
     remaining = effective_target - net
-    projected = project_quit_at(now, clock_in, effective_target, intervals)
+    projected = (
+        project_quit_at(now, clock_in, effective_target, progress_intervals)
+        if availability
+        else None
+    )
     if active:
         projected = None
     return WorkdayOverview(
@@ -435,6 +559,13 @@ def build_workday_overview(
         target_minutes=target,
         vacation_minutes=vacation,
         effective_target_minutes=effective_target,
+        recorded_minutes=actual,
+        expected_now_minutes=expected_now,
+        realtime_delta_minutes=realtime_delta,
+        recorded_available=actual is not None,
+        vacation_available=availability,
+        vacation_state=state,
+        expected_available=availability,
     )
 
 

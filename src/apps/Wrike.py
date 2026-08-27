@@ -1,7 +1,12 @@
 from datetime import datetime, timedelta
+import copy
+import hashlib
 import json
+import math
+import os
 import queue
 import shutil
+import tempfile
 import threading
 import traceback
 import urllib.error
@@ -29,15 +34,39 @@ from src.apps.wrike_worktime import (
     build_lunch_interval,
     build_workday_overview,
     clock_in_candidate,
-    vacation_credit_minutes,
+    composed_vacation_credit_minutes,
 )
 from src.apps.wrike_worktime_state import WorktimeStateStore
+from src.apps.wrike_timelog_snapshot import (
+    TimelogDay,
+    TimelogSnapshotState,
+    WrikeTimelogSnapshotStore,
+    apply_stale_threshold,
+    error_from_last_good,
+    loading_from_last_good,
+    make_error_snapshot,
+    make_fresh_snapshot,
+    make_loading_snapshot,
+    make_unconfigured_snapshot,
+)
+from src.apps.wrike_worktime_panel import (
+    WorktimeActivityPrompt,
+    WorktimePanelDayRow,
+    WorktimePanelLine,
+    WorktimePanelModel,
+    WorktimeQuickPanel,
+)
+from src.apps.worktime_activity import (
+    LastInputUnavailableError,
+    WorktimeActivityWatcher,
+)
 
 
 VACATION_EXPECTED_CALENDAR_NAME = "김종인-ePapyrus"
 VACATION_ERROR_FETCH_FAILED = "calendar_fetch_failed"
 VACATION_ERROR_NAME_MISMATCH = "calendar_name_mismatch"
 VACATION_ERROR_SECRET_UNAVAILABLE = "secret_unavailable"
+VACATION_STATES = frozenset({"unconfigured", "loading", "fresh", "stale", "error"})
 
 
 class Wrike:
@@ -107,8 +136,15 @@ class Wrike:
         self.__root = None
         self.__ui_queue = queue.SimpleQueue()
         self.__ui_pump_started = False
+        self.__ui_after_id = None
+        self.__background_active = False
+        self.__lifecycle_generation = 0
         self.__active_tooltip = None
-        self.__settings_version = 6
+        self.__worktime_panel = None
+        self.__worktime_panel_root = None
+        self.__activity_watcher = None
+        self.__activity_prompt_surfaced_day = ""
+        self.__settings_version = 7
         self.__playwright_checked = False
         self.__playwright_ready = False
         self.__time_log_weekday_labels = ['월', '화', '수', '목', '금', '토', '일']
@@ -121,6 +157,20 @@ class Wrike:
         self.__time_log_log_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike.log")
         self.__time_log_token_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_token.txt")
         self.__settings_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_settings.json")
+        self.__timelog_cache_path = self.__lib.os.path.join(
+            self.__time_log_config_dir,
+            "wrike_timelog_cache.json",
+        )
+        self.__timelog_snapshot_store = WrikeTimelogSnapshotStore(
+            self.__timelog_cache_path
+        )
+        self.__timelog_snapshot_lock = threading.RLock()
+        self.__timelog_refresh_generation = 0
+        self.__timelog_refresh_running = False
+        self.__timelog_refresh_running_generation = None
+        self.__timelog_last_refresh_requested_at = None
+        self.__timelog_snapshot = make_unconfigured_snapshot(generation=0)
+        self.__timelog_last_good = None
         self.__secret_store = SecretStore("windows-supporter:wrike-api-token")
         self.__vacation_secret_store = SecretStore("windows-supporter:vacation-ical-url")
         self.__wrike_api_token_secret_scope = "windows-supporter:wrike-api-token"
@@ -142,15 +192,18 @@ class Wrike:
         self.__vacation_ical_url_session = ""
         self.__vacation_ical_poll_interval_sec = 900.0
         self.__vacation_ical_after_id = None
-        self.__vacation_ical_fetch_running = False
+        self.__vacation_ical_fetch_owner = None
         self.__vacation_ical_last_success_ts = None
         self.__vacation_ical_last_error = ""
+        self.__vacation_ical_state = "unconfigured"
         self.__vacation_ical_observed_calendar_name = ""
         self.__vacation_ical_generation = 0
         self.__vacation_ical_lock = threading.RLock()
         self.__vacation_ical_calendar: dict = {}
         self.__vacation_ical_events_for_date = ""
         self.__vacation_ical_day_result: dict = {}
+        self.__vacation_ical_week_cache_calendar = None
+        self.__vacation_ical_week_cache: dict[str, dict] = {}
         self.__worktime_state_path = self.__lib.os.path.join(
             self.__time_log_config_dir,
             "wrike_worktime_state.json",
@@ -174,6 +227,37 @@ class Wrike:
             default_target_minutes=store_default_target,
             now_provider=self.__lib.datetime.now,
         )
+        configured_token = str(self.__wrike_api_token_session or "").strip()
+        expected_cache_fingerprint = self.__timelog_token_fingerprint(
+            configured_token
+        )
+        try:
+            cached_snapshot = (
+                self.__timelog_snapshot_store.load(
+                    expected_account_fingerprint=expected_cache_fingerprint,
+                    generation=int(self.__timelog_refresh_generation),
+                )
+                if expected_cache_fingerprint
+                else None
+            )
+        except Exception as exc:
+            cached_snapshot = None
+            self.__log_exception("timelog cache load failed", exc)
+        if cached_snapshot is not None:
+            try:
+                cached_snapshot = apply_stale_threshold(
+                    cached_snapshot,
+                    now=self.__lib.datetime.now(),
+                    stale_after=timedelta(0),
+                )
+                self.__timelog_snapshot = cached_snapshot
+                self.__timelog_last_good = cached_snapshot
+            except Exception as exc:
+                self.__log_exception("timelog cache classify failed", exc)
+        elif str(self.__wrike_api_token_session or "").strip():
+            self.__timelog_snapshot = make_loading_snapshot(
+                generation=int(self.__timelog_refresh_generation)
+            )
         return
 
     def is_wrike_active(self) -> bool:
@@ -384,7 +468,16 @@ class Wrike:
         return
 
     def show_weekly_timelog_summary(self, root) -> None:
-        self.__show_live_worktime_summary(root)
+        if root is None:
+            return
+        if self.__root is None:
+            self.attach(root)
+        panel = self.__ensure_worktime_panel(root)
+        if panel is None:
+            return
+        panel.toggle(activate=True)
+        if panel.is_visible():
+            self.__request_timelog_snapshot_refresh(force=True)
         return
 
     def __compose_live_worktime_rows(self) -> list[tuple[str, str | None]]:
@@ -420,12 +513,14 @@ class Wrike:
             return
         self.__ui_pump_started = True
         try:
-            root.after(30, self.__drain_ui_queue)
+            self.__ui_after_id = root.after(30, self.__drain_ui_queue)
         except Exception:
+            self.__ui_after_id = None
             self.__ui_pump_started = False
         return
 
     def __drain_ui_queue(self) -> None:
+        self.__ui_after_id = None
         root = self.__root
         processed = 0
         while processed < 16:
@@ -444,8 +539,12 @@ class Wrike:
             self.__ui_pump_started = False
             return
         try:
-            root.after(1 if processed >= 16 else 30, self.__drain_ui_queue)
+            self.__ui_after_id = root.after(
+                1 if processed >= 16 else 30,
+                self.__drain_ui_queue,
+            )
         except Exception:
+            self.__ui_after_id = None
             self.__ui_pump_started = False
         return
 
@@ -466,31 +565,146 @@ class Wrike:
         return
 
     def attach(self, root) -> None:
+        if root is None:
+            return
         self.__root = root
         self.__start_ui_pump(root)
+        self.start_background()
+        self.__prewarm_wrike_form_browser_async()
+        return
+
+    def start_background(self) -> None:
+        root = self.__root
+        if root is None:
+            return
+        if not self.__background_active:
+            self.__background_active = True
+            self.__lifecycle_generation += 1
         self.__restart_monitor()
         self.__start_ical_polling()
         self.__start_vacation_ical_polling()
-        self.__prewarm_wrike_form_browser_async()
+        self.__start_activity_watcher()
+        return
+
+    def __start_activity_watcher(self) -> None:
+        root = self.__root
+        if root is None or not self.__background_active:
+            return
+        watcher = self.__activity_watcher
+        if watcher is None:
+            try:
+                watcher = WorktimeActivityWatcher(
+                    root,
+                    self.__on_worktime_activity,
+                    now_provider=self.__lib.datetime.now,
+                )
+            except (LastInputUnavailableError, OSError, ValueError):
+                return
+            except Exception:
+                return
+            self.__activity_watcher = watcher
+        try:
+            watcher.start()
+        except Exception:
+            return
+        return
+
+    def __cancel_monitor_after(self) -> None:
+        root = self.__root
+        after_id = self.__monitor_after_id
+        self.__monitor_after_id = None
+        if root is None or after_id is None:
+            return
+        try:
+            root.after_cancel(after_id)
+        except Exception:
+            pass
+        return
+
+    def stop_background(self) -> None:
+        self.__background_active = False
+        self.__lifecycle_generation += 1
+        self.__cancel_monitor_after()
+        self.__monitor_running = False
+        self.__cancel_ical_after()
+        self.__ical_fetch_running = False
+        self.__cancel_vacation_ical_after()
+        self.__vacation_ical_generation += 1
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_fetch_owner = None
+        with self.__timelog_snapshot_lock:
+            self.__timelog_refresh_generation += 1
+            self.__timelog_refresh_running = False
+            self.__timelog_refresh_running_generation = None
+        watcher = self.__activity_watcher
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception:
+                pass
+        panel = self.__worktime_panel
+        if panel is not None:
+            try:
+                panel.hide()
+            except Exception:
+                pass
+        return
+
+    def on_session_unlock(self) -> None:
+        watcher = self.__activity_watcher
+        if watcher is not None:
+            try:
+                watcher.reset_baseline()
+            except Exception:
+                pass
+        panel = self.__worktime_panel
+        if panel is not None:
+            try:
+                if panel.is_visible():
+                    self.__request_timelog_snapshot_refresh(force=False)
+            except Exception:
+                pass
+        return
+
+    def shutdown(self) -> None:
+        self.stop_background()
+        root = self.__root
+        after_id = self.__ui_after_id
+        self.__ui_after_id = None
+        self.__ui_pump_started = False
+        if root is not None and after_id is not None:
+            try:
+                root.after_cancel(after_id)
+            except Exception:
+                pass
+        panel = self.__worktime_panel
+        self.__worktime_panel = None
+        self.__worktime_panel_root = None
+        if panel is not None:
+            try:
+                panel.destroy()
+            except Exception:
+                pass
+        self.__activity_watcher = None
+        self.__root = None
         return
 
     def __restart_monitor(self) -> None:
         root = self.__root
         if root is None:
             return
-        try:
-            if self.__monitor_after_id is not None:
-                root.after_cancel(self.__monitor_after_id)
-        except Exception:
-            pass
-        self.__monitor_after_id = None
-        if not self.__monitor_enabled:
+        self.__cancel_monitor_after()
+        if not self.__background_active or not self.__monitor_enabled:
             return
         self.__schedule_monitor_tick(root, initial_delay_sec=2.0)
         return
 
     def __schedule_monitor_tick(self, root, initial_delay_sec: float | None = None) -> None:
-        if root is None or not self.__monitor_enabled:
+        if (
+            root is None
+            or not self.__background_active
+            or not self.__monitor_enabled
+        ):
             return
         delay_sec = initial_delay_sec if initial_delay_sec is not None else self.__monitor_interval_sec
         try:
@@ -505,62 +719,47 @@ class Wrike:
 
     def __monitor_tick(self) -> None:
         root = self.__root
-        if root is None or not self.__monitor_enabled:
+        if (
+            root is None
+            or not self.__background_active
+            or not self.__monitor_enabled
+        ):
             return
         if self.__monitor_running:
             self.__schedule_monitor_tick(root)
             return
 
-        token = str(self.__wrike_api_token_session or "").strip()
-        if not token:
-            self.__log("monitor skipped: token missing")
-            self.__schedule_monitor_tick(root)
-            return
-
         self.__monitor_running = True
-
-        def worker() -> None:
-            next_total_minutes = None
-            tooltip_lines = None
-            try:
-                contact_id, display_name, contact_error = self.__resolve_contact_identity(token)
-                if contact_error or not contact_id:
-                    if contact_error:
-                        self.__log(f"monitor contact resolve failed: {contact_error}")
-                    return
-                days, error = self.__fetch_weekly_timelog_via_api(token, contact_id)
-                if error or not days:
-                    if error:
-                        self.__log(f"monitor api error: {error}")
-                    return
-                total_minutes = sum(int(d.get("minutes", 0)) for d in days)
-                last_total = self.__monitor_last_total_minutes
-                if last_total is None:
-                    next_total_minutes = total_minutes
-                    return
-                if total_minutes <= int(last_total):
-                    return
-
-                next_total_minutes = total_minutes
-                daily_target_minutes = int(self.__daily_target_minutes)
-                tooltip_lines = self.__build_timelog_summary_lines(
-                    display_name, daily_target_minutes, days
-                )
-            finally:
-                self.__ui_safe(
-                    root,
-                    lambda: self.__finish_monitor_worker(
-                        root,
-                        next_total_minutes,
-                        tooltip_lines,
-                    ),
-                )
-
         try:
-            threading.Thread(target=worker, daemon=True).start()
-        except Exception:
+            self.__request_timelog_snapshot_refresh(force=True)
+        finally:
             self.__monitor_running = False
-            self.__schedule_monitor_tick(root)
+            if root is self.__root and self.__background_active:
+                self.__schedule_monitor_tick(root)
+        return
+
+    def __update_monitor_from_snapshot(self, snapshot) -> None:
+        root = self.__root
+        if (
+            root is None
+            or not self.__background_active
+            or not self.__monitor_enabled
+            or snapshot.state is not TimelogSnapshotState.FRESH
+            or not snapshot.has_last_good_data
+        ):
+            return
+        total_minutes = snapshot.total_recorded_minutes
+        if total_minutes is None:
+            return
+        previous_total = self.__monitor_last_total_minutes
+        self.__monitor_last_total_minutes = int(total_minutes)
+        if previous_total is None or int(total_minutes) <= int(previous_total):
+            return
+        try:
+            tooltip_lines = self.__build_timelog_summary_lines(snapshot)
+            self.__show_tooltip(root, "", lines=tooltip_lines)
+        except Exception as exc:
+            self.__log_exception("monitor snapshot notification failed", exc)
         return
 
     def __finish_monitor_worker(
@@ -568,13 +767,933 @@ class Wrike:
         root,
         next_total_minutes: int | None,
         tooltip_lines: list[tuple[str, str | None]] | None,
+        lifecycle_generation: int | None = None,
     ) -> None:
+        target_generation = (
+            int(self.__lifecycle_generation)
+            if lifecycle_generation is None
+            else int(lifecycle_generation)
+        )
+        if (
+            target_generation != int(self.__lifecycle_generation)
+            or not self.__background_active
+            or root is not self.__root
+        ):
+            return
         if next_total_minutes is not None:
             self.__monitor_last_total_minutes = int(next_total_minutes)
         if tooltip_lines:
             self.__show_tooltip(root, "", lines=tooltip_lines)
         self.__monitor_running = False
         self.__schedule_monitor_tick(root)
+        return
+
+    # ------------------------------------------------------------------
+    # Authoritative realtime snapshot and weekly quick panel
+    # ------------------------------------------------------------------
+
+    def __timelog_refresh_interval(self) -> timedelta:
+        try:
+            seconds = max(5.0, float(self.__monitor_interval_sec))
+        except Exception:
+            seconds = 5.0
+        return timedelta(seconds=seconds)
+
+    def __safe_timelog_error_code(self, value) -> str:
+        code = str(value or "request_failed").strip().lower()
+        allowed = {
+            "api_token_missing",
+            "auth_failed",
+            "contact_not_found",
+            "request_failed",
+            "api_request_failed",
+            "invalid_response",
+            "pagination_cycle",
+            "pagination_limit",
+            "week_dates_empty",
+        }
+        return code if code in allowed else "request_failed"
+
+    def get_timelog_snapshot(self):
+        with self.__timelog_snapshot_lock:
+            return self.__timelog_snapshot
+
+    def __get_timelog_snapshot(self):
+        return self.get_timelog_snapshot()
+
+    def __snapshot_for_now(self, now):
+        with self.__timelog_snapshot_lock:
+            snapshot = self.__timelog_snapshot
+            if (
+                snapshot.state is TimelogSnapshotState.FRESH
+                and snapshot.has_last_good_data
+            ):
+                try:
+                    classified = apply_stale_threshold(
+                        snapshot,
+                        now=now,
+                        stale_after=self.__timelog_refresh_interval(),
+                    )
+                except Exception:
+                    classified = snapshot
+                if classified is not snapshot:
+                    self.__timelog_snapshot = classified
+                    snapshot = classified
+                    if self.__timelog_last_good is not None:
+                        self.__timelog_last_good = classified
+            return snapshot
+
+    def __request_timelog_snapshot_refresh(self, force: bool = False):
+        root = self.__root
+        if root is None or not self.__background_active:
+            return None
+        now = self.__lib.datetime.now()
+        interval = self.__timelog_refresh_interval()
+        token = str(self.__wrike_api_token_session or "").strip()
+        account_fingerprint = self.__timelog_token_fingerprint(token)
+        week_dates = self.__get_week_dates()
+        lifecycle_generation = int(self.__lifecycle_generation)
+
+        with self.__timelog_snapshot_lock:
+            if self.__timelog_refresh_running:
+                return None
+            previous_request = self.__timelog_last_refresh_requested_at
+            if not force and previous_request is not None:
+                try:
+                    if timedelta(0) <= now - previous_request < interval:
+                        return None
+                except Exception:
+                    pass
+            self.__timelog_refresh_generation += 1
+            generation = int(self.__timelog_refresh_generation)
+            self.__timelog_last_refresh_requested_at = now
+            last_good = self.__timelog_last_good
+            if not token:
+                error_code = "api_token_missing"
+                if last_good is not None:
+                    self.__timelog_snapshot = error_from_last_good(
+                        last_good,
+                        generation=generation,
+                        error_code=error_code,
+                    )
+                else:
+                    self.__timelog_snapshot = make_error_snapshot(
+                        generation=generation,
+                        error_code=error_code,
+                    )
+                return generation
+            if last_good is not None:
+                self.__timelog_snapshot = loading_from_last_good(
+                    last_good,
+                    generation=generation,
+                )
+            else:
+                self.__timelog_snapshot = make_loading_snapshot(
+                    generation=generation
+                )
+            self.__timelog_refresh_running = True
+            self.__timelog_refresh_running_generation = generation
+
+        try:
+            thread = threading.Thread(
+                target=lambda: self.__run_timelog_snapshot_refresh(
+                    generation,
+                    token,
+                    account_fingerprint,
+                    week_dates,
+                    root,
+                    lifecycle_generation,
+                ),
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            self.__apply_timelog_snapshot_result(
+                generation,
+                account_fingerprint=account_fingerprint,
+                error_code="request_failed",
+            )
+        return generation
+
+    def __run_timelog_snapshot_refresh(
+        self,
+        generation: int,
+        token: str,
+        account_fingerprint: str,
+        week_dates: list,
+        root,
+        lifecycle_generation: int,
+    ) -> None:
+        fresh_snapshot = None
+        error_code = None
+        try:
+            contact_id, display_name, contact_error = self.__resolve_contact_identity(
+                token
+            )
+            if contact_error or not contact_id:
+                error_code = self.__safe_timelog_error_code(
+                    contact_error or "contact_not_found"
+                )
+            else:
+                timelogs, query_error = self.__query_authoritative_timelogs_week(
+                    token,
+                    contact_id,
+                    week_dates,
+                )
+                if query_error or timelogs is None:
+                    error_code = self.__safe_timelog_error_code(query_error)
+                else:
+                    aggregated = self.__aggregate_timelogs(timelogs, week_dates)
+                    days = tuple(
+                        TimelogDay(
+                            date=item["date"].date(),
+                            recorded_minutes=max(0, int(item.get("minutes", 0))),
+                        )
+                        for item in aggregated
+                    )
+                    fresh_snapshot = make_fresh_snapshot(
+                        days=days,
+                        display_name=str(display_name or "내 계정"),
+                        fetched_at=self.__lib.datetime.now(),
+                        generation=int(generation),
+                        partial=False,
+                    )
+        except Exception as exc:
+            self.__log_exception("authoritative timelog refresh failed", exc)
+            error_code = "request_failed"
+
+        def apply_result() -> None:
+            if lifecycle_generation != int(self.__lifecycle_generation):
+                return
+            self.__apply_timelog_snapshot_result(
+                generation,
+                snapshot=fresh_snapshot,
+                account_fingerprint=account_fingerprint,
+                error_code=error_code,
+            )
+
+        if not self.__ui_safe(root, apply_result):
+            apply_result()
+        return
+
+    def __apply_timelog_snapshot_result(
+        self,
+        generation: int,
+        snapshot=None,
+        account_fingerprint: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        save_snapshot = None
+        save_fingerprint = ""
+        notify_snapshot = None
+        with self.__timelog_snapshot_lock:
+            if int(generation) != int(self.__timelog_refresh_generation):
+                return False
+            if self.__timelog_refresh_running_generation not in {None, int(generation)}:
+                return False
+            if snapshot is not None:
+                captured_fingerprint = str(account_fingerprint or "").strip().lower()
+                current_fingerprint = self.__timelog_token_fingerprint(
+                    self.__wrike_api_token_session
+                )
+                if (
+                    len(captured_fingerprint) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in captured_fingerprint
+                    )
+                    or captured_fingerprint != current_fingerprint
+                ):
+                    return False
+            self.__timelog_refresh_running = False
+            self.__timelog_refresh_running_generation = None
+            if snapshot is not None:
+                if (
+                    snapshot.generation != int(generation)
+                    or snapshot.state is not TimelogSnapshotState.FRESH
+                    or not snapshot.has_last_good_data
+                    or snapshot.partial
+                ):
+                    error_code = "invalid_response"
+                    snapshot = None
+            if snapshot is not None:
+                self.__timelog_snapshot = snapshot
+                self.__timelog_last_good = snapshot
+                save_snapshot = snapshot
+                save_fingerprint = str(account_fingerprint)
+                notify_snapshot = snapshot
+            else:
+                safe_error = self.__safe_timelog_error_code(error_code)
+                last_good = self.__timelog_last_good
+                if last_good is not None:
+                    self.__timelog_snapshot = error_from_last_good(
+                        last_good,
+                        generation=int(generation),
+                        error_code=safe_error,
+                    )
+                else:
+                    self.__timelog_snapshot = make_error_snapshot(
+                        generation=int(generation),
+                        error_code=safe_error,
+                    )
+        if save_snapshot is not None:
+            try:
+                self.__timelog_snapshot_store.save(
+                    save_snapshot,
+                    account_fingerprint=save_fingerprint,
+                )
+            except Exception as exc:
+                self.__log_exception("timelog cache save failed", exc)
+        if notify_snapshot is not None:
+            self.__update_monitor_from_snapshot(notify_snapshot)
+        return True
+
+    def __refresh_visible_panel_if_due(self, now, snapshot) -> None:
+        if not self.__background_active:
+            return
+        panel = self.__worktime_panel
+        if panel is None:
+            return
+        try:
+            if not panel.is_visible():
+                return
+        except Exception:
+            return
+        with self.__timelog_snapshot_lock:
+            if self.__timelog_refresh_running:
+                return
+            requested_at = self.__timelog_last_refresh_requested_at
+        references = [
+            value
+            for value in (snapshot.fetched_at, requested_at)
+            if value is not None
+        ]
+        reference = max(references) if references else None
+        due = reference is None
+        if reference is not None:
+            try:
+                due = now - reference >= self.__timelog_refresh_interval()
+            except Exception:
+                due = True
+        if due:
+            self.__request_timelog_snapshot_refresh(force=False)
+        return
+
+    def __ensure_worktime_panel(self, root):
+        if root is None:
+            return None
+        panel = self.__worktime_panel
+        if panel is not None and self.__worktime_panel_root is root:
+            return panel
+        if panel is not None:
+            try:
+                panel.destroy()
+            except Exception:
+                pass
+        try:
+            panel = WorktimeQuickPanel(
+                root,
+                self.__build_worktime_panel_model,
+                refresh=self.__panel_refresh,
+                clock_in_now=self.__panel_clock_in_now,
+                edit_clock_in=self.__panel_edit_clock_in,
+                edit_plan=self.__open_settings_tab,
+                toggle_break=self.__panel_toggle_break,
+                open_settings=self.__open_settings_tab,
+                prompt_accept=self.__panel_prompt_accept,
+                prompt_edit=self.__panel_prompt_edit,
+                prompt_snooze=self.__panel_prompt_snooze,
+                prompt_skip=self.__panel_prompt_skip,
+            )
+        except Exception:
+            return None
+        self.__worktime_panel = panel
+        self.__worktime_panel_root = root
+        return panel
+
+    def __plan_for_date(self, target_day) -> dict:
+        try:
+            plan = self.get_workday_plan(target_day)
+        except Exception:
+            plan = {
+                "date": target_day.isoformat(),
+                "target_net_minutes": self.__default_workday_target_minutes(),
+                "clock_in": None,
+                "explicit": False,
+            }
+        explicit = bool(plan.get("explicit", False))
+        if explicit:
+            try:
+                target = max(0, min(1440, int(plan.get("target_net_minutes", 0))))
+            except Exception:
+                target = 0
+        else:
+            target = (
+                self.__default_workday_target_minutes()
+                if int(target_day.weekday()) < 5
+                else 0
+            )
+        return {
+            "date": target_day.isoformat(),
+            "target_net_minutes": int(target),
+            "clock_in": plan.get("clock_in"),
+            "explicit": explicit,
+        }
+
+    def __vacation_result_for_date(self, target_day) -> dict:
+        try:
+            cache_key = target_day.isoformat()
+        except Exception:
+            return {
+                "availability_state": "error",
+                "available": False,
+                "automatic_prompt_allowed": False,
+                "using_last_good": False,
+                "error_code": VACATION_ERROR_FETCH_FAILED,
+            }
+        with self.__vacation_ical_lock:
+            state = str(self.__vacation_ical_state or "error").strip().lower()
+            if state not in VACATION_STATES:
+                state = "error"
+            calendar = self.__vacation_ical_calendar
+            last_error = str(self.__vacation_ical_last_error or "").strip()
+            secret_present = bool(
+                str(self.__vacation_ical_url_protected or "").strip()
+                or str(self.__vacation_ical_url_session or "").strip()
+            )
+            if self.__vacation_ical_week_cache_calendar is not calendar:
+                self.__vacation_ical_week_cache_calendar = calendar
+                self.__vacation_ical_week_cache = {}
+            cached = self.__vacation_ical_week_cache.get(cache_key)
+
+        if not secret_present:
+            state = "unconfigured"
+        has_last_good = bool(isinstance(calendar, dict) and calendar)
+        available = state == "unconfigured" or has_last_good
+        metadata = {
+            "availability_state": state,
+            "available": available,
+            "automatic_prompt_allowed": state in {"unconfigured", "fresh"},
+            "using_last_good": bool(has_last_good and state in {"stale", "error"}),
+            "error_code": last_error if state == "error" else "",
+        }
+        if state == "unconfigured":
+            return {
+                **metadata,
+                "calendar_matched": True,
+                "all_day": False,
+                "intervals": [],
+                "event_count": 0,
+            }
+        if not has_last_good:
+            return metadata
+        if isinstance(cached, dict):
+            return {**cached, **metadata}
+        try:
+            result = vacation_events_for_day(
+                calendar,
+                VACATION_EXPECTED_CALENDAR_NAME,
+                target_day,
+            )
+        except Exception:
+            return {
+                **metadata,
+                "availability_state": "error",
+                "available": False,
+                "automatic_prompt_allowed": False,
+                "using_last_good": False,
+                "error_code": VACATION_ERROR_FETCH_FAILED,
+            }
+        normalized = dict(result) if isinstance(result, dict) else {}
+        with self.__vacation_ical_lock:
+            if calendar is not self.__vacation_ical_calendar:
+                return {
+                    "availability_state": "loading",
+                    "available": False,
+                    "automatic_prompt_allowed": False,
+                    "using_last_good": False,
+                    "error_code": "",
+                }
+            if self.__vacation_ical_week_cache_calendar is not calendar:
+                self.__vacation_ical_week_cache_calendar = calendar
+                self.__vacation_ical_week_cache = {}
+            self.__vacation_ical_week_cache[cache_key] = dict(normalized)
+        return {**normalized, **metadata}
+
+    def __vacation_break_intervals(self, vacation) -> list[BreakInterval]:
+        if not isinstance(vacation, dict) or bool(vacation.get("all_day")):
+            return []
+        intervals: list[BreakInterval] = []
+        for span in vacation.get("intervals") or []:
+            try:
+                start, end = span
+                if not isinstance(start, datetime) or not isinstance(end, datetime):
+                    continue
+                if start.tzinfo is not None:
+                    start = start.astimezone().replace(tzinfo=None)
+                if end.tzinfo is not None:
+                    end = end.astimezone().replace(tzinfo=None)
+                if end <= start:
+                    continue
+                intervals.append(BreakInterval(start, end, "휴가"))
+            except Exception:
+                continue
+        return intervals
+
+    def __today_overview(self, now, snapshot=None):
+        current_snapshot = snapshot or self.__get_timelog_snapshot()
+        plan = self.__plan_for_date(now.date())
+        target_minutes = int(plan["target_net_minutes"])
+        clock_in = self.__clock_in_from_plan(plan)
+        intervals = self.__collect_break_intervals(now)
+        vacation = self.__vacation_result_for_date(now.date())
+        vacation_available = vacation.get("available", True) is True
+        vacation_intervals = (
+            self.__vacation_break_intervals(vacation)
+            if vacation_available
+            else []
+        )
+        recorded_minutes = current_snapshot.recorded_minutes_for(now.date())
+        return build_workday_overview(
+            now=now,
+            clock_in=clock_in,
+            target_minutes=target_minutes,
+            intervals=intervals,
+            vacation_intervals=vacation_intervals,
+            vacation_all_day=bool(vacation.get("all_day")),
+            vacation_available=vacation_available,
+            vacation_state=str(vacation.get("availability_state") or "error"),
+            recorded_minutes=recorded_minutes,
+        )
+
+    def __delta_text(self, delta) -> tuple[str, str]:
+        if delta is None:
+            return "조회 불가", "#6B7280"
+        value = int(delta)
+        if value < 0:
+            return f"부족 {self.__format_minutes(-value)}", "#DC2626"
+        if value > 0:
+            return f"초과 {self.__format_minutes(value)}", "#059669"
+        return "딱 맞음", "#059669"
+
+    def __snapshot_sync_text(self, snapshot, now) -> str:
+        pieces: list[str] = []
+        if snapshot.fetched_at is not None:
+            pieces.append(snapshot.fetched_at.strftime("%Y-%m-%d %H:%M:%S"))
+            try:
+                age_seconds = max(
+                    0,
+                    int((now - snapshot.fetched_at).total_seconds()),
+                )
+                if age_seconds < 60:
+                    pieces.append("방금")
+                else:
+                    pieces.append(f"{age_seconds // 60}분 전")
+            except Exception:
+                pass
+        state = snapshot.state.value
+        pieces.append(state)
+        if snapshot.error_code:
+            pieces.append(self.__safe_timelog_error_code(snapshot.error_code))
+        if snapshot.partial:
+            pieces.append("partial")
+        return " · ".join(pieces)
+
+    def __visible_activity_prompt(self, now, day_plan=None):
+        try:
+            resolved_plan = (
+                day_plan
+                if isinstance(day_plan, dict)
+                else self.__plan_for_date(now.date())
+            )
+            if resolved_plan.get("clock_in"):
+                return None
+            prompt = self.__worktime_state_store.get_activity_prompt(now.date())
+        except Exception:
+            return None
+        if not isinstance(prompt, dict) or prompt.get("status") != "pending":
+            return None
+        try:
+            detected = datetime.fromisoformat(str(prompt.get("detected_at") or ""))
+        except Exception:
+            return None
+        if detected.tzinfo is not None or detected.date() != now.date():
+            return None
+        return WorktimeActivityPrompt(detected.strftime("%H:%M"))
+
+    def __build_worktime_panel_model(self) -> WorktimePanelModel:
+        now = self.__lib.datetime.now()
+        snapshot = self.__snapshot_for_now(now)
+        self.__refresh_visible_panel_if_due(now, snapshot)
+        week_start = now.date() - timedelta(days=now.weekday())
+        week_days = [week_start + timedelta(days=index) for index in range(7)]
+        overview = self.__today_overview(now, snapshot)
+        delta_text, delta_color = self.__delta_text(
+            overview.realtime_delta_minutes
+        )
+        recorded_text = (
+            self.__format_minutes(overview.recorded_minutes)
+            if overview.recorded_available and overview.recorded_minutes is not None
+            else "조회 불가"
+        )
+        expected_text = (
+            self.__format_minutes(overview.expected_now_minutes)
+            if overview.expected_available
+            else "조회 불가"
+        )
+        clock_text = (
+            overview.clock_in.strftime("%H:%M")
+            if overview.clock_in is not None
+            else "-"
+        )
+        quit_text = (
+            overview.projected_quit.strftime("%H:%M")
+            if overview.projected_quit is not None
+            else "-"
+        )
+        sync_text = self.__snapshot_sync_text(snapshot, now)
+        today_lines = (
+            WorktimePanelLine(
+                f"Wrike 기록 {recorded_text} · 현재 기대 {expected_text}",
+                "#2563EB"
+                if overview.recorded_available and overview.expected_available
+                else "#6B7280",
+            ),
+            WorktimePanelLine(f"현재 기준 {delta_text}", delta_color),
+            WorktimePanelLine(
+                f"출근 {clock_text} · 예상 퇴근 {quit_text}",
+                "#111827",
+            ),
+            WorktimePanelLine(
+                f"병합 휴게 {self.__format_minutes(overview.break_total_minutes)}"
+                + (" · 진행 중" if overview.manual_break_active else ""),
+                "#6B7280",
+            ),
+            WorktimePanelLine(
+                (
+                    f"휴가 차감 {self.__format_minutes(overview.vacation_minutes)} · "
+                    f"적용 목표 {self.__format_minutes(overview.effective_target_minutes)}"
+                    if overview.vacation_available
+                    else f"휴가 확인 {overview.vacation_state} · 적용 목표 조회 불가"
+                ),
+                "#6B7280",
+            ),
+            WorktimePanelLine(
+                f"동기화 {snapshot.state.value} · {sync_text}",
+                "#DC2626"
+                if snapshot.state is TimelogSnapshotState.ERROR
+                else "#6B7280",
+            ),
+        )
+
+        rows = []
+        for index, target_day in enumerate(week_days):
+            plan = self.__plan_for_date(target_day)
+            target = int(plan["target_net_minutes"])
+            vacation = self.__vacation_result_for_date(target_day)
+            vacation_available = vacation.get("available", True) is True
+            is_today = target_day == now.date()
+            if not vacation_available:
+                vacation_minutes = 0
+            elif is_today:
+                vacation_minutes = overview.vacation_minutes
+            else:
+                vacation_intervals = self.__vacation_break_intervals(vacation)
+                vacation_all_day = bool(vacation.get("all_day"))
+                if vacation_all_day or vacation_intervals:
+                    break_intervals = self.__collect_break_intervals_for_day(
+                        target_day,
+                        now,
+                    )
+                    vacation_minutes = composed_vacation_credit_minutes(
+                        target,
+                        break_intervals,
+                        vacation_intervals,
+                        now,
+                        all_day=vacation_all_day,
+                    )
+                else:
+                    vacation_minutes = 0
+            effective_target = max(0, target - vacation_minutes)
+            recorded = snapshot.recorded_minutes_for(target_day)
+            if target_day > now.date():
+                if not vacation_available:
+                    summary = (
+                        f"목표 {self.__format_minutes(target)} · 휴가 확인 "
+                        f"{vacation.get('availability_state') or 'error'}"
+                    )
+                elif target <= 0:
+                    summary = "휴무"
+                elif vacation_minutes > 0:
+                    summary = (
+                        f"목표 {self.__format_minutes(target)} · 휴가 "
+                        f"{self.__format_minutes(vacation_minutes)} · 적용 "
+                        f"{self.__format_minutes(effective_target)}"
+                    )
+                else:
+                    summary = f"목표 {self.__format_minutes(target)}"
+                color = "#6B7280"
+            elif is_today:
+                if overview.recorded_available and overview.expected_available:
+                    status, color = self.__delta_text(
+                        overview.realtime_delta_minutes
+                    )
+                    summary = (
+                        f"Wrike {recorded_text} · 현재 기대 {expected_text} · {status}"
+                    )
+                elif not overview.expected_available:
+                    summary = (
+                        f"Wrike {recorded_text} · 현재 기대 조회 불가 · 휴가 확인 "
+                        f"{overview.vacation_state}"
+                    )
+                    color = "#6B7280"
+                else:
+                    summary = (
+                        "Wrike 조회 불가 · 현재 기대 "
+                        f"{self.__format_minutes(overview.expected_now_minutes)}"
+                    )
+                    color = "#6B7280"
+            elif not vacation_available:
+                summary = (
+                    f"Wrike {self.__format_minutes(recorded) if recorded is not None else '조회 불가'}"
+                    f" · 휴가 확인 {vacation.get('availability_state') or 'error'}"
+                )
+                color = "#6B7280"
+            elif recorded is None:
+                if effective_target <= 0:
+                    summary = "휴무"
+                else:
+                    summary = (
+                        f"Wrike 조회 불가 · 목표 "
+                        f"{self.__format_minutes(effective_target)}"
+                    )
+                color = "#6B7280"
+            else:
+                delta = int(recorded) - int(effective_target)
+                status, color = self.__delta_text(delta)
+                summary = (
+                    f"Wrike {self.__format_minutes(recorded)} · 목표 "
+                    f"{self.__format_minutes(effective_target)} · {status}"
+                )
+            rows.append(
+                WorktimePanelDayRow(
+                    weekday=self.__time_log_weekday_labels[index],
+                    date=target_day.strftime("%m/%d"),
+                    summary=summary,
+                    today=is_today,
+                    color=color,
+                )
+            )
+        break_state = self.__worktime_state_store.get_manual_break_state(now=now)
+        today_plan = self.__plan_for_date(now.date())
+        return WorktimePanelModel(
+            week_range=(
+                f"{week_days[0].isoformat()} - {week_days[-1].isoformat()}"
+            ),
+            sync_text=sync_text,
+            sync_state=snapshot.state.value,
+            today_lines=today_lines,
+            has_clock_in=bool(today_plan.get("clock_in")),
+            break_active=bool(break_state.get("active")),
+            rows=tuple(rows),
+            prompt=self.__visible_activity_prompt(now, today_plan),
+        )
+
+    def __show_panel_action_error(self, message: str) -> None:
+        root = self.__root
+        if root is None:
+            return
+        try:
+            self.__show_tooltip(root, str(message or "근무시간 저장 실패"))
+        except Exception:
+            pass
+        return
+
+    def __save_clock_in(self, clock_value: str) -> bool:
+        now = self.__lib.datetime.now()
+        try:
+            parsed = datetime.strptime(str(clock_value), "%H:%M")
+            if parsed.strftime("%H:%M") != str(clock_value):
+                raise ValueError("invalid clock")
+        except Exception:
+            self.__show_panel_action_error("출근 시간은 HH:MM 형식이어야 합니다")
+            return False
+        try:
+            plan = self.__plan_for_date(now.date())
+            target = max(0, min(1440, int(plan.get("target_net_minutes", 0))))
+            ok, _error = self.update_workday_plan(
+                now.date(),
+                target,
+                str(clock_value),
+            )
+        except Exception:
+            ok = False
+        if not ok:
+            self.__show_panel_action_error("출근 시간을 저장하지 못했습니다")
+            return False
+        return True
+
+    def __panel_refresh(self) -> None:
+        self.__request_timelog_snapshot_refresh(force=True)
+        return
+
+    def __panel_clock_in_now(self) -> None:
+        self.__save_clock_in(self.__lib.datetime.now().strftime("%H:%M"))
+        return
+
+    def __edit_clock_in(self, initial_value: str) -> None:
+        try:
+            import importlib
+
+            simpledialog = importlib.import_module("tkinter.simpledialog")
+            edited = simpledialog.askstring(
+                "출근 시간 수정",
+                "출근 시간을 HH:MM 형식으로 입력하세요.",
+                initialvalue=str(initial_value),
+                parent=self.__root,
+            )
+        except Exception:
+            edited = None
+        if edited is None:
+            return
+        self.__save_clock_in(str(edited).strip())
+        return
+
+    def __panel_edit_clock_in(self) -> None:
+        now = self.__lib.datetime.now()
+        plan = self.__plan_for_date(now.date())
+        existing = str(plan.get("clock_in") or "").strip()
+        if not existing:
+            return
+        self.__edit_clock_in(existing)
+        return
+
+    def __panel_toggle_break(self) -> None:
+        try:
+            state = self.toggle_manual_break()
+        except Exception:
+            state = {"ok": False}
+        if not bool(state.get("ok", False)):
+            self.__show_panel_action_error("휴게 상태를 저장하지 못했습니다")
+        return
+
+    def __panel_prompt_accept(self, detected_time: str) -> None:
+        self.__save_clock_in(detected_time)
+        return
+
+    def __panel_prompt_edit(self, detected_time: str) -> None:
+        self.__edit_clock_in(str(detected_time))
+        return
+
+    def __panel_prompt_snooze(self) -> None:
+        now = self.__lib.datetime.now()
+        try:
+            ok, _error = self.__worktime_state_store.snooze_activity_prompt(
+                now.date(),
+                now + timedelta(minutes=30),
+            )
+        except Exception:
+            ok = False
+        if not ok:
+            self.__show_panel_action_error("30분 후 알림을 저장하지 못했습니다")
+            return
+        day_key = now.date().isoformat()
+        if self.__activity_prompt_surfaced_day == day_key:
+            self.__activity_prompt_surfaced_day = ""
+        return
+
+    def __panel_prompt_skip(self) -> None:
+        now = self.__lib.datetime.now()
+        try:
+            ok, _error = self.__worktime_state_store.skip_activity_prompt(
+                now.date()
+            )
+        except Exception:
+            ok = False
+        if not ok:
+            self.__show_panel_action_error("오늘 건너뛰기를 저장하지 못했습니다")
+        return
+
+    def __show_activity_panel(self) -> bool:
+        root = self.__root
+        if root is None:
+            return False
+        panel = self.__ensure_worktime_panel(root)
+        if panel is None:
+            return False
+        try:
+            shown = panel.show(activate=False)
+            mapped = panel.is_visible()
+        except Exception:
+            return False
+        if shown is not True or not mapped:
+            return False
+        self.__request_timelog_snapshot_refresh(force=False)
+        return True
+
+    def __surface_activity_panel(self, target_day) -> bool:
+        try:
+            day_key = target_day.isoformat()
+        except Exception:
+            return False
+        if self.__activity_prompt_surfaced_day == day_key:
+            return False
+        if not self.__show_activity_panel():
+            return False
+        self.__activity_prompt_surfaced_day = day_key
+        return True
+
+    def __on_worktime_activity(self, detected_at) -> None:
+        if not isinstance(detected_at, datetime) or detected_at.tzinfo is not None:
+            return
+        if (detected_at.hour, detected_at.minute) < (8, 0):
+            return
+        plan = self.__plan_for_date(detected_at.date())
+        explicit = bool(plan.get("explicit", False))
+        if plan.get("clock_in"):
+            return
+        if not explicit and detected_at.weekday() >= 5:
+            return
+        if int(plan.get("target_net_minutes", 0)) <= 0:
+            return
+        vacation = self.__vacation_result_for_date(detected_at.date())
+        if vacation.get("automatic_prompt_allowed", True) is not True:
+            return
+        if bool(vacation.get("all_day")):
+            return
+        try:
+            prompt = self.__worktime_state_store.get_activity_prompt(
+                detected_at.date()
+            )
+        except Exception:
+            prompt = None
+        if isinstance(prompt, dict):
+            status = str(prompt.get("status") or "")
+            if status == "skipped":
+                return
+            if status == "pending":
+                self.__surface_activity_panel(detected_at.date())
+                return
+            if status == "snoozed":
+                try:
+                    snooze_until = datetime.fromisoformat(
+                        str(prompt.get("snooze_until") or "")
+                    )
+                except Exception:
+                    return
+                if snooze_until.tzinfo is not None or detected_at < snooze_until:
+                    return
+        try:
+            ok, _error = self.__worktime_state_store.record_activity_prompt_pending(
+                detected_at.date(),
+                detected_at,
+            )
+        except Exception:
+            ok = False
+        if not ok:
+            self.__show_panel_action_error("활동 알림을 저장하지 못했습니다")
+            return
+        self.__surface_activity_panel(detected_at.date())
         return
 
     # ------------------------------------------------------------------
@@ -655,16 +1774,24 @@ class Wrike:
         return matched
 
     def __collect_break_intervals(self, now) -> list[BreakInterval]:
+        return self.__collect_break_intervals_for_day(now.date(), now)
+
+    def __collect_break_intervals_for_day(
+        self,
+        target_day,
+        now,
+    ) -> list[BreakInterval]:
         intervals: list[BreakInterval] = []
+        day_marker = datetime.combine(target_day, datetime.min.time())
         lunch = build_lunch_interval(
-            now,
+            day_marker,
             self.__lunch_break_enabled,
             self.__lunch_start_min,
             self.__lunch_end_min,
         )
         if lunch is not None:
             intervals.append(lunch)
-        for entry in self.__ensure_ical_day_cache(now):
+        for entry in self.__ensure_ical_day_cache(day_marker):
             # Private calendar SUMMARY values are matching inputs only; never
             # expose them through live tooltip rows or logs.
             label = "캘린더"
@@ -686,7 +1813,7 @@ class Wrike:
         try:
             intervals.extend(
                 self.__worktime_state_store.break_intervals_for_day(
-                    now.date(),
+                    target_day,
                     now=now,
                 )
             )
@@ -749,7 +1876,7 @@ class Wrike:
 
     def __schedule_ical_tick(self, initial_delay_sec: float = 2.0) -> None:
         root = self.__root
-        if root is None:
+        if root is None or not self.__background_active:
             return
         if not str(self.__decode_ical_url() or "").strip():
             return
@@ -766,6 +1893,8 @@ class Wrike:
 
     def __start_ical_polling(self) -> None:
         self.__cancel_ical_after()
+        if not self.__background_active:
+            return
         if not str(self.__decode_ical_url() or "").strip():
             return
         self.__schedule_ical_tick(initial_delay_sec=2.0)
@@ -773,8 +1902,9 @@ class Wrike:
 
     def __ical_tick(self) -> None:
         root = self.__root
-        if root is None:
+        if root is None or not self.__background_active:
             return
+        lifecycle_generation = int(self.__lifecycle_generation)
         if self.__ical_fetch_running:
             self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
             return
@@ -793,6 +1923,12 @@ class Wrike:
                     parsed_events = None
 
             def apply_result() -> None:
+                if (
+                    lifecycle_generation != int(self.__lifecycle_generation)
+                    or not self.__background_active
+                    or root is not self.__root
+                ):
+                    return
                 self.__ical_fetch_running = False
                 if parsed_events is None:
                     self.__ical_last_error = "calendar_fetch_failed"
@@ -812,7 +1948,8 @@ class Wrike:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
             self.__ical_fetch_running = False
-            self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
+            if lifecycle_generation == int(self.__lifecycle_generation):
+                self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
         return
 
     def __is_allowed_vacation_ical_url(self, url: str) -> bool:
@@ -853,9 +1990,16 @@ class Wrike:
 
     def __clear_vacation_ical_cache(self) -> None:
         with self.__vacation_ical_lock:
+            configured = bool(
+                str(self.__vacation_ical_url_protected or "").strip()
+                or str(self.__vacation_ical_url_session or "").strip()
+            )
             self.__vacation_ical_calendar = {}
             self.__vacation_ical_events_for_date = ""
             self.__vacation_ical_day_result = {}
+            self.__vacation_ical_week_cache_calendar = None
+            self.__vacation_ical_week_cache = {}
+            self.__vacation_ical_state = "loading" if configured else "unconfigured"
         return
 
     def get_vacation_ical_status_snapshot(self) -> dict:
@@ -867,7 +2011,9 @@ class Wrike:
             ).strip()
             last_success = self.__vacation_ical_last_success_ts
             last_error = str(self.__vacation_ical_last_error or "").strip()
-            fetch_running = bool(self.__vacation_ical_fetch_running)
+            fetch_running = self.__vacation_ical_fetch_owner is not None
+            state = str(self.__vacation_ical_state or "error").strip().lower()
+            has_last_good = bool(self.__vacation_ical_calendar)
         secret_present = bool(protected or session)
         configured = bool(self.__decode_vacation_ical_url()) if secret_present else False
         error_code = last_error
@@ -877,17 +2023,15 @@ class Wrike:
         elif not configured:
             state = "error"
             error_code = VACATION_ERROR_SECRET_UNAVAILABLE
-        elif error_code:
+        elif state not in VACATION_STATES:
             state = "error"
-            if error_code not in {
-                VACATION_ERROR_FETCH_FAILED,
-                VACATION_ERROR_NAME_MISMATCH,
-            }:
-                error_code = VACATION_ERROR_FETCH_FAILED
-        elif fetch_running or observed_name != VACATION_EXPECTED_CALENDAR_NAME:
-            state = "pending"
-        else:
-            state = "ok"
+            error_code = error_code or VACATION_ERROR_FETCH_FAILED
+        elif state == "error" and error_code not in {
+            VACATION_ERROR_FETCH_FAILED,
+            VACATION_ERROR_NAME_MISMATCH,
+            VACATION_ERROR_SECRET_UNAVAILABLE,
+        }:
+            error_code = VACATION_ERROR_FETCH_FAILED
         return {
             "secret_present": secret_present,
             "configured": configured,
@@ -897,6 +2041,8 @@ class Wrike:
             "last_success_ts": last_success,
             "error_code": error_code,
             "fetch_running": fetch_running,
+            "has_last_good": has_last_good,
+            "automatic_prompt_allowed": state in {"unconfigured", "fresh"},
         }
 
     def __fetch_vacation_calendar_text(
@@ -975,7 +2121,11 @@ class Wrike:
         if target_generation != current_generation:
             return
         root = self.__root
-        if root is None or not self.__decode_vacation_ical_url():
+        if (
+            root is None
+            or not self.__background_active
+            or not self.__decode_vacation_ical_url()
+        ):
             return
         interval_sec = max(
             60.0,
@@ -1002,7 +2152,24 @@ class Wrike:
         self.__cancel_vacation_ical_after()
         self.__vacation_ical_generation += 1
         generation = int(self.__vacation_ical_generation)
-        if not self.__decode_vacation_ical_url():
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_fetch_owner = None
+            secret_present = bool(
+                str(self.__vacation_ical_url_protected or "").strip()
+                or str(self.__vacation_ical_url_session or "").strip()
+            )
+            has_last_good = bool(self.__vacation_ical_calendar)
+        url = self.__decode_vacation_ical_url()
+        with self.__vacation_ical_lock:
+            if not secret_present:
+                self.__vacation_ical_state = "unconfigured"
+                self.__vacation_ical_last_error = ""
+            elif not url:
+                self.__vacation_ical_state = "error"
+                self.__vacation_ical_last_error = VACATION_ERROR_SECRET_UNAVAILABLE
+            else:
+                self.__vacation_ical_state = "stale" if has_last_good else "loading"
+        if not self.__background_active or not url:
             return
         self.__schedule_vacation_ical_tick(
             initial_delay_sec=2.0,
@@ -1015,14 +2182,14 @@ class Wrike:
         target_generation = (
             current_generation if generation is None else int(generation)
         )
-        if target_generation != current_generation:
+        if target_generation != current_generation or not self.__background_active:
             return
         root = self.__root
         if root is None:
             return
         self.__cancel_vacation_ical_after()
         with self.__vacation_ical_lock:
-            fetch_running = bool(self.__vacation_ical_fetch_running)
+            fetch_running = self.__vacation_ical_fetch_owner is not None
         if fetch_running:
             self.__schedule_vacation_ical_tick(
                 initial_delay_sec=2.0,
@@ -1034,7 +2201,11 @@ class Wrike:
             return
         expected_name = VACATION_EXPECTED_CALENDAR_NAME
         with self.__vacation_ical_lock:
-            self.__vacation_ical_fetch_running = True
+            fetch_owner = (target_generation, object())
+            self.__vacation_ical_fetch_owner = fetch_owner
+            self.__vacation_ical_state = (
+                "stale" if self.__vacation_ical_calendar else "loading"
+            )
 
         def worker() -> None:
             text = self.__fetch_vacation_calendar_text(
@@ -1059,7 +2230,9 @@ class Wrike:
 
             def apply_result() -> None:
                 with self.__vacation_ical_lock:
-                    self.__vacation_ical_fetch_running = False
+                    if self.__vacation_ical_fetch_owner is not fetch_owner:
+                        return
+                    self.__vacation_ical_fetch_owner = None
                 if target_generation != int(self.__vacation_ical_generation):
                     return
                 current_url = self.__decode_vacation_ical_url()
@@ -1073,24 +2246,22 @@ class Wrike:
                 log_message = ""
                 with self.__vacation_ical_lock:
                     if parsed_calendar is None:
-                        self.__vacation_ical_calendar = {}
-                        self.__vacation_ical_events_for_date = ""
-                        self.__vacation_ical_day_result = {}
-                        self.__vacation_ical_observed_calendar_name = ""
+                        self.__vacation_ical_state = "error"
                         self.__vacation_ical_last_error = (
                             VACATION_ERROR_FETCH_FAILED
                         )
-                        log_message = "vacation ical fetch failed"
+                        log_message = "vacation ical fetch failed; last-good retained"
                     elif not calendar_matches:
-                        self.__vacation_ical_calendar = {}
-                        self.__vacation_ical_events_for_date = ""
-                        self.__vacation_ical_day_result = {}
+                        self.__vacation_ical_state = "error"
                         self.__vacation_ical_observed_calendar_name = observed_name
                         self.__vacation_ical_last_error = (
                             VACATION_ERROR_NAME_MISMATCH
                         )
-                        log_message = "vacation ical calendar name mismatch"
+                        log_message = (
+                            "vacation ical calendar name mismatch; last-good retained"
+                        )
                     else:
+                        self.__vacation_ical_state = "fresh"
                         self.__vacation_ical_last_error = ""
                         self.__vacation_ical_last_success_ts = (
                             self.__lib.datetime.now().isoformat(
@@ -1101,6 +2272,8 @@ class Wrike:
                         self.__vacation_ical_calendar = parsed_calendar
                         self.__vacation_ical_events_for_date = ""
                         self.__vacation_ical_day_result = {}
+                        self.__vacation_ical_week_cache_calendar = None
+                        self.__vacation_ical_week_cache = {}
                         log_message = "vacation ical calendar cached"
                 if log_message:
                     self.__log(log_message)
@@ -1115,13 +2288,18 @@ class Wrike:
             threading.Thread(target=worker, daemon=True).start()
         except Exception:
             with self.__vacation_ical_lock:
-                self.__vacation_ical_fetch_running = False
-                self.__vacation_ical_calendar = {}
-                self.__vacation_ical_events_for_date = ""
-                self.__vacation_ical_day_result = {}
-                self.__vacation_ical_observed_calendar_name = ""
+                if self.__vacation_ical_fetch_owner is not fetch_owner:
+                    return
+                self.__vacation_ical_fetch_owner = None
+            if (
+                target_generation != int(self.__vacation_ical_generation)
+                or not self.__background_active
+            ):
+                return
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_state = "error"
                 self.__vacation_ical_last_error = VACATION_ERROR_FETCH_FAILED
-            self.__log("vacation ical fetch worker failed")
+            self.__log("vacation ical fetch worker failed; last-good retained")
             self.__schedule_vacation_ical_tick(
                 initial_delay_sec=self.__vacation_ical_poll_interval_sec,
                 generation=target_generation,
@@ -1153,32 +2331,16 @@ class Wrike:
             self.__vacation_ical_day_result = result
             return dict(result)
 
-    def __build_overview_rows(self, days: list[dict], daily_target_minutes: int) -> list[tuple[str, str]]:
+    def __build_overview_rows(
+        self,
+        days: list[dict],
+        daily_target_minutes: int,
+        snapshot=None,
+    ) -> list[tuple[str, str]]:
         _ = (days, daily_target_minutes)
         now = self.__lib.datetime.now()
-        try:
-            plan = self.get_workday_plan(now.date())
-        except Exception:
-            plan = {
-                "date": now.strftime("%Y-%m-%d"),
-                "target_net_minutes": self.__default_workday_target_minutes(),
-                "clock_in": None,
-            }
-        try:
-            target_minutes = max(0, int(plan.get("target_net_minutes", 0)))
-        except Exception:
-            target_minutes = self.__default_workday_target_minutes()
-        clock_in = self.__clock_in_from_plan(plan)
-        intervals = self.__collect_break_intervals(now)
-        vacation = self.__ensure_vacation_ical_day_cache(now)
-        vacation_minutes = vacation_credit_minutes(target_minutes, vacation)
-        overview = build_workday_overview(
-            now=now,
-            clock_in=clock_in,
-            target_minutes=target_minutes,
-            intervals=intervals,
-            vacation_minutes=vacation_minutes,
-        )
+        authoritative_snapshot = snapshot or self.__get_timelog_snapshot()
+        overview = self.__today_overview(now, authoritative_snapshot)
         return overview.as_lines(now)
 
     def __count_target_days(self, week_dates: list) -> int:
@@ -1275,23 +2437,40 @@ class Wrike:
             return str(int(hours))
         return f"{hours:.2f}".rstrip("0").rstrip(".")
 
-    def __build_timelog_summary_lines(
-        self, display_name: str, daily_target_minutes: int, days: list[dict]
-    ) -> RefreshableLines:
-        rows = self.__compose_timelog_summary_rows(display_name, daily_target_minutes, days)
+    def __snapshot_days(self, snapshot) -> list[dict]:
+        return [
+            {
+                "date": datetime.combine(item.date, datetime.min.time()),
+                "minutes": int(item.recorded_minutes),
+                "raw": "",
+                "first_dt": None,
+            }
+            for item in snapshot.days
+        ]
+
+    def __build_timelog_summary_lines(self, snapshot) -> RefreshableLines:
+        rows = self.__compose_timelog_summary_rows(snapshot)
 
         def _refresh_rows():
-            return self.__compose_timelog_summary_rows(display_name, daily_target_minutes, days)
+            return self.__compose_timelog_summary_rows(snapshot)
 
         return RefreshableLines(rows, _refresh_rows)
 
     def __compose_timelog_summary_rows(
-        self, display_name: str, daily_target_minutes: int, days: list[dict]
+        self,
+        snapshot,
     ) -> list[tuple[str, str | None]]:
+        days = self.__snapshot_days(snapshot)
+        display_name = str(snapshot.display_name or "내 계정")
         week_start, week_end = self.__extract_week_range(days)
         month_label = self.__format_month_label(week_start, week_end)
         lines: list[tuple[str, str | None]] = [
-            (f"Wrike 타임로그 (이번 주) - {display_name}", None)
+            (f"Wrike 타임로그 (이번 주) - {display_name}", None),
+            (
+                f"범위: 내 전체 타임로그 · snapshot generation "
+                f"{int(snapshot.generation)}",
+                None,
+            ),
         ]
         if month_label:
             lines.append((f"조회 기준 월: {month_label}", None))
@@ -1299,13 +2478,11 @@ class Wrike:
             lines.append(
                 (f"조회 주간: {week_start.strftime('%Y-%m-%d')} ~ {week_end.strftime('%Y-%m-%d')}", None)
             )
-        if self.__monitor_folder_path:
-            path_names = [
-                str(f.get("title") or f.get("id", "?"))
-                for f in self.__monitor_folder_path
-            ]
-            lines.append((f"폴더: {' / '.join(path_names)}", None))
-        overview_rows = self.__build_overview_rows(days, int(daily_target_minutes))
+        overview_rows = self.__build_overview_rows(
+            days,
+            int(self.__daily_target_minutes),
+            snapshot=snapshot,
+        )
         if len(overview_rows) != 5:
             raise ValueError("workday overview must contain exactly five rows")
         lines.extend(overview_rows)
@@ -2238,14 +3415,33 @@ class Wrike:
         self.__wrike_api_contact_token = ""
         return
 
+    def __timelog_token_fingerprint(self, token: str) -> str:
+        value = str(token or "").strip()
+        if not value:
+            return ""
+        payload = f"windows-supporter:wrike-timelog-cache:v1:{value}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def __set_wrike_api_token_session(self, token: str) -> None:
         token = str(token or "").strip()
         current = str(self.__wrike_api_token_session or "").strip()
-        if token != current:
-            self.__wrike_api_token_session = token
+        changed = token != current
+        self.__wrike_api_token_session = token
+        if changed:
             self.__reset_wrike_contact_cache()
-        else:
-            self.__wrike_api_token_session = token
+            if hasattr(self, "_Wrike__timelog_snapshot_lock"):
+                with self.__timelog_snapshot_lock:
+                    self.__timelog_refresh_generation += 1
+                    generation = int(self.__timelog_refresh_generation)
+                    self.__timelog_refresh_running = False
+                    self.__timelog_refresh_running_generation = None
+                    self.__timelog_last_refresh_requested_at = None
+                    self.__timelog_last_good = None
+                    self.__timelog_snapshot = (
+                        make_loading_snapshot(generation=generation)
+                        if token
+                        else make_unconfigured_snapshot(generation=generation)
+                    )
         return
 
     def __get_wrike_api_token(self, root, prompt_if_missing: bool = False) -> str:
@@ -2399,21 +3595,65 @@ class Wrike:
             return "*" * len(raw)
         return raw[:3] + ("*" * max(3, len(raw) - 6)) + raw[-3:]
 
+    def __capture_settings_runtime_state(self) -> dict:
+        names = (
+            "wrike_api_token_session",
+            "wrike_api_contact_id",
+            "wrike_api_contact_name",
+            "wrike_api_contact_token",
+            "daily_target_minutes",
+            "tooltip_duration_ms",
+            "monitor_enabled",
+            "monitor_interval_sec",
+            "monitor_last_total_minutes",
+            "lunch_break_enabled",
+            "lunch_start_min",
+            "lunch_end_min",
+            "ical_poll_interval_sec",
+            "ical_keywords",
+            "ical_url_protected",
+            "ical_url_session",
+            "ical_parsed_events",
+            "ical_events_for_date",
+            "ical_matched",
+            "timelog_refresh_generation",
+            "timelog_refresh_running",
+            "timelog_refresh_running_generation",
+            "timelog_last_refresh_requested_at",
+            "timelog_snapshot",
+            "timelog_last_good",
+            "vacation_ical_url_protected",
+            "vacation_ical_url_session",
+            "vacation_ical_poll_interval_sec",
+            "vacation_ical_calendar",
+            "vacation_ical_events_for_date",
+            "vacation_ical_day_result",
+            "vacation_ical_last_success_ts",
+            "vacation_ical_last_error",
+            "vacation_ical_state",
+            "vacation_ical_observed_calendar_name",
+            "vacation_ical_week_cache_calendar",
+            "vacation_ical_week_cache",
+        )
+        with self.__timelog_snapshot_lock, self.__vacation_ical_lock:
+            return {
+                name: copy.deepcopy(getattr(self, f"_Wrike__{name}"))
+                for name in names
+            }
+
+    def __restore_settings_runtime_state(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        with self.__timelog_snapshot_lock, self.__vacation_ical_lock:
+            for name, value in state.items():
+                setattr(self, f"_Wrike__{name}", copy.deepcopy(value))
+        return
+
     def update_settings(self, data: dict) -> tuple[bool, str | None]:
         if not isinstance(data, dict):
             return False, "invalid settings"
 
-        previous_vacation_state = (
-            self.__vacation_ical_url_protected,
-            self.__vacation_ical_url_session,
-            self.__vacation_ical_poll_interval_sec,
-            self.__vacation_ical_calendar,
-            self.__vacation_ical_events_for_date,
-            self.__vacation_ical_day_result,
-            self.__vacation_ical_last_success_ts,
-            self.__vacation_ical_last_error,
-            self.__vacation_ical_observed_calendar_name,
-        )
+        previous_runtime_state = self.__capture_settings_runtime_state()
 
         token_supplied = "api_token" in data
         clear_token = bool(data.get("clear_api_token", False))
@@ -2565,6 +3805,11 @@ class Wrike:
                 self.__vacation_ical_observed_calendar_name = ""
                 self.__vacation_ical_last_success_ts = None
                 self.__vacation_ical_last_error = ""
+                self.__vacation_ical_state = (
+                    "loading" if vacation_ical_protected else "unconfigured"
+                )
+                self.__vacation_ical_week_cache_calendar = None
+                self.__vacation_ical_week_cache = {}
         elif (
             vacation_ical_url_supplied
             and not vacation_ical_url_value
@@ -2573,17 +3818,7 @@ class Wrike:
             pass
         self.__monitor_last_total_minutes = None
         if not self.__save_settings():
-            (
-                self.__vacation_ical_url_protected,
-                self.__vacation_ical_url_session,
-                self.__vacation_ical_poll_interval_sec,
-                self.__vacation_ical_calendar,
-                self.__vacation_ical_events_for_date,
-                self.__vacation_ical_day_result,
-                self.__vacation_ical_last_success_ts,
-                self.__vacation_ical_last_error,
-                self.__vacation_ical_observed_calendar_name,
-            ) = previous_vacation_state
+            self.__restore_settings_runtime_state(previous_runtime_state)
             return False, "settings save failed"
         self.__restart_monitor()
         self.__start_ical_polling()
@@ -2840,6 +4075,9 @@ class Wrike:
         if "vacation_expected_calendar_name" in data:
             data.pop("vacation_expected_calendar_name", None)
             needs_save = True
+        if "timelog_cache_token_fingerprint" in data:
+            data.pop("timelog_cache_token_fingerprint", None)
+            needs_save = True
 
         try:
             version = int(data.get("settings_version", 0))
@@ -2993,6 +4231,11 @@ class Wrike:
                 self.__vacation_ical_observed_calendar_name = ""
                 self.__vacation_ical_last_success_ts = None
                 self.__vacation_ical_last_error = ""
+                self.__vacation_ical_state = (
+                    "loading" if protected_vacation_raw else "unconfigured"
+                )
+                self.__vacation_ical_week_cache_calendar = None
+                self.__vacation_ical_week_cache = {}
 
         if allow_save and needs_save:
             try:
@@ -3069,15 +4312,216 @@ class Wrike:
                 self.__log("settings save skipped: api token protection failed")
                 return False
             payload["api_token_protected"] = protected_token
+        temp_path = None
+        fd = -1
         try:
-            self.__lib.os.makedirs(self.__time_log_config_dir, exist_ok=True)
-            with open(self.__settings_path, "w", encoding="utf-8") as fp:
-                json.dump(payload, fp, ensure_ascii=False, indent=2)
+            settings_parent = self.__lib.os.path.dirname(
+                self.__lib.os.path.abspath(self.__settings_path)
+            )
+            self.__lib.os.makedirs(settings_parent, exist_ok=True)
+            prefix = f".{self.__lib.os.path.basename(self.__settings_path)}."
+            fd, temp_path = tempfile.mkstemp(
+                prefix=prefix,
+                suffix=".tmp",
+                dir=settings_parent,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fp:
+                fd = -1
+                json.dump(
+                    payload,
+                    fp,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                fp.write("\n")
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(temp_path, self.__settings_path)
+            temp_path = None
             self.__vacation_ical_url_protected = protected_vacation
             return True
         except Exception as exc:
             self.__log_exception("settings save failed", exc)
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
         return False
+
+    def __normalize_authoritative_timelog_entry(
+        self,
+        item,
+        week_start,
+        week_end,
+    ) -> dict | None:
+        if type(item) is not dict:
+            return None
+        raw_id = item.get("id")
+        if type(raw_id) is not str or not raw_id.strip():
+            return None
+        raw_tracked_date = item.get("trackedDate")
+        if type(raw_tracked_date) is not str:
+            return None
+        try:
+            tracked_day = datetime.strptime(
+                raw_tracked_date,
+                "%Y-%m-%d",
+            ).date()
+        except Exception:
+            return None
+        if tracked_day.isoformat() != raw_tracked_date:
+            return None
+        if tracked_day < week_start or tracked_day > week_end:
+            return None
+
+        duration_field = None
+        for candidate in ("hours", "trackedHours", "minutes"):
+            if candidate in item:
+                duration_field = candidate
+                break
+        if duration_field is None:
+            return None
+        raw_duration = item.get(duration_field)
+        if type(raw_duration) not in {int, float}:
+            return None
+        try:
+            duration = float(raw_duration)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(duration) or duration < 0:
+            return None
+        scaled = duration if duration_field == "minutes" else duration * 60.0
+        if not math.isfinite(scaled) or scaled < 0:
+            return None
+        try:
+            minutes = int(round(scaled))
+        except (OverflowError, ValueError):
+            return None
+        if minutes < 0:
+            return None
+
+        normalized = dict(item)
+        normalized["id"] = raw_id.strip()
+        normalized["trackedDate"] = raw_tracked_date
+        normalized["_authoritative_minutes"] = minutes
+        return normalized
+
+    def __authoritative_timelog_entry_is_valid(
+        self,
+        item,
+        week_start,
+        week_end,
+    ) -> bool:
+        return self.__normalize_authoritative_timelog_entry(
+            item,
+            week_start,
+            week_end,
+        ) is not None
+
+    def __query_authoritative_timelogs_week(
+        self,
+        token: str,
+        contact_id: str,
+        week_dates: list,
+    ) -> tuple[list[dict] | None, str | None]:
+        token = str(token or "").strip()
+        contact_id = str(contact_id or "").strip()
+        if not token:
+            return None, "api_token_missing"
+        if not contact_id:
+            return None, "contact_not_found"
+        if not week_dates or len(week_dates) != 7:
+            return None, "week_dates_empty"
+        try:
+            week_start = week_dates[0].date()
+            week_end = week_dates[-1].date()
+        except Exception:
+            return None, "week_dates_empty"
+
+        encoded_contact_id = urllib.parse.quote(contact_id, safe="")
+        contact_url = (
+            f"{self.__wrike_api_base}/contacts/{encoded_contact_id}/timelogs"
+        )
+        base_params = {
+            "trackedDate": json.dumps(
+                {
+                    "start": week_start.isoformat(),
+                    "end": week_end.isoformat(),
+                },
+                separators=(",", ":"),
+            ),
+            "pageSize": str(int(self.__wrike_api_page_size)),
+        }
+        try:
+            max_pages = max(1, int(self.__wrike_api_max_pages))
+        except Exception:
+            max_pages = 10
+        self.__wrike_api_last_error_code = 0
+        page = 0
+        next_token = ""
+        seen_page_tokens: set[str] = set()
+        seen_entry_ids: set[str] = set()
+        items: list[dict] = []
+
+        while True:
+            page += 1
+            params = dict(base_params)
+            if next_token:
+                params["nextPageToken"] = next_token
+            full_url = f"{contact_url}?{urllib.parse.urlencode(params)}"
+            payload = self.__api_get_json(full_url, token)
+            if payload is None:
+                if self.__wrike_api_last_error_code in {401, 403}:
+                    return None, "auth_failed"
+                return None, "request_failed"
+            if not isinstance(payload, dict):
+                return None, "invalid_response"
+            data_items = payload.get("data")
+            if not isinstance(data_items, list):
+                return None, "invalid_response"
+            for item in data_items:
+                normalized = self.__normalize_authoritative_timelog_entry(
+                    item,
+                    week_start,
+                    week_end,
+                )
+                if normalized is None:
+                    return None, "invalid_response"
+                entry_id = normalized["id"]
+                if entry_id in seen_entry_ids:
+                    continue
+                seen_entry_ids.add(entry_id)
+                items.append(normalized)
+
+            if "nextPageToken" not in payload:
+                break
+            following_token = payload["nextPageToken"]
+            if (
+                not isinstance(following_token, str)
+                or not following_token
+                or following_token.strip() != following_token
+            ):
+                return None, "invalid_response"
+            if following_token in seen_page_tokens:
+                return None, "pagination_cycle"
+            if page >= max_pages:
+                return None, "pagination_limit"
+            seen_page_tokens.add(following_token)
+            next_token = following_token
+
+        self.__log(
+            f"authoritative contact timelogs: {len(items)} entries, {page} pages"
+        )
+        return items, None
 
     def __query_timelogs_week(self, token: str, contact_id: str, week_dates: list) -> list[dict] | None:
         if not token or not contact_id or not week_dates:
@@ -3260,28 +4704,40 @@ class Wrike:
                 continue
 
         for item in timelogs:
-            if not isinstance(item, dict):
-                continue
+            if type(item) is not dict:
+                raise ValueError("timelog entry must be an object")
             tracked = item.get("trackedDate") or item.get("date") or ""
             date_key = self.__normalize_date_key(tracked)
             if date_key is None or date_key not in by_date:
                 continue
-            minutes = 0
-            hours = item.get("hours")
-            if hours is None:
-                hours = item.get("trackedHours")
-            if hours is not None:
-                try:
-                    minutes = int(round(float(hours) * 60))
-                except Exception:
-                    minutes = 0
+            if "_authoritative_minutes" in item:
+                minutes = item.get("_authoritative_minutes")
+                if type(minutes) is not int or minutes < 0:
+                    raise ValueError("authoritative minutes must be nonnegative int")
             else:
-                raw_minutes = item.get("minutes")
-                if raw_minutes is not None:
-                    try:
-                        minutes = int(round(float(raw_minutes)))
-                    except Exception:
-                        minutes = 0
+                duration_field = None
+                for candidate in ("hours", "trackedHours", "minutes"):
+                    if candidate in item:
+                        duration_field = candidate
+                        break
+                if duration_field is None:
+                    raise ValueError("timelog duration is missing")
+                raw_duration = item.get(duration_field)
+                if type(raw_duration) not in {int, float}:
+                    raise ValueError("timelog duration must be a JSON number")
+                try:
+                    duration = float(raw_duration)
+                except (OverflowError, ValueError) as exc:
+                    raise ValueError("timelog duration cannot be converted") from exc
+                if not math.isfinite(duration) or duration < 0:
+                    raise ValueError("timelog duration must be finite and nonnegative")
+                scaled = duration if duration_field == "minutes" else duration * 60.0
+                if not math.isfinite(scaled) or scaled < 0:
+                    raise ValueError("scaled timelog duration is invalid")
+                try:
+                    minutes = int(round(scaled))
+                except (OverflowError, ValueError) as exc:
+                    raise ValueError("timelog duration cannot be converted") from exc
             by_date[date_key] = int(by_date.get(date_key, 0)) + int(minutes)
 
         first_dt_by_date = {}
