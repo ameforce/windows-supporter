@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import queue
 import shutil
@@ -12,6 +12,32 @@ from src.utils.LibConnector import LibConnector
 from src.utils.secret_store import SecretStore
 from src.utils.subprocess_utils import build_python_module_command, is_frozen_runtime
 from src.utils.ToolTip import ToolTip
+from src.apps.wrike_ical import (
+    DEFAULT_POLL_TIMEOUT_SEC,
+    fetch_calendar_text,
+    matching_break_events,
+    parse_calendar,
+    parse_ics,
+    read_calendar_response_text,
+    vacation_events_for_day,
+)
+from src.apps.wrike_worktime import (
+    BreakInterval,
+    DEFAULT_LUNCH_END_MIN,
+    DEFAULT_LUNCH_START_MIN,
+    RefreshableLines,
+    build_lunch_interval,
+    build_workday_overview,
+    clock_in_candidate,
+    vacation_credit_minutes,
+)
+from src.apps.wrike_worktime_state import WorktimeStateStore
+
+
+VACATION_EXPECTED_CALENDAR_NAME = "김종인-ePapyrus"
+VACATION_ERROR_FETCH_FAILED = "calendar_fetch_failed"
+VACATION_ERROR_NAME_MISMATCH = "calendar_name_mismatch"
+VACATION_ERROR_SECRET_UNAVAILABLE = "secret_unavailable"
 
 
 class Wrike:
@@ -82,7 +108,7 @@ class Wrike:
         self.__ui_queue = queue.SimpleQueue()
         self.__ui_pump_started = False
         self.__active_tooltip = None
-        self.__settings_version = 4
+        self.__settings_version = 6
         self.__playwright_checked = False
         self.__playwright_ready = False
         self.__time_log_weekday_labels = ['월', '화', '수', '목', '금', '토', '일']
@@ -96,6 +122,39 @@ class Wrike:
         self.__time_log_token_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_token.txt")
         self.__settings_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_settings.json")
         self.__secret_store = SecretStore("windows-supporter:wrike-api-token")
+        self.__vacation_secret_store = SecretStore("windows-supporter:vacation-ical-url")
+        self.__wrike_api_token_secret_scope = "windows-supporter:wrike-api-token"
+        self.__lunch_break_enabled = True
+        self.__lunch_start_min = int(DEFAULT_LUNCH_START_MIN)
+        self.__lunch_end_min = int(DEFAULT_LUNCH_END_MIN)
+        self.__ical_url_protected = ""
+        self.__ical_url_session = ""
+        self.__ical_keywords = ["헬스", "운동", "gym", "fitness", "pt"]
+        self.__ical_poll_interval_sec = 900.0
+        self.__ical_after_id = None
+        self.__ical_fetch_running = False
+        self.__ical_last_success_ts = None
+        self.__ical_last_error = ""
+        self.__ical_events_for_date = ""
+        self.__ical_parsed_events: list[dict] = []
+        self.__ical_matched: list[dict] = []
+        self.__vacation_ical_url_protected = ""
+        self.__vacation_ical_url_session = ""
+        self.__vacation_ical_poll_interval_sec = 900.0
+        self.__vacation_ical_after_id = None
+        self.__vacation_ical_fetch_running = False
+        self.__vacation_ical_last_success_ts = None
+        self.__vacation_ical_last_error = ""
+        self.__vacation_ical_observed_calendar_name = ""
+        self.__vacation_ical_generation = 0
+        self.__vacation_ical_lock = threading.RLock()
+        self.__vacation_ical_calendar: dict = {}
+        self.__vacation_ical_events_for_date = ""
+        self.__vacation_ical_day_result: dict = {}
+        self.__worktime_state_path = self.__lib.os.path.join(
+            self.__time_log_config_dir,
+            "wrike_worktime_state.json",
+        )
 
         self.__re_brackets = self.__lib.re.compile(r'\[([^\]]*)\]')
         self.__re_internal = self.__lib.re.compile(r'^없음\s*\((.+?)\)\s*$')
@@ -106,6 +165,15 @@ class Wrike:
         self.__re_weekday_en = self.__lib.re.compile(r'\b(mon|tue|wed|thu|fri|sat|sun)\b', self.__lib.re.I)
         self.__re_date_num = self.__lib.re.compile(r'\b(\d{1,2})[./-](\d{1,2})\b')
         self.__load_settings()
+        try:
+            store_default_target = max(0, min(1440, int(self.__daily_target_minutes)))
+        except Exception:
+            store_default_target = int(self.__time_log_default_daily_minutes)
+        self.__worktime_state_store = WorktimeStateStore(
+            self.__worktime_state_path,
+            default_target_minutes=store_default_target,
+            now_provider=self.__lib.datetime.now,
+        )
         return
 
     def is_wrike_active(self) -> bool:
@@ -316,47 +384,25 @@ class Wrike:
         return
 
     def show_weekly_timelog_summary(self, root) -> None:
-        if self.__time_log_running:
-            return
-        daily_target_minutes = int(self.__daily_target_minutes)
-        if daily_target_minutes <= 0:
-            self.__show_tooltip(root, "Wrike 설정에서 일 목표 시간을 먼저 입력하세요")
-            self.__open_settings_tab()
-            return
-        token = self.__get_wrike_api_token(root, prompt_if_missing=False)
-        if not token:
-            self.__show_tooltip(root, "Wrike 설정에서 API 키를 먼저 입력하세요")
-            self.__open_settings_tab()
-            return
+        self.__show_live_worktime_summary(root)
+        return
 
-        self.__show_tooltip(root, "Wrike 시간 조회중...")
-        self.__time_log_running = True
+    def __compose_live_worktime_rows(self) -> list[tuple[str, str | None]]:
+        rows = self.__build_overview_rows([], int(self.__daily_target_minutes))
+        if len(rows) != 5:
+            raise ValueError("live worktime overview must contain exactly five rows")
+        return rows
 
-        def task() -> None:
-            try:
-                contact_id, display_name, contact_error = self.__resolve_contact_identity(token)
-                if contact_error or not contact_id:
-                    message = "Wrike 사용자 정보를 찾지 못했습니다"
-                    if contact_error == "auth_failed":
-                        message = "Wrike API 키 인증 실패"
-                        self.__ui_safe(root, self.__open_settings_tab)
-                    elif contact_error == "api_request_failed":
-                        message = "Wrike 사용자 정보 조회 실패"
-                    self.__ui_safe(root, lambda: self.__show_tooltip(root, message))
-                    return
-                days, error = self.__fetch_weekly_timelog(contact_id, token)
-                if error:
-                    self.__ui_safe(root, lambda: self.__show_tooltip(root, error))
-                    return
-                if not days:
-                    self.__ui_safe(root, lambda: self.__show_tooltip(root, "Wrike 타임로그 데이터가 없습니다"))
-                    return
-                lines = self.__build_timelog_summary_lines(display_name, daily_target_minutes, days)
-                self.__ui_safe(root, lambda: self.__show_tooltip(root, "", lines=lines))
-            finally:
-                self.__time_log_running = False
+    def __build_live_worktime_lines(self) -> RefreshableLines:
+        rows = self.__compose_live_worktime_rows()
+        return RefreshableLines(rows, self.__compose_live_worktime_rows)
 
-        threading.Thread(target=task, daemon=True).start()
+    def __show_live_worktime_summary(self, root) -> None:
+        self.__show_tooltip(
+            root,
+            "근무시간 (실시간)",
+            lines=self.__build_live_worktime_lines(),
+        )
         return
 
     def __ui_safe(self, root, fn) -> bool:
@@ -423,6 +469,8 @@ class Wrike:
         self.__root = root
         self.__start_ui_pump(root)
         self.__restart_monitor()
+        self.__start_ical_polling()
+        self.__start_vacation_ical_polling()
         self.__prewarm_wrike_form_browser_async()
         return
 
@@ -529,6 +577,610 @@ class Wrike:
         self.__schedule_monitor_tick(root)
         return
 
+    # ------------------------------------------------------------------
+    # Workday overview: persisted plan, break sources, calendar cache
+    # ------------------------------------------------------------------
+
+    def __record_daily_first_seen(self) -> None:
+        """Legacy no-op: clock-in is now always an explicit persisted plan."""
+        return
+
+    def __default_workday_target_minutes(self) -> int:
+        try:
+            return max(0, min(1440, int(self.__daily_target_minutes)))
+        except Exception:
+            return int(self.__time_log_default_daily_minutes)
+
+    def get_workday_plan(self, day=None) -> dict:
+        return self.__worktime_state_store.get_day_plan(
+            day,
+            default_target_minutes=self.__default_workday_target_minutes(),
+        )
+
+    def update_workday_plan(
+        self,
+        day,
+        target_minutes,
+        clock_in,
+    ) -> tuple[bool, str | None]:
+        return self.__worktime_state_store.update_day_plan(
+            day,
+            target_minutes,
+            clock_in,
+        )
+
+    def clear_workday_plan(self, day=None) -> tuple[bool, str | None]:
+        return self.__worktime_state_store.clear_day_plan(day)
+
+    def __clock_in_from_plan(self, plan: dict):
+        if not isinstance(plan, dict):
+            return None
+        day_value = str(plan.get("date") or "").strip()
+        clock_value = str(plan.get("clock_in") or "").strip()
+        if not day_value or not clock_value:
+            return None
+        try:
+            return datetime.strptime(
+                f"{day_value}T{clock_value}",
+                "%Y-%m-%dT%H:%M",
+            )
+        except Exception:
+            return None
+
+    def __resolve_clock_in_today(self, days: list[dict], today_key: str):
+        _ = days
+        try:
+            plan = self.get_workday_plan(today_key)
+        except Exception:
+            return None
+        return self.__clock_in_from_plan(plan)
+
+    def __ensure_ical_day_cache(self, now) -> list[dict]:
+        try:
+            key = now.strftime("%Y-%m-%d")
+        except Exception:
+            return []
+        if self.__ical_events_for_date == key and self.__ical_matched is not None:
+            return self.__ical_matched
+        try:
+            matched = matching_break_events(
+                self.__ical_parsed_events,
+                list(self.__ical_keywords),
+                now.date(),
+            )
+        except Exception:
+            matched = []
+        self.__ical_matched = matched
+        self.__ical_events_for_date = key
+        return matched
+
+    def __collect_break_intervals(self, now) -> list[BreakInterval]:
+        intervals: list[BreakInterval] = []
+        lunch = build_lunch_interval(
+            now,
+            self.__lunch_break_enabled,
+            self.__lunch_start_min,
+            self.__lunch_end_min,
+        )
+        if lunch is not None:
+            intervals.append(lunch)
+        for entry in self.__ensure_ical_day_cache(now):
+            # Private calendar SUMMARY values are matching inputs only; never
+            # expose them through live tooltip rows or logs.
+            label = "캘린더"
+            for span_start, span_end in entry.get("intervals") or []:
+                try:
+                    start_dt = (
+                        span_start.replace(tzinfo=None)
+                        if getattr(span_start, "tzinfo", None)
+                        else span_start
+                    )
+                    end_dt = (
+                        span_end.replace(tzinfo=None)
+                        if (span_end is not None and getattr(span_end, "tzinfo", None))
+                        else span_end
+                    )
+                    intervals.append(BreakInterval(start_dt, end_dt, label))
+                except Exception:
+                    continue
+        try:
+            intervals.extend(
+                self.__worktime_state_store.break_intervals_for_day(
+                    now.date(),
+                    now=now,
+                )
+            )
+        except Exception as exc:
+            self.__log_exception("manual break intervals failed", exc)
+        return intervals
+
+    def get_manual_break_state(self) -> dict:
+        return self.__worktime_state_store.get_manual_break_state()
+
+    def toggle_manual_break(self) -> dict:
+        state = self.__worktime_state_store.toggle_manual_break()
+        message = str(state.get("message") or "")
+        root = self.__root
+        if root is not None and message:
+            self.__ui_safe(
+                root,
+                lambda message=message: self.__show_tooltip(root, message),
+            )
+        return state
+
+    # ------------------------------------------------------------------
+    # Google Calendar private-iCal polling and overview composition
+    # ------------------------------------------------------------------
+
+    def __mask_ical_url(self, url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        tail = raw[-18:] if len(raw) > 24 else raw
+        return f"****{tail}"
+
+    def __decode_ical_url(self) -> str:
+        session_url = str(self.__ical_url_session or "").strip()
+        if session_url:
+            return session_url
+        protected = str(self.__ical_url_protected or "").strip()
+        if not protected:
+            return ""
+        try:
+            decoded = self.__secret_store.unprotect(protected)
+        except Exception:
+            return ""
+        cleaned = str(decoded or "").strip()
+        if cleaned:
+            self.__ical_url_session = cleaned
+        return cleaned
+
+    def __cancel_ical_after(self) -> None:
+        root = self.__root
+        after_id = self.__ical_after_id
+        self.__ical_after_id = None
+        if root is None or after_id is None:
+            return
+        try:
+            root.after_cancel(after_id)
+        except Exception:
+            pass
+        return
+
+    def __schedule_ical_tick(self, initial_delay_sec: float = 2.0) -> None:
+        root = self.__root
+        if root is None:
+            return
+        if not str(self.__decode_ical_url() or "").strip():
+            return
+        interval_sec = max(60.0, float(self.__ical_poll_interval_sec or 900.0))
+        delay_sec = max(1.0, float(initial_delay_sec)) if initial_delay_sec == 2.0 else min(
+            max(1.0, float(initial_delay_sec)), interval_sec
+        )
+        try:
+            delay_ms = int(delay_sec * 1000)
+            self.__ical_after_id = root.after(delay_ms, self.__ical_tick)
+        except Exception:
+            self.__ical_after_id = None
+        return
+
+    def __start_ical_polling(self) -> None:
+        self.__cancel_ical_after()
+        if not str(self.__decode_ical_url() or "").strip():
+            return
+        self.__schedule_ical_tick(initial_delay_sec=2.0)
+        return
+
+    def __ical_tick(self) -> None:
+        root = self.__root
+        if root is None:
+            return
+        if self.__ical_fetch_running:
+            self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
+            return
+        url = str(self.__decode_ical_url() or "").strip()
+        if not url:
+            return
+        self.__ical_fetch_running = True
+
+        def worker() -> None:
+            text = fetch_calendar_text(url, float(DEFAULT_POLL_TIMEOUT_SEC))
+            parsed_events = None
+            if text:
+                try:
+                    parsed_events = parse_ics(text)
+                except Exception:
+                    parsed_events = None
+
+            def apply_result() -> None:
+                self.__ical_fetch_running = False
+                if parsed_events is None:
+                    self.__ical_last_error = "calendar_fetch_failed"
+                    self.__log("ical fetch failed")
+                else:
+                    self.__ical_last_error = ""
+                    self.__ical_last_success_ts = self.__lib.datetime.now().isoformat(timespec="seconds")
+                    self.__ical_parsed_events = parsed_events
+                    self.__ical_events_for_date = ""
+                    self.__ical_matched = []
+                    self.__log(f"ical events cached: {len(parsed_events)}")
+                self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
+
+            self.__ui_safe(root, apply_result)
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self.__ical_fetch_running = False
+            self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
+        return
+
+    def __is_allowed_vacation_ical_url(self, url: str) -> bool:
+        raw = str(url or "").strip()
+        if not raw:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(raw)
+            host = str(parsed.hostname or "").strip().lower().rstrip(".")
+            port = parsed.port
+        except Exception:
+            return False
+        if str(parsed.scheme or "").lower() != "https":
+            return False
+        if parsed.username or parsed.password or port not in (None, 443):
+            return False
+        return host == "calendar.google.com" or host.endswith(".googleusercontent.com")
+
+    def __decode_vacation_ical_url(self) -> str:
+        with self.__vacation_ical_lock:
+            session_url = str(self.__vacation_ical_url_session or "").strip()
+            protected = str(self.__vacation_ical_url_protected or "").strip()
+        if session_url:
+            return session_url if self.__is_allowed_vacation_ical_url(session_url) else ""
+        if not protected:
+            return ""
+        try:
+            decoded = self.__vacation_secret_store.unprotect(protected)
+        except Exception:
+            return ""
+        cleaned = str(decoded or "").strip()
+        if not self.__is_allowed_vacation_ical_url(cleaned):
+            return ""
+        with self.__vacation_ical_lock:
+            if protected == str(self.__vacation_ical_url_protected or "").strip():
+                self.__vacation_ical_url_session = cleaned
+        return cleaned
+
+    def __clear_vacation_ical_cache(self) -> None:
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_calendar = {}
+            self.__vacation_ical_events_for_date = ""
+            self.__vacation_ical_day_result = {}
+        return
+
+    def get_vacation_ical_status_snapshot(self) -> dict:
+        with self.__vacation_ical_lock:
+            protected = str(self.__vacation_ical_url_protected or "").strip()
+            session = str(self.__vacation_ical_url_session or "").strip()
+            observed_name = str(
+                self.__vacation_ical_observed_calendar_name or ""
+            ).strip()
+            last_success = self.__vacation_ical_last_success_ts
+            last_error = str(self.__vacation_ical_last_error or "").strip()
+            fetch_running = bool(self.__vacation_ical_fetch_running)
+        secret_present = bool(protected or session)
+        configured = bool(self.__decode_vacation_ical_url()) if secret_present else False
+        error_code = last_error
+        if not secret_present:
+            state = "unconfigured"
+            error_code = ""
+        elif not configured:
+            state = "error"
+            error_code = VACATION_ERROR_SECRET_UNAVAILABLE
+        elif error_code:
+            state = "error"
+            if error_code not in {
+                VACATION_ERROR_FETCH_FAILED,
+                VACATION_ERROR_NAME_MISMATCH,
+            }:
+                error_code = VACATION_ERROR_FETCH_FAILED
+        elif fetch_running or observed_name != VACATION_EXPECTED_CALENDAR_NAME:
+            state = "pending"
+        else:
+            state = "ok"
+        return {
+            "secret_present": secret_present,
+            "configured": configured,
+            "expected_calendar_name": VACATION_EXPECTED_CALENDAR_NAME,
+            "observed_calendar_name": observed_name,
+            "state": state,
+            "last_success_ts": last_success,
+            "error_code": error_code,
+            "fetch_running": fetch_running,
+        }
+
+    def __fetch_vacation_calendar_text(
+        self,
+        url: str,
+        timeout_sec: float = DEFAULT_POLL_TIMEOUT_SEC,
+    ) -> str | None:
+        cleaned = str(url or "").strip()
+        if not self.__is_allowed_vacation_ical_url(cleaned):
+            return None
+        validator = self.__is_allowed_vacation_ical_url
+
+        class VacationRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(
+                handler_self,
+                request,
+                fp,
+                code,
+                message,
+                headers,
+                new_url,
+            ):
+                absolute_url = urllib.parse.urljoin(request.full_url, new_url)
+                if not validator(absolute_url):
+                    raise urllib.error.URLError("vacation calendar redirect rejected")
+                return super().redirect_request(
+                    request,
+                    fp,
+                    code,
+                    message,
+                    headers,
+                    absolute_url,
+                )
+
+        try:
+            request = urllib.request.Request(
+                cleaned,
+                headers={
+                    "User-Agent": "windows-supporter/vacation-ical",
+                    "Accept": "text/calendar",
+                },
+            )
+            opener = urllib.request.build_opener(VacationRedirectHandler())
+            with opener.open(
+                request,
+                timeout=max(5.0, float(timeout_sec)),
+            ) as response:
+                final_url = str(response.geturl() or "").strip()
+                if not self.__is_allowed_vacation_ical_url(final_url):
+                    return None
+                return read_calendar_response_text(response)
+        except Exception:
+            return None
+
+    def __cancel_vacation_ical_after(self) -> None:
+        root = self.__root
+        after_id = self.__vacation_ical_after_id
+        self.__vacation_ical_after_id = None
+        if root is None or after_id is None:
+            return
+        try:
+            root.after_cancel(after_id)
+        except Exception:
+            pass
+        return
+
+    def __schedule_vacation_ical_tick(
+        self,
+        initial_delay_sec: float = 2.0,
+        generation: int | None = None,
+    ) -> None:
+        current_generation = int(self.__vacation_ical_generation)
+        target_generation = (
+            current_generation if generation is None else int(generation)
+        )
+        if target_generation != current_generation:
+            return
+        root = self.__root
+        if root is None or not self.__decode_vacation_ical_url():
+            return
+        interval_sec = max(
+            60.0,
+            float(self.__vacation_ical_poll_interval_sec or 900.0),
+        )
+        delay_sec = (
+            max(1.0, float(initial_delay_sec))
+            if initial_delay_sec == 2.0
+            else min(max(1.0, float(initial_delay_sec)), interval_sec)
+        )
+        self.__cancel_vacation_ical_after()
+        try:
+            self.__vacation_ical_after_id = root.after(
+                int(delay_sec * 1000),
+                lambda generation=target_generation: self.__vacation_ical_tick(
+                    generation
+                ),
+            )
+        except Exception:
+            self.__vacation_ical_after_id = None
+        return
+
+    def __start_vacation_ical_polling(self) -> None:
+        self.__cancel_vacation_ical_after()
+        self.__vacation_ical_generation += 1
+        generation = int(self.__vacation_ical_generation)
+        if not self.__decode_vacation_ical_url():
+            return
+        self.__schedule_vacation_ical_tick(
+            initial_delay_sec=2.0,
+            generation=generation,
+        )
+        return
+
+    def __vacation_ical_tick(self, generation: int | None = None) -> None:
+        current_generation = int(self.__vacation_ical_generation)
+        target_generation = (
+            current_generation if generation is None else int(generation)
+        )
+        if target_generation != current_generation:
+            return
+        root = self.__root
+        if root is None:
+            return
+        self.__cancel_vacation_ical_after()
+        with self.__vacation_ical_lock:
+            fetch_running = bool(self.__vacation_ical_fetch_running)
+        if fetch_running:
+            self.__schedule_vacation_ical_tick(
+                initial_delay_sec=2.0,
+                generation=target_generation,
+            )
+            return
+        url = self.__decode_vacation_ical_url()
+        if not url:
+            return
+        expected_name = VACATION_EXPECTED_CALENDAR_NAME
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_fetch_running = True
+
+        def worker() -> None:
+            text = self.__fetch_vacation_calendar_text(
+                url,
+                float(DEFAULT_POLL_TIMEOUT_SEC),
+            )
+            parsed_calendar = None
+            if text:
+                try:
+                    parsed_calendar = parse_calendar(text)
+                except Exception:
+                    parsed_calendar = None
+            observed_name = ""
+            if isinstance(parsed_calendar, dict):
+                observed_name = str(
+                    parsed_calendar.get("calendar_name") or ""
+                ).strip()
+            calendar_matches = bool(
+                isinstance(parsed_calendar, dict)
+                and observed_name == expected_name
+            )
+
+            def apply_result() -> None:
+                with self.__vacation_ical_lock:
+                    self.__vacation_ical_fetch_running = False
+                if target_generation != int(self.__vacation_ical_generation):
+                    return
+                current_url = self.__decode_vacation_ical_url()
+                if current_url != url:
+                    self.__schedule_vacation_ical_tick(
+                        initial_delay_sec=2.0,
+                        generation=target_generation,
+                    )
+                    return
+
+                log_message = ""
+                with self.__vacation_ical_lock:
+                    if parsed_calendar is None:
+                        self.__vacation_ical_calendar = {}
+                        self.__vacation_ical_events_for_date = ""
+                        self.__vacation_ical_day_result = {}
+                        self.__vacation_ical_observed_calendar_name = ""
+                        self.__vacation_ical_last_error = (
+                            VACATION_ERROR_FETCH_FAILED
+                        )
+                        log_message = "vacation ical fetch failed"
+                    elif not calendar_matches:
+                        self.__vacation_ical_calendar = {}
+                        self.__vacation_ical_events_for_date = ""
+                        self.__vacation_ical_day_result = {}
+                        self.__vacation_ical_observed_calendar_name = observed_name
+                        self.__vacation_ical_last_error = (
+                            VACATION_ERROR_NAME_MISMATCH
+                        )
+                        log_message = "vacation ical calendar name mismatch"
+                    else:
+                        self.__vacation_ical_last_error = ""
+                        self.__vacation_ical_last_success_ts = (
+                            self.__lib.datetime.now().isoformat(
+                                timespec="seconds"
+                            )
+                        )
+                        self.__vacation_ical_observed_calendar_name = observed_name
+                        self.__vacation_ical_calendar = parsed_calendar
+                        self.__vacation_ical_events_for_date = ""
+                        self.__vacation_ical_day_result = {}
+                        log_message = "vacation ical calendar cached"
+                if log_message:
+                    self.__log(log_message)
+                self.__schedule_vacation_ical_tick(
+                    initial_delay_sec=self.__vacation_ical_poll_interval_sec,
+                    generation=target_generation,
+                )
+
+            self.__ui_safe(root, apply_result)
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_fetch_running = False
+                self.__vacation_ical_calendar = {}
+                self.__vacation_ical_events_for_date = ""
+                self.__vacation_ical_day_result = {}
+                self.__vacation_ical_observed_calendar_name = ""
+                self.__vacation_ical_last_error = VACATION_ERROR_FETCH_FAILED
+            self.__log("vacation ical fetch worker failed")
+            self.__schedule_vacation_ical_tick(
+                initial_delay_sec=self.__vacation_ical_poll_interval_sec,
+                generation=target_generation,
+            )
+        return
+
+    def __ensure_vacation_ical_day_cache(self, now) -> dict:
+        try:
+            key = now.strftime("%Y-%m-%d")
+            target_day = now.date()
+        except Exception:
+            return {}
+        with self.__vacation_ical_lock:
+            if self.__vacation_ical_events_for_date == key:
+                return dict(self.__vacation_ical_day_result)
+            calendar = self.__vacation_ical_calendar
+        try:
+            result = vacation_events_for_day(
+                calendar,
+                VACATION_EXPECTED_CALENDAR_NAME,
+                target_day,
+            )
+        except Exception:
+            result = {}
+        with self.__vacation_ical_lock:
+            if calendar is not self.__vacation_ical_calendar:
+                return {}
+            self.__vacation_ical_events_for_date = key
+            self.__vacation_ical_day_result = result
+            return dict(result)
+
+    def __build_overview_rows(self, days: list[dict], daily_target_minutes: int) -> list[tuple[str, str]]:
+        _ = (days, daily_target_minutes)
+        now = self.__lib.datetime.now()
+        try:
+            plan = self.get_workday_plan(now.date())
+        except Exception:
+            plan = {
+                "date": now.strftime("%Y-%m-%d"),
+                "target_net_minutes": self.__default_workday_target_minutes(),
+                "clock_in": None,
+            }
+        try:
+            target_minutes = max(0, int(plan.get("target_net_minutes", 0)))
+        except Exception:
+            target_minutes = self.__default_workday_target_minutes()
+        clock_in = self.__clock_in_from_plan(plan)
+        intervals = self.__collect_break_intervals(now)
+        vacation = self.__ensure_vacation_ical_day_cache(now)
+        vacation_minutes = vacation_credit_minutes(target_minutes, vacation)
+        overview = build_workday_overview(
+            now=now,
+            clock_in=clock_in,
+            target_minutes=target_minutes,
+            intervals=intervals,
+            vacation_minutes=vacation_minutes,
+        )
+        return overview.as_lines(now)
+
     def __count_target_days(self, week_dates: list) -> int:
         if not week_dates:
             return 0
@@ -625,6 +1277,16 @@ class Wrike:
 
     def __build_timelog_summary_lines(
         self, display_name: str, daily_target_minutes: int, days: list[dict]
+    ) -> RefreshableLines:
+        rows = self.__compose_timelog_summary_rows(display_name, daily_target_minutes, days)
+
+        def _refresh_rows():
+            return self.__compose_timelog_summary_rows(display_name, daily_target_minutes, days)
+
+        return RefreshableLines(rows, _refresh_rows)
+
+    def __compose_timelog_summary_rows(
+        self, display_name: str, daily_target_minutes: int, days: list[dict]
     ) -> list[tuple[str, str | None]]:
         week_start, week_end = self.__extract_week_range(days)
         month_label = self.__format_month_label(week_start, week_end)
@@ -643,24 +1305,17 @@ class Wrike:
                 for f in self.__monitor_folder_path
             ]
             lines.append((f"폴더: {' / '.join(path_names)}", None))
-        lines.append((f"일 목표: {self.__format_minutes(daily_target_minutes)}", None))
+        overview_rows = self.__build_overview_rows(days, int(daily_target_minutes))
+        if len(overview_rows) != 5:
+            raise ValueError("workday overview must contain exactly five rows")
+        lines.extend(overview_rows)
 
-        today = self.__lib.datetime.now().date()
         for idx, day in enumerate(days):
             date_value = day.get("date")
             raw_minutes = int(day.get("minutes", 0))
             label = self.__format_day_label(date_value, idx)
             display = self.__format_minutes(raw_minutes)
-            per_target = self.__target_minutes_for_date(date_value, int(daily_target_minutes))
-            diff = int(per_target) - raw_minutes
-            if diff > 0:
-                status = f"필요 {self.__format_minutes(diff)}"
-            elif diff < 0:
-                status = f"초과 {self.__format_minutes(-diff)}"
-            else:
-                status = "목표 달성"
-            color = self.__pick_day_color(date_value, raw_minutes, per_target, today)
-            lines.append((f"{label}: 기록 {display}, {status}", color))
+            lines.append((f"{label}: Wrike 기록 {display}", None))
         return lines
 
     def __format_day_label(self, date_value, index: int) -> str:
@@ -1688,7 +2343,8 @@ class Wrike:
 
     def get_settings_snapshot(self) -> dict:
         token = str(self.__wrike_api_token_session or "").strip()
-        return {
+        vacation_status = self.get_vacation_ical_status_snapshot()
+        snapshot = {
             "api_token_configured": bool(token),
             "api_token_masked": self.__mask_api_token(token),
             "daily_target_minutes": int(self.__daily_target_minutes),
@@ -1697,7 +2353,43 @@ class Wrike:
             "monitor_interval_sec": float(self.__monitor_interval_sec),
             "monitor_folder_path": list(self.__monitor_folder_path),
             "settings_path": str(self.__settings_path or ""),
+            "lunch_break_enabled": bool(self.__lunch_break_enabled),
+            "lunch_start_min": int(self.__lunch_start_min),
+            "lunch_end_min": int(self.__lunch_end_min),
+            "ical_url_configured": bool(
+                str(self.__decode_ical_url() or "").strip()
+                or str(self.__ical_url_protected or "").strip()
+            ),
+            "break_keywords": list(self.__ical_keywords),
+            "ical_poll_interval_sec": float(self.__ical_poll_interval_sec),
+            "workday_plan": self.get_workday_plan(),
+            "manual_break_state": self.get_manual_break_state(),
+            "worktime_state_path": str(self.__worktime_state_path or ""),
+            "vacation_ical_secret_present": bool(
+                vacation_status["secret_present"]
+            ),
+            "vacation_ical_url_configured": bool(
+                vacation_status["configured"]
+            ),
+            "vacation_ical_configured": bool(vacation_status["configured"]),
+            "vacation_expected_calendar_name": str(
+                vacation_status["expected_calendar_name"]
+            ),
+            "vacation_observed_calendar_name": str(
+                vacation_status["observed_calendar_name"]
+            ),
+            "vacation_calendar_name": str(
+                vacation_status["observed_calendar_name"]
+            ),
+            "vacation_ical_state": str(vacation_status["state"]),
+            "vacation_ical_poll_interval_sec": float(
+                self.__vacation_ical_poll_interval_sec
+            ),
+            "vacation_ical_last_success_ts": vacation_status["last_success_ts"],
+            "vacation_ical_last_error": str(vacation_status["error_code"]),
+            "vacation_ical_status": dict(vacation_status),
         }
+        return snapshot
 
     def __mask_api_token(self, token: str) -> str:
         raw = str(token or "").strip()
@@ -1711,6 +2403,18 @@ class Wrike:
         if not isinstance(data, dict):
             return False, "invalid settings"
 
+        previous_vacation_state = (
+            self.__vacation_ical_url_protected,
+            self.__vacation_ical_url_session,
+            self.__vacation_ical_poll_interval_sec,
+            self.__vacation_ical_calendar,
+            self.__vacation_ical_events_for_date,
+            self.__vacation_ical_day_result,
+            self.__vacation_ical_last_success_ts,
+            self.__vacation_ical_last_error,
+            self.__vacation_ical_observed_calendar_name,
+        )
+
         token_supplied = "api_token" in data
         clear_token = bool(data.get("clear_api_token", False))
         token = str(data.get("api_token", "") or "").strip()
@@ -1718,6 +2422,91 @@ class Wrike:
         tooltip_ms = data.get("tooltip_duration_ms", self.__tooltip_duration_ms)
         monitor_enabled = bool(data.get("monitor_enabled", self.__monitor_enabled))
         monitor_interval = data.get("monitor_interval_sec", self.__monitor_interval_sec)
+
+        clear_ical_url = bool(data.get("clear_ical_url", False))
+        ical_url_supplied = "ical_url" in data
+        ical_url_value = str(data.get("ical_url", "") or "").strip()
+        clear_vacation_ical_url = bool(
+            data.get("clear_vacation_ical_url", False)
+        )
+        vacation_ical_url_supplied = "vacation_ical_url" in data
+        vacation_ical_url_value = str(
+            data.get("vacation_ical_url", "") or ""
+        ).strip()
+        vacation_poll_raw = data.get(
+            "vacation_ical_poll_interval_sec",
+            self.__vacation_ical_poll_interval_sec,
+        )
+        lunch_enabled = bool(data.get("lunch_break_enabled", self.__lunch_break_enabled))
+        lunch_start_raw = data.get("lunch_start_min", self.__lunch_start_min)
+        lunch_end_raw = data.get("lunch_end_min", self.__lunch_end_min)
+        poll_raw = data.get("ical_poll_interval_sec", self.__ical_poll_interval_sec)
+        keywords_raw = data.get("break_keywords", None)
+
+        try:
+            lunch_start_val = int(lunch_start_raw)
+            lunch_end_val = int(lunch_end_raw)
+        except Exception:
+            return False, "lunch window"
+        lunch_start_val = max(0, min(1439, lunch_start_val))
+        lunch_end_val = max(1, min(1440, lunch_end_val))
+        if lunch_end_val <= lunch_start_val:
+            return False, "lunch window"
+
+        try:
+            poll_val = int(round(float(poll_raw)))
+        except Exception:
+            return False, "calendar interval"
+        poll_val = max(300, min(21600, poll_val))
+
+        try:
+            vacation_poll_val = int(round(float(vacation_poll_raw)))
+        except Exception:
+            return False, "vacation calendar interval"
+        vacation_poll_val = max(300, min(21600, vacation_poll_val))
+
+        next_keywords = None
+        if keywords_raw is not None:
+            parsed_terms = []
+            if isinstance(keywords_raw, str):
+                raw_terms = [piece for piece in keywords_raw.split(",")]
+            elif isinstance(keywords_raw, list):
+                raw_terms = [str(piece) for piece in keywords_raw]
+            else:
+                raw_terms = []
+            for piece in raw_terms:
+                term = piece.strip()
+                if not term:
+                    continue
+                if len(term) > 40:
+                    term = term[:40]
+                parsed_terms.append(term)
+                if len(parsed_terms) >= 12:
+                    break
+            next_keywords = parsed_terms
+
+        ical_protected = None
+        if clear_ical_url:
+            ical_protected = ""
+        elif ical_url_supplied and ical_url_value:
+            lowered = ical_url_value.lower()
+            if not (lowered.startswith("http://") or lowered.startswith("https://")):
+                return False, "calendar url"
+            ical_protected = self.__secret_store.protect(ical_url_value)
+            if not ical_protected:
+                return False, "api token protection"
+
+        vacation_ical_protected = None
+        if clear_vacation_ical_url:
+            vacation_ical_protected = ""
+        elif vacation_ical_url_supplied and vacation_ical_url_value:
+            if not self.__is_allowed_vacation_ical_url(vacation_ical_url_value):
+                return False, "vacation calendar url"
+            vacation_ical_protected = self.__vacation_secret_store.protect(
+                vacation_ical_url_value
+            )
+            if not vacation_ical_protected:
+                return False, "vacation calendar protection"
 
         try:
             daily_minutes = int(round(float(daily_minutes)))
@@ -1748,10 +2537,57 @@ class Wrike:
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__monitor_enabled = bool(monitor_enabled)
         self.__monitor_interval_sec = float(monitor_interval)
+        self.__lunch_break_enabled = bool(lunch_enabled)
+        self.__lunch_start_min = int(lunch_start_val)
+        self.__lunch_end_min = int(lunch_end_val)
+        self.__ical_poll_interval_sec = float(poll_val)
+        self.__vacation_ical_poll_interval_sec = float(vacation_poll_val)
+        if next_keywords is not None:
+            self.__ical_keywords = list(next_keywords)
+        if ical_protected is not None:
+            self.__ical_url_protected = ical_protected
+            if not ical_protected:
+                self.__ical_url_session = ""
+                self.__ical_parsed_events = []
+                self.__ical_events_for_date = ""
+                self.__ical_matched = []
+        elif ical_url_supplied and ical_protected is None and not ical_url_value:
+            pass
+        if vacation_ical_protected is not None:
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_url_protected = vacation_ical_protected
+                self.__vacation_ical_url_session = (
+                    vacation_ical_url_value if vacation_ical_protected else ""
+                )
+                self.__vacation_ical_calendar = {}
+                self.__vacation_ical_events_for_date = ""
+                self.__vacation_ical_day_result = {}
+                self.__vacation_ical_observed_calendar_name = ""
+                self.__vacation_ical_last_success_ts = None
+                self.__vacation_ical_last_error = ""
+        elif (
+            vacation_ical_url_supplied
+            and not vacation_ical_url_value
+            and not clear_vacation_ical_url
+        ):
+            pass
         self.__monitor_last_total_minutes = None
         if not self.__save_settings():
-            return False, "api token protection"
+            (
+                self.__vacation_ical_url_protected,
+                self.__vacation_ical_url_session,
+                self.__vacation_ical_poll_interval_sec,
+                self.__vacation_ical_calendar,
+                self.__vacation_ical_events_for_date,
+                self.__vacation_ical_day_result,
+                self.__vacation_ical_last_success_ts,
+                self.__vacation_ical_last_error,
+                self.__vacation_ical_observed_calendar_name,
+            ) = previous_vacation_state
+            return False, "settings save failed"
         self.__restart_monitor()
+        self.__start_ical_polling()
+        self.__start_vacation_ical_polling()
         return True, None
 
     def get_monitor_folder_path(self) -> list[dict]:
@@ -1940,6 +2776,8 @@ class Wrike:
             data, reason = self.__read_settings_file()
             ok, msg = self.__apply_settings_data(data, reason, allow_save=True)
             self.__restart_monitor()
+            self.__start_ical_polling()
+            self.__start_vacation_ical_polling()
             return ok, msg
         except Exception as exc:
             self.__log_exception("settings reload failed", exc)
@@ -1978,6 +2816,13 @@ class Wrike:
             "monitor_enabled": True,
             "monitor_interval_sec": 5.0,
             "monitor_folder_path": [],
+            "lunch_break_enabled": True,
+            "lunch_start_min": int(DEFAULT_LUNCH_START_MIN),
+            "lunch_end_min": int(DEFAULT_LUNCH_END_MIN),
+            "break_keywords": ["헬스", "운동", "gym", "fitness", "pt"],
+            "ical_poll_interval_sec": 900.0,
+            "vacation_ical_poll_interval_sec": 900.0,
+            "vacation_ical_url_protected": "",
         }
         needs_save = False
         if data is None:
@@ -1992,12 +2837,15 @@ class Wrike:
             if key not in data:
                 data[key] = value
                 needs_save = True
+        if "vacation_expected_calendar_name" in data:
+            data.pop("vacation_expected_calendar_name", None)
+            needs_save = True
 
         try:
             version = int(data.get("settings_version", 0))
         except Exception:
             version = 0
-        if version < int(self.__settings_version):
+        if version < 5:
             try:
                 prev_enabled = bool(data.get("monitor_enabled", False))
                 prev_interval = float(data.get("monitor_interval_sec", 300.0))
@@ -2007,6 +2855,7 @@ class Wrike:
             if (not prev_enabled) and prev_interval >= 300:
                 data["monitor_enabled"] = True
                 data["monitor_interval_sec"] = 5.0
+        if version < int(self.__settings_version):
             data["settings_version"] = int(self.__settings_version)
             needs_save = True
 
@@ -2060,6 +2909,91 @@ class Wrike:
         except Exception:
             self.__monitor_folder_path = []
 
+        try:
+            self.__lunch_break_enabled = bool(
+                data.get("lunch_break_enabled", self.__lunch_break_enabled)
+            )
+        except Exception:
+            pass
+        try:
+            self.__lunch_start_min = max(
+                0, min(1439, int(data.get("lunch_start_min", self.__lunch_start_min)))
+            )
+        except Exception:
+            self.__lunch_start_min = int(DEFAULT_LUNCH_START_MIN)
+        try:
+            self.__lunch_end_min = max(
+                1, min(1440, int(data.get("lunch_end_min", self.__lunch_end_min)))
+            )
+        except Exception:
+            self.__lunch_end_min = int(DEFAULT_LUNCH_END_MIN)
+        if self.__lunch_end_min <= self.__lunch_start_min:
+            self.__lunch_end_min = min(1440, self.__lunch_start_min + 60)
+        try:
+            raw_keywords = data.get("break_keywords")
+            if isinstance(raw_keywords, list):
+                cleaned_keywords = []
+                for item in raw_keywords:
+                    term = str(item or "").strip()
+                    if term and len(term) <= 40:
+                        cleaned_keywords.append(term)
+                    if len(cleaned_keywords) >= 12:
+                        break
+                if cleaned_keywords:
+                    self.__ical_keywords = cleaned_keywords
+        except Exception:
+            pass
+        try:
+            self.__ical_poll_interval_sec = float(
+                data.get("ical_poll_interval_sec", self.__ical_poll_interval_sec)
+            )
+        except Exception:
+            self.__ical_poll_interval_sec = 900.0
+        self.__ical_poll_interval_sec = max(300.0, min(21600.0, self.__ical_poll_interval_sec))
+
+        try:
+            protected_ical_raw = str(data.get("ical_url_protected", "") or "").strip()
+            if protected_ical_raw != str(self.__ical_url_protected or "").strip():
+                self.__ical_url_protected = protected_ical_raw
+                self.__ical_url_session = ""
+                self.__ical_parsed_events = []
+                self.__ical_events_for_date = ""
+                self.__ical_matched = []
+        except Exception:
+            pass
+
+        try:
+            self.__vacation_ical_poll_interval_sec = float(
+                data.get(
+                    "vacation_ical_poll_interval_sec",
+                    self.__vacation_ical_poll_interval_sec,
+                )
+            )
+        except Exception:
+            self.__vacation_ical_poll_interval_sec = 900.0
+        self.__vacation_ical_poll_interval_sec = max(
+            300.0,
+            min(21600.0, self.__vacation_ical_poll_interval_sec),
+        )
+        try:
+            protected_vacation_raw = str(
+                data.get("vacation_ical_url_protected", "") or ""
+            ).strip()
+        except Exception:
+            protected_vacation_raw = ""
+        if protected_vacation_raw != str(
+            self.__vacation_ical_url_protected or ""
+        ).strip():
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_url_protected = protected_vacation_raw
+                self.__vacation_ical_url_session = ""
+                self.__vacation_ical_calendar = {}
+                self.__vacation_ical_events_for_date = ""
+                self.__vacation_ical_day_result = {}
+                self.__vacation_ical_observed_calendar_name = ""
+                self.__vacation_ical_last_success_ts = None
+                self.__vacation_ical_last_error = ""
+
         if allow_save and needs_save:
             try:
                 self.__save_settings()
@@ -2093,7 +3027,42 @@ class Wrike:
             "monitor_enabled": bool(self.__monitor_enabled),
             "monitor_interval_sec": float(self.__monitor_interval_sec),
             "monitor_folder_path": list(self.__monitor_folder_path),
+            "lunch_break_enabled": bool(self.__lunch_break_enabled),
+            "lunch_start_min": int(self.__lunch_start_min),
+            "lunch_end_min": int(self.__lunch_end_min),
+            "break_keywords": list(self.__ical_keywords),
+            "ical_poll_interval_sec": float(self.__ical_poll_interval_sec),
+            "vacation_ical_poll_interval_sec": float(
+                self.__vacation_ical_poll_interval_sec
+            ),
         }
+        ical_url_now = str(self.__decode_ical_url() or "").strip()
+        if ical_url_now:
+            protected_ical = self.__secret_store.protect(ical_url_now)
+            if not protected_ical:
+                self.__log("settings save skipped: ical url protection failed")
+                return False
+            payload["ical_url_protected"] = protected_ical
+        elif str(self.__ical_url_protected or "").strip():
+            payload["ical_url_protected"] = ""
+        vacation_url_now = str(self.__vacation_ical_url_session or "").strip()
+        protected_vacation = str(
+            self.__vacation_ical_url_protected or ""
+        ).strip()
+        if vacation_url_now:
+            if not self.__is_allowed_vacation_ical_url(vacation_url_now):
+                self.__log("settings save skipped: vacation calendar url invalid")
+                return False
+            if not protected_vacation:
+                protected_vacation = self.__vacation_secret_store.protect(
+                    vacation_url_now
+                )
+                if not protected_vacation:
+                    self.__log(
+                        "settings save skipped: vacation calendar protection failed"
+                    )
+                    return False
+        payload["vacation_ical_url_protected"] = protected_vacation
         if token:
             protected_token = self.__secret_store.protect(token)
             if not protected_token:
@@ -2104,6 +3073,7 @@ class Wrike:
             self.__lib.os.makedirs(self.__time_log_config_dir, exist_ok=True)
             with open(self.__settings_path, "w", encoding="utf-8") as fp:
                 json.dump(payload, fp, ensure_ascii=False, indent=2)
+            self.__vacation_ical_url_protected = protected_vacation
             return True
         except Exception as exc:
             self.__log_exception("settings save failed", exc)
@@ -2314,11 +3284,31 @@ class Wrike:
                         minutes = 0
             by_date[date_key] = int(by_date.get(date_key, 0)) + int(minutes)
 
+        first_dt_by_date = {}
+        for item in timelogs:
+            if not isinstance(item, dict):
+                continue
+            tracked = item.get("trackedDate") or item.get("date") or ""
+            entry_date_key = self.__normalize_date_key(tracked)
+            if entry_date_key is None:
+                continue
+            candidate = clock_in_candidate(item)
+            if candidate is None:
+                continue
+            previous = first_dt_by_date.get(entry_date_key)
+            if previous is None or candidate < previous:
+                first_dt_by_date[entry_date_key] = candidate
+
         days = []
         for day in week_dates:
             date_key = day.date()
             minutes = int(by_date.get(date_key, 0))
-            days.append({"date": day, "minutes": minutes, "raw": ""})
+            days.append({
+                "date": day,
+                "minutes": minutes,
+                "raw": "",
+                "first_dt": first_dt_by_date.get(date_key),
+            })
         return days
 
     def __normalize_date_key(self, value: str):
