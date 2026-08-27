@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, datetime
+from math import isfinite
 from typing import Any
 import threading
 
@@ -13,6 +15,9 @@ class WrikeSettingsView:
         self._tk = None
         self._ttk = None
         self._win = None
+        self._scroll_canvas = None
+        self._scroll_body = None
+        self._scroll_window_id = None
 
         self._token_var = None
         self._daily_var = None
@@ -23,7 +28,13 @@ class WrikeSettingsView:
         self._status_label = None
         self._show_token_var = None
         self._token_entry = None
+        self._workday_date_var = None
+        self._workday_target_var = None
+        self._workday_clock_in_var = None
         self._break_button_var = None
+        self._manual_break_state: dict[str, Any] = {}
+        self._break_timer_after_id = None
+        self._break_timer_window = None
         self._lunch_enabled_var = None
         self._lunch_start_var = None
         self._lunch_end_var = None
@@ -31,6 +42,10 @@ class WrikeSettingsView:
         self._ical_keywords_var = None
         self._ical_interval_var = None
         self._ical_dirty = False
+        self._vacation_ical_url_var = None
+        self._vacation_ical_status_var = None
+        self._vacation_ical_dirty = False
+        self._vacation_ical_status: dict[str, Any] = {}
         self._folder_path_frame = None
         self._folder_levels: list[dict] = []
         self._folder_path_label = None
@@ -91,7 +106,7 @@ class WrikeSettingsView:
 
         tk.Label(
             title_row,
-            text="Wrike Timelog Monitoring 설정",
+            text="근무시간 · Wrike · 휴가 설정",
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 14, "bold"),
@@ -115,7 +130,7 @@ class WrikeSettingsView:
 
         tk.Label(
             header_inner,
-            text="API 키/일 목표/모니터링을 설정합니다.",
+            text="근무 계획, Wrike API·모니터링, 휴게·휴가 캘린더를 설정합니다.",
             bg=card_bg,
             fg=text_muted,
             font=("Segoe UI", 9),
@@ -138,11 +153,10 @@ class WrikeSettingsView:
         )
         content_card.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        body = tk.Frame(content_card, bg=card_bg)
-        body.pack(fill="both", expand=True, padx=14, pady=12)
+        body = self._create_scroll_body(content_card, card_bg)
 
         content = tk.Frame(body, bg=card_bg)
-        content.pack(fill="both", expand=True)
+        content.pack(fill="both", expand=True, padx=14, pady=12)
         content.columnconfigure(1, weight=1)
 
         self._token_var = tk.StringVar(value="")
@@ -151,6 +165,9 @@ class WrikeSettingsView:
         self._monitor_enabled_var = tk.BooleanVar(value=False)
         self._monitor_interval_var = tk.StringVar(value="")
         self._show_token_var = tk.BooleanVar(value=False)
+        self._workday_date_var = tk.StringVar(value=date.today().isoformat())
+        self._workday_target_var = tk.StringVar(value="")
+        self._workday_clock_in_var = tk.StringVar(value="")
 
         row = 0
 
@@ -177,6 +194,49 @@ class WrikeSettingsView:
             entry.grid(row=row, column=1, sticky="we", pady=6)
             return entry
 
+        tk.Label(
+            content,
+            text="── 오늘·날짜별 근무 계획 ──",
+            bg=card_bg,
+            fg="#2563EB",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        row += 1
+
+        add_label("날짜(YYYY-MM-DD)")
+        add_entry(self._workday_date_var)
+        row += 1
+
+        add_label("목표 순근무 시간(시간)")
+        add_entry(self._workday_target_var)
+        row += 1
+
+        add_label("출근 시각(HH:MM)")
+        add_entry(self._workday_clock_in_var)
+        row += 1
+
+        workday_btn_row = tk.Frame(content, bg=card_bg)
+        workday_btn_row.grid(row=row, column=1, columnspan=2, sticky="w", pady=(2, 10))
+        ttk.Button(
+            workday_btn_row, text="계획 불러오기", command=self._on_load_workday_plan
+        ).pack(side="left")
+        ttk.Button(
+            workday_btn_row, text="계획 저장", command=self._on_save_workday_plan
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(
+            workday_btn_row, text="계획 초기화", command=self._on_clear_workday_plan
+        ).pack(side="left", padx=(4, 0))
+        row += 1
+
+        tk.Label(
+            content,
+            text="── 기본 설정 ──",
+            bg=card_bg,
+            fg="#2563EB",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 4))
+        row += 1
+
         add_label("API 토큰")
         self._token_entry = add_entry(self._token_var, show="*")
         tk.Checkbutton(
@@ -193,7 +253,7 @@ class WrikeSettingsView:
         ).grid(row=row, column=2, sticky="w", padx=(8, 0))
         row += 1
 
-        add_label("일 목표 시간(시간)")
+        add_label("기본 일 목표 시간(시간)")
         add_entry(self._daily_var)
         row += 1
 
@@ -224,10 +284,12 @@ class WrikeSettingsView:
         self._ical_url_var = tk.StringVar(value="")
         self._ical_keywords_var = tk.StringVar(value="")
         self._ical_interval_var = tk.StringVar(value="15")
+        self._vacation_ical_url_var = tk.StringVar(value="")
+        self._vacation_ical_status_var = tk.StringVar(value="미설정")
 
         tk.Label(
             content,
-            text="── 휴게 시간 · 구글 캘린더 ──",
+            text="── 휴게 시간 · 휴게 캘린더 ──",
             bg=card_bg,
             fg="#2563EB",
             font=("Segoe UI", 9, "bold"),
@@ -257,12 +319,10 @@ class WrikeSettingsView:
         ttk.Entry(lunch_frame, textvariable=self._lunch_end_var, width=8).pack(side="left")
         row += 1
 
-        add_label("캘린더 비공개 iCal URL")
+        add_label("휴게 캘린더 비공개 iCal URL")
         ical_entry_holder = add_entry(self._ical_url_var, show="*")
         try:
-            ical_entry_holder.bind(
-                "<KeyRelease>", lambda _event: setattr(self, "_ical_dirty", True)
-            )
+            ical_entry_holder.bind("<KeyRelease>", self._mark_ical_dirty)
         except Exception:
             pass
         ttk.Button(content, text="지우기", command=self._on_clear_ical).grid(
@@ -270,12 +330,72 @@ class WrikeSettingsView:
         )
         row += 1
 
-        add_label("헬스장 키워드(쉼표 구분)")
+        add_label("휴게 캘린더 헬스장 키워드(쉼표 구분)")
         add_entry(self._ical_keywords_var)
         row += 1
 
-        add_label("캘린더 조회 주기(분)")
+        add_label("휴게 캘린더 조회 주기(분)")
         add_entry(self._ical_interval_var)
+        row += 1
+
+        tk.Label(
+            content,
+            text="── 휴가 캘린더 ──",
+            bg=card_bg,
+            fg="#2563EB",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        row += 1
+
+        add_label("휴가 캘린더 비공개 iCal URL")
+        vacation_entry = add_entry(self._vacation_ical_url_var, show="*")
+        try:
+            vacation_entry.bind("<KeyRelease>", self._mark_vacation_ical_dirty)
+        except Exception:
+            pass
+        ttk.Button(
+            content, text="지우기", command=self._on_clear_vacation_ical
+        ).grid(row=row, column=2, sticky="w", padx=(8, 0))
+        row += 1
+
+        tk.Label(
+            content,
+            text="휴가 캘린더 상태",
+            bg=card_bg,
+            fg="#111827",
+            font=("Segoe UI", 9),
+        ).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=6)
+
+        def bind_dynamic_wrap(label: Any, fallback: int = 420) -> None:
+            def sync_wrap(event: Any) -> None:
+                try:
+                    width = max(220, int(event.width) - 4)
+                    current = int(float(label.cget("wraplength") or 0))
+                    if current != width:
+                        label.configure(wraplength=width)
+                except Exception:
+                    return
+
+            try:
+                label.configure(wraplength=max(220, int(fallback)))
+                label.bind("<Configure>", sync_wrap, add="+")
+            except Exception:
+                pass
+            return
+
+        vacation_status_label = tk.Label(
+            content,
+            textvariable=self._vacation_ical_status_var,
+            bg=card_bg,
+            fg=text_muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+        )
+        bind_dynamic_wrap(vacation_status_label)
+        vacation_status_label.grid(
+            row=row, column=1, columnspan=2, sticky="we", pady=6
+        )
         row += 1
 
         tk.Label(
@@ -301,9 +421,9 @@ class WrikeSettingsView:
             fg="#2563EB",
             font=("Segoe UI", 8),
             anchor="w",
-            wraplength=600,
             justify="left",
         )
+        bind_dynamic_wrap(self._folder_path_label)
         self._folder_path_label.pack(fill="x", pady=(4, 0))
 
         folder_btn_row = tk.Frame(folder_outer, bg=card_bg)
@@ -317,13 +437,17 @@ class WrikeSettingsView:
         ttk.Button(
             folder_btn_row, text="캐시 새로고침", command=self._on_refresh_cache
         ).pack(side="left", padx=(4, 0))
-        tk.Label(
-            folder_btn_row,
+        folder_help_label = tk.Label(
+            folder_outer,
             text="비워두면 전체 타임로그를 조회합니다.",
             bg=card_bg,
             fg=text_muted,
             font=("Segoe UI", 8),
-        ).pack(side="left", padx=(8, 0))
+            anchor="w",
+            justify="left",
+        )
+        bind_dynamic_wrap(folder_help_label)
+        folder_help_label.pack(fill="x", pady=(4, 0))
 
         path = ""
         try:
@@ -348,6 +472,9 @@ class WrikeSettingsView:
 
         self._load_settings()
         self._register_autosave_traces()
+        self._bind_scroll_targets()
+        self._refresh_scroll_region()
+        self._start_break_timer()
         try:
             if self._win is not None:
                 self._win.after(120, self._auto_validate_token)
@@ -367,6 +494,168 @@ class WrikeSettingsView:
             return
         self._tk = tk
         self._ttk = ttk
+        return
+
+    def _create_scroll_body(self, parent: Any, bg: str) -> Any:
+        tk = self._tk
+        ttk = self._ttk
+        self._scroll_canvas = None
+        self._scroll_body = None
+        self._scroll_window_id = None
+
+        def fallback_body() -> Any:
+            body = tk.Frame(parent, bg=bg)
+            body.pack(fill="both", expand=True)
+            return body
+
+        canvas_factory = getattr(tk, "Canvas", None)
+        scrollbar_factory = getattr(ttk, "Scrollbar", None)
+        if not callable(canvas_factory) or not callable(scrollbar_factory):
+            return fallback_body()
+
+        host = None
+        try:
+            host = tk.Frame(parent, bg=bg)
+            canvas = canvas_factory(
+                host,
+                bg=bg,
+                highlightthickness=0,
+                borderwidth=0,
+            )
+            scrollbar = scrollbar_factory(host, orient="vertical", command=canvas.yview)
+            body = tk.Frame(canvas, bg=bg)
+            required = (
+                callable(getattr(canvas, "bbox", None))
+                and callable(getattr(canvas, "configure", None))
+                and callable(getattr(canvas, "create_window", None))
+                and callable(getattr(canvas, "itemconfigure", None))
+                and callable(getattr(canvas, "yview_scroll", None))
+                and callable(getattr(scrollbar, "set", None))
+                and callable(getattr(body, "winfo_reqwidth", None))
+            )
+            if not required:
+                raise RuntimeError("scroll widgets are incomplete")
+
+            canvas.configure(yscrollcommand=scrollbar.set)
+            host.pack(fill="both", expand=True)
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+            def sync_scroll_region(_event: Any = None) -> None:
+                self._refresh_scroll_region()
+                return
+
+            def sync_content_width(event: Any) -> None:
+                try:
+                    canvas.itemconfigure(window_id, width=max(1, int(event.width)))
+                except Exception:
+                    pass
+                return
+
+            body.bind("<Configure>", sync_scroll_region)
+            canvas.bind("<Configure>", sync_content_width)
+            self._scroll_canvas = canvas
+            self._scroll_body = body
+            self._scroll_window_id = window_id
+            return body
+        except Exception:
+            if host is not None:
+                try:
+                    host.destroy()
+                except Exception:
+                    pass
+            self._scroll_canvas = None
+            self._scroll_body = None
+            self._scroll_window_id = None
+            return fallback_body()
+
+    def _refresh_scroll_region(self) -> None:
+        canvas = self._scroll_canvas
+        body = self._scroll_body
+        if canvas is None or body is None:
+            return
+        try:
+            body.winfo_reqwidth()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+        return
+
+    def _scroll_settings(self, canvas: Any, event: Any) -> str:
+        if canvas is not self._scroll_canvas:
+            return "break"
+        win = self._win
+        if win is None:
+            return "break"
+        exists = getattr(win, "winfo_exists", None)
+        if callable(exists):
+            try:
+                if not bool(exists()):
+                    return "break"
+            except Exception:
+                return "break"
+        is_mapped = getattr(win, "winfo_ismapped", None)
+        if callable(is_mapped):
+            try:
+                if not bool(is_mapped()):
+                    return "break"
+            except Exception:
+                return "break"
+        try:
+            delta = int(getattr(event, "delta", 0) or 0)
+        except Exception:
+            delta = 0
+        if delta:
+            units = max(1, abs(delta) // 120)
+            units = -units if delta > 0 else units
+        else:
+            button = getattr(event, "num", None)
+            units = -1 if button == 4 else 1 if button == 5 else 0
+        if units:
+            try:
+                canvas.yview_scroll(int(units), "units")
+            except Exception:
+                pass
+        return "break"
+
+    def _bind_scroll_targets(self) -> None:
+        canvas = self._scroll_canvas
+        body = self._scroll_body
+        root = self._win
+        if canvas is None or body is None or root is None:
+            return
+        visited: set[int] = set()
+
+        def bind_widget(widget: Any) -> None:
+            marker = id(widget)
+            if marker in visited:
+                return
+            visited.add(marker)
+            callbacks = (
+                ("<MouseWheel>", lambda event: self._scroll_settings(canvas, event)),
+                ("<Button-4>", lambda event: self._scroll_settings(canvas, event)),
+                ("<Button-5>", lambda event: self._scroll_settings(canvas, event)),
+            )
+            for sequence, callback in callbacks:
+                try:
+                    widget.bind(sequence, callback, add="+")
+                except TypeError:
+                    try:
+                        widget.bind(sequence, callback)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                children = list(widget.winfo_children())
+            except Exception:
+                children = []
+            for child in children:
+                bind_widget(child)
+            return
+
+        bind_widget(root)
         return
 
     def _toggle_token_visibility(self) -> None:
@@ -403,11 +692,316 @@ class WrikeSettingsView:
             return str(int(seconds))
         return f"{seconds:.1f}".rstrip("0").rstrip(".")
 
+    def _parse_iso_day(self, text: str) -> tuple[str | None, str | None]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None, "날짜를 입력해 주세요."
+        try:
+            parsed = date.fromisoformat(raw)
+        except Exception:
+            return None, "날짜 형식은 YYYY-MM-DD 입니다."
+        normalized = parsed.isoformat()
+        if raw != normalized:
+            return None, "날짜 형식은 YYYY-MM-DD 입니다."
+        return normalized, None
+
+    def _strict_nonnegative_float(self, text: str, label: str) -> tuple[float, str | None]:
+        raw = str(text or "").strip()
+        if not raw:
+            return 0.0, f"{label} 값을 입력해 주세요."
+        try:
+            value = float(raw)
+        except Exception:
+            return 0.0, f"{label} 값이 숫자가 아닙니다."
+        if not isfinite(value):
+            return 0.0, f"{label} 값이 올바르지 않습니다."
+        if value < 0:
+            return 0.0, f"{label} 값은 0 이상이어야 합니다."
+        return float(value), None
+
+    def _apply_workday_plan(self, plan: Any, fallback_day: str | None = None) -> None:
+        data = dict(plan) if isinstance(plan, dict) else {}
+        day_text = str(data.get("date") or fallback_day or date.today().isoformat()).strip()
+        try:
+            target_minutes = max(0, int(data.get("target_net_minutes", 0) or 0))
+        except Exception:
+            target_minutes = 0
+        clock_in = str(data.get("clock_in") or "").strip()
+        try:
+            if self._workday_date_var is not None:
+                self._workday_date_var.set(day_text)
+        except Exception:
+            pass
+        try:
+            if self._workday_target_var is not None:
+                self._workday_target_var.set(self._format_hours(target_minutes))
+        except Exception:
+            pass
+        try:
+            if self._workday_clock_in_var is not None:
+                self._workday_clock_in_var.set(clock_in)
+        except Exception:
+            pass
+        return
+
+    def _read_workday_day(self) -> tuple[str | None, str | None]:
+        value = ""
+        try:
+            if self._workday_date_var is not None:
+                value = str(self._workday_date_var.get() or "")
+        except Exception:
+            value = ""
+        return self._parse_iso_day(value)
+
+    def _fetch_and_apply_workday_plan(self, day_text: str) -> tuple[bool, str | None]:
+        try:
+            plan = self._wrike.get_workday_plan(day_text)
+        except Exception as exc:
+            return False, str(exc) or "근무 계획을 불러오지 못했습니다."
+        if not isinstance(plan, dict):
+            return False, "근무 계획 응답이 올바르지 않습니다."
+        self._apply_workday_plan(plan, fallback_day=day_text)
+        return True, None
+
+    def _on_load_workday_plan(self) -> None:
+        day_text, error = self._read_workday_day()
+        if error or day_text is None:
+            self._set_status(f"계획 불러오기 실패: {error}", level="error")
+            return
+        ok, error = self._fetch_and_apply_workday_plan(day_text)
+        if ok:
+            self._set_status("근무 계획을 불러왔습니다.", level="ok")
+        else:
+            self._set_status(f"계획 불러오기 실패: {error}", level="error")
+        return
+
+    def _on_save_workday_plan(self) -> None:
+        day_text, error = self._read_workday_day()
+        if error or day_text is None:
+            self._set_status(f"계획 저장 실패: {error}", level="error")
+            return
+        try:
+            target_text = (
+                str(self._workday_target_var.get() or "")
+                if self._workday_target_var is not None
+                else ""
+            )
+        except Exception:
+            target_text = ""
+        target_hours, error = self._strict_nonnegative_float(
+            target_text, "목표 순근무 시간"
+        )
+        if error:
+            self._set_status(f"계획 저장 실패: {error}", level="error")
+            return
+        try:
+            clock_text = (
+                str(self._workday_clock_in_var.get() or "")
+                if self._workday_clock_in_var is not None
+                else ""
+            )
+        except Exception:
+            clock_text = ""
+        clock_text = clock_text.strip()
+        if (
+            len(clock_text) != 5
+            or clock_text[2:3] != ":"
+            or not clock_text[:2].isdigit()
+            or not clock_text[3:].isdigit()
+        ):
+            self._set_status(
+                "계획 저장 실패: 출근 시각 형식은 HH:MM 입니다.",
+                level="error",
+            )
+            return
+        clock_minutes, error = self._parse_hhmm(clock_text, "출근 시각")
+        if error or clock_minutes is None:
+            self._set_status(f"계획 저장 실패: {error}", level="error")
+            return
+        target_minutes_value = float(target_hours) * 60.0
+        if not isfinite(target_minutes_value):
+            self._set_status(
+                "계획 저장 실패: 목표 순근무 시간이 너무 큽니다.",
+                level="error",
+            )
+            return
+        target_minutes = max(0, int(round(target_minutes_value)))
+        normalized_clock = self._format_minutes_as_hhmm(clock_minutes)
+        try:
+            ok, update_error = self._wrike.update_workday_plan(
+                day_text,
+                target_minutes,
+                normalized_clock,
+            )
+        except Exception as exc:
+            ok, update_error = False, str(exc) or "근무 계획 저장에 실패했습니다."
+        if not ok:
+            self._set_status(
+                f"계획 저장 실패: {update_error or '알 수 없는 오류'}",
+                level="error",
+            )
+            return
+        refreshed, _refresh_error = self._fetch_and_apply_workday_plan(day_text)
+        if not refreshed:
+            self._apply_workday_plan(
+                {
+                    "date": day_text,
+                    "target_net_minutes": target_minutes,
+                    "clock_in": normalized_clock,
+                }
+            )
+        self._set_status("근무 계획 저장 완료", level="ok")
+        return
+
+    def _on_clear_workday_plan(self) -> None:
+        day_text, error = self._read_workday_day()
+        if error or day_text is None:
+            self._set_status(f"계획 초기화 실패: {error}", level="error")
+            return
+        try:
+            ok, clear_error = self._wrike.clear_workday_plan(day_text)
+        except Exception as exc:
+            ok, clear_error = False, str(exc) or "근무 계획 초기화에 실패했습니다."
+        if not ok:
+            self._set_status(
+                f"계획 초기화 실패: {clear_error or '알 수 없는 오류'}",
+                level="error",
+            )
+            return
+        refreshed, refresh_error = self._fetch_and_apply_workday_plan(day_text)
+        if not refreshed:
+            self._set_status(
+                f"계획 초기화 후 불러오기 실패: {refresh_error}",
+                level="error",
+            )
+            return
+        self._set_status("근무 계획 초기화 완료", level="ok")
+        return
+
+    def _vacation_status_from_settings(self, settings: Any) -> dict[str, Any]:
+        data = settings if isinstance(settings, dict) else {}
+        nested = data.get("vacation_ical_status")
+        if isinstance(nested, dict):
+            return dict(nested)
+        configured = bool(
+            data.get(
+                "vacation_ical_configured",
+                data.get("vacation_ical_url_configured", False),
+            )
+        )
+        return {
+            "secret_present": bool(
+                data.get("vacation_ical_secret_present", configured)
+            ),
+            "configured": configured,
+            "expected_calendar_name": str(
+                data.get("vacation_expected_calendar_name") or ""
+            ).strip(),
+            "observed_calendar_name": str(
+                data.get("vacation_observed_calendar_name") or ""
+            ).strip(),
+            "state": str(
+                data.get("vacation_ical_state")
+                or ("pending" if configured else "unconfigured")
+            ).strip(),
+            "last_success_ts": data.get("vacation_ical_last_success_ts"),
+            "error_code": str(
+                data.get("vacation_ical_last_error") or ""
+            ).strip(),
+            "fetch_running": False,
+        }
+
+    def _read_vacation_status_snapshot(self) -> dict[str, Any] | None:
+        getter = getattr(self._wrike, "get_vacation_ical_status_snapshot", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+        except Exception:
+            return None
+        return dict(value) if isinstance(value, dict) else None
+
+    def _refresh_vacation_status_from_backend(self) -> bool:
+        status = self._read_vacation_status_snapshot()
+        if status is None:
+            return False
+        self._refresh_vacation_ical_status(status)
+        return True
+
+    def _refresh_vacation_ical_status(self, status: Any = None) -> None:
+        if isinstance(status, dict):
+            self._vacation_ical_status = dict(status)
+        data = dict(self._vacation_ical_status)
+        var = self._vacation_ical_status_var
+        if var is None:
+            return
+        state = str(data.get("state") or "unconfigured").strip().lower()
+        if state not in {"unconfigured", "pending", "ok", "error"}:
+            state = "error"
+        expected = str(data.get("expected_calendar_name") or "").strip()
+        observed = str(data.get("observed_calendar_name") or "").strip()
+        last_success = str(data.get("last_success_ts") or "").strip()
+        error_code = str(data.get("error_code") or "").strip()
+        state_labels = {
+            "unconfigured": "미설정",
+            "pending": "대기 중",
+            "ok": "정상",
+            "error": "오류",
+        }
+        error_labels = {
+            "secret_unavailable": "저장된 URL을 해독하거나 검증하지 못했습니다.",
+            "calendar_fetch_failed": "캘린더를 가져오거나 해석하지 못했습니다.",
+            "calendar_name_mismatch": "캘린더 이름이 기대값과 다릅니다.",
+        }
+        parts = [
+            state_labels[state],
+            f"기대 이름: {expected or '-'}",
+            f"확인 이름: {observed or '-'}",
+        ]
+        if state == "error":
+            parts.append(
+                error_labels.get(
+                    error_code,
+                    "캘린더 상태를 확인하지 못했습니다.",
+                )
+            )
+        elif last_success:
+            parts.append(f"마지막 성공: {last_success}")
+        try:
+            var.set(" · ".join(parts))
+        except Exception:
+            pass
+        return
+
+    def _sync_runtime_snapshots(self) -> None:
+        break_getter = getattr(self._wrike, "get_manual_break_state", None)
+        if callable(break_getter):
+            try:
+                break_state = break_getter()
+            except Exception:
+                break_state = None
+            if isinstance(break_state, dict):
+                self._refresh_break_button_label(break_state)
+        self._refresh_vacation_status_from_backend()
+        return
+
+    def _mark_ical_dirty(self, _event: Any = None) -> None:
+        self._ical_dirty = True
+        self._schedule_autosave()
+        return
+
+    def _mark_vacation_ical_dirty(self, _event: Any = None) -> None:
+        self._vacation_ical_dirty = True
+        self._schedule_autosave()
+        return
+
     def _load_settings(self) -> None:
         self._loading_settings = True
         try:
             settings = self._wrike.get_settings_snapshot()
         except Exception:
+            settings = {}
+        if not isinstance(settings, dict):
             settings = {}
         try:
             try:
@@ -434,21 +1028,51 @@ class WrikeSettingsView:
             except Exception:
                 pass
             try:
-                snapshot = settings if isinstance(settings, dict) else {}
-                self._lunch_enabled_var.set(bool(snapshot.get("lunch_break_enabled", True)))
-                lunch_start = max(0, min(1439, int(snapshot.get("lunch_start_min", 720))))
-                lunch_end = max(1, min(1440, int(snapshot.get("lunch_end_min", 780))))
+                plan = settings.get("workday_plan")
+                if not isinstance(plan, dict):
+                    plan = {
+                        "date": date.today().isoformat(),
+                        "target_net_minutes": settings.get("daily_target_minutes", 480),
+                        "clock_in": "",
+                    }
+                self._apply_workday_plan(plan, fallback_day=date.today().isoformat())
+            except Exception:
+                pass
+            try:
+                self._lunch_enabled_var.set(
+                    bool(settings.get("lunch_break_enabled", True))
+                )
+                lunch_start = max(
+                    0, min(1439, int(settings.get("lunch_start_min", 720)))
+                )
+                lunch_end = max(
+                    1, min(1440, int(settings.get("lunch_end_min", 780)))
+                )
                 self._lunch_start_var.set(self._format_minutes_as_hhmm(lunch_start))
                 self._lunch_end_var.set(self._format_minutes_as_hhmm(lunch_end))
                 keywords = [
                     str(item or "").strip()
-                    for item in list(snapshot.get("break_keywords") or [])
+                    for item in list(settings.get("break_keywords") or [])
                     if str(item or "").strip()
                 ]
                 self._ical_keywords_var.set(", ".join(keywords))
-                poll_minutes = int(round(float(snapshot.get("ical_poll_interval_sec", 900)) / 60.0))
+                poll_minutes = int(
+                    round(float(settings.get("ical_poll_interval_sec", 900)) / 60.0)
+                )
                 self._ical_interval_var.set(str(max(5, min(360, poll_minutes))))
-                self._refresh_break_button_label(snapshot.get("manual_break_state"))
+                if self._ical_url_var is not None:
+                    self._ical_url_var.set("")
+                self._ical_dirty = False
+                self._refresh_break_button_label(settings.get("manual_break_state"))
+            except Exception:
+                pass
+            try:
+                if self._vacation_ical_url_var is not None:
+                    self._vacation_ical_url_var.set("")
+                self._vacation_ical_dirty = False
+                self._refresh_vacation_ical_status(
+                    self._vacation_status_from_settings(settings)
+                )
             except Exception:
                 pass
             try:
@@ -507,22 +1131,44 @@ class WrikeSettingsView:
             return 0, f"{label} 값은 0보다 커야 합니다."
         return value, None
 
-    def _refresh_break_button_label(self, state: Any) -> None:
+    def _manual_break_elapsed_seconds(self, state: dict[str, Any]) -> int:
+        try:
+            base_seconds = max(0, int(state.get("ongoing_seconds", 0) or 0))
+        except Exception:
+            base_seconds = 0
+        if base_seconds <= 0:
+            try:
+                base_seconds = max(
+                    0, int(state.get("ongoing_minutes", 0) or 0) * 60
+                )
+            except Exception:
+                base_seconds = 0
+        started_at = str(state.get("started_at") or "").strip()
+        if not started_at:
+            return base_seconds
+        try:
+            parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            now = datetime.now(parsed.tzinfo) if parsed.tzinfo is not None else datetime.now()
+            elapsed = max(0, int((now - parsed).total_seconds()))
+            return max(base_seconds, elapsed)
+        except Exception:
+            return base_seconds
+
+    def _render_break_button_label(self) -> None:
         var = self._break_button_var
         if var is None:
             return
-        data = dict(state) if isinstance(state, dict) else {}
+        data = dict(self._manual_break_state)
         try:
             if bool(data.get("active")):
-                started_at = str(data.get("started_at", "") or "")
+                started_at = str(data.get("started_at") or "")
                 hhmm = started_at[11:16] if len(started_at) >= 16 else ""
-                ongoing = int(data.get("ongoing_minutes", 0) or 0)
+                elapsed = self._manual_break_elapsed_seconds(data)
+                duration = f"{elapsed // 60}분 {elapsed % 60:02d}초"
+                details = [item for item in (hhmm, duration) if item]
                 text = "휴게 종료"
-                if hhmm:
-                    text += f"({hhmm}"
-                    if ongoing > 0:
-                        text += f" · {ongoing}분"
-                    text += ")"
+                if details:
+                    text += f"({' · '.join(details)})"
                 var.set(text)
             else:
                 completed = int(data.get("completed_minutes", 0) or 0)
@@ -534,17 +1180,77 @@ class WrikeSettingsView:
                 pass
         return
 
+    def _refresh_break_button_label(self, state: Any) -> None:
+        self._manual_break_state = dict(state) if isinstance(state, dict) else {}
+        self._render_break_button_label()
+        return
+
+    def _break_timer_is_alive(self, win: Any) -> bool:
+        if win is None or self._win is not win:
+            return False
+        exists = getattr(win, "winfo_exists", None)
+        if callable(exists):
+            try:
+                return bool(exists())
+            except Exception:
+                return False
+        return True
+
+    def _schedule_break_timer(self, win: Any) -> None:
+        if not self._break_timer_is_alive(win):
+            self._break_timer_after_id = None
+            if self._break_timer_window is win:
+                self._break_timer_window = None
+            return
+        after = getattr(win, "after", None)
+        if not callable(after):
+            self._break_timer_after_id = None
+            return
+
+        def tick() -> None:
+            if self._break_timer_window is not win:
+                return
+            self._break_timer_after_id = None
+            if not self._break_timer_is_alive(win):
+                self._break_timer_window = None
+                return
+            self._sync_runtime_snapshots()
+            if bool(self._manual_break_state.get("active")):
+                self._render_break_button_label()
+            self._schedule_break_timer(win)
+            return
+
+        self._break_timer_after_id = "pending"
+        try:
+            timer_id = after(1000, tick)
+            if self._break_timer_after_id == "pending":
+                self._break_timer_after_id = timer_id if timer_id is not None else "scheduled"
+        except Exception:
+            self._break_timer_after_id = None
+        return
+
+    def _start_break_timer(self) -> None:
+        win = self._win
+        if win is None:
+            return
+        if self._break_timer_window is win and self._break_timer_after_id is not None:
+            return
+        self._break_timer_window = win
+        self._break_timer_after_id = None
+        self._schedule_break_timer(win)
+        return
+
     def _on_toggle_break(self) -> None:
         def worker():
             try:
                 return self._wrike.toggle_manual_break()
             except Exception as exc:
-                return {"message": f"휴게 토글 실패: {exc}"}
+                return {"ok": False, "message": f"휴게 토글 실패: {exc}"}
 
         def apply_result(result) -> None:
             state = result if isinstance(result, dict) else {}
             message = str(state.get("message") or "").strip()
-            level = "ok" if message and not message.startswith("휴게 토글 실패") else "error"
+            level = "ok" if state.get("ok") is True else "error"
             try:
                 if message:
                     self._set_status(message, level=level)
@@ -558,11 +1264,46 @@ class WrikeSettingsView:
     def _on_clear_ical(self) -> None:
         ok, err = self._wrike.update_settings({"clear_ical_url": True})
         if ok:
-            self._ical_url_var.set("")
+            try:
+                if self._ical_url_var is not None:
+                    self._ical_url_var.set("")
+            except Exception:
+                pass
             self._ical_dirty = False
-            self._set_status("캘린더 URL 삭제 완료", level="ok")
+            self._set_status("휴게 캘린더 URL 삭제 완료", level="ok")
         else:
-            self._set_status(f"URL 삭제 실패: {err}", level="error")
+            self._set_status("휴게 캘린더 URL 삭제 실패", level="error")
+        return
+
+    def _on_clear_vacation_ical(self) -> None:
+        try:
+            ok, err = self._wrike.update_settings(
+                {"clear_vacation_ical_url": True}
+            )
+        except Exception as exc:
+            ok, err = False, str(exc) or "알 수 없는 오류"
+        if ok:
+            try:
+                if self._vacation_ical_url_var is not None:
+                    self._vacation_ical_url_var.set("")
+            except Exception:
+                pass
+            self._vacation_ical_dirty = False
+            if not self._refresh_vacation_status_from_backend():
+                fallback = dict(self._vacation_ical_status)
+                fallback.update({
+                    "secret_present": False,
+                    "configured": False,
+                    "observed_calendar_name": "",
+                    "state": "unconfigured",
+                    "last_success_ts": None,
+                    "error_code": "",
+                    "fetch_running": False,
+                })
+                self._refresh_vacation_ical_status(fallback)
+            self._set_status("휴가 캘린더 URL 삭제 완료", level="ok")
+        else:
+            self._set_status("휴가 캘린더 URL 삭제 실패", level="error")
         return
 
     def _on_reload(self) -> None:
@@ -745,6 +1486,22 @@ class WrikeSettingsView:
             if self._ical_interval_var is not None
             else "15"
         )
+        ical_dirty = bool(self._ical_dirty)
+        ical_url = ""
+        if ical_dirty and self._ical_url_var is not None:
+            try:
+                ical_url = str(self._ical_url_var.get() or "").strip()
+            except Exception:
+                ical_url = ""
+        vacation_dirty = bool(self._vacation_ical_dirty)
+        vacation_ical_url = ""
+        if vacation_dirty and self._vacation_ical_url_var is not None:
+            try:
+                vacation_ical_url = str(
+                    self._vacation_ical_url_var.get() or ""
+                ).strip()
+            except Exception:
+                vacation_ical_url = ""
 
         lunch_start_min, error = self._parse_hhmm(lunch_start_text, "점심 시작 시간")
         if error:
@@ -791,15 +1548,42 @@ class WrikeSettingsView:
             "break_keywords": parsed_keywords,
             "ical_poll_interval_sec": int(poll_minutes) * 60,
         }
-        if self._ical_dirty:
-            save_payload["ical_url"] = str(self._ical_url_var.get() or "").strip()
+        if ical_dirty:
+            save_payload["ical_url"] = ical_url
+        if vacation_dirty:
+            save_payload["vacation_ical_url"] = vacation_ical_url
 
         ok, err = self._wrike.update_settings(save_payload)
         try:
             if ok:
+                if ical_dirty:
+                    self._ical_dirty = False
+                if vacation_dirty:
+                    try:
+                        if self._vacation_ical_url_var is not None:
+                            self._vacation_ical_url_var.set("")
+                    except Exception:
+                        pass
+                    self._vacation_ical_dirty = False
+                    if not self._refresh_vacation_status_from_backend():
+                        fallback = dict(self._vacation_ical_status)
+                        fallback.update({
+                            "secret_present": bool(vacation_ical_url),
+                            "configured": bool(vacation_ical_url),
+                            "observed_calendar_name": "",
+                            "state": (
+                                "pending"
+                                if vacation_ical_url
+                                else "unconfigured"
+                            ),
+                            "last_success_ts": None,
+                            "error_code": "",
+                            "fetch_running": False,
+                        })
+                        self._refresh_vacation_ical_status(fallback)
                 self._set_status("저장됨", level="ok")
             else:
-                self._set_status(f"저장 실패: {err}", level="error")
+                self._set_status("저장 실패", level="error")
         except Exception:
             pass
         return
