@@ -48,6 +48,33 @@ def overlap_minutes(
     return int(delta // 60)
 
 
+def union_datetime_intervals(intervals) -> list[tuple[datetime, datetime]]:
+    """Return sorted, non-overlapping spans, merging adjacent boundaries."""
+    spans: list[tuple[datetime, datetime]] = []
+    for item in intervals or []:
+        try:
+            if isinstance(item, BreakInterval):
+                start, end = item.start, item.end
+            else:
+                start, end = item
+            if not isinstance(start, datetime) or not isinstance(end, datetime):
+                continue
+            if end <= start:
+                continue
+            spans.append((start, end))
+        except Exception:
+            continue
+    spans.sort(key=lambda pair: pair[0])
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def total_break_minutes_within(
     intervals: list[BreakInterval],
     clock_in: datetime | None,
@@ -58,9 +85,9 @@ def total_break_minutes_within(
     if clock_in is None:
         return 0
     total = 0
-    for item in intervals:
+    for start, end in merge_intervals(intervals, resolved_now):
         try:
-            total += overlap_minutes(item.start, item.resolved_end(resolved_now), clock_in, until)
+            total += overlap_minutes(start, end, clock_in, until)
         except Exception:
             continue
     return int(total)
@@ -77,15 +104,42 @@ def merge_intervals(intervals: list[BreakInterval], now: datetime) -> list[tuple
         if end <= start:
             continue
         spans.append((start, end))
-    spans.sort(key=lambda pair: pair[0])
-    merged: list[tuple[datetime, datetime]] = []
-    for start, end in spans:
-        if merged and start <= merged[-1][1]:
-            previous_start, previous_end = merged[-1]
-            merged[-1] = (previous_start, max(previous_end, end))
-        else:
-            merged.append((start, end))
-    return merged
+    return union_datetime_intervals(spans)
+
+
+def vacation_credit_minutes(
+    target_minutes: int,
+    all_day: bool | dict = False,
+    intervals=None,
+) -> int:
+    """Return vacation credit, capped at the day's target net minutes.
+
+    ``all_day`` may also be the result dictionary returned by
+    ``vacation_events_for_day``. Timed spans are unioned before their duration
+    is calculated so overlapping or adjacent calendar events are credited once.
+    """
+    try:
+        target = max(0, int(target_minutes))
+    except Exception:
+        return 0
+    if isinstance(all_day, dict):
+        vacation = all_day
+        all_day = bool(vacation.get("all_day"))
+        if intervals is None:
+            intervals = vacation.get("intervals")
+    if bool(all_day):
+        return target
+    total_seconds = sum(
+        max(0.0, (end - start).total_seconds())
+        for start, end in union_datetime_intervals(intervals or [])
+    )
+    return min(target, int(total_seconds // 60))
+
+
+# Descriptive aliases retained for callers that prefer an explicit verb.
+compute_vacation_credit_minutes = vacation_credit_minutes
+calculate_vacation_credit_minutes = vacation_credit_minutes
+merge_datetime_intervals = union_datetime_intervals
 
 
 def compute_net_elapsed_minutes(
@@ -108,19 +162,31 @@ def project_quit_at(
     target_minutes: int,
     intervals: list[BreakInterval],
 ) -> datetime | None:
-    """Predicted quit time assuming accrual pauses only during planned breaks.
+    """Predict quit time while all known fixed breaks pause work accrual.
 
-    Breaks with unknown end time (running manual breaks) are excluded so the
-    prediction reflects resume-known plans; callers show "-" while a manual
-    pause is running because the resume moment is unknown.
+    A currently active break has no known resume moment, so no prediction is
+    returned until that break is closed.
     """
-    if clock_in is None or int(target_minutes) <= 0:
+    try:
+        target = int(target_minutes)
+    except Exception:
         return None
-    fixed = [item for item in intervals if item.end is not None]
-    candidate = clock_in + timedelta(minutes=int(target_minutes))
+    if clock_in is None or target <= 0:
+        return None
+    fixed: list[BreakInterval] = []
+    for item in intervals or []:
+        try:
+            if item.end is None:
+                if item.start <= now:
+                    return None
+                continue
+            fixed.append(item)
+        except Exception:
+            continue
+    candidate = clock_in + timedelta(minutes=target)
     for _ in range(8):
         added = total_break_minutes_within(fixed, clock_in, candidate)
-        nxt = clock_in + timedelta(minutes=int(target_minutes) + added)
+        nxt = clock_in + timedelta(minutes=target + added)
         if abs((nxt - candidate).total_seconds()) < 30.0:
             candidate = nxt
             break
@@ -235,6 +301,49 @@ def build_lunch_interval(now: datetime, enabled: bool, start_min: int, end_min: 
     )
 
 
+def _merged_break_labels(
+    intervals: list[BreakInterval],
+    clock_in: datetime | None,
+    now: datetime,
+) -> tuple[str, bool]:
+    active = False
+    spans: list[tuple[datetime, datetime, str]] = []
+    for item in intervals or []:
+        if not isinstance(item, BreakInterval):
+            continue
+        try:
+            if item.end is None and item.start <= now:
+                active = True
+            if clock_in is None:
+                continue
+            start = max(item.start, clock_in)
+            end = min(item.resolved_end(now), now)
+        except Exception:
+            continue
+        if end <= start:
+            continue
+        spans.append((start, end, item.label or "휴게"))
+    spans.sort(key=lambda value: value[0])
+
+    merged: list[dict] = []
+    for start, end, label in spans:
+        if merged and start <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], end)
+            if label not in merged[-1]["labels"]:
+                merged[-1]["labels"].append(label)
+        else:
+            merged.append({"start": start, "end": end, "labels": [label]})
+
+    labels: list[str] = []
+    for item in merged:
+        span = int(max(0.0, (item["end"] - item["start"]).total_seconds()) // 60)
+        if span <= 0:
+            continue
+        label = "/".join(item["labels"])
+        labels.append(f"{label} {format_minutes(span)}")
+    return " + ".join(labels), active
+
+
 @dataclass(frozen=True)
 class WorkdayOverview:
     clock_in: datetime | None
@@ -242,32 +351,40 @@ class WorkdayOverview:
     break_labels: str
     net_elapsed_minutes: int
     projected_quit: datetime | None
-    recorded_minutes: int
-    remaining_recorded_minutes: int
+    remaining_net_minutes: int
     manual_break_active: bool
+    target_minutes: int = 0
+    vacation_minutes: int = 0
+    effective_target_minutes: int = 0
 
     def as_lines(self, now: datetime) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = []
         if self.clock_in is not None:
             head = (
-                f"출근 {format_hhmm(self.clock_in)} · 실근무 경과 "
+                f"출근 {format_hhmm(self.clock_in)} · 실시간 순근무 "
                 f"{format_minutes(self.net_elapsed_minutes)}"
             )
         else:
-            head = "출근 - · 실근무 경과 -"
+            head = "출근 - · 실시간 순근무 -"
         lines.append((head, COLOR_ACCENT))
 
         breakdown = self.break_labels if self.break_labels else "없음"
         active_note = " · 휴게 진행 중" if self.manual_break_active else ""
         lines.append((
-            f"휴게 {format_minutes(self.break_total_minutes)} ({breakdown}){active_note}",
+            f"병합 휴게 {format_minutes(self.break_total_minutes)} ({breakdown}){active_note}",
+            COLOR_MUTED,
+        ))
+
+        lines.append((
+            f"휴가 차감 {format_minutes(self.vacation_minutes)} · "
+            f"적용 목표 {format_minutes(self.effective_target_minutes)}",
             COLOR_MUTED,
         ))
 
         quit_text = format_hhmm(self.projected_quit)
         lines.append((f"예상 퇴근 {quit_text}", COLOR_ACCENT))
 
-        remain = int(self.remaining_recorded_minutes)
+        remain = int(self.remaining_net_minutes)
         basis = f" ({format_hhmm(now)} 기준)"
         if remain > 0:
             lines.append((f"잔여 부족 {format_minutes(remain)}{basis}", COLOR_WARN))
@@ -282,45 +399,42 @@ def build_workday_overview(
     *,
     now: datetime,
     clock_in: datetime | None,
-    recorded_minutes: int,
     target_minutes: int,
     intervals: list[BreakInterval],
+    vacation_minutes: int = 0,
+    recorded_minutes: int | None = None,
 ) -> WorkdayOverview:
+    # Compatibility only: live calculations deliberately ignore Wrike-recorded
+    # time and derive remaining work directly from elapsed net work.
+    _ = recorded_minutes
+    try:
+        target = max(0, int(target_minutes))
+    except Exception:
+        target = 0
+    try:
+        vacation = max(0, int(vacation_minutes))
+    except Exception:
+        vacation = 0
+    effective_target = max(0, target - vacation)
+
     break_total = total_break_minutes_within(intervals, clock_in, now, now)
     net = compute_net_elapsed_minutes(now, clock_in, intervals)
-
-    labels: list[str] = []
-    active = False
-    spans_by_label: dict[str, int] = {}
-    ordered = sorted(
-        [item for item in intervals if isinstance(item, BreakInterval)],
-        key=lambda iv: iv.start,
-    )
-    for item in ordered:
-        if item.end is None:
-            active = True
-            span = total_break_minutes_within([item], item.start, now, now)
-            label_text = f"{item.label or '휴게'} 진행 중"
-        else:
-            span = overlap_minutes(item.start, item.end, item.start, item.end)
-            label_text = item.label or "휴게"
-        if span <= 0:
-            continue
-        spans_by_label[label_text] = spans_by_label.get(label_text, 0) + span
-    for key, value in spans_by_label.items():
-        labels.append(f"{key} {format_minutes(value)}")
-
-    remaining = int(target_minutes) - int(recorded_minutes)
-    projected = project_quit_at(now, clock_in, target_minutes, intervals)
+    break_labels, active = _merged_break_labels(intervals, clock_in, now)
+    remaining = effective_target - net
+    projected = project_quit_at(now, clock_in, effective_target, intervals)
+    if active:
+        projected = None
     return WorkdayOverview(
         clock_in=clock_in,
         break_total_minutes=int(break_total),
-        break_labels=" + ".join(labels),
+        break_labels=break_labels,
         net_elapsed_minutes=net,
         projected_quit=projected,
-        recorded_minutes=int(recorded_minutes),
-        remaining_recorded_minutes=remaining,
+        remaining_net_minutes=remaining,
         manual_break_active=active,
+        target_minutes=target,
+        vacation_minutes=vacation,
+        effective_target_minutes=effective_target,
     )
 
 
