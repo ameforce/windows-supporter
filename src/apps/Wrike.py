@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import queue
 import shutil
@@ -12,6 +12,24 @@ from src.utils.LibConnector import LibConnector
 from src.utils.secret_store import SecretStore
 from src.utils.subprocess_utils import build_python_module_command, is_frozen_runtime
 from src.utils.ToolTip import ToolTip
+from src.apps.wrike_ical import (
+    DEFAULT_POLL_TIMEOUT_SEC,
+    fetch_calendar_text,
+    matching_break_events,
+    parse_ics,
+)
+from src.apps.wrike_worktime import (
+    BreakInterval,
+    DEFAULT_LUNCH_END_MIN,
+    DEFAULT_LUNCH_START_MIN,
+    RefreshableLines,
+    build_lunch_interval,
+    build_workday_overview,
+    clock_in_candidate,
+    earliest_clock_in_from_items,
+    format_minutes,
+    parse_iso_datetime,
+)
 
 
 class Wrike:
@@ -82,7 +100,7 @@ class Wrike:
         self.__ui_queue = queue.SimpleQueue()
         self.__ui_pump_started = False
         self.__active_tooltip = None
-        self.__settings_version = 4
+        self.__settings_version = 5
         self.__playwright_checked = False
         self.__playwright_ready = False
         self.__time_log_weekday_labels = ['월', '화', '수', '목', '금', '토', '일']
@@ -96,6 +114,39 @@ class Wrike:
         self.__time_log_token_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_token.txt")
         self.__settings_path = self.__lib.os.path.join(self.__time_log_config_dir, "wrike_settings.json")
         self.__secret_store = SecretStore("windows-supporter:wrike-api-token")
+        self.__wrike_api_token_secret_scope = "windows-supporter:wrike-api-token"
+        self.__worktime_lock = threading.Lock()
+        self.__lunch_break_enabled = True
+        self.__lunch_start_min = int(DEFAULT_LUNCH_START_MIN)
+        self.__lunch_end_min = int(DEFAULT_LUNCH_END_MIN)
+        self.__ical_url_protected = ""
+        self.__ical_url_session = ""
+        self.__ical_keywords = ["헬스", "운동", "gym", "fitness", "pt"]
+        self.__ical_poll_interval_sec = 900.0
+        self.__ical_after_id = None
+        self.__ical_fetch_running = False
+        self.__ical_last_success_ts = None
+        self.__ical_last_error = ""
+        self.__ical_events_for_date = ""
+        self.__ical_parsed_events: list[dict] = []
+        self.__ical_matched: list[dict] = []
+        self.__manual_break_started_at = None
+        self.__manual_break_sessions: list[tuple] = []
+        self.__daily_first_seen: dict[str, str] = {}
+        base_dir_wt = self.__time_log_config_dir
+        self.__worktime_state_path = self.__lib.os.path.join(base_dir_wt, "wrike_worktime_state.json")
+        if self.__lib.os.path.isfile(self.__worktime_state_path):
+            try:
+                with open(self.__worktime_state_path, "r", encoding="utf-8") as fp:
+                    raw_state = json.load(fp)
+                if isinstance(raw_state, dict):
+                    first_seen_raw = raw_state.get("first_seen_by_date")
+                    if isinstance(first_seen_raw, dict):
+                        self.__daily_first_seen = {
+                            str(k): str(v) for k, v in first_seen_raw.items() if k and v
+                        }
+            except Exception:
+                self.__log_exception("worktime state load failed", None)
 
         self.__re_brackets = self.__lib.re.compile(r'\[([^\]]*)\]')
         self.__re_internal = self.__lib.re.compile(r'^없음\s*\((.+?)\)\s*$')
@@ -422,7 +473,9 @@ class Wrike:
     def attach(self, root) -> None:
         self.__root = root
         self.__start_ui_pump(root)
+        self.__record_daily_first_seen()
         self.__restart_monitor()
+        self.__start_ical_polling()
         self.__prewarm_wrike_form_browser_async()
         return
 
@@ -529,6 +582,312 @@ class Wrike:
         self.__schedule_monitor_tick(root)
         return
 
+    # ------------------------------------------------------------------
+    # Workday overview: first-seen tracking, break sources, calendar cache
+    # ------------------------------------------------------------------
+
+    def __record_daily_first_seen(self) -> None:
+        try:
+            now = self.__lib.datetime.now()
+            key = now.strftime("%Y-%m-%d")
+        except Exception:
+            return
+        with self.__worktime_lock:
+            if not self.__daily_first_seen.get(key):
+                self.__daily_first_seen = {key: now.isoformat(timespec="seconds")}
+                changed = True
+            else:
+                self.__daily_first_seen[key] = self.__daily_first_seen.get(key)
+                changed = False
+                stale = [k for k in self.__daily_first_seen.keys() if k != key]
+                if stale:
+                    self.__daily_first_seen = {
+                        k: v for k, v in self.__daily_first_seen.items() if k == key
+                    }
+                    changed = True
+            if changed:
+                try:
+                    payload = {"first_seen_by_date": dict(self.__daily_first_seen)}
+                    self.__lib.os.makedirs(self.__time_log_config_dir, exist_ok=True)
+                    with open(self.__worktime_state_path, "w", encoding="utf-8") as fp:
+                        json.dump(payload, fp, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+        return
+
+    def __resolve_clock_in_today(self, days: list[dict], today_key: str):
+        best = None
+        for day in days or []:
+            date_value = day.get("date")
+            try:
+                dkey = date_value.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+            if dkey != today_key:
+                continue
+            candidate = day.get("first_dt")
+            if isinstance(candidate, datetime):
+                best = candidate
+            break
+        pc_dt = None
+        iso_seen = str(self.__daily_first_seen.get(today_key, "") or "").strip()
+        if iso_seen:
+            try:
+                parsed = parse_iso_datetime(iso_seen)
+                if isinstance(parsed, datetime):
+                    pc_dt = parsed.replace(tzinfo=None)
+            except Exception:
+                pc_dt = None
+        candidates = [value for value in (best, pc_dt) if isinstance(value, datetime)]
+        if not candidates:
+            return None
+        return min(candidates)
+
+    def __ensure_ical_day_cache(self, now) -> list[dict]:
+        try:
+            key = now.strftime("%Y-%m-%d")
+        except Exception:
+            return []
+        if self.__ical_events_for_date == key and self.__ical_matched is not None:
+            return self.__ical_matched
+        try:
+            matched = matching_break_events(
+                self.__ical_parsed_events,
+                list(self.__ical_keywords),
+                now.date(),
+            )
+        except Exception:
+            matched = []
+        self.__ical_matched = matched
+        self.__ical_events_for_date = key
+        return matched
+
+    def __collect_break_intervals(self, now) -> list[BreakInterval]:
+        intervals: list[BreakInterval] = []
+        lunch = build_lunch_interval(
+            now,
+            self.__lunch_break_enabled,
+            self.__lunch_start_min,
+            self.__lunch_end_min,
+        )
+        if lunch is not None:
+            intervals.append(lunch)
+        for entry in self.__ensure_ical_day_cache(now):
+            label = str(entry.get("label") or "")
+            for span_start, span_end in entry.get("intervals") or []:
+                try:
+                    start_dt = span_start.replace(tzinfo=None) if getattr(span_start, "tzinfo", None) else span_start
+                    end_dt = (
+                        span_end.replace(tzinfo=None)
+                        if (span_end is not None and getattr(span_end, "tzinfo", None))
+                        else span_end
+                    )
+                    intervals.append(BreakInterval(start_dt, end_dt, label))
+                except Exception:
+                    continue
+        with self.__worktime_lock:
+            sessions = [
+                (start, end)
+                for start, end in list(self.__manual_break_sessions)
+                if isinstance(start, datetime) and isinstance(end, datetime)
+            ]
+            started = self.__manual_break_started_at
+        for sess_start, sess_end in sessions:
+            if sess_start.date() != now.date():
+                continue
+            intervals.append(BreakInterval(sess_start, sess_end, "수동"))
+        if isinstance(started, datetime) and started.date() == now.date():
+            intervals.append(BreakInterval(started, None, "수동"))
+        return intervals
+
+    def get_manual_break_state(self) -> dict:
+        now = self.__lib.datetime.now()
+        with self.__worktime_lock:
+            sessions = list(self.__manual_break_sessions)
+            started = self.__manual_break_started_at
+        completed_seconds = 0.0
+        for start, end in sessions:
+            try:
+                if start.date() != now.date():
+                    continue
+                completed_seconds += max(0.0, (end - start).total_seconds())
+            except Exception:
+                continue
+        ongoing_minutes = 0
+        if isinstance(started, datetime) and started.date() == now.date():
+            ongoing_minutes = int(max(0.0, (now - started).total_seconds()) // 60)
+        return {
+            "active": started is not None,
+            "started_at": (
+                started.isoformat(timespec="seconds") if isinstance(started, datetime) else ""
+            ),
+            "completed_minutes": int(completed_seconds // 60),
+            "ongoing_minutes": int(ongoing_minutes),
+            "session_count": len(sessions),
+        }
+
+    def toggle_manual_break(self) -> dict:
+        now = self.__lib.datetime.now()
+        message = ""
+        with self.__worktime_lock:
+            if self.__manual_break_started_at is None:
+                self.__manual_break_started_at = now
+                message = f"휴게 시작 {now.strftime('%H:%M')}"
+            else:
+                start_value = self.__manual_break_started_at
+                self.__manual_break_sessions.append((start_value, now))
+                self.__manual_break_started_at = None
+                minutes = int(max(0.0, (now - start_value).total_seconds()) // 60)
+                total_now = 0
+                for s_item, e_item in self.__manual_break_sessions:
+                    if s_item.date() != now.date():
+                        continue
+                    total_now += int(max(0.0, (e_item - s_item).total_seconds()) // 60)
+                message = f"휴게 종료 ({minutes}분) · 오늘 수동 누적 {format_minutes(total_now)}"
+        root = self.__root
+        if root is not None and message:
+            try:
+                self.__show_tooltip(root, message)
+            except Exception:
+                pass
+        state = self.get_manual_break_state()
+        state["message"] = message
+        return state
+
+    # ------------------------------------------------------------------
+    # Google Calendar private-iCal polling and overview composition
+    # ------------------------------------------------------------------
+
+    def __mask_ical_url(self, url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        tail = raw[-18:] if len(raw) > 24 else raw
+        return f"****{tail}"
+
+    def __decode_ical_url(self) -> str:
+        session_url = str(self.__ical_url_session or "").strip()
+        if session_url:
+            return session_url
+        protected = str(self.__ical_url_protected or "").strip()
+        if not protected:
+            return ""
+        try:
+            decoded = self.__secret_store.unprotect(protected)
+        except Exception:
+            return ""
+        cleaned = str(decoded or "").strip()
+        if cleaned:
+            self.__ical_url_session = cleaned
+        return cleaned
+
+    def __cancel_ical_after(self) -> None:
+        root = self.__root
+        after_id = self.__ical_after_id
+        self.__ical_after_id = None
+        if root is None or after_id is None:
+            return
+        try:
+            root.after_cancel(after_id)
+        except Exception:
+            pass
+        return
+
+    def __schedule_ical_tick(self, initial_delay_sec: float = 2.0) -> None:
+        root = self.__root
+        if root is None:
+            return
+        if not str(self.__decode_ical_url() or "").strip():
+            return
+        interval_sec = max(60.0, float(self.__ical_poll_interval_sec or 900.0))
+        delay_sec = max(1.0, float(initial_delay_sec)) if initial_delay_sec == 2.0 else min(
+            max(1.0, float(initial_delay_sec)), interval_sec
+        )
+        try:
+            delay_ms = int(delay_sec * 1000)
+            self.__ical_after_id = root.after(delay_ms, self.__ical_tick)
+        except Exception:
+            self.__ical_after_id = None
+        return
+
+    def __start_ical_polling(self) -> None:
+        self.__cancel_ical_after()
+        if not str(self.__decode_ical_url() or "").strip():
+            return
+        self.__schedule_ical_tick(initial_delay_sec=2.0)
+        return
+
+    def __ical_tick(self) -> None:
+        root = self.__root
+        if root is None:
+            return
+        if self.__ical_fetch_running:
+            self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
+            return
+        url = str(self.__decode_ical_url() or "").strip()
+        if not url:
+            return
+        self.__ical_fetch_running = True
+
+        def worker() -> None:
+            text = fetch_calendar_text(url, float(DEFAULT_POLL_TIMEOUT_SEC))
+            parsed_events = None
+            if text:
+                try:
+                    parsed_events = parse_ics(text)
+                except Exception:
+                    parsed_events = None
+
+            def apply_result() -> None:
+                self.__ical_fetch_running = False
+                if parsed_events is None:
+                    self.__ical_last_error = "calendar_fetch_failed"
+                    self.__log("ical fetch failed")
+                else:
+                    self.__ical_last_error = ""
+                    self.__ical_last_success_ts = self.__lib.datetime.now().isoformat(timespec="seconds")
+                    self.__ical_parsed_events = parsed_events
+                    self.__ical_events_for_date = ""
+                    self.__ical_matched = []
+                    self.__log(f"ical events cached: {len(parsed_events)}")
+                self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
+
+            self.__ui_safe(root, apply_result)
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self.__ical_fetch_running = False
+            self.__schedule_ical_tick(initial_delay_sec=self.__ical_poll_interval_sec)
+        return
+
+    def __build_overview_rows(self, days: list[dict], daily_target_minutes: int) -> list[tuple[str, str]]:
+        now = self.__lib.datetime.now()
+        today_key = now.strftime("%Y-%m-%d")
+        recorded = 0
+        for day in days or []:
+            date_value = day.get("date")
+            try:
+                if date_value.strftime("%Y-%m-%d") != today_key:
+                    continue
+            except Exception:
+                continue
+            try:
+                recorded = int(day.get("minutes", 0))
+            except Exception:
+                recorded = 0
+            break
+        clock_in = self.__resolve_clock_in_today(days or [], today_key)
+        intervals = self.__collect_break_intervals(now)
+        overview = build_workday_overview(
+            now=now,
+            clock_in=clock_in,
+            recorded_minutes=recorded,
+            target_minutes=int(daily_target_minutes),
+            intervals=intervals,
+        )
+        return overview.as_lines(now)
+
     def __count_target_days(self, week_dates: list) -> int:
         if not week_dates:
             return 0
@@ -625,6 +984,16 @@ class Wrike:
 
     def __build_timelog_summary_lines(
         self, display_name: str, daily_target_minutes: int, days: list[dict]
+    ) -> RefreshableLines:
+        rows = self.__compose_timelog_summary_rows(display_name, daily_target_minutes, days)
+
+        def _refresh_rows():
+            return self.__compose_timelog_summary_rows(display_name, daily_target_minutes, days)
+
+        return RefreshableLines(rows, _refresh_rows)
+
+    def __compose_timelog_summary_rows(
+        self, display_name: str, daily_target_minutes: int, days: list[dict]
     ) -> list[tuple[str, str | None]]:
         week_start, week_end = self.__extract_week_range(days)
         month_label = self.__format_month_label(week_start, week_end)
@@ -644,6 +1013,12 @@ class Wrike:
             ]
             lines.append((f"폴더: {' / '.join(path_names)}", None))
         lines.append((f"일 목표: {self.__format_minutes(daily_target_minutes)}", None))
+        try:
+            for row_text, row_color in self.__build_overview_rows(days, int(daily_target_minutes)):
+                lines.append((row_text, row_color))
+        except Exception as exc:
+            self.__log_exception("overview rows failed", exc)
+
 
         today = self.__lib.datetime.now().date()
         for idx, day in enumerate(days):
@@ -1688,7 +2063,7 @@ class Wrike:
 
     def get_settings_snapshot(self) -> dict:
         token = str(self.__wrike_api_token_session or "").strip()
-        return {
+        snapshot = {
             "api_token_configured": bool(token),
             "api_token_masked": self.__mask_api_token(token),
             "daily_target_minutes": int(self.__daily_target_minutes),
@@ -1697,7 +2072,19 @@ class Wrike:
             "monitor_interval_sec": float(self.__monitor_interval_sec),
             "monitor_folder_path": list(self.__monitor_folder_path),
             "settings_path": str(self.__settings_path or ""),
+            "lunch_break_enabled": bool(self.__lunch_break_enabled),
+            "lunch_start_min": int(self.__lunch_start_min),
+            "lunch_end_min": int(self.__lunch_end_min),
+            "ical_url_configured": bool(
+                str(self.__decode_ical_url() or "").strip()
+                or str(self.__ical_url_protected or "").strip()
+            ),
+            "break_keywords": list(self.__ical_keywords),
+            "ical_poll_interval_sec": float(self.__ical_poll_interval_sec),
+            "manual_break_state": self.get_manual_break_state(),
+            "worktime_state_path": str(self.__worktime_state_path or ""),
         }
+        return snapshot
 
     def __mask_api_token(self, token: str) -> str:
         raw = str(token or "").strip()
@@ -1718,6 +2105,62 @@ class Wrike:
         tooltip_ms = data.get("tooltip_duration_ms", self.__tooltip_duration_ms)
         monitor_enabled = bool(data.get("monitor_enabled", self.__monitor_enabled))
         monitor_interval = data.get("monitor_interval_sec", self.__monitor_interval_sec)
+
+        clear_ical_url = bool(data.get("clear_ical_url", False))
+        ical_url_supplied = "ical_url" in data
+        ical_url_value = str(data.get("ical_url", "") or "").strip()
+        lunch_enabled = bool(data.get("lunch_break_enabled", self.__lunch_break_enabled))
+        lunch_start_raw = data.get("lunch_start_min", self.__lunch_start_min)
+        lunch_end_raw = data.get("lunch_end_min", self.__lunch_end_min)
+        poll_raw = data.get("ical_poll_interval_sec", self.__ical_poll_interval_sec)
+        keywords_raw = data.get("break_keywords", None)
+
+        try:
+            lunch_start_val = int(lunch_start_raw)
+            lunch_end_val = int(lunch_end_raw)
+        except Exception:
+            return False, "lunch window"
+        lunch_start_val = max(0, min(1439, lunch_start_val))
+        lunch_end_val = max(1, min(1440, lunch_end_val))
+        if lunch_end_val <= lunch_start_val:
+            return False, "lunch window"
+
+        try:
+            poll_val = int(round(float(poll_raw)))
+        except Exception:
+            return False, "calendar interval"
+        poll_val = max(300, min(21600, poll_val))
+
+        next_keywords = None
+        if keywords_raw is not None:
+            parsed_terms = []
+            if isinstance(keywords_raw, str):
+                raw_terms = [piece for piece in keywords_raw.split(",")]
+            elif isinstance(keywords_raw, list):
+                raw_terms = [str(piece) for piece in keywords_raw]
+            else:
+                raw_terms = []
+            for piece in raw_terms:
+                term = piece.strip()
+                if not term:
+                    continue
+                if len(term) > 40:
+                    term = term[:40]
+                parsed_terms.append(term)
+                if len(parsed_terms) >= 12:
+                    break
+            next_keywords = parsed_terms
+
+        ical_protected = None
+        if clear_ical_url:
+            ical_protected = ""
+        elif ical_url_supplied and ical_url_value:
+            lowered = ical_url_value.lower()
+            if not (lowered.startswith("http://") or lowered.startswith("https://")):
+                return False, "calendar url"
+            ical_protected = self.__secret_store.protect(ical_url_value)
+            if not ical_protected:
+                return False, "api token protection"
 
         try:
             daily_minutes = int(round(float(daily_minutes)))
@@ -1748,10 +2191,26 @@ class Wrike:
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__monitor_enabled = bool(monitor_enabled)
         self.__monitor_interval_sec = float(monitor_interval)
+        self.__lunch_break_enabled = bool(lunch_enabled)
+        self.__lunch_start_min = int(lunch_start_val)
+        self.__lunch_end_min = int(lunch_end_val)
+        self.__ical_poll_interval_sec = float(poll_val)
+        if next_keywords is not None:
+            self.__ical_keywords = list(next_keywords)
+        if ical_protected is not None:
+            self.__ical_url_protected = ical_protected
+            if not ical_protected:
+                self.__ical_url_session = ""
+                self.__ical_parsed_events = []
+                self.__ical_events_for_date = ""
+                self.__ical_matched = []
+        elif ical_url_supplied and ical_protected is None and not ical_url_value:
+            pass
         self.__monitor_last_total_minutes = None
         if not self.__save_settings():
             return False, "api token protection"
         self.__restart_monitor()
+        self.__start_ical_polling()
         return True, None
 
     def get_monitor_folder_path(self) -> list[dict]:
@@ -1978,6 +2437,11 @@ class Wrike:
             "monitor_enabled": True,
             "monitor_interval_sec": 5.0,
             "monitor_folder_path": [],
+            "lunch_break_enabled": True,
+            "lunch_start_min": int(DEFAULT_LUNCH_START_MIN),
+            "lunch_end_min": int(DEFAULT_LUNCH_END_MIN),
+            "break_keywords": ["헬스", "운동", "gym", "fitness", "pt"],
+            "ical_poll_interval_sec": 900.0,
         }
         needs_save = False
         if data is None:
@@ -2060,6 +2524,59 @@ class Wrike:
         except Exception:
             self.__monitor_folder_path = []
 
+        try:
+            self.__lunch_break_enabled = bool(
+                data.get("lunch_break_enabled", self.__lunch_break_enabled)
+            )
+        except Exception:
+            pass
+        try:
+            self.__lunch_start_min = max(
+                0, min(1439, int(data.get("lunch_start_min", self.__lunch_start_min)))
+            )
+        except Exception:
+            self.__lunch_start_min = int(DEFAULT_LUNCH_START_MIN)
+        try:
+            self.__lunch_end_min = max(
+                1, min(1440, int(data.get("lunch_end_min", self.__lunch_end_min)))
+            )
+        except Exception:
+            self.__lunch_end_min = int(DEFAULT_LUNCH_END_MIN)
+        if self.__lunch_end_min <= self.__lunch_start_min:
+            self.__lunch_end_min = min(1440, self.__lunch_start_min + 60)
+        try:
+            raw_keywords = data.get("break_keywords")
+            if isinstance(raw_keywords, list):
+                cleaned_keywords = []
+                for item in raw_keywords:
+                    term = str(item or "").strip()
+                    if term and len(term) <= 40:
+                        cleaned_keywords.append(term)
+                    if len(cleaned_keywords) >= 12:
+                        break
+                if cleaned_keywords:
+                    self.__ical_keywords = cleaned_keywords
+        except Exception:
+            pass
+        try:
+            self.__ical_poll_interval_sec = float(
+                data.get("ical_poll_interval_sec", self.__ical_poll_interval_sec)
+            )
+        except Exception:
+            self.__ical_poll_interval_sec = 900.0
+        self.__ical_poll_interval_sec = max(300.0, min(21600.0, self.__ical_poll_interval_sec))
+
+        try:
+            protected_ical_raw = str(data.get("ical_url_protected", "") or "").strip()
+            if protected_ical_raw != str(self.__ical_url_protected or "").strip():
+                self.__ical_url_protected = protected_ical_raw
+                self.__ical_url_session = ""
+                self.__ical_parsed_events = []
+                self.__ical_events_for_date = ""
+                self.__ical_matched = []
+        except Exception:
+            pass
+
         if allow_save and needs_save:
             try:
                 self.__save_settings()
@@ -2093,7 +2610,21 @@ class Wrike:
             "monitor_enabled": bool(self.__monitor_enabled),
             "monitor_interval_sec": float(self.__monitor_interval_sec),
             "monitor_folder_path": list(self.__monitor_folder_path),
+            "lunch_break_enabled": bool(self.__lunch_break_enabled),
+            "lunch_start_min": int(self.__lunch_start_min),
+            "lunch_end_min": int(self.__lunch_end_min),
+            "break_keywords": list(self.__ical_keywords),
+            "ical_poll_interval_sec": float(self.__ical_poll_interval_sec),
         }
+        ical_url_now = str(self.__decode_ical_url() or "").strip()
+        if ical_url_now:
+            protected_ical = self.__secret_store.protect(ical_url_now)
+            if not protected_ical:
+                self.__log("settings save skipped: ical url protection failed")
+                return False
+            payload["ical_url_protected"] = protected_ical
+        elif str(self.__ical_url_protected or "").strip():
+            payload["ical_url_protected"] = ""
         if token:
             protected_token = self.__secret_store.protect(token)
             if not protected_token:
@@ -2314,11 +2845,31 @@ class Wrike:
                         minutes = 0
             by_date[date_key] = int(by_date.get(date_key, 0)) + int(minutes)
 
+        first_dt_by_date = {}
+        for item in timelogs:
+            if not isinstance(item, dict):
+                continue
+            tracked = item.get("trackedDate") or item.get("date") or ""
+            entry_date_key = self.__normalize_date_key(tracked)
+            if entry_date_key is None:
+                continue
+            candidate = clock_in_candidate(item)
+            if candidate is None:
+                continue
+            previous = first_dt_by_date.get(entry_date_key)
+            if previous is None or candidate < previous:
+                first_dt_by_date[entry_date_key] = candidate
+
         days = []
         for day in week_dates:
             date_key = day.date()
             minutes = int(by_date.get(date_key, 0))
-            days.append({"date": day, "minutes": minutes, "raw": ""})
+            days.append({
+                "date": day,
+                "minutes": minutes,
+                "raw": "",
+                "first_dt": first_dt_by_date.get(date_key),
+            })
         return days
 
     def __normalize_date_key(self, value: str):
