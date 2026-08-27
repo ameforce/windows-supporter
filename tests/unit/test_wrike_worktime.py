@@ -9,6 +9,7 @@ from src.apps.wrike_worktime import (
     build_lunch_interval,
     build_workday_overview,
     clock_in_candidate,
+    composed_vacation_credit_minutes,
     compute_net_elapsed_minutes,
     earliest_clock_in_from_items,
     format_minutes,
@@ -117,16 +118,257 @@ class WorktimeComputationUnitTest(unittest.TestCase):
         overview = build_workday_overview(
             now=now,
             clock_in=self._dt(9),
-            recorded_minutes=int((now - self._dt(9)).total_seconds() // 60) - 60,
+            recorded_minutes=3 * 60,
             target_minutes=9 * 60,
             intervals=[lunch],
         )
         rows = overview.as_lines(now)
         joined = "\n".join(text for text, _color in rows)
+        self.assertEqual(len(rows), 5)
+        self.assertIn("Wrike 기록 3시간 · 현재 기대 4시간", rows[0][0])
         self.assertIn("출근 09:00", joined)
+        self.assertIn("출근 후 순경과 4시간", joined)
         self.assertIn("점심", joined)
         self.assertIn("예상 퇴근", joined)
-        self.assertIn("잔여 부족", joined)
+        self.assertIn("현재 기준 부족 1시간", rows[-1][0])
+
+    def test_late_wall_clock_reference_does_not_replace_expected_now(self):
+        lunch = build_lunch_interval(self.day, True, 720, 780)
+        now = self._dt(23, 55)
+        overview = build_workday_overview(
+            now=now,
+            clock_in=self._dt(8),
+            recorded_minutes=8 * 60 + 30,
+            target_minutes=9 * 60,
+            intervals=[lunch],
+        )
+
+        self.assertEqual(overview.net_elapsed_minutes, 14 * 60 + 55)
+        self.assertEqual(overview.expected_now_minutes, 9 * 60)
+        self.assertEqual(overview.recorded_minutes, 8 * 60 + 30)
+        self.assertEqual(overview.actual_minutes, 8 * 60 + 30)
+        self.assertEqual(overview.realtime_delta_minutes, -30)
+        self.assertTrue(overview.recorded_available)
+        self.assertEqual(overview.remaining_net_minutes, -(5 * 60 + 55))
+        self.assertEqual((overview.projected_quit.hour, overview.projected_quit.minute), (18, 0))
+
+        rows = overview.as_lines(now)
+        rendered = "\n".join(text for text, _color in rows)
+        self.assertEqual(len(rows), 5)
+        self.assertIn("Wrike 기록 8시간 30분 · 현재 기대 9시간", rows[0][0])
+        self.assertIn("출근 후 순경과 14시간 55분", rows[1][0])
+        self.assertIn("적용 목표 9시간", rows[3][0])
+        self.assertIn("예상 퇴근 18:00", rows[3][0])
+        self.assertIn("현재 기준 부족 30분", rows[-1][0])
+        self.assertNotIn("현재 기준 초과", rows[-1][0])
+        self.assertNotIn("5시간 55분", rendered)
+
+    def test_shortage_grows_when_recorded_minutes_stay_fixed(self):
+        lunch = build_lunch_interval(self.day, True, 720, 780)
+        common = {
+            "clock_in": self._dt(8),
+            "recorded_minutes": 5 * 60 + 30,
+            "target_minutes": 9 * 60,
+            "intervals": [lunch],
+        }
+        at_1500 = build_workday_overview(now=self._dt(15), **common)
+        at_1510 = build_workday_overview(now=self._dt(15, 10), **common)
+
+        self.assertEqual(at_1500.expected_now_minutes, 6 * 60)
+        self.assertEqual(at_1510.expected_now_minutes, 6 * 60 + 10)
+        self.assertEqual(at_1500.realtime_delta_minutes, -30)
+        self.assertEqual(at_1510.realtime_delta_minutes, -40)
+        self.assertEqual(
+            -at_1510.realtime_delta_minutes - (-at_1500.realtime_delta_minutes),
+            10,
+        )
+        self.assertIn("현재 기준 부족 40분", at_1510.as_lines(self._dt(15, 10))[-1][0])
+
+    def test_expected_now_stops_while_break_is_in_progress(self):
+        lunch = build_lunch_interval(self.day, True, 720, 780)
+        common = {
+            "clock_in": self._dt(8),
+            "recorded_minutes": 4 * 60,
+            "target_minutes": 9 * 60,
+            "intervals": [lunch],
+        }
+        early = build_workday_overview(now=self._dt(12, 10), **common)
+        late = build_workday_overview(now=self._dt(12, 50), **common)
+
+        self.assertEqual(early.break_total_minutes, 10)
+        self.assertEqual(late.break_total_minutes, 50)
+        self.assertEqual(early.expected_now_minutes, 4 * 60)
+        self.assertEqual(late.expected_now_minutes, 4 * 60)
+        self.assertEqual(early.realtime_delta_minutes, 0)
+        self.assertEqual(late.realtime_delta_minutes, 0)
+
+    def test_expected_now_stops_at_effective_target_and_projected_quit(self):
+        lunch = build_lunch_interval(self.day, True, 720, 780)
+        common = {
+            "clock_in": self._dt(8),
+            "recorded_minutes": 9 * 60,
+            "target_minutes": 9 * 60,
+            "intervals": [lunch],
+        }
+        at_quit = build_workday_overview(now=self._dt(18), **common)
+        after_quit = build_workday_overview(now=self._dt(23), **common)
+
+        self.assertEqual(at_quit.expected_now_minutes, 9 * 60)
+        self.assertEqual(after_quit.expected_now_minutes, 9 * 60)
+        self.assertGreater(after_quit.net_elapsed_minutes, after_quit.expected_now_minutes)
+        self.assertEqual(at_quit.realtime_delta_minutes, 0)
+        self.assertEqual(after_quit.realtime_delta_minutes, 0)
+        self.assertEqual(at_quit.projected_quit, after_quit.projected_quit)
+        self.assertEqual((after_quit.projected_quit.hour, after_quit.projected_quit.minute), (18, 0))
+
+    def test_realtime_delta_reports_exact_ahead_and_behind(self):
+        cases = [
+            (90, -30, "현재 기준 부족 30분"),
+            (120, 0, "현재 기준 딱 맞음"),
+            (150, 30, "현재 기준 초과 30분"),
+        ]
+        for recorded, expected_delta, expected_text in cases:
+            with self.subTest(recorded=recorded):
+                overview = build_workday_overview(
+                    now=self._dt(10),
+                    clock_in=self._dt(8),
+                    recorded_minutes=recorded,
+                    target_minutes=9 * 60,
+                    intervals=[],
+                )
+                self.assertEqual(overview.expected_now_minutes, 120)
+                self.assertEqual(overview.realtime_delta_minutes, expected_delta)
+                self.assertTrue(overview.recorded_available)
+                self.assertIn(expected_text, overview.as_lines(self._dt(10))[-1][0])
+
+    def test_recorded_none_reports_query_unavailable(self):
+        now = self._dt(10)
+        overview = build_workday_overview(
+            now=now,
+            clock_in=self._dt(8),
+            recorded_minutes=None,
+            target_minutes=9 * 60,
+            intervals=[],
+        )
+
+        self.assertIsNone(overview.recorded_minutes)
+        self.assertIsNone(overview.actual_minutes)
+        self.assertIsNone(overview.realtime_delta_minutes)
+        self.assertFalse(overview.recorded_available)
+        self.assertEqual(overview.expected_now_minutes, 120)
+        rows = overview.as_lines(now)
+        self.assertEqual(len(rows), 5)
+        self.assertIn("Wrike 기록 조회 불가 · 현재 기대 2시간", rows[0][0])
+        self.assertIn("현재 기준 조회 불가", rows[-1][0])
+
+    def test_expected_now_is_zero_before_clock_in(self):
+        now = self._dt(7, 30)
+        overview = build_workday_overview(
+            now=now,
+            clock_in=self._dt(8),
+            recorded_minutes=0,
+            target_minutes=9 * 60,
+            intervals=[],
+        )
+
+        self.assertEqual(overview.net_elapsed_minutes, 0)
+        self.assertEqual(overview.expected_now_minutes, 0)
+        self.assertEqual(overview.realtime_delta_minutes, 0)
+        self.assertIn("현재 기준 딱 맞음", overview.as_lines(now)[-1][0])
+
+    def test_projected_quit_does_not_move_with_wrike_recorded_minutes(self):
+        lunch = build_lunch_interval(self.day, True, 720, 780)
+        common = {
+            "now": self._dt(15),
+            "clock_in": self._dt(8),
+            "target_minutes": 9 * 60,
+            "intervals": [lunch],
+        }
+        far_behind = build_workday_overview(recorded_minutes=0, **common)
+        far_ahead = build_workday_overview(recorded_minutes=20 * 60, **common)
+
+        self.assertEqual(far_behind.projected_quit, far_ahead.projected_quit)
+        self.assertEqual((far_behind.projected_quit.hour, far_behind.projected_quit.minute), (18, 0))
+
+    def test_timed_vacation_credit_excludes_existing_break_overlap(self):
+        lunch = build_lunch_interval(self.day, True, 720, 780)
+        vacation = BreakInterval(
+            start=self._dt(12, 30),
+            end=self._dt(14),
+            label="휴가",
+        )
+
+        overview = build_workday_overview(
+            now=self._dt(14),
+            clock_in=self._dt(8),
+            recorded_minutes=4 * 60,
+            target_minutes=8 * 60,
+            intervals=[lunch],
+            vacation_intervals=[vacation],
+            vacation_all_day=False,
+        )
+
+        self.assertEqual(overview.vacation_minutes, 60)
+        self.assertEqual(overview.effective_target_minutes, 7 * 60)
+        self.assertEqual(overview.break_total_minutes, 2 * 60)
+        self.assertEqual(overview.net_elapsed_minutes, 4 * 60)
+        self.assertEqual(overview.expected_now_minutes, 4 * 60)
+        self.assertEqual(overview.realtime_delta_minutes, 0)
+        self.assertEqual(overview.projected_quit, self._dt(17))
+        self.assertIn("점심/휴가 2시간", overview.break_labels)
+
+    def test_composed_vacation_credit_excludes_lunch_calendar_and_manual_overlap(self):
+        cases = (
+            (
+                "점심",
+                BreakInterval(self._dt(12), self._dt(13), "점심"),
+                BreakInterval(self._dt(12, 30), self._dt(14), "휴가"),
+            ),
+            (
+                "캘린더",
+                BreakInterval(self._dt(10), self._dt(11), "캘린더"),
+                BreakInterval(self._dt(10, 30), self._dt(12), "휴가"),
+            ),
+            (
+                "수동",
+                BreakInterval(self._dt(15), self._dt(16), "수동"),
+                BreakInterval(self._dt(15, 30), self._dt(17), "휴가"),
+            ),
+        )
+
+        for source, break_interval, vacation_interval in cases:
+            with self.subTest(source=source):
+                self.assertEqual(
+                    composed_vacation_credit_minutes(
+                        8 * 60,
+                        [break_interval],
+                        [vacation_interval],
+                        self._dt(18),
+                    ),
+                    60,
+                )
+
+    def test_composed_vacation_credit_floors_only_after_union_difference(self):
+        break_interval = BreakInterval(
+            self.day.replace(hour=10, minute=0, second=0, microsecond=0),
+            self.day.replace(hour=10, minute=1, second=0, microsecond=900_000),
+            "점심",
+        )
+        vacation_interval = BreakInterval(
+            self.day.replace(hour=10, minute=1, second=0, microsecond=900_000),
+            self.day.replace(hour=10, minute=2, second=0, microsecond=100_000),
+            "휴가",
+        )
+
+        self.assertEqual(
+            composed_vacation_credit_minutes(
+                8 * 60,
+                [break_interval],
+                [vacation_interval],
+                self._dt(18),
+            ),
+            0,
+        )
 
     def test_refreshable_lines_length_guard_falls_back(self):
         base_rows = [("a", None), ("b", None)]
