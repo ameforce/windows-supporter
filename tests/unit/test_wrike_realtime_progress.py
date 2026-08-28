@@ -699,7 +699,8 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIn("출근 08:00", today_text)
         self.assertIn("예상 퇴근 18:00", today_text)
         self.assertIn("적용 목표 9시간", today_text)
-        self.assertIn("동기화 fresh", today_text)
+        self.assertNotIn("동기화", today_text)
+        self.assertIn("fresh", model.sync_text)
 
         friday = model.rows[4]
         saturday = model.rows[5]
@@ -1197,6 +1198,141 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(plan["target_net_minutes"], 0)
         self.assertEqual(plan["clock_in"], "10:15")
 
+    def test_panel_target_edit_is_today_only_and_preserves_clock_in(self) -> None:
+        wrike = self._new_wrike()
+        today = date(2026, 4, 6)
+        adjacent_day = date(2026, 4, 7)
+        wrike.update_workday_plan(today, 480, "08:15")
+        wrike.update_workday_plan(adjacent_day, 420, "09:00")
+
+        with patch.object(
+            wrike,
+            "_Wrike__show_panel_action_error",
+        ) as show_error:
+            for target_minutes in (0, 1440):
+                with self.subTest(target_minutes=target_minutes):
+                    self.assertTrue(
+                        wrike._Wrike__panel_save_target_minutes(target_minutes)
+                    )
+                    plan = wrike.get_workday_plan(today)
+                    self.assertEqual(plan["target_net_minutes"], target_minutes)
+                    self.assertEqual(plan["clock_in"], "08:15")
+
+            for invalid in (True, -1, 1441):
+                with self.subTest(invalid=invalid):
+                    self.assertFalse(
+                        wrike._Wrike__panel_save_target_minutes(invalid)
+                    )
+
+        self.assertEqual(show_error.call_count, 3)
+        self.assertEqual(
+            wrike.get_workday_plan(adjacent_day)["target_net_minutes"],
+            420,
+        )
+        self.assertEqual(
+            wrike.get_workday_plan(adjacent_day)["clock_in"],
+            "09:00",
+        )
+
+    def test_retry_vacation_ical_restarts_generation_and_worker_privately(self) -> None:
+        wrike = self._new_wrike()
+        root = _FakeRoot()
+        wrike._Wrike__root = root
+        wrike._Wrike__background_active = True
+        wrike._Wrike__vacation_ical_url_session = (
+            "https://calendar.google.com/calendar/ical/retry/basic.ics"
+        )
+        wrike._Wrike__vacation_ical_calendar = self._empty_compiled_vacation()
+        wrike._Wrike__vacation_ical_state = "error"
+        wrike._Wrike__vacation_ical_last_error = "timeout"
+        wrike._Wrike__vacation_ical_generation = 7
+        wrike._Wrike__vacation_ical_after_id = "after-existing"
+
+        with patch("src.apps.Wrike.threading.Thread", _FakeThread):
+            ok, error = wrike.retry_vacation_ical()
+
+        self.assertTrue(ok, error)
+        self.assertIsNone(error)
+        self.assertEqual(wrike._Wrike__vacation_ical_generation, 8)
+        self.assertEqual(root.cancelled, ["after-existing"])
+        self.assertEqual(len(_FakeThread.created), 1)
+        self.assertTrue(_FakeThread.created[0].started)
+        status = wrike.get_vacation_ical_status_snapshot()
+        self.assertEqual(status["state"], "stale")
+        self.assertEqual(status["error_code"], "")
+        self.assertTrue(status["fetch_running"])
+        self.assertTrue(status["has_last_good"])
+
+        unconfigured = self._new_wrike()
+        self.assertEqual(
+            unconfigured.retry_vacation_ical(),
+            (False, "secret_unavailable"),
+        )
+
+    def test_private_vacation_login_redirects_require_public_secret_ical(self) -> None:
+        wrike = self._new_wrike()
+        private_url = (
+            "https://calendar.google.com/calendar/ical/private/basic.ics"
+            "?secret=redirect-source-sentinel"
+        )
+        login_targets = (
+            "https://accounts.google.com/signin?continue=private-google-sentinel",
+            "https://login.microsoftonline.com/common/oauth2/authorize"
+            "?state=private-microsoft-sentinel",
+        )
+
+        for login_target in login_targets:
+            def login_opener(handler):
+                class _LoginRedirectingOpener:
+                    def open(self, request, timeout=None):
+                        handler.redirect_request(
+                            request,
+                            None,
+                            302,
+                            "private login redirect status",
+                            {"Location": login_target},
+                            login_target,
+                        )
+
+                return _LoginRedirectingOpener()
+
+            with self.subTest(host=urlparse(login_target).hostname), patch(
+                "src.apps.Wrike.urllib.request.build_opener",
+                side_effect=login_opener,
+            ):
+                result = wrike._Wrike__fetch_vacation_calendar_text(private_url)
+
+            self.assertIsInstance(result, CalendarError)
+            self.assertEqual(
+                result.code,
+                CalendarErrorCode.AUTHENTICATION_REQUIRED,
+            )
+            self.assertNotIn(private_url, repr(result))
+            self.assertNotIn(login_target, repr(result))
+
+    def test_vacation_settings_reject_wrong_provider_and_protection_failure(self) -> None:
+        wrike = self._new_wrike()
+        wrong_provider = (
+            "https://outlook.office.com/calendar/private.ics"
+            "?secret=provider-sentinel"
+        )
+        ok, error = wrike.update_settings(
+            {"vacation_ical_url": wrong_provider}
+        )
+        self.assertFalse(ok)
+        self.assertEqual(error, "vacation_ical_invalid_endpoint")
+        self.assertNotIn(wrong_provider, str(error))
+
+        allowed = (
+            "https://calendar.google.com/calendar/ical/private/basic.ics"
+            "?secret=protection-sentinel"
+        )
+        wrike._Wrike__vacation_secret_store.protect = Mock(return_value=None)
+        ok, error = wrike.update_settings({"vacation_ical_url": allowed})
+        self.assertFalse(ok)
+        self.assertEqual(error, "vacation_ical_secret_protection_failed")
+        self.assertNotIn(allowed, str(error))
+
     def test_private_vacation_fetch_classifies_failures_without_network(self) -> None:
         wrike = self._new_wrike()
         private_url = (
@@ -1212,7 +1348,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
 
         cases = (
             (
-                "http_4xx",
+                "authentication_required",
                 urllib.error.HTTPError(
                     private_url,
                     403,
@@ -1220,7 +1356,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
                     {"Location": "private location marker"},
                     None,
                 ),
-                CalendarErrorCode.HTTP_4XX,
+                CalendarErrorCode.AUTHENTICATION_REQUIRED,
             ),
             (
                 "http_5xx",
@@ -1688,7 +1824,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertFalse(view._vacation_ical_status["has_last_good"])
         self.assertIsNone(view._vacation_ical_status["last_success_ts"])
         rendered = view._vacation_ical_status_var.get()
-        self.assertIn("불러오는 중", rendered)
+        self.assertIn("확인 중", rendered)
         self.assertNotIn("마지막 성공값으로 계산 중입니다.", rendered)
 
     def test_panel_rows_show_provisional_targets_for_past_today_and_future(self) -> None:

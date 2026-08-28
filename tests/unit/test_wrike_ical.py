@@ -62,6 +62,59 @@ class CalendarResponseDecodingUnitTest(unittest.TestCase):
         self.assertIsInstance(result, CalendarError)
         self.assertEqual(result.code, code)
 
+    def test_content_type_distinguishes_login_pages_from_non_calendar_data(self):
+        document = _ics("BEGIN:VCALENDAR", "END:VCALENDAR")
+        cases = (
+            (
+                "html-login",
+                "text/html; charset=utf-8",
+                b'<html><form action="/login"><input type="password"></form></html>',
+                CalendarErrorCode.AUTHENTICATION_REQUIRED,
+                True,
+            ),
+            (
+                "xhtml-login",
+                "application/xhtml+xml",
+                b'<html><a href="https://login.microsoftonline.com/">Sign in</a></html>',
+                CalendarErrorCode.AUTHENTICATION_REQUIRED,
+                True,
+            ),
+            (
+                "generic-html",
+                "text/html",
+                b"<html><body>calendar gateway unavailable</body></html>",
+                CalendarErrorCode.UNEXPECTED_CONTENT_TYPE,
+                True,
+            ),
+            (
+                "json",
+                "application/json",
+                b'{"status":"not-a-calendar"}',
+                CalendarErrorCode.UNEXPECTED_CONTENT_TYPE,
+                False,
+            ),
+        )
+        for name, content_type, body, expected_code, body_read in cases:
+            with self.subTest(name=name):
+                response = _Response(
+                    body,
+                    headers={"Content-Type": content_type},
+                )
+                self.assert_error(
+                    decode_calendar_response(response),
+                    expected_code,
+                )
+                self.assertEqual(bool(response.read_sizes), body_read)
+
+        calendar = decode_calendar_response(
+            _Response(
+                document.encode("utf-8"),
+                headers={"Content-Type": "text/calendar; charset=utf-8"},
+            )
+        )
+        self.assertIsInstance(calendar, CalendarSuccess)
+        self.assertEqual(calendar.value, document)
+
     def test_identity_absent_or_case_insensitive_and_bom_are_accepted(self):
         document = _ics("BEGIN:VCALENDAR", "END:VCALENDAR")
         payload = b"\xef\xbb\xbf" + document.encode("utf-8")
@@ -485,6 +538,8 @@ class StrictCalendarDocumentUnitTest(unittest.TestCase):
                 "redirect_rejected",
                 "http_4xx",
                 "http_5xx",
+                "authentication_required",
+                "unexpected_content_type",
                 "dns_or_connect",
                 "timeout",
                 "tls_validation",

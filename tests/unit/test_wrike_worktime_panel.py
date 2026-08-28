@@ -24,6 +24,15 @@ class _FakeRoot:
         self.after_history: list[tuple[str, int, object]] = []
         self.after_cancel_calls: list[str] = []
         self._next_after_id = 0
+        self.pointer_x = 100
+        self.pointer_y = 100
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
 
     def after(self, delay_ms, callback):
         self._next_after_id += 1
@@ -77,6 +86,8 @@ class _FakeWidget:
         self.children: list[_FakeWidget] = []
         self.pack_kwargs: dict = {}
         self.pack_calls: list[dict] = []
+        self.pack_forget_calls = 0
+        self.packed = False
         self.pack_configure_calls: list[dict] = []
         self.configure_calls: list[dict] = []
         self.bindings: dict[str, object] = {}
@@ -92,6 +103,12 @@ class _FakeWidget:
         self.geometry_failures = 0
         self.mapped = False
         self.title_calls: list[str] = []
+        self.override_redirect = False
+        self.attribute_calls: list[tuple] = []
+        self.resizable_calls: list[tuple] = []
+        self.entry_text = ""
+        self.focus_set_calls = 0
+        self.selection_calls: list[tuple] = []
         self.withdraw_calls = 0
         self.deiconify_calls = 0
         self.lift_calls = 0
@@ -109,6 +126,12 @@ class _FakeWidget:
         options = dict(kwargs)
         self.pack_kwargs = options
         self.pack_calls.append(options)
+        self.packed = True
+        return None
+
+    def pack_forget(self):
+        self.pack_forget_calls += 1
+        self.packed = False
         return None
 
     def pack_configure(self, **kwargs):
@@ -122,7 +145,40 @@ class _FakeWidget:
         self.kwargs.update(kwargs)
         return None
 
-    def resizable(self, *_args):
+    def resizable(self, *args):
+        self.resizable_calls.append(tuple(args))
+        return None
+
+    def overrideredirect(self, value=None):
+        if value is not None:
+            self.override_redirect = bool(value)
+        return self.override_redirect
+
+    def attributes(self, *args):
+        self.attribute_calls.append(tuple(args))
+        return None
+
+    def delete(self, _start, _end=None):
+        self.entry_text = ""
+        return None
+
+    def insert(self, index, value):
+        text = str(value)
+        if int(index) <= 0:
+            self.entry_text = text + self.entry_text
+        else:
+            self.entry_text += text
+        return None
+
+    def get(self):
+        return self.entry_text
+
+    def focus_set(self):
+        self.focus_set_calls += 1
+        return None
+
+    def selection_range(self, start, end):
+        self.selection_calls.append((start, end))
         return None
 
     def title(self, text):
@@ -194,10 +250,28 @@ class _FakeWidget:
         return not self.destroyed
 
     def winfo_screenwidth(self):
-        return 800
+        return 1920
 
     def winfo_screenheight(self):
-        return 600
+        return 1080
+
+    def winfo_vrootx(self):
+        return 0
+
+    def winfo_vrooty(self):
+        return 0
+
+    def winfo_vrootwidth(self):
+        return 1920
+
+    def winfo_vrootheight(self):
+        return 1080
+
+    def winfo_pointerx(self):
+        return int(self.owner.pointer_x)
+
+    def winfo_pointery(self):
+        return int(self.owner.pointer_y)
 
     def winfo_reqwidth(self):
         self.size_query_calls += 1
@@ -253,6 +327,9 @@ class _FakeTk:
         self.frames: list[_FakeWidget] = []
         self.labels: list[_FakeWidget] = []
         self.buttons: list[_FakeButton] = []
+        self.entries: list[_FakeWidget] = []
+        self.pointer_x = 100
+        self.pointer_y = 100
 
     def Toplevel(self, parent):
         widget = _FakeWidget(self, parent)
@@ -274,8 +351,19 @@ class _FakeTk:
         self.buttons.append(widget)
         return widget
 
+    def Entry(self, parent, **kwargs):
+        widget = _FakeWidget(self, parent, **kwargs)
+        self.entries.append(widget)
+        return widget
+
     def all_widgets(self) -> list[_FakeWidget]:
-        return [*self.toplevels, *self.frames, *self.labels, *self.buttons]
+        return [
+            *self.toplevels,
+            *self.frames,
+            *self.labels,
+            *self.buttons,
+            *self.entries,
+        ]
 
     def live_label_texts(self) -> list[str]:
         return [
@@ -314,6 +402,7 @@ def _model(
     today_lines: tuple[WorktimePanelLine, ...] | None = None,
     week_range: str = "2026-04-06 - 2026-04-12",
     sync_text: str = "방금 동기화",
+    target_minutes: int = 480,
     today_index: int = 0,
     row_suffix: str = "",
 ) -> WorktimePanelModel:
@@ -337,6 +426,7 @@ def _model(
         sync_text=sync_text,
         sync_state="fresh",
         today_lines=today_lines,
+        target_minutes=target_minutes,
         has_clock_in=has_clock_in,
         break_active=break_active,
         rows=rows,
@@ -349,7 +439,7 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         "refresh": Mock(),
         "clock_in_now": Mock(),
         "edit_clock_in": Mock(),
-        "edit_plan": Mock(),
+        "edit_plan": Mock(return_value=True),
         "toggle_break": Mock(),
         "open_settings": Mock(),
         "prompt_accept": Mock(),
@@ -373,6 +463,7 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         prompt_skip=callbacks["prompt_skip"],
         tk_module=fake_tk,
         idle_timeout_ms=idle_timeout_ms,
+        monotonic=root.monotonic,
     )
     return panel, provider, callbacks
 
@@ -389,6 +480,7 @@ class WorktimePanelModelTests(unittest.TestCase):
                 sync_text=model.sync_text,
                 sync_state=model.sync_state,
                 today_lines=list(model.today_lines),  # type: ignore[arg-type]
+                target_minutes=model.target_minutes,
                 has_clock_in=False,
                 break_active=False,
                 rows=model.rows,
@@ -399,6 +491,7 @@ class WorktimePanelModelTests(unittest.TestCase):
                 sync_text=model.sync_text,
                 sync_state=model.sync_state,
                 today_lines=model.today_lines,
+                target_minutes=model.target_minutes,
                 has_clock_in=False,
                 break_active=False,
                 rows=model.rows[:6],
@@ -413,12 +506,24 @@ class WorktimePanelModelTests(unittest.TestCase):
 
 class WorktimeQuickPanelTests(unittest.TestCase):
     def setUp(self) -> None:
-        patcher = patch(
+        noactivate_patcher = patch(
             "src.apps.wrike_worktime_panel._show_window_without_activation",
             side_effect=lambda window: window.native_show(),
         )
-        self.show_without_activation = patcher.start()
-        self.addCleanup(patcher.stop)
+        active_patcher = patch(
+            "src.apps.wrike_worktime_panel._show_window_activated",
+            side_effect=lambda window: window.native_show(),
+        )
+        foreground_patcher = patch(
+            "src.apps.wrike_worktime_panel._window_is_foreground",
+            return_value=False,
+        )
+        self.show_without_activation = noactivate_patcher.start()
+        self.show_activated = active_patcher.start()
+        self.window_is_foreground = foreground_patcher.start()
+        self.addCleanup(noactivate_patcher.stop)
+        self.addCleanup(active_patcher.stop)
+        self.addCleanup(foreground_patcher.stop)
 
     def test_show_reuses_window_has_distinct_timers_and_rearms_dismissal(self) -> None:
         root = _FakeRoot()
@@ -437,11 +542,11 @@ class WorktimeQuickPanelTests(unittest.TestCase):
 
         self.assertEqual(len(fake_tk.toplevels), 1)
         self.assertIs(fake_tk.toplevels[0], window)
-        self.assertEqual(window.geometry_calls, ["700x500+100+100"])
+        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
         self.assertEqual(len(window.geometry_calls), geometry_count)
         self.assertEqual(fake_tk.live_buttons(), first_buttons)
         self.assertEqual(provider.call_count, 2)
-        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
         self.assertEqual(root.active_id(1_000), refresh_id)
         self.assertNotEqual(root.active_id(6_000), first_dismiss_id)
         self.assertIn(first_dismiss_id, root.after_cancel_calls)
@@ -561,7 +666,14 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         fake_tk.button("휴게 종료").invoke()
         callbacks["toggle_break"].assert_called_once_with()
         fake_tk.button("계획 수정").invoke()
-        callbacks["edit_plan"].assert_called_once_with()
+        self.assertTrue(panel._target_editor_active)
+        target_entry = fake_tk.entries[0]
+        self.assertEqual(target_entry.get(), "08:00")
+        target_entry.delete(0, "end")
+        target_entry.insert(0, "07:30")
+        fake_tk.button("저장").invoke()
+        callbacks["edit_plan"].assert_called_once_with(450)
+        self.assertFalse(panel._target_editor_active)
         fake_tk.button("설정").invoke()
         callbacks["open_settings"].assert_called_once_with()
 
@@ -650,7 +762,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertIs(panel._model, last_good)
         self.assertEqual(tuple(fake_tk.live_buttons()), buttons)
         self.assertEqual(tuple(fake_tk.live_label_texts()), labels)
-        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
         provider.side_effect = lambda: holder["model"]
         holder["model"] = _model(actual_text="복구됨")
@@ -675,7 +787,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(window.focus_force_calls, 0)
         self.assertEqual(window.grab_set_calls, 0)
         self.assertEqual(window.wait_window_calls, 0)
-        self.assertEqual(window.geometry_calls[-1], "700x500+100+100")
+        self.assertEqual(window.geometry_calls[-1], "700x500+116+116")
 
     def test_failed_noactivate_or_unmapped_show_withdraws_and_can_retry(self) -> None:
         root = _FakeRoot()
@@ -702,8 +814,31 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertTrue(panel.show(activate=False))
         self.assertTrue(panel.is_visible())
         self.assertEqual(len(fake_tk.toplevels), 1)
-        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
         self.assertEqual(window.withdraw_calls, 3)
+
+    def test_failed_active_foreground_acquisition_withdraws_and_can_retry(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+        self.show_activated.side_effect = None
+        self.show_activated.return_value = False
+
+        self.assertFalse(panel.show(activate=True))
+        window = fake_tk.toplevels[0]
+        self.assertFalse(panel.is_visible())
+        self.assertEqual(window.withdraw_calls, 2)
+        self.assertEqual(root.after_calls, [])
+
+        self.show_activated.side_effect = lambda target: target.native_show()
+        self.assertTrue(panel.show(activate=True))
+        self.assertTrue(panel.is_visible())
+        self.assertEqual(len(fake_tk.toplevels), 1)
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
     def test_failed_initial_geometry_retries_only_on_dedicated_tick_path(self) -> None:
         root = _FakeRoot()
@@ -717,12 +852,12 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         window.geometry_failures = 1
 
         self.assertTrue(panel.show(activate=False))
-        self.assertEqual(window.geometry_calls, ["700x500+100+100"])
+        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
         self.assertEqual((window.width, window.height), (1, 1))
         rendered_model = panel._model
 
         self.assertTrue(panel.refresh_now())
-        self.assertEqual(window.geometry_calls, ["700x500+100+100"])
+        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
         self.assertIs(panel._model, rendered_model)
 
         with (
@@ -736,13 +871,13 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(provider.call_count, 3)
         self.assertEqual(
             window.geometry_calls,
-            ["700x500+100+100", "700x500+100+100"],
+            ["700x500+116+116", "700x500+116+116"],
         )
         self.assertEqual(
             (window.x, window.y, window.width, window.height),
-            (100, 100, 700, 500),
+            (116, 116, 700, 500),
         )
-        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
     def test_user_geometry_is_untouched_in_place_and_reconciled_on_structure(self) -> None:
         root = _FakeRoot()
@@ -789,14 +924,14 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         )
         panel.show(activate=False)
         clamped_id = root.active_id(1_200)
-        self.assertEqual(root.active_delays(), [1_000, 1_200])
+        self.assertEqual(root.active_delays(), [200, 1_000, 1_200])
 
         panel.set_idle_timeout_ms(2_500)
 
         self.assertIn(clamped_id, root.after_cancel_calls)
-        self.assertEqual(root.active_delays(), [1_000, 2_500])
+        self.assertEqual(root.active_delays(), [200, 1_000, 2_500])
         panel.set_idle_timeout_ms(-1)
-        self.assertEqual(root.active_delays(), [1_000, 1_200])
+        self.assertEqual(root.active_delays(), [200, 1_000, 1_200])
         with self.assertRaises(TypeError):
             panel.set_idle_timeout_ms(1.5)  # type: ignore[arg-type]
 
@@ -826,7 +961,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
 
         self.assertTrue(panel.show(activate=False))
         self.assertIs(fake_tk.toplevels[0], window)
-        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
     def test_pointer_and_key_activity_defer_until_full_delay_after_leave(self) -> None:
         root = _FakeRoot()
@@ -920,7 +1055,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(panel._interaction_depth, 0)
         self.assertTrue(panel.is_visible())
         self.assertIn(original_id, root.after_cancel_calls)
-        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
         final_id = root.active_id(6_000)
         self.assertNotEqual(final_id, original_id)
         self.assertEqual(
@@ -970,6 +1105,134 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(root.after_calls, [])
         self.assertEqual(window.destroy_calls, 1)
         self.assertEqual(len(fake_tk.toplevels), 1)
+
+
+    def test_chromeless_topmost_hover_border_and_cursor_reanchor(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+
+        self.assertTrue(panel.show(activate=True))
+        window = fake_tk.toplevels[0]
+        self.assertTrue(window.overrideredirect())
+        self.assertIn(("-topmost", True), window.attribute_calls)
+        self.assertIn((False, False), window.resizable_calls)
+        self.show_activated.assert_called_once_with(window)
+        self.assertEqual(panel._shell.kwargs["highlightbackground"], "#E5E7EB")
+
+        window.bindings["<Enter>"](object())
+        self.assertEqual(panel._shell.kwargs["highlightbackground"], "#2563EB")
+        self.assertEqual(root.active_delays(), [1_000])
+        window.bindings["<Leave>"](object())
+        self.assertEqual(panel._shell.kwargs["highlightbackground"], "#E5E7EB")
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
+
+        panel.hide()
+        fake_tk.pointer_x = 1500
+        fake_tk.pointer_y = 800
+        with patch(
+            "src.apps.wrike_worktime_panel._work_area_for_point",
+            return_value=(0, 0, 1920, 1080),
+        ):
+            self.assertTrue(panel.show(activate=False))
+        self.assertEqual(window.geometry_calls[-1], "700x500+784+284")
+
+    def test_countdown_and_inline_target_editor_are_view_local(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model(target_minutes=480)}
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        countdown = panel._widgets["countdown"]
+        self.assertEqual(countdown.kwargs["text"], "6초 후 닫힘")
+        root.advance(1.2)
+        root.run_delay(200)
+        self.assertEqual(countdown.kwargs["text"], "5초 후 닫힘")
+
+        fake_tk.button("계획 수정").invoke()
+        self.assertEqual(countdown.kwargs["text"], "편집 중 · 자동 닫힘 일시정지")
+        self.assertEqual(root.active_delays(), [1_000])
+        entry = panel._widgets["target_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "07:00")
+        fake_tk.button("취소").invoke()
+        callbacks["edit_plan"].assert_not_called()
+        self.assertFalse(panel._target_editor_active)
+        fake_tk.button("계획 수정").invoke()
+        self.assertEqual(entry.get(), "08:00")
+        entry.delete(0, "end")
+        entry.insert(0, "24:30")
+        fake_tk.button("저장").invoke()
+        callbacks["edit_plan"].assert_not_called()
+        self.assertIn("24:00", panel._widgets["target_error"].kwargs["text"])
+        self.assertTrue(panel._target_editor_active)
+
+        entry.delete(0, "end")
+        entry.insert(0, "8:00")
+        fake_tk.button("저장").invoke()
+        callbacks["edit_plan"].assert_not_called()
+        self.assertIn("HH:MM", panel._widgets["target_error"].kwargs["text"])
+        self.assertTrue(panel._target_editor_active)
+
+        entry.delete(0, "end")
+        entry.insert(0, "00:00")
+        holder["model"] = _model(target_minutes=0)
+        fake_tk.button("저장").invoke()
+        callbacks["edit_plan"].assert_called_once_with(0)
+        self.assertFalse(panel._target_editor_active)
+        self.assertEqual(countdown.kwargs["text"], "6초 후 닫힘")
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
+
+    def test_sync_header_has_one_owner_and_uses_current_error_text(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": _model(
+                sync_text="2026-08-27 14:00:00 · error · request_failed"
+            )
+        }
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+
+        panel.show(activate=False)
+
+        labels = fake_tk.live_label_texts()
+        sync_labels = [
+            text for text in labels if str(text).startswith("동기화 · ")
+        ]
+        self.assertEqual(
+            sync_labels,
+            ["동기화 · 2026-08-27 14:00:00 · error · request_failed"],
+        )
+        self.assertTrue(
+            all("동기화" not in line.text for line in holder["model"].today_lines)
+        )
+
+    def test_hotkey_toggle_surfaces_obscured_panel_before_hiding_foreground(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+        panel.show(activate=True)
+        window = fake_tk.toplevels[0]
+
+        self.window_is_foreground.return_value = False
+        panel.toggle(activate=True)
+        self.assertTrue(panel.is_visible())
+        self.assertEqual(self.show_activated.call_count, 2)
+        self.assertEqual(window.withdraw_calls, 1)
+
+        self.window_is_foreground.return_value = True
+        panel.toggle(activate=True)
+        self.assertFalse(panel.is_visible())
+        self.assertEqual(window.withdraw_calls, 2)
 
 
 if __name__ == "__main__":
