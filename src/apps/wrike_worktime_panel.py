@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
+import time
 from typing import Any, Callable
 
 
 _REFRESH_INTERVAL_MS = 1_000
+_COUNTDOWN_INTERVAL_MS = 200
 _DEFAULT_IDLE_TIMEOUT_MS = 6_000
 _MIN_IDLE_TIMEOUT_MS = 1_200
+_POINTER_OFFSET_PX = 16
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+_TARGET_HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-4]):[0-5]\d")
 
 _BG = "#F3F4F6"
 _CARD_BG = "#FFFFFF"
 _BORDER = "#E5E7EB"
+_HOVER_BORDER = "#2563EB"
 _TEXT = "#111827"
 _MUTED = "#6B7280"
 _TODAY_BG = "#DBEAFE"
@@ -94,6 +100,7 @@ class WorktimePanelModel:
     sync_text: str
     sync_state: str
     today_lines: tuple[WorktimePanelLine, ...]
+    target_minutes: int
     has_clock_in: bool
     break_active: bool
     rows: tuple[WorktimePanelDayRow, ...]
@@ -107,6 +114,10 @@ class WorktimePanelModel:
             raise TypeError("today_lines must be an immutable tuple")
         if any(not isinstance(item, WorktimePanelLine) for item in self.today_lines):
             raise TypeError("today_lines must contain only WorktimePanelLine values")
+        if type(self.target_minutes) is not int:
+            raise TypeError("target_minutes must be an int")
+        if not 0 <= self.target_minutes <= 1440:
+            raise ValueError("target_minutes must be between 0 and 1440")
         if type(self.has_clock_in) is not bool:
             raise TypeError("has_clock_in must be a bool")
         if type(self.break_active) is not bool:
@@ -139,7 +150,7 @@ class WorktimeQuickPanel:
         refresh: Callable[[], None],
         clock_in_now: Callable[[], None],
         edit_clock_in: Callable[[], None],
-        edit_plan: Callable[[], None],
+        edit_plan: Callable[[int], bool],
         toggle_break: Callable[[], None],
         open_settings: Callable[[], None],
         prompt_accept: Callable[[str], None],
@@ -148,6 +159,7 @@ class WorktimeQuickPanel:
         prompt_skip: Callable[[], None],
         tk_module: Any | None = None,
         idle_timeout_ms: int = _DEFAULT_IDLE_TIMEOUT_MS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         callbacks = {
             "model_provider": model_provider,
@@ -161,6 +173,7 @@ class WorktimeQuickPanel:
             "prompt_edit": prompt_edit,
             "prompt_snooze": prompt_snooze,
             "prompt_skip": prompt_skip,
+            "monotonic": monotonic,
         }
         for name, callback in callbacks.items():
             if not callable(callback):
@@ -178,9 +191,11 @@ class WorktimeQuickPanel:
         self._on_prompt_edit = prompt_edit
         self._on_prompt_snooze = prompt_snooze
         self._on_prompt_skip = prompt_skip
+        self._monotonic = monotonic
         self._tk = tk_module
 
         self._window = None
+        self._shell = None
         self._content = None
         self._model: WorktimePanelModel | None = None
         self._structure_signature: tuple[bool, int] | None = None
@@ -189,7 +204,11 @@ class WorktimeQuickPanel:
         self._refresh_token: object | None = None
         self._dismiss_after_id = None
         self._dismiss_token: object | None = None
+        self._countdown_after_id = None
+        self._countdown_token: object | None = None
+        self._dismiss_deadline: float | None = None
         self._interaction_depth = 0
+        self._target_editor_active = False
         self._idle_timeout_ms = self._clamp_idle_timeout_ms(idle_timeout_ms)
         self._pointer_inside = False
         self._geometry_retry_pending = False
@@ -198,7 +217,7 @@ class WorktimeQuickPanel:
         self._destroyed = False
 
     def show(self, activate: bool = True) -> bool:
-        """Show the reusable panel and verify native mapped state."""
+        """Show, re-anchor at the pointer, and verify native mapped state."""
 
         if type(activate) is not bool:
             raise TypeError("activate must be a bool")
@@ -210,26 +229,34 @@ class WorktimeQuickPanel:
 
         was_visible = self._visible
         self.refresh_now()
+        if not (not self._placed and self._geometry_retry_pending):
+            self._geometry_retry_pending = not self._reconcile_geometry(
+                anchor_to_pointer=True
+            )
         if activate:
-            _safe_call(window, "deiconify")
-            _safe_call(window, "lift")
-            _safe_call(window, "focus_force")
+            if not _show_window_activated(window):
+                return self._fail_show(window)
         elif not _show_window_without_activation(window):
             return self._fail_show(window)
+        _safe_call(window, "update_idletasks")
+        if not self._geometry_retry_pending:
+            self._geometry_retry_pending = not self._reconcile_geometry(
+                anchor_to_pointer=True
+            )
         _safe_call(window, "update_idletasks")
         if not self._window_is_mapped(window):
             return self._fail_show(window)
 
         self._visible = True
         if not was_visible:
-            self._pointer_inside = False
+            self._set_pointer_inside(self._pointer_is_within_window())
         self._schedule_refresh()
         self._reset_dismiss_timer()
         return True
 
     def _fail_show(self, window: Any) -> bool:
         self._visible = False
-        self._pointer_inside = False
+        self._set_pointer_inside(False)
         self._cancel_timers()
         if self._window_exists(window):
             _safe_call(window, "withdraw")
@@ -239,17 +266,21 @@ class WorktimeQuickPanel:
         """Hide the panel without destroying its ``Toplevel``."""
 
         self._visible = False
-        self._pointer_inside = False
+        self._close_target_editor(reconcile=False)
+        self._set_pointer_inside(False)
         self._cancel_timers()
         window = self._window
         if window is not None and self._window_exists(window):
             _safe_call(window, "withdraw")
 
     def toggle(self, activate: bool = True) -> None:
-        """Hide a visible panel or show its existing window."""
+        """Hide a foreground panel, or surface/reopen it for the hotkey."""
 
         if self.is_visible():
-            self.hide()
+            if activate and not _window_is_foreground(self._window):
+                self.show(activate=True)
+            else:
+                self.hide()
         else:
             self.show(activate=activate)
 
@@ -303,11 +334,13 @@ class WorktimeQuickPanel:
             return
         self._destroyed = True
         self._visible = False
-        self._pointer_inside = False
+        self._target_editor_active = False
+        self._set_pointer_inside(False)
         self._cancel_timers()
 
         window = self._window
         self._window = None
+        self._shell = None
         self._content = None
         self._model = None
         self._structure_signature = None
@@ -352,6 +385,7 @@ class WorktimeQuickPanel:
             if self._window_exists(self._window):
                 return self._window
             self._window = None
+            self._shell = None
             self._content = None
             self._model = None
             self._structure_signature = None
@@ -360,6 +394,7 @@ class WorktimeQuickPanel:
             self._geometry_retry_pending = False
             self._destroyed = True
             self._visible = False
+            self._target_editor_active = False
             self._pointer_inside = False
             self._cancel_timers()
             return None
@@ -376,7 +411,9 @@ class WorktimeQuickPanel:
         _safe_call(window, "withdraw")
         _safe_call(window, "title", "Wrike 근무시간")
         _safe_call(window, "configure", bg=_BG)
-        _safe_call(window, "resizable", True, True)
+        _safe_call(window, "overrideredirect", True)
+        _safe_call(window, "attributes", "-topmost", True)
+        _safe_call(window, "resizable", False, False)
         _safe_call(window, "protocol", "WM_DELETE_WINDOW", self.hide)
         self._bind_additive(window, "<Escape>", self._on_escape)
         self._bind_additive(window, "<Enter>", self._on_pointer_enter)
@@ -389,12 +426,21 @@ class WorktimeQuickPanel:
         self._bind_additive(window, "<KeyPress>", self._on_key_activity)
 
         try:
-            content = tk.Frame(window, bg=_BG)
-            content.pack(fill="both", expand=True, padx=8, pady=8)
+            shell = tk.Frame(
+                window,
+                bg=_BG,
+                highlightthickness=1,
+                highlightbackground=_BORDER,
+                highlightcolor=_BORDER,
+            )
+            shell.pack(fill="both", expand=True)
+            content = tk.Frame(shell, bg=_BG)
+            content.pack(fill="both", expand=True, padx=7, pady=7)
         except Exception:
             _safe_call(window, "destroy")
             self._window = None
             return None
+        self._shell = shell
         self._content = content
         return window
 
@@ -417,22 +463,61 @@ class WorktimeQuickPanel:
         self.hide()
         return "break"
 
-    def _on_pointer_enter(self, _event: Any = None) -> None:
-        self._pointer_inside = True
-        self._cancel_dismiss_timer()
+    def _set_pointer_inside(self, inside: bool) -> None:
+        changed = self._pointer_inside is not bool(inside)
+        self._pointer_inside = bool(inside)
+        shell = self._shell
+        if shell is not None:
+            color = _HOVER_BORDER if self._pointer_inside else _BORDER
+            _safe_call(
+                shell,
+                "configure",
+                highlightbackground=color,
+                highlightcolor=color,
+            )
+        if not self._visible or self._destroyed:
+            self._update_countdown_label()
+            return
+        if self._pointer_inside:
+            self._cancel_dismiss_timer()
+        elif changed:
+            self._reset_dismiss_timer()
+        else:
+            self._update_countdown_label()
 
-    def _on_pointer_leave(self, _event: Any = None) -> None:
-        self._pointer_inside = False
-        self._reset_dismiss_timer()
+    def _pointer_is_within_window(self, event: Any = None) -> bool:
+        window = self._window
+        rect = self._window_rect(window)
+        if rect is None:
+            return False
+        try:
+            pointer_x = int(window.winfo_pointerx())
+            pointer_y = int(window.winfo_pointery())
+        except Exception:
+            try:
+                pointer_x = int(getattr(event, "x_root"))
+                pointer_y = int(getattr(event, "y_root"))
+            except Exception:
+                return False
+        x, y, width, height = rect
+        return x <= pointer_x < x + width and y <= pointer_y < y + height
+
+    def _on_pointer_enter(self, _event: Any = None) -> None:
+        self._set_pointer_inside(True)
+
+    def _on_pointer_leave(self, event: Any = None) -> None:
+        self._set_pointer_inside(self._pointer_is_within_window(event))
 
     def _on_pointer_activity(self, _event: Any = None) -> None:
-        self._pointer_inside = True
-        self._cancel_dismiss_timer()
+        self._set_pointer_inside(True)
 
     def _on_key_activity(self, event: Any = None) -> None:
         if str(getattr(event, "keysym", "")).lower() == "escape":
             return
-        self._reset_dismiss_timer()
+        if self._target_editor_active:
+            self._update_countdown_label()
+        else:
+            self._reset_dismiss_timer()
 
     def _schedule_refresh(self) -> None:
         if (
@@ -485,16 +570,20 @@ class WorktimeQuickPanel:
         self._cancel_dismiss_timer()
         if (
             self._interaction_depth > 0
+            or self._target_editor_active
             or self._destroyed
             or not self._visible
             or self._pointer_inside
         ):
+            self._update_countdown_label()
             return
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
+            self._update_countdown_label()
             return
         token = object()
         self._dismiss_token = token
+        self._dismiss_deadline = self._monotonic() + self._idle_timeout_ms / 1000.0
         try:
             self._dismiss_after_id = scheduler(
                 self._idle_timeout_ms,
@@ -503,25 +592,82 @@ class WorktimeQuickPanel:
         except Exception:
             self._dismiss_after_id = None
             self._dismiss_token = None
+            self._dismiss_deadline = None
+        self._update_countdown_label()
+        self._schedule_countdown()
 
     def _dismiss_tick(self, token: object) -> None:
         if token is not self._dismiss_token:
             return
         self._dismiss_after_id = None
         self._dismiss_token = None
+        self._dismiss_deadline = None
+        self._cancel_countdown()
         if (
             self._interaction_depth > 0
+            or self._target_editor_active
             or self._destroyed
             or not self._visible
             or self._pointer_inside
         ):
+            self._update_countdown_label()
             return
         self.hide()
 
-    def _cancel_dismiss_timer(self) -> None:
-        after_id = self._dismiss_after_id
-        self._dismiss_after_id = None
-        self._dismiss_token = None
+    def _schedule_countdown(self) -> None:
+        if (
+            self._countdown_after_id is not None
+            or self._dismiss_deadline is None
+            or self._destroyed
+            or not self._visible
+        ):
+            return
+        scheduler = getattr(self._root, "after", None)
+        if not callable(scheduler):
+            return
+        token = object()
+        self._countdown_token = token
+        try:
+            self._countdown_after_id = scheduler(
+                _COUNTDOWN_INTERVAL_MS,
+                lambda current=token: self._countdown_tick(current),
+            )
+        except Exception:
+            self._countdown_after_id = None
+            self._countdown_token = None
+
+    def _countdown_tick(self, token: object) -> None:
+        if token is not self._countdown_token:
+            return
+        self._countdown_after_id = None
+        self._countdown_token = None
+        self._update_countdown_label()
+        if self._dismiss_deadline is not None and self.is_visible():
+            self._schedule_countdown()
+
+    def _countdown_text(self) -> str:
+        if not self._visible or self._destroyed:
+            return ""
+        if self._target_editor_active:
+            return "편집 중 · 자동 닫힘 일시정지"
+        if self._interaction_depth > 0:
+            return "작업 중 · 자동 닫힘 일시정지"
+        if self._pointer_inside:
+            return "마우스 호버 중 · 자동 닫힘 일시정지"
+        if self._dismiss_deadline is None:
+            return "자동 닫힘 대기 중"
+        remaining = max(0.0, self._dismiss_deadline - self._monotonic())
+        return f"{max(1, math.ceil(remaining))}초 후 닫힘"
+
+    def _update_countdown_label(self) -> None:
+        label = self._widgets.get("countdown")
+        if label is not None:
+            _safe_call(label, "configure", text=self._countdown_text())
+
+    def _cancel_countdown(self) -> None:
+        after_id = self._countdown_after_id
+        self._countdown_after_id = None
+        self._countdown_token = None
         if after_id is None:
             return
         canceller = getattr(self._root, "after_cancel", None)
@@ -530,6 +676,21 @@ class WorktimeQuickPanel:
                 canceller(after_id)
             except Exception:
                 pass
+
+    def _cancel_dismiss_timer(self) -> None:
+        after_id = self._dismiss_after_id
+        self._dismiss_after_id = None
+        self._dismiss_token = None
+        self._dismiss_deadline = None
+        self._cancel_countdown()
+        if after_id is not None:
+            canceller = getattr(self._root, "after_cancel", None)
+            if callable(canceller):
+                try:
+                    canceller(after_id)
+                except Exception:
+                    pass
+        self._update_countdown_label()
 
     def _cancel_timers(self) -> None:
         self._cancel_refresh()
@@ -696,8 +857,56 @@ class WorktimeQuickPanel:
                 (row_frame, weekday_label, date_label, summary_label, today_label)
             )
 
+        target_editor = tk.Frame(
+            content,
+            bg=_CARD_BG,
+            highlightthickness=1,
+            highlightbackground=_HOVER_BORDER,
+        )
+        target_row = tk.Frame(target_editor, bg=_CARD_BG)
+        target_row.pack(fill="x", padx=10, pady=(7, 3))
+        tk.Label(
+            target_row,
+            text="오늘 목표 순근무 시간",
+            bg=_CARD_BG,
+            fg=_TEXT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left")
+        target_entry = tk.Entry(
+            target_row,
+            width=8,
+            bg=_CARD_BG,
+            fg=_TEXT,
+            justify="center",
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+        )
+        target_entry.pack(side="left", padx=(10, 4))
+        _set_entry_text(target_entry, self._format_target_minutes(model.target_minutes))
+        tk.Label(
+            target_row,
+            text="HH:MM (00:00–24:00)",
+            bg=_CARD_BG,
+            fg=_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side="left", padx=(2, 8))
+        self._button(target_row, "저장", self._save_target_editor_command)
+        self._button(target_row, "취소", self._cancel_target_editor_command)
+        target_error = tk.Label(
+            target_editor,
+            text="",
+            bg=_CARD_BG,
+            fg="#DC2626",
+            anchor="w",
+            font=("Segoe UI", 8),
+        )
+        target_error.pack(fill="x", padx=10, pady=(0, 6))
+        self._bind_additive(target_entry, "<Return>", self._save_target_editor_event)
+        self._bind_additive(target_entry, "<Escape>", self._cancel_target_editor_event)
+
         actions = tk.Frame(content, bg=_BG)
-        actions.pack(fill="x", pady=(0, section_gap))
+        actions.pack(fill="x", pady=(0, 1))
         refresh_button = self._button(actions, "새로고침", self._refresh_command)
         clock_button = self._button(
             actions,
@@ -711,6 +920,15 @@ class WorktimeQuickPanel:
         )
         plan_button = self._button(actions, "계획 수정", self._edit_plan_command)
         settings_button = self._button(actions, "설정", self._settings_command)
+        countdown_label = tk.Label(
+            content,
+            text=self._countdown_text(),
+            bg=_BG,
+            fg=_MUTED,
+            anchor="e",
+            font=("Segoe UI", 8),
+        )
+        countdown_label.pack(fill="x", pady=(0, section_gap))
 
         prompt_label = None
         prompt_buttons: tuple[Any, ...] = ()
@@ -771,9 +989,17 @@ class WorktimeQuickPanel:
             "break_button": break_button,
             "plan_button": plan_button,
             "settings_button": settings_button,
+            "target_editor": target_editor,
+            "target_entry": target_entry,
+            "target_error": target_error,
+            "actions": actions,
+            "countdown": countdown_label,
             "prompt_label": prompt_label,
             "prompt_buttons": prompt_buttons,
         }
+        if self._target_editor_active:
+            self._show_target_editor(reset_value=False)
+        self._update_countdown_label()
 
     def _update_rendered_model(self, model: WorktimePanelModel) -> None:
         widgets = self._widgets
@@ -820,6 +1046,12 @@ class WorktimeQuickPanel:
         widgets["break_button"].configure(
             text="휴게 종료" if model.break_active else "휴게 시작"
         )
+        if not self._target_editor_active:
+            _set_entry_text(
+                widgets["target_entry"],
+                self._format_target_minutes(model.target_minutes),
+            )
+        self._update_countdown_label()
 
         if model.prompt is not None:
             prompt = model.prompt
@@ -865,6 +1097,112 @@ class WorktimeQuickPanel:
         button.pack(side="left", padx=(0, 6), pady=2)
         return button
 
+    @staticmethod
+    def _format_target_minutes(minutes: int) -> str:
+        total = max(0, min(1440, int(minutes)))
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    @staticmethod
+    def _parse_target_minutes(value: object) -> tuple[int | None, str | None]:
+        text = str(value or "").strip()
+        if _TARGET_HHMM_PATTERN.fullmatch(text) is None:
+            return None, "HH:MM 형식으로 입력해 주세요."
+        hours_text, minutes_text = text.split(":", 1)
+        hours = int(hours_text)
+        minutes = int(minutes_text)
+        if hours == 24 and minutes != 0:
+            return None, "24시간은 24:00으로만 입력할 수 있습니다."
+        total = hours * 60 + minutes
+        if not 0 <= total <= 1440:
+            return None, "00:00부터 24:00 사이로 입력해 주세요."
+        return total, None
+
+    def _show_target_editor(self, *, reset_value: bool = True) -> None:
+        editor = self._widgets.get("target_editor")
+        entry = self._widgets.get("target_entry")
+        actions = self._widgets.get("actions")
+        if editor is None or entry is None:
+            return
+        self._target_editor_active = True
+        if reset_value and self._model is not None:
+            _set_entry_text(
+                entry,
+                self._format_target_minutes(self._model.target_minutes),
+            )
+        _safe_call(self._widgets.get("target_error"), "configure", text="")
+        _safe_call(
+            editor,
+            "pack",
+            fill="x",
+            pady=(0, 6),
+            before=actions,
+        )
+        _safe_call(entry, "focus_set")
+        _safe_call(entry, "selection_range", 0, "end")
+        self._cancel_dismiss_timer()
+        self._update_countdown_label()
+        self._geometry_retry_pending = not self._reconcile_geometry(
+            resize_to_request=True
+        )
+
+    def _close_target_editor(self, *, reconcile: bool = True) -> None:
+        if not self._target_editor_active:
+            return
+        self._target_editor_active = False
+        _safe_call(self._widgets.get("target_editor"), "pack_forget")
+        _safe_call(self._widgets.get("target_error"), "configure", text="")
+        if reconcile and self._visible:
+            self._geometry_retry_pending = not self._reconcile_geometry(
+                resize_to_request=True
+            )
+            self._reset_dismiss_timer()
+        else:
+            self._update_countdown_label()
+
+    def _save_target_editor_command(self) -> None:
+        entry = self._widgets.get("target_entry")
+        getter = getattr(entry, "get", None)
+        raw_value = getter() if callable(getter) else ""
+        target_minutes, error = self._parse_target_minutes(raw_value)
+        if error is not None or target_minutes is None:
+            _safe_call(
+                self._widgets.get("target_error"),
+                "configure",
+                text=error or "근무시간을 확인해 주세요.",
+            )
+            return
+
+        self._interaction_depth += 1
+        self._cancel_dismiss_timer()
+        saved = False
+        try:
+            saved = self._on_edit_plan(target_minutes) is True
+            self.refresh_now()
+        except Exception:
+            saved = False
+        finally:
+            self._interaction_depth = max(0, self._interaction_depth - 1)
+        if saved:
+            self._close_target_editor(reconcile=True)
+        else:
+            _safe_call(
+                self._widgets.get("target_error"),
+                "configure",
+                text="오늘 목표를 저장하지 못했습니다.",
+            )
+            self._update_countdown_label()
+
+    def _cancel_target_editor_command(self) -> None:
+        self._close_target_editor(reconcile=True)
+
+    def _save_target_editor_event(self, _event: Any = None) -> str:
+        self._save_target_editor_command()
+        return "break"
+
+    def _cancel_target_editor_event(self, _event: Any = None) -> str:
+        self._cancel_target_editor_command()
+        return "break"
+
     def _run_command(self, callback: Callable[..., None], *args: Any) -> None:
         self._interaction_depth += 1
         self._cancel_dismiss_timer()
@@ -907,7 +1245,12 @@ class WorktimeQuickPanel:
         self._run_command(self._on_edit_clock_in)
 
     def _edit_plan_command(self) -> None:
-        self._run_command(self._on_edit_plan)
+        if self._target_editor_active:
+            entry = self._widgets.get("target_entry")
+            _safe_call(entry, "focus_set")
+            _safe_call(entry, "selection_range", 0, "end")
+            return
+        self._show_target_editor(reset_value=True)
 
     def _toggle_break_command(self) -> None:
         self._run_command(self._on_toggle_break)
@@ -927,41 +1270,56 @@ class WorktimeQuickPanel:
     def _prompt_skip_command(self) -> None:
         self._run_command(self._on_prompt_skip)
 
-    def _reconcile_geometry(self) -> bool:
-        """Preserve a valid user rectangle while growing/reclamping as needed."""
+    def _reconcile_geometry(
+        self,
+        *,
+        anchor_to_pointer: bool = False,
+        resize_to_request: bool = False,
+    ) -> bool:
+        """Size safely and optionally anchor the panel beside the pointer."""
 
         window = self._window
         if window is None or not self._window_exists(window):
             return False
         _safe_call(window, "update_idletasks")
 
-        work_left, work_top, work_right, work_bottom = _work_area_for_window(
-            window,
-            self._root,
-        )
-        work_width = max(1, work_right - work_left)
-        work_height = max(1, work_bottom - work_top)
         requested_width = _positive_int_call(window, "winfo_reqwidth", 680)
         requested_height = _positive_int_call(window, "winfo_reqheight", 480)
         current = self._window_rect(window)
-
-        if self._placed and current is not None:
-            current_x, current_y, current_width, current_height = current
-            width = min(
-                max(current_width, requested_width, 680),
-                work_width,
+        pointer_x, pointer_y = _pointer_position(window, self._root)
+        use_pointer = bool(anchor_to_pointer or not self._placed or current is None)
+        if use_pointer:
+            work_area = _work_area_for_point(
+                pointer_x,
+                pointer_y,
+                window,
+                self._root,
             )
-            height = min(
-                max(current_height, requested_height, 480),
-                work_height,
-            )
-            x = current_x
-            y = current_y
         else:
+            work_area = _work_area_for_window(window, self._root)
+        work_left, work_top, work_right, work_bottom = work_area
+        work_width = max(1, work_right - work_left)
+        work_height = max(1, work_bottom - work_top)
+
+        current_width = current[2] if current is not None else 1
+        current_height = current[3] if current is not None else 1
+        if resize_to_request:
             width = min(max(requested_width, 680), work_width)
             height = min(max(requested_height, 480), work_height)
-            x = _int_call(self._root, "winfo_rootx", work_left) + 24
-            y = _int_call(self._root, "winfo_rooty", work_top) + 24
+        else:
+            width = min(max(current_width, requested_width, 680), work_width)
+            height = min(max(current_height, requested_height, 480), work_height)
+
+        if use_pointer:
+            x = pointer_x + _POINTER_OFFSET_PX
+            y = pointer_y + _POINTER_OFFSET_PX
+            if x + width > work_right:
+                x = pointer_x - width - _POINTER_OFFSET_PX
+            if y + height > work_bottom:
+                y = pointer_y - height - _POINTER_OFFSET_PX
+        else:
+            x = current[0]
+            y = current[1]
 
         x = min(max(x, work_left), work_right - width)
         y = min(max(y, work_top), work_bottom - height)
@@ -1033,9 +1391,21 @@ class WorktimeQuickPanel:
             return False
 
 
-def _work_area_for_window(window: Any, root: Any) -> tuple[int, int, int, int]:
-    """Return the nearest monitor work area in virtual-screen coordinates."""
+def _fallback_work_area(window: Any) -> tuple[int, int, int, int]:
+    screen_width = _positive_int_call(window, "winfo_screenwidth", 1280)
+    screen_height = _positive_int_call(window, "winfo_screenheight", 720)
+    left = _int_call(window, "winfo_vrootx", 0)
+    top = _int_call(window, "winfo_vrooty", 0)
+    width = _int_call(window, "winfo_vrootwidth", screen_width)
+    height = _int_call(window, "winfo_vrootheight", screen_height)
+    if width <= 0:
+        width = screen_width
+    if height <= 0:
+        height = screen_height
+    return left, top, left + width, top + height
 
+
+def _monitor_work_area(user32: Any, monitor: Any) -> tuple[int, int, int, int] | None:
     try:
         import ctypes
         from ctypes import wintypes
@@ -1048,6 +1418,35 @@ def _work_area_for_window(window: Any, root: Any) -> tuple[int, int, int, int]:
                 ("dwFlags", wintypes.DWORD),
             ]
 
+        user32.GetMonitorInfoW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(MonitorInfo),
+        ]
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(MonitorInfo)
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            work = info.rcWork
+            result = (
+                int(work.left),
+                int(work.top),
+                int(work.right),
+                int(work.bottom),
+            )
+            if result[2] > result[0] and result[3] > result[1]:
+                return result
+    except Exception:
+        pass
+    return None
+
+
+def _work_area_for_window(window: Any, root: Any) -> tuple[int, int, int, int]:
+    """Return the nearest monitor work area in virtual-screen coordinates."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
         winfo_id = getattr(window, "winfo_id", None)
         if callable(winfo_id):
             hwnd = int(winfo_id())
@@ -1058,58 +1457,227 @@ def _work_area_for_window(window: Any, root: Any) -> tuple[int, int, int, int]:
                     wintypes.DWORD,
                 ]
                 user32.MonitorFromWindow.restype = wintypes.HANDLE
-                user32.GetMonitorInfoW.argtypes = [
-                    wintypes.HANDLE,
-                    ctypes.POINTER(MonitorInfo),
-                ]
-                user32.GetMonitorInfoW.restype = wintypes.BOOL
-                monitor = user32.MonitorFromWindow(
-                    wintypes.HWND(hwnd),
-                    2,
-                )
-                info = MonitorInfo()
-                info.cbSize = ctypes.sizeof(MonitorInfo)
-                if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-                    work = info.rcWork
-                    result = (
-                        int(work.left),
-                        int(work.top),
-                        int(work.right),
-                        int(work.bottom),
-                    )
-                    if result[2] > result[0] and result[3] > result[1]:
-                        return result
+                monitor = user32.MonitorFromWindow(wintypes.HWND(hwnd), 2)
+                result = _monitor_work_area(user32, monitor)
+                if result is not None:
+                    return result
     except Exception:
         pass
-
-    screen_width = _positive_int_call(window, "winfo_screenwidth", 1280)
-    screen_height = _positive_int_call(window, "winfo_screenheight", 720)
-    left = _int_call(window, "winfo_vrootx", 0)
-    top = _int_call(window, "winfo_vrooty", 0)
-    width = _int_call(window, "winfo_vrootwidth", screen_width)
-    height = _int_call(window, "winfo_vrootheight", screen_height)
-    if width <= 0:
-        width = screen_width
-    if height <= 0:
-        height = screen_height
     _ = root
-    return left, top, left + width, top + height
+    return _fallback_work_area(window)
 
 
-def _show_window_without_activation(window: Any) -> bool:
-    """Show a native Tk top-level without moving focus or changing geometry."""
+def _work_area_for_point(
+    x: int,
+    y: int,
+    window: Any,
+    root: Any,
+) -> tuple[int, int, int, int]:
+    """Return the work area containing the current pointer."""
 
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = wintypes.HANDLE
+        monitor = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)
+        result = _monitor_work_area(user32, monitor)
+        if result is not None:
+            return result
+    except Exception:
+        pass
+    return _work_area_for_window(window, root)
+
+
+def _pointer_position(window: Any, root: Any) -> tuple[int, int]:
+    try:
+        return int(window.winfo_pointerx()), int(window.winfo_pointery())
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        point = wintypes.POINT()
+        if user32.GetCursorPos(ctypes.byref(point)):
+            return int(point.x), int(point.y)
+    except Exception:
+        pass
+    return (
+        _int_call(root, "winfo_rootx", 0) + _POINTER_OFFSET_PX,
+        _int_call(root, "winfo_rooty", 0) + _POINTER_OFFSET_PX,
+    )
+
+
+def _native_window_handle(window: Any) -> int:
     try:
         import ctypes
         from ctypes import wintypes
 
         winfo_id = getattr(window, "winfo_id", None)
         if not callable(winfo_id):
-            return False
+            return 0
         client_hwnd = int(winfo_id())
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
         user32.GetAncestor.restype = wintypes.HWND
+        return int(user32.GetAncestor(wintypes.HWND(client_hwnd), 2) or client_hwnd)
+    except Exception:
+        return 0
+
+
+def _window_is_foreground(window: Any) -> bool:
+    hwnd = _native_window_handle(window)
+    if hwnd <= 0:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        foreground = int(user32.GetForegroundWindow() or 0)
+        if foreground <= 0:
+            return False
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        foreground_root = int(
+            user32.GetAncestor(wintypes.HWND(foreground), 2) or foreground
+        )
+        return foreground_root == hwnd
+    except Exception:
+        return False
+
+
+def _show_window_activated(window: Any) -> bool:
+    """Show a short-lived topmost panel and request native foreground ownership."""
+
+    _safe_call(window, "deiconify")
+    _safe_call(window, "attributes", "-topmost", True)
+    _safe_call(window, "lift")
+    _safe_call(window, "focus_force")
+    _safe_call(window, "update_idletasks")
+    hwnd = _native_window_handle(window)
+    if hwnd <= 0:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
+        user32.BringWindowToTop.restype = wintypes.BOOL
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.AttachThreadInput.argtypes = [
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.BOOL,
+        ]
+        user32.AttachThreadInput.restype = wintypes.BOOL
+        user32.SetActiveWindow.argtypes = [wintypes.HWND]
+        user32.SetActiveWindow.restype = wintypes.HWND
+        user32.SetFocus.argtypes = [wintypes.HWND]
+        user32.SetFocus.restype = wintypes.HWND
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        kernel32.GetCurrentThreadId.argtypes = []
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        sw_show = 5
+        swp_nosize = 0x0001
+        swp_nomove = 0x0002
+        swp_showwindow = 0x0040
+        swp_noownerzorder = 0x0200
+        native = wintypes.HWND(hwnd)
+        user32.ShowWindow(native, sw_show)
+        user32.SetWindowPos(
+            native,
+            wintypes.HWND(-1),
+            0,
+            0,
+            0,
+            0,
+            swp_nosize | swp_nomove | swp_showwindow | swp_noownerzorder,
+        )
+
+        foreground = int(user32.GetForegroundWindow() or 0)
+        foreground_thread = 0
+        current_thread = int(kernel32.GetCurrentThreadId() or 0)
+        if foreground > 0:
+            process_id = wintypes.DWORD()
+            foreground_thread = int(
+                user32.GetWindowThreadProcessId(
+                    wintypes.HWND(foreground),
+                    ctypes.byref(process_id),
+                )
+                or 0
+            )
+        attached = False
+        if (
+            foreground_thread > 0
+            and current_thread > 0
+            and foreground_thread != current_thread
+        ):
+            attached = bool(
+                user32.AttachThreadInput(
+                    wintypes.DWORD(current_thread),
+                    wintypes.DWORD(foreground_thread),
+                    True,
+                )
+            )
+        try:
+            user32.BringWindowToTop(native)
+            user32.SetActiveWindow(native)
+            user32.SetFocus(native)
+            user32.SetForegroundWindow(native)
+        finally:
+            if attached:
+                user32.AttachThreadInput(
+                    wintypes.DWORD(current_thread),
+                    wintypes.DWORD(foreground_thread),
+                    False,
+                )
+    except Exception:
+        return False
+    _safe_call(window, "focus_force")
+    return _window_is_foreground(window)
+
+
+def _show_window_without_activation(window: Any) -> bool:
+    """Show a native Tk top-level without moving keyboard focus."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = _native_window_handle(window)
+        if hwnd <= 0:
+            return False
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.ShowWindow.restype = wintypes.BOOL
         user32.SetWindowPos.argtypes = [
@@ -1123,20 +1691,18 @@ def _show_window_without_activation(window: Any) -> bool:
         ]
         user32.SetWindowPos.restype = wintypes.BOOL
 
-        hwnd = int(user32.GetAncestor(wintypes.HWND(client_hwnd), 2) or client_hwnd)
-        if hwnd <= 0:
-            return False
         sw_shownoactivate = 4
         swp_nosize = 0x0001
         swp_nomove = 0x0002
         swp_noactivate = 0x0010
         swp_showwindow = 0x0040
         swp_noownerzorder = 0x0200
-        user32.ShowWindow(wintypes.HWND(hwnd), sw_shownoactivate)
+        native = wintypes.HWND(hwnd)
+        user32.ShowWindow(native, sw_shownoactivate)
         return bool(
             user32.SetWindowPos(
-                wintypes.HWND(hwnd),
-                wintypes.HWND(0),
+                native,
+                wintypes.HWND(-1),
                 0,
                 0,
                 0,
@@ -1150,6 +1716,11 @@ def _show_window_without_activation(window: Any) -> bool:
         )
     except Exception:
         return False
+
+
+def _set_entry_text(entry: Any, text: str) -> None:
+    _safe_call(entry, "delete", 0, "end")
+    _safe_call(entry, "insert", 0, str(text))
 
 
 def _require_string(value: object, *, name: str) -> str:

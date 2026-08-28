@@ -353,9 +353,34 @@ class WrikeSettingsView:
             vacation_entry.bind("<KeyRelease>", self._mark_vacation_ical_dirty)
         except Exception:
             pass
+        vacation_buttons = tk.Frame(content, bg=card_bg)
+        vacation_buttons.grid(row=row, column=2, sticky="w", padx=(8, 0))
         ttk.Button(
-            content, text="지우기", command=self._on_clear_vacation_ical
-        ).grid(row=row, column=2, sticky="w", padx=(8, 0))
+            vacation_buttons,
+            text="연결 다시 확인",
+            command=self._on_retry_vacation_ical,
+        ).pack(side="left")
+        ttk.Button(
+            vacation_buttons,
+            text="지우기",
+            command=self._on_clear_vacation_ical,
+        ).pack(side="left", padx=(4, 0))
+        row += 1
+
+        tk.Label(
+            content,
+            text=(
+                "Google Calendar 설정의 ‘비공개 주소(iCal 형식)’만 지원합니다. "
+                "브라우저 주소, 로그인/Cookie/OAuth 및 Microsoft 365 링크는 "
+                "사용할 수 없습니다."
+            ),
+            bg=card_bg,
+            fg=text_muted,
+            font=("Segoe UI", 8),
+            anchor="w",
+            justify="left",
+            wraplength=620,
+        ).grid(row=row, column=1, columnspan=2, sticky="we", pady=(0, 6))
         row += 1
 
         tk.Label(
@@ -943,38 +968,80 @@ class WrikeSettingsView:
         has_last_good = bool(data.get("has_last_good", False))
         state_labels = {
             "unconfigured": "미설정",
-            "loading": "불러오는 중",
+            "loading": "확인 중",
             "fresh": "정상",
             "stale": "마지막 성공값 사용 중",
             "error": "오류",
         }
         state_messages = {
-            "unconfigured": "비공개 iCal URL을 입력해 주세요.",
-            "loading": "캘린더를 확인하는 중입니다. 잠시 후 다시 확인해 주세요.",
-            "fresh": "휴가 캘린더를 정상적으로 확인했습니다.",
-            "stale": "연결 상태를 확인한 뒤 다시 시도해 주세요.",
+            "unconfigured": (
+                "Google Calendar의 비공개 주소(iCal 형식)를 입력해 주세요."
+            ),
+            "loading": "저장 완료 · 연결 단계 확인 중입니다.",
+            "fresh": "연결·응답·문서·캘린더 확인을 모두 통과했습니다.",
+            "stale": "연결 단계 재확인이 필요합니다. 다시 확인해 주세요.",
         }
         error_labels = {
-            "invalid_endpoint": "비공개 iCal URL 형식을 확인하고 다시 저장해 주세요.",
-            "redirect_rejected": "허용되지 않은 이동이 차단되었습니다. 비공개 iCal URL을 다시 발급해 저장해 주세요.",
-            "http_4xx": "접근이 거부되었거나 링크가 만료되었습니다. 비공개 iCal URL을 다시 발급해 주세요.",
-            "http_5xx": "캘린더 서버 오류입니다. 잠시 후 다시 시도해 주세요.",
-            "dns_or_connect": "네트워크 연결과 DNS 상태를 확인한 뒤 다시 시도해 주세요.",
-            "timeout": "응답 시간이 초과되었습니다. 네트워크 상태를 확인하고 다시 시도해 주세요.",
-            "tls_validation": "보안 연결을 확인하지 못했습니다. 시스템 시간과 인증서 환경을 확인해 주세요.",
-            "body_too_large": "캘린더 데이터가 너무 큽니다. 이벤트 범위를 줄이거나 URL을 다시 발급해 주세요.",
-            "unsupported_encoding": "지원하지 않는 압축 형식입니다. 비공개 iCal URL을 다시 발급해 주세요.",
-            "utf8_decode": "캘린더 문자 인코딩을 읽지 못했습니다. 비공개 iCal URL을 다시 발급해 주세요.",
-            "empty_body": "빈 캘린더 응답입니다. 잠시 후 다시 시도하거나 URL을 다시 발급해 주세요.",
-            "invalid_ical": "캘린더 문서 형식이 올바르지 않습니다. 비공개 iCal URL을 다시 발급해 주세요.",
-            "secret_unavailable": "저장된 비공개 URL을 사용할 수 없습니다. URL을 다시 입력해 주세요.",
-            "calendar_name_mismatch": "휴가 캘린더가 아닌 피드입니다. 올바른 비공개 iCal URL을 다시 저장해 주세요.",
-            "calendar_fetch_failed": "캘린더를 가져오지 못했습니다. 연결 상태를 확인하고 다시 시도해 주세요.",
+            "invalid_endpoint": (
+                "Google Calendar 비공개 주소(iCal 형식)인지 확인해 주세요. "
+                "브라우저·로그인·Microsoft 365 주소는 지원하지 않습니다."
+            ),
+            "redirect_rejected": (
+                "연결 단계에서 허용되지 않은 이동을 차단했습니다. "
+                "비공개 iCal 주소를 다시 발급해 저장해 주세요."
+            ),
+            "authentication_required": (
+                "연결 단계에서 로그인이 필요한 응답을 받았습니다. "
+                "로그인 주소가 아니라 인증 없이 읽히는 비공개 iCal 주소를 저장해 주세요."
+            ),
+            "http_4xx": (
+                "연결 단계에서 링크 거부 또는 만료를 확인했습니다. "
+                "비공개 iCal 주소를 다시 발급해 주세요."
+            ),
+            "http_5xx": "연결 단계의 캘린더 서버 오류입니다. 잠시 후 다시 확인해 주세요.",
+            "dns_or_connect": "연결 단계 오류입니다. 네트워크와 DNS 상태를 확인해 주세요.",
+            "timeout": "연결 단계 응답 시간이 초과되었습니다. 네트워크를 확인해 주세요.",
+            "tls_validation": (
+                "연결 단계의 보안 인증서를 확인하지 못했습니다. "
+                "시스템 시간과 인증서 환경을 확인해 주세요."
+            ),
+            "body_too_large": (
+                "응답 단계에서 캘린더 데이터가 너무 큽니다. "
+                "이벤트 범위를 줄이거나 주소를 다시 발급해 주세요."
+            ),
+            "unsupported_encoding": (
+                "응답 단계에서 지원하지 않는 압축 형식을 받았습니다. "
+                "비공개 iCal 주소를 다시 발급해 주세요."
+            ),
+            "unexpected_content_type": (
+                "응답 단계에서 캘린더가 아닌 형식을 받았습니다. "
+                "브라우저 주소 대신 비공개 iCal 주소를 저장해 주세요."
+            ),
+            "utf8_decode": (
+                "응답 단계에서 문자 인코딩을 읽지 못했습니다. "
+                "비공개 iCal 주소를 다시 발급해 주세요."
+            ),
+            "empty_body": "응답 단계에서 빈 캘린더를 받았습니다. 다시 확인해 주세요.",
+            "invalid_ical": (
+                "문서 단계에서 올바른 iCal 문서를 확인하지 못했습니다. "
+                "비공개 iCal 주소를 다시 발급해 주세요."
+            ),
+            "secret_unavailable": (
+                "저장 단계의 암호화된 비공개 주소를 사용할 수 없습니다. "
+                "주소를 다시 입력해 주세요."
+            ),
+            "calendar_name_mismatch": (
+                "캘린더 확인 단계에서 회사 휴가 캘린더가 아닌 피드를 확인했습니다. "
+                "올바른 캘린더의 비공개 iCal 주소를 저장해 주세요."
+            ),
+            "calendar_fetch_failed": (
+                "연결 단계를 완료하지 못했습니다. 연결 상태를 확인하고 다시 시도해 주세요."
+            ),
         }
         message = (
             error_labels.get(
                 error_code,
-                "캘린더 상태를 확인하지 못했습니다. URL과 연결 상태를 확인해 주세요.",
+                "캘린더 확인 단계를 완료하지 못했습니다. 주소와 연결 상태를 확인해 주세요.",
             )
             if state == "error"
             else state_messages[state]
@@ -1292,6 +1359,46 @@ class WrikeSettingsView:
             self._set_status("휴게 캘린더 URL 삭제 실패", level="error")
         return
 
+    @staticmethod
+    def _vacation_save_error_message(error: object) -> str:
+        code = str(error or "").strip()
+        messages = {
+            "vacation_ical_invalid_endpoint": (
+                "휴가 캘린더 저장 실패: Google Calendar의 비공개 주소"
+                "(iCal 형식)만 지원합니다."
+            ),
+            "vacation_ical_secret_protection_failed": (
+                "휴가 캘린더 저장 실패: 비공개 주소를 안전하게 암호화하지 못했습니다."
+            ),
+        }
+        return messages.get(code, f"저장 실패: {code or '알 수 없는 오류'}")
+
+    def _request_vacation_ical_retry(self) -> tuple[bool, str | None]:
+        retry = getattr(self._wrike, "retry_vacation_ical", None)
+        if not callable(retry):
+            return False, "calendar_fetch_failed"
+        try:
+            result = retry()
+        except Exception:
+            return False, "calendar_fetch_failed"
+        if not isinstance(result, tuple) or len(result) != 2:
+            return False, "calendar_fetch_failed"
+        return bool(result[0]), str(result[1] or "") or None
+
+    def _on_retry_vacation_ical(self) -> None:
+        ok, error = self._request_vacation_ical_retry()
+        if ok:
+            if not self._refresh_vacation_status_from_backend():
+                fallback = dict(self._vacation_ical_status)
+                fallback.update({"state": "loading", "error_code": ""})
+                self._refresh_vacation_ical_status(fallback)
+            self._set_status("휴가 캘린더 연결 확인을 시작했습니다.", level="info")
+            return
+        fallback = dict(self._vacation_ical_status)
+        fallback.update({"state": "error", "error_code": error or "calendar_fetch_failed"})
+        self._refresh_vacation_ical_status(fallback)
+        self._set_status("휴가 캘린더 연결 확인을 시작하지 못했습니다.", level="error")
+
     def _on_clear_vacation_ical(self) -> None:
         try:
             ok, err = self._wrike.update_settings(
@@ -1600,9 +1707,29 @@ class WrikeSettingsView:
                             "has_last_good": False,
                         })
                         self._refresh_vacation_ical_status(fallback)
-                self._set_status("저장됨", level="ok")
+                    retry = getattr(self._wrike, "retry_vacation_ical", None)
+                    if vacation_ical_url and callable(retry):
+                        self._request_vacation_ical_retry()
+                        self._refresh_vacation_status_from_backend()
+                self._set_status(
+                    "저장됨 · 휴가 캘린더 연결 확인 중"
+                    if vacation_dirty and vacation_ical_url
+                    else "저장됨",
+                    level="ok",
+                )
             else:
-                self._set_status("저장 실패", level="error")
+                if str(err or "") == "vacation_ical_invalid_endpoint":
+                    fallback = dict(self._vacation_ical_status)
+                    fallback.update({
+                        "state": "error",
+                        "error_code": "invalid_endpoint",
+                        "has_last_good": False,
+                    })
+                    self._refresh_vacation_ical_status(fallback)
+                self._set_status(
+                    self._vacation_save_error_message(err),
+                    level="error",
+                )
         except Exception:
             pass
         return
