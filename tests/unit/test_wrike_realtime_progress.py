@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import io
 import json
 import os
 from pathlib import Path
 import queue
+import socket
+import ssl
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 from src.apps.Monitor import Monitor
 from src.apps.Wrike import Wrike
+from src.apps.wrike_ical import CalendarError, CalendarErrorCode, CalendarSuccess
+from src.apps.wrike_ui import WrikeSettingsView
 from src.apps.wrike_worktime import BreakInterval
 from src.apps.wrike_timelog_snapshot import (
     TimelogDay,
@@ -19,6 +25,7 @@ from src.apps.wrike_timelog_snapshot import (
     WrikeTimelogSnapshotStore,
     apply_stale_threshold,
     make_fresh_snapshot,
+    make_loading_snapshot,
 )
 from src.utils.secret_store import SecretStore
 
@@ -63,6 +70,63 @@ class _FakeRoot:
         self.after_calls = [item for item in self.after_calls if item[0] != after_id]
 
 
+class _FakeCalendarResponse:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        url: str = "https://calendar.google.com/calendar/ical/test/basic.ics",
+        headers=None,
+        status: int = 200,
+        read_error: BaseException | None = None,
+    ) -> None:
+        self.headers = headers or {}
+        self.status = status
+        self._url = url
+        self._body = io.BytesIO(body)
+        self._read_error = read_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def geturl(self):
+        return self._url
+
+    def getcode(self):
+        return self.status
+
+    def read(self, size=-1):
+        if self._read_error is not None:
+            raise self._read_error
+        return self._body.read(size)
+
+
+class _FakeOpener:
+    def __init__(self, result) -> None:
+        self.result = result
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append((request, timeout))
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+class _FakeVar:
+    def __init__(self, value="") -> None:
+        self.value = value
+
+    def set(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
 class _FakePanel:
     instances = []
 
@@ -70,6 +134,8 @@ class _FakePanel:
         self.root = root
         self.model_provider = model_provider
         self.callbacks = callbacks
+        self.idle_timeout_ms = callbacks.get("idle_timeout_ms")
+        self.idle_timeout_updates = []
         self.visible = False
         self.show_result = True
         self.show_maps = True
@@ -78,6 +144,10 @@ class _FakePanel:
         self.hide_calls = 0
         self.destroy_calls = 0
         self.__class__.instances.append(self)
+
+    def set_idle_timeout_ms(self, value):
+        self.idle_timeout_ms = int(value)
+        self.idle_timeout_updates.append(int(value))
 
     def toggle(self, activate=True):
         self.toggle_calls.append(bool(activate))
@@ -141,6 +211,14 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             wrike = Wrike()
         wrike._Wrike__lib.datetime = _FrozenDateTime
         return wrike
+
+    @staticmethod
+    def _empty_compiled_vacation() -> dict:
+        return {
+            "vacation_schema_version": 1,
+            "calendar_matched": True,
+            "events": [],
+        }
 
     @staticmethod
     def _week_datetimes(start: date = date(2026, 4, 6)) -> list[datetime]:
@@ -958,6 +1036,97 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             wrike._Wrike__on_worktime_activity(datetime(2026, 4, 7, 9, 0))
         self.assertIsNone(wrike._Wrike__worktime_state_store.get_activity_prompt(date(2026, 4, 7)))
 
+    def test_pending_activity_prompt_rechecks_live_vacation_gate_and_identity(self) -> None:
+        wrike = self._new_wrike()
+        target_day = date(2026, 4, 6)
+        detected_at = datetime(2026, 4, 6, 8, 5)
+        _FrozenDateTime.current = datetime(2026, 4, 6, 8, 6)
+        wrike._Wrike__worktime_state_store.record_activity_prompt_pending(
+            target_day,
+            detected_at,
+        )
+        self.assertIsNotNone(
+            wrike._Wrike__visible_activity_prompt(_FrozenDateTime.current)
+        )
+
+        wrike._Wrike__vacation_ical_url_session = (
+            "https://calendar.google.com/calendar/ical/prompt/basic.ics"
+        )
+        wrike._Wrike__vacation_ical_calendar = self._empty_compiled_vacation()
+        for state in ("loading", "stale", "error"):
+            with self.subTest(state=state):
+                wrike._Wrike__vacation_ical_state = state
+                wrike._Wrike__vacation_ical_last_error = (
+                    "calendar_fetch_failed" if state == "error" else ""
+                )
+                self.assertIsNone(
+                    wrike._Wrike__visible_activity_prompt(
+                        _FrozenDateTime.current
+                    )
+                )
+                wrike._Wrike__panel_prompt_accept("08:05")
+                ask = Mock(return_value="08:00")
+                with patch.dict(
+                    "sys.modules",
+                    {"tkinter.simpledialog": Mock(askstring=ask)},
+                ):
+                    wrike._Wrike__panel_prompt_edit("08:05")
+                ask.assert_not_called()
+                wrike._Wrike__panel_prompt_snooze()
+                wrike._Wrike__panel_prompt_skip()
+                self.assertIsNone(wrike.get_workday_plan(target_day)["clock_in"])
+                self.assertEqual(
+                    wrike._Wrike__worktime_state_store.get_activity_prompt(
+                        target_day
+                    )["status"],
+                    "pending",
+                )
+
+        wrike._Wrike__vacation_ical_url_session = ""
+        wrike._Wrike__vacation_ical_calendar = {}
+        wrike._Wrike__vacation_ical_state = "unconfigured"
+        wrike._Wrike__panel_prompt_accept("08:06")
+        self.assertIsNone(wrike.get_workday_plan(target_day)["clock_in"])
+
+        def make_unavailable_during_modal(**_kwargs):
+            wrike._Wrike__vacation_ical_url_session = (
+                "https://calendar.google.com/calendar/ical/prompt/basic.ics"
+            )
+            wrike._Wrike__vacation_ical_state = "loading"
+            return "08:00"
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "tkinter.simpledialog": Mock(
+                    askstring=Mock(side_effect=make_unavailable_during_modal)
+                )
+            },
+        ):
+            wrike._Wrike__panel_prompt_edit("08:05")
+        self.assertIsNone(wrike.get_workday_plan(target_day)["clock_in"])
+        self.assertEqual(
+            wrike._Wrike__worktime_state_store.get_activity_prompt(target_day)[
+                "status"
+            ],
+            "pending",
+        )
+
+        missing_gate_day = date(2026, 4, 7)
+        with patch.object(
+            wrike,
+            "_Wrike__vacation_result_for_date",
+            return_value={"all_day": False},
+        ):
+            wrike._Wrike__on_worktime_activity(
+                datetime(2026, 4, 7, 9, 0)
+            )
+        self.assertIsNone(
+            wrike._Wrike__worktime_state_store.get_activity_prompt(
+                missing_gate_day
+            )
+        )
+
     def test_activity_panel_surface_retries_until_show_is_mapped(self) -> None:
         wrike = self._new_wrike()
         root = _FakeRoot()
@@ -1028,6 +1197,539 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(plan["target_net_minutes"], 0)
         self.assertEqual(plan["clock_in"], "10:15")
 
+    def test_private_vacation_fetch_classifies_failures_without_network(self) -> None:
+        wrike = self._new_wrike()
+        private_url = (
+            "https://calendar.google.com/calendar/ical/private/basic.ics"
+            "?secret=classification-sentinel"
+        )
+
+        invalid = wrike._Wrike__fetch_vacation_calendar_text(
+            "https://example.invalid/private.ics"
+        )
+        self.assertIsInstance(invalid, CalendarError)
+        self.assertEqual(invalid.code, CalendarErrorCode.INVALID_ENDPOINT)
+
+        cases = (
+            (
+                "http_4xx",
+                urllib.error.HTTPError(
+                    private_url,
+                    403,
+                    "private status text",
+                    {"Location": "private location marker"},
+                    None,
+                ),
+                CalendarErrorCode.HTTP_4XX,
+            ),
+            (
+                "http_5xx",
+                urllib.error.HTTPError(
+                    private_url,
+                    503,
+                    "private status text",
+                    {"Location": "private location marker"},
+                    None,
+                ),
+                CalendarErrorCode.HTTP_5XX,
+            ),
+            (
+                "timeout",
+                TimeoutError("private timeout exception text"),
+                CalendarErrorCode.TIMEOUT,
+            ),
+            (
+                "tls",
+                ssl.SSLCertVerificationError(
+                    1,
+                    "private TLS exception text",
+                ),
+                CalendarErrorCode.TLS_VALIDATION,
+            ),
+            (
+                "dns",
+                urllib.error.URLError(
+                    socket.gaierror("private DNS exception text")
+                ),
+                CalendarErrorCode.DNS_OR_CONNECT,
+            ),
+        )
+        for name, failure, expected_code in cases:
+            with self.subTest(name=name), patch(
+                "src.apps.Wrike.urllib.request.build_opener",
+                return_value=_FakeOpener(failure),
+            ):
+                result = wrike._Wrike__fetch_vacation_calendar_text(private_url)
+            self.assertIsInstance(result, CalendarError)
+            self.assertEqual(result.code, expected_code)
+            self.assertNotIn(private_url, repr(result))
+            self.assertNotIn(str(failure), repr(result))
+            close_failure = getattr(failure, "close", None)
+            if callable(close_failure):
+                close_failure()
+
+        decode_cases = (
+            (
+                _FakeCalendarResponse(b"\xffprivate body"),
+                CalendarErrorCode.UTF8_DECODE,
+            ),
+            (
+                _FakeCalendarResponse(
+                    b"private body",
+                    headers={"Content-Encoding": "br"},
+                ),
+                CalendarErrorCode.UNSUPPORTED_ENCODING,
+            ),
+        )
+        for response, expected_code in decode_cases:
+            opener = _FakeOpener(response)
+            with patch(
+                "src.apps.Wrike.urllib.request.build_opener",
+                return_value=opener,
+            ):
+                result = wrike._Wrike__fetch_vacation_calendar_text(private_url)
+            self.assertIsInstance(result, CalendarError)
+            self.assertEqual(result.code, expected_code)
+            request = opener.requests[0][0]
+            request_headers = {
+                key.lower(): value for key, value in request.header_items()
+            }
+            self.assertEqual(
+                request_headers.get("accept-encoding"),
+                "gzip, identity",
+            )
+
+        body_read_cases = (
+            (
+                "body-timeout",
+                TimeoutError("private body timeout sentinel"),
+                CalendarErrorCode.TIMEOUT,
+            ),
+            (
+                "body-tls",
+                ssl.SSLError("private body TLS sentinel"),
+                CalendarErrorCode.TLS_VALIDATION,
+            ),
+            (
+                "body-connect",
+                OSError("private body connect sentinel"),
+                CalendarErrorCode.DNS_OR_CONNECT,
+            ),
+            (
+                "body-http-4xx",
+                urllib.error.HTTPError(
+                    private_url,
+                    429,
+                    "private body HTTP 4xx sentinel",
+                    {},
+                    None,
+                ),
+                CalendarErrorCode.HTTP_4XX,
+            ),
+            (
+                "body-http-5xx",
+                urllib.error.HTTPError(
+                    private_url,
+                    502,
+                    "private body HTTP 5xx sentinel",
+                    {},
+                    None,
+                ),
+                CalendarErrorCode.HTTP_5XX,
+            ),
+        )
+        for name, failure, expected_code in body_read_cases:
+            opener = _FakeOpener(
+                _FakeCalendarResponse(b"unused", read_error=failure)
+            )
+            with self.subTest(name=name), patch(
+                "src.apps.Wrike.urllib.request.build_opener",
+                return_value=opener,
+            ):
+                result = wrike._Wrike__fetch_vacation_calendar_text(private_url)
+            self.assertIsInstance(result, CalendarError)
+            self.assertEqual(result.code, expected_code)
+            self.assertNotIn(private_url, repr(result))
+            self.assertNotIn(str(failure), repr(result))
+            close_failure = getattr(failure, "close", None)
+            if callable(close_failure):
+                close_failure()
+
+        rejected_target = (
+            "https://redirect.invalid/private.ics?secret=location-sentinel"
+        )
+
+        def rejecting_opener(handler):
+            class _RedirectingOpener:
+                def open(self, request, timeout=None):
+                    handler.redirect_request(
+                        request,
+                        None,
+                        302,
+                        "private redirect status",
+                        {"Location": rejected_target},
+                        rejected_target,
+                    )
+
+            return _RedirectingOpener()
+
+        with patch(
+            "src.apps.Wrike.urllib.request.build_opener",
+            side_effect=rejecting_opener,
+        ):
+            rejected = wrike._Wrike__fetch_vacation_calendar_text(private_url)
+        self.assertIsInstance(rejected, CalendarError)
+        self.assertEqual(rejected.code, CalendarErrorCode.REDIRECT_REJECTED)
+        self.assertNotIn(rejected_target, repr(rejected))
+
+        allowed_target = (
+            "https://calendar.googleusercontent.com/calendar/ical/redirect/basic.ics"
+        )
+        allowed_document = "BEGIN:VCALENDAR\r\nEND:VCALENDAR"
+        redirect_requests = []
+
+        def allowing_opener(handler):
+            class _RedirectingOpener:
+                def open(self, request, timeout=None):
+                    redirect_requests.append(request.full_url)
+                    redirected = handler.redirect_request(
+                        request,
+                        None,
+                        302,
+                        "allowed redirect status",
+                        {"Location": allowed_target},
+                        allowed_target,
+                    )
+                    redirect_requests.append(redirected.full_url)
+                    return _FakeCalendarResponse(
+                        allowed_document.encode("utf-8"),
+                        url=allowed_target,
+                    )
+
+            return _RedirectingOpener()
+
+        with patch(
+            "src.apps.Wrike.urllib.request.build_opener",
+            side_effect=allowing_opener,
+        ):
+            allowed = wrike._Wrike__fetch_vacation_calendar_text(private_url)
+        self.assertIsInstance(allowed, CalendarSuccess)
+        self.assertEqual(allowed.value, allowed_document)
+        self.assertEqual(redirect_requests, [private_url, allowed_target])
+
+    def test_worker_retains_last_good_and_redacts_private_calendar_data(self) -> None:
+        wrike = self._new_wrike()
+        root = _FakeRoot()
+        private_values = (
+            "https://calendar.google.com/calendar/ical/private/basic.ics?secret=query-token",
+            "Location-like private redirect marker",
+            "private transport exception text",
+            "private response body marker",
+            "private calendar name marker",
+            "private vacation event title marker",
+            "김종인-ePapyrus",
+        )
+        wrike._Wrike__root = root
+        wrike._Wrike__background_active = True
+        wrike._Wrike__vacation_ical_url_session = private_values[0]
+        wrike._Wrike__vacation_ical_state = "stale"
+        last_good = self._empty_compiled_vacation()
+        wrike._Wrike__vacation_ical_calendar = last_good
+        captured_logs = []
+        wrike._Wrike__log = captured_logs.append
+
+        transport_opener = _FakeOpener(
+            urllib.error.URLError(Exception(private_values[2]))
+        )
+        with patch(
+            "src.apps.Wrike.urllib.request.build_opener",
+            return_value=transport_opener,
+        ):
+            transport_result = wrike._Wrike__fetch_vacation_calendar_text(
+                private_values[0]
+            )
+        self.assertIsInstance(transport_result, CalendarError)
+        self.assertEqual(
+            transport_result.code,
+            CalendarErrorCode.DNS_OR_CONNECT,
+        )
+
+        invalid_document = "\r\n".join(private_values[1:6])
+        mismatch_document = "\r\n".join(
+            (
+                "BEGIN:VCALENDAR",
+                f"NAME:{private_values[4]}",
+                f"X-PRIVATE-URL:{private_values[0]}",
+                f"X-PRIVATE-LOCATION:{private_values[1]}",
+                f"X-PRIVATE-ERROR:{private_values[2]}",
+                f"X-PRIVATE-BODY:{private_values[3]}",
+                "BEGIN:VEVENT",
+                "DTSTART:20260406T090000",
+                f"SUMMARY:{private_values[5]}",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            )
+        )
+        worker_results = (
+            (transport_result, CalendarErrorCode.DNS_OR_CONNECT.value),
+            (CalendarSuccess(invalid_document), CalendarErrorCode.INVALID_ICAL.value),
+            (CalendarSuccess(mismatch_document), "calendar_name_mismatch"),
+        )
+
+        with patch("src.apps.Wrike.threading.Thread", _FakeThread):
+            for result, expected_code in worker_results:
+                wrike._Wrike__fetch_vacation_calendar_text = Mock(
+                    return_value=result
+                )
+                wrike._Wrike__vacation_ical_tick(
+                    wrike._Wrike__vacation_ical_generation
+                )
+                worker_thread = _FakeThread.created[-1]
+                worker_thread.target()
+                wrike._Wrike__drain_ui_queue()
+                status = wrike.get_vacation_ical_status_snapshot()
+                self.assertEqual(status["state"], "error")
+                self.assertEqual(status["error_code"], expected_code)
+                self.assertTrue(status["has_last_good"])
+                self.assertIs(wrike._Wrike__vacation_ical_calendar, last_good)
+
+        private_uid = "private-vacation-uid@example.invalid"
+        success_document = "\r\n".join(
+            (
+                "BEGIN:VCALENDAR",
+                f"X-WR-CALNAME:{private_values[6]}",
+                "BEGIN:VEVENT",
+                f"UID:{private_uid}",
+                "DTSTART:20260406T090000",
+                "DTEND:20260406T100000",
+                f"SUMMARY:{private_values[5]} 휴가",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            )
+        )
+        wrike._Wrike__fetch_vacation_calendar_text = Mock(
+            return_value=CalendarSuccess(success_document)
+        )
+        with patch("src.apps.Wrike.threading.Thread", _FakeThread):
+            wrike._Wrike__vacation_ical_tick(
+                wrike._Wrike__vacation_ical_generation
+            )
+            _FakeThread.created[-1].target()
+            wrike._Wrike__drain_ui_queue()
+        cached = wrike._Wrike__vacation_ical_calendar
+        self.assertEqual(
+            set(cached),
+            {"vacation_schema_version", "calendar_matched", "events"},
+        )
+        self.assertTrue(cached["calendar_matched"])
+        self.assertNotIn(private_uid, repr(cached))
+        self.assertNotIn(private_values[5], repr(cached))
+        self.assertNotIn(private_values[6], repr(cached))
+        cached_day = wrike._Wrike__vacation_result_for_date(date(2026, 4, 6))
+        self.assertEqual(
+            set(cached_day) - {
+                "availability_state",
+                "available",
+                "automatic_prompt_allowed",
+                "using_last_good",
+                "error_code",
+            },
+            {"calendar_matched", "all_day", "intervals", "event_count"},
+        )
+        self.assertEqual(cached_day["event_count"], 1)
+
+        wrike._Wrike__vacation_ical_last_error = private_values[2]
+        wrike._Wrike__vacation_ical_state = "stale"
+        status = wrike.get_vacation_ical_status_snapshot()
+        settings = wrike.get_settings_snapshot()
+        self.assertEqual(status["error_code"], "calendar_fetch_failed")
+        self.assertEqual(status["expected_calendar_name"], "")
+        self.assertEqual(status["observed_calendar_name"], "")
+        self.assertEqual(settings["vacation_expected_calendar_name"], "")
+        self.assertEqual(settings["vacation_observed_calendar_name"], "")
+        self.assertEqual(settings["vacation_calendar_name"], "")
+        self.assertEqual(wrike._Wrike__vacation_ical_observed_calendar_name, "")
+
+        view = WrikeSettingsView(None, wrike)
+        view._vacation_ical_status_var = _FakeVar()
+        private_status = dict(status)
+        private_status["expected_calendar_name"] = private_values[4]
+        private_status["observed_calendar_name"] = private_values[5]
+        view._refresh_vacation_ical_status(private_status)
+        ui_text = view._vacation_ical_status_var.get()
+        self.assertIn("마지막 성공값으로 계산 중입니다.", ui_text)
+
+        snapshots = json.dumps(
+            {"status": status, "settings": settings},
+            ensure_ascii=False,
+            default=str,
+        )
+        rendered_logs = "\n".join(str(item) for item in captured_logs)
+        for result, _expected_code in worker_results:
+            for private_value in private_values:
+                self.assertNotIn(private_value, repr(result))
+        for private_value in private_values:
+            self.assertNotIn(private_value, snapshots)
+            self.assertNotIn(private_value, ui_text)
+            self.assertNotIn(private_value, rendered_logs)
+
+    def test_vacation_status_messages_are_distinct_actionable_and_private(self) -> None:
+        wrike = self._new_wrike()
+        wrike._Wrike__vacation_ical_url_session = (
+            "https://calendar.google.com/calendar/ical/status/basic.ics"
+        )
+        wrike._Wrike__vacation_ical_state = "error"
+        view = WrikeSettingsView(None, wrike)
+        view._vacation_ical_status_var = _FakeVar()
+        private_identity = "private calendar identity marker"
+        codes = [code.value for code in CalendarErrorCode] + [
+            "secret_unavailable",
+            "calendar_name_mismatch",
+            "calendar_fetch_failed",
+        ]
+        rendered = {}
+        for code in codes:
+            wrike._Wrike__vacation_ical_last_error = code
+            self.assertEqual(
+                wrike.get_vacation_ical_status_snapshot()["error_code"],
+                code,
+            )
+            view._refresh_vacation_ical_status(
+                {
+                    "state": "error",
+                    "error_code": code,
+                    "has_last_good": True,
+                    "expected_calendar_name": private_identity,
+                    "observed_calendar_name": private_identity,
+                }
+            )
+            text = view._vacation_ical_status_var.get()
+            self.assertIn("오류", text)
+            self.assertIn("주세요", text)
+            self.assertIn("마지막 성공값으로 계산 중입니다.", text)
+            self.assertNotIn(private_identity, text)
+            rendered[code] = text
+        self.assertEqual(len(set(rendered.values())), len(codes))
+
+    def test_vacation_clear_fallback_discards_last_good_without_status_readback(
+        self,
+    ) -> None:
+        backend = Mock(spec_set=["update_settings"])
+        backend.update_settings.return_value = (True, None)
+        view = WrikeSettingsView(None, backend)
+        view._vacation_ical_url_var = _FakeVar("private old URL sentinel")
+        view._vacation_ical_status_var = _FakeVar()
+        view._vacation_ical_dirty = True
+        view._vacation_ical_status = {
+            "secret_present": True,
+            "configured": True,
+            "state": "stale",
+            "last_success_ts": "2026-04-06T09:00:00",
+            "error_code": "timeout",
+            "fetch_running": False,
+            "has_last_good": True,
+        }
+
+        view._on_clear_vacation_ical()
+
+        backend.update_settings.assert_called_once_with(
+            {"clear_vacation_ical_url": True}
+        )
+        self.assertEqual(view._vacation_ical_url_var.get(), "")
+        self.assertFalse(view._vacation_ical_dirty)
+        self.assertFalse(view._vacation_ical_status["configured"])
+        self.assertEqual(view._vacation_ical_status["state"], "unconfigured")
+        self.assertFalse(view._vacation_ical_status["has_last_good"])
+        self.assertIsNone(view._vacation_ical_status["last_success_ts"])
+        rendered = view._vacation_ical_status_var.get()
+        self.assertIn("미설정", rendered)
+        self.assertNotIn("마지막 성공값으로 계산 중입니다.", rendered)
+
+    def test_vacation_replacement_fallback_discards_last_good_without_status_readback(
+        self,
+    ) -> None:
+        backend = Mock(spec_set=["update_settings"])
+        backend.update_settings.return_value = (True, None)
+        view = WrikeSettingsView(None, backend)
+        view._token_var = _FakeVar("")
+        view._daily_var = _FakeVar("8")
+        view._tooltip_var = _FakeVar("6")
+        view._monitor_enabled_var = _FakeVar(False)
+        view._monitor_interval_var = _FakeVar("60")
+        view._lunch_enabled_var = _FakeVar(True)
+        view._lunch_start_var = _FakeVar("12:00")
+        view._lunch_end_var = _FakeVar("13:00")
+        view._ical_keywords_var = _FakeVar("")
+        view._ical_interval_var = _FakeVar("15")
+        replacement_url = (
+            "https://calendar.google.com/calendar/ical/replacement/basic.ics"
+        )
+        view._vacation_ical_url_var = _FakeVar(replacement_url)
+        view._vacation_ical_status_var = _FakeVar()
+        view._vacation_ical_dirty = True
+        view._vacation_ical_status = {
+            "secret_present": True,
+            "configured": True,
+            "state": "stale",
+            "last_success_ts": "2026-04-06T09:00:00",
+            "error_code": "timeout",
+            "fetch_running": False,
+            "has_last_good": True,
+        }
+
+        view._save_settings()
+
+        payload = backend.update_settings.call_args.args[0]
+        self.assertEqual(payload["vacation_ical_url"], replacement_url)
+        self.assertEqual(view._vacation_ical_url_var.get(), "")
+        self.assertFalse(view._vacation_ical_dirty)
+        self.assertTrue(view._vacation_ical_status["configured"])
+        self.assertEqual(view._vacation_ical_status["state"], "loading")
+        self.assertFalse(view._vacation_ical_status["has_last_good"])
+        self.assertIsNone(view._vacation_ical_status["last_success_ts"])
+        rendered = view._vacation_ical_status_var.get()
+        self.assertIn("불러오는 중", rendered)
+        self.assertNotIn("마지막 성공값으로 계산 중입니다.", rendered)
+
+    def test_panel_rows_show_provisional_targets_for_past_today_and_future(self) -> None:
+        wrike = self._new_wrike()
+        _FrozenDateTime.current = datetime(2026, 4, 8, 10, 0)
+        wrike._Wrike__lunch_break_enabled = False
+        wrike._Wrike__vacation_ical_url_session = (
+            "https://calendar.google.com/calendar/ical/provisional/basic.ics"
+        )
+        wrike._Wrike__vacation_ical_state = "loading"
+        wrike.update_workday_plan(date(2026, 4, 8), 8 * 60, "08:00")
+        self._install_snapshot(
+            wrike,
+            make_loading_snapshot(generation=12),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        today_text = "\n".join(line.text for line in model.today_lines)
+        self.assertIn("Wrike 기록 조회 불가", today_text)
+        self.assertIn("현재 기대 2시간 (임시)", today_text)
+        self.assertIn("현재 기준 조회 불가 (임시)", today_text)
+        self.assertIn("예상 퇴근 16:00 (임시)", today_text)
+        self.assertIn("휴가 미확정 (loading)", today_text)
+        self.assertIn("휴가 미반영 임시 목표 8시간", today_text)
+        self.assertNotIn("현재 기대 조회 불가", today_text)
+        self.assertNotIn("적용 목표 조회 불가", today_text)
+
+        monday = model.rows[0].summary
+        tuesday = model.rows[1].summary
+        today = model.rows[2].summary
+        friday = model.rows[4].summary
+        self.assertIn("휴가 미반영 임시 목표 8시간", monday)
+        self.assertIn("Wrike 조회 불가", monday)
+        self.assertIn("휴가 미확정", monday)
+        self.assertIn("Wrike 조회 불가", tuesday)
+        self.assertIn("휴가 미반영 임시 목표 8시간", tuesday)
+        self.assertIn("현재 기대 2시간 (임시)", today)
+        self.assertIn("휴가 미확정", today)
+        self.assertIn("휴가 미반영 임시 목표 8시간", friday)
+        self.assertIn("휴가 미확정", friday)
+
     def test_configured_vacation_loading_and_error_fail_closed_with_last_good_rules(self) -> None:
         wrike = self._new_wrike()
         root = _FakeRoot()
@@ -1048,6 +1750,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(panel.show_calls, [])
 
+        wrike._Wrike__lunch_break_enabled = False
         wrike.update_workday_plan(date(2026, 4, 6), 480, "08:00")
         snapshot = self._fresh_snapshot(
             (120, 0, 0, 0, 0, 0, 0),
@@ -1060,9 +1763,13 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             snapshot,
         )
         self.assertFalse(loading.vacation_available)
-        self.assertFalse(loading.expected_available)
-        self.assertIsNone(loading.realtime_delta_minutes)
-        self.assertIsNone(loading.projected_quit)
+        self.assertTrue(loading.expected_available)
+        self.assertEqual(loading.expected_now_minutes, 120)
+        self.assertEqual(loading.realtime_delta_minutes, 0)
+        self.assertEqual(
+            loading.projected_quit,
+            datetime(2026, 4, 6, 16, 0),
+        )
 
         wrike._Wrike__vacation_ical_state = "error"
         wrike._Wrike__vacation_ical_last_error = "calendar_fetch_failed"
@@ -1070,10 +1777,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertFalse(no_last_good["available"])
         self.assertFalse(no_last_good["automatic_prompt_allowed"])
 
-        wrike._Wrike__vacation_ical_calendar = {
-            "calendar_name": "김종인-ePapyrus",
-            "events": [],
-        }
+        wrike._Wrike__vacation_ical_calendar = self._empty_compiled_vacation()
         vacation = {
             "calendar_matched": True,
             "all_day": False,
@@ -1111,18 +1815,18 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__vacation_ical_url_session = (
             "https://calendar.google.com/calendar/ical/synthetic/basic.ics"
         )
-        wrike._Wrike__fetch_vacation_calendar_text = Mock(
-            return_value="synthetic calendar"
+        calendar_document = "\r\n".join(
+            (
+                "BEGIN:VCALENDAR",
+                "X-WR-CALNAME:김종인-ePapyrus",
+                "END:VCALENDAR",
+            )
         )
-        parsed = {
-            "calendar_name": "김종인-ePapyrus",
-            "events": [],
-        }
+        wrike._Wrike__fetch_vacation_calendar_text = Mock(
+            return_value=CalendarSuccess(calendar_document)
+        )
 
-        with patch("src.apps.Wrike.threading.Thread", _FakeThread), patch(
-            "src.apps.Wrike.parse_calendar",
-            return_value=parsed,
-        ):
+        with patch("src.apps.Wrike.threading.Thread", _FakeThread):
             wrike._Wrike__start_vacation_ical_polling()
             first_generation = wrike._Wrike__vacation_ical_generation
             wrike._Wrike__vacation_ical_tick(first_generation)
@@ -1150,7 +1854,12 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         status = wrike.get_vacation_ical_status_snapshot()
         self.assertFalse(status["fetch_running"])
         self.assertEqual(status["state"], "fresh")
-        self.assertIs(wrike._Wrike__vacation_ical_calendar, parsed)
+        self.assertEqual(status["expected_calendar_name"], "")
+        self.assertEqual(status["observed_calendar_name"], "")
+        self.assertEqual(
+            wrike._Wrike__vacation_ical_calendar,
+            self._empty_compiled_vacation(),
+        )
 
     def test_weekly_vacation_results_are_cached_per_calendar_and_date(self) -> None:
         wrike = self._new_wrike()
@@ -1166,10 +1875,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             "https://calendar.google.com/calendar/ical/synthetic/basic.ics"
         )
         wrike._Wrike__vacation_ical_state = "fresh"
-        wrike._Wrike__vacation_ical_calendar = {
-            "calendar_name": "김종인-ePapyrus",
-            "events": [],
-        }
+        wrike._Wrike__vacation_ical_calendar = self._empty_compiled_vacation()
         result = {
             "calendar_matched": True,
             "all_day": False,
@@ -1185,10 +1891,9 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             wrike._Wrike__build_worktime_panel_model()
             self.assertEqual(lookup.call_count, 7)
 
-            wrike._Wrike__vacation_ical_calendar = {
-                "calendar_name": "김종인-ePapyrus",
-                "events": [],
-            }
+            wrike._Wrike__vacation_ical_calendar = (
+                self._empty_compiled_vacation()
+            )
             wrike._Wrike__build_worktime_panel_model()
             self.assertEqual(lookup.call_count, 14)
 
@@ -1255,6 +1960,45 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertFalse(wrike._Wrike__timelog_refresh_running)
         self.assertIsNone(wrike._Wrike__root)
 
+    def test_loaded_panel_timeout_is_clamped_and_compat_reuse_is_safe(self) -> None:
+        config_dir = self.appdata / "windows-supporter"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        settings_path = config_dir / "wrike_settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "settings_version": 7,
+                    "tooltip_duration_ms": 100,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        wrike = self._new_wrike()
+        self.assertEqual(
+            wrike.get_settings_snapshot()["tooltip_duration_ms"],
+            1200,
+        )
+        self.assertEqual(
+            json.loads(settings_path.read_text(encoding="utf-8"))[
+                "tooltip_duration_ms"
+            ],
+            1200,
+        )
+
+        root = _FakeRoot()
+        with patch("src.apps.Wrike.WorktimeQuickPanel", _FakePanel):
+            panel = wrike._Wrike__ensure_worktime_panel(root)
+        self.assertEqual(panel.idle_timeout_ms, 1200)
+
+        compatibility_panel = object()
+        wrike._Wrike__worktime_panel = compatibility_panel
+        wrike._Wrike__worktime_panel_root = root
+        self.assertIs(
+            wrike._Wrike__ensure_worktime_panel(root),
+            compatibility_panel,
+        )
+
     def test_singleton_toggle_shutdown_and_session_unlock_lifecycle(self) -> None:
         wrike = self._new_wrike()
         root = _FakeRoot()
@@ -1272,8 +2016,15 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
 
         self.assertEqual(len(_FakePanel.instances), 1)
         panel = _FakePanel.instances[0]
+        self.assertEqual(panel.idle_timeout_ms, 6000)
+        self.assertEqual(panel.idle_timeout_updates, [6000])
         self.assertEqual(panel.toggle_calls, [True, True])
         request_refresh.assert_called_once_with(force=True)
+
+        ok, error = wrike.update_settings({"tooltip_duration_ms": 2500})
+        self.assertTrue(ok, error)
+        self.assertEqual(panel.idle_timeout_ms, 2500)
+        self.assertEqual(panel.idle_timeout_updates[-1], 2500)
 
         wrike.on_session_unlock()
         self.assertEqual(watcher.reset_calls, 1)

@@ -413,8 +413,9 @@ class WorkdayOverview:
             if self.expected_available
             else "조회 불가"
         )
+        provisional_note = " (임시)" if not self.vacation_available else ""
         lines.append((
-            f"Wrike 기록 {recorded_text} · 현재 기대 {expected_text}",
+            f"Wrike 기록 {recorded_text} · 현재 기대 {expected_text}{provisional_note}",
             recorded_color if self.expected_available else COLOR_MUTED,
         ))
 
@@ -445,12 +446,15 @@ class WorkdayOverview:
             )
         else:
             vacation_line = (
-                f"휴가 확인 {self.vacation_state or 'error'} · "
-                "적용 목표 조회 불가 · 예상 퇴근 -"
+                f"휴가 미확정 ({self.vacation_state or 'error'}) · "
+                "휴가 미반영 임시 목표 "
+                f"{format_minutes(self.effective_target_minutes)} · "
+                f"예상 퇴근 {quit_text} (임시)"
             )
         lines.append((vacation_line, COLOR_MUTED))
 
         basis = f" ({format_hhmm(now)})"
+        provisional_note = " (임시)" if not self.vacation_available else ""
         if (
             not self.expected_available
             or not self.recorded_available
@@ -459,16 +463,18 @@ class WorkdayOverview:
             lines.append((f"현재 기준 조회 불가{basis}", COLOR_MUTED))
         elif self.realtime_delta_minutes < 0:
             lines.append((
-                f"현재 기준 부족 {format_minutes(-self.realtime_delta_minutes)}{basis}",
+                f"현재 기준 부족 {format_minutes(-self.realtime_delta_minutes)}"
+                f"{provisional_note}{basis}",
                 COLOR_WARN,
             ))
         elif self.realtime_delta_minutes > 0:
             lines.append((
-                f"현재 기준 초과 {format_minutes(self.realtime_delta_minutes)}{basis}",
+                f"현재 기준 초과 {format_minutes(self.realtime_delta_minutes)}"
+                f"{provisional_note}{basis}",
                 COLOR_OK,
             ))
         else:
-            lines.append((f"현재 기준 딱 맞음{basis}", COLOR_OK))
+            lines.append((f"현재 기준 딱 맞음{provisional_note}{basis}", COLOR_OK))
         return lines
 
 
@@ -494,7 +500,9 @@ def build_workday_overview(
     timed_vacation = list(vacation_intervals or [])
     use_composed_vacation = bool(vacation_all_day) or vacation_intervals is not None
 
-    if availability and use_composed_vacation:
+    if not availability:
+        vacation = 0
+    elif use_composed_vacation:
         vacation = composed_vacation_credit_minutes(
             target,
             base_intervals,
@@ -508,7 +516,7 @@ def build_workday_overview(
         except Exception:
             vacation = 0
     state = str(vacation_state or "error").strip().lower() or "error"
-    effective_target = max(0, target - vacation) if availability else target
+    effective_target = max(0, target - vacation)
     progress_intervals = (
         [*base_intervals, *timed_vacation]
         if availability and not vacation_all_day
@@ -534,17 +542,16 @@ def build_workday_overview(
         clock_in,
         now,
     )
-    expected_now = min(effective_target, net) if availability else 0
-    realtime_delta = (
-        None if actual is None or not availability else actual - expected_now
-    )
+    expected_now = min(effective_target, net)
+    realtime_delta = None if actual is None else actual - expected_now
     # Compatibility reference retained for existing callers: unlike
     # expected_now, this value remains based on uncapped wall-clock net time.
     remaining = effective_target - net
-    projected = (
-        project_quit_at(now, clock_in, effective_target, progress_intervals)
-        if availability
-        else None
+    projected = project_quit_at(
+        now,
+        clock_in,
+        effective_target,
+        progress_intervals,
     )
     if active:
         projected = None
@@ -565,7 +572,7 @@ def build_workday_overview(
         recorded_available=actual is not None,
         vacation_available=availability,
         vacation_state=state,
-        expected_available=availability,
+        expected_available=True,
     )
 
 

@@ -882,7 +882,10 @@ class WrikeSettingsView:
         data = settings if isinstance(settings, dict) else {}
         nested = data.get("vacation_ical_status")
         if isinstance(nested, dict):
-            return dict(nested)
+            sanitized = dict(nested)
+            sanitized["expected_calendar_name"] = ""
+            sanitized["observed_calendar_name"] = ""
+            return sanitized
         configured = bool(
             data.get(
                 "vacation_ical_configured",
@@ -894,12 +897,8 @@ class WrikeSettingsView:
                 data.get("vacation_ical_secret_present", configured)
             ),
             "configured": configured,
-            "expected_calendar_name": str(
-                data.get("vacation_expected_calendar_name") or ""
-            ).strip(),
-            "observed_calendar_name": str(
-                data.get("vacation_observed_calendar_name") or ""
-            ).strip(),
+            "expected_calendar_name": "",
+            "observed_calendar_name": "",
             "state": str(
                 data.get("vacation_ical_state")
                 or ("loading" if configured else "unconfigured")
@@ -909,6 +908,7 @@ class WrikeSettingsView:
                 data.get("vacation_ical_last_error") or ""
             ).strip(),
             "fetch_running": False,
+            "has_last_good": bool(data.get("vacation_ical_has_last_good", False)),
         }
 
     def _read_vacation_status_snapshot(self) -> dict[str, Any] | None:
@@ -938,10 +938,9 @@ class WrikeSettingsView:
         state = str(data.get("state") or "unconfigured").strip().lower()
         if state not in {"unconfigured", "loading", "fresh", "stale", "error"}:
             state = "error"
-        expected = str(data.get("expected_calendar_name") or "").strip()
-        observed = str(data.get("observed_calendar_name") or "").strip()
         last_success = str(data.get("last_success_ts") or "").strip()
         error_code = str(data.get("error_code") or "").strip()
+        has_last_good = bool(data.get("has_last_good", False))
         state_labels = {
             "unconfigured": "미설정",
             "loading": "불러오는 중",
@@ -949,24 +948,41 @@ class WrikeSettingsView:
             "stale": "마지막 성공값 사용 중",
             "error": "오류",
         }
-        error_labels = {
-            "secret_unavailable": "저장된 URL을 해독하거나 검증하지 못했습니다.",
-            "calendar_fetch_failed": "캘린더를 가져오거나 해석하지 못했습니다.",
-            "calendar_name_mismatch": "캘린더 이름이 기대값과 다릅니다.",
+        state_messages = {
+            "unconfigured": "비공개 iCal URL을 입력해 주세요.",
+            "loading": "캘린더를 확인하는 중입니다. 잠시 후 다시 확인해 주세요.",
+            "fresh": "휴가 캘린더를 정상적으로 확인했습니다.",
+            "stale": "연결 상태를 확인한 뒤 다시 시도해 주세요.",
         }
-        parts = [
-            state_labels[state],
-            f"기대 이름: {expected or '-'}",
-            f"확인 이름: {observed or '-'}",
-        ]
-        if state == "error":
-            parts.append(
-                error_labels.get(
-                    error_code,
-                    "캘린더 상태를 확인하지 못했습니다.",
-                )
+        error_labels = {
+            "invalid_endpoint": "비공개 iCal URL 형식을 확인하고 다시 저장해 주세요.",
+            "redirect_rejected": "허용되지 않은 이동이 차단되었습니다. 비공개 iCal URL을 다시 발급해 저장해 주세요.",
+            "http_4xx": "접근이 거부되었거나 링크가 만료되었습니다. 비공개 iCal URL을 다시 발급해 주세요.",
+            "http_5xx": "캘린더 서버 오류입니다. 잠시 후 다시 시도해 주세요.",
+            "dns_or_connect": "네트워크 연결과 DNS 상태를 확인한 뒤 다시 시도해 주세요.",
+            "timeout": "응답 시간이 초과되었습니다. 네트워크 상태를 확인하고 다시 시도해 주세요.",
+            "tls_validation": "보안 연결을 확인하지 못했습니다. 시스템 시간과 인증서 환경을 확인해 주세요.",
+            "body_too_large": "캘린더 데이터가 너무 큽니다. 이벤트 범위를 줄이거나 URL을 다시 발급해 주세요.",
+            "unsupported_encoding": "지원하지 않는 압축 형식입니다. 비공개 iCal URL을 다시 발급해 주세요.",
+            "utf8_decode": "캘린더 문자 인코딩을 읽지 못했습니다. 비공개 iCal URL을 다시 발급해 주세요.",
+            "empty_body": "빈 캘린더 응답입니다. 잠시 후 다시 시도하거나 URL을 다시 발급해 주세요.",
+            "invalid_ical": "캘린더 문서 형식이 올바르지 않습니다. 비공개 iCal URL을 다시 발급해 주세요.",
+            "secret_unavailable": "저장된 비공개 URL을 사용할 수 없습니다. URL을 다시 입력해 주세요.",
+            "calendar_name_mismatch": "휴가 캘린더가 아닌 피드입니다. 올바른 비공개 iCal URL을 다시 저장해 주세요.",
+            "calendar_fetch_failed": "캘린더를 가져오지 못했습니다. 연결 상태를 확인하고 다시 시도해 주세요.",
+        }
+        message = (
+            error_labels.get(
+                error_code,
+                "캘린더 상태를 확인하지 못했습니다. URL과 연결 상태를 확인해 주세요.",
             )
-        elif last_success:
+            if state == "error"
+            else state_messages[state]
+        )
+        parts = [state_labels[state], message]
+        if has_last_good and state in {"loading", "stale", "error"}:
+            parts.append("마지막 성공값으로 계산 중입니다.")
+        if last_success:
             parts.append(f"마지막 성공: {last_success}")
         try:
             var.set(" · ".join(parts))
@@ -1300,6 +1316,7 @@ class WrikeSettingsView:
                     "last_success_ts": None,
                     "error_code": "",
                     "fetch_running": False,
+                    "has_last_good": False,
                 })
                 self._refresh_vacation_ical_status(fallback)
             self._set_status("휴가 캘린더 URL 삭제 완료", level="ok")
@@ -1573,13 +1590,14 @@ class WrikeSettingsView:
                             "configured": bool(vacation_ical_url),
                             "observed_calendar_name": "",
                             "state": (
-                                "pending"
+                                "loading"
                                 if vacation_ical_url
                                 else "unconfigured"
                             ),
                             "last_success_ts": None,
                             "error_code": "",
                             "fetch_running": False,
+                            "has_last_good": False,
                         })
                         self._refresh_vacation_ical_status(fallback)
                 self._set_status("저장됨", level="ok")
