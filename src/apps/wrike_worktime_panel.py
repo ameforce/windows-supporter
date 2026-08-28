@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 
 _REFRESH_INTERVAL_MS = 1_000
+_DEFAULT_IDLE_TIMEOUT_MS = 6_000
+_MIN_IDLE_TIMEOUT_MS = 1_200
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
 _BG = "#F3F4F6"
@@ -145,6 +147,7 @@ class WorktimeQuickPanel:
         prompt_snooze: Callable[[], None],
         prompt_skip: Callable[[], None],
         tk_module: Any | None = None,
+        idle_timeout_ms: int = _DEFAULT_IDLE_TIMEOUT_MS,
     ) -> None:
         callbacks = {
             "model_provider": model_provider,
@@ -180,7 +183,16 @@ class WorktimeQuickPanel:
         self._window = None
         self._content = None
         self._model: WorktimePanelModel | None = None
+        self._structure_signature: tuple[bool, int] | None = None
+        self._widgets: dict[str, Any] = {}
         self._refresh_after_id = None
+        self._refresh_token: object | None = None
+        self._dismiss_after_id = None
+        self._dismiss_token: object | None = None
+        self._interaction_depth = 0
+        self._idle_timeout_ms = self._clamp_idle_timeout_ms(idle_timeout_ms)
+        self._pointer_inside = False
+        self._geometry_retry_pending = False
         self._visible = False
         self._placed = False
         self._destroyed = False
@@ -196,8 +208,8 @@ class WorktimeQuickPanel:
         if window is None:
             return False
 
+        was_visible = self._visible
         self.refresh_now()
-        self._reconcile_geometry()
         if activate:
             _safe_call(window, "deiconify")
             _safe_call(window, "lift")
@@ -209,12 +221,16 @@ class WorktimeQuickPanel:
             return self._fail_show(window)
 
         self._visible = True
+        if not was_visible:
+            self._pointer_inside = False
         self._schedule_refresh()
+        self._reset_dismiss_timer()
         return True
 
     def _fail_show(self, window: Any) -> bool:
         self._visible = False
-        self._cancel_refresh()
+        self._pointer_inside = False
+        self._cancel_timers()
         if self._window_exists(window):
             _safe_call(window, "withdraw")
         return False
@@ -223,7 +239,8 @@ class WorktimeQuickPanel:
         """Hide the panel without destroying its ``Toplevel``."""
 
         self._visible = False
-        self._cancel_refresh()
+        self._pointer_inside = False
+        self._cancel_timers()
         window = self._window
         if window is not None and self._window_exists(window):
             _safe_call(window, "withdraw")
@@ -236,11 +253,18 @@ class WorktimeQuickPanel:
         else:
             self.show(activate=activate)
 
+    def set_idle_timeout_ms(self, idle_timeout_ms: int) -> None:
+        """Set the dismissal delay, clamped to the minimum safe duration."""
+
+        self._idle_timeout_ms = self._clamp_idle_timeout_ms(idle_timeout_ms)
+        if self._visible and not self._destroyed:
+            self._reset_dismiss_timer()
+
     def refresh_now(self) -> bool:
         """Read and render the latest model immediately.
 
-        Provider failures leave the last good model visible and return ``False``;
-        the one-second refresh loop remains alive for a later recovery.
+        Provider failures or invalid values leave the last good model visible.
+        An exactly equal immutable snapshot returns before any Tk mutation.
         """
 
         if self._destroyed:
@@ -251,31 +275,44 @@ class WorktimeQuickPanel:
             return False
         if not isinstance(model, WorktimePanelModel):
             return False
-        previous_model = self._model
+        if model == self._model:
+            return True
+
+        if self._content is None or not self._window_exists(self._window):
+            # ``_model`` represents the successfully rendered snapshot. Keeping
+            # it unset here ensures a pre-show refresh cannot make show blank.
+            return True
+
+        signature = self._model_structure_signature(model)
+        rebuilt = signature != self._structure_signature or not self._widgets
+        if rebuilt:
+            self._render_structure(model)
+            self._structure_signature = signature
+        else:
+            self._update_rendered_model(model)
+
         self._model = model
-        if (
-            model != previous_model
-            and self._content is not None
-            and self._window_exists(self._window)
-        ):
-            self._render(model)
-        if self._visible and self._window_exists(self._window):
-            self._reconcile_geometry()
+        if rebuilt:
+            self._geometry_retry_pending = not self._reconcile_geometry()
         return True
 
     def destroy(self) -> None:
-        """Cancel pending refresh work and permanently destroy the panel once."""
+        """Cancel pending work and permanently destroy the panel once."""
 
         if self._destroyed:
             return
         self._destroyed = True
         self._visible = False
-        self._cancel_refresh()
+        self._pointer_inside = False
+        self._cancel_timers()
 
         window = self._window
         self._window = None
         self._content = None
         self._model = None
+        self._structure_signature = None
+        self._widgets = {}
+        self._geometry_retry_pending = False
         if window is not None:
             _safe_call(window, "destroy")
 
@@ -289,6 +326,16 @@ class WorktimeQuickPanel:
             and self._window_exists(self._window)
             and self._window_is_mapped(self._window)
         )
+
+    @staticmethod
+    def _clamp_idle_timeout_ms(idle_timeout_ms: int) -> int:
+        if type(idle_timeout_ms) is not int:
+            raise TypeError("idle_timeout_ms must be an int")
+        return max(_MIN_IDLE_TIMEOUT_MS, idle_timeout_ms)
+
+    @staticmethod
+    def _model_structure_signature(model: WorktimePanelModel) -> tuple[bool, int]:
+        return model.prompt is not None, len(model.today_lines)
 
     def _ensure_tk(self) -> Any | None:
         if self._tk is not None:
@@ -306,10 +353,15 @@ class WorktimeQuickPanel:
                 return self._window
             self._window = None
             self._content = None
+            self._model = None
+            self._structure_signature = None
+            self._widgets = {}
             self._placed = False
+            self._geometry_retry_pending = False
             self._destroyed = True
             self._visible = False
-            self._cancel_refresh()
+            self._pointer_inside = False
+            self._cancel_timers()
             return None
 
         tk = self._ensure_tk()
@@ -326,7 +378,15 @@ class WorktimeQuickPanel:
         _safe_call(window, "configure", bg=_BG)
         _safe_call(window, "resizable", True, True)
         _safe_call(window, "protocol", "WM_DELETE_WINDOW", self.hide)
-        _safe_call(window, "bind", "<Escape>", self._on_escape)
+        self._bind_additive(window, "<Escape>", self._on_escape)
+        self._bind_additive(window, "<Enter>", self._on_pointer_enter)
+        self._bind_additive(window, "<Leave>", self._on_pointer_leave)
+        self._bind_additive(window, "<Motion>", self._on_pointer_activity)
+        self._bind_additive(window, "<Button>", self._on_pointer_activity)
+        self._bind_additive(window, "<MouseWheel>", self._on_pointer_activity)
+        self._bind_additive(window, "<Button-4>", self._on_pointer_activity)
+        self._bind_additive(window, "<Button-5>", self._on_pointer_activity)
+        self._bind_additive(window, "<KeyPress>", self._on_key_activity)
 
         try:
             content = tk.Frame(window, bg=_BG)
@@ -338,9 +398,41 @@ class WorktimeQuickPanel:
         self._content = content
         return window
 
+    @staticmethod
+    def _bind_additive(widget: Any, sequence: str, callback: Callable[..., Any]) -> None:
+        binder = getattr(widget, "bind", None)
+        if not callable(binder):
+            return
+        try:
+            binder(sequence, callback, add="+")
+        except TypeError:
+            try:
+                binder(sequence, callback)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _on_escape(self, _event: Any = None) -> str:
         self.hide()
         return "break"
+
+    def _on_pointer_enter(self, _event: Any = None) -> None:
+        self._pointer_inside = True
+        self._cancel_dismiss_timer()
+
+    def _on_pointer_leave(self, _event: Any = None) -> None:
+        self._pointer_inside = False
+        self._reset_dismiss_timer()
+
+    def _on_pointer_activity(self, _event: Any = None) -> None:
+        self._pointer_inside = True
+        self._cancel_dismiss_timer()
+
+    def _on_key_activity(self, event: Any = None) -> None:
+        if str(getattr(event, "keysym", "")).lower() == "escape":
+            return
+        self._reset_dismiss_timer()
 
     def _schedule_refresh(self) -> None:
         if (
@@ -352,19 +444,26 @@ class WorktimeQuickPanel:
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
             return
+        token = object()
+        self._refresh_token = token
         try:
             self._refresh_after_id = scheduler(
                 _REFRESH_INTERVAL_MS,
-                self._refresh_tick,
+                lambda current=token: self._refresh_tick(current),
             )
         except Exception:
             self._refresh_after_id = None
+            self._refresh_token = None
 
-    def _refresh_tick(self) -> None:
+    def _refresh_tick(self, token: object) -> None:
+        if token is not self._refresh_token:
+            return
         self._refresh_after_id = None
+        self._refresh_token = None
         if not self.is_visible():
             return
         try:
+            self._retry_geometry_if_pending()
             self.refresh_now()
         finally:
             self._schedule_refresh()
@@ -372,6 +471,7 @@ class WorktimeQuickPanel:
     def _cancel_refresh(self) -> None:
         after_id = self._refresh_after_id
         self._refresh_after_id = None
+        self._refresh_token = None
         if after_id is None:
             return
         canceller = getattr(self._root, "after_cancel", None)
@@ -381,12 +481,72 @@ class WorktimeQuickPanel:
             except Exception:
                 pass
 
-    def _render(self, model: WorktimePanelModel) -> None:
+    def _reset_dismiss_timer(self) -> None:
+        self._cancel_dismiss_timer()
+        if (
+            self._interaction_depth > 0
+            or self._destroyed
+            or not self._visible
+            or self._pointer_inside
+        ):
+            return
+        scheduler = getattr(self._root, "after", None)
+        if not callable(scheduler):
+            return
+        token = object()
+        self._dismiss_token = token
+        try:
+            self._dismiss_after_id = scheduler(
+                self._idle_timeout_ms,
+                lambda current=token: self._dismiss_tick(current),
+            )
+        except Exception:
+            self._dismiss_after_id = None
+            self._dismiss_token = None
+
+    def _dismiss_tick(self, token: object) -> None:
+        if token is not self._dismiss_token:
+            return
+        self._dismiss_after_id = None
+        self._dismiss_token = None
+        if (
+            self._interaction_depth > 0
+            or self._destroyed
+            or not self._visible
+            or self._pointer_inside
+        ):
+            return
+        self.hide()
+
+    def _cancel_dismiss_timer(self) -> None:
+        after_id = self._dismiss_after_id
+        self._dismiss_after_id = None
+        self._dismiss_token = None
+        if after_id is None:
+            return
+        canceller = getattr(self._root, "after_cancel", None)
+        if callable(canceller):
+            try:
+                canceller(after_id)
+            except Exception:
+                pass
+
+    def _cancel_timers(self) -> None:
+        self._cancel_refresh()
+        self._cancel_dismiss_timer()
+
+    def _retry_geometry_if_pending(self) -> None:
+        if not self._geometry_retry_pending or not self.is_visible():
+            return
+        self._geometry_retry_pending = not self._reconcile_geometry()
+
+    def _render_structure(self, model: WorktimePanelModel) -> None:
         tk = self._tk
         content = self._content
         if tk is None or content is None:
             return
         self._clear_content()
+        self._widgets = {}
 
         compact = model.prompt is not None
         section_gap = 4 if compact else 8
@@ -410,22 +570,23 @@ class WorktimeQuickPanel:
             fg=_TEXT,
             font=("Segoe UI", 13, "bold"),
         ).pack(side="left")
-        tk.Label(
+        week_range_label = tk.Label(
             title_row,
             text=model.week_range,
             bg=_CARD_BG,
             fg=_MUTED,
             font=("Segoe UI", 9),
-        ).pack(side="right")
-        sync_color = _SYNC_COLORS.get(model.sync_state.strip().lower(), _MUTED)
-        tk.Label(
+        )
+        week_range_label.pack(side="right")
+        sync_label = tk.Label(
             header,
             text=f"동기화 · {model.sync_text}",
             bg=_CARD_BG,
-            fg=sync_color,
+            fg=self._sync_color(model),
             anchor="w",
             font=("Segoe UI", 9),
-        ).pack(fill="x", padx=10, pady=(0, 4 if compact else 7))
+        )
+        sync_label.pack(fill="x", padx=10, pady=(0, 4 if compact else 7))
 
         today_card = tk.Frame(
             content,
@@ -442,25 +603,31 @@ class WorktimeQuickPanel:
             anchor="w",
             font=("Segoe UI", 10, "bold"),
         ).pack(fill="x", padx=10, pady=title_padding)
-        for line in model.today_lines:
-            tk.Label(
-                today_card,
-                text=line.text,
-                bg=_CARD_BG,
-                fg=line.color,
-                anchor="w",
-                justify="left",
-                font=("Segoe UI", 9),
-            ).pack(fill="x", padx=10, pady=0)
-        if not model.today_lines:
-            tk.Label(
+        today_line_labels = []
+        if model.today_lines:
+            for line in model.today_lines:
+                label = tk.Label(
+                    today_card,
+                    text=line.text,
+                    bg=_CARD_BG,
+                    fg=line.color,
+                    anchor="w",
+                    justify="left",
+                    font=("Segoe UI", 9),
+                )
+                label.pack(fill="x", padx=10, pady=0)
+                today_line_labels.append(label)
+        else:
+            label = tk.Label(
                 today_card,
                 text="표시할 오늘 상세가 없습니다.",
                 bg=_CARD_BG,
                 fg=_MUTED,
                 anchor="w",
                 font=("Segoe UI", 9),
-            ).pack(fill="x", padx=10, pady=0)
+            )
+            label.pack(fill="x", padx=10, pady=0)
+            today_line_labels.append(label)
         tk.Frame(today_card, bg=_CARD_BG, height=2 if compact else 5).pack(fill="x")
 
         week_card = tk.Frame(
@@ -482,11 +649,12 @@ class WorktimeQuickPanel:
             padx=10,
             pady=(4, 1) if compact else (7, 3),
         )
+        row_widgets = []
         for row in model.rows:
             row_bg = _TODAY_BG if row.today else _CARD_BG
             row_frame = tk.Frame(week_card, bg=row_bg)
             row_frame.pack(fill="x", padx=8, pady=0)
-            tk.Label(
+            weekday_label = tk.Label(
                 row_frame,
                 text=row.weekday,
                 width=4,
@@ -494,8 +662,9 @@ class WorktimeQuickPanel:
                 fg=_TEXT,
                 anchor="w",
                 font=("Segoe UI", 9, "bold" if row.today else "normal"),
-            ).pack(side="left", padx=(4, 2), pady=row_padding)
-            tk.Label(
+            )
+            weekday_label.pack(side="left", padx=(4, 2), pady=row_padding)
+            date_label = tk.Label(
                 row_frame,
                 text=row.date,
                 width=8,
@@ -503,8 +672,9 @@ class WorktimeQuickPanel:
                 fg=_MUTED,
                 anchor="w",
                 font=("Segoe UI", 9),
-            ).pack(side="left", padx=(0, 8), pady=row_padding)
-            tk.Label(
+            )
+            date_label.pack(side="left", padx=(0, 8), pady=row_padding)
+            summary_label = tk.Label(
                 row_frame,
                 text=row.summary,
                 bg=row_bg,
@@ -512,34 +682,38 @@ class WorktimeQuickPanel:
                 anchor="w",
                 justify="left",
                 font=("Segoe UI", 9, "bold" if row.today else "normal"),
-            ).pack(side="left", fill="x", expand=True, pady=row_padding)
-            if row.today:
-                tk.Label(
-                    row_frame,
-                    text="오늘",
-                    bg=row_bg,
-                    fg="#1D4ED8",
-                    font=("Segoe UI", 8, "bold"),
-                ).pack(side="right", padx=4, pady=row_padding)
+            )
+            summary_label.pack(side="left", fill="x", expand=True, pady=row_padding)
+            today_label = tk.Label(
+                row_frame,
+                text="오늘" if row.today else "",
+                bg=row_bg,
+                fg="#1D4ED8",
+                font=("Segoe UI", 8, "bold"),
+            )
+            today_label.pack(side="right", padx=4, pady=row_padding)
+            row_widgets.append(
+                (row_frame, weekday_label, date_label, summary_label, today_label)
+            )
 
         actions = tk.Frame(content, bg=_BG)
         actions.pack(fill="x", pady=(0, section_gap))
-        self._button(actions, "새로고침", self._refresh_command)
-        self._button(
+        refresh_button = self._button(actions, "새로고침", self._refresh_command)
+        clock_button = self._button(
             actions,
             "출근 수정" if model.has_clock_in else "지금 출근",
-            self._edit_clock_in_command
-            if model.has_clock_in
-            else self._clock_in_command,
+            self._clock_action_command,
         )
-        self._button(
+        break_button = self._button(
             actions,
             "휴게 종료" if model.break_active else "휴게 시작",
             self._toggle_break_command,
         )
-        self._button(actions, "계획 수정", self._edit_plan_command)
-        self._button(actions, "설정", self._settings_command)
+        plan_button = self._button(actions, "계획 수정", self._edit_plan_command)
+        settings_button = self._button(actions, "설정", self._settings_command)
 
+        prompt_label = None
+        prompt_buttons: tuple[Any, ...] = ()
         if model.prompt is not None:
             prompt = model.prompt
             prompt_card = tk.Frame(
@@ -549,32 +723,115 @@ class WorktimeQuickPanel:
                 highlightbackground=_PROMPT_BORDER,
             )
             prompt_card.pack(fill="x")
-            tk.Label(
+            prompt_label = tk.Label(
                 prompt_card,
                 text=f"{prompt.detected_time} 활동을 출근으로 반영할까요?",
                 bg=_PROMPT_BG,
                 fg="#9A3412",
                 anchor="w",
                 font=("Segoe UI", 9, "bold"),
-            ).pack(fill="x", padx=10, pady=(4, 2))
+            )
+            prompt_label.pack(fill="x", padx=10, pady=(4, 2))
             prompt_actions = tk.Frame(prompt_card, bg=_PROMPT_BG)
             prompt_actions.pack(fill="x", padx=8, pady=(0, 4))
-            self._button(
+            accept_button = self._button(
                 prompt_actions,
                 f"{prompt.detected_time}으로 출근",
-                lambda detected=prompt.detected_time: self._prompt_accept_command(
-                    detected
-                ),
+                self._prompt_accept_current_command,
             )
-            self._button(
+            edit_button = self._button(
                 prompt_actions,
                 "시간 수정",
-                lambda detected=prompt.detected_time: self._prompt_edit_command(
-                    detected
-                ),
+                self._prompt_edit_current_command,
             )
-            self._button(prompt_actions, "30분 후", self._prompt_snooze_command)
-            self._button(prompt_actions, "오늘 건너뛰기", self._prompt_skip_command)
+            snooze_button = self._button(
+                prompt_actions,
+                "30분 후",
+                self._prompt_snooze_command,
+            )
+            skip_button = self._button(
+                prompt_actions,
+                "오늘 건너뛰기",
+                self._prompt_skip_command,
+            )
+            prompt_buttons = (
+                accept_button,
+                edit_button,
+                snooze_button,
+                skip_button,
+            )
+
+        self._widgets = {
+            "week_range": week_range_label,
+            "sync": sync_label,
+            "today_lines": tuple(today_line_labels),
+            "rows": tuple(row_widgets),
+            "refresh_button": refresh_button,
+            "clock_button": clock_button,
+            "break_button": break_button,
+            "plan_button": plan_button,
+            "settings_button": settings_button,
+            "prompt_label": prompt_label,
+            "prompt_buttons": prompt_buttons,
+        }
+
+    def _update_rendered_model(self, model: WorktimePanelModel) -> None:
+        widgets = self._widgets
+        widgets["week_range"].configure(text=model.week_range)
+        widgets["sync"].configure(
+            text=f"동기화 · {model.sync_text}",
+            fg=self._sync_color(model),
+        )
+
+        today_labels = widgets["today_lines"]
+        if model.today_lines:
+            for label, line in zip(today_labels, model.today_lines):
+                label.configure(text=line.text, fg=line.color)
+        else:
+            today_labels[0].configure(
+                text="표시할 오늘 상세가 없습니다.",
+                fg=_MUTED,
+            )
+
+        for row_widgets, row in zip(widgets["rows"], model.rows):
+            row_frame, weekday_label, date_label, summary_label, today_label = (
+                row_widgets
+            )
+            row_bg = _TODAY_BG if row.today else _CARD_BG
+            emphasis = "bold" if row.today else "normal"
+            row_frame.configure(bg=row_bg)
+            weekday_label.configure(
+                text=row.weekday,
+                bg=row_bg,
+                font=("Segoe UI", 9, emphasis),
+            )
+            date_label.configure(text=row.date, bg=row_bg)
+            summary_label.configure(
+                text=row.summary,
+                bg=row_bg,
+                fg=row.color,
+                font=("Segoe UI", 9, emphasis),
+            )
+            today_label.configure(text="오늘" if row.today else "", bg=row_bg)
+
+        widgets["clock_button"].configure(
+            text="출근 수정" if model.has_clock_in else "지금 출근"
+        )
+        widgets["break_button"].configure(
+            text="휴게 종료" if model.break_active else "휴게 시작"
+        )
+
+        if model.prompt is not None:
+            prompt = model.prompt
+            widgets["prompt_label"].configure(
+                text=f"{prompt.detected_time} 활동을 출근으로 반영할까요?"
+            )
+            accept_button = widgets["prompt_buttons"][0]
+            accept_button.configure(text=f"{prompt.detected_time}으로 출근")
+
+    @staticmethod
+    def _sync_color(model: WorktimePanelModel) -> str:
+        return _SYNC_COLORS.get(model.sync_state.strip().lower(), _MUTED)
 
     def _clear_content(self) -> None:
         content = self._content
@@ -609,8 +866,36 @@ class WorktimeQuickPanel:
         return button
 
     def _run_command(self, callback: Callable[..., None], *args: Any) -> None:
-        callback(*args)
-        self.refresh_now()
+        self._interaction_depth += 1
+        self._cancel_dismiss_timer()
+        try:
+            callback(*args)
+            self.refresh_now()
+        finally:
+            self._interaction_depth = max(0, self._interaction_depth - 1)
+            if self._interaction_depth == 0:
+                self._reset_dismiss_timer()
+
+    def _clock_action_command(self) -> None:
+        model = self._model
+        if model is None:
+            return
+        if model.has_clock_in:
+            self._edit_clock_in_command()
+        else:
+            self._clock_in_command()
+
+    def _prompt_accept_current_command(self) -> None:
+        model = self._model
+        if model is None or model.prompt is None:
+            return
+        self._prompt_accept_command(model.prompt.detected_time)
+
+    def _prompt_edit_current_command(self) -> None:
+        model = self._model
+        if model is None or model.prompt is None:
+            return
+        self._prompt_edit_command(model.prompt.detected_time)
 
     def _refresh_command(self) -> None:
         self._run_command(self._on_refresh)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import re
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -20,13 +21,16 @@ _WEEKDAYS = ("월", "화", "수", "목", "금", "토", "일")
 class _FakeRoot:
     def __init__(self) -> None:
         self.after_calls: list[tuple[str, int, object]] = []
+        self.after_history: list[tuple[str, int, object]] = []
         self.after_cancel_calls: list[str] = []
         self._next_after_id = 0
 
     def after(self, delay_ms, callback):
         self._next_after_id += 1
         after_id = f"after-{self._next_after_id}"
-        self.after_calls.append((after_id, int(delay_ms), callback))
+        call = (after_id, int(delay_ms), callback)
+        self.after_calls.append(call)
+        self.after_history.append(call)
         return after_id
 
     def after_cancel(self, after_id) -> None:
@@ -35,9 +39,28 @@ class _FakeRoot:
             call for call in self.after_calls if call[0] != after_id
         ]
 
-    def run_next(self) -> None:
-        _after_id, _delay, callback = self.after_calls.pop(0)
-        callback()
+    def active_id(self, delay_ms: int) -> str:
+        matches = [
+            after_id
+            for after_id, delay, _callback in self.after_calls
+            if delay == delay_ms
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"expected one active {delay_ms}ms timer, got {matches!r}"
+            )
+        return matches[0]
+
+    def active_delays(self) -> list[int]:
+        return sorted(delay for _after_id, delay, _callback in self.after_calls)
+
+    def run_delay(self, delay_ms: int) -> str:
+        for index, (after_id, delay, callback) in enumerate(self.after_calls):
+            if delay == delay_ms:
+                self.after_calls.pop(index)
+                callback()
+                return after_id
+        raise AssertionError(f"active timer not found for {delay_ms}ms")
 
     def winfo_rootx(self) -> int:
         return 790
@@ -53,8 +76,11 @@ class _FakeWidget:
         self.kwargs = dict(kwargs)
         self.children: list[_FakeWidget] = []
         self.pack_kwargs: dict = {}
+        self.pack_calls: list[dict] = []
+        self.pack_configure_calls: list[dict] = []
         self.configure_calls: list[dict] = []
         self.bindings: dict[str, object] = {}
+        self.bind_adds: dict[str, object] = {}
         self.protocols: dict[str, object] = {}
         self.geometry_calls: list[str] = []
         self.requested_width = 700
@@ -72,13 +98,23 @@ class _FakeWidget:
         self.focus_force_calls = 0
         self.grab_set_calls = 0
         self.wait_window_calls = 0
+        self.update_idletasks_calls = 0
+        self.size_query_calls = 0
         self.destroy_calls = 0
         self.destroyed = False
         if isinstance(parent, _FakeWidget):
             parent.children.append(self)
 
     def pack(self, **kwargs):
-        self.pack_kwargs = dict(kwargs)
+        options = dict(kwargs)
+        self.pack_kwargs = options
+        self.pack_calls.append(options)
+        return None
+
+    def pack_configure(self, **kwargs):
+        options = dict(kwargs)
+        self.pack_kwargs.update(options)
+        self.pack_configure_calls.append(options)
         return None
 
     def configure(self, **kwargs):
@@ -119,8 +155,9 @@ class _FakeWidget:
         self.wait_window_calls += 1
         return None
 
-    def bind(self, sequence, callback):
+    def bind(self, sequence, callback, add=None):
         self.bindings[str(sequence)] = callback
+        self.bind_adds[str(sequence)] = add
         return None
 
     def protocol(self, name, callback):
@@ -147,6 +184,7 @@ class _FakeWidget:
         return True
 
     def update_idletasks(self):
+        self.update_idletasks_calls += 1
         return None
 
     def winfo_children(self):
@@ -162,21 +200,27 @@ class _FakeWidget:
         return 600
 
     def winfo_reqwidth(self):
+        self.size_query_calls += 1
         return self.requested_width
 
     def winfo_reqheight(self):
+        self.size_query_calls += 1
         return self.requested_height
 
     def winfo_width(self):
+        self.size_query_calls += 1
         return self.width
 
     def winfo_height(self):
+        self.size_query_calls += 1
         return self.height
 
     def winfo_x(self):
+        self.size_query_calls += 1
         return self.x
 
     def winfo_y(self):
+        self.size_query_calls += 1
         return self.y
 
     def winfo_ismapped(self):
@@ -230,6 +274,9 @@ class _FakeTk:
         self.buttons.append(widget)
         return widget
 
+    def all_widgets(self) -> list[_FakeWidget]:
+        return [*self.toplevels, *self.frames, *self.labels, *self.buttons]
+
     def live_label_texts(self) -> list[str]:
         return [
             str(label.kwargs.get("text", ""))
@@ -246,6 +293,17 @@ class _FakeTk:
                 return button
         raise AssertionError(f"button not found: {text!r}")
 
+    def pack_call_count(self) -> int:
+        return sum(len(widget.pack_calls) for widget in self.all_widgets())
+
+    def pack_configure_call_count(self) -> int:
+        return sum(
+            len(widget.pack_configure_calls) for widget in self.all_widgets()
+        )
+
+    def destroy_call_count(self) -> int:
+        return sum(widget.destroy_calls for widget in self.all_widgets())
+
 
 def _model(
     *,
@@ -253,25 +311,32 @@ def _model(
     has_clock_in: bool = False,
     break_active: bool = False,
     prompt: WorktimeActivityPrompt | None = None,
+    today_lines: tuple[WorktimePanelLine, ...] | None = None,
+    week_range: str = "2026-04-06 - 2026-04-12",
+    sync_text: str = "방금 동기화",
+    today_index: int = 0,
+    row_suffix: str = "",
 ) -> WorktimePanelModel:
     rows = tuple(
         WorktimePanelDayRow(
             weekday=weekday,
             date=f"04/{6 + index:02d}",
-            summary=f"{index + 1}:00 / 8:00",
-            today=index == 0,
-            color="#1D4ED8" if index == 0 else "#6B7280",
+            summary=f"{index + 1}:00 / 8:00{row_suffix}",
+            today=index == today_index,
+            color="#1D4ED8" if index == today_index else "#6B7280",
         )
         for index, weekday in enumerate(_WEEKDAYS)
     )
-    return WorktimePanelModel(
-        week_range="2026-04-06 - 2026-04-12",
-        sync_text="방금 동기화",
-        sync_state="fresh",
-        today_lines=(
+    if today_lines is None:
+        today_lines = (
             WorktimePanelLine(actual_text, "#2563EB"),
             WorktimePanelLine("출근 09:00 · 예상 퇴근 18:00", "#059669"),
-        ),
+        )
+    return WorktimePanelModel(
+        week_range=week_range,
+        sync_text=sync_text,
+        sync_state="fresh",
+        today_lines=today_lines,
         has_clock_in=has_clock_in,
         break_active=break_active,
         rows=rows,
@@ -279,7 +344,7 @@ def _model(
     )
 
 
-def _make_panel(root, fake_tk, holder):
+def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
     callbacks = {
         "refresh": Mock(),
         "clock_in_now": Mock(),
@@ -307,6 +372,7 @@ def _make_panel(root, fake_tk, holder):
         prompt_snooze=callbacks["prompt_snooze"],
         prompt_skip=callbacks["prompt_skip"],
         tk_module=fake_tk,
+        idle_timeout_ms=idle_timeout_ms,
     )
     return panel, provider, callbacks
 
@@ -354,79 +420,144 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.show_without_activation = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_show_reuses_one_toplevel_and_renders_all_seven_rows(self) -> None:
+    def test_show_reuses_window_has_distinct_timers_and_rearms_dismissal(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model()}
         panel, provider, _callbacks = _make_panel(root, fake_tk, holder)
 
         self.assertTrue(panel.show(activate=False))
-        first_window = fake_tk.toplevels[0]
+        window = fake_tk.toplevels[0]
         first_buttons = fake_tk.live_buttons()
+        refresh_id = root.active_id(1_000)
+        first_dismiss_id = root.active_id(6_000)
+        geometry_count = len(window.geometry_calls)
+
         self.assertTrue(panel.show(activate=False))
 
         self.assertEqual(len(fake_tk.toplevels), 1)
-        self.assertIs(fake_tk.toplevels[0], first_window)
-        self.assertEqual(first_window.geometry_calls, ["700x500+100+100"])
+        self.assertIs(fake_tk.toplevels[0], window)
+        self.assertEqual(window.geometry_calls, ["700x500+100+100"])
+        self.assertEqual(len(window.geometry_calls), geometry_count)
         self.assertEqual(fake_tk.live_buttons(), first_buttons)
-        self.assertTrue(all(not button.destroyed for button in first_buttons))
         self.assertEqual(provider.call_count, 2)
+        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        self.assertEqual(root.active_id(1_000), refresh_id)
+        self.assertNotEqual(root.active_id(6_000), first_dismiss_id)
+        self.assertIn(first_dismiss_id, root.after_cancel_calls)
+        self.assertNotEqual(refresh_id, root.active_id(6_000))
         texts = fake_tk.live_label_texts()
         self.assertTrue(set(_WEEKDAYS) <= set(texts))
         self.assertEqual(sum(text in _WEEKDAYS for text in texts), 7)
         self.assertIn("오늘", texts)
-        self.assertEqual(len(root.after_calls), 1)
-        self.assertEqual(root.after_calls[0][1], 1_000)
 
-    def test_one_second_tick_reloads_actual_vs_expected_text(self) -> None:
+    def test_equal_model_returns_before_assignment_or_any_render_path(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model()}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+        rendered_model = panel._model
+        holder["model"] = _model()
+        self.assertIsNot(holder["model"], rendered_model)
+
+        with (
+            patch.object(panel, "_window_exists") as window_exists,
+            patch.object(panel, "_render_structure") as rebuild,
+            patch.object(panel, "_update_rendered_model") as update,
+            patch.object(panel, "_reconcile_geometry") as reconcile,
+        ):
+            self.assertTrue(panel.refresh_now())
+
+        self.assertIs(panel._model, rendered_model)
+        window_exists.assert_not_called()
+        rebuild.assert_not_called()
+        update.assert_not_called()
+        reconcile.assert_not_called()
+
+    def test_text_only_refresh_preserves_widgets_without_layout_or_geometry(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model(actual_text="실제 1:00 vs 기대 2:00")}
-        panel, provider, _callbacks = _make_panel(root, fake_tk, holder)
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
         panel.show(activate=False)
+        window = fake_tk.toplevels[0]
+        buttons = tuple(fake_tk.live_buttons())
+        widget_counts = (
+            len(fake_tk.frames),
+            len(fake_tk.labels),
+            len(fake_tk.buttons),
+        )
+        pack_count = fake_tk.pack_call_count()
+        pack_configure_count = fake_tk.pack_configure_call_count()
+        destroy_count = fake_tk.destroy_call_count()
+        update_count = window.update_idletasks_calls
+        size_query_count = window.size_query_calls
+        geometry_count = len(window.geometry_calls)
+        holder["model"] = _model(
+            actual_text="실제 1:01 vs 기대 2:01",
+            week_range="2026-04-13 - 2026-04-19",
+            sync_text="1초 전 동기화",
+            today_index=1,
+            row_suffix=" 변경",
+        )
 
-        holder["model"] = _model(actual_text="실제 1:01 vs 기대 2:01")
-        root.run_next()
+        with patch(
+            "src.apps.wrike_worktime_panel._work_area_for_window"
+        ) as work_area:
+            self.assertTrue(panel.refresh_now())
 
-        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(tuple(fake_tk.live_buttons()), buttons)
+        self.assertEqual(
+            (len(fake_tk.frames), len(fake_tk.labels), len(fake_tk.buttons)),
+            widget_counts,
+        )
+        self.assertEqual(fake_tk.pack_call_count(), pack_count)
+        self.assertEqual(
+            fake_tk.pack_configure_call_count(),
+            pack_configure_count,
+        )
+        self.assertEqual(fake_tk.destroy_call_count(), destroy_count)
+        self.assertEqual(window.update_idletasks_calls, update_count)
+        self.assertEqual(window.size_query_calls, size_query_count)
+        self.assertEqual(len(window.geometry_calls), geometry_count)
+        work_area.assert_not_called()
         texts = fake_tk.live_label_texts()
         self.assertIn("실제 1:01 vs 기대 2:01", texts)
         self.assertNotIn("실제 1:00 vs 기대 2:00", texts)
-        self.assertEqual(len(root.after_calls), 1)
-        self.assertEqual(root.after_calls[0][1], 1_000)
+        self.assertIn("2026-04-13 - 2026-04-19", texts)
+        self.assertIn("동기화 · 1초 전 동기화", texts)
 
-    def test_main_button_text_and_callbacks_follow_model_state(self) -> None:
+    def test_action_transitions_reuse_buttons_and_stable_commands(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model()}
         panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
         panel.show(activate=False)
-
-        initial_texts = {
-            button.kwargs.get("text") for button in fake_tk.live_buttons()
-        }
-        self.assertTrue(
-            {"새로고침", "지금 출근", "휴게 시작", "계획 수정", "설정"}
-            <= initial_texts
-        )
-        fake_tk.button("새로고침").invoke()
-        callbacks["refresh"].assert_called_once_with()
-        fake_tk.button("지금 출근").invoke()
-        callbacks["clock_in_now"].assert_called_once_with()
+        original_buttons = tuple(fake_tk.live_buttons())
+        clock_button = fake_tk.button("지금 출근")
+        break_button = fake_tk.button("휴게 시작")
+        clock_command = clock_button.kwargs["command"]
+        break_command = break_button.kwargs["command"]
 
         holder["model"] = _model(has_clock_in=True, break_active=True)
         panel.refresh_now()
-        updated_texts = {
-            button.kwargs.get("text") for button in fake_tk.live_buttons()
-        }
-        self.assertIn("출근 수정", updated_texts)
-        self.assertIn("휴게 종료", updated_texts)
-        self.assertNotIn("지금 출근", updated_texts)
-        self.assertNotIn("휴게 시작", updated_texts)
 
+        self.assertEqual(tuple(fake_tk.live_buttons()), original_buttons)
+        self.assertIs(fake_tk.button("출근 수정"), clock_button)
+        self.assertIs(fake_tk.button("휴게 종료"), break_button)
+        self.assertIs(clock_button.kwargs["command"], clock_command)
+        self.assertIs(break_button.kwargs["command"], break_command)
+        self.assertTrue(
+            all(
+                "command" not in call
+                for button in original_buttons
+                for call in button.configure_calls
+            )
+        )
         fake_tk.button("출근 수정").invoke()
         callbacks["edit_clock_in"].assert_called_once_with()
-        callbacks["clock_in_now"].assert_called_once_with()
+        callbacks["clock_in_now"].assert_not_called()
         fake_tk.button("휴게 종료").invoke()
         callbacks["toggle_break"].assert_called_once_with()
         fake_tk.button("계획 수정").invoke()
@@ -434,33 +565,97 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         fake_tk.button("설정").invoke()
         callbacks["open_settings"].assert_called_once_with()
 
-    def test_prompt_buttons_appear_invoke_callbacks_and_then_hide(self) -> None:
+    def test_prompt_time_updates_in_place_but_presence_change_rebuilds(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model(prompt=WorktimeActivityPrompt("08:35"))}
         panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
         panel.show(activate=False)
+        all_buttons = tuple(fake_tk.live_buttons())
+        accept_button = fake_tk.button("08:35으로 출근")
+        edit_button = fake_tk.button("시간 수정")
+        accept_command = accept_button.kwargs["command"]
+        edit_command = edit_button.kwargs["command"]
 
-        expected = {"08:35으로 출근", "시간 수정", "30분 후", "오늘 건너뛰기"}
-        self.assertTrue(
-            expected
-            <= {button.kwargs.get("text") for button in fake_tk.live_buttons()}
+        with patch.object(
+            panel,
+            "_reconcile_geometry",
+            wraps=panel._reconcile_geometry,
+        ) as reconcile:
+            holder["model"] = _model(prompt=WorktimeActivityPrompt("09:10"))
+            panel.refresh_now()
+            reconcile.assert_not_called()
+            self.assertEqual(tuple(fake_tk.live_buttons()), all_buttons)
+            self.assertIs(fake_tk.button("09:10으로 출근"), accept_button)
+            self.assertIs(accept_button.kwargs["command"], accept_command)
+            self.assertIs(edit_button.kwargs["command"], edit_command)
+            self.assertTrue(
+                all(
+                    "command" not in call
+                    for button in all_buttons
+                    for call in button.configure_calls
+                )
+            )
+            fake_tk.button("09:10으로 출근").invoke()
+            callbacks["prompt_accept"].assert_called_once_with("09:10")
+
+            holder["model"] = _model(prompt=None)
+            panel.refresh_now()
+            self.assertEqual(reconcile.call_count, 1)
+
+        self.assertTrue(all(button.destroyed for button in all_buttons))
+        self.assertNotIn(
+            "09:10으로 출근",
+            {button.kwargs.get("text") for button in fake_tk.live_buttons()},
         )
-        fake_tk.button("08:35으로 출근").invoke()
-        callbacks["prompt_accept"].assert_called_once_with("08:35")
-        fake_tk.button("시간 수정").invoke()
-        callbacks["prompt_edit"].assert_called_once_with("08:35")
-        fake_tk.button("30분 후").invoke()
-        callbacks["prompt_snooze"].assert_called_once_with()
-        fake_tk.button("오늘 건너뛰기").invoke()
-        callbacks["prompt_skip"].assert_called_once_with()
+        self.assertIsNot(fake_tk.button("새로고침"), all_buttons[0])
 
-        holder["model"] = _model(prompt=None)
-        panel.refresh_now()
-        live_texts = {
-            button.kwargs.get("text") for button in fake_tk.live_buttons()
-        }
-        self.assertTrue(expected.isdisjoint(live_texts))
+    def test_today_line_cardinality_change_is_structural(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model()}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+        original_button = fake_tk.button("새로고침")
+        one_line = (WorktimePanelLine("한 줄만", "#2563EB"),)
+
+        with patch.object(
+            panel,
+            "_reconcile_geometry",
+            wraps=panel._reconcile_geometry,
+        ) as reconcile:
+            holder["model"] = _model(today_lines=one_line)
+            panel.refresh_now()
+
+        reconcile.assert_called_once_with()
+        self.assertTrue(original_button.destroyed)
+        self.assertIsNot(fake_tk.button("새로고침"), original_button)
+        self.assertIn("한 줄만", fake_tk.live_label_texts())
+
+    def test_provider_failure_and_invalid_model_preserve_last_good_render(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model(actual_text="마지막 정상")}
+        panel, provider, _callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+        last_good = panel._model
+        buttons = tuple(fake_tk.live_buttons())
+        labels = tuple(fake_tk.live_label_texts())
+
+        holder["model"] = object()
+        self.assertFalse(panel.refresh_now())
+        provider.side_effect = RuntimeError("offline")
+        self.assertFalse(panel.refresh_now())
+
+        self.assertIs(panel._model, last_good)
+        self.assertEqual(tuple(fake_tk.live_buttons()), buttons)
+        self.assertEqual(tuple(fake_tk.live_label_texts()), labels)
+        self.assertEqual(root.active_delays(), [1_000, 6_000])
+
+        provider.side_effect = lambda: holder["model"]
+        holder["model"] = _model(actual_text="복구됨")
+        self.assertTrue(panel.refresh_now())
+        self.assertIn("복구됨", fake_tk.live_label_texts())
 
     def test_nonactivating_show_uses_no_tk_activation_or_modal_calls(self) -> None:
         root = _FakeRoot()
@@ -507,13 +702,13 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertTrue(panel.show(activate=False))
         self.assertTrue(panel.is_visible())
         self.assertEqual(len(fake_tk.toplevels), 1)
-        self.assertEqual(len(root.after_calls), 1)
+        self.assertEqual(root.active_delays(), [1_000, 6_000])
         self.assertEqual(window.withdraw_calls, 3)
 
-    def test_failed_initial_geometry_is_retried_on_refresh(self) -> None:
+    def test_failed_initial_geometry_retries_only_on_dedicated_tick_path(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
-        panel, _provider, _callbacks = _make_panel(
+        panel, provider, _callbacks = _make_panel(
             root,
             fake_tk,
             {"model": _model()},
@@ -524,16 +719,32 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertTrue(panel.show(activate=False))
         self.assertEqual(window.geometry_calls, ["700x500+100+100"])
         self.assertEqual((window.width, window.height), (1, 1))
+        rendered_model = panel._model
 
-        root.run_next()
+        self.assertTrue(panel.refresh_now())
+        self.assertEqual(window.geometry_calls, ["700x500+100+100"])
+        self.assertIs(panel._model, rendered_model)
 
+        with (
+            patch.object(panel, "_render_structure") as rebuild,
+            patch.object(panel, "_update_rendered_model") as update,
+        ):
+            root.run_delay(1_000)
+
+        rebuild.assert_not_called()
+        update.assert_not_called()
+        self.assertEqual(provider.call_count, 3)
         self.assertEqual(
             window.geometry_calls,
             ["700x500+100+100", "700x500+100+100"],
         )
-        self.assertEqual((window.x, window.y, window.width, window.height), (100, 100, 700, 500))
+        self.assertEqual(
+            (window.x, window.y, window.width, window.height),
+            (100, 100, 700, 500),
+        )
+        self.assertEqual(root.active_delays(), [1_000, 6_000])
 
-    def test_geometry_preserves_user_position_then_grows_and_reclamps(self) -> None:
+    def test_user_geometry_is_untouched_in_place_and_reconciled_on_structure(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model()}
@@ -547,19 +758,49 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             return_value=(-1920, 0, 0, 1080),
         ) as work_area:
             geometry_count = len(window.geometry_calls)
+            holder["model"] = _model(actual_text="텍스트만 변경")
             panel.refresh_now()
             self.assertEqual(len(window.geometry_calls), geometry_count)
+            work_area.assert_not_called()
 
             window.requested_height = 620
-            holder["model"] = _model(prompt=WorktimeActivityPrompt("08:35"))
+            holder["model"] = _model(
+                actual_text="텍스트만 변경",
+                prompt=WorktimeActivityPrompt("08:35"),
+            )
             panel.refresh_now()
             self.assertEqual(window.geometry_calls[-1], "740x620-1000+50")
+            self.assertEqual(work_area.call_count, 1)
 
             work_area.return_value = (-800, -100, 0, 500)
+            holder["model"] = _model(actual_text="텍스트만 변경", prompt=None)
             panel.refresh_now()
             self.assertEqual(window.geometry_calls[-1], "740x600-800-100")
+            self.assertEqual(work_area.call_count, 2)
 
-    def test_escape_and_window_close_hide_without_destroying(self) -> None:
+    def test_timeout_clamps_and_runtime_update_rearms_with_new_delay(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+            idle_timeout_ms=100,
+        )
+        panel.show(activate=False)
+        clamped_id = root.active_id(1_200)
+        self.assertEqual(root.active_delays(), [1_000, 1_200])
+
+        panel.set_idle_timeout_ms(2_500)
+
+        self.assertIn(clamped_id, root.after_cancel_calls)
+        self.assertEqual(root.active_delays(), [1_000, 2_500])
+        panel.set_idle_timeout_ms(-1)
+        self.assertEqual(root.active_delays(), [1_000, 1_200])
+        with self.assertRaises(TypeError):
+            panel.set_idle_timeout_ms(1.5)  # type: ignore[arg-type]
+
+    def test_idle_timeout_withdraws_without_destroy_and_stops_both_timers(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         panel, _provider, _callbacks = _make_panel(
@@ -569,40 +810,163 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         )
         panel.show(activate=False)
         window = fake_tk.toplevels[0]
-        first_after_id = root.after_calls[0][0]
+        refresh_id = root.active_id(1_000)
+        dismiss_id = root.active_id(6_000)
+        window.mapped = False
+
+        self.assertEqual(root.run_delay(6_000), dismiss_id)
+
+        self.assertFalse(panel.is_visible())
+        self.assertFalse(panel._visible)
+        self.assertEqual(window.withdraw_calls, 2)
+        self.assertEqual(window.destroy_calls, 0)
+        self.assertEqual(root.after_calls, [])
+        self.assertIn(refresh_id, root.after_cancel_calls)
+        self.assertNotIn(dismiss_id, root.after_cancel_calls)
+
+        self.assertTrue(panel.show(activate=False))
+        self.assertIs(fake_tk.toplevels[0], window)
+        self.assertEqual(root.active_delays(), [1_000, 6_000])
+
+    def test_pointer_and_key_activity_defer_until_full_delay_after_leave(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+        panel.show(activate=False)
+        window = fake_tk.toplevels[0]
+        first_dismiss_id = root.active_id(6_000)
+        expected_bindings = {
+            "<Escape>",
+            "<Enter>",
+            "<Leave>",
+            "<Motion>",
+            "<Button>",
+            "<MouseWheel>",
+            "<Button-4>",
+            "<Button-5>",
+            "<KeyPress>",
+        }
+        self.assertTrue(expected_bindings <= set(window.bindings))
+        self.assertTrue(
+            all(window.bind_adds[sequence] == "+" for sequence in expected_bindings)
+        )
+
+        window.bindings["<Enter>"](object())
+        self.assertIn(first_dismiss_id, root.after_cancel_calls)
+        self.assertEqual(root.active_delays(), [1_000])
+        for sequence in ("<Motion>", "<Button>", "<MouseWheel>"):
+            window.bindings[sequence](object())
+            self.assertEqual(root.active_delays(), [1_000])
+        root.run_delay(1_000)
+        self.assertTrue(panel.is_visible())
+        self.assertEqual(root.active_delays(), [1_000])
+
+        window.bindings["<KeyPress>"](SimpleNamespace(keysym="a"))
+        self.assertEqual(root.active_delays(), [1_000])
+        window.bindings["<Leave>"](object())
+        leave_id = root.active_id(6_000)
+        window.bindings["<KeyPress>"](SimpleNamespace(keysym="Return"))
+        key_id = root.active_id(6_000)
+        self.assertNotEqual(key_id, leave_id)
+        self.assertIn(leave_id, root.after_cancel_calls)
+
+        window.bindings["<KeyPress>"](SimpleNamespace(keysym="Escape"))
+        self.assertEqual(root.active_id(6_000), key_id)
+
+    def test_command_interaction_blocks_dismissal_until_outermost_return(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model()}
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+        window = fake_tk.toplevels[0]
+        original_id = root.active_id(6_000)
+        stale_callback = next(
+            callback
+            for after_id, delay, callback in root.after_history
+            if after_id == original_id and delay == 6_000
+        )
+        observed_depths: list[int] = []
+
+        def assert_interaction_is_protected(expected_depth: int) -> None:
+            observed_depths.append(panel._interaction_depth)
+            self.assertEqual(panel._interaction_depth, expected_depth)
+            stale_callback()
+            window.bindings["<Leave>"](object())
+            window.bindings["<KeyPress>"](SimpleNamespace(keysym="Return"))
+            panel.set_idle_timeout_ms(6_000)
+            self.assertTrue(panel.is_visible())
+            self.assertEqual(root.active_delays(), [1_000])
+
+        def nested_probe() -> None:
+            assert_interaction_is_protected(2)
+
+        def command_probe() -> None:
+            assert_interaction_is_protected(1)
+            panel._run_command(nested_probe)
+            self.assertEqual(panel._interaction_depth, 1)
+            self.assertTrue(panel.is_visible())
+            self.assertEqual(root.active_delays(), [1_000])
+
+        callbacks["refresh"].side_effect = command_probe
+
+        fake_tk.button("새로고침").invoke()
+
+        self.assertEqual(observed_depths, [1, 2])
+        self.assertEqual(panel._interaction_depth, 0)
+        self.assertTrue(panel.is_visible())
+        self.assertIn(original_id, root.after_cancel_calls)
+        self.assertEqual(root.active_delays(), [1_000, 6_000])
+        final_id = root.active_id(6_000)
+        self.assertNotEqual(final_id, original_id)
+        self.assertEqual(
+            [delay for _after_id, delay, _callback in root.after_history].count(6_000),
+            2,
+        )
+        callbacks["refresh"].assert_called_once_with()
+
+    def test_escape_close_toggle_and_destroy_hide_immediately_and_cancel_both(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+        panel.show(activate=False)
+        window = fake_tk.toplevels[0]
+        escape_ids = {root.active_id(1_000), root.active_id(6_000)}
 
         result = window.bindings["<Escape>"](object())
 
         self.assertEqual(result, "break")
         self.assertFalse(panel.is_visible())
-        self.assertEqual(window.withdraw_calls, 2)
         self.assertEqual(window.destroy_calls, 0)
-        self.assertEqual(root.after_cancel_calls, [first_after_id])
+        self.assertTrue(escape_ids <= set(root.after_cancel_calls))
 
         panel.show(activate=False)
+        close_ids = {root.active_id(1_000), root.active_id(6_000)}
         window.protocols["WM_DELETE_WINDOW"]()
         self.assertFalse(panel.is_visible())
-        self.assertEqual(window.destroy_calls, 0)
-        self.assertEqual(len(fake_tk.toplevels), 1)
+        self.assertTrue(close_ids <= set(root.after_cancel_calls))
 
-    def test_toggle_reuses_window_and_destroy_is_idempotent_with_cancel(self) -> None:
-        root = _FakeRoot()
-        fake_tk = _FakeTk()
-        panel, _provider, _callbacks = _make_panel(
-            root,
-            fake_tk,
-            {"model": _model()},
-        )
+        panel.show(activate=False)
+        toggle_ids = {root.active_id(1_000), root.active_id(6_000)}
         panel.toggle(activate=False)
-        window = fake_tk.toplevels[0]
-        first_after_id = root.after_calls[0][0]
+        self.assertFalse(panel.is_visible())
+        self.assertTrue(toggle_ids <= set(root.after_cancel_calls))
 
+        panel.show(activate=False)
+        destroy_ids = {root.active_id(1_000), root.active_id(6_000)}
         panel.destroy()
         panel.destroy()
         panel.show(activate=False)
-
         self.assertFalse(panel.is_visible())
-        self.assertEqual(root.after_cancel_calls, [first_after_id])
+        self.assertTrue(destroy_ids <= set(root.after_cancel_calls))
         self.assertEqual(root.after_calls, [])
         self.assertEqual(window.destroy_calls, 1)
         self.assertEqual(len(fake_tk.toplevels), 1)

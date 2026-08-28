@@ -370,6 +370,45 @@ class WorktimeComputationUnitTest(unittest.TestCase):
             0,
         )
 
+    def test_vacation_unavailable_keeps_provisional_calculation_and_wording(self):
+        known_break = BreakInterval(
+            start=self._dt(9),
+            end=self._dt(9, 15),
+            label="수동",
+        )
+        now = self._dt(10)
+
+        overview = build_workday_overview(
+            now=now,
+            clock_in=self._dt(8),
+            recorded_minutes=105,
+            target_minutes=8 * 60,
+            intervals=[known_break],
+            vacation_intervals=[
+                BreakInterval(self._dt(9, 30), self._dt(10), "휴가")
+            ],
+            vacation_all_day=True,
+            vacation_minutes=8 * 60,
+            vacation_available=False,
+            vacation_state="loading",
+        )
+
+        self.assertFalse(overview.vacation_available)
+        self.assertTrue(overview.expected_available)
+        self.assertEqual(overview.vacation_minutes, 0)
+        self.assertEqual(overview.effective_target_minutes, 8 * 60)
+        self.assertEqual(overview.break_total_minutes, 15)
+        self.assertEqual(overview.expected_now_minutes, 105)
+        self.assertEqual(overview.realtime_delta_minutes, 0)
+        self.assertEqual(overview.projected_quit, self._dt(16, 15))
+        rendered = "\n".join(text for text, _color in overview.as_lines(now))
+        self.assertIn("현재 기대 1시간 45분 (임시)", rendered)
+        self.assertIn("휴가 미확정 (loading)", rendered)
+        self.assertIn("휴가 미반영 임시 목표 8시간", rendered)
+        self.assertIn("예상 퇴근 16:15 (임시)", rendered)
+        self.assertNotIn("현재 기대 조회 불가", rendered)
+        self.assertNotIn("적용 목표 조회 불가", rendered)
+
     def test_refreshable_lines_length_guard_falls_back(self):
         base_rows = [("a", None), ("b", None)]
         refreshed = RefreshableLines(base_rows, lambda: [("x", "#fff")])
