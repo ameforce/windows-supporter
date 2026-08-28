@@ -61,6 +61,6 @@ Native runner의 full scenario는 synthetic renderer를 800x640 client viewport�
 4. `uv run python scripts/qa_wrike_worktime_panel_native.py --scenario inline-edit-hover-deadline --output-dir <external-empty-directory>` 및 4개 관련 PNG/run.json read-back
 5. `git diff --check`
 6. `cmd /c build.bat`
-7. clean tagged `main` 산출물의 `FileVersion`, `ProductVersion`, `Comments` read-back과 `main`, `v0.13.1`, `develop`의 `release-chain-gate` 확인
+7. clean tagged `main` 산출물의 `FileVersion`, `ProductVersion`, `Comments`, SHA-256 read-back과 `main`, tag, `develop` exact local/remote ref 일치 확인
 
 전체 unittest discovery, private iCal E2E와 vacation·break·focus 등 변경과 무관한 native scenario는 이 hotfix 검증에서 실행하지 않는다.
