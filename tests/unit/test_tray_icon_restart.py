@@ -11,6 +11,7 @@ class SystemTrayIconRestartUnitTest(unittest.TestCase):
         *,
         on_restart=None,
         on_display_topology_change=None,
+        on_open_worktime=None,
     ) -> SystemTrayIcon:
         return SystemTrayIcon(
             tooltip="Windows Supporter",
@@ -18,6 +19,7 @@ class SystemTrayIconRestartUnitTest(unittest.TestCase):
             on_exit=lambda: None,
             on_restart=on_restart,
             on_display_topology_change=on_display_topology_change,
+            on_open_worktime=on_open_worktime,
         )
 
     def test_restart_menu_is_shown_before_exit_when_callback_exists(self) -> None:
@@ -48,6 +50,38 @@ class SystemTrayIconRestartUnitTest(unittest.TestCase):
             text for _, item_id, text in appended if item_id == SystemTrayIcon._MENU_RESTART
         ]
         self.assertEqual(restart_text, ["재시작"])
+
+    def test_worktime_menu_is_shown_and_dispatches_callback(self) -> None:
+        calls: list[str] = []
+        tray = self._build_tray(
+            on_open_worktime=lambda: calls.append("worktime"),
+        )
+        tray._hwnd = 100
+        appended: list[tuple[int, int, str]] = []
+
+        def append_menu(menu, flags, item_id, text):
+            appended.append((int(flags), int(item_id), str(text)))
+
+        with patch("src.utils.tray_icon.win32gui.CreatePopupMenu", return_value=1), patch(
+            "src.utils.tray_icon.win32gui.AppendMenu",
+            side_effect=append_menu,
+        ), patch("src.utils.tray_icon.win32gui.SetForegroundWindow"), patch(
+            "src.utils.tray_icon.win32gui.GetCursorPos",
+            return_value=(0, 0),
+        ), patch("src.utils.tray_icon.win32gui.TrackPopupMenu"), patch(
+            "src.utils.tray_icon.win32gui.PostMessage"
+        ), patch("src.utils.tray_icon.win32gui.DestroyMenu"):
+            tray._show_menu()
+
+        entries = [
+            text
+            for _, item_id, text in appended
+            if item_id == SystemTrayIcon._MENU_WORKTIME
+        ]
+        self.assertEqual(entries, ["Wrike 근무시간..."])
+        result = tray._on_command(200, 0, SystemTrayIcon._MENU_WORKTIME, 0)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["worktime"])
 
     def test_restart_command_calls_restart_and_destroys_window(self) -> None:
         calls: list[str] = []

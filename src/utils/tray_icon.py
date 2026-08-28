@@ -84,6 +84,7 @@ class SystemTrayIcon:
     _MENU_OPEN_CONFIG = 1005
     _MENU_OPEN_CONFIG_DIR = 1006
     _MENU_TOGGLE_ENABLED = 1007
+    _MENU_WORKTIME = 1008
     _MENU_KAKAO_MONITOR = 1010
     _MENU_RESTART = 1098
     _MENU_EXIT = 1099
@@ -100,6 +101,7 @@ class SystemTrayIcon:
         on_open_config_dir: Callable[[], None] | None = None,
         on_toggle_enabled: Callable[[], None] | None = None,
         is_enabled: Callable[[], bool] | None = None,
+        on_open_worktime: Callable[[], None] | None = None,
         on_open_kakao_monitor: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
         icon_path: str | None = None,
@@ -120,6 +122,7 @@ class SystemTrayIcon:
         self._on_open_config_dir = on_open_config_dir
         self._on_toggle_enabled = on_toggle_enabled
         self._is_enabled = is_enabled
+        self._on_open_worktime = on_open_worktime
         self._on_open_kakao_monitor = on_open_kakao_monitor
         self._on_restart = on_restart
         self._icon_path = str(icon_path).strip() if icon_path else None
@@ -608,8 +611,21 @@ class SystemTrayIcon:
                 "로그 열기",
             )
 
-        if self._on_open_kakao_monitor is not None:
+        if (
+            self._on_open_worktime is not None
+            or self._on_open_kakao_monitor is not None
+        ):
             win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+
+        if self._on_open_worktime is not None:
+            win32gui.AppendMenu(
+                menu,
+                win32con.MF_STRING,
+                self._MENU_WORKTIME,
+                "Wrike 근무시간...",
+            )
+
+        if self._on_open_kakao_monitor is not None:
             win32gui.AppendMenu(
                 menu,
                 win32con.MF_STRING,
@@ -694,6 +710,13 @@ class SystemTrayIcon:
         if cmd_id == self._MENU_TOGGLE_ENABLED and self._on_toggle_enabled is not None:
             try:
                 self._on_toggle_enabled()
+            except Exception:
+                pass
+            return 0
+
+        if cmd_id == self._MENU_WORKTIME and self._on_open_worktime is not None:
+            try:
+                self._on_open_worktime()
             except Exception:
                 pass
             return 0

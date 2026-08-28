@@ -554,7 +554,7 @@ class WrikeResponsivenessAndTokenUnitTest(unittest.TestCase):
 
         fill_on_worker.assert_called_once_with(root, normalized)
 
-    def test_monitor_worker_posts_finish_to_ui_thread_before_rescheduling(self) -> None:
+    def test_monitor_tick_uses_authoritative_snapshot_refresh_and_reschedules(self) -> None:
         wrike = self._new_wrike()
         root = _RecordingRoot()
         wrike._Wrike__monitor_enabled = True
@@ -571,16 +571,18 @@ class WrikeResponsivenessAndTokenUnitTest(unittest.TestCase):
                 return_value=(None, None, "auth_failed"),
             ):
                 wrike._Wrike__monitor_tick()
-                root.after_calls.clear()
+                self.assertEqual(len(_FakeThread.created), 1)
+                self.assertFalse(wrike._Wrike__monitor_running)
+                self.assertTrue(
+                    any(delay >= 5000 for delay, _callback in root.after_calls)
+                )
                 _FakeThread.created[0].target()
-
-        self.assertTrue(wrike._Wrike__monitor_running)
-        self.assertEqual(root.after_calls, [])
 
         wrike._Wrike__drain_ui_queue()
 
-        self.assertFalse(wrike._Wrike__monitor_running)
-        self.assertTrue(any(delay >= 5000 for delay, _callback in root.after_calls))
+        snapshot = wrike.get_timelog_snapshot()
+        self.assertEqual(snapshot.state.value, "error")
+        self.assertEqual(snapshot.error_code, "auth_failed")
 
     def test_ui_safe_does_not_schedule_tk_directly_when_queue_fails(self) -> None:
         wrike = self._new_wrike()
@@ -593,6 +595,41 @@ class WrikeResponsivenessAndTokenUnitTest(unittest.TestCase):
 
         self.assertFalse(posted)
         self.assertEqual(root.after_calls, [])
+
+    def test_atomic_settings_replace_uses_destination_parent_and_rolls_back(self) -> None:
+        wrike = self._new_wrike()
+        original_target = wrike.get_settings_snapshot()["daily_target_minutes"]
+        destination_parent = self.appdata / "alternate-settings"
+        destination_parent.mkdir(parents=True)
+        destination = destination_parent / "wrike_settings.json"
+        original_bytes = b'{"sentinel": true}\n'
+        destination.write_bytes(original_bytes)
+        wrike._Wrike__settings_path = str(destination)
+
+        with patch(
+            "src.apps.Wrike.os.replace",
+            side_effect=OSError("replace failed"),
+        ) as replace:
+            ok, error = wrike.update_settings(
+                {"daily_target_minutes": original_target + 15}
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(error, "settings save failed")
+        self.assertEqual(
+            wrike.get_settings_snapshot()["daily_target_minutes"],
+            original_target,
+        )
+        self.assertEqual(destination.read_bytes(), original_bytes)
+        replace.assert_called_once()
+        temp_name, target_name = replace.call_args.args
+        self.assertEqual(Path(temp_name).parent, destination_parent)
+        self.assertEqual(Path(target_name), destination)
+        self.assertFalse(Path(temp_name).exists())
+        self.assertEqual(
+            list(destination_parent.glob(".wrike_settings.json.*.tmp")),
+            [],
+        )
 
     def test_saving_token_omits_plaintext_and_snapshot_masks_token(self) -> None:
         wrike = self._new_wrike()

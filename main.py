@@ -391,6 +391,11 @@ def _run_main_app() -> None:
         on_open_config_dir=lambda: event_queue.put(startup_manager.open_config_dir),
         on_toggle_enabled=lambda: event_queue.put(_toggle_and_start_bg),
         is_enabled=startup_manager.get_enabled_state,
+        on_open_worktime=lambda: getattr(
+            monitor,
+            "show_worktime_quick_panel",
+            lambda: None,
+        )(),
         on_open_kakao_monitor=lambda: event_queue.put(main_ui.show),
         on_open_log=lambda: event_queue.put(startup_manager.open_log_file),
         on_restart=lambda: event_queue.put(_request_restart),
