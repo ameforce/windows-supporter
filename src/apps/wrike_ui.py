@@ -902,7 +902,7 @@ class WrikeSettingsView:
             ).strip(),
             "state": str(
                 data.get("vacation_ical_state")
-                or ("pending" if configured else "unconfigured")
+                or ("loading" if configured else "unconfigured")
             ).strip(),
             "last_success_ts": data.get("vacation_ical_last_success_ts"),
             "error_code": str(
@@ -936,7 +936,7 @@ class WrikeSettingsView:
         if var is None:
             return
         state = str(data.get("state") or "unconfigured").strip().lower()
-        if state not in {"unconfigured", "pending", "ok", "error"}:
+        if state not in {"unconfigured", "loading", "fresh", "stale", "error"}:
             state = "error"
         expected = str(data.get("expected_calendar_name") or "").strip()
         observed = str(data.get("observed_calendar_name") or "").strip()
@@ -944,8 +944,9 @@ class WrikeSettingsView:
         error_code = str(data.get("error_code") or "").strip()
         state_labels = {
             "unconfigured": "미설정",
-            "pending": "대기 중",
-            "ok": "정상",
+            "loading": "불러오는 중",
+            "fresh": "정상",
+            "stale": "마지막 성공값 사용 중",
             "error": "오류",
         }
         error_labels = {
