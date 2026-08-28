@@ -1,5 +1,7 @@
 # Release v0.13.0 — Quick Panel UX·private iCal 연결 진단
 
+> **v0.13.1 계약 정정:** v0.13.0 구현에서 `출근 수정`과 activity prompt `시간 수정`이 별도 modal로 분기되고 hover가 deadline 자체를 재설정한 것은 불완전 구현이다. 아래 Quick Panel #5·#6 및 acceptance는 v0.13.1에서 복구한 원래 의도를 반영한다.
+
 ## 변경 분류
 
 - 의도한 계약: `Ctrl+Alt+W`로 여는 Quick Panel은 사용자가 즉시 확인·조작할 수 있도록 전면에 표시되고, 회사 휴가 캘린더는 인증정보를 노출하지 않으면서 지원 가능한 Google 비공개 iCal 주소와 실패 원인을 구분해 안내해야 한다.
@@ -15,8 +17,8 @@
 | 2 | 제목 표시줄 제거 | Quick Panel은 `overrideredirect` chromeless, topmost, fixed-size shell로 표시한다. native caption과 thick frame을 사용하지 않는다. |
 | 3 | hover 외곽 표시 | 기본 외곽선과 구분되는 파란 hover 외곽선을 사용한다. native pointer enter/leave로 실제 상태 전환을 확인한다. |
 | 4 | 동기화 문구 중복 제거 | 동기화 상태의 소유자는 header 하나뿐이다. 정상·오류를 포함한 모든 panel 상태에서 동기화 label은 정확히 하나만 표시한다. |
-| 5 | Quick Panel에서 근무시간 변경 | `계획 수정`은 오늘의 목표 순근무시간만 `HH:MM` 형식(`00:00`–`24:00`)으로 inline 편집한다. 저장·취소·validation을 제공하고 오늘의 출근 시각과 인접 날짜 계획은 변경하지 않는다. 상세 설정 화면은 다른 날짜와 전체 설정 용도로 유지한다. |
-| 6 | 자동 닫힘 남은 시간 표시 | 기존 `tooltip_duration_ms` 설정을 따르는 idle deadline(기본 6초)의 남은 시간을 1초 단위로 표시한다. hover·inline 편집·명시적 상호작용 중에는 자동 닫힘을 일시정지한다. countdown은 영속 domain state가 아닌 view-local 상태다. |
+| 5 | Quick Panel에서 근무시간 변경 | `계획 수정`, 기존 출근의 `출근 수정`, activity prompt의 `시간 수정`은 별도 dialog 없이 동일 Quick Panel의 공통 inline editor를 재사용한다. 목표는 `00:00`–`24:00`, 출근 시각은 `00:00`–`23:59` validation을 적용하며 저장·취소를 제공한다. 오늘 값만 변경하고 인접 날짜 계획은 유지한다. 상세 설정 화면은 다른 날짜와 전체 설정 용도로 유지한다. |
+| 6 | 자동 닫힘 남은 시간 표시 | 기존 `tooltip_duration_ms` 설정을 따르는 absolute idle deadline(기본 6초)의 남은 시간을 1초 단위로 표시한다. Hover 중에도 deadline과 countdown은 계속 흐른다. Deadline 만료 시 hover 중이면 창만 hold하고 `마우스 호버 중 · 이동 시 닫힘`을 표시하며 실제 leave에서 즉시 닫는다. Inline 편집·명시적 상호작용은 완료 후 timeout을 재arm한다. Countdown은 영속 domain state가 아닌 view-local 상태다. |
 | 7 | 마우스 위치 기반 표시 | 최초 표시와 재표시 모두 현재 pointer에서 16px 떨어진 위치를 사용한다. pointer monitor의 work area를 기준으로 오른쪽/아래 공간이 부족하면 반대편으로 뒤집고 마지막으로 clamp한다. 최초 native mapping이 geometry를 보정하는 경우 mapped 후 같은 pointer 계약을 다시 적용한다. |
 
 ## private iCal 계약
@@ -37,12 +39,12 @@
 | #2 chromeless | shell 구성 unit test | `tk_overrideredirect=true`, topmost/fixed-size, caption/thickframe 부재 read-back |
 | #3 hover | enter/leave와 border state unit test | `initial.png`과 `hover-active.png`의 외곽 색 및 native pointer delivery 비교 |
 | #4 sync dedup | 정상·오류 header 단일 소유권 unit test | 9개 checkpoint 각각 sync label 정확히 1개 |
-| #5 inline 목표 | `0`, `1440`, validation, 저장·취소, 출근/인접 날짜 보존 unit test | prefill `08:00`, invalid `24:30`, save `07:30`, cancel 후 `07:30` 보존과 callback `edit_plan:450` |
-| #6 countdown | view-local deadline·설정값 연동·pause unit test | 안정적인 다단계 캡처를 위해 synthetic runner에 60초를 주입해 `60초 후 닫힘`을 확인하고, 별도 short-idle phase에서 hover/editor/interaction defer와 withdraw lifecycle 확인 |
+| #5 공통 inline 시간 편집 | 목표 `0`/`1440`, 출근 `00:00`–`23:59`, prompt stale identity, 저장·취소, 오늘 값/인접 날짜 보존 unit test | clock·target·prompt가 동일 entry와 단일 Toplevel을 재사용하고 clock `08:00`, prompt `08:35` prefill 및 callback context를 확인 |
+| #6 countdown | absolute deadline identity·hover 중 countdown 진행·만료 hold·leave 즉시 withdraw unit test | `inline-edit-hover-deadline` subset에서 hover 전후 deadline 동일성, 만료 후 hold text, bounded leave withdraw와 timeout 미재arm 확인 |
 | #7 pointer placement | monitor work-area flip/clamp unit test | initial·reopen geometry를 실제 Win32 cursor/work-area 기대값과 비교 |
 | #8 private iCal | HTML/XHTML/JSON/calendar content type, login redirect, retry generation/state, 저장 오류 fixture | 실제 비공개 endpoint를 캡처하지 않으며 synthetic fixture 결과만 evidence로 사용 |
 
-Native runner는 synthetic renderer를 800x640 client viewport로 캡처하며, 여러 checkpoint를 안정적으로 수집하기 위해 production 기본값과 독립적으로 60초 idle timeout을 주입한다. checkpoint는 `initial`, `hover-active`, `target-editor-prefill`, `target-editor-validation`, `target-editor-save-cancel`, `vacation-provisional`, `break-active`, `activity-prompt-focus`, `error-last-good`이며 각 PNG는 full decode, exact inventory, digest binding과 수동 시각 검토 receipt를 거쳐 finalized validation한다.
+Native runner의 full scenario는 synthetic renderer를 800x640 client viewport로 캡처한다. v0.13.1 inline/deadline 회귀는 `--scenario inline-edit-hover-deadline` subset으로 분리해 `clock-inline`, `prompt-inline`, `hover-countdown`, `hover-deadline-held`만 캡처하며 vacation·break·focus·iCal checkpoint를 실행하지 않는다. 이 subset은 단일 Toplevel/공통 entry, deadline identity, 만료 hold와 leave 즉시 withdraw를 run.json 및 PNG digest에 기록한다.
 
 ## 확인 가능한 경계와 알려진 한계
 
@@ -53,12 +55,12 @@ Native runner는 synthetic renderer를 800x640 client viewport로 캡처하며, 
 
 ## 릴리스 검증
 
-1. `uv run python -m unittest tests.unit.test_wrike_worktime_panel tests.unit.test_wrike_realtime_progress tests.unit.test_wrike_ical`
-2. `uv run python -m unittest tests.unit.test_qa_wrike_worktime_panel_native`
-3. `uv run python scripts/qa_wrike_worktime_panel_native.py --output-dir <external-empty-directory>` 및 9개 PNG 시각 검토
-4. review receipt를 적용한 finalize와 `--validate-finalized` exact inventory/digest read-back
-5. `uv run python -m unittest discover -s tests -p "test_*.py"`
-6. `git diff --check`
-7. `cmd /c build.bat`
-8. packaged `windows-supporter.exe` startup/shutdown 및 가능한 `Ctrl+Alt+W` foreground smoke
-9. clean tagged `main` 산출물의 `FileVersion`, `ProductVersion`, `Comments` read-back과 `main`, `v0.13.0`, `develop`의 `release-chain-gate` 확인
+1. `tests.unit.test_wrike_worktime_panel`에서 공통 inline editor·absolute hover deadline 관련 test case만 선택 실행
+2. `tests.unit.test_wrike_realtime_progress`에서 model clock-in 값·clock save·prompt live-gate 관련 test case만 선택 실행
+3. `tests.unit.test_qa_wrike_worktime_panel_native`에서 변경된 hover countdown validator case만 선택 실행
+4. `uv run python scripts/qa_wrike_worktime_panel_native.py --scenario inline-edit-hover-deadline --output-dir <external-empty-directory>` 및 4개 관련 PNG/run.json read-back
+5. `git diff --check`
+6. `cmd /c build.bat`
+7. clean tagged `main` 산출물의 `FileVersion`, `ProductVersion`, `Comments` read-back과 `main`, `v0.13.1`, `develop`의 `release-chain-gate` 확인
+
+전체 unittest discovery, private iCal E2E와 vacation·break·focus 등 변경과 무관한 native scenario는 이 hotfix 검증에서 실행하지 않는다.
