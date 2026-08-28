@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from datetime import date, timedelta
 import re
 from types import SimpleNamespace
 import unittest
@@ -401,16 +402,28 @@ def _model(
     break_active: bool = False,
     prompt: WorktimeActivityPrompt | None = None,
     today_lines: tuple[WorktimePanelLine, ...] | None = None,
-    week_range: str = "2026-04-06 - 2026-04-12",
+    week_start: date = date(2026, 4, 6),
+    week_range: str | None = None,
     sync_text: str = "방금 동기화",
     target_minutes: int = 480,
+    row_targets: tuple[int, ...] | None = None,
     today_index: int = 0,
     row_suffix: str = "",
 ) -> WorktimePanelModel:
+    week_days = tuple(week_start + timedelta(days=index) for index in range(7))
+    targets = (
+        tuple(target_minutes for _day in week_days)
+        if row_targets is None
+        else tuple(row_targets)
+    )
+    if len(targets) != 7:
+        raise ValueError("row_targets must contain exactly seven values")
     rows = tuple(
         WorktimePanelDayRow(
             weekday=weekday,
-            date=f"04/{6 + index:02d}",
+            date=week_days[index].strftime("%m/%d"),
+            date_key=week_days[index].isoformat(),
+            target_minutes=targets[index],
             summary=f"{index + 1}:00 / 8:00{row_suffix}",
             today=index == today_index,
             color="#1D4ED8" if index == today_index else "#6B7280",
@@ -425,11 +438,15 @@ def _model(
     if clock_in_time is None and has_clock_in:
         clock_in_time = "09:00"
     return WorktimePanelModel(
-        week_range=week_range,
+        week_range=(
+            f"{week_days[0].isoformat()} - {week_days[-1].isoformat()}"
+            if week_range is None
+            else week_range
+        ),
         sync_text=sync_text,
         sync_state="fresh",
         today_lines=today_lines,
-        target_minutes=target_minutes,
+        target_minutes=targets[today_index],
         clock_in_time=clock_in_time,
         break_active=break_active,
         rows=rows,
@@ -477,6 +494,40 @@ class WorktimePanelModelTests(unittest.TestCase):
 
         with self.assertRaises(FrozenInstanceError):
             model.sync_text = "변경"  # type: ignore[misc]
+        with self.assertRaises(FrozenInstanceError):
+            model.rows[0].target_minutes = 0  # type: ignore[misc]
+        for invalid_date_key in ("2026-4-06", "20260406", "2026-02-30"):
+            with self.subTest(date_key=invalid_date_key):
+                with self.assertRaises(ValueError):
+                    WorktimePanelDayRow(
+                        weekday="월",
+                        date="04/06",
+                        date_key=invalid_date_key,
+                        target_minutes=480,
+                        summary="목표 8시간",
+                        today=True,
+                        color="#111827",
+                    )
+        with self.assertRaises(TypeError):
+            WorktimePanelDayRow(
+                weekday="월",
+                date="04/06",
+                date_key="2026-04-06",
+                target_minutes=True,  # type: ignore[arg-type]
+                summary="목표 8시간",
+                today=True,
+                color="#111827",
+            )
+        with self.assertRaises(ValueError):
+            WorktimePanelDayRow(
+                weekday="월",
+                date="04/06",
+                date_key="2026-04-06",
+                target_minutes=1441,
+                summary="목표 8시간",
+                today=True,
+                color="#111827",
+            )
         with self.assertRaises(TypeError):
             WorktimePanelModel(
                 week_range=model.week_range,
@@ -498,6 +549,17 @@ class WorktimePanelModelTests(unittest.TestCase):
                 clock_in_time=None,
                 break_active=False,
                 rows=model.rows[:6],
+            )
+        with self.assertRaises(ValueError):
+            WorktimePanelModel(
+                week_range=model.week_range,
+                sync_text=model.sync_text,
+                sync_state=model.sync_state,
+                today_lines=model.today_lines,
+                target_minutes=model.target_minutes,
+                clock_in_time=None,
+                break_active=False,
+                rows=(model.rows[0], model.rows[0], *model.rows[2:]),
             )
         with self.assertRaises(ValueError):
             WorktimeActivityPrompt("24:00")
@@ -587,13 +649,28 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         update.assert_not_called()
         reconcile.assert_not_called()
 
-    def test_text_only_refresh_preserves_widgets_without_layout_or_geometry(self) -> None:
+    def test_in_place_week_refresh_preserves_widgets_and_reconciles_selection(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model(actual_text="실제 1:00 vs 기대 2:00")}
         panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
         panel.show(activate=False)
         window = fake_tk.toplevels[0]
+        row_widgets = panel._widgets["rows"]
+        self.assertEqual(panel._selected_date_key, "2026-04-06")
+        self.assertEqual(row_widgets[0][0].kwargs["bg"], "#BFDBFE")
+        self.assertTrue(
+            all(
+                "<Button-1>" in widget.bindings
+                for widgets in row_widgets
+                for widget in widgets
+            )
+        )
+        row_widgets[4][2].bindings["<Button-1>"](SimpleNamespace())
+        self.assertEqual(panel._selected_date_key, "2026-04-10")
+        self.assertEqual(row_widgets[0][0].kwargs["bg"], "#DBEAFE")
+        self.assertEqual(row_widgets[4][0].kwargs["bg"], "#BFDBFE")
+
         buttons = tuple(fake_tk.live_buttons())
         widget_counts = (
             len(fake_tk.frames),
@@ -608,7 +685,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         geometry_count = len(window.geometry_calls)
         holder["model"] = _model(
             actual_text="실제 1:01 vs 기대 2:01",
-            week_range="2026-04-13 - 2026-04-19",
+            week_start=date(2026, 4, 13),
             sync_text="1초 전 동기화",
             today_index=1,
             row_suffix=" 변경",
@@ -634,11 +711,17 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(window.size_query_calls, size_query_count)
         self.assertEqual(len(window.geometry_calls), geometry_count)
         work_area.assert_not_called()
+        self.assertEqual(panel._selected_date_key, "2026-04-14")
+        self.assertEqual(row_widgets[1][0].kwargs["bg"], "#BFDBFE")
         texts = fake_tk.live_label_texts()
         self.assertIn("실제 1:01 vs 기대 2:01", texts)
         self.assertNotIn("실제 1:00 vs 기대 2:00", texts)
         self.assertIn("2026-04-13 - 2026-04-19", texts)
         self.assertIn("동기화 · 1초 전 동기화", texts)
+
+        row_widgets[2][3].bindings["<Button-1>"](SimpleNamespace())
+        self.assertEqual(panel._selected_date_key, "2026-04-15")
+        self.assertEqual(row_widgets[2][0].kwargs["bg"], "#BFDBFE")
 
     def test_time_edits_share_one_panel_local_inline_editor(self) -> None:
         root = _FakeRoot()
@@ -647,6 +730,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             "model": _model(
                 has_clock_in=True,
                 clock_in_time="08:00",
+                row_targets=(480, 420, 360, 480, 480, 0, 0),
                 prompt=WorktimeActivityPrompt("08:35"),
             )
         }
@@ -670,13 +754,29 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         callbacks["edit_clock_in"].assert_called_once_with("08:15")
         self.assertFalse(panel._inline_editor_active)
 
-        fake_tk.button("계획 수정").invoke()
+        panel._widgets["rows"][1][1].bindings["<Button-1>"](
+            SimpleNamespace()
+        )
+        fake_tk.button("목표 수정").invoke()
         self.assertIs(panel._widgets["inline_entry"], shared_entry)
-        self.assertEqual(shared_entry.get(), "08:00")
+        self.assertEqual(shared_entry.get(), "07:00")
+        self.assertEqual(
+            panel._widgets["inline_title"].kwargs["text"],
+            "2026-04-07 목표 순근무 시간",
+        )
+        panel._widgets["rows"][2][4].bindings["<Button-1>"](
+            SimpleNamespace()
+        )
+        self.assertEqual(shared_entry.get(), "06:00")
+        self.assertEqual(panel._inline_editor_context, "2026-04-08")
+        self.assertEqual(
+            panel._widgets["inline_title"].kwargs["text"],
+            "2026-04-08 목표 순근무 시간",
+        )
         shared_entry.delete(0, "end")
         shared_entry.insert(0, "07:30")
         fake_tk.button("저장").invoke()
-        callbacks["edit_plan"].assert_called_once_with(450)
+        callbacks["edit_plan"].assert_called_once_with("2026-04-08", 450)
         self.assertFalse(panel._inline_editor_active)
 
         fake_tk.button("시간 수정").invoke()
@@ -698,7 +798,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         fake_tk.button("설정").invoke()
         callbacks["open_settings"].assert_called_once_with()
 
-    def test_prompt_inline_editor_closes_when_detected_context_changes(self) -> None:
+    def test_stale_inline_editor_context_closes_on_prompt_or_week_change(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model(prompt=WorktimeActivityPrompt("08:35"))}
@@ -713,6 +813,18 @@ class WorktimeQuickPanelTests(unittest.TestCase):
 
         self.assertFalse(panel._inline_editor_active)
         callbacks["prompt_edit"].assert_not_called()
+        fake_tk.button("목표 수정").invoke()
+        self.assertEqual(panel._inline_editor_context, "2026-04-06")
+        holder["model"] = _model(
+            week_start=date(2026, 4, 13),
+            today_index=2,
+            prompt=WorktimeActivityPrompt("08:36"),
+        )
+        panel.refresh_now()
+
+        self.assertFalse(panel._inline_editor_active)
+        self.assertEqual(panel._selected_date_key, "2026-04-15")
+        callbacks["edit_plan"].assert_not_called()
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
     def test_prompt_time_updates_in_place_but_presence_change_rebuilds(self) -> None:
@@ -1200,7 +1312,11 @@ class WorktimeQuickPanelTests(unittest.TestCase):
     def test_countdown_and_common_inline_target_validation_are_view_local(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
-        holder = {"model": _model(target_minutes=480)}
+        holder = {
+            "model": _model(
+                row_targets=(480, 420, 480, 480, 480, 0, 0),
+            )
+        }
         panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
         panel.show(activate=False)
 
@@ -1210,17 +1326,25 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         root.run_delay(200)
         self.assertEqual(countdown.kwargs["text"], "5초 후 닫힘")
 
-        fake_tk.button("계획 수정").invoke()
+        panel._widgets["rows"][1][0].bindings["<Button-1>"](
+            SimpleNamespace()
+        )
+        fake_tk.button("목표 수정").invoke()
         self.assertEqual(countdown.kwargs["text"], "편집 중 · 자동 닫힘 일시정지")
         self.assertEqual(root.active_delays(), [1_000])
+        self.assertEqual(
+            panel._widgets["inline_title"].kwargs["text"],
+            "2026-04-07 목표 순근무 시간",
+        )
         entry = panel._widgets["inline_entry"]
+        self.assertEqual(entry.get(), "07:00")
         entry.delete(0, "end")
-        entry.insert(0, "07:00")
+        entry.insert(0, "06:30")
         fake_tk.button("취소").invoke()
         callbacks["edit_plan"].assert_not_called()
         self.assertFalse(panel._inline_editor_active)
-        fake_tk.button("계획 수정").invoke()
-        self.assertEqual(entry.get(), "08:00")
+        fake_tk.button("목표 수정").invoke()
+        self.assertEqual(entry.get(), "07:00")
         entry.delete(0, "end")
         entry.insert(0, "24:30")
         fake_tk.button("저장").invoke()
@@ -1237,9 +1361,11 @@ class WorktimeQuickPanelTests(unittest.TestCase):
 
         entry.delete(0, "end")
         entry.insert(0, "00:00")
-        holder["model"] = _model(target_minutes=0)
+        holder["model"] = _model(
+            row_targets=(480, 0, 480, 480, 480, 0, 0),
+        )
         fake_tk.button("저장").invoke()
-        callbacks["edit_plan"].assert_called_once_with(0)
+        callbacks["edit_plan"].assert_called_once_with("2026-04-07", 0)
         self.assertFalse(panel._inline_editor_active)
         self.assertEqual(countdown.kwargs["text"], "6초 후 닫힘")
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])

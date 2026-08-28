@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
+from datetime import date, timedelta
 import hashlib
 import importlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import struct
 import subprocess
 import sys
@@ -35,7 +37,7 @@ class _RendererApi:
     WorktimeQuickPanel: Any
 
 
-RUNNER_VERSION = "3.0"
+RUNNER_VERSION = "3.1"
 WEEKDAYS = ("월", "화", "수", "목", "금", "토", "일")
 VIEWPORT = (800, 640)
 CAPTURE_IDLE_TIMEOUT_MS = 60_000
@@ -108,10 +110,13 @@ REQUIRED_ASSERTIONS = frozenset(
         "active_hover_border_visible",
         "visible_countdown",
         "exactly_one_sync_label_per_checkpoint",
-        "today_target_editor_visible",
+        "selected_date_row_highlight_visible",
+        "selected_date_target_editor_visible",
+        "target_editor_title_matches_selected_date",
         "target_editor_prefill_is_0800",
         "invalid_target_rejected_without_callback",
         "target_save_callback_invoked_once",
+        "target_save_callback_includes_date",
         "target_save_closes_editor",
         "target_cancel_skips_callback",
         "target_cancel_preserves_saved_prefill",
@@ -125,7 +130,9 @@ REQUIRED_ASSERTIONS = frozenset(
         "same_structure_refresh_preserves_geometry",
         "same_structure_refresh_skips_render_structure",
         "same_structure_refresh_updates_model_once",
-        "same_structure_refresh_skips_reconcile",
+        "same_structure_refresh_reconciles_stale_editor_once",
+        "week_rollover_falls_back_to_today",
+        "week_rollover_closes_stale_target_editor",
         "provisional_vacation_wording_visible",
         "break_callback_invoked",
         "break_button_transition",
@@ -165,9 +172,9 @@ SCOPE_CLAIMS = (
     "Native chromeless, topmost, fixed-size style and active-show foreground HWND",
     "Pointer-relative initial placement and nonactivating reopen re-anchor within the monitor work area",
     "Normal/hover shell border, visible countdown, and exactly one synchronization label",
-    "Synthetic today-target editor prefill, validation, save callback, and cancel behavior",
+    "Synthetic selected-date target editor prefill, validation, dated save callback, and cancel behavior",
     "Synthetic Tk mouse callbacks and visible state transitions",
-    "Exact-equal refresh dispatches no render, update, or geometry work; same-structure refresh dispatches one in-place update",
+    "Exact-equal refresh dispatches no render, update, or geometry work; same-structure week rollover dispatches one in-place update and one stale-editor geometry reconciliation",
     "Win32 pointer moves delivered through additive Tk <Enter>/<Leave> bindings",
     "Synthetic provisional vacation wording",
     "Synthetic idle-dismiss, hover/interaction defer, and reusable reopen lifecycle",
@@ -192,7 +199,7 @@ SCOPE_EXCLUSIONS = (
     {
         "id": "state-persistence",
         "description": (
-            "The synthetic today-target editor and callback are exercised, but "
+            "The synthetic selected-date target editor and callback are exercised, but "
             "production state persistence or migration is not exercised."
         ),
     },
@@ -344,7 +351,12 @@ def _load_renderer(expected_revision: str) -> _RendererApi:
     return renderer
 
 
-def _rows(renderer: _RendererApi) -> tuple[Any, ...]:
+def _rows(
+    renderer: _RendererApi,
+    *,
+    week_start: date = date(2026, 8, 24),
+    today_index: int = 3,
+) -> tuple[Any, ...]:
     summaries = (
         "Wrike 8시간 · 목표 8시간 · 딱 맞음",
         "Wrike 7시간 30분 · 목표 8시간 · 부족 30분",
@@ -354,13 +366,16 @@ def _rows(renderer: _RendererApi) -> tuple[Any, ...]:
         "목표 2시간",
         "휴무",
     )
+    targets = (480, 480, 480, 480, 480, 120, 0)
     return tuple(
         renderer.WorktimePanelDayRow(
             weekday=weekday,
-            date=f"08/{24 + index:02d}",
+            date=(week_start + timedelta(days=index)).strftime("%m/%d"),
+            date_key=(week_start + timedelta(days=index)).isoformat(),
+            target_minutes=targets[index],
             summary=summaries[index],
-            today=index == 3,
-            color="#059669" if index in {0, 2, 3} else "#6B7280",
+            today=index == today_index,
+            color="#059669" if index in {0, 2, today_index} else "#6B7280",
         )
         for index, weekday in enumerate(WEEKDAYS)
     )
@@ -414,9 +429,17 @@ def _model(
     prompt: Any | None = None,
     error: bool = False,
     vacation_provisional: bool = False,
+    week_start: date = date(2026, 8, 24),
+    today_index: int = 3,
 ) -> Any:
+    week_end = week_start + timedelta(days=6)
+    rows = _rows(
+        renderer,
+        week_start=week_start,
+        today_index=today_index,
+    )
     return renderer.WorktimePanelModel(
-        week_range="2026-08-24 - 2026-08-30",
+        week_range=f"{week_start.isoformat()} - {week_end.isoformat()}",
         sync_text=(
             ERROR_SYNC_LABEL.removeprefix("동기화 · ")
             if error
@@ -429,11 +452,88 @@ def _model(
             error=error,
             vacation_provisional=vacation_provisional,
         ),
-        target_minutes=480,
+        target_minutes=rows[today_index].target_minutes,
         clock_in_time="08:00",
         break_active=break_active,
-        rows=_rows(renderer),
+        rows=rows,
         prompt=prompt,
+    )
+
+
+def _format_synthetic_minutes(minutes: int) -> str:
+    total = max(0, int(minutes))
+    hours, remainder = divmod(total, 60)
+    if hours and remainder:
+        return f"{hours}시간 {remainder}분"
+    if hours:
+        return f"{hours}시간"
+    return f"{remainder}분"
+
+
+def _parse_synthetic_minutes(value: str) -> int:
+    match = re.fullmatch(r"(?:(\d+)시간)?(?:\s*(\d+)분)?", str(value).strip())
+    if match is None or not any(match.groups()):
+        raise ValueError(f"unsupported synthetic duration: {value!r}")
+    return int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
+
+
+def _recalculate_synthetic_row(row: Any, target_minutes: int) -> Any:
+    target = max(0, int(target_minutes))
+    summary = str(row.summary)
+    color = str(row.color)
+    if row.today and target != row.target_minutes:
+        raise ValueError("synthetic today target requires explicit today-line recomposition")
+    if summary.startswith("Wrike "):
+        recorded_text = summary.removeprefix("Wrike ").split(" ·", 1)[0]
+        recorded = _parse_synthetic_minutes(recorded_text)
+        delta = recorded - target
+        if delta == 0:
+            status = "딱 맞음"
+        elif delta > 0:
+            status = f"초과 {_format_synthetic_minutes(delta)}"
+        else:
+            status = f"부족 {_format_synthetic_minutes(-delta)}"
+        summary = (
+            f"Wrike {_format_synthetic_minutes(recorded)} · 목표 "
+            f"{_format_synthetic_minutes(target)} · {status}"
+        )
+        color = "#059669" if delta >= 0 else "#6B7280"
+    elif " · 휴가 " in summary and " · 적용 " in summary:
+        vacation_text = summary.split(" · 휴가 ", 1)[1].split(" · 적용 ", 1)[0]
+        vacation_minutes = _parse_synthetic_minutes(vacation_text)
+        summary = (
+            f"목표 {_format_synthetic_minutes(target)} · 휴가 "
+            f"{_format_synthetic_minutes(vacation_minutes)} · 적용 "
+            f"{_format_synthetic_minutes(max(0, target - vacation_minutes))}"
+        )
+    elif target <= 0:
+        summary = "휴무"
+    else:
+        summary = f"목표 {_format_synthetic_minutes(target)}"
+    return replace(
+        row,
+        target_minutes=target,
+        summary=summary,
+        color=color,
+    )
+
+
+def _update_model_target(model: Any, date_key: str, target_minutes: int) -> Any:
+    matched = False
+    updated_rows = []
+    for row in model.rows:
+        if row.date_key == date_key:
+            matched = True
+            row = _recalculate_synthetic_row(row, target_minutes)
+        updated_rows.append(row)
+    if not matched:
+        raise ValueError(f"target row not found: {date_key}")
+    rows = tuple(updated_rows)
+    today_target = next(row.target_minutes for row in rows if row.today)
+    return replace(
+        model,
+        rows=rows,
+        target_minutes=today_target,
     )
 
 
@@ -459,20 +559,23 @@ def _button(window: Any, text: str) -> Any:
     raise AssertionError(f"visible button not found: {text}")
 
 
-def _click_button(window: Any, text: str) -> None:
-    button = _button(window, text)
-    button.update_idletasks()
-    x = max(1, int(button.winfo_width()) // 2)
-    y = max(1, int(button.winfo_height()) // 2)
-    button.event_generate("<Enter>", x=x, y=y)
+def _click_widget(window: Any, widget: Any) -> None:
+    widget.update_idletasks()
+    x = max(1, int(widget.winfo_width()) // 2)
+    y = max(1, int(widget.winfo_height()) // 2)
+    widget.event_generate("<Enter>", x=x, y=y)
     window.update()
-    button.event_generate("<Motion>", x=x, y=y, warp=True)
+    widget.event_generate("<Motion>", x=x, y=y, warp=True)
     window.update()
-    button.event_generate("<ButtonPress-1>", x=x, y=y)
+    widget.event_generate("<ButtonPress-1>", x=x, y=y)
     window.update()
-    button.event_generate("<ButtonRelease-1>", x=x, y=y)
+    widget.event_generate("<ButtonRelease-1>", x=x, y=y)
     window.update_idletasks()
     window.update()
+
+
+def _click_button(window: Any, text: str) -> None:
+    _click_widget(window, _button(window, text))
 
 
 def _widget_identity(window: Any) -> tuple[str, ...]:
@@ -1259,6 +1362,8 @@ def _capture_state(
     checkpoint_filenames = {
         **CHECKPOINT_FILENAMES,
         "clock-inline": "clock-inline.png",
+        "target-inline-selected-date": "target-inline-selected-date.png",
+        "target-inline-saved": "target-inline-saved.png",
         "prompt-inline": "prompt-inline.png",
         "hover-countdown": "hover-countdown.png",
         "hover-deadline-held": "hover-deadline-held.png",
@@ -1435,11 +1540,12 @@ def _run(output_dir: Path) -> dict[str, Any]:
         calls.append("prompt_snooze")
         holder["model"] = replace(holder["model"], prompt=None)
 
-    def save_target(target_minutes: int) -> bool:
-        calls.append(f"edit_plan:{target_minutes}")
-        holder["model"] = replace(
+    def save_target(date_key: str, target_minutes: int) -> bool:
+        calls.append(f"edit_plan:{date_key}:{target_minutes}")
+        holder["model"] = _update_model_target(
             holder["model"],
-            target_minutes=int(target_minutes),
+            str(date_key),
+            int(target_minutes),
         )
         return True
 
@@ -1564,7 +1670,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
             "reopen": None,
         }
 
-        base_buttons = ("새로고침", "출근 수정", "휴게 시작", "계획 수정", "설정")
+        base_buttons = ("새로고침", "출근 수정", "휴게 시작", "목표 수정", "설정")
         states.append(
             _capture_state(
                 window,
@@ -1660,8 +1766,21 @@ def _run(output_dir: Path) -> dict[str, Any]:
             "window_geometry": _window_geometry(window),
         }
 
-        _click_button(window, "계획 수정")
+        selected_row_index = 4
+        selected_row_widget_index = 2
+        selected_date_key = holder["model"].rows[selected_row_index].date_key
+        _click_widget(
+            window,
+            panel._widgets["rows"][selected_row_index][selected_row_widget_index],
+        )
+        selected_date_after_click = panel._selected_date_key
+        selected_row_highlight_color = str(
+            panel._widgets["rows"][selected_row_index][0].cget("bg")
+        )
+        _click_button(window, "목표 수정")
         target_entry = panel._widgets["inline_entry"]
+        editor_title = str(panel._widgets["inline_title"].cget("text"))
+        expected_editor_title = f"{selected_date_key} 목표 순근무 시간"
         prefill_value = str(target_entry.get())
         states.append(
             _capture_state(
@@ -1669,7 +1788,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 output_dir,
                 "target-editor-prefill",
                 required_labels=(
-                    "오늘 목표 순근무 시간",
+                    expected_editor_title,
                     "HH:MM (00:00–24:00)",
                     "편집 중 · 자동 닫힘 일시정지",
                 ),
@@ -1698,14 +1817,14 @@ def _run(output_dir: Path) -> dict[str, Any]:
         target_entry.insert(0, "07:30")
         _click_button(window, "저장")
         saved_editor_closed = panel._inline_editor_active is False
-        _click_button(window, "계획 수정")
+        _click_button(window, "목표 수정")
         saved_prefill = str(target_entry.get())
         target_entry.delete(0, "end")
         target_entry.insert(0, "06:00")
         callbacks_before_cancel = list(calls)
         _click_button(window, "취소")
         cancel_skipped_callback = calls == callbacks_before_cancel
-        _click_button(window, "계획 수정")
+        _click_button(window, "목표 수정")
         prefill_after_cancel = str(target_entry.get())
         states.append(
             _capture_state(
@@ -1713,16 +1832,24 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 output_dir,
                 "target-editor-save-cancel",
                 required_labels=(
-                    "오늘 목표 순근무 시간",
+                    expected_editor_title,
                     "편집 중 · 자동 닫힘 일시정지",
                 ),
                 required_buttons=("저장", "취소"),
             )
         )
         _click_button(window, "취소")
-        assertions["today_target_editor_visible"] = bool(
-            "오늘 목표 순근무 시간" in states[2]["labels"]
+        dated_callback = f"edit_plan:{selected_date_key}:450"
+        assertions["selected_date_row_highlight_visible"] = bool(
+            selected_date_after_click == selected_date_key
+            and selected_row_highlight_color.upper() == "#BFDBFE"
+        )
+        assertions["selected_date_target_editor_visible"] = bool(
+            expected_editor_title in states[2]["labels"]
             and states[2]["entries"] == ["08:00"]
+        )
+        assertions["target_editor_title_matches_selected_date"] = bool(
+            editor_title == expected_editor_title
         )
         assertions["target_editor_prefill_is_0800"] = prefill_value == "08:00"
         assertions["invalid_target_rejected_without_callback"] = bool(
@@ -1731,8 +1858,9 @@ def _run(output_dir: Path) -> dict[str, Any]:
             and validation_message in states[3]["labels"]
         )
         assertions["target_save_callback_invoked_once"] = (
-            calls.count("edit_plan:450") == 1
+            calls.count(dated_callback) == 1
         )
+        assertions["target_save_callback_includes_date"] = dated_callback in calls
         assertions["target_save_closes_editor"] = saved_editor_closed
         assertions["target_cancel_skips_callback"] = cancel_skipped_callback
         assertions["target_cancel_preserves_saved_prefill"] = bool(
@@ -1741,12 +1869,19 @@ def _run(output_dir: Path) -> dict[str, Any]:
             and states[4]["entries"] == ["07:30"]
         )
         target_editor_observation = {
+            "selected_date_key": selected_date_key,
+            "selected_date_after_click": selected_date_after_click,
+            "selected_row_index": selected_row_index,
+            "selected_row_widget_index": selected_row_widget_index,
+            "selected_row_highlight_color": selected_row_highlight_color,
+            "editor_title": editor_title,
             "prefill_value": prefill_value,
             "invalid_value": "24:30",
             "validation_message": validation_message,
             "invalid_callback_unchanged": invalid_callback_unchanged,
             "saved_value": "07:30",
             "saved_minutes": 450,
+            "saved_callback": dated_callback,
             "saved_editor_closed": saved_editor_closed,
             "saved_prefill": saved_prefill,
             "cancel_attempt_value": "06:00",
@@ -1815,13 +1950,27 @@ def _run(output_dir: Path) -> dict[str, Any]:
             exact_dispatch_delta["reconcile_geometry"] == 0
         )
 
+        _click_button(window, "목표 수정")
+        rollover_selection_before = panel._selected_date_key
+        rollover_editor_active_before = panel._inline_editor_active
+        rollover_editor_context_before = panel._inline_editor_context
         same_structure_identity_before = _widget_identity(window)
         same_structure_geometry_before = _window_geometry(window)
         same_structure_signature_before = panel._structure_signature
         same_structure_dispatch_before = dict(dispatch_calls)
-        holder["model"] = _model(renderer, vacation_provisional=True)
+        rollover_week_start = date(2026, 8, 31)
+        holder["model"] = _model(
+            renderer,
+            vacation_provisional=True,
+            week_start=rollover_week_start,
+        )
+        rollover_today_date_key = next(
+            row.date_key for row in holder["model"].rows if row.today
+        )
         panel.refresh_now()
         window.update_idletasks()
+        rollover_selection_after = panel._selected_date_key
+        rollover_editor_active_after = panel._inline_editor_active
         same_structure_identity_after = _widget_identity(window)
         same_structure_geometry_after = _window_geometry(window)
         same_structure_signature_after = panel._structure_signature
@@ -1841,8 +1990,17 @@ def _run(output_dir: Path) -> dict[str, Any]:
         assertions["same_structure_refresh_updates_model_once"] = (
             same_structure_dispatch_delta["update_rendered_model"] == 1
         )
-        assertions["same_structure_refresh_skips_reconcile"] = (
-            same_structure_dispatch_delta["reconcile_geometry"] == 0
+        assertions["same_structure_refresh_reconciles_stale_editor_once"] = (
+            same_structure_dispatch_delta["reconcile_geometry"] == 1
+        )
+        assertions["week_rollover_falls_back_to_today"] = bool(
+            rollover_selection_before == selected_date_key
+            and rollover_selection_after == rollover_today_date_key
+        )
+        assertions["week_rollover_closes_stale_target_editor"] = bool(
+            rollover_editor_active_before
+            and rollover_editor_context_before == selected_date_key
+            and rollover_editor_active_after is False
         )
         provisional_expected_label = (
             "Wrike 기록 5시간 30분 · 현재 기대 5시간 (임시)"
@@ -1884,6 +2042,12 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 "widget_identity_after": list(same_structure_identity_after),
                 "geometry_before": same_structure_geometry_before,
                 "geometry_after": same_structure_geometry_after,
+                "selection_before": rollover_selection_before,
+                "selection_after": rollover_selection_after,
+                "fallback_today_date_key": rollover_today_date_key,
+                "target_editor_active_before": rollover_editor_active_before,
+                "target_editor_context_before": rollover_editor_context_before,
+                "target_editor_active_after": rollover_editor_active_after,
                 "method_calls": dict(same_structure_dispatch_delta),
             },
         }
@@ -2331,7 +2495,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 first_failure = name
                 break
         result = {
-            "schema_version": 4,
+            "schema_version": 5,
             "runner_version": RUNNER_VERSION,
             "ok": bool(
                 set(assertions) == REQUIRED_ASSERTIONS
@@ -2424,10 +2588,11 @@ def _requirements() -> list[dict[str, Any]]:
             "required": True,
         },
         {
-            "id": "REQ-SYNTHETIC-TODAY-TARGET-EDITOR",
+            "id": "REQ-SYNTHETIC-SELECTED-DATE-TARGET-EDITOR",
             "claim": (
-                "The synthetic today-target editor proves 08:00 prefill, invalid "
-                "24:30 rejection, one 07:30 save callback, and cancel preservation."
+                "The synthetic selected-date target editor proves row highlighting, "
+                "a dated 08:00 prefill, invalid 24:30 rejection, one dated 07:30 "
+                "save callback, and cancel preservation."
             ),
             "required": True,
         },
@@ -2435,8 +2600,9 @@ def _requirements() -> list[dict[str, Any]]:
             "id": "REQ-SYNTHETIC-REFRESH-STABILITY",
             "claim": (
                 "Exact-equal refresh dispatches no render, update, or geometry "
-                "method, while a same-structure text change dispatches exactly "
-                "one in-place update without reconciliation."
+                "method, while a same-structure week rollover dispatches exactly "
+                "one in-place update, falls back to the new today row, and closes "
+                "the stale target editor with exactly one geometry reconciliation."
             ),
             "required": True,
         },
@@ -2596,10 +2762,10 @@ def _write_manifest(
                     "Verify chromeless/topmost/fixed native style and active foreground HWND ownership",
                     "Verify initial and nonactivating reopen placement beside controlled Win32 cursor points",
                     "Inspect the normal and hover shell borders, visible countdown, and one synchronization label",
-                    "Exercise the today-only target editor prefill, validation, save callback, and cancel preservation",
+                    "Exercise a non-today row selection and the dated target editor prefill, validation, save callback, and cancel preservation",
                     "Inspect synthetic actual-versus-expected text and seven week rows",
                     "Verify a distinct exact-equal model dispatches zero render, update, or geometry methods",
-                    "Apply a same-structure provisional-vacation text change through exactly one in-place update without geometry reconciliation",
+                    "Apply a same-structure provisional-vacation week rollover through exactly one in-place update, then verify today fallback and stale target-editor closure with exactly one geometry reconciliation",
                     "Inspect provisional current-expectation, vacation-unconfirmed, and temporary-target wording",
                     "Activate the synthetic break callback through a Tk mouse event",
                     "Exercise repeated nonactivating show calls with a same-process sentinel",
@@ -2809,7 +2975,7 @@ def _validate_run_evidence(
     run_path = output_dir / "run.json"
     run = _load_json_object(run_path, "run evidence")
     run_digest = _sha256(run_path)
-    if run.get("schema_version") != 4:
+    if run.get("schema_version") != 5:
         raise RuntimeError("unsupported run evidence schema")
     if run.get("runner_version") != RUNNER_VERSION:
         raise RuntimeError("run evidence runner version is missing or stale")
@@ -2937,7 +3103,7 @@ def _validate_run_evidence(
         elif expected_state == "target-editor-prefill":
             if (
                 entries != ["08:00"]
-                or "오늘 목표 순근무 시간" not in labels
+                or "2026-08-28 목표 순근무 시간" not in labels
                 or not {"저장", "취소"} <= set(buttons)
             ):
                 raise RuntimeError("target editor prefill evidence is invalid")
@@ -2948,7 +3114,10 @@ def _validate_run_evidence(
             ):
                 raise RuntimeError("target editor validation evidence is invalid")
         elif expected_state == "target-editor-save-cancel":
-            if entries != ["07:30"]:
+            if (
+                entries != ["07:30"]
+                or "2026-08-28 목표 순근무 시간" not in labels
+            ):
                 raise RuntimeError("target editor save/cancel evidence is invalid")
         elif expected_state == "error-last-good":
             if labels.count(ERROR_SYNC_LABEL) != 1:
@@ -3143,12 +3312,19 @@ def _validate_run_evidence(
 
     target_editor = run.get("target_editor_observation")
     expected_target_editor = {
+        "selected_date_key": "2026-08-28",
+        "selected_date_after_click": "2026-08-28",
+        "selected_row_index": 4,
+        "selected_row_widget_index": 2,
+        "selected_row_highlight_color": "#BFDBFE",
+        "editor_title": "2026-08-28 목표 순근무 시간",
         "prefill_value": "08:00",
         "invalid_value": "24:30",
         "validation_message": "24시간은 24:00으로만 입력할 수 있습니다.",
         "invalid_callback_unchanged": True,
         "saved_value": "07:30",
         "saved_minutes": 450,
+        "saved_callback": "edit_plan:2026-08-28:450",
         "saved_editor_closed": True,
         "saved_prefill": "07:30",
         "cancel_attempt_value": "06:00",
@@ -3200,6 +3376,12 @@ def _validate_run_evidence(
         "widget_identity_after",
         "geometry_before",
         "geometry_after",
+        "selection_before",
+        "selection_after",
+        "fallback_today_date_key",
+        "target_editor_active_before",
+        "target_editor_context_before",
+        "target_editor_active_after",
         "method_calls",
     }:
         raise RuntimeError("same-structure refresh observation is incomplete")
@@ -3214,14 +3396,23 @@ def _validate_run_evidence(
         or not _valid_viewport_geometry(same_structure.get("geometry_before"))
         or same_structure.get("geometry_after")
         != same_structure.get("geometry_before")
+        or same_structure.get("selection_before") != "2026-08-28"
+        or same_structure.get("selection_after") != "2026-09-03"
+        or same_structure.get("fallback_today_date_key") != "2026-09-03"
+        or same_structure.get("target_editor_active_before") is not True
+        or same_structure.get("target_editor_context_before") != "2026-08-28"
+        or same_structure.get("target_editor_active_after") is not False
         or same_structure.get("method_calls")
         != {
             "render_structure": 0,
             "update_rendered_model": 1,
-            "reconcile_geometry": 0,
+            "reconcile_geometry": 1,
         }
     ):
-        raise RuntimeError("same-structure refresh did not use one in-place update")
+        raise RuntimeError(
+            "same-structure refresh did not use one in-place update and one "
+            "stale-editor geometry reconciliation"
+        )
 
     idle = run.get("idle_observation")
     expected_idle_keys = {
@@ -3398,7 +3589,7 @@ def _validate_run_evidence(
         raise RuntimeError("native Tk pointer binding deliveries are incomplete")
 
     if run.get("callbacks") != [
-        "edit_plan:450",
+        "edit_plan:2026-08-28:450",
         "toggle_break",
         "prompt_snooze",
         "refresh",
@@ -3680,7 +3871,7 @@ def _validate_finalized(output_dir: Path) -> dict[str, Any]:
 
 
 def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
-    """Capture only the v0.13.1 inline-edit and hover-deadline contract."""
+    """Capture only the v0.14.0 selected-date inline-edit and hover contract."""
 
     output_dir = output_dir.resolve(strict=False)
     _prepare_empty_output_dir(output_dir)
@@ -3713,11 +3904,12 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
         )
         return True
 
-    def save_target(target_minutes: int) -> bool:
-        calls.append(f"target:{target_minutes}")
-        holder["model"] = replace(
+    def save_target(date_key: str, target_minutes: int) -> bool:
+        calls.append(f"target:{date_key}:{target_minutes}")
+        holder["model"] = _update_model_target(
             holder["model"],
-            target_minutes=int(target_minutes),
+            str(date_key),
+            int(target_minutes),
         )
         return True
 
@@ -3815,10 +4007,74 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
             and holder["model"].clock_in_time == "08:15"
         )
 
-        _click_button(window, "계획 수정")
+        target_row_index = 1
+        target_selected_date = holder["model"].rows[target_row_index].date_key
+        _click_widget(window, panel._widgets["rows"][target_row_index][3])
+        _click_button(window, "목표 수정")
         target_uses_shared_entry = panel._widgets["inline_entry"] is shared_entry
         target_prefill = str(shared_entry.get())
+        target_title = str(panel._widgets["inline_title"].cget("text"))
+        target_editor_toplevel_before_save = panel._window
+        target_editor_hwnd_before_save = _window_hwnd(
+            target_editor_toplevel_before_save
+        )
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "target-inline-selected-date",
+                required_labels=(
+                    f"{target_selected_date} 목표 순근무 시간",
+                    "HH:MM (00:00–24:00)",
+                    "편집 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=("저장", "취소"),
+            )
+        )
+        target_callback = f"target:{target_selected_date}:450"
+        target_expected_summary = (
+            "Wrike 7시간 30분 · 목표 7시간 30분 · 딱 맞음"
+        )
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "07:30")
+        _click_button(window, "저장")
+        target_saved_editor_closed = panel._inline_editor_active is False
+        target_saved_row = next(
+            row
+            for row in holder["model"].rows
+            if row.date_key == target_selected_date
+        )
+        target_saved_model_minutes = target_saved_row.target_minutes
+        target_saved_model_summary = target_saved_row.summary
+
+        _click_button(window, "목표 수정")
+        target_editor_toplevel_after_reopen = panel._window
+        target_editor_hwnd_after_reopen = _window_hwnd(
+            target_editor_toplevel_after_reopen
+        )
+        target_saved_prefill = str(shared_entry.get())
+        target_same_toplevel = bool(
+            target_editor_toplevel_before_save is window
+            and target_editor_toplevel_after_reopen is window
+            and target_editor_hwnd_before_save == panel_hwnd
+            and target_editor_hwnd_after_reopen == panel_hwnd
+        )
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "target-inline-saved",
+                required_labels=(
+                    f"{target_selected_date} 목표 순근무 시간",
+                    target_expected_summary,
+                    "HH:MM (00:00–24:00)",
+                    "편집 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=("저장", "취소"),
+            )
+        )
         _click_button(window, "취소")
+        target_reopen_cancelled = panel._inline_editor_active is False
 
         _click_button(window, "시간 수정")
         prompt_uses_shared_entry = panel._widgets["inline_entry"] is shared_entry
@@ -3883,7 +4139,7 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
                 output_dir,
                 "hover-countdown",
                 required_labels=(NORMAL_SYNC_LABEL,),
-                required_buttons=("출근 수정", "계획 수정", "설정"),
+                required_buttons=("출근 수정", "목표 수정", "설정"),
             )
         )
         hover_countdown_texts = [
@@ -3905,7 +4161,7 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
                 output_dir,
                 "hover-deadline-held",
                 required_labels=("마우스 호버 중 · 이동 시 닫힘",),
-                required_buttons=("출근 수정", "계획 수정", "설정"),
+                required_buttons=("출근 수정", "목표 수정", "설정"),
             )
         )
 
@@ -3937,7 +4193,31 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
             "invalid_clock_rejected_inline": invalid_clock_rejected,
             "clock_inline_save": clock_saved,
             "target_uses_shared_inline_entry": bool(
-                target_uses_shared_entry and target_prefill == "08:00"
+                target_uses_shared_entry
+                and panel._selected_date_key == target_selected_date
+                and target_prefill == "08:00"
+                and target_title
+                == f"{target_selected_date} 목표 순근무 시간"
+                and states[1]["entries"] == ["08:00"]
+            ),
+            "target_save_callback_exact": (
+                [item for item in calls if item.startswith("target:")]
+                == [target_callback]
+            ),
+            "target_save_closes_editor": target_saved_editor_closed,
+            "target_provider_reread_is_450": (
+                target_saved_model_minutes == 450
+            ),
+            "target_provider_reread_updates_summary": bool(
+                target_saved_model_summary == target_expected_summary
+                and target_expected_summary in states[2]["labels"]
+            ),
+            "target_reopen_prefill_is_0730": bool(
+                target_saved_prefill == "07:30"
+                and states[2]["entries"] == ["07:30"]
+            ),
+            "target_save_reopen_same_toplevel": bool(
+                target_same_toplevel and target_reopen_cancelled
             ),
             "prompt_uses_shared_inline_entry": bool(
                 prompt_uses_shared_entry and prompt_prefill == "08:35"
@@ -3983,6 +4263,8 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
                 [state.get("state") for state in states]
                 == [
                     "clock-inline",
+                    "target-inline-selected-date",
+                    "target-inline-saved",
                     "prompt-inline",
                     "hover-countdown",
                     "hover-deadline-held",
@@ -3996,7 +4278,26 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
             "anchor": anchor,
             "clock_prefill": clock_prefill,
             "clock_validation": clock_validation,
+            "target_selected_date": target_selected_date,
+            "target_title": target_title,
             "target_prefill": target_prefill,
+            "target_callback": target_callback,
+            "target_callback_count": calls.count(target_callback),
+            "target_saved_editor_closed": target_saved_editor_closed,
+            "target_saved_model_minutes": int(target_saved_model_minutes),
+            "target_expected_summary": target_expected_summary,
+            "target_saved_model_summary": target_saved_model_summary,
+            "target_saved_prefill": target_saved_prefill,
+            "target_reopen_cancelled": target_reopen_cancelled,
+            "target_editor_toplevel_before_save": str(
+                target_editor_toplevel_before_save
+            ),
+            "target_editor_toplevel_after_reopen": str(
+                target_editor_toplevel_after_reopen
+            ),
+            "target_editor_hwnd_before_save": target_editor_hwnd_before_save,
+            "target_editor_hwnd_after_reopen": target_editor_hwnd_after_reopen,
+            "target_same_toplevel": target_same_toplevel,
             "prompt_prefill": prompt_prefill,
             "callbacks": list(calls),
             "deadline_before_hover": deadline_before_hover,
@@ -4052,10 +4353,11 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
         "scenario": run["scenario"],
         "target_revision": sealed_revision,
         "scope": [
-            "Quick Panel common inline editor for clock, target, and activity prompt",
+            "Quick Panel common inline editor for clock, synthetic selected-date 07:30 save with immediate provider reread, and activity prompt",
             "absolute hover deadline, expiry hold, and immediate leave withdraw",
         ],
         "excluded": [
+            "production target persistence, state persistence, and Wrike HTTP writes",
             "vacation and private iCal",
             "break controls",
             "same-process and cross-process focus",

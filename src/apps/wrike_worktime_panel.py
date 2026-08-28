@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date as date_type
 import math
 import re
 import time
@@ -14,6 +15,7 @@ _COUNTDOWN_INTERVAL_MS = 200
 _DEFAULT_IDLE_TIMEOUT_MS = 6_000
 _MIN_IDLE_TIMEOUT_MS = 1_200
 _POINTER_OFFSET_PX = 16
+_DATE_KEY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 _TARGET_HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-4]):[0-5]\d")
 _INLINE_EDITOR_TARGET = "target_minutes"
@@ -27,6 +29,7 @@ _HOVER_BORDER = "#2563EB"
 _TEXT = "#111827"
 _MUTED = "#6B7280"
 _TODAY_BG = "#DBEAFE"
+_SELECTED_BG = "#BFDBFE"
 _PROMPT_BG = "#FFF7ED"
 _PROMPT_BORDER = "#FDBA74"
 _SYNC_COLORS = {
@@ -59,6 +62,8 @@ class WorktimePanelDayRow:
 
     weekday: str
     date: str
+    date_key: str
+    target_minutes: int
     summary: str
     today: bool
     color: str
@@ -66,6 +71,11 @@ class WorktimePanelDayRow:
     def __post_init__(self) -> None:
         _require_nonempty_string(self.weekday, name="weekday")
         _require_nonempty_string(self.date, name="date")
+        _require_iso_date_key(self.date_key)
+        if type(self.target_minutes) is not int:
+            raise TypeError("target_minutes must be an int")
+        if not 0 <= self.target_minutes <= 1440:
+            raise ValueError("target_minutes must be between 0 and 1440")
         _require_string(self.summary, name="summary")
         if type(self.today) is not bool:
             raise TypeError("today must be a bool")
@@ -134,6 +144,8 @@ class WorktimePanelModel:
             raise ValueError("rows must contain exactly seven Monday-through-Sunday entries")
         if any(not isinstance(item, WorktimePanelDayRow) for item in self.rows):
             raise TypeError("rows must contain only WorktimePanelDayRow values")
+        if len({item.date_key for item in self.rows}) != len(self.rows):
+            raise ValueError("rows must contain unique date_key values")
         if self.prompt is not None and not isinstance(
             self.prompt, WorktimeActivityPrompt
         ):
@@ -150,10 +162,10 @@ class WorktimeQuickPanel:
     """Singleton-style nonmodal panel backed by one reusable ``Toplevel``.
 
     Prompt accept callbacks receive the detected ``HH:MM`` string. Clock-in
-    and target save callbacks return whether persistence succeeded; prompt edit
-    saves receive both the detected context and edited value. Callback completion
-    is followed by an immediate provider read so synchronous state changes become
-    visible without waiting for the next one-second refresh.
+    and selected-date target save callbacks return whether persistence succeeded;
+    prompt edit saves receive both the detected context and edited value. Callback
+    completion is followed by an immediate provider read so synchronous state
+    changes become visible without waiting for the next one-second refresh.
     """
 
     def __init__(
@@ -163,7 +175,7 @@ class WorktimeQuickPanel:
         refresh: Callable[[], None],
         clock_in_now: Callable[[], None],
         edit_clock_in: Callable[[str], bool],
-        edit_plan: Callable[[int], bool],
+        edit_plan: Callable[[str, int], bool],
         toggle_break: Callable[[], None],
         open_settings: Callable[[], None],
         prompt_accept: Callable[[str], None],
@@ -211,6 +223,7 @@ class WorktimeQuickPanel:
         self._shell = None
         self._content = None
         self._model: WorktimePanelModel | None = None
+        self._selected_date_key: str | None = None
         self._structure_signature: tuple[bool, int] | None = None
         self._widgets: dict[str, Any] = {}
         self._refresh_after_id = None
@@ -325,6 +338,7 @@ class WorktimeQuickPanel:
         if model == self._model:
             return True
 
+        self._reconcile_selection_for_model(model)
         self._reconcile_inline_editor_for_model(model)
         if self._content is None or not self._window_exists(self._window):
             # ``_model`` represents the successfully rendered snapshot. Keeping
@@ -362,6 +376,7 @@ class WorktimeQuickPanel:
         self._shell = None
         self._content = None
         self._model = None
+        self._selected_date_key = None
         self._structure_signature = None
         self._widgets = {}
         self._geometry_retry_pending = False
@@ -385,11 +400,45 @@ class WorktimeQuickPanel:
             raise TypeError("idle_timeout_ms must be an int")
         return max(_MIN_IDLE_TIMEOUT_MS, idle_timeout_ms)
 
+    @staticmethod
+    def _default_selected_date_key(model: WorktimePanelModel) -> str:
+        for row in model.rows:
+            if row.today:
+                return row.date_key
+        return model.rows[0].date_key
+
+    @staticmethod
+    def _row_for_date(
+        model: WorktimePanelModel,
+        date_key: str | None,
+    ) -> WorktimePanelDayRow | None:
+        if date_key is None:
+            return None
+        return next(
+            (row for row in model.rows if row.date_key == date_key),
+            None,
+        )
+
+    def _reconcile_selection_for_model(self, model: WorktimePanelModel) -> None:
+        if self._row_for_date(model, self._selected_date_key) is None:
+            self._selected_date_key = self._default_selected_date_key(model)
+
+    def _selected_row(
+        self,
+        model: WorktimePanelModel | None = None,
+    ) -> WorktimePanelDayRow | None:
+        current = self._model if model is None else model
+        if current is None:
+            return None
+        return self._row_for_date(current, self._selected_date_key)
+
     def _reconcile_inline_editor_for_model(self, model: WorktimePanelModel) -> None:
         if not self._inline_editor_active:
             return
         stale = False
-        if self._inline_editor_kind == _INLINE_EDITOR_CLOCK_IN:
+        if self._inline_editor_kind == _INLINE_EDITOR_TARGET:
+            stale = self._row_for_date(model, self._inline_editor_context) is None
+        elif self._inline_editor_kind == _INLINE_EDITOR_CLOCK_IN:
             stale = model.clock_in_time is None
         elif self._inline_editor_kind == _INLINE_EDITOR_PROMPT:
             stale = (
@@ -421,6 +470,7 @@ class WorktimeQuickPanel:
             self._shell = None
             self._content = None
             self._model = None
+            self._selected_date_key = None
             self._structure_signature = None
             self._widgets = {}
             self._placed = False
@@ -881,9 +931,11 @@ class WorktimeQuickPanel:
             pady=(4, 1) if compact else (7, 3),
         )
         row_widgets = []
-        for row in model.rows:
-            row_bg = _TODAY_BG if row.today else _CARD_BG
-            row_frame = tk.Frame(week_card, bg=row_bg)
+        for row_index, row in enumerate(model.rows):
+            selected = row.date_key == self._selected_date_key
+            row_bg = _SELECTED_BG if selected else (_TODAY_BG if row.today else _CARD_BG)
+            emphasis = "bold" if row.today or selected else "normal"
+            row_frame = tk.Frame(week_card, bg=row_bg, cursor="hand2")
             row_frame.pack(fill="x", padx=8, pady=0)
             weekday_label = tk.Label(
                 row_frame,
@@ -892,7 +944,8 @@ class WorktimeQuickPanel:
                 bg=row_bg,
                 fg=_TEXT,
                 anchor="w",
-                font=("Segoe UI", 9, "bold" if row.today else "normal"),
+                cursor="hand2",
+                font=("Segoe UI", 9, emphasis),
             )
             weekday_label.pack(side="left", padx=(4, 2), pady=row_padding)
             date_label = tk.Label(
@@ -902,6 +955,7 @@ class WorktimeQuickPanel:
                 bg=row_bg,
                 fg=_MUTED,
                 anchor="w",
+                cursor="hand2",
                 font=("Segoe UI", 9),
             )
             date_label.pack(side="left", padx=(0, 8), pady=row_padding)
@@ -912,7 +966,8 @@ class WorktimeQuickPanel:
                 fg=row.color,
                 anchor="w",
                 justify="left",
-                font=("Segoe UI", 9, "bold" if row.today else "normal"),
+                cursor="hand2",
+                font=("Segoe UI", 9, emphasis),
             )
             summary_label.pack(side="left", fill="x", expand=True, pady=row_padding)
             today_label = tk.Label(
@@ -920,12 +975,26 @@ class WorktimeQuickPanel:
                 text="오늘" if row.today else "",
                 bg=row_bg,
                 fg="#1D4ED8",
+                cursor="hand2",
                 font=("Segoe UI", 8, "bold"),
             )
             today_label.pack(side="right", padx=4, pady=row_padding)
-            row_widgets.append(
-                (row_frame, weekday_label, date_label, summary_label, today_label)
+            widgets_for_row = (
+                row_frame,
+                weekday_label,
+                date_label,
+                summary_label,
+                today_label,
             )
+            for widget in widgets_for_row:
+                self._bind_additive(
+                    widget,
+                    "<Button-1>",
+                    lambda _event=None, index=row_index: self._select_row_command(
+                        index
+                    ),
+                )
+            row_widgets.append(widgets_for_row)
 
         inline_editor = tk.Frame(
             content,
@@ -989,7 +1058,7 @@ class WorktimeQuickPanel:
             "휴게 종료" if model.break_active else "휴게 시작",
             self._toggle_break_command,
         )
-        plan_button = self._button(actions, "계획 수정", self._edit_plan_command)
+        plan_button = self._button(actions, "목표 수정", self._edit_plan_command)
         settings_button = self._button(actions, "설정", self._settings_command)
         countdown_label = tk.Label(
             content,
@@ -1107,8 +1176,9 @@ class WorktimeQuickPanel:
             row_frame, weekday_label, date_label, summary_label, today_label = (
                 row_widgets
             )
-            row_bg = _TODAY_BG if row.today else _CARD_BG
-            emphasis = "bold" if row.today else "normal"
+            selected = row.date_key == self._selected_date_key
+            row_bg = _SELECTED_BG if selected else (_TODAY_BG if row.today else _CARD_BG)
+            emphasis = "bold" if row.today or selected else "normal"
             row_frame.configure(bg=row_bg)
             weekday_label.configure(
                 text=row.weekday,
@@ -1139,6 +1209,72 @@ class WorktimeQuickPanel:
             )
             accept_button = widgets["prompt_buttons"][0]
             accept_button.configure(text=f"{prompt.detected_time}으로 출근")
+
+    def _update_row_selection(self, model: WorktimePanelModel) -> None:
+        for row_widgets, row in zip(self._widgets.get("rows", ()), model.rows):
+            row_frame, weekday_label, date_label, summary_label, today_label = (
+                row_widgets
+            )
+            selected = row.date_key == self._selected_date_key
+            row_bg = _SELECTED_BG if selected else (_TODAY_BG if row.today else _CARD_BG)
+            emphasis = "bold" if row.today or selected else "normal"
+            _safe_call(row_frame, "configure", bg=row_bg)
+            _safe_call(
+                weekday_label,
+                "configure",
+                bg=row_bg,
+                font=("Segoe UI", 9, emphasis),
+            )
+            _safe_call(date_label, "configure", bg=row_bg)
+            _safe_call(
+                summary_label,
+                "configure",
+                bg=row_bg,
+                font=("Segoe UI", 9, emphasis),
+            )
+            _safe_call(today_label, "configure", bg=row_bg)
+
+    def _retarget_target_editor(self, row: WorktimePanelDayRow) -> None:
+        if (
+            not self._inline_editor_active
+            or self._inline_editor_kind != _INLINE_EDITOR_TARGET
+        ):
+            return
+        self._inline_editor_context = row.date_key
+        title, hint = self._inline_editor_copy(
+            _INLINE_EDITOR_TARGET,
+            row.date_key,
+        )
+        _safe_call(self._widgets.get("inline_title"), "configure", text=title)
+        _safe_call(self._widgets.get("inline_hint"), "configure", text=hint)
+        entry = self._widgets.get("inline_entry")
+        _set_entry_text(entry, self._format_target_minutes(row.target_minutes))
+        _safe_call(self._widgets.get("inline_error"), "configure", text="")
+        _safe_call(entry, "focus_set")
+        _safe_call(entry, "selection_range", 0, "end")
+        self._update_countdown_label()
+
+    def _select_row_command(self, row_index: int) -> str:
+        model = self._model
+        if (
+            model is None
+            or type(row_index) is not int
+            or not 0 <= row_index < len(model.rows)
+        ):
+            return "break"
+        row = model.rows[row_index]
+        changed = row.date_key != self._selected_date_key
+        self._selected_date_key = row.date_key
+        self._update_row_selection(model)
+        if (
+            changed
+            and self._inline_editor_active
+            and self._inline_editor_kind == _INLINE_EDITOR_TARGET
+        ):
+            self._retarget_target_editor(row)
+        elif not self._inline_editor_active and self._visible:
+            self._reset_dismiss_timer()
+        return "break"
 
     @staticmethod
     def _sync_color(model: WorktimePanelModel) -> str:
@@ -1215,14 +1351,17 @@ class WorktimeQuickPanel:
         except Exception:
             return None
 
-    @staticmethod
     def _inline_editor_initial_value(
+        self,
         kind: str,
         model: WorktimePanelModel,
         context: str | None,
     ) -> str:
         if kind == _INLINE_EDITOR_TARGET:
-            return WorktimeQuickPanel._format_target_minutes(model.target_minutes)
+            row = self._row_for_date(model, context)
+            return self._format_target_minutes(
+                model.target_minutes if row is None else row.target_minutes
+            )
         if kind == _INLINE_EDITOR_CLOCK_IN:
             return str(model.clock_in_time or "")
         if kind == _INLINE_EDITOR_PROMPT:
@@ -1230,9 +1369,12 @@ class WorktimeQuickPanel:
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     @staticmethod
-    def _inline_editor_copy(kind: str) -> tuple[str, str]:
+    def _inline_editor_copy(
+        kind: str,
+        context: str | None = None,
+    ) -> tuple[str, str]:
         if kind == _INLINE_EDITOR_TARGET:
-            return "오늘 목표 순근무 시간", "HH:MM (00:00–24:00)"
+            return f"{context or '선택 날짜'} 목표 순근무 시간", "HH:MM (00:00–24:00)"
         if kind == _INLINE_EDITOR_CLOCK_IN:
             return "오늘 출근 시간", "HH:MM (00:00–23:59)"
         if kind == _INLINE_EDITOR_PROMPT:
@@ -1251,7 +1393,7 @@ class WorktimeQuickPanel:
         actions = self._widgets.get("actions")
         if editor is None or entry is None:
             return
-        title, hint = self._inline_editor_copy(kind)
+        title, hint = self._inline_editor_copy(kind, context)
         self._inline_editor_active = True
         self._inline_editor_kind = kind
         self._inline_editor_context = context
@@ -1318,9 +1460,14 @@ class WorktimeQuickPanel:
 
         if kind == _INLINE_EDITOR_TARGET:
             target_minutes, error = self._parse_target_minutes(raw_value)
-            if error is None and target_minutes is not None:
-                callback = lambda: self._on_edit_plan(target_minutes) is True
-                failure_message = "오늘 목표를 저장하지 못했습니다."
+            context = self._inline_editor_context
+            if context is None:
+                error = "수정할 날짜가 만료되었습니다."
+            elif error is None and target_minutes is not None:
+                callback = lambda date_key=context, minutes=target_minutes: (
+                    self._on_edit_plan(date_key, minutes) is True
+                )
+                failure_message = "선택 날짜 목표를 저장하지 못했습니다."
         elif kind in {_INLINE_EDITOR_CLOCK_IN, _INLINE_EDITOR_PROMPT}:
             clock_value, error = self._parse_clock_time(raw_value)
             if error is None and clock_value is not None:
@@ -1433,9 +1580,16 @@ class WorktimeQuickPanel:
         model = self._model
         if model is None:
             return
+        row = self._selected_row(model)
+        if row is None:
+            self._reconcile_selection_for_model(model)
+            row = self._selected_row(model)
+        if row is None:
+            return
         self._focus_or_show_inline_editor(
             _INLINE_EDITOR_TARGET,
-            self._format_target_minutes(model.target_minutes),
+            self._format_target_minutes(row.target_minutes),
+            context=row.date_key,
         )
 
     def _toggle_break_command(self) -> None:
@@ -1923,6 +2077,19 @@ def _require_nonempty_string(value: object, *, name: str) -> str:
     text = _require_string(value, name=name)
     if not text.strip():
         raise ValueError(f"{name} must be a nonempty string")
+    return text
+
+
+def _require_iso_date_key(value: object) -> str:
+    text = _require_string(value, name="date_key")
+    if _DATE_KEY_PATTERN.fullmatch(text) is None:
+        raise ValueError("date_key must use strict YYYY-MM-DD format")
+    try:
+        parsed = date_type.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("date_key must be a valid calendar date") from exc
+    if parsed.isoformat() != text:
+        raise ValueError("date_key must use strict YYYY-MM-DD format")
     return text
 
 
