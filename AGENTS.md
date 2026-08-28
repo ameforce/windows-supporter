@@ -57,7 +57,7 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
 3. 모든 task PR이 병합된 뒤 `main`으로 돌아와 `hotfix/vX.Y.Z`를 `--no-ff`로 merge하고 annotated `vX.Y.Z` 태그를 만든다.
    - merge commit 메시지는 기본 형태인 `Merge branch 'hotfix/vX.Y.Z'`를 유지한다.
    - 최종 릴리즈 빌드는 dirty build가 아니라 태그가 붙은 clean `main`에서 만든다.
-4. `main` 태그 기준으로 최종 artifact와 해당 SHA의 `release-chain-gate` 성공을 확인한다.
+4. `main` 태그 기준으로 최종 artifact와 해당 SHA의 local release evidence 일치를 확인한다.
    - task branch에서 통과한 targeted test·native scenario evidence가 `main`의 source tree와 동일한지 확인한다.
    - merge conflict나 content drift가 없으면 같은 test나 E2E를 다시 실행하지 않는다. 차이가 있으면 그 차이에 직접 대응하는 targeted test만 실행한다.
    - `cmd /c build.bat`
@@ -68,14 +68,15 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
    - merge commit 메시지는 `Merge branch 'hotfix/vX.Y.Z' into develop`를 유지한다.
    - merge conflict나 content drift가 없으면 task branch의 targeted 검증을 반복하지 않는다. develop 고유 차이가 생긴 경우에만 그 차이에 직접 대응하는 targeted test를 실행한다.
    - develop build는 develop 고유 packaging 변경을 검증해야 할 때만 실행한다.
-6. main, tag, develop을 원격에 push하고 각 ref의 `release-chain-gate` 성공을 확인한다.
+6. GitHub Actions 없이 main, tag, develop을 원격에 push하고 exact remote ref를 read-back한다.
+   - 이 저장소는 GitHub Actions를 비활성화하고 `.github/workflows`를 두지 않는다. 릴리스 검증은 task의 targeted evidence, clean tagged `main` artifact와 local/remote ref read-back이 소유한다.
    - `git push origin main`
    - `git push origin vX.Y.Z`
    - `git push origin develop`
    - 이미 잘못된 release graph를 push했다면 공개 ref를 force rewrite하지 않는다. revert 또는 다음 patch release로 복구한다.
 7. merge된 hotfix 브랜치를 정리한다.
    - 로컬 브랜치: `git branch -d hotfix/vX.Y.Z`
-   - 원격 branch는 main/develop push와 release-chain 성공 뒤 exact remote tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다.
+   - 원격 branch는 main/tag/develop push와 exact remote ref read-back 뒤 tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다.
    - 삭제 전에 별도 임시 ruleset으로 exact `refs/heads/hotfix/vX.Y.Z`에 `creation`과 `update` freeze를 적용하고 effective read-back한다. 이 freeze는 branch tip 이동과 삭제 뒤 같은 이름의 재생성을 막되 deletion은 막지 않아야 한다.
    - 이어 `.github/pr-protection/ruleset.json`의 live ruleset을 읽어 다른 규칙과 기존 exclude를 보존한 채 삭제할 exact ref만 일시 exclude하고 read-back한다. `git push origin --force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA> :refs/heads/hotfix/vX.Y.Z`로 compare-and-delete하고 remote exact ref 부재를 확인한다.
    - 성공 여부와 관계없이 canonical protection의 원래 exclude 목록을 먼저 복원하고 live read-back한다. 삭제가 성공했다면 freeze를 유지한 상태에서 remote ref 부재를 다시 확인한 뒤에만 임시 freeze ruleset을 제거한다. 제거 API 결과만 신뢰하지 않고 임시 freeze ruleset의 ID와 이름이 live 목록에 없음을 확인한 다음, canonical ruleset 일치와 remote ref 부재를 최종 확인한다. freeze가 남아 있으면 cleanup 완료로 보고하지 않는다.
