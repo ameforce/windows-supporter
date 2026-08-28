@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Native 800x540 synthetic renderer harness for the Wrike worktime panel."""
+"""Native 800x640 synthetic renderer harness for the Wrike worktime panel."""
 
 from __future__ import annotations
 
@@ -35,13 +35,17 @@ class _RendererApi:
     WorktimeQuickPanel: Any
 
 
-RUNNER_VERSION = "2.3"
+RUNNER_VERSION = "3.0"
 WEEKDAYS = ("월", "화", "수", "목", "금", "토", "일")
-VIEWPORT = (800, 540)
+VIEWPORT = (800, 640)
 CAPTURE_IDLE_TIMEOUT_MS = 60_000
 SHORT_IDLE_TIMEOUT_MS = 1_200
 SHORT_IDLE_EVENT_PUMP_GRACE_MS = 350
 POINTER_DELIVERY_TIMEOUT_MS = 1_500
+POINTER_OFFSET_PX = 16
+SYNTHETIC_TODAY_LINE_COUNT = 5
+NORMAL_SYNC_LABEL = "동기화 · 2026-08-27 14:00:00 · 방금 · fresh"
+ERROR_SYNC_LABEL = "동기화 · 2026-08-27 14:00:00 · error · request_failed"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 CONVERTER_RELATIVE_PATH = Path("scripts") / "convert_bmp_to_png.ps1"
 CAPTURE_BACKEND = "repository-owned-win32-client-getdc-bitblt"
@@ -58,6 +62,10 @@ CAPTURE_PROVENANCE = {
 }
 CHECKPOINT_FILENAMES = {
     "initial": "initial.png",
+    "hover-active": "hover-active.png",
+    "target-editor-prefill": "target-editor-prefill.png",
+    "target-editor-validation": "target-editor-validation.png",
+    "target-editor-save-cancel": "target-editor-save-cancel.png",
     "vacation-provisional": "vacation-provisional.png",
     "break-active": "break-active.png",
     "activity-prompt-focus": "activity-prompt-focus.png",
@@ -93,6 +101,20 @@ REQUIRED_ASSERTIONS = frozenset(
         "seven_weekday_rows",
         "today_badge_visible",
         "normal_capture_timeout_is_60_seconds",
+        "chromeless_native_style",
+        "active_show_owns_foreground_hwnd",
+        "initial_pointer_relative_placement",
+        "normal_hover_border_visible",
+        "active_hover_border_visible",
+        "visible_countdown",
+        "exactly_one_sync_label_per_checkpoint",
+        "today_target_editor_visible",
+        "target_editor_prefill_is_0800",
+        "invalid_target_rejected_without_callback",
+        "target_save_callback_invoked_once",
+        "target_save_closes_editor",
+        "target_cancel_skips_callback",
+        "target_cancel_preserves_saved_prefill",
         "exact_equal_refresh_preserves_widgets",
         "exact_equal_refresh_preserves_geometry",
         "exact_equal_refresh_uses_distinct_instance",
@@ -111,12 +133,14 @@ REQUIRED_ASSERTIONS = frozenset(
         "prompt_actions_in_focus_order",
         "nonactivating_show_preserves_focus",
         "nonactivating_show_preserves_foreground_hwnd",
-        "nonactivating_show_preserves_geometry",
+        "nonactivating_show_preserves_size",
+        "reopen_reanchors_to_pointer",
         "repeated_nonactivating_show_preserves_contract",
         "prompt_focus_checkpoint",
         "snooze_callback_invoked",
         "prompt_hidden_after_snooze",
         "error_state_visible",
+        "current_error_header_visible",
         "native_pointer_leave_delivered",
         "native_pointer_enter_delivered",
         "interaction_native_leave_delivered",
@@ -136,8 +160,12 @@ REQUIRED_ASSERTIONS = frozenset(
     }
 )
 SCOPE_CLAIMS = (
-    "Synthetic WorktimeQuickPanel renderer content at 800x540",
+    "Synthetic WorktimeQuickPanel renderer content at 800x640",
     "Synthetic renderer layout and required control visibility",
+    "Native chromeless, topmost, fixed-size style and active-show foreground HWND",
+    "Pointer-relative initial placement and nonactivating reopen re-anchor within the monitor work area",
+    "Normal/hover shell border, visible countdown, and exactly one synchronization label",
+    "Synthetic today-target editor prefill, validation, save callback, and cancel behavior",
     "Synthetic Tk mouse callbacks and visible state transitions",
     "Exact-equal refresh dispatches no render, update, or geometry work; same-structure refresh dispatches one in-place update",
     "Win32 pointer moves delivered through additive Tk <Enter>/<Leave> bindings",
@@ -163,7 +191,10 @@ SCOPE_EXCLUSIONS = (
     },
     {
         "id": "state-persistence",
-        "description": "Production state persistence or migration is not exercised.",
+        "description": (
+            "The synthetic today-target editor and callback are exercised, but "
+            "production state persistence or migration is not exercised."
+        ),
     },
     {
         "id": "tray",
@@ -364,12 +395,6 @@ def _today_lines(
             ),
             "#6B7280",
         ),
-        renderer.WorktimePanelLine(
-            "동기화 error · 마지막 성공값 유지 · request_failed"
-            if error
-            else "동기화 fresh · 방금",
-            "#DC2626" if error else "#6B7280",
-        ),
     )
 
 
@@ -384,9 +409,9 @@ def _model(
     return renderer.WorktimePanelModel(
         week_range="2026-08-24 - 2026-08-30",
         sync_text=(
-            "2026-08-27 14:00:00 · error · request_failed"
+            ERROR_SYNC_LABEL.removeprefix("동기화 · ")
             if error
-            else "2026-08-27 14:00:00 · 방금 · fresh"
+            else NORMAL_SYNC_LABEL.removeprefix("동기화 · ")
         ),
         sync_state="error" if error else "fresh",
         today_lines=_today_lines(
@@ -395,6 +420,7 @@ def _model(
             error=error,
             vacation_provisional=vacation_provisional,
         ),
+        target_minutes=480,
         has_clock_in=True,
         break_active=break_active,
         rows=_rows(renderer),
@@ -595,6 +621,140 @@ def _request_foreground_hwnd(window_handle: int) -> bool:
     set_foreground_window.argtypes = [wintypes.HWND]
     set_foreground_window.restype = wintypes.BOOL
     return bool(set_foreground_window(wintypes.HWND(window_handle)))
+
+
+def _cursor_position() -> list[int]:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    point = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        raise OSError(ctypes.get_last_error(), "Win32 GetCursorPos failed")
+    return [int(point.x), int(point.y)]
+
+
+def _set_cursor_position(position: list[int]) -> list[int]:
+    import ctypes
+    from ctypes import wintypes
+
+    if (
+        not isinstance(position, list)
+        or len(position) != 2
+        or any(type(coordinate) is not int for coordinate in position)
+    ):
+        raise ValueError("cursor position must contain exactly two ints")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = wintypes.BOOL
+    if not user32.SetCursorPos(position[0], position[1]):
+        raise OSError(ctypes.get_last_error(), "Win32 SetCursorPos failed")
+    actual = _cursor_position()
+    if actual != position:
+        raise RuntimeError(
+            f"cursor placement precondition failed: expected {position}, got {actual}"
+        )
+    return actual
+
+
+def _monitor_work_area_for_point(position: list[int]) -> dict[str, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    user32.MonitorFromPoint.restype = wintypes.HANDLE
+    user32.GetMonitorInfoW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(MonitorInfo),
+    ]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    monitor = user32.MonitorFromPoint(
+        wintypes.POINT(position[0], position[1]),
+        2,
+    )
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(MonitorInfo)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise OSError(ctypes.get_last_error(), "Win32 GetMonitorInfoW failed")
+    return {
+        "left": int(info.rcWork.left),
+        "top": int(info.rcWork.top),
+        "right": int(info.rcWork.right),
+        "bottom": int(info.rcWork.bottom),
+    }
+
+
+def _expected_pointer_geometry(
+    position: list[int],
+    work_area: dict[str, int],
+) -> dict[str, int]:
+    width, height = VIEWPORT
+    left = work_area["left"]
+    top = work_area["top"]
+    right = work_area["right"]
+    bottom = work_area["bottom"]
+    if right - left < width or bottom - top < height:
+        raise RuntimeError("monitor work area is smaller than the native QA viewport")
+    x = position[0] + POINTER_OFFSET_PX
+    y = position[1] + POINTER_OFFSET_PX
+    if x + width > right:
+        x = position[0] - width - POINTER_OFFSET_PX
+    if y + height > bottom:
+        y = position[1] - height - POINTER_OFFSET_PX
+    x = min(max(x, left), right - width)
+    y = min(max(y, top), bottom - height)
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _native_window_style(window: Any) -> dict[str, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    hwnd = _window_hwnd(window)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    style = int(user32.GetWindowLongW(wintypes.HWND(hwnd), -16)) & 0xFFFFFFFF
+    extended_style = (
+        int(user32.GetWindowLongW(wintypes.HWND(hwnd), -20)) & 0xFFFFFFFF
+    )
+    resizable = window.resizable()
+    return {
+        "window_handle": hwnd,
+        "tk_overrideredirect": bool(window.overrideredirect()),
+        "tk_topmost": bool(int(window.attributes("-topmost"))),
+        "tk_resizable": [bool(int(value)) for value in resizable],
+        "style": style,
+        "extended_style": extended_style,
+        "has_caption": bool(style & 0x00C00000),
+        "has_thickframe": bool(style & 0x00040000),
+        "native_topmost": bool(extended_style & 0x00000008),
+    }
+
+
+def _wait_for_foreground(window: Any, timeout_ms: int = 2_000) -> int:
+    hwnd = _window_hwnd(window)
+    deadline = time.monotonic() + max(1, int(timeout_ms)) / 1000.0
+    while True:
+        window.update_idletasks()
+        window.update()
+        foreground = _foreground_hwnd()
+        if foreground == hwnd:
+            return foreground
+        if time.monotonic() >= deadline:
+            return foreground
+        time.sleep(0.02)
 
 
 def _window_geometry(window: Any) -> dict[str, int]:
@@ -1016,6 +1176,7 @@ def _visual_metrics(window: Any) -> dict[str, Any]:
     underallocated: list[str] = []
     labels: list[str] = []
     buttons: list[str] = []
+    entries: list[str] = []
     for widget in _walk(window):
         if widget is window or not widget.winfo_ismapped() or not widget.winfo_manager():
             continue
@@ -1042,10 +1203,22 @@ def _visual_metrics(window: Any) -> dict[str, Any]:
             labels.append(str(widget.cget("text")))
         elif widget.winfo_class() == "Button":
             buttons.append(str(widget.cget("text")))
+        elif widget.winfo_class() == "Entry":
+            entries.append(str(widget.get()))
     focused = window.focus_get()
     focus_text = ""
+    focus_entry_value = ""
     if focused is not None and focused.winfo_class() == "Button":
         focus_text = str(focused.cget("text"))
+    elif focused is not None and focused.winfo_class() == "Entry":
+        focus_entry_value = str(focused.get())
+    shell_border_color = ""
+    children = window.winfo_children()
+    if children:
+        try:
+            shell_border_color = str(children[0].cget("highlightbackground"))
+        except Exception:
+            shell_border_color = ""
     return {
         "window_geometry": {
             "x": left,
@@ -1059,7 +1232,10 @@ def _visual_metrics(window: Any) -> dict[str, Any]:
         "underallocated_text_widgets": underallocated,
         "labels": labels,
         "buttons": buttons,
+        "entries": entries,
         "focus_text": focus_text,
+        "focus_entry_value": focus_entry_value,
+        "shell_border_color": shell_border_color,
     }
 
 
@@ -1220,6 +1396,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
         if active_window is None:
             raise RuntimeError("interaction probe window is unavailable")
         interaction_probe["depth"] = panel._interaction_depth
+        interaction_probe["window_geometry"] = _window_geometry(active_window)
         delivery_start = len(native_pointer_events)
         interaction_probe["cursor_position"] = _move_pointer(
             active_window,
@@ -1242,13 +1419,21 @@ def _run(output_dir: Path) -> dict[str, Any]:
         calls.append("prompt_snooze")
         holder["model"] = replace(holder["model"], prompt=None)
 
+    def save_target(target_minutes: int) -> bool:
+        calls.append(f"edit_plan:{target_minutes}")
+        holder["model"] = replace(
+            holder["model"],
+            target_minutes=int(target_minutes),
+        )
+        return True
+
     panel = renderer.WorktimeQuickPanel(
         root,
         lambda: holder["model"],
         refresh=refresh,
         clock_in_now=lambda: calls.append("clock_in_now"),
         edit_clock_in=lambda: calls.append("edit_clock_in"),
-        edit_plan=lambda: calls.append("edit_plan"),
+        edit_plan=save_target,
         toggle_break=toggle_break,
         open_settings=lambda: calls.append("open_settings"),
         prompt_accept=lambda value: calls.append(f"prompt_accept:{value}"),
@@ -1266,6 +1451,10 @@ def _run(output_dir: Path) -> dict[str, Any]:
     refresh_observation: dict[str, Any] = {}
     idle_observation: dict[str, Any] = {}
     pointer_delivery_observation: dict[str, Any] = {}
+    native_window_observation: dict[str, Any] = {}
+    placement_observation: dict[str, Any] = {}
+    hover_observation: dict[str, Any] = {}
+    target_editor_observation: dict[str, Any] = {}
     capture_start_revision = ""
     capture_end_revision = ""
     try:
@@ -1273,9 +1462,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
             sealed_revision,
             "before first renderer show/capture",
         )
-        if panel.show(activate=True) is not True or not panel.is_visible():
-            raise RuntimeError("Quick Panel did not become mapped for capture")
-        window = panel._window
+        window = panel._ensure_window()
         if window is None:
             raise RuntimeError("Quick Panel window was not created")
 
@@ -1304,9 +1491,45 @@ def _run(output_dir: Path) -> dict[str, Any]:
         window.maxsize(*VIEWPORT)
         window.geometry(f"{VIEWPORT[0]}x{VIEWPORT[1]}+40+40")
         window.update_idletasks()
+
+        initial_work_area = _monitor_work_area_for_point(_cursor_position())
+        initial_anchor = _set_cursor_position(
+            [
+                initial_work_area["left"] + 64,
+                initial_work_area["top"] + 64,
+            ]
+        )
+        initial_work_area = _monitor_work_area_for_point(initial_anchor)
+        initial_expected_geometry = _expected_pointer_geometry(
+            initial_anchor,
+            initial_work_area,
+        )
+        if panel.show(activate=True) is not True or not panel.is_visible():
+            raise RuntimeError("Quick Panel did not become mapped for capture")
+        window.update_idletasks()
         window.update()
         if _window_size(window) != list(VIEWPORT):
-            raise RuntimeError("could not establish the fixed 800x540 QA viewport")
+            raise RuntimeError("could not establish the fixed 800x640 QA viewport")
+        initial_geometry = _window_geometry(window)
+        panel_hwnd = _window_hwnd(window)
+        active_foreground_hwnd = _wait_for_foreground(window)
+        native_window_observation = _native_window_style(window)
+        native_window_observation.update(
+            {
+                "foreground_hwnd_after_active_show": active_foreground_hwnd,
+                "foreground_matches_panel": active_foreground_hwnd == panel_hwnd,
+            }
+        )
+        placement_observation = {
+            "pointer_offset_px": POINTER_OFFSET_PX,
+            "initial": {
+                "cursor_position": initial_anchor,
+                "work_area": initial_work_area,
+                "expected_geometry": initial_expected_geometry,
+                "window_geometry": initial_geometry,
+            },
+            "reopen": None,
+        }
 
         base_buttons = ("새로고침", "출근 수정", "휴게 시작", "계획 수정", "설정")
         states.append(
@@ -1315,6 +1538,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 output_dir,
                 "initial",
                 required_labels=(
+                    NORMAL_SYNC_LABEL,
                     "Wrike 기록 5시간 30분 · 현재 기대 5시간",
                     "현재 기준 초과 30분",
                     "오늘",
@@ -1323,6 +1547,12 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 required_buttons=base_buttons,
             )
         )
+        initial_countdowns = [
+            text
+            for text in states[-1]["labels"]
+            if text.endswith("초 후 닫힘")
+            and text.removesuffix("초 후 닫힘").isdigit()
+        ]
         assertions["seven_weekday_rows"] = all(
             states[0]["labels"].count(day) == 1 for day in WEEKDAYS
         )
@@ -1330,6 +1560,160 @@ def _run(output_dir: Path) -> dict[str, Any]:
         assertions["normal_capture_timeout_is_60_seconds"] = (
             panel._idle_timeout_ms == CAPTURE_IDLE_TIMEOUT_MS
         )
+        assertions["chromeless_native_style"] = bool(
+            native_window_observation["tk_overrideredirect"]
+            and native_window_observation["tk_topmost"]
+            and native_window_observation["tk_resizable"] == [False, False]
+            and native_window_observation["has_caption"] is False
+            and native_window_observation["has_thickframe"] is False
+            and native_window_observation["native_topmost"] is True
+        )
+        assertions["active_show_owns_foreground_hwnd"] = bool(
+            native_window_observation["foreground_matches_panel"]
+        )
+        assertions["initial_pointer_relative_placement"] = bool(
+            initial_geometry == initial_expected_geometry
+        )
+        assertions["normal_hover_border_visible"] = bool(
+            states[-1]["shell_border_color"].upper() == "#E5E7EB"
+        )
+        assertions["visible_countdown"] = len(initial_countdowns) == 1
+
+        hover_delivery_start = len(native_pointer_events)
+        hover_cursor = _move_pointer(window, inside=True)
+        hover_delivery_elapsed_ms = _wait_for_pointer_delivery(
+            window,
+            native_pointer_events,
+            expected="enter",
+            start_index=hover_delivery_start,
+        )
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "hover-active",
+                required_labels=(
+                    NORMAL_SYNC_LABEL,
+                    "마우스 호버 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=base_buttons,
+            )
+        )
+        assertions["active_hover_border_visible"] = bool(
+            states[-1]["shell_border_color"].upper() == "#2563EB"
+        )
+        hover_exit_start = len(native_pointer_events)
+        hover_exit_cursor = _move_pointer(window, inside=False)
+        hover_exit_elapsed_ms = _wait_for_pointer_delivery(
+            window,
+            native_pointer_events,
+            expected="leave",
+            start_index=hover_exit_start,
+        )
+        hover_observation = {
+            "normal_border_color": states[0]["shell_border_color"],
+            "active_border_color": states[1]["shell_border_color"],
+            "active_countdown_text": "마우스 호버 중 · 자동 닫힘 일시정지",
+            "enter_cursor_position": hover_cursor,
+            "enter_delivery_elapsed_ms": hover_delivery_elapsed_ms,
+            "exit_cursor_position": hover_exit_cursor,
+            "exit_delivery_elapsed_ms": hover_exit_elapsed_ms,
+            "window_geometry": _window_geometry(window),
+        }
+
+        _click_button(window, "계획 수정")
+        target_entry = panel._widgets["target_entry"]
+        prefill_value = str(target_entry.get())
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "target-editor-prefill",
+                required_labels=(
+                    "오늘 목표 순근무 시간",
+                    "HH:MM (00:00–24:00)",
+                    "편집 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=("저장", "취소"),
+            )
+        )
+        callbacks_before_invalid = list(calls)
+        target_entry.delete(0, "end")
+        target_entry.insert(0, "24:30")
+        _click_button(window, "저장")
+        validation_message = "24시간은 24:00으로만 입력할 수 있습니다."
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "target-editor-validation",
+                required_labels=(
+                    validation_message,
+                    "편집 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=("저장", "취소"),
+            )
+        )
+        invalid_callback_unchanged = calls == callbacks_before_invalid
+        target_entry.delete(0, "end")
+        target_entry.insert(0, "07:30")
+        _click_button(window, "저장")
+        saved_editor_closed = panel._target_editor_active is False
+        _click_button(window, "계획 수정")
+        saved_prefill = str(target_entry.get())
+        target_entry.delete(0, "end")
+        target_entry.insert(0, "06:00")
+        callbacks_before_cancel = list(calls)
+        _click_button(window, "취소")
+        cancel_skipped_callback = calls == callbacks_before_cancel
+        _click_button(window, "계획 수정")
+        prefill_after_cancel = str(target_entry.get())
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "target-editor-save-cancel",
+                required_labels=(
+                    "오늘 목표 순근무 시간",
+                    "편집 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=("저장", "취소"),
+            )
+        )
+        _click_button(window, "취소")
+        assertions["today_target_editor_visible"] = bool(
+            "오늘 목표 순근무 시간" in states[2]["labels"]
+            and states[2]["entries"] == ["08:00"]
+        )
+        assertions["target_editor_prefill_is_0800"] = prefill_value == "08:00"
+        assertions["invalid_target_rejected_without_callback"] = bool(
+            invalid_callback_unchanged
+            and states[3]["entries"] == ["24:30"]
+            and validation_message in states[3]["labels"]
+        )
+        assertions["target_save_callback_invoked_once"] = (
+            calls.count("edit_plan:450") == 1
+        )
+        assertions["target_save_closes_editor"] = saved_editor_closed
+        assertions["target_cancel_skips_callback"] = cancel_skipped_callback
+        assertions["target_cancel_preserves_saved_prefill"] = bool(
+            saved_prefill == "07:30"
+            and prefill_after_cancel == "07:30"
+            and states[4]["entries"] == ["07:30"]
+        )
+        target_editor_observation = {
+            "prefill_value": prefill_value,
+            "invalid_value": "24:30",
+            "validation_message": validation_message,
+            "invalid_callback_unchanged": invalid_callback_unchanged,
+            "saved_value": "07:30",
+            "saved_minutes": 450,
+            "saved_editor_closed": saved_editor_closed,
+            "saved_prefill": saved_prefill,
+            "cancel_attempt_value": "06:00",
+            "cancel_skipped_callback": cancel_skipped_callback,
+            "prefill_after_cancel": prefill_after_cancel,
+        }
 
         dispatch_calls = {
             "render_structure": 0,
@@ -1348,9 +1732,9 @@ def _run(output_dir: Path) -> dict[str, Any]:
             dispatch_calls["update_rendered_model"] += 1
             original_update_rendered_model(model)
 
-        def counted_reconcile_geometry() -> bool:
+        def counted_reconcile_geometry(*args, **kwargs) -> bool:
             dispatch_calls["reconcile_geometry"] += 1
-            return original_reconcile_geometry()
+            return original_reconcile_geometry(*args, **kwargs)
 
         panel._render_structure = counted_render_structure
         panel._update_rendered_model = counted_update_rendered_model
@@ -1500,7 +1884,9 @@ def _run(output_dir: Path) -> dict[str, Any]:
 
         sentinel = tk.Toplevel(root)
         sentinel.title("Wrike native QA focus sentinel")
-        sentinel.geometry("160x60+900+40")
+        sentinel.geometry(
+            f"160x60+{initial_work_area['left'] + 8}+{initial_work_area['top'] + 8}"
+        )
         sentinel_entry = tk.Entry(sentinel)
         sentinel_entry.pack(fill="both", expand=True)
         sentinel.update_idletasks()
@@ -1516,12 +1902,24 @@ def _run(output_dir: Path) -> dict[str, Any]:
             sentinel.update()
             focus_before = root.focus_get()
             foreground_before = _foreground_hwnd()
-            if focus_before is sentinel_entry and foreground_before > 0:
+            if focus_before is sentinel_entry and foreground_before == sentinel_hwnd:
                 break
             if time.monotonic() >= focus_deadline:
                 break
             time.sleep(0.02)
 
+        reopen_anchor = _set_cursor_position(
+            [
+                initial_work_area["right"] - 64,
+                initial_work_area["bottom"] - 64,
+            ]
+        )
+        reopen_work_area = _monitor_work_area_for_point(reopen_anchor)
+        reopen_expected_geometry = _expected_pointer_geometry(
+            reopen_anchor,
+            reopen_work_area,
+        )
+        panel.hide()
         repeated_observations: list[dict[str, Any]] = []
         for attempt in range(1, NONACTIVATING_SHOW_REPETITIONS + 1):
             if panel.show(activate=False) is not True or not panel.is_visible():
@@ -1544,18 +1942,22 @@ def _run(output_dir: Path) -> dict[str, Any]:
             and all(item["tk_focus_is_sentinel"] for item in repeated_observations)
         )
         foreground_preserved = bool(
-            foreground_before > 0
-            and foreground_before == sentinel_hwnd
+            foreground_before == sentinel_hwnd
             and all(
                 item["foreground_hwnd"] == foreground_before
                 for item in repeated_observations
             )
         )
-        geometry_preserved = bool(
-            [geometry_before["width"], geometry_before["height"]]
-            == list(VIEWPORT)
+        size_preserved = bool(
+            all(item["window_size"] == list(VIEWPORT) for item in repeated_observations)
+        )
+        reopen_reanchored = bool(
+            repeated_observations
+            and repeated_observations[0]["window_geometry"]
+            == reopen_expected_geometry
+            and reopen_expected_geometry != geometry_before
             and all(
-                item["window_geometry"] == geometry_before
+                item["window_geometry"] == reopen_expected_geometry
                 for item in repeated_observations
             )
         )
@@ -1563,10 +1965,21 @@ def _run(output_dir: Path) -> dict[str, Any]:
         assertions["nonactivating_show_preserves_foreground_hwnd"] = (
             foreground_preserved
         )
-        assertions["nonactivating_show_preserves_geometry"] = geometry_preserved
+        assertions["nonactivating_show_preserves_size"] = size_preserved
+        assertions["reopen_reanchors_to_pointer"] = reopen_reanchored
         assertions["repeated_nonactivating_show_preserves_contract"] = bool(
-            tk_focus_preserved and foreground_preserved and geometry_preserved
+            tk_focus_preserved
+            and foreground_preserved
+            and size_preserved
+            and reopen_reanchored
         )
+        placement_observation["reopen"] = {
+            "cursor_position": reopen_anchor,
+            "work_area": reopen_work_area,
+            "previous_geometry": geometry_before,
+            "expected_geometry": reopen_expected_geometry,
+            "window_geometry": repeated_observations[0]["window_geometry"],
+        }
         focus_observation = {
             "scope": FOCUS_SCOPE,
             "cross_process_focus_excluded": True,
@@ -1579,6 +1992,9 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 geometry_before["width"],
                 geometry_before["height"],
             ],
+            "reopen_cursor_position": reopen_anchor,
+            "reopen_work_area": reopen_work_area,
+            "reopen_expected_geometry": reopen_expected_geometry,
             "observations": repeated_observations,
         }
         sentinel.destroy()
@@ -1619,20 +2035,23 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 output_dir,
                 "error-last-good",
                 required_labels=(
-                    "동기화 error · 마지막 성공값 유지 · request_failed",
+                    ERROR_SYNC_LABEL,
                     "Wrike 기록 5시간 30분 · 현재 기대 5시간",
                 ),
                 required_buttons=base_buttons,
             )
         )
         assertions["error_state_visible"] = bool(
-            "동기화 error · 마지막 성공값 유지 · request_failed"
-            in states[-1]["labels"]
+            ERROR_SYNC_LABEL in states[-1]["labels"]
+        )
+        assertions["current_error_header_visible"] = bool(
+            states[-1]["labels"].count(ERROR_SYNC_LABEL) == 1
         )
 
         idle_window_identity = _widget_identity(window)
         idle_window_handle = _window_hwnd(window)
         panel.set_idle_timeout_ms(SHORT_IDLE_TIMEOUT_MS)
+        idle_window_geometry = _window_geometry(window)
         idle_delivery_start = len(native_pointer_events)
         idle_cursor_position = _move_pointer(window, inside=False)
         idle_delivery_elapsed_ms = _wait_for_pointer_delivery(
@@ -1651,6 +2070,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
         first_reopen_visible = bool(
             panel.show(activate=False) is True and panel.is_visible()
         )
+        first_reopen_geometry = _window_geometry(window)
 
         hover_delivery_start = len(native_pointer_events)
         hover_cursor_position = _move_pointer(window, inside=True)
@@ -1678,6 +2098,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
         interaction_native_leave = interaction_probe.get("delivered") is True
 
         rearmed_enter_start = len(native_pointer_events)
+        rearmed_enter_window_geometry = _window_geometry(window)
         rearmed_enter_cursor_position = _move_pointer(window, inside=True)
         rearmed_enter_delivery_elapsed_ms = _wait_for_pointer_delivery(
             window,
@@ -1686,6 +2107,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
             start_index=rearmed_enter_start,
         )
         rearmed_leave_start = len(native_pointer_events)
+        rearmed_leave_window_geometry = _window_geometry(window)
         rearmed_cursor_position = _move_pointer(window, inside=False)
         rearmed_leave_delivery_elapsed_ms = _wait_for_pointer_delivery(
             window,
@@ -1762,19 +2184,24 @@ def _run(output_dir: Path) -> dict[str, Any]:
             "short_timeout_ms": SHORT_IDLE_TIMEOUT_MS,
             "window_handle_before": idle_window_handle,
             "widget_identity_before": list(idle_window_identity),
+            "idle_window_geometry": idle_window_geometry,
             "idle_cursor_position": idle_cursor_position,
             "idle_pointer_outside": idle_pointer_outside,
             "idle_elapsed_ms": idle_elapsed_ms,
             "idle_withdrawn": idle_withdrawn,
             "window_exists_after_idle": window_exists_after_idle,
             "first_reopen_visible": first_reopen_visible,
+            "first_reopen_geometry": first_reopen_geometry,
             "hover_cursor_position": hover_cursor_position,
             "hover_pointer_inside": hover_pointer_inside,
             "hover_elapsed_ms": hover_elapsed_ms,
             "hover_visible": hover_visible,
             "interaction_depth": interaction_depth,
+            "interaction_window_geometry": interaction_probe.get("window_geometry"),
             "interaction_elapsed_ms": interaction_elapsed_ms,
             "interaction_visible": interaction_visible,
+            "rearmed_enter_window_geometry": rearmed_enter_window_geometry,
+            "rearmed_leave_window_geometry": rearmed_leave_window_geometry,
             "rearmed_cursor_position": rearmed_cursor_position,
             "rearmed_pointer_outside": rearmed_pointer_outside,
             "rearmed_idle_elapsed_ms": rearmed_idle_elapsed_ms,
@@ -1794,30 +2221,35 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 {
                     "phase": "idle",
                     "expected": "leave",
+                    "window_geometry": idle_window_geometry,
                     "cursor_position": idle_cursor_position,
                     "delivery_elapsed_ms": idle_delivery_elapsed_ms,
                 },
                 {
                     "phase": "hover",
                     "expected": "enter",
+                    "window_geometry": first_reopen_geometry,
                     "cursor_position": hover_cursor_position,
                     "delivery_elapsed_ms": hover_delivery_elapsed_ms,
                 },
                 {
                     "phase": "interaction",
                     "expected": "leave",
+                    "window_geometry": interaction_probe.get("window_geometry"),
                     "cursor_position": interaction_probe.get("cursor_position"),
                     "delivery_elapsed_ms": interaction_delivery_elapsed_ms,
                 },
                 {
                     "phase": "rearmed-enter",
                     "expected": "enter",
+                    "window_geometry": rearmed_enter_window_geometry,
                     "cursor_position": rearmed_enter_cursor_position,
                     "delivery_elapsed_ms": rearmed_enter_delivery_elapsed_ms,
                 },
                 {
                     "phase": "rearmed-leave",
                     "expected": "leave",
+                    "window_geometry": rearmed_leave_window_geometry,
                     "cursor_position": rearmed_cursor_position,
                     "delivery_elapsed_ms": rearmed_leave_delivery_elapsed_ms,
                 },
@@ -1825,6 +2257,15 @@ def _run(output_dir: Path) -> dict[str, Any]:
             "events": [dict(item) for item in native_pointer_events],
         }
 
+        assertions["exactly_one_sync_label_per_checkpoint"] = all(
+            sum(
+                1
+                for label in state["labels"]
+                if str(label).startswith("동기화 · ")
+            )
+            == 1
+            for state in states
+        )
         capture_end_revision = _require_target_revision(
             sealed_revision,
             "after final native scenario",
@@ -1851,7 +2292,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 first_failure = name
                 break
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "runner_version": RUNNER_VERSION,
             "ok": bool(
                 set(assertions) == REQUIRED_ASSERTIONS
@@ -1873,6 +2314,10 @@ def _run(output_dir: Path) -> dict[str, Any]:
             "states": states,
             "assertions": assertions,
             "refresh_observation": refresh_observation,
+            "native_window_observation": native_window_observation,
+            "placement_observation": placement_observation,
+            "hover_observation": hover_observation,
+            "target_editor_observation": target_editor_observation,
             "idle_observation": idle_observation,
             "pointer_delivery_observation": pointer_delivery_observation,
             "focus_order": focus_order,
@@ -1918,7 +2363,32 @@ def _requirements() -> list[dict[str, Any]]:
             "id": "REQ-SYNTHETIC-LAYOUT",
             "claim": (
                 "The synthetic renderer keeps all seven weekday rows, required "
-                "controls, and decoded PNG checkpoints within 800x540."
+                "controls, and decoded PNG checkpoints within 800x640."
+            ),
+            "required": True,
+        },
+        {
+            "id": "REQ-NATIVE-WINDOW-CONTRACT",
+            "claim": (
+                "The native panel is chromeless, topmost, fixed-size, owns the "
+                "foreground HWND after active show, and re-anchors beside the "
+                "current pointer within its monitor work area on reopen."
+            ),
+            "required": True,
+        },
+        {
+            "id": "REQ-SYNTHETIC-HOVER-COUNTDOWN",
+            "claim": (
+                "The synthetic panel exposes distinct normal and hover borders, "
+                "a visible dismissal countdown, and one synchronization label."
+            ),
+            "required": True,
+        },
+        {
+            "id": "REQ-SYNTHETIC-TODAY-TARGET-EDITOR",
+            "claim": (
+                "The synthetic today-target editor proves 08:00 prefill, invalid "
+                "24:30 rejection, one 07:30 save callback, and cancel preservation."
             ),
             "required": True,
         },
@@ -1960,14 +2430,15 @@ def _requirements() -> list[dict[str, Any]]:
             "claim": (
                 "Repeated nonactivating show calls preserve the OS foreground HWND "
                 "and same-process synthetic Tk sentinel focus under the fixed "
-                "800x540 QA viewport."
+                "800x640 QA viewport."
             ),
             "required": True,
         },
         {
             "id": "REQ-SYNTHETIC-ERROR",
             "claim": (
-                "The synthetic renderer shows its explicit error fixture with retained data."
+                "The synthetic renderer shows the exact current error header "
+                f"'{ERROR_SYNC_LABEL}' with retained data."
             ),
             "required": True,
         },
@@ -2069,7 +2540,7 @@ def _write_manifest(
         "requirements": requirements,
         "matrix": [
             {
-                "id": "windows-native-tk-synthetic-800x540",
+                "id": "windows-native-tk-synthetic-800x640",
                 "source": "repository synthetic renderer-only harness",
                 "required": True,
                 "browser": "Tk native desktop synthetic fixture",
@@ -2082,7 +2553,11 @@ def _write_manifest(
                 "requirement_ids": [item["id"] for item in requirements],
                 "required": True,
                 "steps": [
-                    "Open the synthetic Quick Panel renderer at 800x540 with a 60-second capture timeout",
+                    "Open the synthetic Quick Panel renderer at 800x640 with a 60-second capture timeout",
+                    "Verify chromeless/topmost/fixed native style and active foreground HWND ownership",
+                    "Verify initial and nonactivating reopen placement beside controlled Win32 cursor points",
+                    "Inspect the normal and hover shell borders, visible countdown, and one synchronization label",
+                    "Exercise the today-only target editor prefill, validation, save callback, and cancel preservation",
                     "Inspect synthetic actual-versus-expected text and seven week rows",
                     "Verify a distinct exact-equal model dispatches zero render, update, or geometry methods",
                     "Apply a same-structure provisional-vacation text change through exactly one in-place update without geometry reconciliation",
@@ -2091,15 +2566,15 @@ def _write_manifest(
                     "Exercise repeated nonactivating show calls with a same-process sentinel",
                     "Traverse synthetic prompt actions by keyboard focus",
                     "Snooze the synthetic prompt through a Tk mouse event",
-                    "Render the explicit synthetic error fixture with retained data",
+                    f"Render the exact synthetic error header {ERROR_SYNC_LABEL} with retained data",
                     "Use Win32 SetCursorPos and additive Tk enter/leave observers with a bounded delivery wait",
                     "Use a 1.2-second timeout to verify idle withdraw without window destruction",
                     "Verify native hover delivery and an active callback defer dismissal, then reopen the same window",
-                    "Keep production snapshot, cache, vacation fetch/calculation, state, tray, hotkey, packaged EXE, and cross-process focus outside this evidence scope",
+                    "Keep production snapshot, cache, vacation fetch/calculation, state persistence, tray, hotkey, packaged EXE, and cross-process focus outside this evidence scope",
                 ],
                 "executions": [
                     {
-                        "matrix_id": "windows-native-tk-synthetic-800x540",
+                        "matrix_id": "windows-native-tk-synthetic-800x640",
                         "status": "passed" if passed else "failed",
                         "attempts": int(run.get("attempts", 1)),
                         "assertions": [
@@ -2267,6 +2742,13 @@ def _validate_manifest_evidence(
         or execution.get("status") != ("passed" if passed else "failed")
         or execution.get("visual_states") != expected_states
         or execution.get("checkpoints") != expected_checkpoints
+        or execution.get("attempts") != run.get("attempts")
+        or execution.get("assertions")
+        != [
+            name
+            for name, value in run.get("assertions", {}).items()
+            if value is True
+        ]
         or execution.get("unexpected_errors") != run.get("runtime_errors", [])
     ):
         raise RuntimeError("manifest execution/checkpoint evidence is inconsistent")
@@ -2288,7 +2770,7 @@ def _validate_run_evidence(
     run_path = output_dir / "run.json"
     run = _load_json_object(run_path, "run evidence")
     run_digest = _sha256(run_path)
-    if run.get("schema_version") != 3:
+    if run.get("schema_version") != 4:
         raise RuntimeError("unsupported run evidence schema")
     if run.get("runner_version") != RUNNER_VERSION:
         raise RuntimeError("run evidence runner version is missing or stale")
@@ -2297,7 +2779,7 @@ def _validate_run_evidence(
     if run.get("output_root") != str(output_dir):
         raise RuntimeError("run evidence output root does not match --output-dir")
     if run.get("viewport") != list(VIEWPORT):
-        raise RuntimeError("run evidence viewport is not exactly 800x540")
+        raise RuntimeError("run evidence viewport is not exactly 800x640")
 
     capture_start = run.get("capture_start_revision")
     capture_end = run.get("capture_end_revision")
@@ -2350,7 +2832,7 @@ def _validate_run_evidence(
         decoded_dimensions = decoded_png["dimensions"]
         if decoded_dimensions != list(VIEWPORT):
             raise RuntimeError(
-                f"checkpoint is not exactly 800x540: {expected_path} "
+                f"checkpoint is not exactly 800x640: {expected_path} "
                 f"({decoded_dimensions[0]}x{decoded_dimensions[1]})"
             )
         if state.get("dimensions") != decoded_dimensions:
@@ -2368,13 +2850,66 @@ def _validate_run_evidence(
         ):
             raise RuntimeError(f"checkpoint digest mismatch: {expected_path}")
         if state.get("window_size") != list(VIEWPORT):
-            raise RuntimeError(f"checkpoint window size is not 800x540: {expected_state}")
+            raise RuntimeError(f"checkpoint window size is not 800x640: {expected_state}")
         if not _valid_viewport_geometry(state.get("window_geometry")):
             raise RuntimeError(
                 f"checkpoint full window geometry is invalid: {expected_state}"
             )
         if state.get("ok") is not True:
             raise RuntimeError(f"checkpoint assertion failed: {expected_state}")
+        labels = state.get("labels")
+        entries = state.get("entries")
+        buttons = state.get("buttons")
+        border_color = state.get("shell_border_color")
+        if (
+            not isinstance(labels, list)
+            or not isinstance(entries, list)
+            or not isinstance(buttons, list)
+            or not isinstance(border_color, str)
+            or not border_color
+        ):
+            raise RuntimeError(
+                f"checkpoint widget metrics are incomplete: {expected_state}"
+            )
+        if sum(str(label).startswith("동기화 · ") for label in labels) != 1:
+            raise RuntimeError(
+                f"checkpoint synchronization label is duplicated or missing: {expected_state}"
+            )
+        if expected_state == "initial":
+            countdowns = [
+                text
+                for text in labels
+                if isinstance(text, str)
+                and text.endswith("초 후 닫힘")
+                and text.removesuffix("초 후 닫힘").isdigit()
+            ]
+            if border_color.upper() != "#E5E7EB" or len(countdowns) != 1:
+                raise RuntimeError("initial hover border or countdown evidence is invalid")
+        elif expected_state == "hover-active":
+            if (
+                border_color.upper() != "#2563EB"
+                or "마우스 호버 중 · 자동 닫힘 일시정지" not in labels
+            ):
+                raise RuntimeError("active hover border evidence is invalid")
+        elif expected_state == "target-editor-prefill":
+            if (
+                entries != ["08:00"]
+                or "오늘 목표 순근무 시간" not in labels
+                or not {"저장", "취소"} <= set(buttons)
+            ):
+                raise RuntimeError("target editor prefill evidence is invalid")
+        elif expected_state == "target-editor-validation":
+            if (
+                entries != ["24:30"]
+                or "24시간은 24:00으로만 입력할 수 있습니다." not in labels
+            ):
+                raise RuntimeError("target editor validation evidence is invalid")
+        elif expected_state == "target-editor-save-cancel":
+            if entries != ["07:30"]:
+                raise RuntimeError("target editor save/cancel evidence is invalid")
+        elif expected_state == "error-last-good":
+            if labels.count(ERROR_SYNC_LABEL) != 1:
+                raise RuntimeError("current error synchronization header is invalid")
         if expected_state == "vacation-provisional":
             labels = state.get("labels")
             required_provisional_labels = {
@@ -2394,7 +2929,7 @@ def _validate_run_evidence(
                 )
         if provenance.get("client_dimensions") != list(VIEWPORT):
             raise RuntimeError(
-                f"checkpoint client capture is not 800x540: {expected_state}"
+                f"checkpoint client capture is not 800x640: {expected_state}"
             )
         if not isinstance(provenance.get("window_handle"), int):
             raise RuntimeError(f"checkpoint HWND missing: {expected_state}")
@@ -2418,6 +2953,163 @@ def _validate_run_evidence(
             and all(isinstance(item, str) and item for item in value)
             and len(value) == len(set(value))
         )
+
+    def valid_cursor_position(value: object) -> bool:
+        return bool(
+            isinstance(value, list)
+            and len(value) == 2
+            and all(type(coordinate) is int for coordinate in value)
+        )
+
+    def valid_work_area(value: object) -> bool:
+        return bool(
+            isinstance(value, dict)
+            and set(value) == {"left", "top", "right", "bottom"}
+            and all(type(value[key]) is int for key in value)
+            and value["right"] - value["left"] >= VIEWPORT[0]
+            and value["bottom"] - value["top"] >= VIEWPORT[1]
+        )
+
+    def cursor_inside_geometry(cursor: list[int], geometry: dict[str, int]) -> bool:
+        return bool(
+            geometry["x"] <= cursor[0] < geometry["x"] + geometry["width"]
+            and geometry["y"] <= cursor[1] < geometry["y"] + geometry["height"]
+        )
+
+    native = run.get("native_window_observation")
+    expected_native_keys = {
+        "window_handle",
+        "tk_overrideredirect",
+        "tk_topmost",
+        "tk_resizable",
+        "style",
+        "extended_style",
+        "has_caption",
+        "has_thickframe",
+        "native_topmost",
+        "foreground_hwnd_after_active_show",
+        "foreground_matches_panel",
+    }
+    if not isinstance(native, dict) or set(native) != expected_native_keys:
+        raise RuntimeError("native window observation is missing or unexpected")
+    if (
+        type(native.get("window_handle")) is not int
+        or native["window_handle"] <= 0
+        or type(native.get("style")) is not int
+        or type(native.get("extended_style")) is not int
+        or native.get("tk_overrideredirect") is not True
+        or native.get("tk_topmost") is not True
+        or native.get("tk_resizable") != [False, False]
+        or native.get("has_caption") is not False
+        or native.get("has_thickframe") is not False
+        or native.get("native_topmost") is not True
+        or native.get("foreground_hwnd_after_active_show")
+        != native.get("window_handle")
+        or native.get("foreground_matches_panel") is not True
+    ):
+        raise RuntimeError("native chromeless/foreground window evidence is invalid")
+
+    placement = run.get("placement_observation")
+    if not isinstance(placement, dict) or set(placement) != {
+        "pointer_offset_px",
+        "initial",
+        "reopen",
+    }:
+        raise RuntimeError("pointer placement observation is missing or unexpected")
+    if placement.get("pointer_offset_px") != POINTER_OFFSET_PX:
+        raise RuntimeError("pointer placement offset is invalid")
+    initial_placement = placement.get("initial")
+    reopen_placement = placement.get("reopen")
+    if not isinstance(initial_placement, dict) or set(initial_placement) != {
+        "cursor_position",
+        "work_area",
+        "expected_geometry",
+        "window_geometry",
+    }:
+        raise RuntimeError("initial pointer placement evidence is incomplete")
+    if not isinstance(reopen_placement, dict) or set(reopen_placement) != {
+        "cursor_position",
+        "work_area",
+        "previous_geometry",
+        "expected_geometry",
+        "window_geometry",
+    }:
+        raise RuntimeError("reopen pointer placement evidence is incomplete")
+    for label, observation in (
+        ("initial", initial_placement),
+        ("reopen", reopen_placement),
+    ):
+        cursor = observation.get("cursor_position")
+        work_area = observation.get("work_area")
+        expected = observation.get("expected_geometry")
+        geometry = observation.get("window_geometry")
+        if (
+            not valid_cursor_position(cursor)
+            or not valid_work_area(work_area)
+            or not _valid_viewport_geometry(expected)
+            or not _valid_viewport_geometry(geometry)
+            or expected != _expected_pointer_geometry(cursor, work_area)
+            or geometry != expected
+            or cursor_inside_geometry(cursor, geometry)
+        ):
+            raise RuntimeError(f"{label} pointer placement evidence is invalid")
+    if (
+        not _valid_viewport_geometry(reopen_placement.get("previous_geometry"))
+        or reopen_placement["previous_geometry"]
+        == reopen_placement["window_geometry"]
+        or initial_placement["window_geometry"]
+        == reopen_placement["window_geometry"]
+    ):
+        raise RuntimeError("reopen did not demonstrate pointer re-anchoring")
+
+    hover = run.get("hover_observation")
+    expected_hover_keys = {
+        "normal_border_color",
+        "active_border_color",
+        "active_countdown_text",
+        "enter_cursor_position",
+        "enter_delivery_elapsed_ms",
+        "exit_cursor_position",
+        "exit_delivery_elapsed_ms",
+        "window_geometry",
+    }
+    if not isinstance(hover, dict) or set(hover) != expected_hover_keys:
+        raise RuntimeError("hover observation is missing or unexpected")
+    hover_geometry = hover.get("window_geometry")
+    if (
+        str(hover.get("normal_border_color", "")).upper() != "#E5E7EB"
+        or str(hover.get("active_border_color", "")).upper() != "#2563EB"
+        or hover.get("active_countdown_text")
+        != "마우스 호버 중 · 자동 닫힘 일시정지"
+        or not _valid_viewport_geometry(hover_geometry)
+        or not valid_cursor_position(hover.get("enter_cursor_position"))
+        or not cursor_inside_geometry(hover["enter_cursor_position"], hover_geometry)
+        or not valid_cursor_position(hover.get("exit_cursor_position"))
+        or cursor_inside_geometry(hover["exit_cursor_position"], hover_geometry)
+        or any(
+            type(hover.get(field)) is not int
+            or not 0 <= hover[field] <= POINTER_DELIVERY_TIMEOUT_MS
+            for field in ("enter_delivery_elapsed_ms", "exit_delivery_elapsed_ms")
+        )
+    ):
+        raise RuntimeError("hover border/countdown evidence is invalid")
+
+    target_editor = run.get("target_editor_observation")
+    expected_target_editor = {
+        "prefill_value": "08:00",
+        "invalid_value": "24:30",
+        "validation_message": "24시간은 24:00으로만 입력할 수 있습니다.",
+        "invalid_callback_unchanged": True,
+        "saved_value": "07:30",
+        "saved_minutes": 450,
+        "saved_editor_closed": True,
+        "saved_prefill": "07:30",
+        "cancel_attempt_value": "06:00",
+        "cancel_skipped_callback": True,
+        "prefill_after_cancel": "07:30",
+    }
+    if target_editor != expected_target_editor:
+        raise RuntimeError("target editor evidence is incomplete or stale")
 
     refresh = run.get("refresh_observation")
     if not isinstance(refresh, dict) or set(refresh) != {
@@ -2465,8 +3157,10 @@ def _validate_run_evidence(
     }:
         raise RuntimeError("same-structure refresh observation is incomplete")
     if (
-        same_structure.get("signature_before") != [False, 6]
-        or same_structure.get("signature_after") != [False, 6]
+        same_structure.get("signature_before")
+        != [False, SYNTHETIC_TODAY_LINE_COUNT]
+        or same_structure.get("signature_after")
+        != [False, SYNTHETIC_TODAY_LINE_COUNT]
         or not valid_widget_identity(same_structure.get("widget_identity_before"))
         or same_structure.get("widget_identity_after")
         != same_structure.get("widget_identity_before")
@@ -2488,19 +3182,24 @@ def _validate_run_evidence(
         "short_timeout_ms",
         "window_handle_before",
         "widget_identity_before",
+        "idle_window_geometry",
         "idle_cursor_position",
         "idle_pointer_outside",
         "idle_elapsed_ms",
         "idle_withdrawn",
         "window_exists_after_idle",
         "first_reopen_visible",
+        "first_reopen_geometry",
         "hover_cursor_position",
         "hover_pointer_inside",
         "hover_elapsed_ms",
         "hover_visible",
         "interaction_depth",
+        "interaction_window_geometry",
         "interaction_elapsed_ms",
         "interaction_visible",
+        "rearmed_enter_window_geometry",
+        "rearmed_leave_window_geometry",
         "rearmed_cursor_position",
         "rearmed_pointer_outside",
         "rearmed_idle_elapsed_ms",
@@ -2521,23 +3220,11 @@ def _validate_run_evidence(
         "rearmed_idle_elapsed_ms",
     )
 
-    def valid_cursor_position(value: object) -> bool:
-        return bool(
-            isinstance(value, list)
-            and len(value) == 2
-            and all(type(coordinate) is int for coordinate in value)
-        )
-
-    checkpoint_geometry = states[-1]["window_geometry"]
-
-    def cursor_inside_checkpoint(value: list[int]) -> bool:
-        return bool(
-            checkpoint_geometry["x"] <= value[0]
-            < checkpoint_geometry["x"] + checkpoint_geometry["width"]
-            and checkpoint_geometry["y"] <= value[1]
-            < checkpoint_geometry["y"] + checkpoint_geometry["height"]
-        )
-
+    idle_geometry = idle.get("idle_window_geometry")
+    hover_geometry = idle.get("first_reopen_geometry")
+    interaction_geometry = idle.get("interaction_window_geometry")
+    rearmed_enter_geometry = idle.get("rearmed_enter_window_geometry")
+    rearmed_leave_geometry = idle.get("rearmed_leave_window_geometry")
     idle_cursor = idle.get("idle_cursor_position")
     hover_cursor = idle.get("hover_cursor_position")
     rearmed_cursor = idle.get("rearmed_cursor_position")
@@ -2549,12 +3236,22 @@ def _validate_run_evidence(
         or idle.get("window_handle_after") != idle.get("window_handle_before")
         or not valid_widget_identity(idle.get("widget_identity_before"))
         or idle.get("widget_identity_after") != idle.get("widget_identity_before")
+        or any(
+            not _valid_viewport_geometry(geometry)
+            for geometry in (
+                idle_geometry,
+                hover_geometry,
+                interaction_geometry,
+                rearmed_enter_geometry,
+                rearmed_leave_geometry,
+            )
+        )
         or not valid_cursor_position(idle_cursor)
-        or cursor_inside_checkpoint(idle_cursor)
+        or cursor_inside_geometry(idle_cursor, idle_geometry)
         or not valid_cursor_position(hover_cursor)
-        or not cursor_inside_checkpoint(hover_cursor)
+        or not cursor_inside_geometry(hover_cursor, hover_geometry)
         or not valid_cursor_position(rearmed_cursor)
-        or cursor_inside_checkpoint(rearmed_cursor)
+        or cursor_inside_geometry(rearmed_cursor, rearmed_leave_geometry)
         or any(
             type(idle.get(field)) is not int
             or idle[field] < SHORT_IDLE_TIMEOUT_MS
@@ -2617,17 +3314,20 @@ def _validate_run_evidence(
         if not isinstance(transition, dict) or set(transition) != {
             "phase",
             "expected",
+            "window_geometry",
             "cursor_position",
             "delivery_elapsed_ms",
         }:
             raise RuntimeError("native pointer transition shape is invalid")
         cursor = transition.get("cursor_position")
+        geometry = transition.get("window_geometry")
         elapsed = transition.get("delivery_elapsed_ms")
         if (
             transition.get("phase") != phase
             or transition.get("expected") != expected
+            or not _valid_viewport_geometry(geometry)
             or not valid_cursor_position(cursor)
-            or cursor_inside_checkpoint(cursor) is (expected == "leave")
+            or cursor_inside_geometry(cursor, geometry) is (expected == "leave")
             or type(elapsed) is not int
             or not 0 <= elapsed <= POINTER_DELIVERY_TIMEOUT_MS
         ):
@@ -2650,7 +3350,12 @@ def _validate_run_evidence(
     if sequences.count("enter") < 2 or sequences.count("leave") < 3:
         raise RuntimeError("native Tk pointer binding deliveries are incomplete")
 
-    if run.get("callbacks") != ["toggle_break", "prompt_snooze", "refresh"]:
+    if run.get("callbacks") != [
+        "edit_plan:450",
+        "toggle_break",
+        "prompt_snooze",
+        "refresh",
+    ]:
         raise RuntimeError("synthetic callback evidence is incomplete")
     focus_order = run.get("focus_order")
     if not isinstance(focus_order, list) or not all(
@@ -2659,17 +3364,41 @@ def _validate_run_evidence(
     ):
         raise RuntimeError("synthetic prompt focus evidence is incomplete")
     focus = run.get("nonactivating_focus_observation")
-    if not isinstance(focus, dict):
+    expected_focus_keys = {
+        "scope",
+        "cross_process_focus_excluded",
+        "repetitions",
+        "sentinel_hwnd",
+        "foreground_hwnd_before",
+        "tk_focus_before_is_sentinel",
+        "window_geometry_before",
+        "window_size_before",
+        "reopen_cursor_position",
+        "reopen_work_area",
+        "reopen_expected_geometry",
+        "observations",
+    }
+    if not isinstance(focus, dict) or set(focus) != expected_focus_keys:
         raise RuntimeError("nonactivating focus observation is missing")
+    focus_cursor = focus.get("reopen_cursor_position")
+    focus_work_area = focus.get("reopen_work_area")
+    focus_expected_geometry = focus.get("reopen_expected_geometry")
     if (
         focus.get("scope") != FOCUS_SCOPE
         or focus.get("cross_process_focus_excluded") is not True
         or focus.get("repetitions") != NONACTIVATING_SHOW_REPETITIONS
-        or type(focus.get("foreground_hwnd_before")) is not int
-        or focus["foreground_hwnd_before"] <= 0
+        or type(focus.get("sentinel_hwnd")) is not int
+        or focus.get("sentinel_hwnd") <= 0
+        or focus.get("foreground_hwnd_before") != focus.get("sentinel_hwnd")
         or not _valid_viewport_geometry(focus.get("window_geometry_before"))
         or focus.get("window_size_before") != list(VIEWPORT)
         or focus.get("tk_focus_before_is_sentinel") is not True
+        or not valid_cursor_position(focus_cursor)
+        or not valid_work_area(focus_work_area)
+        or not _valid_viewport_geometry(focus_expected_geometry)
+        or focus_expected_geometry
+        != _expected_pointer_geometry(focus_cursor, focus_work_area)
+        or focus_expected_geometry == focus.get("window_geometry_before")
     ):
         raise RuntimeError("nonactivating focus scope or precondition is invalid")
     observations = focus.get("observations")
@@ -2679,11 +3408,11 @@ def _validate_run_evidence(
         not isinstance(item, dict)
         or item.get("foreground_hwnd") != focus.get("foreground_hwnd_before")
         or item.get("tk_focus_is_sentinel") is not True
-        or item.get("window_geometry") != focus.get("window_geometry_before")
+        or item.get("window_geometry") != focus_expected_geometry
         or item.get("window_size") != list(VIEWPORT)
         for item in observations
     ):
-        raise RuntimeError("nonactivating focus/geometry evidence is inconsistent")
+        raise RuntimeError("nonactivating focus/re-anchor evidence is inconsistent")
     return run, run_digest
 
 
