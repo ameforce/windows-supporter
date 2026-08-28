@@ -267,6 +267,30 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         qa._decode_png(path)
 
     def test_schema_contract_fixture_finalizes_with_exact_artifact_transition(self) -> None:
+        renderer_module = qa.importlib.import_module(
+            "src.apps.wrike_worktime_panel"
+        )
+        renderer = qa._RendererApi(
+            WorktimeActivityPrompt=renderer_module.WorktimeActivityPrompt,
+            WorktimePanelDayRow=renderer_module.WorktimePanelDayRow,
+            WorktimePanelLine=renderer_module.WorktimePanelLine,
+            WorktimePanelModel=renderer_module.WorktimePanelModel,
+            WorktimeQuickPanel=renderer_module.WorktimeQuickPanel,
+        )
+        updated_model = qa._update_model_target(
+            qa._model(renderer),
+            "2026-08-25",
+            450,
+        )
+        updated_row = next(
+            row for row in updated_model.rows if row.date_key == "2026-08-25"
+        )
+        self.assertEqual(updated_row.target_minutes, 450)
+        self.assertEqual(
+            updated_row.summary,
+            "Wrike 7시간 30분 · 목표 7시간 30분 · 딱 맞음",
+        )
+
         work_area = {"left": 0, "top": 0, "right": 1920, "bottom": 1080}
         initial_cursor = [100, 100]
         geometry = {"x": 116, "y": 116, "width": 800, "height": 640}
@@ -299,7 +323,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 elif state_name == "target-editor-prefill":
                     labels.extend(
                         [
-                            "오늘 목표 순근무 시간",
+                            "2026-08-28 목표 순근무 시간",
                             "편집 중 · 자동 닫힘 일시정지",
                         ]
                     )
@@ -317,7 +341,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 elif state_name == "target-editor-save-cancel":
                     labels.extend(
                         [
-                            "오늘 목표 순근무 시간",
+                            "2026-08-28 목표 순근무 시간",
                             "편집 중 · 자동 닫힘 일시정지",
                         ]
                     )
@@ -370,7 +394,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
             ]
             target_revision = "fixture-revision"
             run = {
-                "schema_version": 4,
+                "schema_version": 5,
                 "runner_version": qa.RUNNER_VERSION,
                 "ok": True,
                 "output_root": str(root),
@@ -409,10 +433,16 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         "widget_identity_after": list(identity),
                         "geometry_before": dict(geometry),
                         "geometry_after": dict(geometry),
+                        "selection_before": "2026-08-28",
+                        "selection_after": "2026-09-03",
+                        "fallback_today_date_key": "2026-09-03",
+                        "target_editor_active_before": True,
+                        "target_editor_context_before": "2026-08-28",
+                        "target_editor_active_after": False,
                         "method_calls": {
                             "render_structure": 0,
                             "update_rendered_model": 1,
-                            "reconcile_geometry": 0,
+                            "reconcile_geometry": 1,
                         },
                     },
                 },
@@ -456,12 +486,19 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                     "window_geometry": dict(geometry),
                 },
                 "target_editor_observation": {
+                    "selected_date_key": "2026-08-28",
+                    "selected_date_after_click": "2026-08-28",
+                    "selected_row_index": 4,
+                    "selected_row_widget_index": 2,
+                    "selected_row_highlight_color": "#BFDBFE",
+                    "editor_title": "2026-08-28 목표 순근무 시간",
                     "prefill_value": "08:00",
                     "invalid_value": "24:30",
                     "validation_message": "24시간은 24:00으로만 입력할 수 있습니다.",
                     "invalid_callback_unchanged": True,
                     "saved_value": "07:30",
                     "saved_minutes": 450,
+                    "saved_callback": "edit_plan:2026-08-28:450",
                     "saved_editor_closed": True,
                     "saved_prefill": "07:30",
                     "cancel_attempt_value": "06:00",
@@ -572,7 +609,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                     "observations": observations,
                 },
                 "callbacks": [
-                    "edit_plan:450",
+                    "edit_plan:2026-08-28:450",
                     "toggle_break",
                     "prompt_snooze",
                     "refresh",
@@ -690,7 +727,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 "fixture finalized",
             )
             manifest = qa._load_json_object(root / "manifest.json", "manifest")
-            self.assertEqual(qa.RUNNER_VERSION, "3.0")
+            self.assertEqual(qa.RUNNER_VERSION, "3.1")
             self.assertEqual(manifest["schema_version"], 1)
             self.assertEqual(manifest["runner"]["version"], qa.RUNNER_VERSION)
             requirement_ids = [item["id"] for item in qa._requirements()]
@@ -705,6 +742,8 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
             self.assertTrue(all(item["reviewed"] for item in execution["checkpoints"]))
             self.assertTrue(any("60-second" in step for step in scenario["steps"]))
             self.assertTrue(any("1.2-second" in step for step in scenario["steps"]))
+            self.assertTrue(any("non-today row selection" in step for step in scenario["steps"]))
+            self.assertTrue(any("today fallback" in step for step in scenario["steps"]))
             self.assertTrue(any("provisional-vacation" in step for step in scenario["steps"]))
             self.assertEqual(manifest["result"]["status"], "passed")
             bindings = manifest["evidence_bindings"]
