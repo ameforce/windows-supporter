@@ -6,6 +6,8 @@ import math
 import os
 import queue
 import shutil
+import socket
+import ssl
 import tempfile
 import threading
 import traceback
@@ -19,11 +21,15 @@ from src.utils.subprocess_utils import build_python_module_command, is_frozen_ru
 from src.utils.ToolTip import ToolTip
 from src.apps.wrike_ical import (
     DEFAULT_POLL_TIMEOUT_SEC,
+    CalendarError,
+    CalendarErrorCode,
+    CalendarSuccess,
+    compile_vacation_calendar,
+    decode_calendar_response,
     fetch_calendar_text,
     matching_break_events,
-    parse_calendar,
+    parse_calendar_document,
     parse_ics,
-    read_calendar_response_text,
     vacation_events_for_day,
 )
 from src.apps.wrike_worktime import (
@@ -67,6 +73,18 @@ VACATION_ERROR_FETCH_FAILED = "calendar_fetch_failed"
 VACATION_ERROR_NAME_MISMATCH = "calendar_name_mismatch"
 VACATION_ERROR_SECRET_UNAVAILABLE = "secret_unavailable"
 VACATION_STATES = frozenset({"unconfigured", "loading", "fresh", "stale", "error"})
+VACATION_STATUS_ERROR_CODES = frozenset(
+    {
+        *(code.value for code in CalendarErrorCode),
+        VACATION_ERROR_FETCH_FAILED,
+        VACATION_ERROR_NAME_MISMATCH,
+        VACATION_ERROR_SECRET_UNAVAILABLE,
+    }
+)
+
+
+class _VacationRedirectRejected(Exception):
+    """Target-free marker for a rejected private-calendar redirect."""
 
 
 class Wrike:
@@ -1079,11 +1097,29 @@ class Wrike:
             self.__request_timelog_snapshot_refresh(force=False)
         return
 
+    def __worktime_panel_idle_timeout_ms(self) -> int:
+        try:
+            return max(1200, int(self.__tooltip_duration_ms))
+        except Exception:
+            return 1200
+
+    def __sync_worktime_panel_idle_timeout(self, panel=None) -> None:
+        target = self.__worktime_panel if panel is None else panel
+        setter = getattr(target, "set_idle_timeout_ms", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self.__worktime_panel_idle_timeout_ms())
+        except Exception:
+            pass
+        return
+
     def __ensure_worktime_panel(self, root):
         if root is None:
             return None
         panel = self.__worktime_panel
         if panel is not None and self.__worktime_panel_root is root:
+            self.__sync_worktime_panel_idle_timeout(panel)
             return panel
         if panel is not None:
             try:
@@ -1104,6 +1140,7 @@ class Wrike:
                 prompt_edit=self.__panel_prompt_edit,
                 prompt_snooze=self.__panel_prompt_snooze,
                 prompt_skip=self.__panel_prompt_skip,
+                idle_timeout_ms=self.__worktime_panel_idle_timeout_ms(),
             )
         except Exception:
             return None
@@ -1138,6 +1175,28 @@ class Wrike:
             "target_net_minutes": int(target),
             "clock_in": plan.get("clock_in"),
             "explicit": explicit,
+        }
+
+    @staticmethod
+    def __calculation_only_vacation_result(result) -> dict:
+        source = result if isinstance(result, dict) else {}
+        try:
+            event_count = max(0, int(source.get("event_count", 0)))
+        except Exception:
+            event_count = 0
+        intervals = []
+        for span in source.get("intervals") or []:
+            try:
+                start, end = span
+            except Exception:
+                continue
+            if isinstance(start, datetime) and isinstance(end, datetime):
+                intervals.append((start, end))
+        return {
+            "calendar_matched": source.get("calendar_matched") is True,
+            "all_day": source.get("all_day") is True,
+            "intervals": intervals,
+            "event_count": event_count,
         }
 
     def __vacation_result_for_date(self, target_day) -> dict:
@@ -1204,7 +1263,7 @@ class Wrike:
                 "using_last_good": False,
                 "error_code": VACATION_ERROR_FETCH_FAILED,
             }
-        normalized = dict(result) if isinstance(result, dict) else {}
+        normalized = self.__calculation_only_vacation_result(result)
         with self.__vacation_ical_lock:
             if calendar is not self.__vacation_ical_calendar:
                 return {
@@ -1299,7 +1358,14 @@ class Wrike:
             pieces.append("partial")
         return " · ".join(pieces)
 
-    def __visible_activity_prompt(self, now, day_plan=None):
+    def __live_activity_prompt_detected_at(
+        self,
+        now,
+        day_plan=None,
+        expected_detected_time: str | None = None,
+    ) -> datetime | None:
+        if not isinstance(now, datetime) or now.tzinfo is not None:
+            return None
         try:
             resolved_plan = (
                 day_plan
@@ -1318,6 +1384,25 @@ class Wrike:
         except Exception:
             return None
         if detected.tzinfo is not None or detected.date() != now.date():
+            return None
+        if (
+            expected_detected_time is not None
+            and detected.strftime("%H:%M") != str(expected_detected_time).strip()
+        ):
+            return None
+        try:
+            vacation = self.__vacation_result_for_date(now.date())
+        except Exception:
+            return None
+        if vacation.get("automatic_prompt_allowed") is not True:
+            return None
+        if vacation.get("all_day") is True:
+            return None
+        return detected
+
+    def __visible_activity_prompt(self, now, day_plan=None):
+        detected = self.__live_activity_prompt_detected_at(now, day_plan)
+        if detected is None:
             return None
         return WorktimeActivityPrompt(detected.strftime("%H:%M"))
 
@@ -1341,6 +1426,8 @@ class Wrike:
             if overview.expected_available
             else "조회 불가"
         )
+        provisional = not overview.vacation_available
+        expected_display = expected_text + (" (임시)" if provisional else "")
         clock_text = (
             overview.clock_in.strftime("%H:%M")
             if overview.clock_in is not None
@@ -1354,14 +1441,22 @@ class Wrike:
         sync_text = self.__snapshot_sync_text(snapshot, now)
         today_lines = (
             WorktimePanelLine(
-                f"Wrike 기록 {recorded_text} · 현재 기대 {expected_text}",
+                f"Wrike 기록 {recorded_text} · 현재 기대 {expected_display}",
                 "#2563EB"
-                if overview.recorded_available and overview.expected_available
+                if (
+                    overview.recorded_available
+                    and overview.expected_available
+                    and not provisional
+                )
                 else "#6B7280",
             ),
-            WorktimePanelLine(f"현재 기준 {delta_text}", delta_color),
             WorktimePanelLine(
-                f"출근 {clock_text} · 예상 퇴근 {quit_text}",
+                f"현재 기준 {delta_text}" + (" (임시)" if provisional else ""),
+                delta_color,
+            ),
+            WorktimePanelLine(
+                f"출근 {clock_text} · 예상 퇴근 {quit_text}"
+                + (" (임시)" if provisional else ""),
                 "#111827",
             ),
             WorktimePanelLine(
@@ -1374,7 +1469,11 @@ class Wrike:
                     f"휴가 차감 {self.__format_minutes(overview.vacation_minutes)} · "
                     f"적용 목표 {self.__format_minutes(overview.effective_target_minutes)}"
                     if overview.vacation_available
-                    else f"휴가 확인 {overview.vacation_state} · 적용 목표 조회 불가"
+                    else (
+                        f"휴가 미확정 ({overview.vacation_state}) · "
+                        "휴가 미반영 임시 목표 "
+                        f"{self.__format_minutes(overview.effective_target_minutes)} (임시)"
+                    )
                 ),
                 "#6B7280",
             ),
@@ -1416,12 +1515,21 @@ class Wrike:
                     vacation_minutes = 0
             effective_target = max(0, target - vacation_minutes)
             recorded = snapshot.recorded_minutes_for(target_day)
+            vacation_state = str(
+                vacation.get("availability_state") or "error"
+            )
             if target_day > now.date():
                 if not vacation_available:
-                    summary = (
-                        f"목표 {self.__format_minutes(target)} · 휴가 확인 "
-                        f"{vacation.get('availability_state') or 'error'}"
-                    )
+                    if target <= 0:
+                        summary = (
+                            f"휴무 · 휴가 미확정 ({vacation_state}) (임시)"
+                        )
+                    else:
+                        summary = (
+                            "휴가 미반영 임시 목표 "
+                            f"{self.__format_minutes(target)} · "
+                            f"휴가 미확정 ({vacation_state}) (임시)"
+                        )
                 elif target <= 0:
                     summary = "휴무"
                 elif vacation_minutes > 0:
@@ -1439,26 +1547,47 @@ class Wrike:
                         overview.realtime_delta_minutes
                     )
                     summary = (
-                        f"Wrike {recorded_text} · 현재 기대 {expected_text} · {status}"
+                        f"Wrike {recorded_text} · 현재 기대 {expected_display} · {status}"
                     )
+                    if provisional:
+                        summary += f" · 휴가 미확정 ({overview.vacation_state})"
                 elif not overview.expected_available:
                     summary = (
-                        f"Wrike {recorded_text} · 현재 기대 조회 불가 · 휴가 확인 "
-                        f"{overview.vacation_state}"
+                        f"Wrike {recorded_text} · 현재 기대 조회 불가 · 휴가 미확정 "
+                        f"({overview.vacation_state})"
                     )
                     color = "#6B7280"
                 else:
                     summary = (
                         "Wrike 조회 불가 · 현재 기대 "
-                        f"{self.__format_minutes(overview.expected_now_minutes)}"
+                        f"{expected_display}"
                     )
+                    if provisional:
+                        summary += f" · 휴가 미확정 ({overview.vacation_state})"
                     color = "#6B7280"
             elif not vacation_available:
-                summary = (
-                    f"Wrike {self.__format_minutes(recorded) if recorded is not None else '조회 불가'}"
-                    f" · 휴가 확인 {vacation.get('availability_state') or 'error'}"
-                )
-                color = "#6B7280"
+                if recorded is None:
+                    if target <= 0:
+                        summary = (
+                            f"Wrike 조회 불가 · 휴무 · 휴가 미확정 "
+                            f"({vacation_state}) (임시)"
+                        )
+                    else:
+                        summary = (
+                            "Wrike 조회 불가 · 휴가 미반영 임시 목표 "
+                            f"{self.__format_minutes(target)} · "
+                            f"휴가 미확정 ({vacation_state}) (임시)"
+                        )
+                    color = "#6B7280"
+                else:
+                    delta = int(recorded) - int(target)
+                    status, color = self.__delta_text(delta)
+                    summary = (
+                        f"Wrike {self.__format_minutes(recorded)} · "
+                        "휴가 미반영 임시 목표 "
+                        f"{self.__format_minutes(target)} · {status} · "
+                        f"휴가 미확정 ({vacation_state}) (임시)"
+                    )
             elif recorded is None:
                 if effective_target <= 0:
                     summary = "휴무"
@@ -1541,7 +1670,7 @@ class Wrike:
         self.__save_clock_in(self.__lib.datetime.now().strftime("%H:%M"))
         return
 
-    def __edit_clock_in(self, initial_value: str) -> None:
+    def __ask_clock_in(self, initial_value: str) -> str | None:
         try:
             import importlib
 
@@ -1553,10 +1682,16 @@ class Wrike:
                 parent=self.__root,
             )
         except Exception:
-            edited = None
+            return None
+        if edited is None:
+            return None
+        return str(edited).strip()
+
+    def __edit_clock_in(self, initial_value: str) -> None:
+        edited = self.__ask_clock_in(initial_value)
         if edited is None:
             return
-        self.__save_clock_in(str(edited).strip())
+        self.__save_clock_in(edited)
         return
 
     def __panel_edit_clock_in(self) -> None:
@@ -1578,15 +1713,38 @@ class Wrike:
         return
 
     def __panel_prompt_accept(self, detected_time: str) -> None:
-        self.__save_clock_in(detected_time)
+        now = self.__lib.datetime.now()
+        if self.__live_activity_prompt_detected_at(
+            now,
+            expected_detected_time=detected_time,
+        ) is None:
+            return
+        self.__save_clock_in(str(detected_time).strip())
         return
 
     def __panel_prompt_edit(self, detected_time: str) -> None:
-        self.__edit_clock_in(str(detected_time))
+        now = self.__lib.datetime.now()
+        if self.__live_activity_prompt_detected_at(
+            now,
+            expected_detected_time=detected_time,
+        ) is None:
+            return
+        edited = self.__ask_clock_in(str(detected_time))
+        if edited is None:
+            return
+        now = self.__lib.datetime.now()
+        if self.__live_activity_prompt_detected_at(
+            now,
+            expected_detected_time=detected_time,
+        ) is None:
+            return
+        self.__save_clock_in(edited)
         return
 
     def __panel_prompt_snooze(self) -> None:
         now = self.__lib.datetime.now()
+        if self.__live_activity_prompt_detected_at(now) is None:
+            return
         try:
             ok, _error = self.__worktime_state_store.snooze_activity_prompt(
                 now.date(),
@@ -1604,6 +1762,8 @@ class Wrike:
 
     def __panel_prompt_skip(self) -> None:
         now = self.__lib.datetime.now()
+        if self.__live_activity_prompt_detected_at(now) is None:
+            return
         try:
             ok, _error = self.__worktime_state_store.skip_activity_prompt(
                 now.date()
@@ -1657,7 +1817,7 @@ class Wrike:
         if int(plan.get("target_net_minutes", 0)) <= 0:
             return
         vacation = self.__vacation_result_for_date(detected_at.date())
-        if vacation.get("automatic_prompt_allowed", True) is not True:
+        if vacation.get("automatic_prompt_allowed") is not True:
             return
         if bool(vacation.get("all_day")):
             return
@@ -2006,9 +2166,6 @@ class Wrike:
         with self.__vacation_ical_lock:
             protected = str(self.__vacation_ical_url_protected or "").strip()
             session = str(self.__vacation_ical_url_session or "").strip()
-            observed_name = str(
-                self.__vacation_ical_observed_calendar_name or ""
-            ).strip()
             last_success = self.__vacation_ical_last_success_ts
             last_error = str(self.__vacation_ical_last_error or "").strip()
             fetch_running = self.__vacation_ical_fetch_owner is not None
@@ -2026,17 +2183,15 @@ class Wrike:
         elif state not in VACATION_STATES:
             state = "error"
             error_code = error_code or VACATION_ERROR_FETCH_FAILED
-        elif state == "error" and error_code not in {
-            VACATION_ERROR_FETCH_FAILED,
-            VACATION_ERROR_NAME_MISMATCH,
-            VACATION_ERROR_SECRET_UNAVAILABLE,
-        }:
+        if state == "error" and not error_code:
+            error_code = VACATION_ERROR_FETCH_FAILED
+        elif error_code and error_code not in VACATION_STATUS_ERROR_CODES:
             error_code = VACATION_ERROR_FETCH_FAILED
         return {
             "secret_present": secret_present,
             "configured": configured,
-            "expected_calendar_name": VACATION_EXPECTED_CALENDAR_NAME,
-            "observed_calendar_name": observed_name,
+            "expected_calendar_name": "",
+            "observed_calendar_name": "",
             "state": state,
             "last_success_ts": last_success,
             "error_code": error_code,
@@ -2049,10 +2204,10 @@ class Wrike:
         self,
         url: str,
         timeout_sec: float = DEFAULT_POLL_TIMEOUT_SEC,
-    ) -> str | None:
+    ) -> CalendarSuccess[str] | CalendarError:
         cleaned = str(url or "").strip()
         if not self.__is_allowed_vacation_ical_url(cleaned):
-            return None
+            return CalendarError(CalendarErrorCode.INVALID_ENDPOINT)
         validator = self.__is_allowed_vacation_ical_url
 
         class VacationRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -2067,7 +2222,7 @@ class Wrike:
             ):
                 absolute_url = urllib.parse.urljoin(request.full_url, new_url)
                 if not validator(absolute_url):
-                    raise urllib.error.URLError("vacation calendar redirect rejected")
+                    raise _VacationRedirectRejected() from None
                 return super().redirect_request(
                     request,
                     fp,
@@ -2077,12 +2232,26 @@ class Wrike:
                     absolute_url,
                 )
 
+        def http_error_for(status) -> CalendarError | None:
+            try:
+                code = int(status)
+            except Exception:
+                return None
+            if 400 <= code <= 499:
+                return CalendarError(CalendarErrorCode.HTTP_4XX)
+            if 500 <= code <= 599:
+                return CalendarError(CalendarErrorCode.HTTP_5XX)
+            if 300 <= code <= 399:
+                return CalendarError(CalendarErrorCode.REDIRECT_REJECTED)
+            return None
+
         try:
             request = urllib.request.Request(
                 cleaned,
                 headers={
                     "User-Agent": "windows-supporter/vacation-ical",
                     "Accept": "text/calendar",
+                    "Accept-Encoding": "gzip, identity",
                 },
             )
             opener = urllib.request.build_opener(VacationRedirectHandler())
@@ -2092,10 +2261,39 @@ class Wrike:
             ) as response:
                 final_url = str(response.geturl() or "").strip()
                 if not self.__is_allowed_vacation_ical_url(final_url):
-                    return None
-                return read_calendar_response_text(response)
+                    return CalendarError(CalendarErrorCode.REDIRECT_REJECTED)
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if callable(getcode) else None
+                http_error = http_error_for(status)
+                if http_error is not None:
+                    return http_error
+                return decode_calendar_response(response)
+        except _VacationRedirectRejected:
+            return CalendarError(CalendarErrorCode.REDIRECT_REJECTED)
+        except urllib.error.HTTPError as exc:
+            return http_error_for(getattr(exc, "code", None)) or CalendarError(
+                CalendarErrorCode.DNS_OR_CONNECT
+            )
+        except (TimeoutError, socket.timeout):
+            return CalendarError(CalendarErrorCode.TIMEOUT)
+        except (ssl.SSLCertVerificationError, ssl.CertificateError, ssl.SSLError):
+            return CalendarError(CalendarErrorCode.TLS_VALIDATION)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                return CalendarError(CalendarErrorCode.TIMEOUT)
+            if isinstance(
+                reason,
+                (ssl.SSLCertVerificationError, ssl.CertificateError, ssl.SSLError),
+            ):
+                return CalendarError(CalendarErrorCode.TLS_VALIDATION)
+            return CalendarError(CalendarErrorCode.DNS_OR_CONNECT)
+        except (ConnectionError, socket.gaierror, OSError):
+            return CalendarError(CalendarErrorCode.DNS_OR_CONNECT)
         except Exception:
-            return None
+            return CalendarError(CalendarErrorCode.DNS_OR_CONNECT)
 
     def __cancel_vacation_ical_after(self) -> None:
         root = self.__root
@@ -2154,6 +2352,7 @@ class Wrike:
         generation = int(self.__vacation_ical_generation)
         with self.__vacation_ical_lock:
             self.__vacation_ical_fetch_owner = None
+            self.__vacation_ical_observed_calendar_name = ""
             secret_present = bool(
                 str(self.__vacation_ical_url_protected or "").strip()
                 or str(self.__vacation_ical_url_session or "").strip()
@@ -2208,25 +2407,58 @@ class Wrike:
             )
 
         def worker() -> None:
-            text = self.__fetch_vacation_calendar_text(
+            fetch_result = self.__fetch_vacation_calendar_text(
                 url,
                 float(DEFAULT_POLL_TIMEOUT_SEC),
             )
             parsed_calendar = None
-            if text:
+            compiled_calendar = None
+            parse_succeeded = False
+            failure_code = VACATION_ERROR_FETCH_FAILED
+            if isinstance(fetch_result, CalendarError):
+                failure_code = fetch_result.code.value
+            elif isinstance(fetch_result, CalendarSuccess):
                 try:
-                    parsed_calendar = parse_calendar(text)
+                    parse_result = parse_calendar_document(fetch_result.value)
                 except Exception:
-                    parsed_calendar = None
+                    parse_result = CalendarError(CalendarErrorCode.INVALID_ICAL)
+                if isinstance(parse_result, CalendarSuccess) and isinstance(
+                    parse_result.value,
+                    dict,
+                ):
+                    parsed_calendar = parse_result.value
+                    parse_succeeded = True
+                    failure_code = ""
+                elif isinstance(parse_result, CalendarError):
+                    failure_code = parse_result.code.value
+                else:
+                    failure_code = CalendarErrorCode.INVALID_ICAL.value
             observed_name = ""
             if isinstance(parsed_calendar, dict):
                 observed_name = str(
                     parsed_calendar.get("calendar_name") or ""
                 ).strip()
             calendar_matches = bool(
-                isinstance(parsed_calendar, dict)
-                and observed_name == expected_name
+                parse_succeeded and observed_name == expected_name
             )
+            if calendar_matches:
+                try:
+                    candidate = compile_vacation_calendar(
+                        parsed_calendar,
+                        expected_name,
+                    )
+                except Exception:
+                    candidate = None
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("calendar_matched") is True
+                ):
+                    compiled_calendar = candidate
+                else:
+                    parse_succeeded = False
+                    failure_code = CalendarErrorCode.INVALID_ICAL.value
+            parsed_calendar = None
+            observed_name = ""
 
             def apply_result() -> None:
                 with self.__vacation_ical_lock:
@@ -2245,20 +2477,26 @@ class Wrike:
 
                 log_message = ""
                 with self.__vacation_ical_lock:
-                    if parsed_calendar is None:
-                        self.__vacation_ical_state = "error"
-                        self.__vacation_ical_last_error = (
-                            VACATION_ERROR_FETCH_FAILED
+                    self.__vacation_ical_observed_calendar_name = ""
+                    if not parse_succeeded:
+                        stable_code = (
+                            failure_code
+                            if failure_code in VACATION_STATUS_ERROR_CODES
+                            else VACATION_ERROR_FETCH_FAILED
                         )
-                        log_message = "vacation ical fetch failed; last-good retained"
+                        self.__vacation_ical_state = "error"
+                        self.__vacation_ical_last_error = stable_code
+                        log_message = (
+                            f"vacation ical failed: {stable_code}; last-good retained"
+                        )
                     elif not calendar_matches:
                         self.__vacation_ical_state = "error"
-                        self.__vacation_ical_observed_calendar_name = observed_name
                         self.__vacation_ical_last_error = (
                             VACATION_ERROR_NAME_MISMATCH
                         )
                         log_message = (
-                            "vacation ical calendar name mismatch; last-good retained"
+                            "vacation ical failed: calendar_name_mismatch; "
+                            "last-good retained"
                         )
                     else:
                         self.__vacation_ical_state = "fresh"
@@ -2268,8 +2506,7 @@ class Wrike:
                                 timespec="seconds"
                             )
                         )
-                        self.__vacation_ical_observed_calendar_name = observed_name
-                        self.__vacation_ical_calendar = parsed_calendar
+                        self.__vacation_ical_calendar = compiled_calendar
                         self.__vacation_ical_events_for_date = ""
                         self.__vacation_ical_day_result = {}
                         self.__vacation_ical_week_cache_calendar = None
@@ -2324,6 +2561,7 @@ class Wrike:
             )
         except Exception:
             result = {}
+        result = self.__calculation_only_vacation_result(result)
         with self.__vacation_ical_lock:
             if calendar is not self.__vacation_ical_calendar:
                 return {}
@@ -3568,15 +3806,9 @@ class Wrike:
                 vacation_status["configured"]
             ),
             "vacation_ical_configured": bool(vacation_status["configured"]),
-            "vacation_expected_calendar_name": str(
-                vacation_status["expected_calendar_name"]
-            ),
-            "vacation_observed_calendar_name": str(
-                vacation_status["observed_calendar_name"]
-            ),
-            "vacation_calendar_name": str(
-                vacation_status["observed_calendar_name"]
-            ),
+            "vacation_expected_calendar_name": "",
+            "vacation_observed_calendar_name": "",
+            "vacation_calendar_name": "",
             "vacation_ical_state": str(vacation_status["state"]),
             "vacation_ical_poll_interval_sec": float(
                 self.__vacation_ical_poll_interval_sec
@@ -3820,6 +4052,7 @@ class Wrike:
         if not self.__save_settings():
             self.__restore_settings_runtime_state(previous_runtime_state)
             return False, "settings save failed"
+        self.__sync_worktime_panel_idle_timeout()
         self.__restart_monitor()
         self.__start_ical_polling()
         self.__start_vacation_ical_polling()
@@ -4119,9 +4352,15 @@ class Wrike:
         except Exception:
             self.__daily_target_minutes = int(self.__time_log_default_daily_minutes)
         try:
-            self.__tooltip_duration_ms = int(data.get("tooltip_duration_ms", self.__tooltip_duration_ms))
+            loaded_tooltip_ms = int(
+                data.get("tooltip_duration_ms", self.__tooltip_duration_ms)
+            )
         except Exception:
-            self.__tooltip_duration_ms = int(self.__tooltip_duration_ms)
+            loaded_tooltip_ms = 1200
+            needs_save = True
+        self.__tooltip_duration_ms = max(1200, loaded_tooltip_ms)
+        if self.__tooltip_duration_ms != loaded_tooltip_ms:
+            needs_save = True
         try:
             self.__monitor_enabled = bool(data.get("monitor_enabled", self.__monitor_enabled))
         except Exception:
