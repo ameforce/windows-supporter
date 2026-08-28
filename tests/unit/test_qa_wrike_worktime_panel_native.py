@@ -267,7 +267,12 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         qa._decode_png(path)
 
     def test_schema_contract_fixture_finalizes_with_exact_artifact_transition(self) -> None:
-        geometry = {"x": -320, "y": 40, "width": 800, "height": 540}
+        work_area = {"left": 0, "top": 0, "right": 1920, "bottom": 1080}
+        initial_cursor = [100, 100]
+        geometry = {"x": 116, "y": 116, "width": 800, "height": 640}
+        reopen_cursor = [1800, 900]
+        reopen_geometry = {"x": 984, "y": 244, "width": 800, "height": 640}
+        idle_reopen_geometry = {"x": 16, "y": 16, "width": 800, "height": 640}
         identity = [".!toplevel", ".!toplevel.!frame", ".!toplevel.!frame.!label"]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -279,16 +284,55 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 screenshot = self._write(
                     root,
                     filename,
-                    _rgba_png(width=800, height=540, fill=index),
+                    _rgba_png(width=800, height=640, fill=index),
                 )
                 decoded = qa._decode_png(screenshot)
-                labels = []
-                if state_name == "vacation-provisional":
-                    labels = [
-                        "Wrike 기록 5시간 30분 · 현재 기대 5시간 (임시)",
-                        "현재 기준 초과 30분 (임시)",
-                        "휴가 미확정 (loading) · 휴가 미반영 임시 목표 8시간 (임시)",
-                    ]
+                labels = [qa.NORMAL_SYNC_LABEL]
+                buttons = []
+                entries = []
+                shell_border_color = "#E5E7EB"
+                if state_name == "initial":
+                    labels.append("60초 후 닫힘")
+                elif state_name == "hover-active":
+                    labels.append("마우스 호버 중 · 자동 닫힘 일시정지")
+                    shell_border_color = "#2563EB"
+                elif state_name == "target-editor-prefill":
+                    labels.extend(
+                        [
+                            "오늘 목표 순근무 시간",
+                            "편집 중 · 자동 닫힘 일시정지",
+                        ]
+                    )
+                    buttons = ["저장", "취소"]
+                    entries = ["08:00"]
+                elif state_name == "target-editor-validation":
+                    labels.extend(
+                        [
+                            "24시간은 24:00으로만 입력할 수 있습니다.",
+                            "편집 중 · 자동 닫힘 일시정지",
+                        ]
+                    )
+                    buttons = ["저장", "취소"]
+                    entries = ["24:30"]
+                elif state_name == "target-editor-save-cancel":
+                    labels.extend(
+                        [
+                            "오늘 목표 순근무 시간",
+                            "편집 중 · 자동 닫힘 일시정지",
+                        ]
+                    )
+                    buttons = ["저장", "취소"]
+                    entries = ["07:30"]
+                elif state_name == "vacation-provisional":
+                    labels.extend(
+                        [
+                            "Wrike 기록 5시간 30분 · 현재 기대 5시간 (임시)",
+                            "현재 기준 초과 30분 (임시)",
+                            "휴가 미확정 (loading) · 휴가 미반영 임시 목표 8시간 (임시)",
+                        ]
+                    )
+                elif state_name == "error-last-good":
+                    labels = [qa.ERROR_SYNC_LABEL]
                 states.append(
                     {
                         "state": state_name,
@@ -298,13 +342,18 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         "png_signature": qa.PNG_SIGNATURE.hex(),
                         "png_fully_decoded": True,
                         "png_decoded_bytes": decoded["decoded_bytes"],
-                        "window_size": [800, 540],
+                        "window_size": [800, 640],
                         "window_geometry": dict(geometry),
                         "labels": labels,
+                        "buttons": buttons,
+                        "entries": entries,
+                        "focus_text": "",
+                        "focus_entry_value": entries[0] if entries else "",
+                        "shell_border_color": shell_border_color,
                         "capture_provenance": {
                             **qa.CAPTURE_PROVENANCE,
                             "window_handle": 123,
-                            "client_dimensions": [800, 540],
+                            "client_dimensions": [800, 640],
                         },
                         "ok": True,
                     }
@@ -314,14 +363,14 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                     "attempt": attempt,
                     "foreground_hwnd": 456,
                     "tk_focus_is_sentinel": True,
-                    "window_geometry": dict(geometry),
-                    "window_size": [800, 540],
+                    "window_geometry": dict(reopen_geometry),
+                    "window_size": [800, 640],
                 }
                 for attempt in range(1, qa.NONACTIVATING_SHOW_REPETITIONS + 1)
             ]
             target_revision = "fixture-revision"
             run = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "runner_version": qa.RUNNER_VERSION,
                 "ok": True,
                 "output_root": str(root),
@@ -334,7 +383,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                     "focus": qa.FOCUS_SCOPE,
                     "exclusions": [dict(item) for item in qa.SCOPE_EXCLUSIONS],
                 },
-                "viewport": [800, 540],
+                "viewport": [800, 640],
                 "states": states,
                 "assertions": {
                     name: True for name in qa.REQUIRED_ASSERTIONS
@@ -354,8 +403,8 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         },
                     },
                     "same_structure": {
-                        "signature_before": [False, 6],
-                        "signature_after": [False, 6],
+                        "signature_before": [False, qa.SYNTHETIC_TODAY_LINE_COUNT],
+                        "signature_after": [False, qa.SYNTHETIC_TODAY_LINE_COUNT],
                         "widget_identity_before": list(identity),
                         "widget_identity_after": list(identity),
                         "geometry_before": dict(geometry),
@@ -367,25 +416,82 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         },
                     },
                 },
+                "native_window_observation": {
+                    "window_handle": 123,
+                    "tk_overrideredirect": True,
+                    "tk_topmost": True,
+                    "tk_resizable": [False, False],
+                    "style": 0,
+                    "extended_style": 8,
+                    "has_caption": False,
+                    "has_thickframe": False,
+                    "native_topmost": True,
+                    "foreground_hwnd_after_active_show": 123,
+                    "foreground_matches_panel": True,
+                },
+                "placement_observation": {
+                    "pointer_offset_px": qa.POINTER_OFFSET_PX,
+                    "initial": {
+                        "cursor_position": list(initial_cursor),
+                        "work_area": dict(work_area),
+                        "expected_geometry": dict(geometry),
+                        "window_geometry": dict(geometry),
+                    },
+                    "reopen": {
+                        "cursor_position": list(reopen_cursor),
+                        "work_area": dict(work_area),
+                        "previous_geometry": dict(geometry),
+                        "expected_geometry": dict(reopen_geometry),
+                        "window_geometry": dict(reopen_geometry),
+                    },
+                },
+                "hover_observation": {
+                    "normal_border_color": "#E5E7EB",
+                    "active_border_color": "#2563EB",
+                    "active_countdown_text": "마우스 호버 중 · 자동 닫힘 일시정지",
+                    "enter_cursor_position": [200, 200],
+                    "enter_delivery_elapsed_ms": 1,
+                    "exit_cursor_position": [1919, 1079],
+                    "exit_delivery_elapsed_ms": 1,
+                    "window_geometry": dict(geometry),
+                },
+                "target_editor_observation": {
+                    "prefill_value": "08:00",
+                    "invalid_value": "24:30",
+                    "validation_message": "24시간은 24:00으로만 입력할 수 있습니다.",
+                    "invalid_callback_unchanged": True,
+                    "saved_value": "07:30",
+                    "saved_minutes": 450,
+                    "saved_editor_closed": True,
+                    "saved_prefill": "07:30",
+                    "cancel_attempt_value": "06:00",
+                    "cancel_skipped_callback": True,
+                    "prefill_after_cancel": "07:30",
+                },
                 "idle_observation": {
                     "normal_timeout_ms": qa.CAPTURE_IDLE_TIMEOUT_MS,
                     "short_timeout_ms": qa.SHORT_IDLE_TIMEOUT_MS,
                     "window_handle_before": 123,
                     "widget_identity_before": list(identity),
-                    "idle_cursor_position": [500, 600],
+                    "idle_window_geometry": dict(reopen_geometry),
+                    "idle_cursor_position": [0, 0],
                     "idle_pointer_outside": True,
                     "idle_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
                     "idle_withdrawn": True,
                     "window_exists_after_idle": True,
                     "first_reopen_visible": True,
-                    "hover_cursor_position": [0, 100],
+                    "first_reopen_geometry": dict(idle_reopen_geometry),
+                    "hover_cursor_position": [100, 100],
                     "hover_pointer_inside": True,
                     "hover_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
                     "hover_visible": True,
                     "interaction_depth": 1,
+                    "interaction_window_geometry": dict(idle_reopen_geometry),
                     "interaction_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
                     "interaction_visible": True,
-                    "rearmed_cursor_position": [500, 600],
+                    "rearmed_enter_window_geometry": dict(idle_reopen_geometry),
+                    "rearmed_leave_window_geometry": dict(idle_reopen_geometry),
+                    "rearmed_cursor_position": [1919, 1079],
                     "rearmed_pointer_outside": True,
                     "rearmed_idle_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
                     "rearmed_idle_withdrawn": True,
@@ -404,31 +510,36 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         {
                             "phase": "idle",
                             "expected": "leave",
-                            "cursor_position": [500, 600],
+                            "window_geometry": dict(reopen_geometry),
+                            "cursor_position": [0, 0],
                             "delivery_elapsed_ms": 1,
                         },
                         {
                             "phase": "hover",
                             "expected": "enter",
-                            "cursor_position": [0, 100],
+                            "window_geometry": dict(idle_reopen_geometry),
+                            "cursor_position": [100, 100],
                             "delivery_elapsed_ms": 1,
                         },
                         {
                             "phase": "interaction",
                             "expected": "leave",
-                            "cursor_position": [500, 600],
+                            "window_geometry": dict(idle_reopen_geometry),
+                            "cursor_position": [1919, 1079],
                             "delivery_elapsed_ms": 1,
                         },
                         {
                             "phase": "rearmed-enter",
                             "expected": "enter",
-                            "cursor_position": [0, 100],
+                            "window_geometry": dict(idle_reopen_geometry),
+                            "cursor_position": [100, 100],
                             "delivery_elapsed_ms": 1,
                         },
                         {
                             "phase": "rearmed-leave",
                             "expected": "leave",
-                            "cursor_position": [500, 600],
+                            "window_geometry": dict(idle_reopen_geometry),
+                            "cursor_position": [1919, 1079],
                             "delivery_elapsed_ms": 1,
                         },
                     ],
@@ -454,10 +565,18 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                     "foreground_hwnd_before": 456,
                     "tk_focus_before_is_sentinel": True,
                     "window_geometry_before": dict(geometry),
-                    "window_size_before": [800, 540],
+                    "window_size_before": [800, 640],
+                    "reopen_cursor_position": list(reopen_cursor),
+                    "reopen_work_area": dict(work_area),
+                    "reopen_expected_geometry": dict(reopen_geometry),
                     "observations": observations,
                 },
-                "callbacks": ["toggle_break", "prompt_snooze", "refresh"],
+                "callbacks": [
+                    "edit_plan:450",
+                    "toggle_break",
+                    "prompt_snooze",
+                    "refresh",
+                ],
                 "runtime_errors": [],
                 "first_failure": None,
                 "fixture_contains_real_identity": False,
@@ -496,7 +615,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 if state["state"] == "vacation-provisional"
             )
             provisional_labels = provisional["labels"]
-            provisional["labels"] = []
+            provisional["labels"] = [qa.NORMAL_SYNC_LABEL]
             write_run()
             with self.assertRaisesRegex(RuntimeError, "provisional vacation wording"):
                 qa._validate_run_evidence(root)
@@ -571,7 +690,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 "fixture finalized",
             )
             manifest = qa._load_json_object(root / "manifest.json", "manifest")
-            self.assertEqual(qa.RUNNER_VERSION, "2.3")
+            self.assertEqual(qa.RUNNER_VERSION, "3.0")
             self.assertEqual(manifest["schema_version"], 1)
             self.assertEqual(manifest["runner"]["version"], qa.RUNNER_VERSION)
             requirement_ids = [item["id"] for item in qa._requirements()]
@@ -655,15 +774,15 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
     def test_full_geometry_contract_requires_xy_and_exact_viewport(self) -> None:
         self.assertTrue(
             qa._valid_viewport_geometry(
-                {"x": -900, "y": 40, "width": 800, "height": 540}
+                {"x": -900, "y": 40, "width": 800, "height": 640}
             )
         )
         self.assertFalse(
-            qa._valid_viewport_geometry({"width": 800, "height": 540})
+            qa._valid_viewport_geometry({"width": 800, "height": 640})
         )
         self.assertFalse(
             qa._valid_viewport_geometry(
-                {"x": 0, "y": 0, "width": 801, "height": 540}
+                {"x": 0, "y": 0, "width": 801, "height": 640}
             )
         )
 

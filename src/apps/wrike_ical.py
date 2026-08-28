@@ -32,6 +32,8 @@ class CalendarErrorCode(str, Enum):
     REDIRECT_REJECTED = "redirect_rejected"
     HTTP_4XX = "http_4xx"
     HTTP_5XX = "http_5xx"
+    AUTHENTICATION_REQUIRED = "authentication_required"
+    UNEXPECTED_CONTENT_TYPE = "unexpected_content_type"
     DNS_OR_CONNECT = "dns_or_connect"
     TIMEOUT = "timeout"
     TLS_VALIDATION = "tls_validation"
@@ -132,6 +134,54 @@ def _response_content_encoding(response) -> str | None:
     return encoding if encoding in {"identity", "gzip"} else None
 
 
+def _response_media_type(response) -> str | None:
+    values = _response_header_values(response, "Content-Type")
+    if not values:
+        return ""
+    if len(values) != 1:
+        return None
+    return values[0].split(";", 1)[0].strip().lower()
+
+
+def _response_content_type_error(media_type: str | None) -> CalendarErrorCode | None:
+    if media_type is None:
+        return CalendarErrorCode.UNEXPECTED_CONTENT_TYPE
+    if media_type in {
+        "",
+        "text/html",
+        "application/xhtml+xml",
+        "text/calendar",
+        "application/calendar",
+        "application/ics",
+        "text/plain",
+        "application/octet-stream",
+    }:
+        return None
+    return CalendarErrorCode.UNEXPECTED_CONTENT_TYPE
+
+
+def _html_authentication_required(payload: bytes) -> bool:
+    lowered = payload.lower()
+    if re.search(
+        br"\btype\s*=\s*['\"]?password(?:['\"\s/>]|$)",
+        lowered,
+    ):
+        return True
+    if any(
+        marker in lowered
+        for marker in (
+            b"accounts.google.com",
+            b"login.microsoftonline.com",
+            b"login.live.com",
+        )
+    ):
+        return True
+    return b"<form" in lowered and any(
+        marker in lowered
+        for marker in (b"login", b"log in", b"signin", b"sign-in", b"sign in")
+    )
+
+
 def decode_calendar_response(
     response,
     limit_bytes: int = MAX_ICAL_BYTES,
@@ -141,6 +191,10 @@ def decode_calendar_response(
         limit = min(MAX_ICAL_BYTES, max(0, int(limit_bytes)))
     except Exception:
         return CalendarError(CalendarErrorCode.INVALID_ICAL)
+    media_type = _response_media_type(response)
+    content_type_error = _response_content_type_error(media_type)
+    if content_type_error is not None:
+        return CalendarError(content_type_error)
     if _declared_body_too_large(response, limit):
         return CalendarError(CalendarErrorCode.BODY_TOO_LARGE)
 
@@ -251,6 +305,13 @@ def decode_calendar_response(
     payload = b"".join(decoded_parts)
     if not payload:
         return CalendarError(CalendarErrorCode.EMPTY_BODY)
+    if media_type in {"text/html", "application/xhtml+xml"}:
+        code = (
+            CalendarErrorCode.AUTHENTICATION_REQUIRED
+            if _html_authentication_required(payload)
+            else CalendarErrorCode.UNEXPECTED_CONTENT_TYPE
+        )
+        return CalendarError(code)
     try:
         text = payload.decode("utf-8-sig", errors="strict")
     except UnicodeDecodeError:

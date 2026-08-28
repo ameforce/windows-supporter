@@ -87,6 +87,10 @@ class _VacationRedirectRejected(Exception):
     """Target-free marker for a rejected private-calendar redirect."""
 
 
+class _VacationAuthenticationRequired(Exception):
+    """Target-free marker for a redirect to an interactive login surface."""
+
+
 class Wrike:
     def __init__(self) -> None:
         self.__lib = LibConnector()
@@ -1133,7 +1137,7 @@ class Wrike:
                 refresh=self.__panel_refresh,
                 clock_in_now=self.__panel_clock_in_now,
                 edit_clock_in=self.__panel_edit_clock_in,
-                edit_plan=self.__open_settings_tab,
+                edit_plan=self.__panel_save_target_minutes,
                 toggle_break=self.__panel_toggle_break,
                 open_settings=self.__open_settings_tab,
                 prompt_accept=self.__panel_prompt_accept,
@@ -1477,12 +1481,6 @@ class Wrike:
                 ),
                 "#6B7280",
             ),
-            WorktimePanelLine(
-                f"동기화 {snapshot.state.value} · {sync_text}",
-                "#DC2626"
-                if snapshot.state is TimelogSnapshotState.ERROR
-                else "#6B7280",
-            ),
         )
 
         rows = []
@@ -1622,6 +1620,7 @@ class Wrike:
             sync_text=sync_text,
             sync_state=snapshot.state.value,
             today_lines=today_lines,
+            target_minutes=int(today_plan.get("target_net_minutes", 0)),
             has_clock_in=bool(today_plan.get("clock_in")),
             break_active=bool(break_state.get("active")),
             rows=tuple(rows),
@@ -1702,6 +1701,28 @@ class Wrike:
             return
         self.__edit_clock_in(existing)
         return
+
+    def __panel_save_target_minutes(self, target_minutes: int) -> bool:
+        if type(target_minutes) is not int or not 0 <= target_minutes <= 1440:
+            self.__show_panel_action_error(
+                "목표 순근무 시간은 00:00부터 24:00 사이여야 합니다"
+            )
+            return False
+        now = self.__lib.datetime.now()
+        try:
+            plan = self.__plan_for_date(now.date())
+            clock_in = plan.get("clock_in")
+            ok, _error = self.update_workday_plan(
+                now.date(),
+                target_minutes,
+                clock_in,
+            )
+        except Exception:
+            ok = False
+        if not ok:
+            self.__show_panel_action_error("오늘 목표를 저장하지 못했습니다")
+            return False
+        return True
 
     def __panel_toggle_break(self) -> None:
         try:
@@ -2222,6 +2243,14 @@ class Wrike:
             ):
                 absolute_url = urllib.parse.urljoin(request.full_url, new_url)
                 if not validator(absolute_url):
+                    try:
+                        login_host = (
+                            urllib.parse.urlparse(absolute_url).hostname or ""
+                        ).rstrip(".").lower()
+                    except Exception:
+                        login_host = ""
+                    if login_host in {"accounts.google.com", "login.microsoftonline.com"}:
+                        raise _VacationAuthenticationRequired() from None
                     raise _VacationRedirectRejected() from None
                 return super().redirect_request(
                     request,
@@ -2237,6 +2266,8 @@ class Wrike:
                 code = int(status)
             except Exception:
                 return None
+            if code in {401, 403}:
+                return CalendarError(CalendarErrorCode.AUTHENTICATION_REQUIRED)
             if 400 <= code <= 499:
                 return CalendarError(CalendarErrorCode.HTTP_4XX)
             if 500 <= code <= 599:
@@ -2270,6 +2301,8 @@ class Wrike:
                 if http_error is not None:
                     return http_error
                 return decode_calendar_response(response)
+        except _VacationAuthenticationRequired:
+            return CalendarError(CalendarErrorCode.AUTHENTICATION_REQUIRED)
         except _VacationRedirectRejected:
             return CalendarError(CalendarErrorCode.REDIRECT_REJECTED)
         except urllib.error.HTTPError as exc:
@@ -2306,6 +2339,36 @@ class Wrike:
         except Exception:
             pass
         return
+
+    def retry_vacation_ical(self) -> tuple[bool, str | None]:
+        """Immediately recheck the configured private feed without exposing it."""
+
+        with self.__vacation_ical_lock:
+            secret_present = bool(
+                str(self.__vacation_ical_url_protected or "").strip()
+                or str(self.__vacation_ical_url_session or "").strip()
+            )
+            has_last_good = bool(self.__vacation_ical_calendar)
+        if not secret_present:
+            return False, VACATION_ERROR_SECRET_UNAVAILABLE
+        url = self.__decode_vacation_ical_url()
+        if not url:
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_state = "error"
+                self.__vacation_ical_last_error = VACATION_ERROR_SECRET_UNAVAILABLE
+            return False, VACATION_ERROR_SECRET_UNAVAILABLE
+        if self.__root is None or not self.__background_active:
+            return False, VACATION_ERROR_FETCH_FAILED
+
+        self.__cancel_vacation_ical_after()
+        self.__vacation_ical_generation += 1
+        generation = int(self.__vacation_ical_generation)
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_fetch_owner = None
+            self.__vacation_ical_state = "stale" if has_last_good else "loading"
+            self.__vacation_ical_last_error = ""
+        self.__vacation_ical_tick(generation)
+        return True, None
 
     def __schedule_vacation_ical_tick(
         self,
@@ -3973,12 +4036,12 @@ class Wrike:
             vacation_ical_protected = ""
         elif vacation_ical_url_supplied and vacation_ical_url_value:
             if not self.__is_allowed_vacation_ical_url(vacation_ical_url_value):
-                return False, "vacation calendar url"
+                return False, "vacation_ical_invalid_endpoint"
             vacation_ical_protected = self.__vacation_secret_store.protect(
                 vacation_ical_url_value
             )
             if not vacation_ical_protected:
-                return False, "vacation calendar protection"
+                return False, "vacation_ical_secret_protection_failed"
 
         try:
             daily_minutes = int(round(float(daily_minutes)))
