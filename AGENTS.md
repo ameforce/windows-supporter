@@ -15,14 +15,17 @@
 - `.github/pr-protection/ruleset.json`은 `hotfix/*`와 `release/*`에 PR-only merge와 force-push·deletion 보호를 적용하며 required status check를 두지 않는다.
 - 공개된 `main`, `develop`, tag의 잘못된 이력은 revert 또는 다음 patch release로 교정한다. 정상 release 절차에서 `--force-with-lease`로 공개 ref를 다시 쓰지 않는다.
 
-이 레포에서 수정사항이 생기면 아래 순서를 항상 지킨다.
+## 검증 범위 정책
 
-1. 변경 후 정상 동작을 먼저 검증한다.
-   - 기본 검증 명령: `uv run python -m unittest discover -s tests -p "test_*.py"`
-   - 변경 범위가 명확하면 관련 테스트를 추가로 실행한다.
-2. 테스트 통과 후 `@build.bat`(=`build.bat`)를 실행해 새로운 `windows-supporter.exe`를 만든다.
-   - 실행 예시: `cmd /c build.bat`
-3. 빌드 실패/실행 실패 시 원인을 해결한 뒤, 테스트부터 다시 수행하고 재빌드한다.
+이 레포의 기본 검증은 항상 변경 범위에 직접 대응하는 최소 집합이다.
+
+1. 구현 전에 변경 파일, 직접 호출 경로, 영향받는 test module과 native scenario를 명시한다.
+2. 변경된 동작을 직접 검증하는 test module·test case만 선택해 실행한다. `unittest discover` 전체 실행이나 전체 E2E는 기본 검증으로 사용하지 않는다.
+3. 사용자 UI 변경은 해당 화면과 상태만 포함하는 native/E2E scenario subset으로 검증한다. 변경과 무관한 화면, 앱, 브라우저, 시나리오는 실행하지 않는다.
+4. 전체 test suite 또는 전체 E2E는 사용자가 명시적으로 요청했거나, 공용 기반 코드의 광범위한 영향으로 targeted selection이 불가능하다는 구체적 증거가 있을 때만 실행한다. 실행 전 그 이유를 기록한다.
+5. 동일 source tree에 대해 이미 통과한 targeted 검증을 task branch, main merge, develop back-merge에서 반복하지 않는다. merge conflict나 content drift가 없으면 기존 immutable evidence를 재사용한다.
+6. runtime·packaging 코드가 변경된 경우 targeted 검증 통과 후 `cmd /c build.bat`으로 새 `windows-supporter.exe`를 만든다. 문서·정책만 변경된 경우 build를 강제하지 않는다.
+7. 실패 시 원인을 수정한 뒤 실패한 test와 직접 영향 범위부터 다시 실행한다. 관련성 증거 없이 전체 suite로 확대하지 않는다.
 
 ## 변경 분류 게이트
 
@@ -54,16 +57,17 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
 3. 모든 task PR이 병합된 뒤 `main`으로 돌아와 `hotfix/vX.Y.Z`를 `--no-ff`로 merge하고 annotated `vX.Y.Z` 태그를 만든다.
    - merge commit 메시지는 기본 형태인 `Merge branch 'hotfix/vX.Y.Z'`를 유지한다.
    - 최종 릴리즈 빌드는 dirty build가 아니라 태그가 붙은 clean `main`에서 만든다.
-4. `main` 태그 기준으로 검증과 빌드를 수행하고, 해당 SHA의 `release-chain-gate` 성공을 확인한다.
-   - `uv run python -m unittest discover -s tests -p "test_*.py"`
+4. `main` 태그 기준으로 최종 artifact와 해당 SHA의 `release-chain-gate` 성공을 확인한다.
+   - task branch에서 통과한 targeted test·native scenario evidence가 `main`의 source tree와 동일한지 확인한다.
+   - merge conflict나 content drift가 없으면 같은 test나 E2E를 다시 실행하지 않는다. 차이가 있으면 그 차이에 직접 대응하는 targeted test만 실행한다.
    - `cmd /c build.bat`
    - `windows-supporter.exe`의 `FileVersion`, `ProductVersion`, `Comments`가 태그 버전과 일치하는지 확인한다.
 5. `develop`으로 돌아와 같은 `hotfix/vX.Y.Z` 브랜치를 trusted release controller 절차로 `--no-ff` merge한다.
    - `main`을 develop에 merge하지 않는다.
    - release tag merge로 대체하지 않는다.
    - merge commit 메시지는 `Merge branch 'hotfix/vX.Y.Z' into develop`를 유지한다.
-   - `uv run python -m unittest discover -s tests -p "test_*.py"`를 실행한다.
-   - 필요하면 `cmd /c build.bat`로 develop 빌드도 검증한다.
+   - merge conflict나 content drift가 없으면 task branch의 targeted 검증을 반복하지 않는다. develop 고유 차이가 생긴 경우에만 그 차이에 직접 대응하는 targeted test를 실행한다.
+   - develop build는 develop 고유 packaging 변경을 검증해야 할 때만 실행한다.
 6. main, tag, develop을 원격에 push하고 각 ref의 `release-chain-gate` 성공을 확인한다.
    - `git push origin main`
    - `git push origin vX.Y.Z`
@@ -78,7 +82,7 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
    - canonical 복원이나 read-back이 실패하면 임시 freeze에 `deletion`도 추가해 exact ref의 creation/update/deletion을 모두 차단하고 effective read-back한 뒤 freeze를 유지한다. 이 비상 보호까지 확인되지 않으면 즉시 중단하고 cleanup 미완료와 live ruleset/ref 상태를 보고한다. canonical 보호가 복구되기 전에는 비상 freeze를 제거하지 않는다. 삭제가 실패해 ref가 남아 있지만 canonical 복원은 성공했다면 freeze를 제거하되 cleanup 미완료로 보고한다.
 8. 최종 영구 런타임 기준을 다시 확인한다.
    - 현재 branch를 `main`으로 돌려둔다.
-   - main 태그 기준으로 `cmd /c build.bat`를 한 번 더 실행해 영구 실행 파일을 release 버전으로 둔다.
+   - step 4에서 태그가 붙은 clean `main`으로 만든 artifact가 같은 SHA의 산출물이고 그대로 존재하면 재사용한다. artifact가 없거나 source SHA가 달라졌을 때만 `cmd /c build.bat`를 다시 실행한다.
    - `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Windows Supporter`가 `C:\workspace\daeng\git\tools\windows-supporter\windows-supporter.exe`를 가리키는지 확인한다.
    - `git status --short --branch`에서 `main...origin/main`이 clean/synced인지 확인한다.
    - hotfix 브랜치 tip이 `main`과 `develop` 양쪽의 ancestor인지 확인한다.
