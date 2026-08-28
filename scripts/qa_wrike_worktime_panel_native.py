@@ -218,6 +218,11 @@ SCOPE_EXCLUSIONS = (
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--scenario",
+        choices=("full", "inline-edit-hover-deadline"),
+        default="full",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--finalize-review", action="store_true")
     mode.add_argument("--validate-finalized", action="store_true")
@@ -233,6 +238,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--review-receipt is required with --finalize-review")
     if args.review_receipt and not args.finalize_review:
         parser.error("--review-receipt is only valid with --finalize-review")
+    if args.scenario != "full" and (
+        args.finalize_review or args.validate_finalized or args.review_receipt
+    ):
+        parser.error("review finalization is only supported for --scenario full")
     return args
 
 
@@ -421,7 +430,7 @@ def _model(
             vacation_provisional=vacation_provisional,
         ),
         target_minutes=480,
-        has_clock_in=True,
+        clock_in_time="08:00",
         break_active=break_active,
         rows=_rows(renderer),
         prompt=prompt,
@@ -1247,8 +1256,15 @@ def _capture_state(
     required_labels: tuple[str, ...] = (),
     required_buttons: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    checkpoint_filenames = {
+        **CHECKPOINT_FILENAMES,
+        "clock-inline": "clock-inline.png",
+        "prompt-inline": "prompt-inline.png",
+        "hover-countdown": "hover-countdown.png",
+        "hover-deadline-held": "hover-deadline-held.png",
+    }
     try:
-        filename = CHECKPOINT_FILENAMES[state]
+        filename = checkpoint_filenames[state]
     except KeyError as exc:
         raise ValueError(f"unknown checkpoint state: {state}") from exc
     metrics = _visual_metrics(window)
@@ -1427,17 +1443,34 @@ def _run(output_dir: Path) -> dict[str, Any]:
         )
         return True
 
+    def save_clock_in(clock_value: str) -> bool:
+        calls.append(f"edit_clock_in:{clock_value}")
+        holder["model"] = replace(
+            holder["model"],
+            clock_in_time=str(clock_value),
+        )
+        return True
+
+    def save_prompt_time(detected_time: str, clock_value: str) -> bool:
+        calls.append(f"prompt_edit:{detected_time}->{clock_value}")
+        holder["model"] = replace(
+            holder["model"],
+            clock_in_time=str(clock_value),
+            prompt=None,
+        )
+        return True
+
     panel = renderer.WorktimeQuickPanel(
         root,
         lambda: holder["model"],
         refresh=refresh,
         clock_in_now=lambda: calls.append("clock_in_now"),
-        edit_clock_in=lambda: calls.append("edit_clock_in"),
+        edit_clock_in=save_clock_in,
         edit_plan=save_target,
         toggle_break=toggle_break,
         open_settings=lambda: calls.append("open_settings"),
         prompt_accept=lambda value: calls.append(f"prompt_accept:{value}"),
-        prompt_edit=lambda value: calls.append(f"prompt_edit:{value}"),
+        prompt_edit=save_prompt_time,
         prompt_snooze=snooze,
         prompt_skip=lambda: calls.append("prompt_skip"),
         idle_timeout_ms=CAPTURE_IDLE_TIMEOUT_MS,
@@ -1592,13 +1625,15 @@ def _run(output_dir: Path) -> dict[str, Any]:
                 window,
                 output_dir,
                 "hover-active",
-                required_labels=(
-                    NORMAL_SYNC_LABEL,
-                    "마우스 호버 중 · 자동 닫힘 일시정지",
-                ),
+                required_labels=(NORMAL_SYNC_LABEL,),
                 required_buttons=base_buttons,
             )
         )
+        active_hover_countdowns = [
+            text
+            for text in states[-1]["labels"]
+            if str(text).endswith("초 후 닫힘")
+        ]
         assertions["active_hover_border_visible"] = bool(
             states[-1]["shell_border_color"].upper() == "#2563EB"
         )
@@ -1613,7 +1648,11 @@ def _run(output_dir: Path) -> dict[str, Any]:
         hover_observation = {
             "normal_border_color": states[0]["shell_border_color"],
             "active_border_color": states[1]["shell_border_color"],
-            "active_countdown_text": "마우스 호버 중 · 자동 닫힘 일시정지",
+            "active_countdown_text": (
+                active_hover_countdowns[0]
+                if len(active_hover_countdowns) == 1
+                else ""
+            ),
             "enter_cursor_position": hover_cursor,
             "enter_delivery_elapsed_ms": hover_delivery_elapsed_ms,
             "exit_cursor_position": hover_exit_cursor,
@@ -1622,7 +1661,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
         }
 
         _click_button(window, "계획 수정")
-        target_entry = panel._widgets["target_entry"]
+        target_entry = panel._widgets["inline_entry"]
         prefill_value = str(target_entry.get())
         states.append(
             _capture_state(
@@ -1658,7 +1697,7 @@ def _run(output_dir: Path) -> dict[str, Any]:
         target_entry.delete(0, "end")
         target_entry.insert(0, "07:30")
         _click_button(window, "저장")
-        saved_editor_closed = panel._target_editor_active is False
+        saved_editor_closed = panel._inline_editor_active is False
         _click_button(window, "계획 수정")
         saved_prefill = str(target_entry.get())
         target_entry.delete(0, "end")
@@ -2886,11 +2925,15 @@ def _validate_run_evidence(
             if border_color.upper() != "#E5E7EB" or len(countdowns) != 1:
                 raise RuntimeError("initial hover border or countdown evidence is invalid")
         elif expected_state == "hover-active":
-            if (
-                border_color.upper() != "#2563EB"
-                or "마우스 호버 중 · 자동 닫힘 일시정지" not in labels
-            ):
-                raise RuntimeError("active hover border evidence is invalid")
+            countdowns = [
+                text
+                for text in labels
+                if isinstance(text, str)
+                and text.endswith("초 후 닫힘")
+                and text.removesuffix("초 후 닫힘").isdigit()
+            ]
+            if border_color.upper() != "#2563EB" or len(countdowns) != 1:
+                raise RuntimeError("active hover border/countdown evidence is invalid")
         elif expected_state == "target-editor-prefill":
             if (
                 entries != ["08:00"]
@@ -3076,11 +3119,15 @@ def _validate_run_evidence(
     if not isinstance(hover, dict) or set(hover) != expected_hover_keys:
         raise RuntimeError("hover observation is missing or unexpected")
     hover_geometry = hover.get("window_geometry")
+    active_hover_countdown = str(hover.get("active_countdown_text", ""))
+    valid_active_hover_countdown = bool(
+        active_hover_countdown.endswith("초 후 닫힘")
+        and active_hover_countdown.removesuffix("초 후 닫힘").isdigit()
+    )
     if (
         str(hover.get("normal_border_color", "")).upper() != "#E5E7EB"
         or str(hover.get("active_border_color", "")).upper() != "#2563EB"
-        or hover.get("active_countdown_text")
-        != "마우스 호버 중 · 자동 닫힘 일시정지"
+        or not valid_active_hover_countdown
         or not _valid_viewport_geometry(hover_geometry)
         or not valid_cursor_position(hover.get("enter_cursor_position"))
         or not cursor_inside_geometry(hover["enter_cursor_position"], hover_geometry)
@@ -3632,6 +3679,404 @@ def _validate_finalized(output_dir: Path) -> dict[str, Any]:
     }
 
 
+def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
+    """Capture only the v0.13.1 inline-edit and hover-deadline contract."""
+
+    output_dir = output_dir.resolve(strict=False)
+    _prepare_empty_output_dir(output_dir)
+    sealed_revision = _target_revision()
+    renderer = _load_renderer(sealed_revision)
+
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.withdraw()
+    callback_errors: list[str] = []
+    calls: list[str] = []
+    holder = {
+        "model": _model(
+            renderer,
+            prompt=renderer.WorktimeActivityPrompt("08:35"),
+        )
+    }
+
+    def callback_error(exc_type, exc, _traceback) -> None:
+        callback_errors.append(f"{exc_type.__name__}: {exc}")
+
+    root.report_callback_exception = callback_error
+
+    def save_clock(clock_value: str) -> bool:
+        calls.append(f"clock:{clock_value}")
+        holder["model"] = replace(
+            holder["model"],
+            clock_in_time=str(clock_value),
+        )
+        return True
+
+    def save_target(target_minutes: int) -> bool:
+        calls.append(f"target:{target_minutes}")
+        holder["model"] = replace(
+            holder["model"],
+            target_minutes=int(target_minutes),
+        )
+        return True
+
+    def save_prompt(detected_time: str, clock_value: str) -> bool:
+        calls.append(f"prompt:{detected_time}->{clock_value}")
+        holder["model"] = replace(
+            holder["model"],
+            clock_in_time=str(clock_value),
+            prompt=None,
+        )
+        return True
+
+    panel = renderer.WorktimeQuickPanel(
+        root,
+        lambda: holder["model"],
+        refresh=lambda: None,
+        clock_in_now=lambda: None,
+        edit_clock_in=save_clock,
+        edit_plan=save_target,
+        toggle_break=lambda: None,
+        open_settings=lambda: None,
+        prompt_accept=lambda _value: None,
+        prompt_edit=save_prompt,
+        prompt_snooze=lambda: None,
+        prompt_skip=lambda: None,
+        idle_timeout_ms=CAPTURE_IDLE_TIMEOUT_MS,
+    )
+
+    states: list[dict[str, Any]] = []
+    assertions: dict[str, bool] = {}
+    observations: dict[str, Any] = {}
+    window: Any | None = None
+    capture_start_revision = ""
+    capture_end_revision = ""
+    try:
+        capture_start_revision = _require_target_revision(
+            sealed_revision,
+            "before targeted inline/deadline scenario",
+        )
+        window = panel._ensure_window()
+        if window is None:
+            raise RuntimeError("Quick Panel window was not created")
+        window.minsize(*VIEWPORT)
+        window.maxsize(*VIEWPORT)
+        window.geometry(f"{VIEWPORT[0]}x{VIEWPORT[1]}+40+40")
+        window.update_idletasks()
+
+        work_area = _monitor_work_area_for_point(_cursor_position())
+        anchor = _set_cursor_position(
+            [work_area["left"] + 64, work_area["top"] + 64]
+        )
+        if panel.show(activate=True) is not True or not panel.is_visible():
+            raise RuntimeError("Quick Panel did not become mapped")
+        window.update_idletasks()
+        window.update()
+        panel_hwnd = _window_hwnd(window)
+        root_toplevels_before = [
+            child
+            for child in root.winfo_children()
+            if str(child.winfo_class()) == "Toplevel"
+        ]
+        shared_entry = panel._widgets["inline_entry"]
+
+        _click_button(window, "출근 수정")
+        clock_prefill = str(shared_entry.get())
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "clock-inline",
+                required_labels=(
+                    "오늘 출근 시간",
+                    "HH:MM (00:00–23:59)",
+                    "편집 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=("저장", "취소"),
+            )
+        )
+        calls_before_invalid = list(calls)
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "24:00")
+        _click_button(window, "저장")
+        clock_validation = str(panel._widgets["inline_error"].cget("text"))
+        invalid_clock_rejected = bool(
+            calls == calls_before_invalid
+            and panel._inline_editor_active
+            and "23:59" in clock_validation
+        )
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "08:15")
+        _click_button(window, "저장")
+        clock_saved = bool(
+            calls.count("clock:08:15") == 1
+            and panel._inline_editor_active is False
+            and holder["model"].clock_in_time == "08:15"
+        )
+
+        _click_button(window, "계획 수정")
+        target_uses_shared_entry = panel._widgets["inline_entry"] is shared_entry
+        target_prefill = str(shared_entry.get())
+        _click_button(window, "취소")
+
+        _click_button(window, "시간 수정")
+        prompt_uses_shared_entry = panel._widgets["inline_entry"] is shared_entry
+        prompt_prefill = str(shared_entry.get())
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "prompt-inline",
+                required_labels=(
+                    "감지된 출근 시간",
+                    "HH:MM (00:00–23:59)",
+                    "편집 중 · 자동 닫힘 일시정지",
+                ),
+                required_buttons=("저장", "취소"),
+            )
+        )
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "08:40")
+        _click_button(window, "저장")
+        prompt_saved = bool(
+            calls.count("prompt:08:35->08:40") == 1
+            and panel._inline_editor_active is False
+            and holder["model"].prompt is None
+            and holder["model"].clock_in_time == "08:40"
+        )
+        root_toplevels_after_edits = [
+            child
+            for child in root.winfo_children()
+            if str(child.winfo_class()) == "Toplevel"
+        ]
+
+        outside_delivery_start = time.monotonic()
+        _move_pointer(window, inside=False)
+        while panel._pointer_inside and (
+            time.monotonic() - outside_delivery_start
+        ) * 1000 <= POINTER_DELIVERY_TIMEOUT_MS:
+            window.update()
+            time.sleep(0.01)
+        if panel._pointer_inside:
+            raise RuntimeError("pointer leave was not delivered before deadline setup")
+
+        hover_timeout_ms = 2_500
+        panel.set_idle_timeout_ms(hover_timeout_ms)
+        deadline_before_hover = panel._dismiss_deadline
+        hover_delivery_start = time.monotonic()
+        _move_pointer(window, inside=True)
+        while not panel._pointer_inside and (
+            time.monotonic() - hover_delivery_start
+        ) * 1000 <= POINTER_DELIVERY_TIMEOUT_MS:
+            window.update()
+            time.sleep(0.01)
+        hover_enter_elapsed_ms = int(
+            (time.monotonic() - hover_delivery_start) * 1000
+        )
+        hover_pointer_inside = panel._pointer_inside is True
+        deadline_after_hover = panel._dismiss_deadline
+        _pump_events_for(window, 300)
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "hover-countdown",
+                required_labels=(NORMAL_SYNC_LABEL,),
+                required_buttons=("출근 수정", "계획 수정", "설정"),
+            )
+        )
+        hover_countdown_texts = [
+            text
+            for text in states[-1]["labels"]
+            if str(text).endswith("초 후 닫힘")
+        ]
+
+        _pump_events_for(
+            window,
+            hover_timeout_ms + SHORT_IDLE_EVENT_PUMP_GRACE_MS,
+        )
+        held_visible = panel.is_visible()
+        held_deadline = panel._dismiss_deadline
+        held_text = str(panel._widgets["countdown"].cget("text"))
+        states.append(
+            _capture_state(
+                window,
+                output_dir,
+                "hover-deadline-held",
+                required_labels=("마우스 호버 중 · 이동 시 닫힘",),
+                required_buttons=("출근 수정", "계획 수정", "설정"),
+            )
+        )
+
+        expired_leave_start = time.monotonic()
+        _move_pointer(window, inside=False)
+        while panel.is_visible() and (
+            time.monotonic() - expired_leave_start
+        ) * 1000 <= POINTER_DELIVERY_TIMEOUT_MS:
+            root.update()
+            time.sleep(0.01)
+        expired_leave_elapsed_ms = int(
+            (time.monotonic() - expired_leave_start) * 1000
+        )
+        withdrawn_after_leave = not panel.is_visible()
+        window_preserved = bool(window.winfo_exists())
+        no_timeout_rearm = bool(
+            panel._dismiss_deadline is None
+            and panel._dismiss_after_id is None
+            and panel._countdown_after_id is None
+        )
+        final_hwnd = _window_hwnd(window)
+
+        capture_end_revision = _require_target_revision(
+            sealed_revision,
+            "after targeted inline/deadline scenario",
+        )
+        assertions = {
+            "clock_inline_prefill": clock_prefill == "08:00",
+            "invalid_clock_rejected_inline": invalid_clock_rejected,
+            "clock_inline_save": clock_saved,
+            "target_uses_shared_inline_entry": bool(
+                target_uses_shared_entry and target_prefill == "08:00"
+            ),
+            "prompt_uses_shared_inline_entry": bool(
+                prompt_uses_shared_entry and prompt_prefill == "08:35"
+            ),
+            "prompt_inline_save_keeps_detected_context": prompt_saved,
+            "single_toplevel_for_all_edits": bool(
+                len(root_toplevels_before) == 1
+                and len(root_toplevels_after_edits) == 1
+                and root_toplevels_before[0] is root_toplevels_after_edits[0]
+                and root_toplevels_before[0] is window
+            ),
+            "hover_enter_delivered": bool(
+                hover_pointer_inside
+                and hover_enter_elapsed_ms <= POINTER_DELIVERY_TIMEOUT_MS
+            ),
+            "hover_keeps_absolute_deadline": bool(
+                deadline_before_hover is not None
+                and deadline_after_hover == deadline_before_hover
+                and held_deadline == deadline_before_hover
+            ),
+            "hover_countdown_continues_before_deadline": (
+                len(hover_countdown_texts) == 1
+            ),
+            "deadline_holds_only_while_hovered": bool(
+                held_visible
+                and held_text == "마우스 호버 중 · 이동 시 닫힘"
+            ),
+            "expired_hover_leave_withdraws_immediately": bool(
+                withdrawn_after_leave
+                and expired_leave_elapsed_ms <= POINTER_DELIVERY_TIMEOUT_MS
+            ),
+            "expired_hover_leave_does_not_rearm": no_timeout_rearm,
+            "reusable_window_preserved": bool(
+                window_preserved and final_hwnd == panel_hwnd
+            ),
+            "capture_revision_stable": bool(
+                capture_start_revision
+                and capture_start_revision == sealed_revision
+                and capture_end_revision == sealed_revision
+            ),
+            "no_callback_errors": not callback_errors,
+            "visual_checkpoints_complete": bool(
+                [state.get("state") for state in states]
+                == [
+                    "clock-inline",
+                    "prompt-inline",
+                    "hover-countdown",
+                    "hover-deadline-held",
+                ]
+                and all(state.get("ok") is True for state in states)
+            ),
+        }
+        observations = {
+            "panel_hwnd": panel_hwnd,
+            "final_hwnd": final_hwnd,
+            "anchor": anchor,
+            "clock_prefill": clock_prefill,
+            "clock_validation": clock_validation,
+            "target_prefill": target_prefill,
+            "prompt_prefill": prompt_prefill,
+            "callbacks": list(calls),
+            "deadline_before_hover": deadline_before_hover,
+            "deadline_after_hover": deadline_after_hover,
+            "deadline_held": held_deadline,
+            "hover_enter_elapsed_ms": hover_enter_elapsed_ms,
+            "hover_pointer_inside": hover_pointer_inside,
+            "hover_countdown_texts": hover_countdown_texts,
+            "held_text": held_text,
+            "expired_leave_elapsed_ms": expired_leave_elapsed_ms,
+            "withdrawn_after_leave": withdrawn_after_leave,
+            "window_preserved": window_preserved,
+            "no_timeout_rearm": no_timeout_rearm,
+        }
+    finally:
+        try:
+            panel.destroy()
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    run = {
+        "schema_version": 1,
+        "scenario": "inline-edit-hover-deadline",
+        "target_revision": sealed_revision,
+        "ok": bool(assertions and all(assertions.values())),
+        "assertions": assertions,
+        "observations": observations,
+        "callbacks": list(calls),
+        "runtime_errors": callback_errors,
+        "states": states,
+    }
+    run_path = output_dir / "run.json"
+    run_path.write_text(
+        json.dumps(run, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    inventory = sorted(
+        [
+            {
+                "path": path.name,
+                "sha256": _sha256(path),
+            }
+            for path in output_dir.iterdir()
+            if path.is_file()
+        ],
+        key=lambda item: item["path"],
+    )
+    manifest = {
+        "schema_version": 1,
+        "scenario": run["scenario"],
+        "target_revision": sealed_revision,
+        "scope": [
+            "Quick Panel common inline editor for clock, target, and activity prompt",
+            "absolute hover deadline, expiry hold, and immediate leave withdraw",
+        ],
+        "excluded": [
+            "vacation and private iCal",
+            "break controls",
+            "same-process and cross-process focus",
+            "tray, global hotkey, and packaged executable",
+        ],
+        "inventory": inventory,
+        "result": "passed" if run["ok"] else "failed",
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        **run,
+        "run_json": str(run_path),
+        "manifest": str(manifest_path),
+        "evidence_root": str(output_dir),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
@@ -3640,6 +4085,8 @@ def main(argv: list[str] | None = None) -> int:
             result = _finalize(output_dir, args.review_receipt)
         elif args.validate_finalized:
             result = _validate_finalized(output_dir)
+        elif args.scenario == "inline-edit-hover-deadline":
+            result = _run_inline_edit_hover_deadline(output_dir)
         else:
             result = _run(output_dir)
     except Exception as exc:

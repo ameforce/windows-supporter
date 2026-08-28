@@ -397,6 +397,7 @@ def _model(
     *,
     actual_text: str = "Wrike 기록 1:30 · 현재 기대 2:00",
     has_clock_in: bool = False,
+    clock_in_time: str | None = None,
     break_active: bool = False,
     prompt: WorktimeActivityPrompt | None = None,
     today_lines: tuple[WorktimePanelLine, ...] | None = None,
@@ -421,13 +422,15 @@ def _model(
             WorktimePanelLine(actual_text, "#2563EB"),
             WorktimePanelLine("출근 09:00 · 예상 퇴근 18:00", "#059669"),
         )
+    if clock_in_time is None and has_clock_in:
+        clock_in_time = "09:00"
     return WorktimePanelModel(
         week_range=week_range,
         sync_text=sync_text,
         sync_state="fresh",
         today_lines=today_lines,
         target_minutes=target_minutes,
-        has_clock_in=has_clock_in,
+        clock_in_time=clock_in_time,
         break_active=break_active,
         rows=rows,
         prompt=prompt,
@@ -438,12 +441,12 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
     callbacks = {
         "refresh": Mock(),
         "clock_in_now": Mock(),
-        "edit_clock_in": Mock(),
+        "edit_clock_in": Mock(return_value=True),
         "edit_plan": Mock(return_value=True),
         "toggle_break": Mock(),
         "open_settings": Mock(),
         "prompt_accept": Mock(),
-        "prompt_edit": Mock(),
+        "prompt_edit": Mock(return_value=True),
         "prompt_snooze": Mock(),
         "prompt_skip": Mock(),
     }
@@ -481,7 +484,7 @@ class WorktimePanelModelTests(unittest.TestCase):
                 sync_state=model.sync_state,
                 today_lines=list(model.today_lines),  # type: ignore[arg-type]
                 target_minutes=model.target_minutes,
-                has_clock_in=False,
+                clock_in_time=None,
                 break_active=False,
                 rows=model.rows,
             )
@@ -492,12 +495,16 @@ class WorktimePanelModelTests(unittest.TestCase):
                 sync_state=model.sync_state,
                 today_lines=model.today_lines,
                 target_minutes=model.target_minutes,
-                has_clock_in=False,
+                clock_in_time=None,
                 break_active=False,
                 rows=model.rows[:6],
             )
         with self.assertRaises(ValueError):
             WorktimeActivityPrompt("24:00")
+        with self.assertRaises(ValueError):
+            _model(clock_in_time="24:00")
+        self.assertFalse(_model().has_clock_in)
+        self.assertTrue(_model(clock_in_time="08:05").has_clock_in)
         self.assertEqual(
             WorktimeActivityPrompt("08:05").detected_hhmm,
             "08:05",
@@ -633,49 +640,80 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertIn("2026-04-13 - 2026-04-19", texts)
         self.assertIn("동기화 · 1초 전 동기화", texts)
 
-    def test_action_transitions_reuse_buttons_and_stable_commands(self) -> None:
+    def test_time_edits_share_one_panel_local_inline_editor(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
-        holder = {"model": _model()}
+        holder = {
+            "model": _model(
+                has_clock_in=True,
+                clock_in_time="08:00",
+                prompt=WorktimeActivityPrompt("08:35"),
+            )
+        }
         panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
         panel.show(activate=False)
-        original_buttons = tuple(fake_tk.live_buttons())
-        clock_button = fake_tk.button("지금 출근")
-        break_button = fake_tk.button("휴게 시작")
-        clock_command = clock_button.kwargs["command"]
-        break_command = break_button.kwargs["command"]
+        panel_window = fake_tk.toplevels[0]
+        shared_entry = panel._widgets["inline_entry"]
 
-        holder["model"] = _model(has_clock_in=True, break_active=True)
-        panel.refresh_now()
-
-        self.assertEqual(tuple(fake_tk.live_buttons()), original_buttons)
-        self.assertIs(fake_tk.button("출근 수정"), clock_button)
-        self.assertIs(fake_tk.button("휴게 종료"), break_button)
-        self.assertIs(clock_button.kwargs["command"], clock_command)
-        self.assertIs(break_button.kwargs["command"], break_command)
-        self.assertTrue(
-            all(
-                "command" not in call
-                for button in original_buttons
-                for call in button.configure_calls
-            )
-        )
         fake_tk.button("출근 수정").invoke()
-        callbacks["edit_clock_in"].assert_called_once_with()
-        callbacks["clock_in_now"].assert_not_called()
-        fake_tk.button("휴게 종료").invoke()
-        callbacks["toggle_break"].assert_called_once_with()
+        self.assertTrue(panel._inline_editor_active)
+        self.assertEqual(shared_entry.get(), "08:00")
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "24:00")
+        fake_tk.button("저장").invoke()
+        callbacks["edit_clock_in"].assert_not_called()
+        self.assertIn("23:59", panel._widgets["inline_error"].kwargs["text"])
+        self.assertTrue(panel._inline_editor_active)
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "08:15")
+        fake_tk.button("저장").invoke()
+        callbacks["edit_clock_in"].assert_called_once_with("08:15")
+        self.assertFalse(panel._inline_editor_active)
+
         fake_tk.button("계획 수정").invoke()
-        self.assertTrue(panel._target_editor_active)
-        target_entry = fake_tk.entries[0]
-        self.assertEqual(target_entry.get(), "08:00")
-        target_entry.delete(0, "end")
-        target_entry.insert(0, "07:30")
+        self.assertIs(panel._widgets["inline_entry"], shared_entry)
+        self.assertEqual(shared_entry.get(), "08:00")
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "07:30")
         fake_tk.button("저장").invoke()
         callbacks["edit_plan"].assert_called_once_with(450)
-        self.assertFalse(panel._target_editor_active)
+        self.assertFalse(panel._inline_editor_active)
+
+        fake_tk.button("시간 수정").invoke()
+        self.assertIs(panel._widgets["inline_entry"], shared_entry)
+        self.assertEqual(shared_entry.get(), "08:35")
+        shared_entry.delete(0, "end")
+        shared_entry.insert(0, "08:40")
+        fake_tk.button("저장").invoke()
+        callbacks["prompt_edit"].assert_called_once_with("08:35", "08:40")
+        self.assertFalse(panel._inline_editor_active)
+
+        self.assertEqual(fake_tk.toplevels, [panel_window])
+        self.assertEqual(panel_window.grab_set_calls, 0)
+        self.assertEqual(panel_window.wait_window_calls, 0)
+        callbacks["clock_in_now"].assert_not_called()
+
+        fake_tk.button("휴게 시작").invoke()
+        callbacks["toggle_break"].assert_called_once_with()
         fake_tk.button("설정").invoke()
         callbacks["open_settings"].assert_called_once_with()
+
+    def test_prompt_inline_editor_closes_when_detected_context_changes(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model(prompt=WorktimeActivityPrompt("08:35"))}
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        fake_tk.button("시간 수정").invoke()
+        self.assertTrue(panel._inline_editor_active)
+        self.assertEqual(panel._widgets["inline_entry"].get(), "08:35")
+        holder["model"] = _model(prompt=WorktimeActivityPrompt("08:36"))
+        panel.refresh_now()
+
+        self.assertFalse(panel._inline_editor_active)
+        callbacks["prompt_edit"].assert_not_called()
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
     def test_prompt_time_updates_in_place_but_presence_change_rebuilds(self) -> None:
         root = _FakeRoot()
@@ -963,7 +1001,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertIs(fake_tk.toplevels[0], window)
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
-    def test_pointer_and_key_activity_defer_until_full_delay_after_leave(self) -> None:
+    def test_hover_keeps_absolute_deadline_then_leave_closes_immediately(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         panel, _provider, _callbacks = _make_panel(
@@ -974,6 +1012,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         panel.show(activate=False)
         window = fake_tk.toplevels[0]
         first_dismiss_id = root.active_id(6_000)
+        first_deadline = panel._dismiss_deadline
         expected_bindings = {
             "<Escape>",
             "<Enter>",
@@ -986,31 +1025,42 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             "<KeyPress>",
         }
         self.assertTrue(expected_bindings <= set(window.bindings))
-        self.assertTrue(
-            all(window.bind_adds[sequence] == "+" for sequence in expected_bindings)
-        )
 
         window.bindings["<Enter>"](object())
-        self.assertIn(first_dismiss_id, root.after_cancel_calls)
-        self.assertEqual(root.active_delays(), [1_000])
-        for sequence in ("<Motion>", "<Button>", "<MouseWheel>"):
-            window.bindings[sequence](object())
-            self.assertEqual(root.active_delays(), [1_000])
-        root.run_delay(1_000)
+        self.assertTrue(panel._pointer_inside)
+        self.assertEqual(panel._dismiss_deadline, first_deadline)
+        self.assertEqual(root.active_id(6_000), first_dismiss_id)
+        self.assertNotIn(first_dismiss_id, root.after_cancel_calls)
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
+
+        root.advance(1.2)
+        root.run_delay(200)
+        self.assertEqual(panel._widgets["countdown"].kwargs["text"], "5초 후 닫힘")
+        window.bindings["<Motion>"](object())
+        self.assertEqual(panel._dismiss_deadline, first_deadline)
+        self.assertEqual(root.active_id(6_000), first_dismiss_id)
+
+        root.advance(4.8)
+        root.run_delay(6_000)
         self.assertTrue(panel.is_visible())
-        self.assertEqual(root.active_delays(), [1_000])
+        self.assertTrue(panel._dismiss_expired_while_hovered)
+        self.assertEqual(
+            panel._widgets["countdown"].kwargs["text"],
+            "마우스 호버 중 · 이동 시 닫힘",
+        )
+        dismiss_schedule_count = sum(
+            delay == 6_000
+            for _after_id, delay, _callback in root.after_history
+        )
 
-        window.bindings["<KeyPress>"](SimpleNamespace(keysym="a"))
-        self.assertEqual(root.active_delays(), [1_000])
         window.bindings["<Leave>"](object())
-        leave_id = root.active_id(6_000)
-        window.bindings["<KeyPress>"](SimpleNamespace(keysym="Return"))
-        key_id = root.active_id(6_000)
-        self.assertNotEqual(key_id, leave_id)
-        self.assertIn(leave_id, root.after_cancel_calls)
-
-        window.bindings["<KeyPress>"](SimpleNamespace(keysym="Escape"))
-        self.assertEqual(root.active_id(6_000), key_id)
+        self.assertFalse(panel.is_visible())
+        self.assertFalse(panel._dismiss_expired_while_hovered)
+        self.assertNotIn(6_000, root.active_delays())
+        self.assertEqual(
+            sum(delay == 6_000 for _id, delay, _callback in root.after_history),
+            dismiss_schedule_count,
+        )
 
     def test_command_interaction_blocks_dismissal_until_outermost_return(self) -> None:
         root = _FakeRoot()
@@ -1124,12 +1174,18 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.show_activated.assert_called_once_with(window)
         self.assertEqual(panel._shell.kwargs["highlightbackground"], "#E5E7EB")
 
+        dismiss_id = root.active_id(6_000)
+        deadline = panel._dismiss_deadline
         window.bindings["<Enter>"](object())
         self.assertEqual(panel._shell.kwargs["highlightbackground"], "#2563EB")
-        self.assertEqual(root.active_delays(), [1_000])
+        self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
+        self.assertEqual(root.active_id(6_000), dismiss_id)
+        self.assertEqual(panel._dismiss_deadline, deadline)
         window.bindings["<Leave>"](object())
         self.assertEqual(panel._shell.kwargs["highlightbackground"], "#E5E7EB")
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
+        self.assertEqual(root.active_id(6_000), dismiss_id)
+        self.assertEqual(panel._dismiss_deadline, deadline)
 
         panel.hide()
         fake_tk.pointer_x = 1500
@@ -1141,7 +1197,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             self.assertTrue(panel.show(activate=False))
         self.assertEqual(window.geometry_calls[-1], "700x500+784+284")
 
-    def test_countdown_and_inline_target_editor_are_view_local(self) -> None:
+    def test_countdown_and_common_inline_target_validation_are_view_local(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model(target_minutes=480)}
@@ -1157,34 +1213,34 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         fake_tk.button("계획 수정").invoke()
         self.assertEqual(countdown.kwargs["text"], "편집 중 · 자동 닫힘 일시정지")
         self.assertEqual(root.active_delays(), [1_000])
-        entry = panel._widgets["target_entry"]
+        entry = panel._widgets["inline_entry"]
         entry.delete(0, "end")
         entry.insert(0, "07:00")
         fake_tk.button("취소").invoke()
         callbacks["edit_plan"].assert_not_called()
-        self.assertFalse(panel._target_editor_active)
+        self.assertFalse(panel._inline_editor_active)
         fake_tk.button("계획 수정").invoke()
         self.assertEqual(entry.get(), "08:00")
         entry.delete(0, "end")
         entry.insert(0, "24:30")
         fake_tk.button("저장").invoke()
         callbacks["edit_plan"].assert_not_called()
-        self.assertIn("24:00", panel._widgets["target_error"].kwargs["text"])
-        self.assertTrue(panel._target_editor_active)
+        self.assertIn("24:00", panel._widgets["inline_error"].kwargs["text"])
+        self.assertTrue(panel._inline_editor_active)
 
         entry.delete(0, "end")
         entry.insert(0, "8:00")
         fake_tk.button("저장").invoke()
         callbacks["edit_plan"].assert_not_called()
-        self.assertIn("HH:MM", panel._widgets["target_error"].kwargs["text"])
-        self.assertTrue(panel._target_editor_active)
+        self.assertIn("HH:MM", panel._widgets["inline_error"].kwargs["text"])
+        self.assertTrue(panel._inline_editor_active)
 
         entry.delete(0, "end")
         entry.insert(0, "00:00")
         holder["model"] = _model(target_minutes=0)
         fake_tk.button("저장").invoke()
         callbacks["edit_plan"].assert_called_once_with(0)
-        self.assertFalse(panel._target_editor_active)
+        self.assertFalse(panel._inline_editor_active)
         self.assertEqual(countdown.kwargs["text"], "6초 후 닫힘")
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 

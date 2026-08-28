@@ -1613,6 +1613,7 @@ class Wrike:
             )
         break_state = self.__worktime_state_store.get_manual_break_state(now=now)
         today_plan = self.__plan_for_date(now.date())
+        clock_in_time = str(today_plan.get("clock_in") or "").strip() or None
         return WorktimePanelModel(
             week_range=(
                 f"{week_days[0].isoformat()} - {week_days[-1].isoformat()}"
@@ -1621,7 +1622,7 @@ class Wrike:
             sync_state=snapshot.state.value,
             today_lines=today_lines,
             target_minutes=int(today_plan.get("target_net_minutes", 0)),
-            has_clock_in=bool(today_plan.get("clock_in")),
+            clock_in_time=clock_in_time,
             break_active=bool(break_state.get("active")),
             rows=tuple(rows),
             prompt=self.__visible_activity_prompt(now, today_plan),
@@ -1637,14 +1638,22 @@ class Wrike:
             pass
         return
 
-    def __save_clock_in(self, clock_value: str) -> bool:
+    def __save_clock_in(
+        self,
+        clock_value: str,
+        *,
+        report_error: bool = True,
+    ) -> bool:
         now = self.__lib.datetime.now()
         try:
             parsed = datetime.strptime(str(clock_value), "%H:%M")
             if parsed.strftime("%H:%M") != str(clock_value):
                 raise ValueError("invalid clock")
         except Exception:
-            self.__show_panel_action_error("출근 시간은 HH:MM 형식이어야 합니다")
+            if report_error:
+                self.__show_panel_action_error(
+                    "출근 시간은 HH:MM 형식이어야 합니다"
+                )
             return False
         try:
             plan = self.__plan_for_date(now.date())
@@ -1657,7 +1666,8 @@ class Wrike:
         except Exception:
             ok = False
         if not ok:
-            self.__show_panel_action_error("출근 시간을 저장하지 못했습니다")
+            if report_error:
+                self.__show_panel_action_error("출근 시간을 저장하지 못했습니다")
             return False
         return True
 
@@ -1669,44 +1679,14 @@ class Wrike:
         self.__save_clock_in(self.__lib.datetime.now().strftime("%H:%M"))
         return
 
-    def __ask_clock_in(self, initial_value: str) -> str | None:
-        try:
-            import importlib
-
-            simpledialog = importlib.import_module("tkinter.simpledialog")
-            edited = simpledialog.askstring(
-                "출근 시간 수정",
-                "출근 시간을 HH:MM 형식으로 입력하세요.",
-                initialvalue=str(initial_value),
-                parent=self.__root,
-            )
-        except Exception:
-            return None
-        if edited is None:
-            return None
-        return str(edited).strip()
-
-    def __edit_clock_in(self, initial_value: str) -> None:
-        edited = self.__ask_clock_in(initial_value)
-        if edited is None:
-            return
-        self.__save_clock_in(edited)
-        return
-
-    def __panel_edit_clock_in(self) -> None:
-        now = self.__lib.datetime.now()
-        plan = self.__plan_for_date(now.date())
-        existing = str(plan.get("clock_in") or "").strip()
-        if not existing:
-            return
-        self.__edit_clock_in(existing)
-        return
+    def __panel_edit_clock_in(self, clock_value: str) -> bool:
+        return self.__save_clock_in(
+            str(clock_value).strip(),
+            report_error=False,
+        )
 
     def __panel_save_target_minutes(self, target_minutes: int) -> bool:
         if type(target_minutes) is not int or not 0 <= target_minutes <= 1440:
-            self.__show_panel_action_error(
-                "목표 순근무 시간은 00:00부터 24:00 사이여야 합니다"
-            )
             return False
         now = self.__lib.datetime.now()
         try:
@@ -1719,10 +1699,7 @@ class Wrike:
             )
         except Exception:
             ok = False
-        if not ok:
-            self.__show_panel_action_error("오늘 목표를 저장하지 못했습니다")
-            return False
-        return True
+        return bool(ok)
 
     def __panel_toggle_break(self) -> None:
         try:
@@ -1743,24 +1720,21 @@ class Wrike:
         self.__save_clock_in(str(detected_time).strip())
         return
 
-    def __panel_prompt_edit(self, detected_time: str) -> None:
+    def __panel_prompt_edit(
+        self,
+        detected_time: str,
+        edited_time: str,
+    ) -> bool:
         now = self.__lib.datetime.now()
         if self.__live_activity_prompt_detected_at(
             now,
             expected_detected_time=detected_time,
         ) is None:
-            return
-        edited = self.__ask_clock_in(str(detected_time))
-        if edited is None:
-            return
-        now = self.__lib.datetime.now()
-        if self.__live_activity_prompt_detected_at(
-            now,
-            expected_detected_time=detected_time,
-        ) is None:
-            return
-        self.__save_clock_in(edited)
-        return
+            return False
+        return self.__save_clock_in(
+            str(edited_time).strip(),
+            report_error=False,
+        )
 
     def __panel_prompt_snooze(self) -> None:
         now = self.__lib.datetime.now()

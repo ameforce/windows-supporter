@@ -701,6 +701,8 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIn("적용 목표 9시간", today_text)
         self.assertNotIn("동기화", today_text)
         self.assertIn("fresh", model.sync_text)
+        self.assertEqual(model.clock_in_time, "08:00")
+        self.assertTrue(model.has_clock_in)
 
         friday = model.rows[4]
         saturday = model.rows[5]
@@ -1004,14 +1006,9 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         )
 
         _FrozenDateTime.current = datetime(2026, 4, 6, 9, 33)
-        ask = Mock(return_value="09:30")
-        fake_simpledialog = Mock(askstring=ask)
-        with patch.dict(
-            "sys.modules",
-            {"tkinter.simpledialog": fake_simpledialog},
-        ):
-            wrike._Wrike__panel_prompt_edit("09:32")
-        ask.assert_called_once()
+        self.assertTrue(
+            wrike._Wrike__panel_prompt_edit("09:32", "09:30")
+        )
         self.assertEqual(wrike.get_workday_plan(date(2026, 4, 6))["clock_in"], "09:30")
         self.assertIsNone(wrike._Wrike__worktime_state_store.get_activity_prompt(date(2026, 4, 6)))
 
@@ -1066,13 +1063,9 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
                     )
                 )
                 wrike._Wrike__panel_prompt_accept("08:05")
-                ask = Mock(return_value="08:00")
-                with patch.dict(
-                    "sys.modules",
-                    {"tkinter.simpledialog": Mock(askstring=ask)},
-                ):
-                    wrike._Wrike__panel_prompt_edit("08:05")
-                ask.assert_not_called()
+                self.assertFalse(
+                    wrike._Wrike__panel_prompt_edit("08:05", "08:00")
+                )
                 wrike._Wrike__panel_prompt_snooze()
                 wrike._Wrike__panel_prompt_skip()
                 self.assertIsNone(wrike.get_workday_plan(target_day)["clock_in"])
@@ -1089,22 +1082,13 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__panel_prompt_accept("08:06")
         self.assertIsNone(wrike.get_workday_plan(target_day)["clock_in"])
 
-        def make_unavailable_during_modal(**_kwargs):
-            wrike._Wrike__vacation_ical_url_session = (
-                "https://calendar.google.com/calendar/ical/prompt/basic.ics"
-            )
-            wrike._Wrike__vacation_ical_state = "loading"
-            return "08:00"
-
-        with patch.dict(
-            "sys.modules",
-            {
-                "tkinter.simpledialog": Mock(
-                    askstring=Mock(side_effect=make_unavailable_during_modal)
-                )
-            },
-        ):
-            wrike._Wrike__panel_prompt_edit("08:05")
+        wrike._Wrike__vacation_ical_url_session = (
+            "https://calendar.google.com/calendar/ical/prompt/basic.ics"
+        )
+        wrike._Wrike__vacation_ical_state = "loading"
+        self.assertFalse(
+            wrike._Wrike__panel_prompt_edit("08:05", "08:00")
+        )
         self.assertIsNone(wrike.get_workday_plan(target_day)["clock_in"])
         self.assertEqual(
             wrike._Wrike__worktime_state_store.get_activity_prompt(target_day)[
@@ -1127,6 +1111,66 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
                 missing_gate_day
             )
         )
+
+    def test_panel_model_exposes_clock_in_time_for_inline_prefill(self) -> None:
+        wrike = self._new_wrike()
+        target_day = date(2026, 4, 6)
+        _FrozenDateTime.current = datetime(2026, 4, 6, 9, 0)
+        wrike.update_workday_plan(target_day, 480, "08:00")
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+
+        with patch.object(
+            wrike,
+            "_Wrike__vacation_result_for_date",
+            return_value={},
+        ):
+            model = wrike._Wrike__build_worktime_panel_model()
+
+        self.assertEqual(model.clock_in_time, "08:00")
+        self.assertTrue(model.has_clock_in)
+
+    def test_panel_prompt_inline_save_rechecks_identity_and_live_gate(self) -> None:
+        target_day = date(2026, 4, 6)
+        detected_at = datetime(2026, 4, 6, 8, 5)
+        _FrozenDateTime.current = datetime(2026, 4, 6, 8, 6)
+        wrike = self._new_wrike()
+        wrike._Wrike__worktime_state_store.record_activity_prompt_pending(
+            target_day,
+            detected_at,
+        )
+
+        self.assertFalse(
+            wrike._Wrike__panel_prompt_edit("08:06", "08:10")
+        )
+        self.assertTrue(
+            wrike._Wrike__panel_prompt_edit("08:05", "08:10")
+        )
+        self.assertEqual(
+            wrike.get_workday_plan(target_day)["clock_in"],
+            "08:10",
+        )
+
+        gated = self._new_wrike()
+        gated.clear_workday_plan(target_day)
+        gated._Wrike__worktime_state_store.record_activity_prompt_pending(
+            target_day,
+            detected_at,
+        )
+        gated._Wrike__vacation_ical_url_session = (
+            "https://calendar.google.com/calendar/ical/prompt/basic.ics"
+        )
+        gated._Wrike__vacation_ical_calendar = self._empty_compiled_vacation()
+        gated._Wrike__vacation_ical_state = "loading"
+        self.assertFalse(
+            gated._Wrike__panel_prompt_edit("08:05", "08:10")
+        )
+        self.assertIsNone(gated.get_workday_plan(target_day)["clock_in"])
 
     def test_activity_panel_surface_retries_until_show_is_mapped(self) -> None:
         wrike = self._new_wrike()
@@ -1156,36 +1200,21 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             detected_day.isoformat(),
         )
 
-    def test_existing_clock_in_edit_prefills_and_preserves_value_on_cancel(self) -> None:
+    def test_existing_clock_in_inline_save_preserves_target(self) -> None:
         wrike = self._new_wrike()
-        wrike.update_workday_plan(date(2026, 4, 6), 480, "08:00")
+        target_day = date(2026, 4, 6)
+        wrike.update_workday_plan(target_day, 480, "08:00")
         _FrozenDateTime.current = datetime(2026, 4, 6, 15, 0)
 
-        cancel = Mock(return_value=None)
-        with patch.dict(
-            "sys.modules",
-            {"tkinter.simpledialog": Mock(askstring=cancel)},
-        ):
-            wrike._Wrike__panel_edit_clock_in()
+        self.assertFalse(wrike._Wrike__panel_edit_clock_in("24:00"))
         self.assertEqual(
-            cancel.call_args.kwargs.get("initialvalue"),
+            wrike.get_workday_plan(target_day)["clock_in"],
             "08:00",
         )
-        self.assertEqual(
-            wrike.get_workday_plan(date(2026, 4, 6))["clock_in"],
-            "08:00",
-        )
-
-        confirm = Mock(return_value="08:15")
-        with patch.dict(
-            "sys.modules",
-            {"tkinter.simpledialog": Mock(askstring=confirm)},
-        ):
-            wrike._Wrike__panel_edit_clock_in()
-        self.assertEqual(
-            wrike.get_workday_plan(date(2026, 4, 6))["clock_in"],
-            "08:15",
-        )
+        self.assertTrue(wrike._Wrike__panel_edit_clock_in("08:15"))
+        plan = wrike.get_workday_plan(target_day)
+        self.assertEqual(plan["clock_in"], "08:15")
+        self.assertEqual(plan["target_net_minutes"], 480)
 
     def test_clock_in_now_preserves_implicit_weekend_zero_target(self) -> None:
         wrike = self._new_wrike()
@@ -1224,7 +1253,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
                         wrike._Wrike__panel_save_target_minutes(invalid)
                     )
 
-        self.assertEqual(show_error.call_count, 3)
+        show_error.assert_not_called()
         self.assertEqual(
             wrike.get_workday_plan(adjacent_day)["target_net_minutes"],
             420,
