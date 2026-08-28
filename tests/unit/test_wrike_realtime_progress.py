@@ -545,6 +545,31 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(restored.state, TimelogSnapshotState.STALE)
         self.assertEqual(restored.days, snapshot.days)
 
+        wrike._Wrike__wrike_api_token_session = "token"
+        with (
+            patch.object(wrike, "_Wrike__ui_safe", return_value=False),
+            patch("src.apps.Wrike.threading.Thread", _FakeThread),
+        ):
+            discarded_generation = (
+                wrike._Wrike__request_timelog_snapshot_refresh(force=True)
+            )
+            loading = wrike.get_timelog_snapshot()
+            self.assertEqual(loading.state, TimelogSnapshotState.LOADING)
+            self.assertEqual(loading.generation, discarded_generation)
+            _FakeThread.created[-1].target()
+
+        self.assertIs(wrike.get_timelog_snapshot(), loading)
+        self.assertEqual(
+            wrike.get_timelog_snapshot().state,
+            TimelogSnapshotState.LOADING,
+        )
+        self.assertEqual(
+            wrike._Wrike__timelog_refresh_generation,
+            discarded_generation,
+        )
+        self.assertFalse(wrike._Wrike__timelog_refresh_running)
+        self.assertIsNone(wrike._Wrike__timelog_refresh_running_generation)
+
     def test_replacement_token_restart_does_not_restore_previous_account_cache(self) -> None:
         def protect_value(_store, value):
             return f"protected:{value}"
@@ -690,6 +715,14 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
 
         self.assertEqual(len(model.rows), 7)
         self.assertEqual([row.weekday for row in model.rows], ["월", "화", "수", "목", "금", "토", "일"])
+        self.assertEqual(
+            [row.date_key for row in model.rows],
+            [f"2026-04-{day:02d}" for day in range(6, 13)],
+        )
+        self.assertEqual(
+            [row.target_minutes for row in model.rows],
+            [480, 480, 480, 540, 480, 120, 0],
+        )
         self.assertIn("부족 30분", overview_rows[-1][0])
         self.assertNotIn("5시간 55분", overview_rows[-1][0])
         today_text = "\n".join(line.text for line in model.today_lines)
@@ -707,8 +740,12 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         friday = model.rows[4]
         saturday = model.rows[5]
         sunday = model.rows[6]
+        self.assertEqual(friday.date_key, "2026-04-10")
+        self.assertEqual(friday.target_minutes, 480)
         self.assertIn("휴가 8시간", friday.summary)
         self.assertNotIn("부족", friday.summary)
+        self.assertEqual(saturday.date_key, "2026-04-11")
+        self.assertEqual(saturday.target_minutes, 120)
         self.assertIn("목표 2시간", saturday.summary)
         self.assertNotEqual(saturday.summary, "휴무")
         self.assertEqual(sunday.summary, "휴무")
@@ -1227,40 +1264,133 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(plan["target_net_minutes"], 0)
         self.assertEqual(plan["clock_in"], "10:15")
 
-    def test_panel_target_edit_is_today_only_and_preserves_clock_in(self) -> None:
+    def test_panel_target_edit_uses_selected_date_preserves_clock_and_is_local_only(self) -> None:
         wrike = self._new_wrike()
-        today = date(2026, 4, 6)
-        adjacent_day = date(2026, 4, 7)
+        _FrozenDateTime.current = datetime(2026, 4, 8, 15, 0)
+        today = date(2026, 4, 8)
+        selected_day = date(2026, 4, 7)
+        untouched_day = date(2026, 4, 9)
         wrike.update_workday_plan(today, 480, "08:15")
-        wrike.update_workday_plan(adjacent_day, 420, "09:00")
-
-        with patch.object(
+        wrike.update_workday_plan(selected_day, 420, "09:00")
+        wrike.update_workday_plan(untouched_day, 360, None)
+        self._install_snapshot(
             wrike,
-            "_Wrike__show_panel_action_error",
-        ) as show_error:
+            self._fresh_snapshot(
+                (0, 450, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+        available_vacation = {
+            "available": True,
+            "availability_state": "fresh",
+            "automatic_prompt_allowed": True,
+            "all_day": False,
+            "intervals": [],
+            "event_count": 0,
+        }
+
+        with (
+            patch.object(
+                wrike,
+                "_Wrike__show_panel_action_error",
+            ) as show_error,
+            patch.object(
+                wrike,
+                "_Wrike__request_timelog_snapshot_refresh",
+            ) as request_refresh,
+            patch.object(
+                wrike,
+                "_Wrike__resolve_contact_identity",
+            ) as resolve_contact,
+            patch.object(
+                wrike,
+                "_Wrike__query_authoritative_timelogs_week",
+            ) as query_timelogs,
+            patch.object(
+                wrike,
+                "_Wrike__vacation_result_for_date",
+                return_value=available_vacation,
+            ),
+            patch("src.apps.Wrike.urllib.request.urlopen") as urlopen,
+        ):
             for target_minutes in (0, 1440):
                 with self.subTest(target_minutes=target_minutes):
                     self.assertTrue(
-                        wrike._Wrike__panel_save_target_minutes(target_minutes)
+                        wrike._Wrike__panel_save_target_minutes(
+                            selected_day.isoformat(),
+                            target_minutes,
+                        )
                     )
-                    plan = wrike.get_workday_plan(today)
+                    plan = wrike.get_workday_plan(selected_day)
                     self.assertEqual(plan["target_net_minutes"], target_minutes)
-                    self.assertEqual(plan["clock_in"], "08:15")
+                    self.assertEqual(plan["clock_in"], "09:00")
 
-            for invalid in (True, -1, 1441):
-                with self.subTest(invalid=invalid):
+            for invalid_date in (
+                "2026-4-7",
+                "20260407",
+                "2026-02-30",
+                " 2026-04-07",
+            ):
+                with self.subTest(invalid_date=invalid_date):
                     self.assertFalse(
-                        wrike._Wrike__panel_save_target_minutes(invalid)
+                        wrike._Wrike__panel_save_target_minutes(
+                            invalid_date,
+                            480,
+                        )
+                    )
+            for invalid_target in (True, -1, 1441):
+                with self.subTest(invalid_target=invalid_target):
+                    self.assertFalse(
+                        wrike._Wrike__panel_save_target_minutes(
+                            selected_day.isoformat(),
+                            invalid_target,
+                        )
                     )
 
-        show_error.assert_not_called()
+            self.assertTrue(
+                wrike._Wrike__panel_save_target_minutes(
+                    selected_day.isoformat(),
+                    450,
+                )
+            )
+            recalculated_model = wrike._Wrike__build_worktime_panel_model()
+
+        selected_row = next(
+            row
+            for row in recalculated_model.rows
+            if row.date_key == selected_day.isoformat()
+        )
+        self.assertEqual(selected_row.target_minutes, 450)
         self.assertEqual(
-            wrike.get_workday_plan(adjacent_day)["target_net_minutes"],
-            420,
+            selected_row.summary,
+            "Wrike 7시간 30분 · 목표 7시간 30분 · 딱 맞음",
+        )
+        show_error.assert_not_called()
+        request_refresh.assert_not_called()
+        resolve_contact.assert_not_called()
+        query_timelogs.assert_not_called()
+        urlopen.assert_not_called()
+        self.assertEqual(
+            wrike.get_workday_plan(today),
+            {
+                "date": today.isoformat(),
+                "target_net_minutes": 480,
+                "clock_in": "08:15",
+                "explicit": True,
+            },
         )
         self.assertEqual(
-            wrike.get_workday_plan(adjacent_day)["clock_in"],
-            "09:00",
+            wrike.get_workday_plan(selected_day),
+            {
+                "date": selected_day.isoformat(),
+                "target_net_minutes": 450,
+                "clock_in": "09:00",
+                "explicit": True,
+            },
+        )
+        self.assertEqual(
+            wrike.get_workday_plan(untouched_day)["target_net_minutes"],
+            360,
         )
 
     def test_retry_vacation_ical_restarts_generation_and_worker_privately(self) -> None:
@@ -2171,26 +2301,73 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__background_active = True
         watcher = _FakeWatcher()
         wrike._Wrike__activity_watcher = watcher
+        gated = self._fresh_snapshot((120, 0, 0, 0, 0, 0, 0), generation=20)
+        baseline = self._fresh_snapshot((60, 0, 0, 0, 0, 0, 0), generation=21)
+        equal = self._fresh_snapshot((60, 0, 0, 0, 0, 0, 0), generation=22)
+        decrease = self._fresh_snapshot((30, 0, 0, 0, 0, 0, 0), generation=23)
+        increase = self._fresh_snapshot((45, 0, 0, 0, 0, 0, 0), generation=24)
 
-        with patch("src.apps.Wrike.WorktimeQuickPanel", _FakePanel), patch.object(
-            wrike,
-            "_Wrike__request_timelog_snapshot_refresh",
-        ) as request_refresh:
+        with (
+            patch("src.apps.Wrike.WorktimeQuickPanel", _FakePanel),
+            patch.object(
+                wrike,
+                "_Wrike__request_timelog_snapshot_refresh",
+            ) as request_refresh,
+            patch.object(wrike, "_Wrike__show_tooltip") as legacy_tooltip,
+            patch.object(
+                wrike,
+                "_Wrike__build_timelog_summary_lines",
+            ) as legacy_summary,
+        ):
+            wrike._Wrike__background_active = False
+            wrike._Wrike__monitor_enabled = True
+            wrike._Wrike__update_monitor_from_snapshot(gated)
+            self.assertIsNone(wrike._Wrike__monitor_last_total_minutes)
+
+            wrike._Wrike__background_active = True
+            wrike._Wrike__monitor_enabled = False
+            wrike._Wrike__update_monitor_from_snapshot(gated)
+            self.assertIsNone(wrike._Wrike__monitor_last_total_minutes)
+
+            wrike._Wrike__monitor_enabled = True
+            wrike._Wrike__update_monitor_from_snapshot(baseline)
+            wrike._Wrike__update_monitor_from_snapshot(equal)
+            wrike._Wrike__update_monitor_from_snapshot(decrease)
+            self.assertEqual(_FakePanel.instances, [])
+            self.assertEqual(wrike._Wrike__monitor_last_total_minutes, 30)
+
+            panel = wrike._Wrike__ensure_worktime_panel(root)
+            panel.show_result = False
+            wrike._Wrike__update_monitor_from_snapshot(increase)
+            self.assertEqual(wrike._Wrike__monitor_last_total_minutes, 30)
+
+            panel.show_result = True
+            wrike._Wrike__update_monitor_from_snapshot(increase)
+            self.assertEqual(wrike._Wrike__monitor_last_total_minutes, 45)
             wrike.show_weekly_timelog_summary(root)
             wrike.show_weekly_timelog_summary(root)
 
+        self.assertEqual(wrike._Wrike__monitor_last_total_minutes, 45)
         self.assertEqual(len(_FakePanel.instances), 1)
         panel = _FakePanel.instances[0]
         self.assertEqual(panel.idle_timeout_ms, 6000)
-        self.assertEqual(panel.idle_timeout_updates, [6000])
+        self.assertEqual(panel.idle_timeout_updates, [6000, 6000, 6000, 6000])
+        self.assertEqual(panel.show_calls, [False, False])
         self.assertEqual(panel.toggle_calls, [True, True])
-        request_refresh.assert_called_once_with(force=True)
+        self.assertEqual(request_refresh.call_count, 2)
+        self.assertEqual(
+            [item.kwargs.get("force") for item in request_refresh.call_args_list],
+            [False, True],
+        )
+        legacy_tooltip.assert_not_called()
+        legacy_summary.assert_not_called()
 
         ok, error = wrike.update_settings({"tooltip_duration_ms": 2500})
         self.assertTrue(ok, error)
         self.assertEqual(panel.idle_timeout_ms, 2500)
         self.assertEqual(panel.idle_timeout_updates[-1], 2500)
 
+        panel.hide()
         wrike.on_session_unlock()
         self.assertEqual(watcher.reset_calls, 1)
         generation_before = wrike._Wrike__timelog_refresh_generation
