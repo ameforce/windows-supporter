@@ -30,12 +30,15 @@ def _rgba_png(
     filters: tuple[int, ...] | None = None,
     interlace: int = 0,
     compressed_suffix: bytes = b"",
+    fill: int = 0,
 ) -> bytes:
     row_filters = filters if filters is not None else tuple(0 for _ in range(height))
     if len(row_filters) != height:
         raise ValueError("filter count must match height")
+    if type(fill) is not int or not 0 <= fill <= 255:
+        raise ValueError("fill must be one byte")
     scanlines = b"".join(
-        bytes([filter_value]) + bytes(width * 4)
+        bytes([filter_value]) + bytes([fill]) * (width * 4)
         for filter_value in row_filters
     )
     header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, interlace)
@@ -64,10 +67,24 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
             if isinstance(node, ast.ImportFrom)
         }
         self.assertNotIn("src.apps.wrike_worktime_panel", eager_modules)
+        run_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run"
+        )
+        forbidden_pointer_calls = {
+            node.func.attr
+            for node in ast.walk(run_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"_on_pointer_enter", "_on_pointer_leave"}
+        }
+        self.assertEqual(forbidden_pointer_calls, set())
 
         args = argparse.Namespace(
             output_dir="unused",
             finalize_review=True,
+            validate_finalized=False,
             review_receipt="receipt.json",
         )
         finalized = {"ok": True, "manifest": "manifest.json"}
@@ -84,6 +101,35 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
             self.assertEqual(qa.main([]), 0)
 
         finalize.assert_called_once()
+        run.assert_not_called()
+        loader.assert_not_called()
+
+        validate_args = argparse.Namespace(
+            output_dir="unused",
+            finalize_review=False,
+            validate_finalized=True,
+            review_receipt=None,
+        )
+        validated = {"ok": True, "manifest": "manifest.json"}
+        with patch.object(
+            qa,
+            "_parse_args",
+            return_value=validate_args,
+        ), patch.object(
+            qa,
+            "_external_output_dir",
+            return_value=Path("C:/external/evidence"),
+        ), patch.object(
+            qa,
+            "_validate_finalized",
+            return_value=validated,
+        ) as validate, patch.object(qa, "_run") as run, patch.object(
+            qa,
+            "_load_renderer",
+        ) as loader, redirect_stdout(io.StringIO()):
+            self.assertEqual(qa.main([]), 0)
+
+        validate.assert_called_once_with(Path("C:/external/evidence"))
         run.assert_not_called()
         loader.assert_not_called()
 
@@ -222,13 +268,27 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
 
     def test_schema_contract_fixture_finalizes_with_exact_artifact_transition(self) -> None:
         geometry = {"x": -320, "y": 40, "width": 800, "height": 540}
-        png_content = _rgba_png(width=800, height=540)
+        identity = [".!toplevel", ".!toplevel.!frame", ".!toplevel.!frame.!label"]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             states = []
-            for state_name, filename in qa.CHECKPOINT_FILENAMES.items():
-                screenshot = self._write(root, filename, png_content)
+            for index, (state_name, filename) in enumerate(
+                qa.CHECKPOINT_FILENAMES.items(),
+                start=1,
+            ):
+                screenshot = self._write(
+                    root,
+                    filename,
+                    _rgba_png(width=800, height=540, fill=index),
+                )
                 decoded = qa._decode_png(screenshot)
+                labels = []
+                if state_name == "vacation-provisional":
+                    labels = [
+                        "Wrike 기록 5시간 30분 · 현재 기대 5시간 (임시)",
+                        "현재 기준 초과 30분 (임시)",
+                        "휴가 미확정 (loading) · 휴가 미반영 임시 목표 8시간 (임시)",
+                    ]
                 states.append(
                     {
                         "state": state_name,
@@ -240,6 +300,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                         "png_decoded_bytes": decoded["decoded_bytes"],
                         "window_size": [800, 540],
                         "window_geometry": dict(geometry),
+                        "labels": labels,
                         "capture_provenance": {
                             **qa.CAPTURE_PROVENANCE,
                             "window_handle": 123,
@@ -260,7 +321,8 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
             ]
             target_revision = "fixture-revision"
             run = {
-                "schema_version": 2,
+                "schema_version": 3,
+                "runner_version": qa.RUNNER_VERSION,
                 "ok": True,
                 "output_root": str(root),
                 "capture_start_revision": target_revision,
@@ -276,6 +338,107 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 "states": states,
                 "assertions": {
                     name: True for name in qa.REQUIRED_ASSERTIONS
+                },
+                "refresh_observation": {
+                    "normal_capture_timeout_ms": qa.CAPTURE_IDLE_TIMEOUT_MS,
+                    "exact_equal": {
+                        "provider_returned_distinct_equal_instance": True,
+                        "widget_identity_before": list(identity),
+                        "widget_identity_after": list(identity),
+                        "geometry_before": dict(geometry),
+                        "geometry_after": dict(geometry),
+                        "method_calls": {
+                            "render_structure": 0,
+                            "update_rendered_model": 0,
+                            "reconcile_geometry": 0,
+                        },
+                    },
+                    "same_structure": {
+                        "signature_before": [False, 6],
+                        "signature_after": [False, 6],
+                        "widget_identity_before": list(identity),
+                        "widget_identity_after": list(identity),
+                        "geometry_before": dict(geometry),
+                        "geometry_after": dict(geometry),
+                        "method_calls": {
+                            "render_structure": 0,
+                            "update_rendered_model": 1,
+                            "reconcile_geometry": 0,
+                        },
+                    },
+                },
+                "idle_observation": {
+                    "normal_timeout_ms": qa.CAPTURE_IDLE_TIMEOUT_MS,
+                    "short_timeout_ms": qa.SHORT_IDLE_TIMEOUT_MS,
+                    "window_handle_before": 123,
+                    "widget_identity_before": list(identity),
+                    "idle_cursor_position": [500, 600],
+                    "idle_pointer_outside": True,
+                    "idle_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
+                    "idle_withdrawn": True,
+                    "window_exists_after_idle": True,
+                    "first_reopen_visible": True,
+                    "hover_cursor_position": [0, 100],
+                    "hover_pointer_inside": True,
+                    "hover_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
+                    "hover_visible": True,
+                    "interaction_depth": 1,
+                    "interaction_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
+                    "interaction_visible": True,
+                    "rearmed_cursor_position": [500, 600],
+                    "rearmed_pointer_outside": True,
+                    "rearmed_idle_elapsed_ms": qa.SHORT_IDLE_TIMEOUT_MS,
+                    "rearmed_idle_withdrawn": True,
+                    "reopened_after_interaction": True,
+                    "window_handle_after": 123,
+                    "widget_identity_after": list(identity),
+                    "same_window_reused": True,
+                    "normal_timeout_restored": True,
+                    "final_visible": True,
+                },
+                "pointer_delivery_observation": {
+                    "cursor_backend": "Win32 SetCursorPos",
+                    "binding": "additive Tk <Enter>/<Leave>",
+                    "delivery_timeout_ms": qa.POINTER_DELIVERY_TIMEOUT_MS,
+                    "transitions": [
+                        {
+                            "phase": "idle",
+                            "expected": "leave",
+                            "cursor_position": [500, 600],
+                            "delivery_elapsed_ms": 1,
+                        },
+                        {
+                            "phase": "hover",
+                            "expected": "enter",
+                            "cursor_position": [0, 100],
+                            "delivery_elapsed_ms": 1,
+                        },
+                        {
+                            "phase": "interaction",
+                            "expected": "leave",
+                            "cursor_position": [500, 600],
+                            "delivery_elapsed_ms": 1,
+                        },
+                        {
+                            "phase": "rearmed-enter",
+                            "expected": "enter",
+                            "cursor_position": [0, 100],
+                            "delivery_elapsed_ms": 1,
+                        },
+                        {
+                            "phase": "rearmed-leave",
+                            "expected": "leave",
+                            "cursor_position": [500, 600],
+                            "delivery_elapsed_ms": 1,
+                        },
+                    ],
+                    "events": [
+                        {"sequence": "leave", "widget": ".!toplevel", "elapsed_ms": 1},
+                        {"sequence": "enter", "widget": ".!toplevel", "elapsed_ms": 2},
+                        {"sequence": "leave", "widget": ".!toplevel", "elapsed_ms": 3},
+                        {"sequence": "enter", "widget": ".!toplevel", "elapsed_ms": 4},
+                        {"sequence": "leave", "widget": ".!toplevel", "elapsed_ms": 5},
+                    ],
                 },
                 "focus_order": [
                     "08:05으로 출근",
@@ -294,17 +457,21 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                     "window_size_before": [800, 540],
                     "observations": observations,
                 },
-                "callbacks": ["toggle_break", "prompt_snooze"],
+                "callbacks": ["toggle_break", "prompt_snooze", "refresh"],
                 "runtime_errors": [],
                 "first_failure": None,
                 "fixture_contains_real_identity": False,
                 "attempts": 1,
             }
             run_path = root / "run.json"
-            run_path.write_text(
-                json.dumps(run, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+
+            def write_run() -> None:
+                run_path.write_text(
+                    json.dumps(run, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+            write_run()
             qa._write_manifest(root, run, review=None)
             qa._require_exact_inventory(
                 root,
@@ -314,10 +481,40 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
             validated, run_digest = qa._validate_run_evidence(root)
             self.assertEqual(validated, run)
 
+            run["refresh_observation"]["exact_equal"]["method_calls"][
+                "reconcile_geometry"
+            ] = 1
+            write_run()
+            with self.assertRaisesRegex(RuntimeError, "exact-equal refresh"):
+                qa._validate_run_evidence(root)
+            run["refresh_observation"]["exact_equal"]["method_calls"][
+                "reconcile_geometry"
+            ] = 0
+            provisional = next(
+                state
+                for state in states
+                if state["state"] == "vacation-provisional"
+            )
+            provisional_labels = provisional["labels"]
+            provisional["labels"] = []
+            write_run()
+            with self.assertRaisesRegex(RuntimeError, "provisional vacation wording"):
+                qa._validate_run_evidence(root)
+            provisional["labels"] = provisional_labels
+            write_run()
+            validated, run_digest = qa._validate_run_evidence(root)
+            self.assertEqual(validated, run)
+
             receipt = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "run_json_sha256": run_digest,
                 "target_revision": target_revision,
+                "declared_review_provenance": {
+                    "reviewer_label": "fixture manual reviewer",
+                    "review_method": "manual-visual-inspection",
+                    "identity_assurance": "none",
+                    "signature": None,
+                },
                 "reviewed": True,
                 "sensitive_reviewed": True,
                 "checkpoints": [
@@ -333,6 +530,27 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 ],
             }
             receipt_path = root / qa.REVIEW_RECEIPT_FILENAME
+            receipt_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            overstated_receipt = json.loads(
+                receipt_path.read_text(encoding="utf-8")
+            )
+            overstated_receipt["declared_review_provenance"][
+                "identity_assurance"
+            ] = "authenticated"
+            receipt_path.write_text(
+                json.dumps(overstated_receipt, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "no identity assurance"):
+                qa._validate_review_receipt(
+                    root,
+                    str(receipt_path),
+                    run,
+                    run_digest,
+                )
             receipt_path.write_text(
                 json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -353,8 +571,86 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 "fixture finalized",
             )
             manifest = qa._load_json_object(root / "manifest.json", "manifest")
+            self.assertEqual(qa.RUNNER_VERSION, "2.3")
             self.assertEqual(manifest["schema_version"], 1)
+            self.assertEqual(manifest["runner"]["version"], qa.RUNNER_VERSION)
+            requirement_ids = [item["id"] for item in qa._requirements()]
+            scenario = manifest["scenarios"][0]
+            execution = scenario["executions"][0]
+            self.assertEqual(scenario["requirement_ids"], requirement_ids)
+            self.assertEqual(execution["visual_states"], list(qa.CHECKPOINT_FILENAMES))
+            self.assertEqual(
+                [item["state"] for item in execution["checkpoints"]],
+                list(qa.CHECKPOINT_FILENAMES),
+            )
+            self.assertTrue(all(item["reviewed"] for item in execution["checkpoints"]))
+            self.assertTrue(any("60-second" in step for step in scenario["steps"]))
+            self.assertTrue(any("1.2-second" in step for step in scenario["steps"]))
+            self.assertTrue(any("provisional-vacation" in step for step in scenario["steps"]))
             self.assertEqual(manifest["result"]["status"], "passed")
+            bindings = manifest["evidence_bindings"]
+            self.assertEqual(bindings["run_json"]["sha256"], run_digest)
+            self.assertEqual(
+                bindings["review_receipt"]["sha256"],
+                result["review_receipt_sha256"],
+            )
+            self.assertEqual(
+                bindings["review_receipt"]["declared_review_provenance"],
+                receipt["declared_review_provenance"],
+            )
+            self.assertEqual(
+                bindings["exact_inventory"],
+                sorted(qa.FINALIZED_FILENAMES),
+            )
+
+            inventory_before = qa._root_entry_names(root)
+            digests_before = {
+                name: qa._sha256(root / name)
+                for name in inventory_before
+            }
+            standalone = qa._validate_finalized(root)
+            self.assertTrue(standalone["ok"])
+            self.assertEqual(standalone["run_json_sha256"], run_digest)
+            self.assertEqual(standalone["exact_inventory"], inventory_before)
+            self.assertEqual(qa._root_entry_names(root), inventory_before)
+            self.assertEqual(
+                {name: qa._sha256(root / name) for name in inventory_before},
+                digests_before,
+            )
+
+            original_manifest = (root / "manifest.json").read_text(encoding="utf-8")
+            tampered_manifest = json.loads(original_manifest)
+            tampered_manifest["evidence_bindings"]["run_json"]["sha256"] = "0" * 64
+            (root / "manifest.json").write_text(
+                json.dumps(tampered_manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "digest bindings"):
+                qa._validate_finalized(root)
+            (root / "manifest.json").write_text(
+                original_manifest,
+                encoding="utf-8",
+            )
+
+            original_receipt = receipt_path.read_text(encoding="utf-8")
+            tampered_receipt = json.loads(original_receipt)
+            tampered_receipt["declared_review_provenance"]["reviewer_label"] = (
+                "different declared reviewer"
+            )
+            receipt_path.write_text(
+                json.dumps(tampered_receipt, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "digest bindings"):
+                qa._validate_finalized(root)
+            receipt_path.write_text(original_receipt, encoding="utf-8")
+
+            extra = root / "unexpected.txt"
+            extra.write_text("unexpected", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "artifact set mismatch"):
+                qa._validate_finalized(root)
+            extra.unlink()
+            self.assertTrue(qa._validate_finalized(root)["ok"])
 
     def test_full_geometry_contract_requires_xy_and_exact_viewport(self) -> None:
         self.assertTrue(

@@ -8,42 +8,265 @@ TZID params besides UTC are treated as local wall-clock times.
 
 from __future__ import annotations
 
+import re
+import socket
+import ssl
 import unicodedata
+import urllib.error
 import urllib.request
+import zlib
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Generic, TypeAlias, TypeVar, final
 
 DEFAULT_POLL_TIMEOUT_SEC = 15.0
 MAX_ICAL_BYTES = 2 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+class CalendarErrorCode(str, Enum):
+    """Stable, privacy-safe failures for calendar decoding and validation."""
+
+    INVALID_ENDPOINT = "invalid_endpoint"
+    REDIRECT_REJECTED = "redirect_rejected"
+    HTTP_4XX = "http_4xx"
+    HTTP_5XX = "http_5xx"
+    DNS_OR_CONNECT = "dns_or_connect"
+    TIMEOUT = "timeout"
+    TLS_VALIDATION = "tls_validation"
+    BODY_TOO_LARGE = "body_too_large"
+    UNSUPPORTED_ENCODING = "unsupported_encoding"
+    UTF8_DECODE = "utf8_decode"
+    EMPTY_BODY = "empty_body"
+    INVALID_ICAL = "invalid_ical"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+_ResultValue = TypeVar("_ResultValue")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CalendarSuccess(Generic[_ResultValue]):
+    """Successful typed result whose representation never includes its value."""
+
+    value: _ResultValue = field(repr=False)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CalendarError:
+    """Closed error result containing only a stable, non-sensitive code."""
+
+    code: CalendarErrorCode
+
+
+CalendarResponseDecodeResult: TypeAlias = CalendarSuccess[str] | CalendarError
+CalendarDocumentParseResult: TypeAlias = CalendarSuccess[dict] | CalendarError
+
+
+def _response_header_values(response, name: str) -> list[str]:
+    try:
+        headers = response.headers
+    except Exception:
+        return []
+    if headers is None:
+        return []
+
+    def as_values(value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        return [str(value)]
+
+    try:
+        get_all = getattr(headers, "get_all", None)
+        values = as_values(get_all(name)) if callable(get_all) else []
+        if values:
+            return values
+    except Exception:
+        pass
+    try:
+        value = headers.get(name)
+        if value is not None:
+            return as_values(value)
+    except Exception:
+        pass
+    try:
+        return [
+            item
+            for key, value in headers.items()
+            if str(key).strip().lower() == name.lower()
+            for item in as_values(value)
+        ]
+    except Exception:
+        return []
+
+
+def _declared_body_too_large(response, limit: int) -> bool:
+    for raw_value in _response_header_values(response, "Content-Length"):
+        for raw_piece in raw_value.split(","):
+            try:
+                declared = int(raw_piece.strip())
+            except (TypeError, ValueError):
+                continue
+            if declared > limit:
+                return True
+    return False
+
+
+def _response_content_encoding(response) -> str | None:
+    values = _response_header_values(response, "Content-Encoding")
+    if not values:
+        return "identity"
+    if len(values) != 1:
+        return None
+    encodings = [piece.strip().lower() for piece in values[0].split(",")]
+    if len(encodings) != 1:
+        return None
+    encoding = encodings[0] or "identity"
+    return encoding if encoding in {"identity", "gzip"} else None
+
+
+def decode_calendar_response(
+    response,
+    limit_bytes: int = MAX_ICAL_BYTES,
+) -> CalendarResponseDecodeResult:
+    """Incrementally read and strictly decode one bounded calendar response."""
+    try:
+        limit = min(MAX_ICAL_BYTES, max(0, int(limit_bytes)))
+    except Exception:
+        return CalendarError(CalendarErrorCode.INVALID_ICAL)
+    if _declared_body_too_large(response, limit):
+        return CalendarError(CalendarErrorCode.BODY_TOO_LARGE)
+
+    encoding = _response_content_encoding(response)
+    if encoding is None:
+        return CalendarError(CalendarErrorCode.UNSUPPORTED_ENCODING)
+
+    decompressor = (
+        zlib.decompressobj(16 + zlib.MAX_WBITS)
+        if encoding == "gzip"
+        else None
+    )
+    decoded_parts: list[bytes] = []
+    wire_size = 0
+    decoded_size = 0
+
+    while True:
+        read_size = min(_READ_CHUNK_BYTES, limit - wire_size + 1)
+        try:
+            raw_chunk = response.read(read_size)
+        except Exception as exc:
+            if isinstance(exc, (TimeoutError, socket.timeout)):
+                code = CalendarErrorCode.TIMEOUT
+            elif isinstance(
+                exc,
+                (ssl.SSLCertVerificationError, ssl.CertificateError, ssl.SSLError),
+            ):
+                code = CalendarErrorCode.TLS_VALIDATION
+            elif isinstance(exc, urllib.error.HTTPError):
+                try:
+                    status = int(getattr(exc, "code", 0))
+                except Exception:
+                    status = 0
+                if 400 <= status <= 499:
+                    code = CalendarErrorCode.HTTP_4XX
+                elif 500 <= status <= 599:
+                    code = CalendarErrorCode.HTTP_5XX
+                else:
+                    code = CalendarErrorCode.DNS_OR_CONNECT
+            elif isinstance(exc, urllib.error.URLError):
+                reason = getattr(exc, "reason", None)
+                if isinstance(reason, (TimeoutError, socket.timeout)):
+                    code = CalendarErrorCode.TIMEOUT
+                elif isinstance(
+                    reason,
+                    (
+                        ssl.SSLCertVerificationError,
+                        ssl.CertificateError,
+                        ssl.SSLError,
+                    ),
+                ):
+                    code = CalendarErrorCode.TLS_VALIDATION
+                else:
+                    code = CalendarErrorCode.DNS_OR_CONNECT
+            else:
+                code = CalendarErrorCode.DNS_OR_CONNECT
+            return CalendarError(code)
+        if not isinstance(raw_chunk, (bytes, bytearray, memoryview)):
+            return CalendarError(CalendarErrorCode.INVALID_ICAL)
+        chunk = bytes(raw_chunk)
+        if not chunk:
+            break
+        wire_size += len(chunk)
+        if wire_size > limit:
+            return CalendarError(CalendarErrorCode.BODY_TOO_LARGE)
+
+        if decompressor is None:
+            decoded_parts.append(chunk)
+            decoded_size += len(chunk)
+            continue
+
+        pending = chunk
+        while pending:
+            remaining = limit - decoded_size
+            try:
+                decoded_chunk = decompressor.decompress(pending, remaining + 1)
+            except zlib.error:
+                return CalendarError(CalendarErrorCode.INVALID_ICAL)
+            if len(decoded_chunk) > remaining:
+                return CalendarError(CalendarErrorCode.BODY_TOO_LARGE)
+            if decoded_chunk:
+                decoded_parts.append(decoded_chunk)
+                decoded_size += len(decoded_chunk)
+            if decompressor.unused_data:
+                return CalendarError(CalendarErrorCode.INVALID_ICAL)
+            next_pending = decompressor.unconsumed_tail
+            if next_pending and len(next_pending) >= len(pending) and not decoded_chunk:
+                return CalendarError(CalendarErrorCode.INVALID_ICAL)
+            pending = next_pending
+
+    if wire_size == 0:
+        return CalendarError(CalendarErrorCode.EMPTY_BODY)
+
+    if decompressor is not None:
+        remaining = limit - decoded_size
+        try:
+            decoded_tail = decompressor.flush(remaining + 1)
+        except zlib.error:
+            return CalendarError(CalendarErrorCode.INVALID_ICAL)
+        if len(decoded_tail) > remaining:
+            return CalendarError(CalendarErrorCode.BODY_TOO_LARGE)
+        if decoded_tail:
+            decoded_parts.append(decoded_tail)
+            decoded_size += len(decoded_tail)
+        if not decompressor.eof or decompressor.unused_data:
+            return CalendarError(CalendarErrorCode.INVALID_ICAL)
+
+    payload = b"".join(decoded_parts)
+    if not payload:
+        return CalendarError(CalendarErrorCode.EMPTY_BODY)
+    try:
+        text = payload.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError:
+        return CalendarError(CalendarErrorCode.UTF8_DECODE)
+    if not text:
+        return CalendarError(CalendarErrorCode.EMPTY_BODY)
+    return CalendarSuccess(text)
 
 
 def read_calendar_response_text(
     response,
     limit_bytes: int = MAX_ICAL_BYTES,
 ) -> str | None:
-    """Read one bounded iCal response and decode strict UTF-8 with BOM support."""
-    try:
-        limit = max(0, int(limit_bytes))
-    except Exception:
-        return None
-    try:
-        content_length = response.headers.get("Content-Length")
-        if content_length is not None and int(content_length) > limit:
-            return None
-    except (AttributeError, TypeError, ValueError):
-        pass
-    try:
-        raw = response.read(limit + 1)
-    except Exception:
-        return None
-    if not isinstance(raw, (bytes, bytearray, memoryview)):
-        return None
-    payload = bytes(raw)
-    if len(payload) > limit:
-        return None
-    try:
-        return payload.decode("utf-8-sig", errors="strict")
-    except UnicodeDecodeError:
-        return None
+    """Compatibility adapter returning decoded calendar text or ``None``."""
+    result = decode_calendar_response(response, limit_bytes=limit_bytes)
+    return result.value if isinstance(result, CalendarSuccess) else None
 
 
 def fetch_calendar_text(url: str, timeout_sec: float = DEFAULT_POLL_TIMEOUT_SEC) -> str | None:
@@ -128,10 +351,11 @@ def _parse_ics_date_value(raw: str) -> tuple[datetime | None, bool]:
 
 
 def parse_calendar(text: str) -> dict:
-    """Parse calendar metadata and VEVENT values without external I/O."""
+    """Permissively parse metadata and VEVENT values for legacy callers."""
     result = {"calendar_name": "", "timezone": "", "events": []}
     stack: list[str] = []
     current: dict | None = None
+    saw_x_wr_calname = False
 
     for line in unfold_ics_lines(text):
         stripped = line.strip()
@@ -184,6 +408,9 @@ def parse_calendar(text: str) -> dict:
             if stack and stack[-1] != "VCALENDAR":
                 continue
             if name == "X-WR-CALNAME":
+                saw_x_wr_calname = True
+                result["calendar_name"] = escaped.strip()
+            elif name == "NAME" and stack == ["VCALENDAR"] and not saw_x_wr_calname:
                 result["calendar_name"] = escaped.strip()
             elif name == "X-WR-TIMEZONE":
                 result["timezone"] = escaped.strip()
@@ -223,6 +450,79 @@ def parse_calendar(text: str) -> dict:
                 if ex_dt is not None:
                     current["exdates"].append(ex_dt)
     return result
+
+
+_COMPONENT_NAME = re.compile(r"^[A-Z0-9-]+$")
+
+
+def _strict_unfold_ics_lines(text: str) -> list[str] | None:
+    lines: list[str] = []
+    raw_lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for raw_line in raw_lines:
+        if raw_line[:1] in (" ", "\t"):
+            if not lines or not lines[-1]:
+                return None
+            lines[-1] += raw_line[1:]
+        else:
+            lines.append(raw_line)
+    return lines
+
+
+def _is_strict_calendar_document(text: str) -> bool:
+    lines = _strict_unfold_ics_lines(text)
+    if lines is None:
+        return False
+    stack: list[str] = []
+    root_seen = False
+    root_closed = False
+    for line in lines:
+        if not line.strip():
+            continue
+        parsed = _split_property(line)
+        if parsed is None:
+            return False
+        name, params, value = parsed
+        if not name:
+            return False
+        if name not in {"BEGIN", "END"}:
+            if not stack or root_closed:
+                return False
+            continue
+        component = value.strip().upper()
+        if params or not _COMPONENT_NAME.fullmatch(component):
+            return False
+        if name == "BEGIN":
+            if not stack:
+                if root_seen or root_closed or component != "VCALENDAR":
+                    return False
+                root_seen = True
+            elif component == "VCALENDAR":
+                return False
+            stack.append(component)
+            continue
+        if not stack or stack[-1] != component:
+            return False
+        if len(stack) == 1:
+            if component != "VCALENDAR":
+                return False
+            root_closed = True
+        stack.pop()
+    return root_seen and root_closed and not stack
+
+
+def parse_calendar_document(text: str) -> CalendarDocumentParseResult:
+    """Validate one complete VCALENDAR document, then parse it permissively."""
+    if not isinstance(text, str):
+        return CalendarError(CalendarErrorCode.INVALID_ICAL)
+    document = text[1:] if text.startswith("\ufeff") else text
+    if not document.strip():
+        return CalendarError(CalendarErrorCode.EMPTY_BODY)
+    if not _is_strict_calendar_document(document):
+        return CalendarError(CalendarErrorCode.INVALID_ICAL)
+    try:
+        return CalendarSuccess(parse_calendar(document))
+    except Exception:
+        return CalendarError(CalendarErrorCode.INVALID_ICAL)
 
 
 def parse_ics(text: str) -> list[dict]:
@@ -435,33 +735,110 @@ def _same_recurrence_start(left: datetime, right: datetime) -> bool:
         return False
 
 
+VACATION_CALENDAR_SCHEMA_VERSION = 1
+_VACATION_RRULE_FIELDS = frozenset({"FREQ", "INTERVAL", "BYDAY", "UNTIL", "COUNT"})
+
+
+def compile_vacation_calendar(calendar, expected_calendar_name: str) -> dict:
+    """Compile a private vacation feed into calculation-only runtime data.
+
+    Calendar identity and event titles are used only while validating and
+    classifying the document. Raw UIDs are replaced with document-local integer
+    keys so the long-lived cache cannot disclose feed identity or titles.
+    """
+    parsed = parse_calendar(calendar) if isinstance(calendar, str) else calendar
+    compiled = {
+        "vacation_schema_version": VACATION_CALENDAR_SCHEMA_VERSION,
+        "calendar_matched": False,
+        "events": [],
+    }
+    if not isinstance(parsed, dict):
+        return compiled
+    expected = str(expected_calendar_name or "").strip()
+    observed = str(parsed.get("calendar_name") or "").strip()
+    if not expected or observed != expected:
+        return compiled
+    compiled["calendar_matched"] = True
+
+    events = [event for event in (parsed.get("events") or []) if isinstance(event, dict)]
+    uid_keys: dict[str, int] = {}
+    master_matches: dict[str, bool] = {}
+    for event in events:
+        uid = str(event.get("uid") or "").strip()
+        if uid and uid not in uid_keys:
+            uid_keys[uid] = len(uid_keys) + 1
+        if uid and not isinstance(event.get("recurrence_id"), datetime):
+            summary = str(event.get("summary") or "").strip()
+            if summary:
+                master_matches.setdefault(
+                    uid,
+                    "휴가" in _normalized_summary(summary),
+                )
+
+    sanitized_events: list[dict] = []
+    for event in events:
+        uid = str(event.get("uid") or "").strip()
+        summary = str(event.get("summary") or "").strip()
+        vacation_match = (
+            "휴가" in _normalized_summary(summary)
+            if summary
+            else bool(uid and master_matches.get(uid, False))
+        )
+        rule = event.get("rrule")
+        sanitized_rule = {
+            str(key): str(value)
+            for key, value in (rule.items() if isinstance(rule, dict) else ())
+            if str(key) in _VACATION_RRULE_FIELDS
+        }
+        sanitized_events.append(
+            {
+                "event_key": uid_keys.get(uid),
+                "vacation_match": vacation_match,
+                "cancelled": (
+                    str(event.get("status") or "").strip().upper() == "CANCELLED"
+                ),
+                "recurrence_id": event.get("recurrence_id"),
+                "dtstart": event.get("dtstart"),
+                "dtend": event.get("dtend"),
+                "all_day": bool(event.get("all_day")),
+                "rrule": sanitized_rule,
+                "exdates": [
+                    value
+                    for value in (event.get("exdates") or [])
+                    if isinstance(value, datetime)
+                ],
+            }
+        )
+    compiled["events"] = sanitized_events
+    return compiled
+
+
 def vacation_events_for_day(calendar, expected_calendar_name: str, day) -> dict:
     """Return matching vacation occurrences clipped to one local day.
 
-    The calendar name must match exactly after normal iCal text decoding.
-    Cancelled events and summaries without the normalized ``휴가`` substring
-    are ignored. Recurrence exceptions suppress their original master slot;
-    a non-cancelled moved exception contributes its replacement interval.
-    Returned intervals intentionally remain unmerged because the work-time
-    helper owns overlap and adjacency union semantics.
+    Raw calendars are compiled first; already-compiled runtime calendars never
+    contain calendar identity, event titles, or raw UIDs. Cancelled events and
+    events not classified with the normalized ``휴가`` substring are ignored.
+    Recurrence exceptions suppress their original master slot; a non-cancelled
+    moved exception contributes its replacement interval. Returned intervals
+    remain unmerged because the work-time helper owns overlap/adjacency union.
     """
-    parsed = parse_calendar(calendar) if isinstance(calendar, str) else calendar
-    if not isinstance(parsed, dict):
-        parsed = {}
-    calendar_name = str(parsed.get("calendar_name") or "").strip()
-    timezone_name = str(parsed.get("timezone") or "").strip()
+    if (
+        isinstance(calendar, dict)
+        and calendar.get("vacation_schema_version")
+        == VACATION_CALENDAR_SCHEMA_VERSION
+    ):
+        compiled = calendar
+    else:
+        compiled = compile_vacation_calendar(calendar, expected_calendar_name)
     result = {
-        "calendar_name": calendar_name,
-        "timezone": timezone_name,
-        "calendar_matched": False,
+        "calendar_matched": bool(compiled.get("calendar_matched") is True),
         "all_day": False,
         "intervals": [],
         "event_count": 0,
     }
-    expected = str(expected_calendar_name or "").strip()
-    if not expected or calendar_name != expected:
+    if not result["calendar_matched"]:
         return result
-    result["calendar_matched"] = True
 
     try:
         target_day = day.date() if isinstance(day, datetime) else day
@@ -469,35 +846,25 @@ def vacation_events_for_day(calendar, expected_calendar_name: str, day) -> dict:
     except Exception:
         return result
 
-    events = [event for event in (parsed.get("events") or []) if isinstance(event, dict)]
-    master_summaries: dict[str, str] = {}
-    exception_starts: dict[str, list[datetime]] = {}
+    events = [event for event in (compiled.get("events") or []) if isinstance(event, dict)]
+    exception_starts: dict[int, list[datetime]] = {}
     for event in events:
-        uid = str(event.get("uid") or "").strip()
+        event_key = event.get("event_key")
         recurrence_id = event.get("recurrence_id")
-        if uid and isinstance(recurrence_id, datetime):
-            exception_starts.setdefault(uid, []).append(recurrence_id)
-        elif uid:
-            summary = str(event.get("summary") or "").strip()
-            if summary:
-                master_summaries.setdefault(uid, summary)
+        if type(event_key) is int and isinstance(recurrence_id, datetime):
+            exception_starts.setdefault(event_key, []).append(recurrence_id)
 
     for event in events:
-        if str(event.get("status") or "").strip().upper() == "CANCELLED":
+        if event.get("cancelled") is True or event.get("vacation_match") is not True:
             continue
-        uid = str(event.get("uid") or "").strip()
+        event_key = event.get("event_key")
         recurrence_id = event.get("recurrence_id")
-        summary = str(event.get("summary") or "").strip()
-        if not summary and uid:
-            summary = master_summaries.get(uid, "")
-        if "휴가" not in _normalized_summary(summary):
-            continue
         try:
             occurrences = occurrences_for_day(event, target_day, include_all_day=True)
         except Exception:
             continue
-        if uid and not isinstance(recurrence_id, datetime):
-            suppressed = exception_starts.get(uid, [])
+        if type(event_key) is int and not isinstance(recurrence_id, datetime):
+            suppressed = exception_starts.get(event_key, [])
             occurrences = [
                 occurrence
                 for occurrence in occurrences
