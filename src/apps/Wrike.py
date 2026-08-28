@@ -773,13 +773,14 @@ class Wrike:
         total_minutes = snapshot.total_recorded_minutes
         if total_minutes is None:
             return
+        current_total = int(total_minutes)
         previous_total = self.__monitor_last_total_minutes
-        self.__monitor_last_total_minutes = int(total_minutes)
-        if previous_total is None or int(total_minutes) <= int(previous_total):
+        if previous_total is None or current_total <= int(previous_total):
+            self.__monitor_last_total_minutes = current_total
             return
         try:
-            tooltip_lines = self.__build_timelog_summary_lines(snapshot)
-            self.__show_tooltip(root, "", lines=tooltip_lines)
+            if self.__show_activity_panel() is True:
+                self.__monitor_last_total_minutes = current_total
         except Exception as exc:
             self.__log_exception("monitor snapshot notification failed", exc)
         return
@@ -995,7 +996,14 @@ class Wrike:
             )
 
         if not self.__ui_safe(root, apply_result):
-            apply_result()
+            with self.__timelog_snapshot_lock:
+                if (
+                    int(generation) == int(self.__timelog_refresh_generation)
+                    and self.__timelog_refresh_running_generation
+                    == int(generation)
+                ):
+                    self.__timelog_refresh_running = False
+                    self.__timelog_refresh_running_generation = None
         return
 
     def __apply_timelog_snapshot_result(
@@ -1606,6 +1614,8 @@ class Wrike:
                 WorktimePanelDayRow(
                     weekday=self.__time_log_weekday_labels[index],
                     date=target_day.strftime("%m/%d"),
+                    date_key=target_day.isoformat(),
+                    target_minutes=target,
                     summary=summary,
                     today=is_today,
                     color=color,
@@ -1685,15 +1695,23 @@ class Wrike:
             report_error=False,
         )
 
-    def __panel_save_target_minutes(self, target_minutes: int) -> bool:
-        if type(target_minutes) is not int or not 0 <= target_minutes <= 1440:
+    def __panel_save_target_minutes(
+        self,
+        date_key: str,
+        target_minutes: int,
+    ) -> bool:
+        if type(date_key) is not str or type(target_minutes) is not int:
             return False
-        now = self.__lib.datetime.now()
+        if not 0 <= target_minutes <= 1440:
+            return False
         try:
-            plan = self.__plan_for_date(now.date())
+            target_day = datetime.strptime(date_key, "%Y-%m-%d").date()
+            if target_day.isoformat() != date_key:
+                return False
+            plan = self.__plan_for_date(target_day)
             clock_in = plan.get("clock_in")
             ok, _error = self.update_workday_plan(
-                now.date(),
+                target_day,
                 target_minutes,
                 clock_in,
             )
