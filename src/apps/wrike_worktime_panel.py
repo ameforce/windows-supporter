@@ -16,6 +16,9 @@ _MIN_IDLE_TIMEOUT_MS = 1_200
 _POINTER_OFFSET_PX = 16
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 _TARGET_HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-4]):[0-5]\d")
+_INLINE_EDITOR_TARGET = "target_minutes"
+_INLINE_EDITOR_CLOCK_IN = "clock_in"
+_INLINE_EDITOR_PROMPT = "prompt_clock_in"
 
 _BG = "#F3F4F6"
 _CARD_BG = "#FFFFFF"
@@ -101,7 +104,7 @@ class WorktimePanelModel:
     sync_state: str
     today_lines: tuple[WorktimePanelLine, ...]
     target_minutes: int
-    has_clock_in: bool
+    clock_in_time: str | None
     break_active: bool
     rows: tuple[WorktimePanelDayRow, ...]
     prompt: WorktimeActivityPrompt | None = None
@@ -118,8 +121,11 @@ class WorktimePanelModel:
             raise TypeError("target_minutes must be an int")
         if not 0 <= self.target_minutes <= 1440:
             raise ValueError("target_minutes must be between 0 and 1440")
-        if type(self.has_clock_in) is not bool:
-            raise TypeError("has_clock_in must be a bool")
+        if self.clock_in_time is not None and (
+            type(self.clock_in_time) is not str
+            or _HHMM_PATTERN.fullmatch(self.clock_in_time) is None
+        ):
+            raise ValueError("clock_in_time must be None or use 24-hour HH:MM format")
         if type(self.break_active) is not bool:
             raise TypeError("break_active must be a bool")
         if not isinstance(self.rows, tuple):
@@ -133,13 +139,20 @@ class WorktimePanelModel:
         ):
             raise TypeError("prompt must be a WorktimeActivityPrompt or None")
 
+    @property
+    def has_clock_in(self) -> bool:
+        """Return whether today's editable clock-in value exists."""
+
+        return self.clock_in_time is not None
+
 
 class WorktimeQuickPanel:
     """Singleton-style nonmodal panel backed by one reusable ``Toplevel``.
 
-    Prompt accept/edit callbacks receive the detected ``HH:MM`` string. All
-    other callbacks are called without arguments. Callback completion is
-    followed by an immediate provider read so synchronous state changes become
+    Prompt accept callbacks receive the detected ``HH:MM`` string. Clock-in
+    and target save callbacks return whether persistence succeeded; prompt edit
+    saves receive both the detected context and edited value. Callback completion
+    is followed by an immediate provider read so synchronous state changes become
     visible without waiting for the next one-second refresh.
     """
 
@@ -149,12 +162,12 @@ class WorktimeQuickPanel:
         model_provider: Callable[[], WorktimePanelModel],
         refresh: Callable[[], None],
         clock_in_now: Callable[[], None],
-        edit_clock_in: Callable[[], None],
+        edit_clock_in: Callable[[str], bool],
         edit_plan: Callable[[int], bool],
         toggle_break: Callable[[], None],
         open_settings: Callable[[], None],
         prompt_accept: Callable[[str], None],
-        prompt_edit: Callable[[str], None],
+        prompt_edit: Callable[[str, str], bool],
         prompt_snooze: Callable[[], None],
         prompt_skip: Callable[[], None],
         tk_module: Any | None = None,
@@ -207,8 +220,11 @@ class WorktimeQuickPanel:
         self._countdown_after_id = None
         self._countdown_token: object | None = None
         self._dismiss_deadline: float | None = None
+        self._dismiss_expired_while_hovered = False
         self._interaction_depth = 0
-        self._target_editor_active = False
+        self._inline_editor_active = False
+        self._inline_editor_kind: str | None = None
+        self._inline_editor_context: str | None = None
         self._idle_timeout_ms = self._clamp_idle_timeout_ms(idle_timeout_ms)
         self._pointer_inside = False
         self._geometry_retry_pending = False
@@ -266,7 +282,7 @@ class WorktimeQuickPanel:
         """Hide the panel without destroying its ``Toplevel``."""
 
         self._visible = False
-        self._close_target_editor(reconcile=False)
+        self._close_inline_editor(reconcile=False)
         self._set_pointer_inside(False)
         self._cancel_timers()
         window = self._window
@@ -309,6 +325,7 @@ class WorktimeQuickPanel:
         if model == self._model:
             return True
 
+        self._reconcile_inline_editor_for_model(model)
         if self._content is None or not self._window_exists(self._window):
             # ``_model`` represents the successfully rendered snapshot. Keeping
             # it unset here ensures a pre-show refresh cannot make show blank.
@@ -334,7 +351,9 @@ class WorktimeQuickPanel:
             return
         self._destroyed = True
         self._visible = False
-        self._target_editor_active = False
+        self._inline_editor_active = False
+        self._inline_editor_kind = None
+        self._inline_editor_context = None
         self._set_pointer_inside(False)
         self._cancel_timers()
 
@@ -366,6 +385,20 @@ class WorktimeQuickPanel:
             raise TypeError("idle_timeout_ms must be an int")
         return max(_MIN_IDLE_TIMEOUT_MS, idle_timeout_ms)
 
+    def _reconcile_inline_editor_for_model(self, model: WorktimePanelModel) -> None:
+        if not self._inline_editor_active:
+            return
+        stale = False
+        if self._inline_editor_kind == _INLINE_EDITOR_CLOCK_IN:
+            stale = model.clock_in_time is None
+        elif self._inline_editor_kind == _INLINE_EDITOR_PROMPT:
+            stale = (
+                model.prompt is None
+                or model.prompt.detected_time != self._inline_editor_context
+            )
+        if stale:
+            self._close_inline_editor(reconcile=self._visible)
+
     @staticmethod
     def _model_structure_signature(model: WorktimePanelModel) -> tuple[bool, int]:
         return model.prompt is not None, len(model.today_lines)
@@ -394,7 +427,9 @@ class WorktimeQuickPanel:
             self._geometry_retry_pending = False
             self._destroyed = True
             self._visible = False
-            self._target_editor_active = False
+            self._inline_editor_active = False
+            self._inline_editor_kind = None
+            self._inline_editor_context = None
             self._pointer_inside = False
             self._cancel_timers()
             return None
@@ -478,12 +513,20 @@ class WorktimeQuickPanel:
         if not self._visible or self._destroyed:
             self._update_countdown_label()
             return
-        if self._pointer_inside:
-            self._cancel_dismiss_timer()
-        elif changed:
-            self._reset_dismiss_timer()
-        else:
-            self._update_countdown_label()
+        if (
+            changed
+            and not self._pointer_inside
+            and (
+                self._dismiss_expired_while_hovered
+                or (
+                    self._dismiss_deadline is not None
+                    and self._monotonic() >= self._dismiss_deadline
+                )
+            )
+        ):
+            self.hide()
+            return
+        self._update_countdown_label()
 
     def _pointer_is_within_window(self, event: Any = None) -> bool:
         window = self._window
@@ -514,7 +557,7 @@ class WorktimeQuickPanel:
     def _on_key_activity(self, event: Any = None) -> None:
         if str(getattr(event, "keysym", "")).lower() == "escape":
             return
-        if self._target_editor_active:
+        if self._inline_editor_active:
             self._update_countdown_label()
         else:
             self._reset_dismiss_timer()
@@ -570,46 +613,67 @@ class WorktimeQuickPanel:
         self._cancel_dismiss_timer()
         if (
             self._interaction_depth > 0
-            or self._target_editor_active
+            or self._inline_editor_active
             or self._destroyed
             or not self._visible
-            or self._pointer_inside
         ):
             self._update_countdown_label()
             return
+        self._dismiss_deadline = self._monotonic() + self._idle_timeout_ms / 1000.0
+        self._dismiss_expired_while_hovered = False
+        self._schedule_dismiss_callback(self._idle_timeout_ms)
+        self._update_countdown_label()
+        self._schedule_countdown()
+
+    def _schedule_dismiss_callback(self, delay_ms: int | None = None) -> None:
+        deadline = self._dismiss_deadline
+        if (
+            deadline is None
+            or self._dismiss_after_id is not None
+            or self._destroyed
+            or not self._visible
+        ):
+            return
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
-            self._update_countdown_label()
             return
+        if delay_ms is None:
+            delay_ms = max(
+                1,
+                math.ceil((deadline - self._monotonic()) * 1000.0),
+            )
         token = object()
         self._dismiss_token = token
-        self._dismiss_deadline = self._monotonic() + self._idle_timeout_ms / 1000.0
         try:
             self._dismiss_after_id = scheduler(
-                self._idle_timeout_ms,
+                delay_ms,
                 lambda current=token: self._dismiss_tick(current),
             )
         except Exception:
             self._dismiss_after_id = None
             self._dismiss_token = None
             self._dismiss_deadline = None
-        self._update_countdown_label()
-        self._schedule_countdown()
 
     def _dismiss_tick(self, token: object) -> None:
         if token is not self._dismiss_token:
             return
         self._dismiss_after_id = None
         self._dismiss_token = None
-        self._dismiss_deadline = None
+        deadline = self._dismiss_deadline
+        if deadline is None:
+            return
         self._cancel_countdown()
-        if (
-            self._interaction_depth > 0
-            or self._target_editor_active
-            or self._destroyed
-            or not self._visible
-            or self._pointer_inside
-        ):
+        if self._destroyed or not self._visible:
+            self._dismiss_deadline = None
+            self._dismiss_expired_while_hovered = False
+            return
+        if self._interaction_depth > 0 or self._inline_editor_active:
+            self._dismiss_deadline = None
+            self._dismiss_expired_while_hovered = False
+            self._update_countdown_label()
+            return
+        if self._pointer_inside:
+            self._dismiss_expired_while_hovered = True
             self._update_countdown_label()
             return
         self.hide()
@@ -648,16 +712,20 @@ class WorktimeQuickPanel:
     def _countdown_text(self) -> str:
         if not self._visible or self._destroyed:
             return ""
-        if self._target_editor_active:
+        if self._inline_editor_active:
             return "편집 중 · 자동 닫힘 일시정지"
         if self._interaction_depth > 0:
             return "작업 중 · 자동 닫힘 일시정지"
-        if self._pointer_inside:
-            return "마우스 호버 중 · 자동 닫힘 일시정지"
         if self._dismiss_deadline is None:
             return "자동 닫힘 대기 중"
-        remaining = max(0.0, self._dismiss_deadline - self._monotonic())
-        return f"{max(1, math.ceil(remaining))}초 후 닫힘"
+        if self._dismiss_expired_while_hovered and self._pointer_inside:
+            return "마우스 호버 중 · 이동 시 닫힘"
+        remaining = self._dismiss_deadline - self._monotonic()
+        if remaining > 0:
+            return f"{max(1, math.ceil(remaining))}초 후 닫힘"
+        if self._pointer_inside:
+            return "마우스 호버 중 · 이동 시 닫힘"
+        return "0초 후 닫힘"
 
     def _update_countdown_label(self) -> None:
         label = self._widgets.get("countdown")
@@ -682,6 +750,7 @@ class WorktimeQuickPanel:
         self._dismiss_after_id = None
         self._dismiss_token = None
         self._dismiss_deadline = None
+        self._dismiss_expired_while_hovered = False
         self._cancel_countdown()
         if after_id is not None:
             canceller = getattr(self._root, "after_cancel", None)
@@ -706,6 +775,7 @@ class WorktimeQuickPanel:
         content = self._content
         if tk is None or content is None:
             return
+        preserved_inline_value = self._current_inline_editor_value()
         self._clear_content()
         self._widgets = {}
 
@@ -857,23 +927,24 @@ class WorktimeQuickPanel:
                 (row_frame, weekday_label, date_label, summary_label, today_label)
             )
 
-        target_editor = tk.Frame(
+        inline_editor = tk.Frame(
             content,
             bg=_CARD_BG,
             highlightthickness=1,
             highlightbackground=_HOVER_BORDER,
         )
-        target_row = tk.Frame(target_editor, bg=_CARD_BG)
-        target_row.pack(fill="x", padx=10, pady=(7, 3))
-        tk.Label(
-            target_row,
-            text="오늘 목표 순근무 시간",
+        inline_row = tk.Frame(inline_editor, bg=_CARD_BG)
+        inline_row.pack(fill="x", padx=10, pady=(7, 3))
+        inline_title = tk.Label(
+            inline_row,
+            text="",
             bg=_CARD_BG,
             fg=_TEXT,
             font=("Segoe UI", 9, "bold"),
-        ).pack(side="left")
-        target_entry = tk.Entry(
-            target_row,
+        )
+        inline_title.pack(side="left")
+        inline_entry = tk.Entry(
+            inline_row,
             width=8,
             bg=_CARD_BG,
             fg=_TEXT,
@@ -882,28 +953,28 @@ class WorktimeQuickPanel:
             borderwidth=1,
             font=("Segoe UI", 9),
         )
-        target_entry.pack(side="left", padx=(10, 4))
-        _set_entry_text(target_entry, self._format_target_minutes(model.target_minutes))
-        tk.Label(
-            target_row,
-            text="HH:MM (00:00–24:00)",
+        inline_entry.pack(side="left", padx=(10, 4))
+        inline_hint = tk.Label(
+            inline_row,
+            text="",
             bg=_CARD_BG,
             fg=_MUTED,
             font=("Segoe UI", 8),
-        ).pack(side="left", padx=(2, 8))
-        self._button(target_row, "저장", self._save_target_editor_command)
-        self._button(target_row, "취소", self._cancel_target_editor_command)
-        target_error = tk.Label(
-            target_editor,
+        )
+        inline_hint.pack(side="left", padx=(2, 8))
+        self._button(inline_row, "저장", self._save_inline_editor_command)
+        self._button(inline_row, "취소", self._cancel_inline_editor_command)
+        inline_error = tk.Label(
+            inline_editor,
             text="",
             bg=_CARD_BG,
             fg="#DC2626",
             anchor="w",
             font=("Segoe UI", 8),
         )
-        target_error.pack(fill="x", padx=10, pady=(0, 6))
-        self._bind_additive(target_entry, "<Return>", self._save_target_editor_event)
-        self._bind_additive(target_entry, "<Escape>", self._cancel_target_editor_event)
+        inline_error.pack(fill="x", padx=10, pady=(0, 6))
+        self._bind_additive(inline_entry, "<Return>", self._save_inline_editor_event)
+        self._bind_additive(inline_entry, "<Escape>", self._cancel_inline_editor_event)
 
         actions = tk.Frame(content, bg=_BG)
         actions.pack(fill="x", pady=(0, 1))
@@ -989,16 +1060,29 @@ class WorktimeQuickPanel:
             "break_button": break_button,
             "plan_button": plan_button,
             "settings_button": settings_button,
-            "target_editor": target_editor,
-            "target_entry": target_entry,
-            "target_error": target_error,
+            "inline_editor": inline_editor,
+            "inline_title": inline_title,
+            "inline_entry": inline_entry,
+            "inline_hint": inline_hint,
+            "inline_error": inline_error,
             "actions": actions,
             "countdown": countdown_label,
             "prompt_label": prompt_label,
             "prompt_buttons": prompt_buttons,
         }
-        if self._target_editor_active:
-            self._show_target_editor(reset_value=False)
+        if self._inline_editor_active and self._inline_editor_kind is not None:
+            initial_value = preserved_inline_value
+            if initial_value is None:
+                initial_value = self._inline_editor_initial_value(
+                    self._inline_editor_kind,
+                    model,
+                    self._inline_editor_context,
+                )
+            self._show_inline_editor(
+                self._inline_editor_kind,
+                initial_value,
+                context=self._inline_editor_context,
+            )
         self._update_countdown_label()
 
     def _update_rendered_model(self, model: WorktimePanelModel) -> None:
@@ -1046,11 +1130,6 @@ class WorktimeQuickPanel:
         widgets["break_button"].configure(
             text="휴게 종료" if model.break_active else "휴게 시작"
         )
-        if not self._target_editor_active:
-            _set_entry_text(
-                widgets["target_entry"],
-                self._format_target_minutes(model.target_minutes),
-            )
         self._update_countdown_label()
 
         if model.prompt is not None:
@@ -1117,19 +1196,69 @@ class WorktimeQuickPanel:
             return None, "00:00부터 24:00 사이로 입력해 주세요."
         return total, None
 
-    def _show_target_editor(self, *, reset_value: bool = True) -> None:
-        editor = self._widgets.get("target_editor")
-        entry = self._widgets.get("target_entry")
+    @staticmethod
+    def _parse_clock_time(value: object) -> tuple[str | None, str | None]:
+        text = str(value or "").strip()
+        if _HHMM_PATTERN.fullmatch(text) is None:
+            return None, "HH:MM (00:00–23:59) 형식으로 입력해 주세요."
+        return text, None
+
+    def _current_inline_editor_value(self) -> str | None:
+        if not self._inline_editor_active:
+            return None
+        entry = self._widgets.get("inline_entry")
+        getter = getattr(entry, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            return str(getter())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _inline_editor_initial_value(
+        kind: str,
+        model: WorktimePanelModel,
+        context: str | None,
+    ) -> str:
+        if kind == _INLINE_EDITOR_TARGET:
+            return WorktimeQuickPanel._format_target_minutes(model.target_minutes)
+        if kind == _INLINE_EDITOR_CLOCK_IN:
+            return str(model.clock_in_time or "")
+        if kind == _INLINE_EDITOR_PROMPT:
+            return str(context or "")
+        raise ValueError(f"unsupported inline editor kind: {kind}")
+
+    @staticmethod
+    def _inline_editor_copy(kind: str) -> tuple[str, str]:
+        if kind == _INLINE_EDITOR_TARGET:
+            return "오늘 목표 순근무 시간", "HH:MM (00:00–24:00)"
+        if kind == _INLINE_EDITOR_CLOCK_IN:
+            return "오늘 출근 시간", "HH:MM (00:00–23:59)"
+        if kind == _INLINE_EDITOR_PROMPT:
+            return "감지된 출근 시간", "HH:MM (00:00–23:59)"
+        raise ValueError(f"unsupported inline editor kind: {kind}")
+
+    def _show_inline_editor(
+        self,
+        kind: str,
+        initial_value: str,
+        *,
+        context: str | None = None,
+    ) -> None:
+        editor = self._widgets.get("inline_editor")
+        entry = self._widgets.get("inline_entry")
         actions = self._widgets.get("actions")
         if editor is None or entry is None:
             return
-        self._target_editor_active = True
-        if reset_value and self._model is not None:
-            _set_entry_text(
-                entry,
-                self._format_target_minutes(self._model.target_minutes),
-            )
-        _safe_call(self._widgets.get("target_error"), "configure", text="")
+        title, hint = self._inline_editor_copy(kind)
+        self._inline_editor_active = True
+        self._inline_editor_kind = kind
+        self._inline_editor_context = context
+        _safe_call(self._widgets.get("inline_title"), "configure", text=title)
+        _safe_call(self._widgets.get("inline_hint"), "configure", text=hint)
+        _set_entry_text(entry, str(initial_value))
+        _safe_call(self._widgets.get("inline_error"), "configure", text="")
         _safe_call(
             editor,
             "pack",
@@ -1145,12 +1274,32 @@ class WorktimeQuickPanel:
             resize_to_request=True
         )
 
-    def _close_target_editor(self, *, reconcile: bool = True) -> None:
-        if not self._target_editor_active:
+    def _focus_or_show_inline_editor(
+        self,
+        kind: str,
+        initial_value: str,
+        *,
+        context: str | None = None,
+    ) -> None:
+        if (
+            self._inline_editor_active
+            and self._inline_editor_kind == kind
+            and self._inline_editor_context == context
+        ):
+            entry = self._widgets.get("inline_entry")
+            _safe_call(entry, "focus_set")
+            _safe_call(entry, "selection_range", 0, "end")
             return
-        self._target_editor_active = False
-        _safe_call(self._widgets.get("target_editor"), "pack_forget")
-        _safe_call(self._widgets.get("target_error"), "configure", text="")
+        self._show_inline_editor(kind, initial_value, context=context)
+
+    def _close_inline_editor(self, *, reconcile: bool = True) -> None:
+        if not self._inline_editor_active:
+            return
+        self._inline_editor_active = False
+        self._inline_editor_kind = None
+        self._inline_editor_context = None
+        _safe_call(self._widgets.get("inline_editor"), "pack_forget")
+        _safe_call(self._widgets.get("inline_error"), "configure", text="")
         if reconcile and self._visible:
             self._geometry_retry_pending = not self._reconcile_geometry(
                 resize_to_request=True
@@ -1159,14 +1308,41 @@ class WorktimeQuickPanel:
         else:
             self._update_countdown_label()
 
-    def _save_target_editor_command(self) -> None:
-        entry = self._widgets.get("target_entry")
+    def _save_inline_editor_command(self) -> None:
+        kind = self._inline_editor_kind
+        entry = self._widgets.get("inline_entry")
         getter = getattr(entry, "get", None)
         raw_value = getter() if callable(getter) else ""
-        target_minutes, error = self._parse_target_minutes(raw_value)
-        if error is not None or target_minutes is None:
+        callback: Callable[[], bool] | None = None
+        failure_message = "근무시간을 저장하지 못했습니다."
+
+        if kind == _INLINE_EDITOR_TARGET:
+            target_minutes, error = self._parse_target_minutes(raw_value)
+            if error is None and target_minutes is not None:
+                callback = lambda: self._on_edit_plan(target_minutes) is True
+                failure_message = "오늘 목표를 저장하지 못했습니다."
+        elif kind in {_INLINE_EDITOR_CLOCK_IN, _INLINE_EDITOR_PROMPT}:
+            clock_value, error = self._parse_clock_time(raw_value)
+            if error is None and clock_value is not None:
+                if kind == _INLINE_EDITOR_CLOCK_IN:
+                    callback = lambda: self._on_edit_clock_in(clock_value) is True
+                else:
+                    context = self._inline_editor_context
+                    if context is None:
+                        error = "수정할 활동 시간이 만료되었습니다."
+                    else:
+                        callback = (
+                            lambda: self._on_prompt_edit(context, clock_value) is True
+                        )
+                        failure_message = (
+                            "출근 시간을 저장하지 못했거나 요청이 만료되었습니다."
+                        )
+        else:
+            error = "편집 상태가 만료되었습니다."
+
+        if error is not None or callback is None:
             _safe_call(
-                self._widgets.get("target_error"),
+                self._widgets.get("inline_error"),
                 "configure",
                 text=error or "근무시간을 확인해 주세요.",
             )
@@ -1176,31 +1352,34 @@ class WorktimeQuickPanel:
         self._cancel_dismiss_timer()
         saved = False
         try:
-            saved = self._on_edit_plan(target_minutes) is True
+            saved = callback()
             self.refresh_now()
         except Exception:
             saved = False
         finally:
             self._interaction_depth = max(0, self._interaction_depth - 1)
         if saved:
-            self._close_target_editor(reconcile=True)
-        else:
+            if self._inline_editor_active:
+                self._close_inline_editor(reconcile=True)
+            elif self._visible:
+                self._reset_dismiss_timer()
+        elif self._inline_editor_active:
             _safe_call(
-                self._widgets.get("target_error"),
+                self._widgets.get("inline_error"),
                 "configure",
-                text="오늘 목표를 저장하지 못했습니다.",
+                text=failure_message,
             )
             self._update_countdown_label()
 
-    def _cancel_target_editor_command(self) -> None:
-        self._close_target_editor(reconcile=True)
+    def _cancel_inline_editor_command(self) -> None:
+        self._close_inline_editor(reconcile=True)
 
-    def _save_target_editor_event(self, _event: Any = None) -> str:
-        self._save_target_editor_command()
+    def _save_inline_editor_event(self, _event: Any = None) -> str:
+        self._save_inline_editor_command()
         return "break"
 
-    def _cancel_target_editor_event(self, _event: Any = None) -> str:
-        self._cancel_target_editor_command()
+    def _cancel_inline_editor_event(self, _event: Any = None) -> str:
+        self._cancel_inline_editor_command()
         return "break"
 
     def _run_command(self, callback: Callable[..., None], *args: Any) -> None:
@@ -1242,15 +1421,22 @@ class WorktimeQuickPanel:
         self._run_command(self._on_clock_in_now)
 
     def _edit_clock_in_command(self) -> None:
-        self._run_command(self._on_edit_clock_in)
+        model = self._model
+        if model is None or model.clock_in_time is None:
+            return
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_CLOCK_IN,
+            model.clock_in_time,
+        )
 
     def _edit_plan_command(self) -> None:
-        if self._target_editor_active:
-            entry = self._widgets.get("target_entry")
-            _safe_call(entry, "focus_set")
-            _safe_call(entry, "selection_range", 0, "end")
+        model = self._model
+        if model is None:
             return
-        self._show_target_editor(reset_value=True)
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_TARGET,
+            self._format_target_minutes(model.target_minutes),
+        )
 
     def _toggle_break_command(self) -> None:
         self._run_command(self._on_toggle_break)
@@ -1262,7 +1448,11 @@ class WorktimeQuickPanel:
         self._run_command(self._on_prompt_accept, detected_time)
 
     def _prompt_edit_command(self, detected_time: str) -> None:
-        self._run_command(self._on_prompt_edit, detected_time)
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_PROMPT,
+            detected_time,
+            context=detected_time,
+        )
 
     def _prompt_snooze_command(self) -> None:
         self._run_command(self._on_prompt_snooze)

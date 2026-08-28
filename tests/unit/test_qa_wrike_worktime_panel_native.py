@@ -294,7 +294,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 if state_name == "initial":
                     labels.append("60초 후 닫힘")
                 elif state_name == "hover-active":
-                    labels.append("마우스 호버 중 · 자동 닫힘 일시정지")
+                    labels.append("59초 후 닫힘")
                     shell_border_color = "#2563EB"
                 elif state_name == "target-editor-prefill":
                     labels.extend(
@@ -448,7 +448,7 @@ class QaWrikeWorktimePanelNativeTest(unittest.TestCase):
                 "hover_observation": {
                     "normal_border_color": "#E5E7EB",
                     "active_border_color": "#2563EB",
-                    "active_countdown_text": "마우스 호버 중 · 자동 닫힘 일시정지",
+                    "active_countdown_text": "59초 후 닫힘",
                     "enter_cursor_position": [200, 200],
                     "enter_delivery_elapsed_ms": 1,
                     "exit_cursor_position": [1919, 1079],
