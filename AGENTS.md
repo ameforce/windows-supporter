@@ -74,9 +74,19 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
    - `git push origin vX.Y.Z`
    - `git push origin develop`
    - 이미 잘못된 release graph를 push했다면 공개 ref를 force rewrite하지 않는다. revert 또는 다음 patch release로 복구한다.
-7. merge된 hotfix 브랜치를 정리한다.
-   - 로컬 브랜치: `git branch -d hotfix/vX.Y.Z`
-   - 원격 branch는 main/tag/develop push와 exact remote ref read-back 뒤 tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다.
+7. merge된 topic branch와 task-owned linked worktree를 자동 정리한 뒤 hotfix 브랜치를 정리한다.
+   - 사용자가 별도 cleanup 지시를 하지 않아도 이번 release/hotfix에 포함된 merged task PR의 topic branch, 그 branch만을 위해 만든 linked worktree, 그 안의 검증된 task-owned ignored build artifact를 완료 과정에서 정리한다.
+   - 삭제 전 PR 번호·`MERGED` 상태·final head SHA·base repository/ref와 merge 시 base SHA, 최종 version-tip SHA를 immutable cleanup receipt로 기록한다. 각 topic tip의 ancestry는 branch 이름이 아니라 이 version-tip commit과 최종 `main`, `develop`, release tag peeled commit을 기준으로 확인하며, version branch 삭제 후 재시도할 때도 같은 commit SHA와 receipt를 사용한다.
+   - local ref와 remote exact ref는 독립적으로 판정한다. 존재하는 ref는 final PR head SHA와 일치하고 위 ancestry 검증을 통과해야 하며, 이미 없는 ref는 이미 정리된 상태로 취급하고 최종 read-back에서도 계속 없어야 한다. 어느 한쪽이라도 다른 SHA면 전체 mutation 전에 중단한다.
+   - linked worktree는 task 생성 기록으로 exact 경로 소유권을 증명한 뒤 제거 직전에 `git worktree list --porcelain`을 다시 읽는다. 그 exact path가 expected `refs/heads/<topic>`과 final PR head SHA에 유일하게 binding되어야 하며 detached·locked·prunable 상태, 다른 path/branch/HEAD mapping, 다른 task·사용자와의 shared ownership, 불명확하거나 변경된 registration이면 제거하지 않는다.
+   - worktree의 staged·unstaged·untracked 상태가 모두 clean인지 확인한다. `git ls-files --others --ignored --exclude-standard -z` 등 NUL-safe 방식으로 root 아래 ignored entry를 빠짐없이 열거하고 모든 entry를 creation provenance와 대조해 task-owned 또는 보존 대상으로 분류한다. `.venv`, `build`, `dist`, generated `*.spec`, task worktree root exe, generated egg-info/cache라는 이름만으로 소유권을 추정하지 않는다. 제거 직전에 같은 exhaustive inventory를 다시 읽어 byte-for-byte 일치해야 하며 새 항목·미분류 항목·보존 대상이 하나라도 있으면 중단한다.
+   - worktree 아래 실행 파일이나 도구를 사용하는 process가 없고 시작프로그램·자동 업데이트·주기 실행이 그 경로를 가리키지 않는지 확인한다. main 물리 worktree의 tagged artifact와 영구 runtime 경로가 정상인 상태에서만 진행한다.
+   - 모든 사전 검증과 final inventory re-read가 끝난 뒤 linked worktree를 exact path의 non-force `git worktree remove`로 제거하고 path와 administrative entry 부재를 확인한다. local topic ref를 즉시 다시 읽어 expected SHA와 같을 때만 `git update-ref -d refs/heads/<topic> <EXPECTED_SHA>`로 old-OID compare-and-delete하고 exact 부재를 확인한다. 이미 없으면 부재를 다시 확인하고, 다른 SHA면 삭제하지 않는다.
+   - remote topic ref도 삭제 직전 각각 다시 읽는다. 존재하면 expected SHA에 lease를 건 compare-and-delete를 사용하고, 여러 ref는 단일 atomic push로 삭제한다. 이미 없으면 그대로 두며, 마지막에 exact remote ref 부재와 remote-tracking ref prune을 확인한다.
+   - 안전 전제 하나라도 확인되지 않으면 `git worktree remove --force`, `git branch -D`, recursive force deletion, 광역 `git clean -fdx`로 우회하지 않는다. dirty·shared·unmerged·runtime-active·ownership-uncertain worktree/ref와 task-owned임을 증명하지 못한 ignored evidence/log/사용자 자료는 보존하고 exact 경로·ref·SHA와 사유, immutable version-tip/PR-base receipt를 보고한다.
+   - topic cleanup은 `hotfix/*`·`release/*` version branch의 보호형 cleanup과 분리하고 topic branch 때문에 canonical ruleset을 변경하지 않는다. topic이 보존되더라도 protected version branch cleanup 전에 그 receipt가 durable report에 기록되어야 하며, 이후 retry는 삭제된 branch 이름이 아니라 기록된 version-tip commit을 검증한다.
+   - 로컬 hotfix 브랜치: `git branch -d hotfix/vX.Y.Z`
+   - 원격 hotfix branch는 main/tag/develop push와 exact remote ref read-back 뒤 tip을 다시 읽고, 그 tip이 main과 develop 양쪽의 ancestor인지 확인한다.
    - 삭제 전에 별도 임시 ruleset으로 exact `refs/heads/hotfix/vX.Y.Z`에 `creation`과 `update` freeze를 적용하고 effective read-back한다. 이 freeze는 branch tip 이동과 삭제 뒤 같은 이름의 재생성을 막되 deletion은 막지 않아야 한다.
    - 이어 `.github/pr-protection/ruleset.json`의 live ruleset을 읽어 다른 규칙과 기존 exclude를 보존한 채 삭제할 exact ref만 일시 exclude하고 read-back한다. `git push origin --force-with-lease=refs/heads/hotfix/vX.Y.Z:<EXPECTED_SHA> :refs/heads/hotfix/vX.Y.Z`로 compare-and-delete하고 remote exact ref 부재를 확인한다.
    - 성공 여부와 관계없이 canonical protection의 원래 exclude 목록을 먼저 복원하고 live read-back한다. 삭제가 성공했다면 freeze를 유지한 상태에서 remote ref 부재를 다시 확인한 뒤에만 임시 freeze ruleset을 제거한다. 제거 API 결과만 신뢰하지 않고 임시 freeze ruleset의 ID와 이름이 live 목록에 없음을 확인한 다음, canonical ruleset 일치와 remote ref 부재를 최종 확인한다. freeze가 남아 있으면 cleanup 완료로 보고하지 않는다.
@@ -98,8 +108,11 @@ Codex가 이 레포에서 버그 수정, 개선, 운영 지침 보강을 구현�
 
 - hotfix 브랜치 이름, main merge commit, tag, develop back-merge commit
 - push 대상과 결과(`main`, tag, `develop`)
+- 각 topic의 PR-base identity·final head·immutable version-tip cleanup receipt
+- 삭제한 local/remote topic branch와 expected/final tip, 제거한 linked worktree 및 exhaustive inventory로 승인한 task-owned ignored artifact
+- 보존한 dirty/shared/unmerged/runtime-active/ownership-uncertain 대상과 exact path/ref/SHA, 보존 사유, retry용 cleanup receipt
 - 삭제한 local/remote hotfix 브랜치
-- 최종 local/remote refs 검증 결과
+- 최종 local/remote refs와 worktree 검증 결과
 - 최종 release graph에서 `develop` back-merge가 `main` release merge 위에 표시되는지
 - 테스트/빌드 명령과 결과
 - 최종 `windows-supporter.exe` 버전과 시작프로그램 등록 경로
