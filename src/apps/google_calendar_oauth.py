@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import importlib.resources
 import ipaddress
 import json
 import re
@@ -31,6 +32,9 @@ from typing import Generic, TypeAlias, TypeVar, final
 from src.apps.wrike_ical import VACATION_CALENDAR_SCHEMA_VERSION
 
 GOOGLE_CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+GOOGLE_CALENDAR_ROLES = frozenset({"break", "vacation"})
+_BUNDLED_CLIENT_PACKAGE = "src.apps.resources"
+_BUNDLED_CLIENT_NAME = "google_desktop_oauth.json"
 
 _AUTH_ENDPOINTS = frozenset(
     {
@@ -90,10 +94,22 @@ class DesktopClientConfig:
 @final
 @dataclass(frozen=True, slots=True)
 class OAuthEnvelope:
+    """One account grant with independently optional calendar role bindings."""
+
     client_id: str = field(repr=False)
     client_secret: str = field(default="", repr=False)
     refresh_token: str = field(default="", repr=False)
-    calendar_id: str = field(default="", repr=False)
+    break_calendar_id: str = field(default="", repr=False)
+    vacation_calendar_id: str = field(default="", repr=False)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CalendarCatalogEntry:
+    """A display label paired with an internal provider identifier."""
+
+    internal_id: str = field(repr=False)
+    label: str
 
 
 _ResultValue = TypeVar("_ResultValue")
@@ -191,18 +207,14 @@ def _valid_loopback_redirect(value) -> bool:
         return False
 
 
-def load_desktop_client_config(path) -> GoogleCalendarResult[DesktopClientConfig]:
-    """Load and validate a bounded Google downloaded desktop client file."""
-
-    try:
-        with Path(path).open("rb") as stream:
-            raw = stream.read(_CLIENT_CONFIG_LIMIT + 1)
-    except (OSError, TypeError, ValueError):
+def _desktop_client_config_from_raw(raw) -> GoogleCalendarResult[DesktopClientConfig]:
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
         return GoogleCalendarError(GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID)
-    if not raw or len(raw) > _CLIENT_CONFIG_LIMIT:
+    raw_bytes = bytes(raw)
+    if not raw_bytes or len(raw_bytes) > _CLIENT_CONFIG_LIMIT:
         return GoogleCalendarError(GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID)
     try:
-        document = _strict_json_loads(raw.decode("utf-8", errors="strict"))
+        document = _strict_json_loads(raw_bytes.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
         return GoogleCalendarError(GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID)
     if type(document) is not dict or set(document) != {"installed"}:
@@ -230,6 +242,31 @@ def load_desktop_client_config(path) -> GoogleCalendarResult[DesktopClientConfig
     if not valid:
         return GoogleCalendarError(GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID)
     return GoogleCalendarSuccess(DesktopClientConfig(client_id, client_secret))
+
+
+def load_desktop_client_config(path) -> GoogleCalendarResult[DesktopClientConfig]:
+    """Load and validate a bounded Google downloaded desktop client file."""
+
+    try:
+        with Path(path).open("rb") as stream:
+            raw = stream.read(_CLIENT_CONFIG_LIMIT + 1)
+    except (OSError, TypeError, ValueError):
+        return GoogleCalendarError(GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID)
+    return _desktop_client_config_from_raw(raw)
+
+
+def load_bundled_desktop_client_config() -> GoogleCalendarResult[DesktopClientConfig]:
+    """Load the packaged Desktop client without exposing resource contents."""
+
+    try:
+        resource = importlib.resources.files(_BUNDLED_CLIENT_PACKAGE).joinpath(
+            _BUNDLED_CLIENT_NAME
+        )
+        with resource.open("rb") as stream:
+            raw = stream.read(_CLIENT_CONFIG_LIMIT + 1)
+    except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError):
+        return GoogleCalendarError(GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID)
+    return _desktop_client_config_from_raw(raw)
 
 
 def _response_status(response) -> int | None:
@@ -487,8 +524,22 @@ def _api_get_json(url: str, access_token: str, timeout: float, remaining: int, u
     )
 
 
-def _select_calendar(access_token: str, expected_name: str, timeout: float, urlopen):
-    matches: set[str] = set()
+def _valid_display_label(value) -> bool:
+    return (
+        type(value) is str
+        and 0 < len(value) <= 1024
+        and value == value.strip()
+        and not any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    )
+
+
+def _list_calendar_catalog_with_access_token(
+    access_token: str,
+    timeout: float,
+    urlopen,
+):
+    entries: list[CalendarCatalogEntry] = []
+    seen_ids: set[str] = set()
     seen_tokens: set[str] = set()
     next_token = ""
     remaining = _API_RESPONSE_LIMIT
@@ -513,12 +564,16 @@ def _select_calendar(access_token: str, expected_name: str, timeout: float, urlo
                 return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
             calendar_id = item.get("id")
             summary = item.get("summary")
-            if type(calendar_id) is not str or type(summary) is not str:
+            if (
+                not _valid_secret_string(calendar_id, maximum=4096)
+                or not _valid_display_label(summary)
+                or calendar_id in seen_ids
+            ):
                 return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
-            if summary == expected_name:
-                if not _valid_secret_string(calendar_id, maximum=4096):
-                    return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
-                matches.add(calendar_id)
+            seen_ids.add(calendar_id)
+            entries.append(CalendarCatalogEntry(calendar_id, summary))
+            if len(entries) > _MAX_EVENTS:
+                return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
         raw_next = document.get("nextPageToken", "")
         if type(raw_next) is not str or len(raw_next) > 4096:
             return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
@@ -530,12 +585,77 @@ def _select_calendar(access_token: str, expected_name: str, timeout: float, urlo
         seen_tokens.add(next_token)
     else:
         return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+    return GoogleCalendarSuccess(tuple(entries))
 
-    if not matches:
-        return GoogleCalendarError(GoogleCalendarErrorCode.CALENDAR_NOT_FOUND)
-    if len(matches) != 1:
-        return GoogleCalendarError(GoogleCalendarErrorCode.CALENDAR_AMBIGUOUS)
-    return GoogleCalendarSuccess(next(iter(matches)))
+
+def list_calendar_catalog(
+    envelope: OAuthEnvelope,
+    timeout_sec=15,
+    urlopen=urllib.request.urlopen,
+) -> GoogleCalendarResult[tuple[CalendarCatalogEntry, ...]]:
+    """List a bounded read-only catalog; provider IDs remain repr-hidden."""
+
+    if not _valid_envelope(envelope):
+        return GoogleCalendarError(GoogleCalendarErrorCode.TOKEN_REFRESH_FAILED)
+    timeout = _bounded_timeout(timeout_sec, 15.0, _MAX_API_TIMEOUT_SEC)
+    access_result = _refresh_access_token(envelope, timeout, urlopen)
+    if isinstance(access_result, GoogleCalendarError):
+        return access_result
+    return _list_calendar_catalog_with_access_token(
+        access_result.value,
+        timeout,
+        urlopen,
+    )
+
+
+def bind_calendar_role(
+    envelope: OAuthEnvelope,
+    role,
+    calendar: CalendarCatalogEntry,
+) -> GoogleCalendarResult[OAuthEnvelope]:
+    """Return a new envelope with one explicitly selected role binding."""
+
+    if (
+        not _valid_envelope(envelope)
+        or type(role) is not str
+        or role not in GOOGLE_CALENDAR_ROLES
+        or not isinstance(calendar, CalendarCatalogEntry)
+        or not _valid_secret_string(calendar.internal_id, maximum=4096)
+        or not _valid_display_label(calendar.label)
+    ):
+        return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+    values = {
+        "client_id": envelope.client_id,
+        "client_secret": envelope.client_secret,
+        "refresh_token": envelope.refresh_token,
+        "break_calendar_id": envelope.break_calendar_id,
+        "vacation_calendar_id": envelope.vacation_calendar_id,
+    }
+    values[f"{role}_calendar_id"] = calendar.internal_id
+    return GoogleCalendarSuccess(OAuthEnvelope(**values))
+
+
+def clear_calendar_role(
+    envelope: OAuthEnvelope,
+    role,
+) -> GoogleCalendarResult[OAuthEnvelope]:
+    """Return a new envelope with one role unbound."""
+
+    if (
+        not _valid_envelope(envelope)
+        or type(role) is not str
+        or role not in GOOGLE_CALENDAR_ROLES
+    ):
+        return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+    values = {
+        "client_id": envelope.client_id,
+        "client_secret": envelope.client_secret,
+        "refresh_token": envelope.refresh_token,
+        "break_calendar_id": envelope.break_calendar_id,
+        "vacation_calendar_id": envelope.vacation_calendar_id,
+    }
+    values[f"{role}_calendar_id"] = ""
+    return GoogleCalendarSuccess(OAuthEnvelope(**values))
 
 
 def _is_cancelled(cancel_event) -> bool:
@@ -618,21 +738,17 @@ def revoke_refresh_token(
 
 def authorize_desktop(
     config: DesktopClientConfig,
-    expected_calendar_name,
     timeout_sec=180,
     browser_opener=webbrowser.open,
     urlopen=urllib.request.urlopen,
     cancel_event=None,
 ) -> GoogleCalendarResult[OAuthEnvelope]:
-    """Authorize through a one-shot loopback callback and select one calendar."""
+    """Authorize one account grant; calendar roles are bound separately."""
 
     if (
         not isinstance(config, DesktopClientConfig)
         or not _valid_client_id(config.client_id)
         or not _valid_secret_string(config.client_secret, optional=True, maximum=4096)
-        or type(expected_calendar_name) is not str
-        or not expected_calendar_name
-        or len(expected_calendar_name) > 1024
     ):
         return GoogleCalendarError(GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID)
 
@@ -718,48 +834,10 @@ def authorize_desktop(
     if not _valid_secret_string(access_token) or not _valid_secret_string(refresh_token):
         return GoogleCalendarError(GoogleCalendarErrorCode.TOKEN_EXCHANGE_FAILED)
 
-    issued_envelope = OAuthEnvelope(
-        client_id=config.client_id,
-        client_secret=config.client_secret,
-        refresh_token=refresh_token,
-        calendar_id="pending",
-    )
-    if _is_cancelled(cancel_event):
-        revoke_result = revoke_refresh_token(
-            issued_envelope,
-            timeout_sec=timeout_sec,
-            urlopen=urlopen,
-        )
-        if isinstance(revoke_result, GoogleCalendarError):
-            return revoke_result
-        return GoogleCalendarError(
-            GoogleCalendarErrorCode.AUTHORIZATION_CANCELLED
-        )
-
-    calendar_result = _select_calendar(
-        access_token,
-        expected_calendar_name,
-        _bounded_timeout(timeout_sec, 15.0, _MAX_API_TIMEOUT_SEC),
-        urlopen,
-    )
-    if isinstance(calendar_result, GoogleCalendarError):
-        revoke_result = revoke_refresh_token(
-            issued_envelope,
-            timeout_sec=timeout_sec,
-            urlopen=urlopen,
-        )
-        if isinstance(revoke_result, GoogleCalendarError):
-            return revoke_result
-        if _is_cancelled(cancel_event):
-            return GoogleCalendarError(
-                GoogleCalendarErrorCode.AUTHORIZATION_CANCELLED
-            )
-        return calendar_result
     envelope = OAuthEnvelope(
         client_id=config.client_id,
         client_secret=config.client_secret,
         refresh_token=refresh_token,
-        calendar_id=calendar_result.value,
     )
     if _is_cancelled(cancel_event):
         revoke_result = revoke_refresh_token(
@@ -879,7 +957,7 @@ def fetch_vacation_calendar(
         or not _valid_client_id(envelope.client_id)
         or not _valid_secret_string(envelope.client_secret, optional=True, maximum=4096)
         or not _valid_secret_string(envelope.refresh_token)
-        or not _valid_secret_string(envelope.calendar_id, maximum=4096)
+        or not _valid_secret_string(envelope.vacation_calendar_id, maximum=4096)
     ):
         return GoogleCalendarError(GoogleCalendarErrorCode.TOKEN_REFRESH_FAILED)
     bounds = _week_bounds(week_start)
@@ -893,7 +971,7 @@ def fetch_vacation_calendar(
     access_token = access_result.value
 
     endpoint = _EVENTS_ENDPOINT_PREFIX + urllib.parse.quote(
-        envelope.calendar_id,
+        envelope.vacation_calendar_id,
         safe="",
     ) + "/events"
     events: list[dict] = []
@@ -971,29 +1049,155 @@ def fetch_vacation_calendar(
     )
 
 
+def _normalized_break_keyword(summary: str, keywords) -> str:
+    normalized_summary = unicodedata.normalize("NFKC", summary).casefold()
+    for raw_term in keywords or ():
+        if type(raw_term) is not str:
+            continue
+        term = " ".join(unicodedata.normalize("NFKC", raw_term).split()).strip()
+        if term and len(term) <= 40 and term.casefold() in normalized_summary:
+            return term
+    return ""
+
+
+def fetch_break_calendar(
+    envelope: OAuthEnvelope,
+    week_start,
+    keywords,
+    timeout_sec=15,
+    urlopen=urllib.request.urlopen,
+) -> GoogleCalendarResult[list[dict]]:
+    """Fetch one explicit break role and return title-minimized parsed events."""
+
+    if (
+        not _valid_envelope(envelope)
+        or not _valid_secret_string(envelope.break_calendar_id, maximum=4096)
+        or type(keywords) not in {list, tuple}
+    ):
+        return GoogleCalendarError(GoogleCalendarErrorCode.CALENDAR_NOT_FOUND)
+    clean_keywords = tuple(
+        term
+        for term in (
+            " ".join(unicodedata.normalize("NFKC", value).split()).strip()
+            for value in keywords
+            if type(value) is str
+        )
+        if term and len(term) <= 40
+    )
+    if not clean_keywords:
+        return GoogleCalendarSuccess([])
+    bounds = _week_bounds(week_start)
+    if bounds is None:
+        return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+    time_min, time_max = bounds
+    timeout = _bounded_timeout(timeout_sec, 15.0, _MAX_API_TIMEOUT_SEC)
+    access_result = _refresh_access_token(envelope, timeout, urlopen)
+    if isinstance(access_result, GoogleCalendarError):
+        return access_result
+    endpoint = _EVENTS_ENDPOINT_PREFIX + urllib.parse.quote(
+        envelope.break_calendar_id,
+        safe="",
+    ) + "/events"
+    events: list[dict] = []
+    seen_tokens: set[str] = set()
+    next_token = ""
+    remaining = _API_RESPONSE_LIMIT
+    for _page in range(_MAX_PAGES):
+        params = {
+            "fields": "items(end,start,status,summary),nextPageToken",
+            "maxResults": "2500",
+            "showDeleted": "false",
+            "singleEvents": "true",
+            "timeMax": time_max,
+            "timeMin": time_min,
+        }
+        if next_token:
+            params["pageToken"] = next_token
+        url = endpoint + "?" + urllib.parse.urlencode(params)
+        response = _api_get_json(
+            url, access_result.value, timeout, remaining, urlopen
+        )
+        if isinstance(response, GoogleCalendarError):
+            return response
+        document, consumed = response.value
+        remaining -= consumed
+        items = document.get("items", [])
+        if type(items) is not list:
+            return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+        for item in items:
+            if type(item) is not dict:
+                return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+            status = item.get("status", "confirmed")
+            summary = item.get("summary", "")
+            if type(status) is not str or type(summary) is not str or len(summary) > 32_768:
+                return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+            if status == "cancelled":
+                continue
+            matched_keyword = _normalized_break_keyword(summary, clean_keywords)
+            if not matched_keyword:
+                continue
+            parsed_time = _parse_google_time(item.get("start"), item.get("end"))
+            if parsed_time is None:
+                return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+            start_dt, end_dt, all_day = parsed_time
+            events.append(
+                {
+                    "event_key": len(events) + 1,
+                    "summary": matched_keyword,
+                    "cancelled": False,
+                    "recurrence_id": None,
+                    "dtstart": start_dt,
+                    "dtend": end_dt,
+                    "all_day": all_day,
+                    "rrule": {},
+                    "exdates": [],
+                }
+            )
+            if len(events) > _MAX_EVENTS:
+                return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+        raw_next = document.get("nextPageToken", "")
+        if type(raw_next) is not str or len(raw_next) > 4096:
+            return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+        next_token = raw_next
+        if not next_token:
+            break
+        if next_token in seen_tokens or remaining <= 0:
+            return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+        seen_tokens.add(next_token)
+    else:
+        return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+    return GoogleCalendarSuccess(events)
+
+
 def _valid_envelope(envelope) -> bool:
     return (
         isinstance(envelope, OAuthEnvelope)
         and _valid_client_id(envelope.client_id)
         and _valid_secret_string(envelope.client_secret, optional=True, maximum=4096)
         and _valid_secret_string(envelope.refresh_token)
-        and _valid_secret_string(envelope.calendar_id, maximum=4096)
+        and _valid_secret_string(
+            envelope.break_calendar_id, optional=True, maximum=4096
+        )
+        and _valid_secret_string(
+            envelope.vacation_calendar_id, optional=True, maximum=4096
+        )
     )
 
 
 def serialize_envelope(envelope: OAuthEnvelope) -> GoogleCalendarResult[str]:
-    """Serialize credentials into a bounded versioned JSON document."""
+    """Serialize credentials and role bindings as schema version 2 only."""
 
     if not _valid_envelope(envelope):
         return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
     try:
         text = json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "client_id": envelope.client_id,
                 "client_secret": envelope.client_secret,
                 "refresh_token": envelope.refresh_token,
-                "calendar_id": envelope.calendar_id,
+                "break_calendar_id": envelope.break_calendar_id,
+                "vacation_calendar_id": envelope.vacation_calendar_id,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -1008,7 +1212,7 @@ def serialize_envelope(envelope: OAuthEnvelope) -> GoogleCalendarResult[str]:
 
 
 def deserialize_envelope(text) -> GoogleCalendarResult[OAuthEnvelope]:
-    """Strictly deserialize schema version 1 without exposing its payload."""
+    """Strictly deserialize v1/v2, migrating v1 to the vacation role."""
 
     if type(text) is not str:
         return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
@@ -1022,23 +1226,35 @@ def deserialize_envelope(text) -> GoogleCalendarResult[OAuthEnvelope]:
         document = _strict_json_loads(text)
     except (json.JSONDecodeError, ValueError, TypeError):
         return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
-    required = {
-        "schema_version",
-        "client_id",
-        "client_secret",
-        "refresh_token",
-        "calendar_id",
-    }
-    if type(document) is not dict or set(document) != required:
+    if type(document) is not dict or type(document.get("schema_version")) is not int:
         return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
-    if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+    version = document["schema_version"]
+    common = {"schema_version", "client_id", "client_secret", "refresh_token"}
+    if version == 1:
+        if set(document) != common | {"calendar_id"}:
+            return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+        envelope = OAuthEnvelope(
+            client_id=document.get("client_id"),
+            client_secret=document.get("client_secret"),
+            refresh_token=document.get("refresh_token"),
+            break_calendar_id="",
+            vacation_calendar_id=document.get("calendar_id"),
+        )
+    elif version == 2:
+        if set(document) != common | {
+            "break_calendar_id",
+            "vacation_calendar_id",
+        }:
+            return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
+        envelope = OAuthEnvelope(
+            client_id=document.get("client_id"),
+            client_secret=document.get("client_secret"),
+            refresh_token=document.get("refresh_token"),
+            break_calendar_id=document.get("break_calendar_id"),
+            vacation_calendar_id=document.get("vacation_calendar_id"),
+        )
+    else:
         return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
-    envelope = OAuthEnvelope(
-        client_id=document.get("client_id"),
-        client_secret=document.get("client_secret"),
-        refresh_token=document.get("refresh_token"),
-        calendar_id=document.get("calendar_id"),
-    )
     if not _valid_envelope(envelope):
         return GoogleCalendarError(GoogleCalendarErrorCode.INVALID_RESPONSE)
     return GoogleCalendarSuccess(envelope)

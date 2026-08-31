@@ -154,7 +154,7 @@ echo [ Success !! ]
 REM Build the executable
 echo | set /p="Building %MAIN_SOURCE% to %EXE_NAME%..."
 call :clear_log
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller build failed.
@@ -173,10 +173,22 @@ if not exist "dist\%EXE_NAME%" (
   call :print_log
   exit /b 1
 )
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\verify_pyinstaller_archive.py" "dist\%EXE_NAME%" --entry "playwright\driver\node.exe" --match-file ".venv\Lib\site-packages\playwright\driver\node.exe" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\verify_pyinstaller_archive.py" "dist\%EXE_NAME%" --entry "playwright\driver\node.exe" --entry "src\apps\resources\google_desktop_oauth.json" --match-file ".venv\Lib\site-packages\playwright\driver\node.exe" --match-file "src\apps\resources\google_desktop_oauth.json" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller archive validation failed.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+
+REM Exercise the bundled OAuth resource through the frozen importlib.resources loader
+echo | set /p="Validating frozen Google Calendar resource loader..."
+call :clear_log
+"dist\%EXE_NAME%" --google-calendar-resource-smoke > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo Frozen Google Calendar resource loader validation failed.
   call :print_log
   exit /b 1
 )
