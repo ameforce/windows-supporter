@@ -19,6 +19,17 @@ from src.utils.LibConnector import LibConnector
 from src.utils.secret_store import SecretStore
 from src.utils.subprocess_utils import build_python_module_command, is_frozen_runtime
 from src.utils.ToolTip import ToolTip
+from src.apps.google_calendar_oauth import (
+    GoogleCalendarError,
+    GoogleCalendarErrorCode,
+    GoogleCalendarSuccess,
+    authorize_desktop,
+    deserialize_envelope,
+    fetch_vacation_calendar,
+    load_desktop_client_config,
+    revoke_refresh_token,
+    serialize_envelope,
+)
 from src.apps.wrike_ical import (
     DEFAULT_POLL_TIMEOUT_SEC,
     CalendarError,
@@ -72,10 +83,22 @@ VACATION_EXPECTED_CALENDAR_NAME = "김종인-ePapyrus"
 VACATION_ERROR_FETCH_FAILED = "calendar_fetch_failed"
 VACATION_ERROR_NAME_MISMATCH = "calendar_name_mismatch"
 VACATION_ERROR_SECRET_UNAVAILABLE = "secret_unavailable"
-VACATION_STATES = frozenset({"unconfigured", "loading", "fresh", "stale", "error"})
+VACATION_CALENDAR_PROVIDERS = frozenset({"private_ical", "google_oauth"})
+VACATION_STATES = frozenset(
+    {
+        "unconfigured",
+        "authorizing",
+        "disconnecting",
+        "loading",
+        "fresh",
+        "stale",
+        "error",
+    }
+)
 VACATION_STATUS_ERROR_CODES = frozenset(
     {
         *(code.value for code in CalendarErrorCode),
+        *(code.value for code in GoogleCalendarErrorCode),
         VACATION_ERROR_FETCH_FAILED,
         VACATION_ERROR_NAME_MISMATCH,
         VACATION_ERROR_SECRET_UNAVAILABLE,
@@ -166,7 +189,7 @@ class Wrike:
         self.__worktime_panel_root = None
         self.__activity_watcher = None
         self.__activity_prompt_surfaced_day = ""
-        self.__settings_version = 7
+        self.__settings_version = 8
         self.__playwright_checked = False
         self.__playwright_ready = False
         self.__time_log_weekday_labels = ['월', '화', '수', '목', '금', '토', '일']
@@ -195,6 +218,9 @@ class Wrike:
         self.__timelog_last_good = None
         self.__secret_store = SecretStore("windows-supporter:wrike-api-token")
         self.__vacation_secret_store = SecretStore("windows-supporter:vacation-ical-url")
+        self.__vacation_google_oauth_secret_store = SecretStore(
+            "windows-supporter:google-calendar-oauth"
+        )
         self.__wrike_api_token_secret_scope = "windows-supporter:wrike-api-token"
         self.__lunch_break_enabled = True
         self.__lunch_start_min = int(DEFAULT_LUNCH_START_MIN)
@@ -210,8 +236,14 @@ class Wrike:
         self.__ical_events_for_date = ""
         self.__ical_parsed_events: list[dict] = []
         self.__ical_matched: list[dict] = []
+        self.__vacation_calendar_provider = "private_ical"
         self.__vacation_ical_url_protected = ""
         self.__vacation_ical_url_session = ""
+        self.__vacation_google_oauth_protected = ""
+        self.__vacation_google_oauth_session = ""
+        self.__vacation_google_oauth_week_start = ""
+        self.__vacation_google_oauth_cancel_event = None
+        self.__vacation_google_oauth_delete_pending = False
         self.__vacation_ical_poll_interval_sec = 900.0
         self.__vacation_ical_after_id = None
         self.__vacation_ical_fetch_owner = None
@@ -651,6 +683,7 @@ class Wrike:
         self.__cancel_ical_after()
         self.__ical_fetch_running = False
         self.__cancel_vacation_ical_after()
+        self.__cancel_vacation_google_oauth()
         self.__vacation_ical_generation += 1
         with self.__vacation_ical_lock:
             self.__vacation_ical_fetch_owner = None
@@ -1222,24 +1255,27 @@ class Wrike:
                 "using_last_good": False,
                 "error_code": VACATION_ERROR_FETCH_FAILED,
             }
+        provider, secret_present, configuration, _fingerprint = (
+            self.__active_vacation_configuration()
+        )
         with self.__vacation_ical_lock:
             state = str(self.__vacation_ical_state or "error").strip().lower()
             if state not in VACATION_STATES:
                 state = "error"
             calendar = self.__vacation_ical_calendar
             last_error = str(self.__vacation_ical_last_error or "").strip()
-            secret_present = bool(
-                str(self.__vacation_ical_url_protected or "").strip()
-                or str(self.__vacation_ical_url_session or "").strip()
-            )
             if self.__vacation_ical_week_cache_calendar is not calendar:
                 self.__vacation_ical_week_cache_calendar = calendar
                 self.__vacation_ical_week_cache = {}
             cached = self.__vacation_ical_week_cache.get(cache_key)
 
-        if not secret_present:
+        authorizing = provider == "google_oauth" and state == "authorizing"
+        if not secret_present and not authorizing:
             state = "unconfigured"
-        has_last_good = bool(isinstance(calendar, dict) and calendar)
+        elif secret_present and configuration is None and not authorizing:
+            state = "error"
+            last_error = VACATION_ERROR_SECRET_UNAVAILABLE
+        has_last_good = self.__vacation_calendar_has_last_good(target_day)
         available = state == "unconfigured" or has_last_good
         metadata = {
             "availability_state": state,
@@ -2161,33 +2197,178 @@ class Wrike:
                 self.__vacation_ical_url_session = cleaned
         return cleaned
 
-    def __clear_vacation_ical_cache(self) -> None:
+    def __normalized_vacation_provider(self, value=None) -> str:
+        provider = str(
+            self.__vacation_calendar_provider if value is None else value
+        ).strip()
+        return provider if provider in VACATION_CALENDAR_PROVIDERS else "private_ical"
+
+    def __cancel_vacation_google_oauth(self) -> None:
         with self.__vacation_ical_lock:
-            configured = bool(
-                str(self.__vacation_ical_url_protected or "").strip()
-                or str(self.__vacation_ical_url_session or "").strip()
+            cancel_event = self.__vacation_google_oauth_cancel_event
+            self.__vacation_google_oauth_cancel_event = None
+        if cancel_event is not None:
+            try:
+                cancel_event.set()
+            except Exception:
+                pass
+        return
+
+    def __revoke_uncommitted_google_oauth(self, envelope) -> bool:
+        try:
+            result = revoke_refresh_token(envelope)
+        except Exception:
+            result = GoogleCalendarError(
+                GoogleCalendarErrorCode.TOKEN_REVOCATION_FAILED
             )
+        if isinstance(result, GoogleCalendarError):
+            self.__log(
+                "vacation oauth rollback failed: token_revocation_failed"
+            )
+            return False
+        self.__log("vacation oauth uncommitted grant revoked")
+        return True
+
+    def __revoke_uncommitted_google_oauth_async(self, envelope) -> bool:
+        try:
+            threading.Thread(
+                target=lambda: self.__revoke_uncommitted_google_oauth(envelope),
+                daemon=True,
+            ).start()
+            return True
+        except Exception:
+            self.__log("vacation oauth rollback worker failed")
+            return False
+
+    def __decode_vacation_google_oauth(self):
+        with self.__vacation_ical_lock:
+            session = str(self.__vacation_google_oauth_session or "").strip()
+            protected = str(self.__vacation_google_oauth_protected or "").strip()
+        serialized = session
+        if not serialized and protected:
+            try:
+                serialized = str(
+                    self.__vacation_google_oauth_secret_store.unprotect(protected)
+                    or ""
+                ).strip()
+            except Exception:
+                serialized = ""
+        if not serialized:
+            return None
+        result = deserialize_envelope(serialized)
+        if not isinstance(result, GoogleCalendarSuccess):
+            return None
+        with self.__vacation_ical_lock:
+            if (
+                not session
+                and protected
+                == str(self.__vacation_google_oauth_protected or "").strip()
+            ):
+                self.__vacation_google_oauth_session = serialized
+        return result.value
+
+    def __active_vacation_configuration(self):
+        provider = self.__normalized_vacation_provider()
+        if provider == "private_ical":
+            with self.__vacation_ical_lock:
+                secret_present = bool(
+                    str(self.__vacation_ical_url_protected or "").strip()
+                    or str(self.__vacation_ical_url_session or "").strip()
+                )
+            url = self.__decode_vacation_ical_url()
+            fingerprint = (
+                hashlib.sha256((provider + "\0" + url).encode("utf-8")).hexdigest()
+                if url
+                else ""
+            )
+            return provider, secret_present, url or None, fingerprint
+
+        with self.__vacation_ical_lock:
+            secret_present = bool(
+                str(self.__vacation_google_oauth_protected or "").strip()
+                or str(self.__vacation_google_oauth_session or "").strip()
+            )
+            delete_pending = bool(
+                self.__vacation_google_oauth_delete_pending
+            )
+        if delete_pending:
+            return provider, secret_present, None, ""
+        envelope = self.__decode_vacation_google_oauth()
+        if envelope is None:
+            return provider, secret_present, None, ""
+        serialized_result = serialize_envelope(envelope)
+        if not isinstance(serialized_result, GoogleCalendarSuccess):
+            return provider, secret_present, None, ""
+        fingerprint = hashlib.sha256(
+            (provider + "\0" + serialized_result.value).encode("utf-8")
+        ).hexdigest()
+        return provider, secret_present, envelope, fingerprint
+
+    def __current_vacation_week_start(self) -> str:
+        try:
+            today = self.__lib.datetime.now().date()
+            return (today - timedelta(days=today.weekday())).isoformat()
+        except Exception:
+            return ""
+
+    def __vacation_calendar_has_last_good(self, target_day=None) -> bool:
+        with self.__vacation_ical_lock:
+            has_calendar = bool(self.__vacation_ical_calendar)
+            provider = self.__normalized_vacation_provider()
+            covered_week = str(self.__vacation_google_oauth_week_start or "")
+        if not has_calendar:
+            return False
+        if provider != "google_oauth":
+            return True
+        try:
+            day = target_day or self.__lib.datetime.now().date()
+            expected_week = (day - timedelta(days=day.weekday())).isoformat()
+        except Exception:
+            return False
+        return bool(covered_week and covered_week == expected_week)
+
+    def __clear_vacation_ical_cache(self) -> None:
+        _provider, secret_present, configured, _fingerprint = (
+            self.__active_vacation_configuration()
+        )
+        with self.__vacation_ical_lock:
             self.__vacation_ical_calendar = {}
             self.__vacation_ical_events_for_date = ""
             self.__vacation_ical_day_result = {}
             self.__vacation_ical_week_cache_calendar = None
             self.__vacation_ical_week_cache = {}
-            self.__vacation_ical_state = "loading" if configured else "unconfigured"
+            self.__vacation_google_oauth_week_start = ""
+            self.__vacation_ical_last_success_ts = None
+            self.__vacation_ical_last_error = ""
+            self.__vacation_ical_state = (
+                "loading" if secret_present and configured is not None else "unconfigured"
+            )
         return
 
     def get_vacation_ical_status_snapshot(self) -> dict:
+        provider, secret_present, configuration, _fingerprint = (
+            self.__active_vacation_configuration()
+        )
+        oauth_configured = (
+            not bool(self.__vacation_google_oauth_delete_pending)
+            and self.__decode_vacation_google_oauth() is not None
+        )
         with self.__vacation_ical_lock:
-            protected = str(self.__vacation_ical_url_protected or "").strip()
-            session = str(self.__vacation_ical_url_session or "").strip()
             last_success = self.__vacation_ical_last_success_ts
             last_error = str(self.__vacation_ical_last_error or "").strip()
             fetch_running = self.__vacation_ical_fetch_owner is not None
             state = str(self.__vacation_ical_state or "error").strip().lower()
-            has_last_good = bool(self.__vacation_ical_calendar)
-        secret_present = bool(protected or session)
-        configured = bool(self.__decode_vacation_ical_url()) if secret_present else False
+        configured = configuration is not None
+        has_last_good = self.__vacation_calendar_has_last_good()
         error_code = last_error
-        if not secret_present:
+        authorizing = (
+            provider == "google_oauth"
+            and state == "authorizing"
+            and fetch_running
+        )
+        if authorizing:
+            error_code = ""
+        elif not secret_present:
             state = "unconfigured"
             error_code = ""
         elif not configured:
@@ -2201,6 +2382,8 @@ class Wrike:
         elif error_code and error_code not in VACATION_STATUS_ERROR_CODES:
             error_code = VACATION_ERROR_FETCH_FAILED
         return {
+            "provider": provider,
+            "oauth_configured": oauth_configured,
             "secret_present": secret_present,
             "configured": configured,
             "expected_calendar_name": "",
@@ -2332,22 +2515,450 @@ class Wrike:
             pass
         return
 
-    def retry_vacation_ical(self) -> tuple[bool, str | None]:
-        """Immediately recheck the configured private feed without exposing it."""
+    def begin_google_calendar_oauth(
+        self,
+        client_config_path,
+    ) -> tuple[bool, str | None]:
+        config_result = load_desktop_client_config(client_config_path)
+        if isinstance(config_result, GoogleCalendarError):
+            return False, config_result.code.value
+        if not isinstance(config_result, GoogleCalendarSuccess):
+            return False, GoogleCalendarErrorCode.CLIENT_CONFIG_INVALID.value
+        root = self.__root
+        if root is None or not self.__background_active:
+            return False, VACATION_ERROR_FETCH_FAILED
 
+        self.__cancel_vacation_ical_after()
+        self.__cancel_vacation_google_oauth()
+        self.__vacation_ical_generation += 1
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_fetch_owner = None
+
+        previous_runtime_state = self.__capture_settings_runtime_state()
+        self.__vacation_calendar_provider = "google_oauth"
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_calendar = {}
+            self.__vacation_ical_events_for_date = ""
+            self.__vacation_ical_day_result = {}
+            self.__vacation_ical_week_cache_calendar = None
+            self.__vacation_ical_week_cache = {}
+            self.__vacation_google_oauth_week_start = ""
+            self.__vacation_ical_last_success_ts = None
+            self.__vacation_ical_last_error = ""
+            self.__vacation_ical_state = "unconfigured"
+        if not self.__save_settings():
+            self.__restore_settings_runtime_state(previous_runtime_state)
+            self.__start_vacation_ical_polling()
+            return False, VACATION_ERROR_SECRET_UNAVAILABLE
+
+        generation = int(self.__vacation_ical_generation)
+        cancel_event = threading.Event()
+        with self.__vacation_ical_lock:
+            auth_owner = (generation, object())
+            self.__vacation_google_oauth_cancel_event = cancel_event
+            self.__vacation_ical_fetch_owner = auth_owner
+            self.__vacation_ical_state = "authorizing"
+            self.__vacation_ical_last_error = ""
+
+        def worker() -> None:
+            try:
+                auth_result = authorize_desktop(
+                    config_result.value,
+                    VACATION_EXPECTED_CALENDAR_NAME,
+                    cancel_event=cancel_event,
+                )
+            except Exception:
+                auth_result = GoogleCalendarError(
+                    GoogleCalendarErrorCode.INVALID_RESPONSE
+                )
+            grant_envelope = (
+                auth_result.value
+                if isinstance(auth_result, GoogleCalendarSuccess)
+                else None
+            )
+            grant_settled = threading.Event()
+
+            def rollback_sync() -> bool:
+                if grant_envelope is None or grant_settled.is_set():
+                    return True
+                grant_settled.set()
+                return self.__revoke_uncommitted_google_oauth(grant_envelope)
+
+            def rollback_async() -> bool:
+                if grant_envelope is None or grant_settled.is_set():
+                    return True
+                if self.__revoke_uncommitted_google_oauth_async(
+                    grant_envelope
+                ):
+                    grant_settled.set()
+                    return True
+                return rollback_sync()
+
+            if grant_envelope is not None and cancel_event.is_set():
+                revoked = rollback_sync()
+                auth_result = GoogleCalendarError(
+                    GoogleCalendarErrorCode.AUTHORIZATION_CANCELLED
+                    if revoked
+                    else GoogleCalendarErrorCode.TOKEN_REVOCATION_FAILED
+                )
+            serialized = ""
+            protected = ""
+            failure_code = VACATION_ERROR_FETCH_FAILED
+            if isinstance(auth_result, GoogleCalendarError):
+                failure_code = auth_result.code.value
+            elif isinstance(auth_result, GoogleCalendarSuccess):
+                serialized_result = serialize_envelope(auth_result.value)
+                if isinstance(serialized_result, GoogleCalendarSuccess):
+                    serialized = serialized_result.value
+                    try:
+                        protected = str(
+                            self.__vacation_google_oauth_secret_store.protect(
+                                serialized
+                            )
+                            or ""
+                        ).strip()
+                    except Exception:
+                        protected = ""
+                    failure_code = (
+                        "" if protected else VACATION_ERROR_SECRET_UNAVAILABLE
+                    )
+                else:
+                    failure_code = VACATION_ERROR_SECRET_UNAVAILABLE
+
+            if failure_code and grant_envelope is not None:
+                if not rollback_sync():
+                    failure_code = (
+                        GoogleCalendarErrorCode.TOKEN_REVOCATION_FAILED.value
+                    )
+
+            apply_started = threading.Event()
+            apply_done = threading.Event()
+
+            def apply_result_body() -> None:
+                with self.__vacation_ical_lock:
+                    if self.__vacation_ical_fetch_owner is not auth_owner:
+                        rollback_async()
+                        return
+                    if self.__vacation_google_oauth_cancel_event is cancel_event:
+                        self.__vacation_google_oauth_cancel_event = None
+                    if (
+                        cancel_event.is_set()
+                        or generation != int(self.__vacation_ical_generation)
+                        or self.__normalized_vacation_provider()
+                        != "google_oauth"
+                        or root is not self.__root
+                        or not self.__background_active
+                    ):
+                        self.__vacation_ical_fetch_owner = None
+                        rollback_async()
+                        return
+                    if failure_code:
+                        self.__vacation_ical_fetch_owner = None
+                        stable_code = (
+                            failure_code
+                            if failure_code in VACATION_STATUS_ERROR_CODES
+                            else VACATION_ERROR_FETCH_FAILED
+                        )
+                        self.__vacation_ical_state = "error"
+                        self.__vacation_ical_last_error = stable_code
+                        self.__log(
+                            f"vacation oauth authorization failed: {stable_code}"
+                        )
+                        return
+                    previous_protected = self.__vacation_google_oauth_protected
+                    previous_session = self.__vacation_google_oauth_session
+                    previous_delete_pending = (
+                        self.__vacation_google_oauth_delete_pending
+                    )
+                    self.__vacation_google_oauth_protected = protected
+                    self.__vacation_google_oauth_session = serialized
+                    self.__vacation_google_oauth_delete_pending = False
+                if not self.__save_settings():
+                    rollback_async()
+                    with self.__vacation_ical_lock:
+                        if self.__vacation_ical_fetch_owner is not auth_owner:
+                            return
+                        self.__vacation_google_oauth_protected = previous_protected
+                        self.__vacation_google_oauth_session = previous_session
+                        self.__vacation_google_oauth_delete_pending = (
+                            previous_delete_pending
+                        )
+                        self.__vacation_ical_fetch_owner = None
+                        self.__vacation_ical_state = "error"
+                        self.__vacation_ical_last_error = (
+                            VACATION_ERROR_SECRET_UNAVAILABLE
+                        )
+                    self.__log(
+                        "vacation oauth authorization failed: secret_unavailable"
+                    )
+                    return
+                owner_lost = False
+                restore_needed = False
+                with self.__vacation_ical_lock:
+                    if self.__vacation_ical_fetch_owner is not auth_owner:
+                        owner_lost = True
+                        if (
+                            self.__vacation_google_oauth_protected == protected
+                            and self.__vacation_google_oauth_session == serialized
+                        ):
+                            self.__vacation_google_oauth_protected = (
+                                previous_protected
+                            )
+                            self.__vacation_google_oauth_session = previous_session
+                            self.__vacation_google_oauth_delete_pending = (
+                                previous_delete_pending
+                            )
+                            restore_needed = True
+                    else:
+                        grant_settled.set()
+                        self.__vacation_google_oauth_delete_pending = False
+                        self.__vacation_ical_fetch_owner = None
+                        self.__vacation_ical_calendar = {}
+                        self.__vacation_ical_events_for_date = ""
+                        self.__vacation_ical_day_result = {}
+                        self.__vacation_ical_week_cache_calendar = None
+                        self.__vacation_ical_week_cache = {}
+                        self.__vacation_google_oauth_week_start = ""
+                        self.__vacation_ical_last_success_ts = None
+                        self.__vacation_ical_state = "loading"
+                        self.__vacation_ical_last_error = ""
+                if owner_lost:
+                    if restore_needed:
+                        self.__save_settings()
+                    rollback_async()
+                    return
+                self.__log("vacation oauth authorization completed")
+                self.__vacation_ical_tick(generation)
+
+            def apply_result() -> None:
+                apply_started.set()
+                try:
+                    apply_result_body()
+                finally:
+                    apply_done.set()
+
+            queued = self.__ui_safe(root, apply_result)
+            if not queued:
+                rollback_sync()
+                with self.__vacation_ical_lock:
+                    if self.__vacation_ical_fetch_owner is auth_owner:
+                        self.__vacation_ical_fetch_owner = None
+                        self.__vacation_ical_state = "error"
+                        self.__vacation_ical_last_error = (
+                            VACATION_ERROR_FETCH_FAILED
+                        )
+            elif not apply_done.wait(5.0):
+                if not apply_started.is_set():
+                    with self.__vacation_ical_lock:
+                        if self.__vacation_ical_fetch_owner is auth_owner:
+                            self.__vacation_ical_fetch_owner = None
+                            self.__vacation_ical_state = "error"
+                            self.__vacation_ical_last_error = (
+                                VACATION_ERROR_FETCH_FAILED
+                            )
+                    rollback_sync()
+                else:
+                    apply_done.wait()
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            with self.__vacation_ical_lock:
+                if self.__vacation_ical_fetch_owner is auth_owner:
+                    self.__vacation_ical_fetch_owner = None
+                    if self.__vacation_google_oauth_cancel_event is cancel_event:
+                        self.__vacation_google_oauth_cancel_event = None
+                    self.__vacation_ical_state = "error"
+                    self.__vacation_ical_last_error = VACATION_ERROR_FETCH_FAILED
+            self.__log("vacation oauth authorization worker failed")
+            return False, VACATION_ERROR_FETCH_FAILED
+        return True, None
+
+    def disconnect_google_calendar_oauth(self) -> tuple[bool, str | None]:
         with self.__vacation_ical_lock:
             secret_present = bool(
-                str(self.__vacation_ical_url_protected or "").strip()
-                or str(self.__vacation_ical_url_session or "").strip()
+                str(self.__vacation_google_oauth_protected or "").strip()
+                or str(self.__vacation_google_oauth_session or "").strip()
             )
-            has_last_good = bool(self.__vacation_ical_calendar)
-        if not secret_present:
-            return False, VACATION_ERROR_SECRET_UNAVAILABLE
-        url = self.__decode_vacation_ical_url()
-        if not url:
+            delete_pending = bool(
+                self.__vacation_google_oauth_delete_pending
+            )
+        envelope = self.__decode_vacation_google_oauth()
+        with self.__vacation_ical_lock:
+            stored_protected = str(
+                self.__vacation_google_oauth_protected or ""
+            ).strip()
+            stored_session = str(
+                self.__vacation_google_oauth_session or ""
+            ).strip()
+        self.__cancel_vacation_ical_after()
+        self.__cancel_vacation_google_oauth()
+        self.__vacation_ical_generation += 1
+        generation = int(self.__vacation_ical_generation)
+        self.__vacation_calendar_provider = "google_oauth"
+        with self.__vacation_ical_lock:
+            self.__vacation_ical_fetch_owner = None
+
+        def complete_local_delete(revoked: bool) -> bool:
+            previous_runtime_state = self.__capture_settings_runtime_state()
+            with self.__vacation_ical_lock:
+                self.__vacation_google_oauth_delete_pending = False
+                self.__vacation_google_oauth_protected = ""
+                self.__vacation_google_oauth_session = ""
+                self.__vacation_google_oauth_week_start = ""
+                self.__vacation_ical_calendar = {}
+                self.__vacation_ical_events_for_date = ""
+                self.__vacation_ical_day_result = {}
+                self.__vacation_ical_week_cache_calendar = None
+                self.__vacation_ical_week_cache = {}
+                self.__vacation_ical_last_success_ts = None
+                self.__vacation_ical_last_error = ""
+                self.__vacation_ical_state = "disconnecting"
+            if not self.__save_settings():
+                self.__restore_settings_runtime_state(previous_runtime_state)
+                with self.__vacation_ical_lock:
+                    self.__vacation_google_oauth_delete_pending = bool(
+                        revoked
+                    )
+                    self.__vacation_ical_state = "error"
+                    self.__vacation_ical_last_error = (
+                        VACATION_ERROR_SECRET_UNAVAILABLE
+                    )
+                self.__log("vacation oauth disconnect local save failed")
+                return False
+            with self.__vacation_ical_lock:
+                self.__vacation_google_oauth_delete_pending = False
+                self.__vacation_ical_state = "unconfigured"
+                self.__vacation_ical_last_error = ""
+            return True
+
+        def record_revoked_pending() -> bool:
+            with self.__vacation_ical_lock:
+                if (
+                    str(self.__vacation_google_oauth_protected or "").strip()
+                    != stored_protected
+                    or str(self.__vacation_google_oauth_session or "").strip()
+                    != stored_session
+                ):
+                    return False
+                self.__vacation_google_oauth_delete_pending = True
+                self.__vacation_ical_state = "disconnecting"
+                self.__vacation_ical_last_error = ""
+            if self.__save_settings():
+                return True
             with self.__vacation_ical_lock:
                 self.__vacation_ical_state = "error"
-                self.__vacation_ical_last_error = VACATION_ERROR_SECRET_UNAVAILABLE
+                self.__vacation_ical_last_error = (
+                    VACATION_ERROR_SECRET_UNAVAILABLE
+                )
+            self.__log("vacation oauth revoke receipt save failed")
+            return False
+
+        if delete_pending:
+            if complete_local_delete(True):
+                self.__log("vacation oauth revoked grant removed locally")
+                return True, None
+            return False, VACATION_ERROR_SECRET_UNAVAILABLE
+
+        if envelope is None:
+            if secret_present:
+                with self.__vacation_ical_lock:
+                    self.__vacation_ical_state = "error"
+                    self.__vacation_ical_last_error = (
+                        VACATION_ERROR_SECRET_UNAVAILABLE
+                    )
+                return False, VACATION_ERROR_SECRET_UNAVAILABLE
+            if complete_local_delete(False):
+                return True, None
+            return False, VACATION_ERROR_SECRET_UNAVAILABLE
+
+        with self.__vacation_ical_lock:
+            revoke_owner = (generation, object())
+            self.__vacation_ical_fetch_owner = revoke_owner
+            self.__vacation_ical_state = "disconnecting"
+            self.__vacation_ical_last_error = ""
+
+        def worker() -> None:
+            try:
+                revoke_result = revoke_refresh_token(envelope)
+            except Exception:
+                revoke_result = GoogleCalendarError(
+                    GoogleCalendarErrorCode.TOKEN_REVOCATION_FAILED
+                )
+
+            completion_lock = threading.Lock()
+            completion_claimed = False
+            apply_done = threading.Event()
+
+            def apply_result_body() -> None:
+                with self.__vacation_ical_lock:
+                    owner_matches = (
+                        self.__vacation_ical_fetch_owner is revoke_owner
+                    )
+                    if owner_matches:
+                        self.__vacation_ical_fetch_owner = None
+                    if isinstance(revoke_result, GoogleCalendarError):
+                        if owner_matches:
+                            self.__vacation_ical_state = "error"
+                            self.__vacation_ical_last_error = (
+                                GoogleCalendarErrorCode.TOKEN_REVOCATION_FAILED.value
+                            )
+                        self.__log(
+                            "vacation oauth disconnect failed: "
+                            "token_revocation_failed"
+                        )
+                        return
+                if not record_revoked_pending():
+                    return
+                if not complete_local_delete(True):
+                    return
+                self.__log("vacation oauth disconnected and grant revoked")
+
+            def apply_result() -> None:
+                nonlocal completion_claimed
+                with completion_lock:
+                    if completion_claimed:
+                        return
+                    completion_claimed = True
+                try:
+                    apply_result_body()
+                finally:
+                    apply_done.set()
+
+            queued = self.__ui_safe(self.__root, apply_result)
+            if not queued:
+                apply_result()
+            elif not apply_done.wait(5.0):
+                apply_result()
+                apply_done.wait()
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            with self.__vacation_ical_lock:
+                if self.__vacation_ical_fetch_owner is revoke_owner:
+                    self.__vacation_ical_fetch_owner = None
+                    self.__vacation_ical_state = "error"
+                    self.__vacation_ical_last_error = (
+                        GoogleCalendarErrorCode.TOKEN_REVOCATION_FAILED.value
+                    )
+            return False, GoogleCalendarErrorCode.TOKEN_REVOCATION_FAILED.value
+        return True, None
+
+    def retry_vacation_ical(self) -> tuple[bool, str | None]:
+        """Immediately recheck the selected provider without exposing secrets."""
+
+        _provider, secret_present, configuration, _fingerprint = (
+            self.__active_vacation_configuration()
+        )
+        has_last_good = self.__vacation_calendar_has_last_good()
+        if not secret_present or configuration is None:
+            with self.__vacation_ical_lock:
+                if secret_present:
+                    self.__vacation_ical_state = "error"
+                    self.__vacation_ical_last_error = (
+                        VACATION_ERROR_SECRET_UNAVAILABLE
+                    )
             return False, VACATION_ERROR_SECRET_UNAVAILABLE
         if self.__root is None or not self.__background_active:
             return False, VACATION_ERROR_FETCH_FAILED
@@ -2374,11 +2985,10 @@ class Wrike:
         if target_generation != current_generation:
             return
         root = self.__root
-        if (
-            root is None
-            or not self.__background_active
-            or not self.__decode_vacation_ical_url()
-        ):
+        _provider, _secret_present, configuration, _fingerprint = (
+            self.__active_vacation_configuration()
+        )
+        if root is None or not self.__background_active or configuration is None:
             return
         interval_sec = max(
             60.0,
@@ -2405,25 +3015,28 @@ class Wrike:
         self.__cancel_vacation_ical_after()
         self.__vacation_ical_generation += 1
         generation = int(self.__vacation_ical_generation)
+        provider, secret_present, configuration, _fingerprint = (
+            self.__active_vacation_configuration()
+        )
+        has_last_good = self.__vacation_calendar_has_last_good()
         with self.__vacation_ical_lock:
             self.__vacation_ical_fetch_owner = None
             self.__vacation_ical_observed_calendar_name = ""
-            secret_present = bool(
-                str(self.__vacation_ical_url_protected or "").strip()
-                or str(self.__vacation_ical_url_session or "").strip()
-            )
-            has_last_good = bool(self.__vacation_ical_calendar)
-        url = self.__decode_vacation_ical_url()
-        with self.__vacation_ical_lock:
             if not secret_present:
                 self.__vacation_ical_state = "unconfigured"
                 self.__vacation_ical_last_error = ""
-            elif not url:
+            elif configuration is None:
                 self.__vacation_ical_state = "error"
-                self.__vacation_ical_last_error = VACATION_ERROR_SECRET_UNAVAILABLE
+                self.__vacation_ical_last_error = (
+                    VACATION_ERROR_SECRET_UNAVAILABLE
+                )
             else:
-                self.__vacation_ical_state = "stale" if has_last_good else "loading"
-        if not self.__background_active or not url:
+                self.__vacation_ical_state = (
+                    "stale" if has_last_good else "loading"
+                )
+                if provider == "google_oauth" and not has_last_good:
+                    self.__vacation_google_oauth_week_start = ""
+        if not self.__background_active or configuration is None:
             return
         self.__schedule_vacation_ical_tick(
             initial_delay_sec=2.0,
@@ -2450,70 +3063,104 @@ class Wrike:
                 generation=target_generation,
             )
             return
-        url = self.__decode_vacation_ical_url()
-        if not url:
+        provider, _secret_present, configuration, configuration_fingerprint = (
+            self.__active_vacation_configuration()
+        )
+        if configuration is None or not configuration_fingerprint:
             return
         expected_name = VACATION_EXPECTED_CALENDAR_NAME
+        try:
+            now_day = self.__lib.datetime.now().date()
+            week_start = now_day - timedelta(days=now_day.weekday())
+            week_start_key = week_start.isoformat()
+        except Exception:
+            return
         with self.__vacation_ical_lock:
             fetch_owner = (target_generation, object())
             self.__vacation_ical_fetch_owner = fetch_owner
             self.__vacation_ical_state = (
-                "stale" if self.__vacation_ical_calendar else "loading"
+                "stale" if self.__vacation_calendar_has_last_good() else "loading"
             )
 
         def worker() -> None:
-            fetch_result = self.__fetch_vacation_calendar_text(
-                url,
-                float(DEFAULT_POLL_TIMEOUT_SEC),
-            )
-            parsed_calendar = None
             compiled_calendar = None
             parse_succeeded = False
+            calendar_matches = False
             failure_code = VACATION_ERROR_FETCH_FAILED
-            if isinstance(fetch_result, CalendarError):
-                failure_code = fetch_result.code.value
-            elif isinstance(fetch_result, CalendarSuccess):
+            if provider == "google_oauth":
                 try:
-                    parse_result = parse_calendar_document(fetch_result.value)
-                except Exception:
-                    parse_result = CalendarError(CalendarErrorCode.INVALID_ICAL)
-                if isinstance(parse_result, CalendarSuccess) and isinstance(
-                    parse_result.value,
-                    dict,
-                ):
-                    parsed_calendar = parse_result.value
-                    parse_succeeded = True
-                    failure_code = ""
-                elif isinstance(parse_result, CalendarError):
-                    failure_code = parse_result.code.value
-                else:
-                    failure_code = CalendarErrorCode.INVALID_ICAL.value
-            observed_name = ""
-            if isinstance(parsed_calendar, dict):
-                observed_name = str(
-                    parsed_calendar.get("calendar_name") or ""
-                ).strip()
-            calendar_matches = bool(
-                parse_succeeded and observed_name == expected_name
-            )
-            if calendar_matches:
-                try:
-                    candidate = compile_vacation_calendar(
-                        parsed_calendar,
-                        expected_name,
+                    fetch_result = fetch_vacation_calendar(
+                        configuration,
+                        week_start,
+                        float(DEFAULT_POLL_TIMEOUT_SEC),
                     )
                 except Exception:
-                    candidate = None
-                if (
-                    isinstance(candidate, dict)
-                    and candidate.get("calendar_matched") is True
+                    fetch_result = GoogleCalendarError(
+                        GoogleCalendarErrorCode.API_UNAVAILABLE
+                    )
+                if isinstance(fetch_result, GoogleCalendarError):
+                    failure_code = fetch_result.code.value
+                elif (
+                    isinstance(fetch_result, GoogleCalendarSuccess)
+                    and isinstance(fetch_result.value, dict)
+                    and fetch_result.value.get("calendar_matched") is True
                 ):
-                    compiled_calendar = candidate
+                    compiled_calendar = fetch_result.value
+                    parse_succeeded = True
+                    calendar_matches = True
+                    failure_code = ""
                 else:
-                    parse_succeeded = False
-                    failure_code = CalendarErrorCode.INVALID_ICAL.value
-            parsed_calendar = None
-            observed_name = ""
+                    failure_code = GoogleCalendarErrorCode.INVALID_RESPONSE.value
+            else:
+                fetch_result = self.__fetch_vacation_calendar_text(
+                    configuration,
+                    float(DEFAULT_POLL_TIMEOUT_SEC),
+                )
+                parsed_calendar = None
+                if isinstance(fetch_result, CalendarError):
+                    failure_code = fetch_result.code.value
+                elif isinstance(fetch_result, CalendarSuccess):
+                    try:
+                        parse_result = parse_calendar_document(fetch_result.value)
+                    except Exception:
+                        parse_result = CalendarError(CalendarErrorCode.INVALID_ICAL)
+                    if isinstance(parse_result, CalendarSuccess) and isinstance(
+                        parse_result.value,
+                        dict,
+                    ):
+                        parsed_calendar = parse_result.value
+                        parse_succeeded = True
+                        failure_code = ""
+                    elif isinstance(parse_result, CalendarError):
+                        failure_code = parse_result.code.value
+                    else:
+                        failure_code = CalendarErrorCode.INVALID_ICAL.value
+                observed_name = ""
+                if isinstance(parsed_calendar, dict):
+                    observed_name = str(
+                        parsed_calendar.get("calendar_name") or ""
+                    ).strip()
+                calendar_matches = bool(
+                    parse_succeeded and observed_name == expected_name
+                )
+                if calendar_matches:
+                    try:
+                        candidate = compile_vacation_calendar(
+                            parsed_calendar,
+                            expected_name,
+                        )
+                    except Exception:
+                        candidate = None
+                    if (
+                        isinstance(candidate, dict)
+                        and candidate.get("calendar_matched") is True
+                    ):
+                        compiled_calendar = candidate
+                    else:
+                        parse_succeeded = False
+                        failure_code = CalendarErrorCode.INVALID_ICAL.value
+                parsed_calendar = None
+                observed_name = ""
 
             def apply_result() -> None:
                 with self.__vacation_ical_lock:
@@ -2522,8 +3169,17 @@ class Wrike:
                     self.__vacation_ical_fetch_owner = None
                 if target_generation != int(self.__vacation_ical_generation):
                     return
-                current_url = self.__decode_vacation_ical_url()
-                if current_url != url:
+                (
+                    current_provider,
+                    _current_secret_present,
+                    current_configuration,
+                    current_fingerprint,
+                ) = self.__active_vacation_configuration()
+                if (
+                    current_provider != provider
+                    or current_configuration is None
+                    or current_fingerprint != configuration_fingerprint
+                ):
                     self.__schedule_vacation_ical_tick(
                         initial_delay_sec=2.0,
                         generation=target_generation,
@@ -2542,7 +3198,8 @@ class Wrike:
                         self.__vacation_ical_state = "error"
                         self.__vacation_ical_last_error = stable_code
                         log_message = (
-                            f"vacation ical failed: {stable_code}; last-good retained"
+                            f"vacation calendar failed: {stable_code}; "
+                            "last-good retained"
                         )
                     elif not calendar_matches:
                         self.__vacation_ical_state = "error"
@@ -2550,7 +3207,7 @@ class Wrike:
                             VACATION_ERROR_NAME_MISMATCH
                         )
                         log_message = (
-                            "vacation ical failed: calendar_name_mismatch; "
+                            "vacation calendar failed: calendar_name_mismatch; "
                             "last-good retained"
                         )
                     else:
@@ -2562,11 +3219,14 @@ class Wrike:
                             )
                         )
                         self.__vacation_ical_calendar = compiled_calendar
+                        self.__vacation_google_oauth_week_start = (
+                            week_start_key if provider == "google_oauth" else ""
+                        )
                         self.__vacation_ical_events_for_date = ""
                         self.__vacation_ical_day_result = {}
                         self.__vacation_ical_week_cache_calendar = None
                         self.__vacation_ical_week_cache = {}
-                        log_message = "vacation ical calendar cached"
+                        log_message = "vacation calendar cached"
                 if log_message:
                     self.__log(log_message)
                 self.__schedule_vacation_ical_tick(
@@ -2574,7 +3234,14 @@ class Wrike:
                     generation=target_generation,
                 )
 
-            self.__ui_safe(root, apply_result)
+            if not self.__ui_safe(root, apply_result):
+                with self.__vacation_ical_lock:
+                    if self.__vacation_ical_fetch_owner is fetch_owner:
+                        self.__vacation_ical_fetch_owner = None
+                        self.__vacation_ical_state = "error"
+                        self.__vacation_ical_last_error = (
+                            VACATION_ERROR_FETCH_FAILED
+                        )
 
         try:
             threading.Thread(target=worker, daemon=True).start()
@@ -2591,7 +3258,7 @@ class Wrike:
             with self.__vacation_ical_lock:
                 self.__vacation_ical_state = "error"
                 self.__vacation_ical_last_error = VACATION_ERROR_FETCH_FAILED
-            self.__log("vacation ical fetch worker failed; last-good retained")
+            self.__log("vacation calendar fetch worker failed; last-good retained")
             self.__schedule_vacation_ical_tick(
                 initial_delay_sec=self.__vacation_ical_poll_interval_sec,
                 generation=target_generation,
@@ -3854,6 +4521,8 @@ class Wrike:
             "workday_plan": self.get_workday_plan(),
             "manual_break_state": self.get_manual_break_state(),
             "worktime_state_path": str(self.__worktime_state_path or ""),
+            "vacation_calendar_provider": str(vacation_status["provider"]),
+            "oauth_configured": bool(vacation_status["oauth_configured"]),
             "vacation_ical_secret_present": bool(
                 vacation_status["secret_present"]
             ),
@@ -3909,8 +4578,13 @@ class Wrike:
             "timelog_last_refresh_requested_at",
             "timelog_snapshot",
             "timelog_last_good",
+            "vacation_calendar_provider",
             "vacation_ical_url_protected",
             "vacation_ical_url_session",
+            "vacation_google_oauth_protected",
+            "vacation_google_oauth_session",
+            "vacation_google_oauth_week_start",
+            "vacation_google_oauth_delete_pending",
             "vacation_ical_poll_interval_sec",
             "vacation_ical_calendar",
             "vacation_ical_events_for_date",
@@ -3940,7 +4614,21 @@ class Wrike:
         if not isinstance(data, dict):
             return False, "invalid settings"
 
+        provider_supplied = "vacation_calendar_provider" in data
+        requested_provider = str(
+            data.get(
+                "vacation_calendar_provider",
+                self.__vacation_calendar_provider,
+            )
+            or ""
+        ).strip()
+        if provider_supplied and requested_provider not in VACATION_CALENDAR_PROVIDERS:
+            return False, "vacation_calendar_provider"
+        next_provider = self.__normalized_vacation_provider(requested_provider)
         previous_runtime_state = self.__capture_settings_runtime_state()
+        provider_changed = (
+            next_provider != self.__normalized_vacation_provider()
+        )
 
         token_supplied = "api_token" in data
         clear_token = bool(data.get("clear_api_token", False))
@@ -4069,6 +4757,13 @@ class Wrike:
         self.__lunch_end_min = int(lunch_end_val)
         self.__ical_poll_interval_sec = float(poll_val)
         self.__vacation_ical_poll_interval_sec = float(vacation_poll_val)
+        if provider_changed:
+            self.__cancel_vacation_ical_after()
+            self.__cancel_vacation_google_oauth()
+            self.__vacation_ical_generation += 1
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_fetch_owner = None
+        self.__vacation_calendar_provider = next_provider
         if next_keywords is not None:
             self.__ical_keywords = list(next_keywords)
         if ical_protected is not None:
@@ -4086,26 +4781,41 @@ class Wrike:
                 self.__vacation_ical_url_session = (
                     vacation_ical_url_value if vacation_ical_protected else ""
                 )
-                self.__vacation_ical_calendar = {}
-                self.__vacation_ical_events_for_date = ""
-                self.__vacation_ical_day_result = {}
-                self.__vacation_ical_observed_calendar_name = ""
-                self.__vacation_ical_last_success_ts = None
-                self.__vacation_ical_last_error = ""
-                self.__vacation_ical_state = (
-                    "loading" if vacation_ical_protected else "unconfigured"
-                )
-                self.__vacation_ical_week_cache_calendar = None
-                self.__vacation_ical_week_cache = {}
         elif (
             vacation_ical_url_supplied
             and not vacation_ical_url_value
             and not clear_vacation_ical_url
         ):
             pass
+
+        if provider_changed or (
+            vacation_ical_protected is not None
+            and next_provider == "private_ical"
+        ):
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_calendar = {}
+                self.__vacation_ical_events_for_date = ""
+                self.__vacation_ical_day_result = {}
+                self.__vacation_ical_observed_calendar_name = ""
+                self.__vacation_ical_last_success_ts = None
+                self.__vacation_ical_last_error = ""
+                self.__vacation_ical_week_cache_calendar = None
+                self.__vacation_ical_week_cache = {}
+                self.__vacation_google_oauth_week_start = ""
+            _provider, secret_present, configuration, _fingerprint = (
+                self.__active_vacation_configuration()
+            )
+            with self.__vacation_ical_lock:
+                self.__vacation_ical_state = (
+                    "loading"
+                    if secret_present and configuration is not None
+                    else "unconfigured"
+                )
         self.__monitor_last_total_minutes = None
         if not self.__save_settings():
             self.__restore_settings_runtime_state(previous_runtime_state)
+            if provider_changed:
+                self.__start_vacation_ical_polling()
             return False, "settings save failed"
         self.__sync_worktime_panel_idle_timeout()
         self.__restart_monitor()
@@ -4345,7 +5055,10 @@ class Wrike:
             "break_keywords": ["헬스", "운동", "gym", "fitness", "pt"],
             "ical_poll_interval_sec": 900.0,
             "vacation_ical_poll_interval_sec": 900.0,
+            "vacation_calendar_provider": "private_ical",
             "vacation_ical_url_protected": "",
+            "vacation_google_oauth_protected": "",
+            "vacation_google_oauth_delete_pending": False,
         }
         needs_save = False
         if data is None:
@@ -4507,29 +5220,80 @@ class Wrike:
             300.0,
             min(21600.0, self.__vacation_ical_poll_interval_sec),
         )
+        loaded_provider = str(
+            data.get("vacation_calendar_provider", "private_ical") or ""
+        ).strip()
+        if loaded_provider not in VACATION_CALENDAR_PROVIDERS:
+            loaded_provider = "private_ical"
+            data["vacation_calendar_provider"] = loaded_provider
+            needs_save = True
+        provider_changed = (
+            loaded_provider != self.__normalized_vacation_provider()
+        )
         try:
             protected_vacation_raw = str(
                 data.get("vacation_ical_url_protected", "") or ""
             ).strip()
         except Exception:
             protected_vacation_raw = ""
-        if protected_vacation_raw != str(
+        try:
+            protected_oauth_raw = str(
+                data.get("vacation_google_oauth_protected", "") or ""
+            ).strip()
+        except Exception:
+            protected_oauth_raw = ""
+        delete_pending_raw = bool(
+            data.get("vacation_google_oauth_delete_pending", False)
+        )
+        private_changed = protected_vacation_raw != str(
             self.__vacation_ical_url_protected or ""
-        ).strip():
-            with self.__vacation_ical_lock:
+        ).strip()
+        oauth_changed = (
+            protected_oauth_raw
+            != str(self.__vacation_google_oauth_protected or "").strip()
+            or delete_pending_raw
+            != bool(self.__vacation_google_oauth_delete_pending)
+        )
+        with self.__vacation_ical_lock:
+            self.__vacation_calendar_provider = loaded_provider
+            if private_changed:
                 self.__vacation_ical_url_protected = protected_vacation_raw
                 self.__vacation_ical_url_session = ""
+            if oauth_changed:
+                self.__vacation_google_oauth_protected = protected_oauth_raw
+                self.__vacation_google_oauth_session = ""
+                self.__vacation_google_oauth_delete_pending = (
+                    delete_pending_raw
+                )
+            clear_active_cache = (
+                provider_changed
+                or (private_changed and loaded_provider == "private_ical")
+                or (oauth_changed and loaded_provider == "google_oauth")
+            )
+            if clear_active_cache:
                 self.__vacation_ical_calendar = {}
                 self.__vacation_ical_events_for_date = ""
                 self.__vacation_ical_day_result = {}
                 self.__vacation_ical_observed_calendar_name = ""
                 self.__vacation_ical_last_success_ts = None
                 self.__vacation_ical_last_error = ""
-                self.__vacation_ical_state = (
-                    "loading" if protected_vacation_raw else "unconfigured"
-                )
+                self.__vacation_google_oauth_week_start = ""
                 self.__vacation_ical_week_cache_calendar = None
                 self.__vacation_ical_week_cache = {}
+        if clear_active_cache:
+            _provider, secret_present, configuration, _fingerprint = (
+                self.__active_vacation_configuration()
+            )
+            with self.__vacation_ical_lock:
+                if secret_present and configuration is None:
+                    self.__vacation_ical_state = "error"
+                    self.__vacation_ical_last_error = (
+                        VACATION_ERROR_SECRET_UNAVAILABLE
+                    )
+                elif configuration is not None:
+                    self.__vacation_ical_state = "loading"
+                else:
+                    self.__vacation_ical_state = "unconfigured"
 
         if allow_save and needs_save:
             try:
@@ -4572,6 +5336,10 @@ class Wrike:
             "vacation_ical_poll_interval_sec": float(
                 self.__vacation_ical_poll_interval_sec
             ),
+            "vacation_calendar_provider": self.__normalized_vacation_provider(),
+            "vacation_google_oauth_delete_pending": bool(
+                self.__vacation_google_oauth_delete_pending
+            ),
         }
         ical_url_now = str(self.__decode_ical_url() or "").strip()
         if ical_url_now:
@@ -4600,6 +5368,29 @@ class Wrike:
                     )
                     return False
         payload["vacation_ical_url_protected"] = protected_vacation
+        oauth_session = str(self.__vacation_google_oauth_session or "").strip()
+        protected_oauth = str(
+            self.__vacation_google_oauth_protected or ""
+        ).strip()
+        if oauth_session:
+            envelope_result = deserialize_envelope(oauth_session)
+            if not isinstance(envelope_result, GoogleCalendarSuccess):
+                self.__log("settings save skipped: oauth envelope invalid")
+                return False
+            if not protected_oauth:
+                try:
+                    protected_oauth = str(
+                        self.__vacation_google_oauth_secret_store.protect(
+                            oauth_session
+                        )
+                        or ""
+                    ).strip()
+                except Exception:
+                    protected_oauth = ""
+                if not protected_oauth:
+                    self.__log("settings save skipped: oauth protection failed")
+                    return False
+        payload["vacation_google_oauth_protected"] = protected_oauth
         if token:
             protected_token = self.__secret_store.protect(token)
             if not protected_token:
@@ -4635,6 +5426,7 @@ class Wrike:
             os.replace(temp_path, self.__settings_path)
             temp_path = None
             self.__vacation_ical_url_protected = protected_vacation
+            self.__vacation_google_oauth_protected = protected_oauth
             return True
         except Exception as exc:
             self.__log_exception("settings save failed", exc)
