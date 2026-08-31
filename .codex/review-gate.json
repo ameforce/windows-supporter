@@ -8,12 +8,14 @@
       "triggers": [
         "main.py",
         "src/utils/StartReg.py",
+        "src/utils/update_handoff_recovery.py",
         "src/utils/worktree_runtime.py",
         "src/utils/update_monitor.py"
       ],
       "direct_execution_paths": [
         "main.py",
         "src/utils/StartReg.py",
+        "src/utils/update_handoff_recovery.py",
         "src/utils/worktree_runtime.py",
         "src/utils/update_monitor.py"
       ],
@@ -37,6 +39,7 @@
     {
       "id": "main-ui-shell",
       "triggers": [
+        "main.py",
         "src/apps/main_ui.py",
         "src/apps/main_ui_state.py",
         "src/apps/dashboard_ui.py",
@@ -69,14 +72,21 @@
         "pyproject.toml",
         "uv.lock",
         "tools/generate_build_metadata.py",
+        "tools/remove_path_with_retry.bat",
+        "tools/stop_stale_pyinstaller_workers.ps1",
         "tools/verify_pyinstaller_archive.py",
+        "tools/verify_codex_usage_worker_smoke.py",
         "tools/ensure_uv_ready.bat",
         "tools/ensure_venv_ready.bat",
-        "tools/uv-bootstrap-requirements.txt"
+        "tools/uv-bootstrap-requirements.txt",
+        "src/utils/windows_supporter.ico"
       ],
       "direct_execution_paths": [
         "build.bat",
         "tools/generate_build_metadata.py",
+        "tools/remove_path_with_retry.bat",
+        "tools/stop_stale_pyinstaller_workers.ps1",
+        "tools/verify_codex_usage_worker_smoke.py",
         "tools/verify_pyinstaller_archive.py"
       ],
       "changed_contract_consumers": [
@@ -100,9 +110,12 @@
         ".codex/review-gate.json",
         "AGENTS.md",
         ".github/pr-protection/ruleset.json",
+        ".github/workflows/**",
+        "docs/runbooks/protected-version-branch-cleanup.md",
         "docs/runbooks/release-delivery.md",
         "docs/runbooks/release-evidence.md",
         "docs/runbooks/runtime-registration.md",
+        "docs/runbooks/topic-worktree-cleanup.md",
         "docs/runbooks/validation-and-release-build.md"
       ],
       "direct_execution_paths": [],
