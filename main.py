@@ -23,6 +23,10 @@ from src.apps.lid_power_policy import (
 from src.utils.StartReg import StartReg
 from src.apps.startup_apps import StartupAppManager
 from src.apps.codex_usage_playwright_process import run_process_boundary_smoke
+from src.apps.google_calendar_oauth import (
+    GoogleCalendarSuccess,
+    load_bundled_desktop_client_config,
+)
 from src.utils.tray_icon import SystemTrayIcon
 from src.utils.ui_event_pump import SharedUiEventPump
 from src.utils.update_monitor import (
@@ -233,7 +237,14 @@ def _restart_current_process() -> None:
     return
 
 
+def _run_google_calendar_resource_smoke() -> int:
+    result = load_bundled_desktop_client_config()
+    return 0 if isinstance(result, GoogleCalendarSuccess) else 1
+
+
 def main() -> None:
+    if "--google-calendar-resource-smoke" in sys.argv:
+        raise SystemExit(_run_google_calendar_resource_smoke())
     if "--codex-usage-worker-smoke" in sys.argv:
         raise SystemExit(run_process_boundary_smoke())
     if run_update_handoff_from_argv(sys.argv):
