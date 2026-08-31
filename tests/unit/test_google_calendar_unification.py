@@ -14,6 +14,8 @@ from unittest.mock import Mock, patch
 from src.apps.Wrike import Wrike
 from src.apps.google_calendar_oauth import (
     CalendarCatalogEntry,
+    GoogleCalendarError,
+    GoogleCalendarErrorCode,
     GoogleCalendarSuccess,
     OAuthEnvelope,
     bind_calendar_role,
@@ -273,6 +275,249 @@ class GoogleCalendarUnificationTest(unittest.TestCase):
                 wrike.get_google_calendar_status_snapshot()["vacation_role_configured"],
                 True,
             )
+
+    def test_v8_private_provider_migrates_inactive_google_grant_without_vacation_role(
+        self,
+    ) -> None:
+        def protect(_store, value):
+            encoded = base64.b64encode(str(value).encode("utf-8")).decode("ascii")
+            return "test-protected:" + encoded
+
+        def unprotect(_store, value):
+            raw = str(value or "")
+            if not raw.startswith("test-protected:"):
+                return ""
+            return base64.b64decode(raw.split(":", 1)[1]).decode("utf-8")
+
+        private_url = "https://calendar.google.com/calendar/ical/private/basic.ics"
+        legacy_envelope = json.dumps(
+            {
+                "schema_version": 1,
+                "client_id": "unit-test.apps.googleusercontent.com",
+                "client_secret": "unit-client-secret",
+                "refresh_token": "unit-refresh-token",
+                "calendar_id": "inactive-google-vacation-calendar",
+            },
+            separators=(",", ":"),
+        )
+        with tempfile.TemporaryDirectory() as root, patch.object(
+            SecretStore, "protect", autospec=True, side_effect=protect
+        ), patch.object(
+            SecretStore, "unprotect", autospec=True, side_effect=unprotect
+        ), patch.dict(os.environ, {"APPDATA": root}, clear=False):
+            config_dir = Path(root) / "windows-supporter"
+            config_dir.mkdir(parents=True)
+            settings_path = config_dir / "wrike_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "settings_version": 8,
+                        "vacation_calendar_provider": "private_ical",
+                        "vacation_ical_url_protected": protect(None, private_url),
+                        "vacation_google_oauth_protected": protect(
+                            None, legacy_envelope
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            wrike = Wrike()
+            persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+            migrated = json.loads(
+                unprotect(None, persisted["google_calendar_oauth_protected"])
+            )
+
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["vacation_calendar_id"], "")
+        provider, present, configuration, _fingerprint = (
+            wrike._Wrike__active_vacation_configuration()
+        )
+        self.assertEqual(provider, "private_ical")
+        self.assertTrue(present)
+        self.assertEqual(configuration, private_url)
+        self.assertFalse(
+            wrike.get_google_calendar_status_snapshot()["vacation_role_configured"]
+        )
+
+    def test_failed_google_authorization_restarts_selected_private_polling(self) -> None:
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        failures = (
+            GoogleCalendarError(GoogleCalendarErrorCode.AUTHORIZATION_CANCELLED),
+            GoogleCalendarSuccess(self._envelope()),
+        )
+        for auth_result in failures:
+            with self.subTest(result=type(auth_result).__name__), tempfile.TemporaryDirectory() as root, patch.dict(
+                os.environ, {"APPDATA": root}, clear=False
+            ):
+                wrike = Wrike()
+                wrike._Wrike__root = object()
+                wrike._Wrike__background_active = True
+                wrike._Wrike__vacation_calendar_provider = "private_ical"
+                wrike._Wrike__vacation_ical_url_session = (
+                    "https://calendar.google.com/calendar/ical/private/basic.ics"
+                )
+                if isinstance(auth_result, GoogleCalendarSuccess):
+                    wrike._Wrike__google_calendar_oauth_secret_store.protect = Mock(
+                        return_value=""
+                    )
+                with patch("src.apps.Wrike.threading.Thread", ImmediateThread), patch(
+                    "src.apps.Wrike.load_bundled_desktop_client_config",
+                    return_value=GoogleCalendarSuccess({"installed": {}}),
+                ), patch(
+                    "src.apps.Wrike.authorize_desktop", return_value=auth_result
+                ), patch(
+                    "src.apps.Wrike.list_calendar_catalog",
+                    return_value=GoogleCalendarSuccess(()),
+                ), patch(
+                    "src.apps.Wrike.revoke_refresh_token",
+                    return_value=GoogleCalendarSuccess(None),
+                ), patch.object(
+                    wrike,
+                    "_Wrike__ui_safe",
+                    side_effect=lambda _root, callback: (callback(), True)[1],
+                ), patch.object(
+                    wrike, "_Wrike__start_vacation_ical_polling"
+                ) as restart:
+                    ok, error = wrike.begin_google_calendar_oauth()
+
+                self.assertTrue(ok, error)
+                restart.assert_called_once_with()
+                self.assertIsNone(wrike._Wrike__google_calendar_oauth_cancel_event)
+
+    def test_google_authorization_queue_failure_releases_authorization_claim(self) -> None:
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"APPDATA": root}, clear=False
+        ):
+            wrike = Wrike()
+        wrike._Wrike__root = object()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__google_calendar_oauth_secret_store.protect = Mock(
+            return_value="protected-new-account"
+        )
+        with patch("src.apps.Wrike.threading.Thread", ImmediateThread), patch(
+            "src.apps.Wrike.load_bundled_desktop_client_config",
+            return_value=GoogleCalendarSuccess({"installed": {}}),
+        ), patch(
+            "src.apps.Wrike.authorize_desktop",
+            return_value=GoogleCalendarSuccess(self._envelope()),
+        ), patch(
+            "src.apps.Wrike.list_calendar_catalog",
+            return_value=GoogleCalendarSuccess(()),
+        ), patch(
+            "src.apps.Wrike.revoke_refresh_token",
+            return_value=GoogleCalendarSuccess(None),
+        ), patch.object(wrike, "_Wrike__ui_safe", return_value=False):
+            ok, error = wrike.begin_google_calendar_oauth()
+
+        self.assertTrue(ok, error)
+        self.assertIsNone(wrike._Wrike__google_calendar_oauth_cancel_event)
+        self.assertIsNone(wrike._Wrike__vacation_ical_fetch_owner)
+        status = wrike.get_google_calendar_status_snapshot()
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error_code"], "calendar_fetch_failed")
+
+    def test_google_authorization_timeout_releases_claim_before_late_ui_apply(self) -> None:
+        class FakeEvent:
+            def __init__(self, wait_result=True):
+                self.flag = False
+                self.wait_result = wait_result
+
+            def set(self):
+                self.flag = True
+
+            def is_set(self):
+                return self.flag
+
+            def wait(self, _timeout=None):
+                return self.wait_result
+
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        events = []
+
+        def event_factory():
+            event = FakeEvent(wait_result=len(events) != 3)
+            events.append(event)
+            return event
+
+        queued_callbacks = []
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"APPDATA": root}, clear=False
+        ):
+            wrike = Wrike()
+        wrike._Wrike__root = object()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__vacation_calendar_provider = "private_ical"
+        wrike._Wrike__vacation_ical_url_session = (
+            "https://calendar.google.com/calendar/ical/private/basic.ics"
+        )
+        wrike._Wrike__google_calendar_oauth_secret_store.protect = Mock(
+            return_value="protected-new-account"
+        )
+        with patch("src.apps.Wrike.threading.Event", side_effect=event_factory), patch(
+            "src.apps.Wrike.threading.Thread", ImmediateThread
+        ), patch(
+            "src.apps.Wrike.load_bundled_desktop_client_config",
+            return_value=GoogleCalendarSuccess({"installed": {}}),
+        ), patch(
+            "src.apps.Wrike.authorize_desktop",
+            return_value=GoogleCalendarSuccess(self._envelope()),
+        ), patch(
+            "src.apps.Wrike.list_calendar_catalog",
+            return_value=GoogleCalendarSuccess(()),
+        ), patch(
+            "src.apps.Wrike.revoke_refresh_token",
+            return_value=GoogleCalendarSuccess(None),
+        ), patch.object(
+            wrike,
+            "_Wrike__ui_safe",
+            side_effect=lambda _root, callback: queued_callbacks.append(callback) or True,
+        ), patch.object(
+            wrike, "_Wrike__start_vacation_ical_polling"
+        ) as restart:
+            ok, error = wrike.begin_google_calendar_oauth()
+            self.assertTrue(ok, error)
+            self.assertIsNone(wrike._Wrike__google_calendar_oauth_cancel_event)
+            self.assertIsNone(wrike._Wrike__vacation_ical_fetch_owner)
+            queued_callbacks.pop()()
+
+        restart.assert_called_once_with()
+
+    def test_google_catalog_error_precedes_fresh_account_state(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"APPDATA": root}, clear=False
+        ):
+            wrike = Wrike()
+        serialized = serialize_envelope(self._envelope())
+        self.assertIsInstance(serialized, GoogleCalendarSuccess)
+        wrike._Wrike__google_calendar_oauth_session = serialized.value
+        wrike._Wrike__google_calendar_oauth_protected = "protected-account"
+        wrike._Wrike__google_calendar_catalog_error = "api_unavailable"
+
+        status = wrike.get_google_calendar_status_snapshot()
+
+        self.assertTrue(status["configured"])
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error_code"], "api_unavailable")
 
     def test_ui_connect_is_argumentless_and_role_selection_uses_opaque_handle(self) -> None:
         source = inspect.getsource(WrikeSettingsView._on_connect_google_calendar_oauth)
