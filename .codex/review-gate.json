@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "kind": "review_profile",
+  "repository": "https://github.com/ameforce/windows-supporter.git",
+  "rules": [
+    {
+      "id": "runtime-entry-and-persistence",
+      "triggers": [
+        "main.py",
+        "src/utils/StartReg.py",
+        "src/utils/update_handoff_recovery.py",
+        "src/utils/worktree_runtime.py",
+        "src/utils/update_monitor.py"
+      ],
+      "direct_execution_paths": [
+        "main.py",
+        "src/utils/StartReg.py",
+        "src/utils/update_handoff_recovery.py",
+        "src/utils/worktree_runtime.py",
+        "src/utils/update_monitor.py"
+      ],
+      "changed_contract_consumers": [
+        "main.py",
+        "src/apps/dashboard_ui.py",
+        "src/apps/update_settings_ui.py",
+        "src/utils/StartReg.py",
+        "src/utils/update_monitor.py"
+      ],
+      "build_package_artifact_paths": [
+        "build.bat",
+        "tools/generate_build_metadata.py"
+      ],
+      "release_deploy_consumers": [
+        "docs/runbooks/runtime-registration.md",
+        "docs/runbooks/validation-and-release-build.md"
+      ],
+      "evidence": "main.py owns process startup and the listed runtime utilities own persistent registration, update execution, and worktree-safe executable resolution"
+    },
+    {
+      "id": "main-ui-shell",
+      "triggers": [
+        "main.py",
+        "src/apps/main_ui.py",
+        "src/apps/main_ui_state.py",
+        "src/apps/dashboard_ui.py",
+        "src/utils/tray_icon.py",
+        "src/utils/ui_event_pump.py"
+      ],
+      "direct_execution_paths": [
+        "main.py",
+        "src/apps/main_ui.py",
+        "src/apps/dashboard_ui.py",
+        "src/utils/tray_icon.py",
+        "src/utils/ui_event_pump.py"
+      ],
+      "changed_contract_consumers": [
+        "src/apps/main_ui_state.py"
+      ],
+      "build_package_artifact_paths": [
+        "build.bat",
+        "src/utils/windows_supporter.ico"
+      ],
+      "release_deploy_consumers": [
+        "docs/runbooks/validation-and-release-build.md"
+      ],
+      "evidence": "main.py constructs the main UI, dashboard, tray icon, and shared UI event pump; build.bat packages their entrypoint and icon"
+    },
+    {
+      "id": "build-and-package",
+      "triggers": [
+        "build.bat",
+        "pyproject.toml",
+        "uv.lock",
+        "tools/generate_build_metadata.py",
+        "tools/remove_path_with_retry.bat",
+        "tools/stop_stale_pyinstaller_workers.ps1",
+        "tools/verify_pyinstaller_archive.py",
+        "tools/verify_codex_usage_worker_smoke.py",
+        "tools/ensure_uv_ready.bat",
+        "tools/ensure_venv_ready.bat",
+        "tools/uv-bootstrap-requirements.txt",
+        "src/utils/windows_supporter.ico"
+      ],
+      "direct_execution_paths": [
+        "build.bat",
+        "tools/generate_build_metadata.py",
+        "tools/remove_path_with_retry.bat",
+        "tools/stop_stale_pyinstaller_workers.ps1",
+        "tools/verify_codex_usage_worker_smoke.py",
+        "tools/verify_pyinstaller_archive.py"
+      ],
+      "changed_contract_consumers": [
+        "main.py",
+        "src/utils/app_version.py"
+      ],
+      "build_package_artifact_paths": [
+        "pyproject.toml",
+        "uv.lock",
+        "src/utils/windows_supporter.ico"
+      ],
+      "release_deploy_consumers": [
+        "docs/runbooks/validation-and-release-build.md",
+        "docs/runbooks/runtime-registration.md"
+      ],
+      "evidence": "build.bat resolves dependencies, generates version metadata, runs PyInstaller, and verifies the packaged archive before promoting the executable"
+    },
+    {
+      "id": "release-and-runtime-policy",
+      "triggers": [
+        ".codex/review-gate.json",
+        "AGENTS.md",
+        ".github/pr-protection/ruleset.json",
+        ".github/workflows/**",
+        "docs/runbooks/protected-version-branch-cleanup.md",
+        "docs/runbooks/release-delivery.md",
+        "docs/runbooks/release-evidence.md",
+        "docs/runbooks/runtime-registration.md",
+        "docs/runbooks/topic-worktree-cleanup.md",
+        "docs/runbooks/validation-and-release-build.md"
+      ],
+      "direct_execution_paths": [],
+      "changed_contract_consumers": [
+        "docs/runbooks/protected-version-branch-cleanup.md",
+        "docs/runbooks/topic-worktree-cleanup.md"
+      ],
+      "build_package_artifact_paths": [
+        "build.bat",
+        "tools/generate_build_metadata.py"
+      ],
+      "release_deploy_consumers": [
+        "main.py",
+        "src/utils/StartReg.py",
+        "src/utils/worktree_runtime.py",
+        "src/utils/update_monitor.py"
+      ],
+      "evidence": "the repository contract and release runbooks govern branch delivery, tagged build evidence, persistent runtime promotion, startup registration, and updater behavior"
+    }
+  ]
+}
