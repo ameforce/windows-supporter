@@ -7,6 +7,14 @@ import threading
 
 
 class WrikeSettingsView:
+    _VACATION_PROVIDER_LABELS = {
+        "private_ical": "비공개 iCal",
+        "google_oauth": "Google 계정 OAuth",
+    }
+    _VACATION_PROVIDER_VALUES = {
+        label: provider for provider, label in _VACATION_PROVIDER_LABELS.items()
+    }
+
     def __init__(self, root: Any, wrike: Any, ui_post=None) -> None:
         self._root = root
         self._wrike = wrike
@@ -44,6 +52,11 @@ class WrikeSettingsView:
         self._ical_dirty = False
         self._vacation_ical_url_var = None
         self._vacation_ical_status_var = None
+        self._vacation_provider_var = None
+        self._vacation_provider_combo = None
+        self._vacation_private_frame = None
+        self._vacation_oauth_frame = None
+        self._vacation_calendar_provider = "private_ical"
         self._vacation_ical_dirty = False
         self._vacation_ical_status: dict[str, Any] = {}
         self._folder_path_frame = None
@@ -286,6 +299,9 @@ class WrikeSettingsView:
         self._ical_interval_var = tk.StringVar(value="15")
         self._vacation_ical_url_var = tk.StringVar(value="")
         self._vacation_ical_status_var = tk.StringVar(value="미설정")
+        self._vacation_provider_var = tk.StringVar(
+            value=self._VACATION_PROVIDER_LABELS["private_ical"]
+        )
 
         tk.Label(
             content,
@@ -347,32 +363,73 @@ class WrikeSettingsView:
         ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 4))
         row += 1
 
-        add_label("휴가 캘린더 비공개 iCal URL")
-        vacation_entry = add_entry(self._vacation_ical_url_var, show="*")
+        add_label("휴가 캘린더 연결 방식")
+        self._vacation_provider_combo = ttk.Combobox(
+            content,
+            textvariable=self._vacation_provider_var,
+            values=tuple(self._VACATION_PROVIDER_VALUES),
+            state="readonly",
+            width=48,
+        )
+        self._vacation_provider_combo.grid(
+            row=row, column=1, columnspan=2, sticky="we", pady=6
+        )
+        try:
+            self._vacation_provider_combo.bind(
+                "<<ComboboxSelected>>", self._on_vacation_provider_selected
+            )
+        except Exception:
+            pass
+        row += 1
+
+        add_label("휴가 캘린더 연결")
+        vacation_controls = tk.Frame(content, bg=card_bg)
+        vacation_controls.grid(
+            row=row, column=1, columnspan=2, sticky="we", pady=6
+        )
+
+        self._vacation_private_frame = tk.Frame(vacation_controls, bg=card_bg)
+        vacation_entry = ttk.Entry(
+            self._vacation_private_frame,
+            textvariable=self._vacation_ical_url_var,
+            show="*",
+            width=44,
+        )
+        vacation_entry.pack(side="left", fill="x", expand=True)
         try:
             vacation_entry.bind("<KeyRelease>", self._mark_vacation_ical_dirty)
         except Exception:
             pass
-        vacation_buttons = tk.Frame(content, bg=card_bg)
-        vacation_buttons.grid(row=row, column=2, sticky="w", padx=(8, 0))
         ttk.Button(
-            vacation_buttons,
+            self._vacation_private_frame,
             text="연결 다시 확인",
             command=self._on_retry_vacation_ical,
-        ).pack(side="left")
+        ).pack(side="left", padx=(8, 0))
         ttk.Button(
-            vacation_buttons,
+            self._vacation_private_frame,
             text="지우기",
             command=self._on_clear_vacation_ical,
+        ).pack(side="left", padx=(4, 0))
+
+        self._vacation_oauth_frame = tk.Frame(vacation_controls, bg=card_bg)
+        ttk.Button(
+            self._vacation_oauth_frame,
+            text="Google 계정 연결",
+            command=self._on_connect_google_calendar_oauth,
+        ).pack(side="left")
+        ttk.Button(
+            self._vacation_oauth_frame,
+            text="연결 해제",
+            command=self._on_disconnect_google_calendar_oauth,
         ).pack(side="left", padx=(4, 0))
         row += 1
 
         tk.Label(
             content,
             text=(
-                "Google Calendar 설정의 ‘비공개 주소(iCal 형식)’만 지원합니다. "
-                "브라우저 주소, 로그인/Cookie/OAuth 및 Microsoft 365 링크는 "
-                "사용할 수 없습니다."
+                "Google Calendar 비공개 iCal 또는 Google Calendar API의 "
+                "읽기 전용 OAuth 연결을 지원합니다. 비밀번호, Cookie, 스크래핑을 "
+                "사용하지 않으며 OAuth는 브라우저에서 Google 로그인과 동의를 진행합니다."
             ),
             bg=card_bg,
             fg=text_muted,
@@ -903,11 +960,122 @@ class WrikeSettingsView:
         self._set_status("근무 계획 초기화 완료", level="ok")
         return
 
+    def _normalize_vacation_provider(self, value: Any) -> str:
+        provider = str(value or "").strip()
+        if provider in self._VACATION_PROVIDER_LABELS:
+            return provider
+        return "private_ical"
+
+    def _selected_vacation_provider(self) -> str:
+        var = self._vacation_provider_var
+        if var is not None:
+            try:
+                label = str(var.get() or "").strip()
+                provider = self._VACATION_PROVIDER_VALUES.get(label)
+                if provider is not None:
+                    return provider
+            except Exception:
+                pass
+        return self._normalize_vacation_provider(
+            self._vacation_calendar_provider
+        )
+
+    def _set_vacation_provider_control(self, provider: Any) -> None:
+        normalized = self._normalize_vacation_provider(provider)
+        self._vacation_calendar_provider = normalized
+        var = self._vacation_provider_var
+        if var is not None:
+            try:
+                var.set(self._VACATION_PROVIDER_LABELS[normalized])
+            except Exception:
+                pass
+        private_frame = self._vacation_private_frame
+        oauth_frame = self._vacation_oauth_frame
+        for frame in (private_frame, oauth_frame):
+            if frame is not None:
+                try:
+                    frame.pack_forget()
+                except Exception:
+                    pass
+        selected_frame = (
+            oauth_frame if normalized == "google_oauth" else private_frame
+        )
+        if selected_frame is not None:
+            try:
+                selected_frame.pack(fill="x", expand=True)
+            except Exception:
+                pass
+        self._refresh_scroll_region()
+        return
+
+    def _on_vacation_provider_selected(self, _event: Any = None) -> None:
+        if bool(self._loading_settings):
+            return
+        previous = self._normalize_vacation_provider(
+            self._vacation_calendar_provider
+        )
+        selected = self._selected_vacation_provider()
+        if selected == previous:
+            self._set_vacation_provider_control(selected)
+            return
+        try:
+            result = self._wrike.update_settings(
+                {"vacation_calendar_provider": selected}
+            )
+            if not isinstance(result, tuple) or len(result) != 2:
+                ok, _error = False, None
+            else:
+                ok, _error = bool(result[0]), result[1]
+        except Exception:
+            ok, _error = False, None
+        if not ok:
+            self._set_vacation_provider_control(previous)
+            self._refresh_vacation_ical_status(self._vacation_ical_status)
+            self._set_status("휴가 캘린더 연결 방식 저장 실패", level="error")
+            return
+        self._set_vacation_provider_control(selected)
+        if not self._refresh_vacation_status_from_backend():
+            fallback = dict(self._vacation_ical_status)
+            configured = bool(
+                fallback.get("oauth_configured", False)
+                if selected == "google_oauth"
+                else False
+            )
+            fallback.update({
+                "provider": selected,
+                "configured": configured,
+                "state": "loading" if configured else "unconfigured",
+                "last_success_ts": None,
+                "error_code": "",
+                "authorizing": False,
+                "fetch_running": False,
+                "has_last_good": False,
+            })
+            self._refresh_vacation_ical_status(fallback)
+        self._set_status("휴가 캘린더 연결 방식 저장 완료", level="ok")
+        return
+
     def _vacation_status_from_settings(self, settings: Any) -> dict[str, Any]:
         data = settings if isinstance(settings, dict) else {}
         nested = data.get("vacation_ical_status")
+        provider = self._normalize_vacation_provider(
+            data.get(
+                "vacation_calendar_provider",
+                nested.get("provider") if isinstance(nested, dict) else None,
+            )
+        )
+        oauth_configured = bool(
+            data.get(
+                "oauth_configured",
+                nested.get("oauth_configured", False)
+                if isinstance(nested, dict)
+                else False,
+            )
+        )
         if isinstance(nested, dict):
             sanitized = dict(nested)
+            sanitized["provider"] = provider
+            sanitized["oauth_configured"] = oauth_configured
             sanitized["expected_calendar_name"] = ""
             sanitized["observed_calendar_name"] = ""
             return sanitized
@@ -917,10 +1085,14 @@ class WrikeSettingsView:
                 data.get("vacation_ical_url_configured", False),
             )
         )
+        if provider == "google_oauth":
+            configured = oauth_configured
         return {
+            "provider": provider,
+            "oauth_configured": oauth_configured,
             "secret_present": bool(
                 data.get("vacation_ical_secret_present", configured)
-            ),
+            ) if provider == "private_ical" else False,
             "configured": configured,
             "expected_calendar_name": "",
             "observed_calendar_name": "",
@@ -955,33 +1127,64 @@ class WrikeSettingsView:
 
     def _refresh_vacation_ical_status(self, status: Any = None) -> None:
         if isinstance(status, dict):
-            self._vacation_ical_status = dict(status)
+            sanitized = dict(status)
+            sanitized["expected_calendar_name"] = ""
+            sanitized["observed_calendar_name"] = ""
+            self._vacation_ical_status = sanitized
         data = dict(self._vacation_ical_status)
+        provider = self._normalize_vacation_provider(
+            data.get("provider", self._vacation_calendar_provider)
+        )
+        data["provider"] = provider
+        self._vacation_ical_status = data
+        self._set_vacation_provider_control(provider)
         var = self._vacation_ical_status_var
         if var is None:
             return
         state = str(data.get("state") or "unconfigured").strip().lower()
-        if state not in {"unconfigured", "loading", "fresh", "stale", "error"}:
+        if provider == "google_oauth" and bool(data.get("authorizing", False)):
+            state = "authorizing"
+        if state not in {
+            "unconfigured", "authorizing", "disconnecting", "loading",
+            "fresh", "stale", "error"
+        }:
             state = "error"
         last_success = str(data.get("last_success_ts") or "").strip()
         error_code = str(data.get("error_code") or "").strip()
         has_last_good = bool(data.get("has_last_good", False))
+        provider_label = self._VACATION_PROVIDER_LABELS[provider]
         state_labels = {
             "unconfigured": "미설정",
+            "authorizing": "Google 인증 중",
+            "disconnecting": "Google 연결 해제 중",
             "loading": "확인 중",
             "fresh": "정상",
             "stale": "마지막 성공값 사용 중",
             "error": "오류",
         }
-        state_messages = {
-            "unconfigured": (
-                "Google Calendar의 비공개 주소(iCal 형식)를 입력해 주세요."
-            ),
+        private_state_messages = {
+            "unconfigured": "Google Calendar 비공개 주소(iCal 형식)를 입력해 주세요.",
+            "authorizing": "연결 확인을 진행하고 있습니다.",
+            "disconnecting": "연결 해제를 진행하고 있습니다.",
             "loading": "저장 완료 · 연결 단계 확인 중입니다.",
             "fresh": "연결·응답·문서·캘린더 확인을 모두 통과했습니다.",
             "stale": "연결 단계 재확인이 필요합니다. 다시 확인해 주세요.",
         }
-        error_labels = {
+        oauth_state_messages = {
+            "unconfigured": (
+                "Google Desktop client JSON을 선택해 계정을 연결해 주세요."
+            ),
+            "authorizing": (
+                "브라우저에서 Google 로그인과 읽기 전용 권한 동의를 완료해 주세요."
+            ),
+            "disconnecting": (
+                "Google 권한 해제와 로컬 인증 정보 삭제를 진행하고 있습니다."
+            ),
+            "loading": "Google Calendar API 연결과 캘린더를 확인 중입니다.",
+            "fresh": "Google Calendar API 읽기 전용 연결이 정상입니다.",
+            "stale": "연결을 다시 확인하고 필요하면 Google 계정을 다시 연결해 주세요.",
+        }
+        private_errors = {
             "invalid_endpoint": (
                 "Google Calendar 비공개 주소(iCal 형식)인지 확인해 주세요. "
                 "브라우저·로그인·Microsoft 365 주소는 지원하지 않습니다."
@@ -1038,16 +1241,76 @@ class WrikeSettingsView:
                 "연결 단계를 완료하지 못했습니다. 연결 상태를 확인하고 다시 시도해 주세요."
             ),
         }
+        oauth_errors = {
+            "client_config_invalid": (
+                "Google Desktop 앱용 client JSON인지 확인한 뒤 다시 선택해 주세요."
+            ),
+            "browser_launch_failed": (
+                "기본 브라우저를 열지 못했습니다. 브라우저 설정을 확인한 뒤 다시 연결해 주세요."
+            ),
+            "callback_timeout": (
+                "Google 로그인과 동의 시간이 초과되었습니다. 연결을 다시 시작해 주세요."
+            ),
+            "authorization_denied": (
+                "읽기 전용 권한 동의가 완료되지 않았습니다. 동의 후 다시 연결해 주세요."
+            ),
+            "authorization_cancelled": (
+                "Google 계정 연결이 취소되었습니다. 필요하면 다시 연결해 주세요."
+            ),
+            "state_mismatch": (
+                "인증 응답을 안전하게 확인하지 못했습니다. 연결을 다시 시작해 주세요."
+            ),
+            "token_exchange_failed": (
+                "Google 인증 완료 정보를 저장하지 못했습니다. 다시 연결해 주세요."
+            ),
+            "token_refresh_failed": (
+                "Google 인증이 만료되었거나 갱신되지 않았습니다. 계정을 다시 연결해 주세요."
+            ),
+            "token_revocation_failed": (
+                "Google 권한을 해제하지 못했습니다. 네트워크를 확인한 뒤 연결 해제를 다시 시도해 주세요."
+            ),
+            "api_unauthorized": (
+                "Google 인증이 유효하지 않습니다. 계정을 다시 연결해 주세요."
+            ),
+            "api_forbidden": (
+                "Google Calendar 읽기 권한 또는 API 사용 설정을 확인해 주세요."
+            ),
+            "api_rate_limited": (
+                "Google Calendar 요청 한도에 도달했습니다. 잠시 후 다시 확인해 주세요."
+            ),
+            "api_unavailable": (
+                "Google Calendar API를 사용할 수 없습니다. 잠시 후 다시 확인해 주세요."
+            ),
+            "invalid_response": (
+                "Google Calendar 응답을 확인하지 못했습니다. 잠시 후 다시 확인해 주세요."
+            ),
+            "calendar_not_found": (
+                "사용 가능한 휴가 캘린더를 찾지 못했습니다. 캘린더 접근 권한을 확인해 주세요."
+            ),
+            "calendar_ambiguous": (
+                "휴가 캘린더를 하나로 결정하지 못했습니다. 캘린더 구성을 확인해 주세요."
+            ),
+        }
+        state_messages = (
+            oauth_state_messages if provider == "google_oauth" else private_state_messages
+        )
+        error_labels = oauth_errors if provider == "google_oauth" else private_errors
         message = (
             error_labels.get(
                 error_code,
-                "캘린더 확인 단계를 완료하지 못했습니다. 주소와 연결 상태를 확인해 주세요.",
+                (
+                    "Google 계정 연결을 확인하지 못했습니다. 다시 연결하거나 잠시 후 다시 시도해 주세요."
+                    if provider == "google_oauth"
+                    else "캘린더 확인 단계를 완료하지 못했습니다. 주소와 연결 상태를 확인해 주세요."
+                ),
             )
             if state == "error"
             else state_messages[state]
         )
-        parts = [state_labels[state], message]
-        if has_last_good and state in {"loading", "stale", "error"}:
+        parts = [provider_label, state_labels[state], message]
+        if has_last_good and state in {
+            "authorizing", "disconnecting", "loading", "stale", "error"
+        }:
             parts.append("마지막 성공값으로 계산 중입니다.")
         if last_success:
             parts.append(f"마지막 성공: {last_success}")
@@ -1154,9 +1417,11 @@ class WrikeSettingsView:
                 if self._vacation_ical_url_var is not None:
                     self._vacation_ical_url_var.set("")
                 self._vacation_ical_dirty = False
-                self._refresh_vacation_ical_status(
-                    self._vacation_status_from_settings(settings)
+                vacation_status = self._vacation_status_from_settings(settings)
+                self._set_vacation_provider_control(
+                    vacation_status.get("provider", "private_ical")
                 )
+                self._refresh_vacation_ical_status(vacation_status)
             except Exception:
                 pass
             try:
@@ -1431,6 +1696,94 @@ class WrikeSettingsView:
             self._set_status("휴가 캘린더 URL 삭제 실패", level="error")
         return
 
+    def _on_connect_google_calendar_oauth(self) -> None:
+        try:
+            from tkinter import filedialog
+
+            client_path = filedialog.askopenfilename(
+                title="Google Desktop client JSON 선택",
+                filetypes=(("JSON 파일", "*.json"), ("모든 파일", "*.*")),
+            )
+        except Exception:
+            self._set_status("Google 계정 연결 파일 선택 실패", level="error")
+            return
+        if not client_path:
+            return
+        begin = getattr(self._wrike, "begin_google_calendar_oauth", None)
+        try:
+            result = begin(client_path) if callable(begin) else (False, None)
+        except Exception:
+            result = (False, None)
+        if not isinstance(result, tuple) or len(result) != 2:
+            ok, error = False, None
+        else:
+            ok, error = bool(result[0]), str(result[1] or "").strip() or None
+        fallback = dict(self._vacation_ical_status)
+        fallback.update({
+            "provider": "google_oauth",
+            "state": "authorizing" if ok else "error",
+            "authorizing": bool(ok),
+            "error_code": "" if ok else (error or "client_config_invalid"),
+            "fetch_running": bool(ok),
+        })
+        self._refresh_vacation_ical_status(fallback)
+        if ok:
+            self._set_status(
+                "Google 계정 인증을 시작했습니다. 브라우저에서 로그인하고 동의해 주세요.",
+                level="info",
+            )
+        else:
+            self._set_status("Google 계정 연결을 시작하지 못했습니다.", level="error")
+        return
+
+    def _on_disconnect_google_calendar_oauth(self) -> None:
+        disconnect = getattr(
+            self._wrike, "disconnect_google_calendar_oauth", None
+        )
+        try:
+            result = disconnect() if callable(disconnect) else (False, None)
+        except Exception:
+            result = (False, None)
+        if not isinstance(result, tuple) or len(result) != 2:
+            ok, error = False, None
+        else:
+            ok, error = bool(result[0]), str(result[1] or "").strip() or None
+        if ok:
+            status = self._read_vacation_status_snapshot()
+            if isinstance(status, dict):
+                self._refresh_vacation_ical_status(status)
+            else:
+                fallback = dict(self._vacation_ical_status)
+                fallback.update({
+                    "provider": "google_oauth",
+                    "state": "disconnecting",
+                    "last_success_ts": fallback.get("last_success_ts"),
+                    "error_code": "",
+                    "authorizing": False,
+                    "fetch_running": True,
+                })
+                self._refresh_vacation_ical_status(fallback)
+            current_state = str(
+                self._vacation_ical_status.get("state") or ""
+            ).strip().lower()
+            if current_state == "unconfigured":
+                self._set_status("Google 계정 연결 해제 완료", level="ok")
+            else:
+                self._set_status(
+                    "Google 권한과 로컬 연결 정보 해제를 시작했습니다.",
+                    level="info",
+                )
+            return
+        fallback = dict(self._vacation_ical_status)
+        fallback.update({
+            "provider": "google_oauth",
+            "state": "error",
+            "error_code": error or "api_unauthorized",
+        })
+        self._refresh_vacation_ical_status(fallback)
+        self._set_status("Google 계정 연결 해제 실패", level="error")
+        return
+
     def _on_reload(self) -> None:
         try:
             self._set_status("로드 중...", level="info")
@@ -1618,7 +1971,12 @@ class WrikeSettingsView:
                 ical_url = str(self._ical_url_var.get() or "").strip()
             except Exception:
                 ical_url = ""
-        vacation_dirty = bool(self._vacation_ical_dirty)
+        vacation_provider = self._selected_vacation_provider()
+        include_vacation_provider = self._vacation_provider_var is not None
+        vacation_dirty = (
+            bool(self._vacation_ical_dirty)
+            and vacation_provider == "private_ical"
+        )
         vacation_ical_url = ""
         if vacation_dirty and self._vacation_ical_url_var is not None:
             try:
@@ -1675,12 +2033,16 @@ class WrikeSettingsView:
         }
         if ical_dirty:
             save_payload["ical_url"] = ical_url
+        if include_vacation_provider:
+            save_payload["vacation_calendar_provider"] = vacation_provider
         if vacation_dirty:
             save_payload["vacation_ical_url"] = vacation_ical_url
 
         ok, err = self._wrike.update_settings(save_payload)
         try:
             if ok:
+                if include_vacation_provider:
+                    self._set_vacation_provider_control(vacation_provider)
                 if ical_dirty:
                     self._ical_dirty = False
                 if vacation_dirty:
@@ -1693,6 +2055,7 @@ class WrikeSettingsView:
                     if not self._refresh_vacation_status_from_backend():
                         fallback = dict(self._vacation_ical_status)
                         fallback.update({
+                            "provider": "private_ical",
                             "secret_present": bool(vacation_ical_url),
                             "configured": bool(vacation_ical_url),
                             "observed_calendar_name": "",
