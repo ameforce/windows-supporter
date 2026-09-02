@@ -132,8 +132,10 @@ _RESET_WINDOW_BY_METRIC = {
     },
 }
 _RESET_DETAIL_COLUMN_WIDTH_PX = 48
-_RESET_WEEKLY_COLUMN_WIDTH_PX = 52
-_RESET_FIVE_HOUR_COLUMN_WIDTH_PX = 40
+# Fixed countdown shapes ("00d 00h 00m 00s" / "00h 00m 00s") need these floors
+# so the reserved column holds the widest tick of the metric's own format.
+_RESET_WEEKLY_COLUMN_WIDTH_PX = 78
+_RESET_FIVE_HOUR_COLUMN_WIDTH_PX = 58
 _RESET_SHORT_COLUMN_WIDTH_PX = 28
 _RESET_PLACEHOLDER_TEXT = "--"
 _RESET_DIRECTION_SHORTAGE = "shortage"
@@ -872,11 +874,29 @@ def _row_fits_badge_mode_for_overlay_width(
     *,
     min_progress_px: int | None = None,
 ) -> bool:
-    row_layout = _metric_row_layout_for_overlay_width(width, metrics)
-    return _row_fits_badge_mode_for_layout(
-        row_layout,
+    return _rows_fit_badge_mode_for_overlay_width(
+        width,
+        [metrics],
         badge_mode,
         min_progress_px=min_progress_px,
+    )
+
+
+def _rows_fit_badge_mode_for_overlay_width(
+    width: int,
+    rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
+    badge_mode: str,
+    *,
+    min_progress_px: int | None = None,
+) -> bool:
+    row_layouts = _metric_rows_layout_for_overlay_width(width, rows)
+    return all(
+        _row_fits_badge_mode_for_layout(
+            row_layout,
+            badge_mode,
+            min_progress_px=min_progress_px,
+        )
+        for row_layout in row_layouts
     )
 
 
@@ -896,111 +916,147 @@ def _resolve_overlay_badge_mode(row_layouts: tuple[_MetricRowLayout, ...]) -> st
     return "short"
 
 
-def _metric_row_layout_for_overlay_width(
+_METRIC_SLOT_ORDER_RANKS = {
+    "five_hour_limit": 0,
+    "weekly_limit": 1,
+    "credit": 2,
+}
+
+
+def _metric_slot_key(metric: dict[str, Any]) -> str:
+    metric_dict = metric if isinstance(metric, dict) else {}
+    return str(metric_dict.get("metric_key") or metric_dict.get("key") or "")
+
+
+def _metric_slot_keys(rows_metrics: list[tuple[dict[str, Any], ...]]) -> list[str]:
+    slots: list[str] = []
+    for metrics in rows_metrics:
+        for metric in metrics:
+            key = _metric_slot_key(metric)
+            if key and key not in slots:
+                slots.append(key)
+    # Canonical column order (5H, 7D, credit) with unknown keys keeping their
+    # appearance order after the known ones.
+    slots.sort(key=lambda key: _METRIC_SLOT_ORDER_RANKS.get(key, len(_METRIC_SLOT_ORDER_RANKS)))
+    return slots
+
+
+def _metric_rows_layout_for_overlay_width(
     width: int,
-    metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
-) -> _MetricRowLayout:
+    rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
+) -> list[_MetricRowLayout]:
+    """Shared-column layout for every visible row at one overlay width.
+
+    Columns are keyed by metric slot and shared across rows: both profiles'
+    7D segments start at the same x with the same width and the same bar
+    width, a 7D-only row leaves the 5H column blank instead of stretching,
+    and resizing one row's column resizes the same column on every row.
+    """
     overlay_width = int(width)
-    visible_metrics = tuple(metric for metric in metrics[:3] if isinstance(metric, dict))
+    rows_metrics = [
+        tuple(metric for metric in tuple(row)[:3] if isinstance(metric, dict))
+        for row in rows
+    ]
     label_width = _label_width_for_overlay_width(overlay_width)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
     metrics_width = max(0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX)
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
-    segment_width = _metric_segment_width_for_metrics_width(
-        metrics_width,
-        len(visible_metrics),
-        segment_gap,
-    )
-    progress_width = _metric_progress_width_for_segment(segment_width)
 
-    # Text-first allocation: every visible metric must keep its reset
-    # countdown, normal-usage guidance, and (when applicable) transition time.
-    # Blind equal split starves the second metric's texts whenever a row mixes
-    # one- and two-metric profiles, so instead reserve each metric's required
-    # full-text width and hand the leftover to the progress bars.
-    counts = len(visible_metrics)
-    required_widths = [
-        min(
-            _required_metric_segment_width(metric, badge_mode="short"),
-            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
-        )
-        for metric in visible_metrics
-    ]
-    total_required = sum(required_widths) + segment_gap * max(0, counts - 1)
-    layout: _MetricRowLayout | None = None
+    slot_keys = _metric_slot_keys(rows_metrics)
+    counts = len(slot_keys)
+    required_by_slot: dict[str, int] = {}
+    for metrics in rows_metrics:
+        for metric in metrics:
+            key = _metric_slot_key(metric)
+            required = min(
+                _required_metric_segment_width(metric, badge_mode="short"),
+                _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+            )
+            if required > required_by_slot.get(key, 0):
+                required_by_slot[key] = required
+
+    column_widths: dict[str, int] = {}
+    column_progresses: dict[str, int] = {}
+    total_required = sum(required_by_slot.values()) + segment_gap * max(0, counts - 1)
     if counts and total_required <= metrics_width:
-        leftover = metrics_width - total_required
-        extra = leftover // counts
-        widths: list[int] = []
-        offsets: list[int] = []
-        progresses: list[int] = []
-        cursor = 0
-        for index, metric in enumerate(visible_metrics):
-            segment = required_widths[index] + extra
-            widths.append(int(segment))
-            offsets.append(int(cursor))
-            progresses.append(
-                int(
-                    max(
-                        _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-                        min(
-                            _METRIC_PROGRESS_MAX_WIDTH_PX,
-                            _metric_progress_width_for_segment(segment),
-                        ),
-                    )
+        # Text-first allocation on the shared grid: reserve each column's
+        # widest requirement across rows and hand the leftover to the bars,
+        # so no row's text is dropped while free width remains.
+        extra = (metrics_width - total_required) // counts
+        for key in slot_keys:
+            column_width = required_by_slot[key] + extra
+            column_widths[key] = column_width
+            column_progresses[key] = int(
+                max(
+                    _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+                    min(
+                        _METRIC_PROGRESS_MAX_WIDTH_PX,
+                        _metric_progress_width_for_segment(column_width),
+                    ),
                 )
             )
-            cursor += segment + segment_gap
-        layout = _MetricRowLayout(
-            label_width=label_width,
-            status_width=status_width,
-            metrics_x=metrics_x,
-            metrics_width=metrics_width,
-            segment_gap=segment_gap,
-            segment_width=max(widths),
-            progress_width=max(progresses),
-            visible_metrics=visible_metrics,
-            segment_offsets=tuple(offsets),
-            segment_widths=tuple(widths),
-            progress_widths=tuple(progresses),
+    else:
+        # Degraded fallback: equal split across the shared columns; the render
+        # fit then drops text inside each column the same way on every row.
+        equal_width = _metric_segment_width_for_metrics_width(
+            metrics_width, counts, segment_gap
         )
-    if layout is not None:
-        return layout
+        fits = all(
+            _metric_fits_badge_mode(
+                metric,
+                equal_width,
+                _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+                "short",
+            )
+            for metrics in rows_metrics
+            for metric in metrics
+        )
+        for key in slot_keys:
+            column_widths[key] = equal_width
+        if fits or equal_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
+            for key in slot_keys:
+                column_progresses[key] = _metric_progress_width_for_segment(equal_width)
+        else:
+            for key in slot_keys:
+                column_progresses[key] = _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
 
-    # Fallback: keep every metric's countdown by clamping the progress bar to
-    # the text-priority floor in each equal segment before any text is dropped.
-    uniform_layout = _MetricRowLayout(
-        label_width=label_width,
-        status_width=status_width,
-        metrics_x=metrics_x,
-        metrics_width=metrics_width,
-        segment_gap=segment_gap,
-        segment_width=segment_width,
-        progress_width=progress_width,
-        visible_metrics=visible_metrics,
-    )
-    fits = all(
-        _metric_fits_badge_mode(
-            metric,
-            segment_width,
-            _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-            "short",
+    offsets_by_slot: dict[str, int] = {}
+    cursor = 0
+    for key in slot_keys:
+        offsets_by_slot[key] = cursor
+        cursor += column_widths[key] + segment_gap
+
+    layouts = []
+    for metrics in rows_metrics:
+        row_offsets = tuple(offsets_by_slot[_metric_slot_key(metric)] for metric in metrics)
+        row_widths = tuple(column_widths[_metric_slot_key(metric)] for metric in metrics)
+        row_progresses = tuple(
+            column_progresses[_metric_slot_key(metric)] for metric in metrics
         )
-        for metric in visible_metrics
-    )
-    if fits or segment_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
-        return uniform_layout
-    return _MetricRowLayout(
-        label_width=label_width,
-        status_width=status_width,
-        metrics_x=metrics_x,
-        metrics_width=metrics_width,
-        segment_gap=segment_gap,
-        segment_width=segment_width,
-        progress_width=_METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-        visible_metrics=visible_metrics,
-    )
+        layouts.append(
+            _MetricRowLayout(
+                label_width=label_width,
+                status_width=status_width,
+                metrics_x=metrics_x,
+                metrics_width=metrics_width,
+                segment_gap=segment_gap,
+                segment_width=max(row_widths) if row_widths else metrics_width,
+                progress_width=max(row_progresses) if row_progresses else metrics_width,
+                visible_metrics=metrics,
+                segment_offsets=row_offsets,
+                segment_widths=row_widths,
+                progress_widths=row_progresses,
+            )
+        )
+    return layouts
+
+
+def _metric_row_layout_for_overlay_width(
+    width: int,
+    metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> _MetricRowLayout:
+    return _metric_rows_layout_for_overlay_width(width, [metrics])[0]
 
 
 def _required_metric_segment_width(
@@ -1099,18 +1155,18 @@ def _preferred_width_for_rows_cached(
     )
 
     def fits(candidate_width: int, badge_mode: str) -> bool:
-        return all(
-            _row_fits_badge_mode_for_overlay_width(
-                candidate_width,
-                visible_metrics,
-                badge_mode,
-                # Accept a candidate width only when the bar keeps its
-                # preferred width too — otherwise the min-fit search would
-                # stop at a uniform split that squeezes the bar to the
-                # cramped floor even though a wider overlay fits everything.
-                min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
-            )
-            for visible_metrics in rows
+        # One shared-column layout for all rows: the search accepts a width
+        # only when every row fits every one of its metrics at the shared
+        # column geometry — never a per-row width that would break alignment.
+        return _rows_fit_badge_mode_for_overlay_width(
+            candidate_width,
+            list(rows),
+            badge_mode,
+            # Accept a candidate width only when the bar keeps its
+            # preferred width too — otherwise the min-fit search would
+            # stop at a uniform split that squeezes the bar to the
+            # cramped floor even though a wider overlay fits everything.
+            min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
         )
 
     # The 300..900 sweep is too wide for a per-second layout budget when a
@@ -2578,19 +2634,14 @@ class CodexUsageTaskbarOverlay:
             return
         row_count = min(2, len(bars))
         row_height = max(14, (height - 8) // max(1, row_count))
-        row_entries = []
-        for bar in bars[:2]:
-            if not isinstance(bar, dict):
-                continue
-            row_entries.append(
-                (
-                    bar,
-                    _metric_row_layout_for_overlay_width(
-                        width,
-                        _visible_metrics_for_taskbar_bar(bar),
-                    ),
-                )
-            )
+        draw_bars = [bar for bar in bars[:2] if isinstance(bar, dict)]
+        # One shared-column grid for every visible row: same-line segments of
+        # both profiles align and resize together.
+        row_layouts = _metric_rows_layout_for_overlay_width(
+            width,
+            [_visible_metrics_for_taskbar_bar(bar) for bar in draw_bars],
+        )
+        row_entries = list(zip(draw_bars, row_layouts))
         overlay_badge_mode = _resolve_overlay_badge_mode(
             tuple(row_layout for _bar, row_layout in row_entries)
         )
@@ -5217,40 +5268,44 @@ def _build_normal_guidance(
         min(100, int(math.floor(upper_bound + 1e-9))),
     )
     remaining_percent = max(0, min(100, int(current_percent)))
+    # Display contract: the guidance always carries a time — every state has a
+    # next boundary on the linear burn projection, so "/ tt" renders uniformly:
+    #   shortage: time until remaining climbs back into the normal band,
+    #   on-track: time until remaining falls to the shortage boundary,
+    #   surplus:  time until remaining falls back on track.
+    # (For a just-reset 0% the shortage boundary time equals the reset time;
+    # it stays visible so the column shape is identical across segments.)
     normal_transition_seconds: int | None = None
-    transition_text = ""
     if remaining_percent < normal_min_percent:
         direction = _RESET_DIRECTION_SHORTAGE
         transition_seconds = remaining_seconds - (
             float(remaining_percent) / 100.0 * float(window_seconds)
         )
         normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
-        # When the burn-rate projection lands on the reset boundary itself, the
-        # countdown rendered next to the guidance already shows that time; a
-        # second copy adds width without information.
-        transition_matches_reset = (
-            abs(transition_seconds - remaining_seconds) <= 60.0
-        )
-        if not transition_matches_reset:
-            transition_text = _format_guidance_duration(
-                normal_transition_seconds
-            )
     elif remaining_percent > normal_max_percent:
         direction = _RESET_DIRECTION_SURPLUS
+        transition_seconds = (
+            (float(remaining_percent - normal_max_percent) / 100.0)
+            * float(window_seconds)
+        )
+        normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
     else:
         direction = _RESET_DIRECTION_ON_TRACK
+        transition_seconds = (
+            (float(remaining_percent - normal_min_percent) / 100.0)
+            * float(window_seconds)
+        )
+        normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
+
+    transition_text = _format_guidance_duration(normal_transition_seconds)
 
     range_text = (
         f"{normal_min_percent}%"
         if normal_min_percent == normal_max_percent
         else f"{normal_min_percent}~{normal_max_percent}%"
     )
-    if direction == _RESET_DIRECTION_SHORTAGE and transition_text:
-        text = f"N {range_text} / {transition_text}"
-        short_text = text
-    else:
-        text = f"N {range_text}"
-        short_text = text
+    text = f"N {range_text} / {transition_text}"
+    short_text = text
     return {
         "direction": direction,
         "normal_min_percent": normal_min_percent,
@@ -5478,27 +5533,17 @@ def _format_reset_remaining_detail(
     metric_key: str = "",
     reset_precision: str = "",
 ) -> str:
-    _ = metric_key
     _ = reset_precision
     seconds = max(0, int(seconds))
-    # Compact countdown contract: zero padding and the second cadence above the
-    # final hour are the noise, the minutes are information. A day-scale reset
-    # reads "4d 10h 3m" instead of "04d 10h 03m 58s" and a final-hour reset
-    # keeps its second cadence. Exact units collapse ("45m", "6h", "6d 20h").
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        minutes, secs = divmod(seconds, 60)
-        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
-    hours, minutes = divmod(seconds // 60, 60)
-    days, hours = divmod(hours, 24)
-    if days:
-        if minutes:
-            return f"{days}d {hours}h {minutes}m"
-        if hours:
-            return f"{days}d {hours}h"
-        return f"{days}d"
-    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    # Display contract: each metric owns one fixed countdown shape so the
+    # column never jitters as digits tick — 5H reads "00h 00m 00s" (its window
+    # never spans days) and 7D reads "00d 00h 00m 00s".
+    if str(metric_key or "").endswith("five_hour_limit"):
+        return f"{hours:02d}h {minutes:02d}m {secs:02d}s"
+    return f"{days:02d}d {hours:02d}h {minutes:02d}m {secs:02d}s"
 
 
 def _format_reset_remaining_compact(
