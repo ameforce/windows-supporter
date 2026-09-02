@@ -273,6 +273,7 @@ class CodexUsageSettingsView:
         self._live_spark_weekly_var = tk.StringVar(value="-")
         self._live_spark_weekly_reset_var = tk.StringVar(value="-")
         self._live_credit_var = tk.StringVar(value="-")
+        self._live_spark_cells: list[Any] = []
 
         row = 0
 
@@ -747,14 +748,17 @@ class CodexUsageSettingsView:
             column=2,
         )
         runtime_row += 1
-        self._add_value_row(
+        self._live_spark_cells = []
+        spark_cells = self._add_value_row(
             runtime_grid,
             runtime_row,
             "Spark 5시간 한도",
             self._live_spark_five_hour_var,
             card_bg,
         )
-        self._add_value_row(
+        if spark_cells is not None:
+            self._live_spark_cells.extend(spark_cells)
+        spark_cells = self._add_value_row(
             runtime_grid,
             runtime_row,
             "Spark 5시간 초기화",
@@ -762,15 +766,19 @@ class CodexUsageSettingsView:
             card_bg,
             column=2,
         )
+        if spark_cells is not None:
+            self._live_spark_cells.extend(spark_cells)
         runtime_row += 1
-        self._add_value_row(
+        spark_cells = self._add_value_row(
             runtime_grid,
             runtime_row,
             "Spark 주간 한도",
             self._live_spark_weekly_var,
             card_bg,
         )
-        self._add_value_row(
+        if spark_cells is not None:
+            self._live_spark_cells.extend(spark_cells)
+        spark_cells = self._add_value_row(
             runtime_grid,
             runtime_row,
             "Spark 주간 초기화",
@@ -778,6 +786,8 @@ class CodexUsageSettingsView:
             card_bg,
             column=2,
         )
+        if spark_cells is not None:
+            self._live_spark_cells.extend(spark_cells)
         return row + 1
 
     def _profile_card_column_count(
@@ -1009,14 +1019,15 @@ class CodexUsageSettingsView:
             return
         label_pad = (0, 6) if column == 0 else (18, 6)
         value_pad = (0, 8)
-        tk.Label(
+        label_cell = tk.Label(
             parent,
             text=label,
             bg=bg,
             fg="#6B7280",
             font=("Segoe UI", 9),
-        ).grid(row=row, column=column, sticky="w", padx=label_pad, pady=1)
-        tk.Label(
+        )
+        label_cell.grid(row=row, column=column, sticky="w", padx=label_pad, pady=1)
+        value_cell = tk.Label(
             parent,
             textvariable=value_var,
             bg=bg,
@@ -1025,8 +1036,9 @@ class CodexUsageSettingsView:
             anchor="w",
             justify="left",
             wraplength=self._scaled_wrap_length(250 if column else 220),
-        ).grid(row=row, column=column + 1, sticky="w", padx=value_pad, pady=1)
-        return
+        )
+        value_cell.grid(row=row, column=column + 1, sticky="w", padx=value_pad, pady=1)
+        return (label_cell, value_cell)
 
     def _shorten_path(self, value: str, max_chars: int = 84) -> str:
         text = str(value or "").strip()
@@ -2716,6 +2728,30 @@ class CodexUsageSettingsView:
             )
             visibility["five_hour_limit"] = bool(five_hour_visible)
             visibility["five_hour_limit_reset_at"] = bool(five_hour_visible)
+            spark_five_hour_visible = (
+                "gpt_5_3_codex_spark_five_hour_limit" in descriptor_keys
+                or bool(
+                    str(
+                        payload.get("gpt_5_3_codex_spark_five_hour_limit") or ""
+                    ).strip()
+                )
+            )
+            visibility["gpt_5_3_codex_spark_five_hour_limit"] = bool(
+                spark_five_hour_visible
+            )
+            visibility["gpt_5_3_codex_spark_five_hour_limit_reset_at"] = bool(
+                spark_five_hour_visible
+            )
+            spark_weekly_visible = (
+                "gpt_5_3_codex_spark_weekly_limit" in descriptor_keys
+                or bool(
+                    str(payload.get("gpt_5_3_codex_spark_weekly_limit") or "").strip()
+                )
+            )
+            visibility["gpt_5_3_codex_spark_weekly_limit"] = bool(spark_weekly_visible)
+            visibility["gpt_5_3_codex_spark_weekly_limit_reset_at"] = bool(
+                spark_weekly_visible
+            )
         for key, visible in visibility.items():
             cell = cells.get(key)
             if cell is None:
@@ -2728,6 +2764,24 @@ class CodexUsageSettingsView:
                         widget.grid_remove()
                 except Exception:
                     pass
+        return
+
+    def _apply_live_spark_visibility(self, payload: dict[str, Any]) -> None:
+        # Spark quota rows are provider-optional: hide them entirely for
+        # accounts whose usage page never reports Spark limits instead of
+        # showing permanent "-" placeholders.
+        visible = bool(
+            str(payload.get("gpt_5_3_codex_spark_five_hour_limit") or "").strip()
+            or str(payload.get("gpt_5_3_codex_spark_weekly_limit") or "").strip()
+        )
+        for widget in self._metric_cell_widgets(self._live_spark_cells):
+            try:
+                if visible:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            except Exception:
+                pass
         return
 
     def _start_runtime_refresh(self) -> None:
@@ -2864,6 +2918,7 @@ class CodexUsageSettingsView:
                     _fmt_reset("gpt_5_3_codex_spark_weekly_limit_reset_at")
                 )
             self._live_credit_var.set(_val("remaining_credit"))
+            self._apply_live_spark_visibility(payload)
         except Exception:
             pass
 
