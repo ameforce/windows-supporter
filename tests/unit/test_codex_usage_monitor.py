@@ -821,19 +821,87 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
                 "Kim Jong",
             )
 
-    def test_build_snapshot_from_probe_rejects_conflicting_bound_profile_name(self) -> None:
+    def test_build_snapshot_from_probe_adopts_renamed_profile_name(self) -> None:
+        # Given: a bound profile name collected from the same logged-in session.
         with tempfile.TemporaryDirectory() as tmp:
             monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
             monitor._CodexUsageMonitor__profile_name = "Kim Jong"
 
+            # When: the provider page reports the same session under a renamed
+            # display name, the fresh scrape must be adopted, not rejected.
             snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
-                self._usage_probe("Other Profile")
+                self._usage_probe("Kim J.")
             )
 
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(
+                monitor.get_runtime_status().get("profile_name"),
+                "Kim J.",
+            )
+
+    def test_build_snapshot_from_probe_rejects_conflicting_bound_account_id(self) -> None:
+        # Given: an account identity is bound from a previous successful scrape.
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            monitor._CodexUsageMonitor__account_id = "acct-bound"
+
+            # When: the probe presents a different account identity.
+            probe = self._usage_probe("Kim Jong")
+            probe["accountId"] = "acct-other"
+
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(probe)
+
+            # Then: the snapshot is rejected as a cross-account payload.
             self.assertIsNone(snapshot)
             self.assertEqual(
                 monitor.get_runtime_status().get("profile_name"),
-                "Kim Jong",
+                "",
+            )
+
+    def test_build_snapshot_from_probe_accepts_rename_with_matching_account_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            monitor._CodexUsageMonitor__account_id = "acct-bound"
+
+            probe = self._usage_probe("Kim Jong Park")
+            probe["accountId"] = "acct-bound"
+
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(probe)
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(
+                monitor.get_runtime_status().get("profile_name"),
+                "Kim Jong Park",
+            )
+
+    def test_account_identity_binding_survives_state_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            probe = self._usage_probe("Kim Jong")
+            probe["accountId"] = "acct-bound"
+            self.assertIsNotNone(
+                monitor._CodexUsageMonitor__build_snapshot_from_probe(probe)
+            )
+            monitor._CodexUsageMonitor__save_state()
+
+            reloaded = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+            )
+
+            conflicting = self._usage_probe("Kim Jong")
+            conflicting["accountId"] = "acct-other"
+            self.assertIsNone(
+                reloaded._CodexUsageMonitor__build_snapshot_from_probe(conflicting)
+            )
+            matching = self._usage_probe("Kim J.")
+            matching["accountId"] = "acct-bound"
+            self.assertIsNotNone(
+                reloaded._CodexUsageMonitor__build_snapshot_from_probe(matching)
+            )
+            self.assertEqual(
+                reloaded.get_runtime_status().get("profile_name"),
+                "Kim J.",
             )
 
     def test_build_snapshot_from_probe_keeps_bound_profile_name_when_probe_name_is_empty(self) -> None:
