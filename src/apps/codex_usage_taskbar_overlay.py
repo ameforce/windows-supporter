@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Callable
 
 from src.apps.codex_usage_taskbar_targets import (
@@ -961,14 +962,37 @@ def _required_metric_segment_width(
     *,
     badge_mode: str = "any",
 ) -> int:
+    return int(_required_metric_segment_width_cached(_metric_width_signature(metric), badge_mode))
+
+
+def _metric_width_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
     metric_dict = metric if isinstance(metric, dict) else {}
-    detail_text, short_text = _metric_guidance_texts(metric_dict)
-    badge_label = str(metric_dict.get("reset_badge_label") or "")
-    badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
+    # Countdown digits tick every second; only the text *shape* (length and
+    # non-digit characters) affects layout width, so mask digits to keep the
+    # cache hitting across consecutive ticks.
+    return (
+        str(metric_dict.get("metric_key") or ""),
+        re.sub(r"\d", "0", str(metric_dict.get("reset_text") or "")),
+        re.sub(r"\d", "0", str(metric_dict.get("reset_short_text") or "")),
+        str(metric_dict.get("reset_badge_label") or ""),
+        str(metric_dict.get("reset_badge_short_label") or ""),
+    )
+
+
+@lru_cache(maxsize=512)
+def _required_metric_segment_width_cached(
+    signature: tuple[Any, ...],
+    badge_mode: str,
+) -> int:
+    (
+        metric_key,
+        detail_text,
+        short_text,
+        badge_label,
+        badge_short_label,
+    ) = signature
     has_reset_badge = bool(badge_label or badge_short_label)
     has_reset_time = bool(detail_text or short_text)
-    metric_key = str(metric_dict.get("metric_key") or "")
-    reset_marker = str(metric_dict.get("reset_marker") or "")
     mode = _normalized_badge_mode(badge_mode)
 
     for candidate_width in range(48, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX + 1):
@@ -979,7 +1003,7 @@ def _required_metric_segment_width(
             badge_label=badge_label,
             badge_short_label=badge_short_label,
             metric_key=metric_key,
-            reset_marker=reset_marker,
+            reset_marker="",
             has_reset_badge=has_reset_badge,
             progress_width=_metric_progress_width_for_segment(candidate_width),
             badge_mode=mode,
@@ -1013,23 +1037,14 @@ def _required_metric_segment_width(
     return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
 
 
-def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | None:
-    if not isinstance(model, dict) or not bool(model.get("visible")):
-        return None
-
-    rows: list[tuple[dict[str, Any], ...]] = []
-    bars = model.get("bars")
-    if not isinstance(bars, list):
-        return None
-    for bar in bars[:2]:
-        if not isinstance(bar, dict) or not bool(bar.get("enabled", True)):
-            continue
-        visible_metrics = _visible_metrics_for_taskbar_bar(bar)
-        rows.append(visible_metrics)
-
-    if not rows:
-        return None
-
+@lru_cache(maxsize=512)
+def _preferred_width_for_rows_cached(
+    rows_signature: tuple[tuple[tuple[Any, ...], ...], ...],
+) -> int:
+    rows = tuple(
+        tuple(_metric_from_width_signature(sig) for sig in row)
+        for row in rows_signature
+    )
     for badge_mode in ("full", "short"):
         for candidate_width in range(
             _MIN_EMPTY_SLOT_WIDTH_PX,
@@ -1045,6 +1060,48 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
             ):
                 return int(candidate_width)
     return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
+
+
+def _metric_from_width_signature(
+    signature: tuple[Any, ...],
+) -> dict[str, Any]:
+    (
+        metric_key,
+        reset_text,
+        reset_short_text,
+        badge_label,
+        badge_short_label,
+    ) = signature
+    return {
+        "metric_key": metric_key,
+        "reset_text": reset_text,
+        "reset_short_text": reset_short_text,
+        "reset_badge_label": badge_label,
+        "reset_badge_short_label": badge_short_label,
+    }
+
+
+def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | None:
+    if not isinstance(model, dict) or not bool(model.get("visible")):
+        return None
+
+    rows: list[tuple[tuple[Any, ...], ...]] = []
+    bars = model.get("bars")
+    if not isinstance(bars, list):
+        return None
+    for bar in bars[:2]:
+        if not isinstance(bar, dict) or not bool(bar.get("enabled", True)):
+            continue
+        rows.append(
+            tuple(
+                _metric_width_signature(metric)
+                for metric in _visible_metrics_for_taskbar_bar(bar)
+            )
+        )
+
+    if not rows:
+        return None
+    return _preferred_width_for_rows_cached(tuple(rows))
 
 
 def _render_signature_value(value: Any) -> Any:
