@@ -4005,7 +4005,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 512)
+        self.assertEqual(width, 485)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
@@ -4015,10 +4015,18 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             (narrow_metric, wide_metric),
         )
         required_wide_segment = taskbar_overlay._required_metric_segment_width(wide_metric)
-        self.assertGreaterEqual(row_layout.segment_width, required_wide_segment)
-        self.assertLess(narrower_row_layout.segment_width, required_wide_segment)
+        # Text-first allocation gives each metric at least its required width.
+        wide_index = 1
+        _offset, wide_segment_width, wide_progress = row_layout.segment_geometry(
+            wide_index
+        )
+        self.assertGreaterEqual(wide_segment_width, required_wide_segment)
+        _narrower_offset, narrower_wide_width, _narrower_progress = (
+            narrower_row_layout.segment_geometry(wide_index)
+        )
+        self.assertLess(narrower_wide_width, required_wide_segment)
         layout = taskbar_overlay._fit_metric_segment_layout(
-            row_layout.segment_width,
+            wide_segment_width,
             wide_metric["reset_text"],
             wide_metric["reset_short_text"],
             badge_label=wide_metric["reset_badge_label"],
@@ -4026,7 +4034,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             metric_key=wide_metric["metric_key"],
             reset_marker="",
             has_reset_badge=True,
-            progress_width=row_layout.progress_width,
+            progress_width=wide_progress,
         )
         badge_fit = dict(layout["badge_fit"])
 
@@ -4285,9 +4293,18 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 4)
         self.assertEqual({call["badge_mode"] for call in calls}, {"short"})
-        self.assertEqual(
-            len({call["progress_width"] for call in calls}),
-            1,
+        # Text-first allocation reserves each metric's text width; per-row
+        # differences are expected, but every progress bar stays within the
+        # display contract bounds.
+        widths_by_metric = [call["progress_width"] for call in calls]
+        self.assertTrue(
+            all(
+                taskbar_overlay._METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
+                <= width
+                <= taskbar_overlay._METRIC_PROGRESS_MAX_WIDTH_PX
+                for width in widths_by_metric
+            ),
+            f"progress widths out of bounds: {widths_by_metric}",
         )
 
     def test_fit_reset_badge_can_be_forced_to_short_or_full_mode(self):
