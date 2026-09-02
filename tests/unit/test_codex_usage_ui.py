@@ -35,6 +35,17 @@ class _FakeLabel:
         return None
 
 
+class _GridTrackingLabel(_FakeLabel):
+    def __init__(self, owner, *args, **kwargs):
+        super().__init__(owner, *args, **kwargs)
+        self.grid_calls = 0
+
+    def grid(self, **kwargs):
+        self.grid_calls += 1
+        super().grid(**kwargs)
+        return None
+
+
 class _FakeWidget:
     def __init__(self, owner=None, *args, **kwargs):
         _ = args
@@ -309,6 +320,73 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(codex_value.grid_remove_calls, 1)
         self.assertEqual(codex_reset.grid_remove_calls, 1)
         self.assertEqual(cursor_od.grid_remove_calls, 1)
+
+    def test_metric_presence_hides_unreported_codex_spark_rows_until_reported(self) -> None:
+        fake_tk = _FakeTk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        spark_five = _GridTrackingLabel(fake_tk)
+        spark_five_reset = _GridTrackingLabel(fake_tk)
+        spark_weekly = _GridTrackingLabel(fake_tk)
+        spark_weekly_reset = _GridTrackingLabel(fake_tk)
+        view._account_metric_cells = {
+            "codex-1": {
+                "gpt_5_3_codex_spark_five_hour_limit": spark_five,
+                "gpt_5_3_codex_spark_five_hour_limit_reset_at": spark_five_reset,
+                "gpt_5_3_codex_spark_weekly_limit": spark_weekly,
+                "gpt_5_3_codex_spark_weekly_limit_reset_at": spark_weekly_reset,
+            },
+        }
+
+        # Given: the account's usage page reports no Spark quota blocks.
+        view._update_account_metric_visibility(
+            "codex-1",
+            provider="codex",
+            descriptor_keys={"five_hour_limit", "weekly_limit"},
+            payload={"five_hour_limit": "68%", "weekly_limit": "80%"},
+        )
+
+        # Then: Spark rows are removed from the grid instead of showing "-".
+        self.assertEqual(spark_five.grid_remove_calls, 1)
+        self.assertEqual(spark_five_reset.grid_remove_calls, 1)
+        self.assertEqual(spark_weekly.grid_remove_calls, 1)
+        self.assertEqual(spark_weekly_reset.grid_remove_calls, 1)
+
+        # When: a later snapshot reports Spark limits on the same account.
+        view._update_account_metric_visibility(
+            "codex-1",
+            provider="codex",
+            descriptor_keys=set(),
+            payload={
+                "gpt_5_3_codex_spark_five_hour_limit": "20%",
+                "gpt_5_3_codex_spark_weekly_limit": "80 / 100",
+            },
+        )
+
+        # Then: the same Spark rows return to the grid.
+        self.assertEqual(spark_five.grid_calls, 1)
+        self.assertEqual(spark_five_reset.grid_calls, 1)
+        self.assertEqual(spark_weekly.grid_calls, 1)
+        self.assertEqual(spark_weekly_reset.grid_calls, 1)
+
+    def test_live_spark_rows_hide_until_spark_reported(self) -> None:
+        fake_tk = _FakeTk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        spark_cells = [_GridTrackingLabel(fake_tk) for _ in range(4)]
+        view._live_spark_cells = list(spark_cells)
+
+        view._apply_live_spark_visibility({})
+
+        for cell in spark_cells:
+            self.assertEqual(cell.grid_remove_calls, 1)
+            self.assertEqual(cell.grid_calls, 0)
+
+        view._apply_live_spark_visibility(
+            {"gpt_5_3_codex_spark_weekly_limit": "80 / 100"}
+        )
+
+        for cell in spark_cells:
+            self.assertEqual(cell.grid_calls, 1)
+            self.assertEqual(cell.grid_remove_calls, 1)
 
     def test_runtime_refresh_keeps_only_one_scheduled_callback(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
