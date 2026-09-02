@@ -2556,9 +2556,11 @@ class CodexUsageTaskbarOverlay:
         reset_text_x = x + int(layout["reset_text_x"])
         badge_fit = dict(layout["badge_fit"])
         display_reset_text = str(layout["display_reset_text"])
-        if bool(layout["placeholder_visible"]):
+        if bool(layout["placeholder_visible"]) and not is_credit_metric:
             reset_color = "#4b5563"
-        show_reset = bool(display_reset_text)
+        # Credit carries no reset semantics: the "--" placeholder would land
+        # right after the amount and obscure it.
+        show_reset = bool(display_reset_text) and not is_credit_metric
         bar_y = y + max(4, (row_height - 7) // 2)
         if flash:
             _ = flash_phase
@@ -4847,6 +4849,7 @@ def _credit_metric_descriptor(snapshot: dict[str, Any]) -> dict[str, Any] | None
     else:
         display = f"${amount:g}"
     return {
+        "metric_key": "credit",
         "key": "CR",
         "short_label": "CR",
         "percent": None,
