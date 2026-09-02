@@ -1523,10 +1523,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             layout["progress_width"],
             taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX,
         )
-        self.assertGreaterEqual(
-            layout["progress_width"],
-            taskbar_overlay._METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-        )
+        # The bar yields all the way to zero before badge or countdown drop.
+        self.assertGreaterEqual(layout["progress_width"], 0)
         self.assertTrue(layout["badge_fit"]["badge_visible"])
         # The short variant keeps the full badge label by design.
         self.assertIn(layout["badge_fit"]["badge_label"], {"남", "남음"})
@@ -1549,10 +1547,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             layout["progress_width"],
             taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX,
         )
-        self.assertGreaterEqual(
-            layout["progress_width"],
-            taskbar_overlay._METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-        )
+        # The bar yields all the way to zero before badge or countdown drop.
+        self.assertGreaterEqual(layout["progress_width"], 0)
         # Display contract: the countdown outranks the badge, so the compact
         # five-hour segment shows the full time and drops the badge instead.
         self.assertTrue(layout["badge_fit"]["time_text"])
@@ -1786,10 +1782,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(len(reset_times), 1)
         track_width = int(track_rect[1][2]) - int(track_rect[1][0])
         self.assertLessEqual(track_width, taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX)
-        self.assertGreaterEqual(
-            track_width,
-            taskbar_overlay._METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-        )
+        # The bar yields all the way to zero before badge or countdown drop.
+        self.assertGreaterEqual(track_width, 0)
         self.assertEqual(arrow_only, [])
 
     def test_draw_metric_segment_keeps_time_text_by_shrinking_progress_below_legacy_floor(self):
@@ -2124,8 +2118,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
     def test_required_segment_width_keeps_preferred_bar_with_badge_and_guidance(self):
         metric = {
             "metric_key": "five_hour_limit",
-            "reset_text": "4h 4m",
-            "reset_short_text": "4h 4m",
+            "value_text": "88%",
+            "reset_text": "02h 54m 00s",
+            "reset_short_text": "02h 54m 00s",
             "normal_guidance_text": "N 82~83%",
             "normal_guidance_short_text": "N 82~83%",
             "reset_badge_label": "남음",
@@ -2144,10 +2139,13 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             has_reset_badge=True,
             progress_width=taskbar_overlay._metric_progress_width_for_segment(required),
             badge_mode="short",
+            value_width=taskbar_overlay._value_column_width_for_text(
+                str(metric.get("value_text") or "--")
+            ),
         )
 
         self.assertTrue(layout["badge_fit"]["badge_visible"])
-        self.assertEqual(layout["badge_fit"]["time_text"], "4h 4m | N 82~83%")
+        self.assertEqual(layout["badge_fit"]["time_text"], "02h 54m 00s | N 82~83%")
         self.assertGreaterEqual(
             int(layout["progress_width"]),
             taskbar_overlay._METRIC_REQUIRED_PROGRESS_FLOOR_PX,
@@ -2229,8 +2227,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "percent": 71,
             "value_text": "71%",
             "color": "#22c55e",
-            "reset_text": "00h 02h 54m 00s",
-            "reset_short_text": "00h 02h 54m 00s",
+            "reset_text": "02h 54m 00s",
+            "reset_short_text": "02h 54m 00s",
             "reset_badge_label": "남음",
             "reset_badge_short_label": "남",
             "normal_guidance_text": "N 59~62% / 27m",
@@ -2283,8 +2281,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "percent": 57,
             "value_text": "57%",
             "color": "#22c55e",
-            "reset_text": "00h 02h 54m 00s",
-            "reset_short_text": "00h 02h 54m 00s",
+            "reset_text": "02h 54m 00s",
+            "reset_short_text": "02h 54m 00s",
             "reset_badge_label": "남음",
             "reset_badge_short_label": "남",
             "normal_guidance_text": "N 59~62% / 27m",
@@ -2391,6 +2389,132 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(on_track["direction"], "on_track")
         self.assertIn(" / ", on_track["text"])
 
+    def test_build_metric_tooltip_text_lines(self):
+        metric = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "value_text": "46%",
+            "reset_text": "00d 06h 51m 00s",
+            "normal_guidance_text": "N 90% / 2d 20h",
+            "reset_badge_label": "부족",
+        }
+
+        text = taskbar_overlay._build_metric_tooltip_text(metric, "김종인")
+
+        self.assertEqual(
+            text,
+            "주간 한도 46% (부족)\n"
+            "리셋까지 00d 06h 51m 00s\n"
+            "정상 범위 N 90% / 2d 20h\n"
+            "프로필: 김종인",
+        )
+        credit = {"key": "CR", "metric_key": "credit", "value_text": "227"}
+        self.assertEqual(
+            taskbar_overlay._build_metric_tooltip_text(credit, "김종인"),
+            "크레딧 227\n프로필: 김종인",
+        )
+
+    def test_canvas_motion_schedules_tooltip_for_hovered_segment(self):
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        metrics = self._row_badge_metrics()
+        overlay._draw(self._row_badge_model(530, metrics=metrics))
+
+        self.assertTrue(overlay._metric_hit_rects)
+
+        class _Event:
+            x = 130
+            y = 12
+            x_root = 1000
+            y_root = 1400
+
+        overlay._on_canvas_motion(_Event())
+        self.assertEqual(len(overlay._root.after_calls), 1)
+        self.assertIsNotNone(overlay._tooltip_after_id)
+
+        class _EventOutside:
+            x = 3
+            y = 3
+            x_root = 1000
+            y_root = 1400
+
+        overlay._on_canvas_motion(_EventOutside())
+        self.assertIsNone(overlay._metric_tooltip)
+        self.assertIsNone(overlay._tooltip_after_id)
+        self.assertTrue(overlay._root.after_cancel_calls)
+
+    def test_clamped_rows_keep_short_badge_with_countdown(self):
+        # Regression for the live 456px clamp: after the guidance yields, the
+        # short state badge still survives next to the fixed countdown — the
+        # badge is the only at-a-glance state carrier left in that state.
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 57,
+            "value_text": "57%",
+            "color": "#22c55e",
+            "reset_text": "02h 54m 00s",
+            "reset_short_text": "02h 54m 00s",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 59~62% / 27m",
+            "normal_guidance_short_text": "N 59~62% / 27m",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 46,
+            "value_text": "46%",
+            "color": "#f59e0b",
+            "reset_text": "00d 06h 51m 00s",
+            "reset_short_text": "00d 06h 51m 00s",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 90% / 2d 20h",
+            "normal_guidance_short_text": "N 90% / 2d 20h",
+        }
+        credit = {
+            "key": "CR",
+            "metric_key": "credit",
+            "percent": None,
+            "value_text": "227",
+        }
+        rows = [(weekly,), (five_hour, weekly, credit)]
+
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(456, rows)
+
+        for layout in layouts:
+            for index, metric in enumerate(layout.visible_metrics):
+                _offset, segment_width, segment_progress = layout.segment_geometry(index)
+                detail, short = taskbar_overlay._metric_guidance_texts(metric)
+                fit = taskbar_overlay._fit_metric_segment_layout(
+                    segment_width,
+                    detail,
+                    short,
+                    badge_label=str(metric.get("reset_badge_label") or ""),
+                    badge_short_label=str(metric.get("reset_badge_short_label") or ""),
+                    metric_key=str(metric.get("metric_key") or ""),
+                    has_reset_badge=bool(
+                        metric.get("reset_badge_label")
+                        or metric.get("reset_badge_short_label")
+                    ),
+                    progress_width=segment_progress,
+                    badge_mode="short",
+                    value_width=taskbar_overlay._value_column_width_for_text(
+                        str(metric.get("value_text") or "--")
+                    ),
+                )
+                if metric.get("metric_key") == "credit":
+                    continue
+                badge_fit = fit["badge_fit"]
+                self.assertTrue(badge_fit["badge_visible"])
+                time_text = str(
+                    badge_fit["time_text"] or fit["display_reset_text"] or ""
+                )
+                self.assertEqual(time_text, detail.split(" | ")[0])
+                self.assertNotIn("|", time_text)
+
     def test_metric_layout_reserves_right_breathing_room(self):
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             500,
@@ -2462,7 +2586,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         second_metric = {
             "key": "5h",
             "percent": 100,
-            "value_text": "100%",
+            "value_text": "6%",
             "color": "#22c55e",
             "reset_text": "00d 00h 00m 00s",
             "reset_short_text": "00d 00h 00m 00s",
@@ -4294,7 +4418,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 530)
+        self.assertEqual(width, 520)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
@@ -4711,12 +4835,14 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertIn("414x", window.geometry_calls[-1])
         # At a 414px clamp the shared columns sit below the badge+time budget,
         # so the short-mode ladder keeps the countdown and drops the badge.
+        # With the measured percent column the short state badges survive the
+        # clamp alongside their countdowns; the full labels stay compacted.
         self.assertIn("00d 00h 00m 00s", texts)
         self.assertIn("06d 20h 00m 00s", texts)
+        self.assertIn("부", texts)
+        self.assertIn("남", texts)
         self.assertNotIn("부족", texts)
         self.assertNotIn("남음", texts)
-        self.assertNotIn("남", texts)
-        self.assertNotIn("부", texts)
 
     def test_refresh_uses_real_preferred_width_above_old_text_cap_when_slot_is_wide(self):
         metrics = self._row_badge_metrics()
