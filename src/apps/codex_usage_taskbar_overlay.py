@@ -191,6 +191,13 @@ _OVERLAY_RIGHT_PADDING_PX = 10
 _METRIC_PROGRESS_MIN_WIDTH_PX = 28
 _METRIC_PROGRESS_PREFERRED_WIDTH_PX = 36
 _METRIC_PROGRESS_MAX_WIDTH_PX = 48
+# Display contract: the % value and reset text must stay visible even when the
+# taskbar slot is narrow. The progress bar is the last element allowed to
+# shrink, down to this text-priority floor, before any text is omitted.
+_METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX = 14
+# Below this equal-split segment width, per-metric reservation is impossible;
+# the compact shrink path already runs inside each segment.
+_MIN_COMPACT_SEGMENT_FOR_TEXT_PX = 140
 _METRIC_SEGMENT_GAP_COMPACT_PX = 6
 _METRIC_SEGMENT_GAP_WIDE_PX = 12
 _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX = 64
@@ -271,6 +278,23 @@ class _MetricRowLayout:
     segment_width: int
     progress_width: int
     visible_metrics: tuple[dict[str, Any], ...]
+    # Per-segment layout. `segment_width`/`progress_width` stay as the uniform
+    # fallback for callers that assume equal split; when the text-first
+    # allocation applies, these lists carry the real per-segment geometry.
+    segment_offsets: tuple[int, ...] = ()
+    segment_widths: tuple[int, ...] = ()
+    progress_widths: tuple[int, ...] = ()
+
+    def segment_geometry(self, index: int) -> tuple[int, int, int]:
+        """Return (offset, width, progress_width) for one segment."""
+        if index < len(self.segment_widths):
+            return (
+                self.segment_offsets[index],
+                self.segment_widths[index],
+                self.progress_widths[index],
+            )
+        step = self.segment_width + self.segment_gap
+        return index * step, self.segment_width, self.progress_width
 
 
 def _taskbar_profile_source(runtime: dict[str, Any]) -> list[Any]:
@@ -364,10 +388,11 @@ def build_codex_usage_taskbar_overlay_model(
                     )
                 )
         credit_metric = _credit_metric_descriptor(snapshot)
-        if credit_metric is not None and len(metrics) < 2:
-            # Display contract: credit occupies a taskbar slot only when the
-            # account actually reports a usable balance, and it never evicts a
-            # reported usage limit (5h/weekly) from the two compact slots.
+        if credit_metric is not None and len(metrics) < 3:
+            # Display contract: credit always occupies its own compact slot
+            # (5h, weekly, credit) whenever the account reports a usable
+            # balance. Credit without a percent never replaces a reported
+            # usage limit's slot order.
             metrics.append(credit_metric)
         primary_metric = metrics[0] if metrics else {
             "percent": None,
@@ -625,7 +650,7 @@ def _visible_metrics_for_taskbar_bar(bar: dict[str, Any]) -> tuple[dict[str, Any
         for metric in bar_dict.get("metrics", [])
         if isinstance(metric, dict)
     ]
-    return tuple(metrics[:2])
+    return tuple(metrics[:3])
 
 
 def _metric_guidance_texts(metric: dict[str, Any]) -> tuple[str, str]:
@@ -738,7 +763,7 @@ def _metric_fits_badge_mode(
         progress_width=progress_width,
         badge_mode=mode,
     )
-    if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_MIN_WIDTH_PX:
+    if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX:
         return False
     badge_fit = layout.get("badge_fit")
     if not isinstance(badge_fit, dict):
@@ -769,7 +794,7 @@ def _row_fits_badge_mode(
     progress_width: int,
     badge_mode: str,
 ) -> bool:
-    visible_metrics = tuple(metric for metric in metrics[:2] if isinstance(metric, dict))
+    visible_metrics = tuple(metric for metric in metrics[:3] if isinstance(metric, dict))
     if not visible_metrics:
         return True
     return all(
@@ -783,28 +808,41 @@ def _row_fits_badge_mode(
     )
 
 
+def _row_fits_badge_mode_for_layout(
+    row_layout: _MetricRowLayout,
+    badge_mode: str,
+) -> bool:
+    visible_metrics = tuple(
+        metric for metric in row_layout.visible_metrics[:3] if isinstance(metric, dict)
+    )
+    if not visible_metrics:
+        return True
+    for index, metric in enumerate(visible_metrics):
+        _offset, segment_width_value, segment_progress = row_layout.segment_geometry(
+            index
+        )
+        if not _metric_fits_badge_mode(
+            metric,
+            int(segment_width_value),
+            int(segment_progress),
+            badge_mode,
+        ):
+            return False
+    return True
+
+
 def _row_fits_badge_mode_for_overlay_width(
     width: int,
     metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     badge_mode: str,
 ) -> bool:
     row_layout = _metric_row_layout_for_overlay_width(width, metrics)
-    return _row_fits_badge_mode(
-        row_layout.visible_metrics,
-        row_layout.segment_width,
-        row_layout.progress_width,
-        badge_mode,
-    )
+    return _row_fits_badge_mode_for_layout(row_layout, badge_mode)
 
 
 def _resolve_overlay_badge_mode(row_layouts: tuple[_MetricRowLayout, ...]) -> str:
     if all(
-        _row_fits_badge_mode(
-            row_layout.visible_metrics,
-            row_layout.segment_width,
-            row_layout.progress_width,
-            "full",
-        )
+        _row_fits_badge_mode_for_layout(row_layout, "full")
         for row_layout in row_layouts
     ):
         return "full"
@@ -816,7 +854,7 @@ def _metric_row_layout_for_overlay_width(
     metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
 ) -> _MetricRowLayout:
     overlay_width = int(width)
-    visible_metrics = tuple(metric for metric in metrics[:2] if isinstance(metric, dict))
+    visible_metrics = tuple(metric for metric in metrics[:3] if isinstance(metric, dict))
     label_width = _label_width_for_overlay_width(overlay_width)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
@@ -828,7 +866,64 @@ def _metric_row_layout_for_overlay_width(
         segment_gap,
     )
     progress_width = _metric_progress_width_for_segment(segment_width)
-    return _MetricRowLayout(
+
+    # Text-first allocation: every visible metric must keep its reset
+    # countdown, normal-usage guidance, and (when applicable) transition time.
+    # Blind equal split starves the second metric's texts whenever a row mixes
+    # one- and two-metric profiles, so instead reserve each metric's required
+    # full-text width and hand the leftover to the progress bars.
+    counts = len(visible_metrics)
+    required_widths = [
+        min(
+            _required_metric_segment_width(metric, badge_mode="short"),
+            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+        )
+        for metric in visible_metrics
+    ]
+    total_required = sum(required_widths) + segment_gap * max(0, counts - 1)
+    layout: _MetricRowLayout | None = None
+    if counts and total_required <= metrics_width:
+        leftover = metrics_width - total_required
+        extra = leftover // counts
+        widths: list[int] = []
+        offsets: list[int] = []
+        progresses: list[int] = []
+        cursor = 0
+        for index, metric in enumerate(visible_metrics):
+            segment = required_widths[index] + extra
+            widths.append(int(segment))
+            offsets.append(int(cursor))
+            progresses.append(
+                int(
+                    max(
+                        _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+                        min(
+                            _METRIC_PROGRESS_MAX_WIDTH_PX,
+                            _metric_progress_width_for_segment(segment),
+                        ),
+                    )
+                )
+            )
+            cursor += segment + segment_gap
+        layout = _MetricRowLayout(
+            label_width=label_width,
+            status_width=status_width,
+            metrics_x=metrics_x,
+            metrics_width=metrics_width,
+            segment_gap=segment_gap,
+            segment_width=max(widths),
+            progress_width=max(progresses),
+            visible_metrics=visible_metrics,
+            segment_offsets=tuple(offsets),
+            segment_widths=tuple(widths),
+            progress_widths=tuple(progresses),
+        )
+    if layout is not None:
+        return layout
+
+    # Fallback: keep every metric's countdown by clamping the progress bar to
+    # the text-priority floor in each equal segment before any text is dropped.
+    uniform_layout = _MetricRowLayout(
         label_width=label_width,
         status_width=status_width,
         metrics_x=metrics_x,
@@ -836,6 +931,27 @@ def _metric_row_layout_for_overlay_width(
         segment_gap=segment_gap,
         segment_width=segment_width,
         progress_width=progress_width,
+        visible_metrics=visible_metrics,
+    )
+    fits = all(
+        _metric_fits_badge_mode(
+            metric,
+            segment_width,
+            _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+            "short",
+        )
+        for metric in visible_metrics
+    )
+    if fits or segment_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
+        return uniform_layout
+    return _MetricRowLayout(
+        label_width=label_width,
+        status_width=status_width,
+        metrics_x=metrics_x,
+        metrics_width=metrics_width,
+        segment_gap=segment_gap,
+        segment_width=segment_width,
+        progress_width=_METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
         visible_metrics=visible_metrics,
     )
 
@@ -868,7 +984,7 @@ def _required_metric_segment_width(
             progress_width=_metric_progress_width_for_segment(candidate_width),
             badge_mode=mode,
         )
-        if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_MIN_WIDTH_PX:
+        if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX:
             continue
         badge_fit = layout.get("badge_fit")
         if not isinstance(badge_fit, dict):
@@ -2377,17 +2493,18 @@ class CodexUsageTaskbarOverlay:
                     text=status_text[:5],
                 )
             for metric_index, metric in enumerate(row_layout.visible_metrics):
-                segment_x = row_layout.metrics_x + metric_index * (
-                    row_layout.segment_width + row_layout.segment_gap
+                segment_offset, segment_width_value, segment_progress = (
+                    row_layout.segment_geometry(metric_index)
                 )
+                segment_x = row_layout.metrics_x + segment_offset
                 self._draw_metric_segment(
                     canvas,
                     metric,
                     segment_x,
                     y,
-                    row_layout.segment_width,
+                    segment_width_value,
                     row_height,
-                    progress_width=row_layout.progress_width,
+                    progress_width=segment_progress,
                     badge_mode=overlay_badge_mode,
                 )
         return
@@ -2420,6 +2537,7 @@ class CodexUsageTaskbarOverlay:
         color = str(metric.get("color") or "#6b7280")
         flash = bool(metric.get("flash"))
         flash_phase = bool(metric.get("flash_phase"))
+        is_credit_metric = metric_key == "credit" and metric.get("percent") is None
         layout = _fit_metric_segment_layout(
             width,
             reset_text,
@@ -2460,24 +2578,25 @@ class CodexUsageTaskbarOverlay:
             font=("Segoe UI", 7, "bold"),
             text=label,
         )
-        canvas.create_rectangle(
-            bar_x,
-            bar_y,
-            bar_x + bar_width,
-            bar_y + 7,
-            fill="#2a2f38",
-            outline="#3f4654",
-        )
-        fill_width = int(round(bar_width * max(0, min(100, percent)) / 100))
-        if fill_width > 0:
+        if not is_credit_metric:
             canvas.create_rectangle(
                 bar_x,
                 bar_y,
-                bar_x + fill_width,
+                bar_x + bar_width,
                 bar_y + 7,
-                fill=color,
-                outline=color,
+                fill="#2a2f38",
+                outline="#3f4654",
             )
+            fill_width = int(round(bar_width * max(0, min(100, percent)) / 100))
+            if fill_width > 0:
+                canvas.create_rectangle(
+                    bar_x,
+                    bar_y,
+                    bar_x + fill_width,
+                    bar_y + 7,
+                    fill=color,
+                    outline=color,
+                )
         canvas.create_text(
             value_x,
             center_y,
@@ -5292,7 +5411,10 @@ def _fit_metric_segment_layout(
     )
     minimum_progress_width = max(
         6,
-        min(_METRIC_PROGRESS_MIN_WIDTH_PX, int(max_progress_width)),
+        min(
+            _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+            int(max_progress_width),
+        ),
     )
 
     hidden_badge = {
@@ -5458,7 +5580,11 @@ def _fit_reset_badge_for_space(
     candidates: list[tuple[str, str, int, str, int]] = []
     allow_full_badge = normalized_badge_mode in {"any", "full"}
     allow_short_badge = normalized_badge_mode in {"any", "short"}
-    force_visible_badge = normalized_badge_mode in {"full", "short"}
+    # Display contract: the reset countdown outranks the reset badge. In short
+    # mode the badge becomes optional so the time text wins when space is
+    # tight; the metric identity ("5h"/"7d") is already drawn at the segment
+    # start, so a hidden badge never loses the metric.
+    force_visible_badge = normalized_badge_mode == "full"
 
     def add_candidate(
         variant: str,
