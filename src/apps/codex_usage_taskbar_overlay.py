@@ -363,6 +363,12 @@ def build_codex_usage_taskbar_overlay_model(
                         now=now,
                     )
                 )
+        credit_metric = _credit_metric_descriptor(snapshot)
+        if credit_metric is not None and len(metrics) < 2:
+            # Display contract: credit occupies a taskbar slot only when the
+            # account actually reports a usable balance, and it never evicts a
+            # reported usage limit (5h/weekly) from the two compact slots.
+            metrics.append(credit_metric)
         primary_metric = metrics[0] if metrics else {
             "percent": None,
             "value_text": "--",
@@ -2942,6 +2948,14 @@ def _fit_horizontal_geometry_to_empty_slot(
         previous_geometry=previous_geometry,
         target_width=target_width,
     )
+    if selected_slot is not None:
+        fallback_slot = _wider_left_fallback_slot(
+            free_spans,
+            selected_slot,
+            target_width=target_width,
+        )
+        if fallback_slot is not None:
+            selected_slot = fallback_slot
     if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
@@ -3028,6 +3042,33 @@ def _selected_free_slot(
     if previous_slot is not None:
         return previous_slot
     return rightmost_slot
+
+
+def _wider_left_fallback_slot(
+    free_spans: list[tuple[int, int]],
+    rightmost_slot: tuple[int, int],
+    *,
+    target_width: int,
+) -> tuple[int, int] | None:
+    """Return a left slot that fits the full content width when the right slot cannot.
+
+    Display contract: the overlay prefers the rightmost taskbar slot, but a
+    slot narrower than the content width silently hides the overlay. When the
+    right slot cannot fit `target_width` and a left free span can, use the
+    left span instead of disappearing.
+    """
+    right_width = int(rightmost_slot[1]) - int(rightmost_slot[0])
+    if right_width >= int(target_width):
+        return None
+    left_candidates = [
+        span
+        for span in free_spans
+        if int(span[1]) - int(span[0]) >= int(target_width)
+        and int(span[0]) < int(rightmost_slot[0])
+    ]
+    if not left_candidates:
+        return None
+    return max(left_candidates, key=lambda span: (int(span[1]) - int(span[0]), int(span[0])))
 
 
 def _slot_side_for_geometry(geometry: dict[str, Any], screen_width: int) -> str:
@@ -4661,6 +4702,41 @@ def _descriptor_percent(descriptor: dict[str, Any]) -> int | None:
     if isinstance(value, (int, float)):
         return max(0, min(100, int(round(float(value)))))
     return _parse_percent(value)
+
+
+def _credit_metric_descriptor(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """Build the taskbar credit metric when the account reports a usable credit.
+
+    "0" is a real reported balance and still shows. Missing, empty, or
+    placeholder payloads mean the provider page does not expose credit and the
+    metric must not exist (same presence contract as other optional metrics).
+    """
+    raw = str(snapshot.get("remaining_credit") or "").strip()
+    if not raw or raw.lower() in {"n/a", "unavailable", "조회 불가"}:
+        return None
+    normalized = raw
+    if raw.lower().startswith("$"):
+        normalized = raw[1:].strip() or raw
+    try:
+        amount = float(normalized.replace(",", ""))
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    if amount >= 1000:
+        display = f"${int(round(amount)):,}"
+    else:
+        display = f"${amount:g}"
+    return {
+        "key": "CR",
+        "short_label": "CR",
+        "percent": None,
+        "value_text": display,
+        "short_value_text": display,
+        "reset_at": "",
+        "reset_precision": "",
+        "state": "ready",
+    }
 
 
 def _build_provider_metric(
