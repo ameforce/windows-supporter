@@ -1871,6 +1871,7 @@ class CodexUsageMonitor:
         self.__monitor_state = "idle"
         self.__session_state = "logged_out"
         self.__profile_name = ""
+        self.__account_id = ""
         self.__auth_attention_required = False
         self.__auth_attention_reason = ""
         self.__auth_attention_source = ""
@@ -2162,6 +2163,8 @@ class CodexUsageMonitor:
             self.__usage_history = []
             self.__snapshot_backfill_allowed = False
             self.__set_session_state("logged_out")
+            self.__profile_name = ""
+            self.__account_id = ""
             self.__clear_auth_attention()
             self.__save_state()
             self.__failure_count = 0
@@ -2307,12 +2310,24 @@ class CodexUsageMonitor:
         self.__profile_name = sanitize_profile_name(value)
         return
 
-    def __probe_profile_matches_bound_profile(self, value: Any) -> bool:
-        incoming = sanitize_profile_name(value)
-        existing = sanitize_profile_name(self.__profile_name)
+    def __probe_identity_matches_bound_account(self, incoming_account_id: Any) -> bool:
+        # Account identity, not the display name, owns cross-account rejection.
+        # The display name can change at any time on the provider side and must
+        # be adopted from a fresh scrape of the same bound session.
+        incoming = normalize_usage_value(incoming_account_id)
+        existing = normalize_usage_value(self.__account_id)
         if not incoming or not existing:
             return True
         return incoming == existing
+
+    def __bind_probe_identity(self, *, account_id: Any, profile_name: Any) -> None:
+        normalized_account = normalize_usage_value(account_id)
+        if normalized_account:
+            self.__account_id = normalized_account
+        sanitized_name = sanitize_profile_name(profile_name)
+        if sanitized_name:
+            self.__profile_name = sanitized_name
+        return
 
     def __set_auth_attention(self, reason: str, source: str = "") -> None:
         self.__auth_attention_required = True
@@ -4363,11 +4378,14 @@ class CodexUsageMonitor:
             return None
         if not self.__is_usage_dom_ready_from_probe(normalized_probe):
             return None
-        profile_name = normalized_probe.get("profileName", "")
-        if not self.__probe_profile_matches_bound_profile(profile_name):
+        if not self.__probe_identity_matches_bound_account(
+            normalized_probe.get("accountId", "")
+        ):
             return None
-        if sanitize_profile_name(profile_name):
-            self.__set_profile_name(profile_name)
+        self.__bind_probe_identity(
+            account_id=normalized_probe.get("accountId", ""),
+            profile_name=normalized_probe.get("profileName", ""),
+        )
         captured_at = self.__now_iso()
         metric_blocks = normalized_probe.get("metricBlocks", [])
         metrics = extract_usage_metrics_from_semantic_blocks(metric_blocks)
@@ -4527,6 +4545,13 @@ class CodexUsageMonitor:
         self.__last_snapshot = snap
         self.__usage_history = self.__normalize_usage_history(raw_history)
         self.__set_profile_name(data.get("profile_name", ""))
+        raw_account_id = normalize_usage_value(data.get("account_id", ""))
+        if raw_account_id:
+            self.__account_id = raw_account_id
+        else:
+            # Older state files carry no account_id; rewrite once so identity
+            # binding is persisted for the next launch.
+            dirty = True
         raw_state = data.get("session_state", "")
         state = normalize_usage_value(raw_state)
         if state not in {"logged_in", "logged_out"}:
@@ -4554,6 +4579,7 @@ class CodexUsageMonitor:
             "snapshot_contract_version": USAGE_SNAPSHOT_CONTRACT_VERSION,
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
+            "account_id": str(self.__account_id or ""),
             "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),
             "auth_attention_required": bool(self.__auth_attention_required),
             "auth_attention_reason": str(self.__auth_attention_reason or ""),
