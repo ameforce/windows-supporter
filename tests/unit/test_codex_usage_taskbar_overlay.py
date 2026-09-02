@@ -3491,6 +3491,39 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertLessEqual(geometry["x"] + geometry["width"], 1280)
         self.assertGreaterEqual(geometry["width"], 344)
 
+    def test_bottom_taskbar_geometry_falls_back_to_left_slot_when_right_slot_cannot_fit(self):
+        # Display contract: a right slot narrower than the content width would
+        # silently hide the overlay; a left span that fits the full preferred
+        # width takes over instead.
+        geometry = calculate_taskbar_overlay_geometry(
+            1400,
+            600,
+            (0, 0, 1400, 560),
+            occupied_spans=[(0, 120), (620, 820), (1240, 1400)],
+            preferred_width=420,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["orientation"], "bottom")
+        self.assertLessEqual(
+            geometry["x"] + geometry["width"],
+            820,
+        )
+        self.assertEqual(geometry["width"], 420)
+        self.assertGreaterEqual(geometry["x"], 120)
+
+    def test_bottom_taskbar_geometry_keeps_right_slot_when_left_slot_also_cannot_fit(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            1400,
+            600,
+            (0, 0, 1400, 560),
+            occupied_spans=[(0, 120), (620, 820), (1240, 1400)],
+            preferred_width=900,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertGreaterEqual(geometry["x"], 820)
+
     def test_bottom_taskbar_geometry_uses_measured_mid_sized_right_slot(self):
         geometry = calculate_taskbar_overlay_geometry(
             2560,
@@ -3952,6 +3985,124 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             int(layout["progress_width"]),
             taskbar_overlay._METRIC_PROGRESS_MIN_WIDTH_PX,
         )
+
+    def test_credit_metric_descriptor_builds_display_when_balance_is_usable(self):
+        descriptor = taskbar_overlay._credit_metric_descriptor(
+            {"remaining_credit": "245"}
+        )
+
+        self.assertIsNotNone(descriptor)
+        self.assertEqual(descriptor["key"], "CR")
+        self.assertEqual(descriptor["value_text"], "$245")
+        self.assertIsNone(descriptor["percent"])
+
+    def test_credit_metric_descriptor_is_absent_without_usable_balance(self):
+        self.assertIsNone(taskbar_overlay._credit_metric_descriptor({}))
+        self.assertIsNone(
+            taskbar_overlay._credit_metric_descriptor({"remaining_credit": ""})
+        )
+        self.assertIsNone(
+            taskbar_overlay._credit_metric_descriptor({"remaining_credit": "0"})
+        )
+        self.assertIsNone(
+            taskbar_overlay._credit_metric_descriptor({"remaining_credit": "조회 불가"})
+        )
+
+    def test_credit_metric_descriptor_formats_fractional_and_thousands(self):
+        fractional = taskbar_overlay._credit_metric_descriptor(
+            {"remaining_credit": "$12.34"}
+        )
+        thousands = taskbar_overlay._credit_metric_descriptor(
+            {"remaining_credit": "1,540"}
+        )
+
+        self.assertEqual(fractional["value_text"], "$12.34")
+        self.assertEqual(thousands["value_text"], "$1,540")
+
+    def _credit_runtime(self, remaining_credit, *, with_metric_descriptors=False):
+        profile = {
+            "id": "profile_1",
+            "label": "Codex 1",
+            "provider": "codex",
+            "enabled": True,
+            "taskbar_selected": True,
+            "freshness": "fresh",
+            "provider_status": "ready",
+            "last_snapshot": {
+                "captured_at": "2026-09-02T12:00:00",
+                "five_hour_limit": "68% left",
+                "weekly_limit": "97%",
+                "remaining_credit": remaining_credit,
+            },
+        }
+        if with_metric_descriptors:
+            profile["metrics"] = [
+                {
+                    "key": "five_hour_limit",
+                    "metric_key": "five_hour_limit",
+                    "percent": 68,
+                    "value_text": "68%",
+                    "state": "ready",
+                }
+            ]
+        return {"enabled": True, "profiles": [profile]}
+
+    def test_overlay_model_appends_credit_metric_when_snapshot_reports_balance(self):
+        model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(
+            self._credit_runtime("245", with_metric_descriptors=True)
+        )
+
+        keys = [metric["key"] for metric in model["bars"][0]["metrics"]]
+        self.assertEqual(keys, ["five_hour_limit", "CR"])
+        credit_metric = model["bars"][0]["metrics"][1]
+        self.assertEqual(credit_metric["value_text"], "$245")
+
+    def test_overlay_model_does_not_exceed_two_metrics_and_keeps_limits_first(self):
+        model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(
+            self._credit_runtime("245")
+        )
+
+        keys = [metric["key"] for metric in model["bars"][0]["metrics"]]
+        self.assertEqual(keys[:2], ["5h", "7d"])
+        self.assertNotIn("CR", keys)
+
+    def test_overlay_model_omits_credit_when_snapshot_has_no_balance(self):
+        model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(
+            self._credit_runtime("", with_metric_descriptors=True)
+        )
+
+        keys = [metric["key"] for metric in model["bars"][0]["metrics"]]
+        self.assertEqual(keys, ["five_hour_limit"])
+
+    def test_overlay_model_appends_credit_when_provider_reports_single_limit(self):
+        runtime = self._credit_runtime("40.5")
+        runtime["profiles"][0]["provider"] = "cursor"
+        runtime["profiles"][0]["metrics"] = [
+            {
+                "key": "included_usage",
+                "metric_key": "included_usage",
+                "percent": 47,
+                "value_text": "47%",
+                "state": "ready",
+            }
+        ]
+        model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(runtime)
+
+        keys = [metric["key"] for metric in model["bars"][0]["metrics"]]
+        self.assertEqual(keys, ["included_usage", "CR"])
+
+    def test_draw_renders_credit_segment_with_short_label_and_amount(self):
+        runtime = self._credit_runtime("245", with_metric_descriptors=True)
+        model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(runtime)
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(dict(model, geometry={"width": 760, "height": 38}))
+
+        texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
+        self.assertIn("CR", texts)
+        self.assertIn("$245", texts)
 
     def test_overlay_badge_mode_resolves_full_or_short_from_row_layouts(self):
         metrics = self._row_badge_metrics()
