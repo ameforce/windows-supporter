@@ -784,6 +784,9 @@ def _metric_fits_badge_mode(
         has_reset_badge=has_reset_badge,
         progress_width=progress_width,
         badge_mode=mode,
+        value_width=_value_column_width_for_text(
+            str(metric_dict.get("value_text") or "--")
+        ),
     )
     progress_floor = (
         _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
@@ -928,6 +931,37 @@ def _metric_slot_key(metric: dict[str, Any]) -> str:
     return str(metric_dict.get("metric_key") or metric_dict.get("key") or "")
 
 
+_METRIC_TOOLTIP_NAMES = {
+    "five_hour_limit": "5시간 한도",
+    "weekly_limit": "주간 한도",
+    "credit": "크레딧",
+}
+
+
+def _build_metric_tooltip_text(metric: dict[str, Any], profile_label: str = "") -> str:
+    """Tier-2 detail for a hovered segment: the guidance (normal band +
+    transition time) lives here instead of being forced into a cramped
+    column."""
+    metric_dict = metric if isinstance(metric, dict) else {}
+    key = _metric_slot_key(metric_dict)
+    name = _METRIC_TOOLTIP_NAMES.get(key, str(metric_dict.get("key") or key))
+    head = f"{name} {metric_dict.get('value_text') or '--'}"
+    state = str(metric_dict.get("reset_badge_label") or "")
+    if state:
+        head += f" ({state})"
+    lines = [head]
+    reset_text = str(metric_dict.get("reset_text") or "")
+    if reset_text:
+        lines.append(f"리셋까지 {reset_text}")
+    guidance = str(metric_dict.get("normal_guidance_text") or "")
+    if guidance:
+        lines.append(f"정상 범위 {guidance}")
+    profile = str(profile_label or "").strip()
+    if profile:
+        lines.append(f"프로필: {profile}")
+    return "\n".join(lines)
+
+
 def _metric_slot_keys(rows_metrics: list[tuple[dict[str, Any], ...]]) -> list[str]:
     slots: list[str] = []
     for metrics in rows_metrics:
@@ -942,16 +976,32 @@ def _metric_slot_keys(rows_metrics: list[tuple[dict[str, Any], ...]]) -> list[st
 
 
 def _metric_countdown_min_width(metric: dict[str, Any]) -> int:
-    """Column width that keeps the metric's fixed countdown + percent with no
-    bar, badge, or guidance — the never-dropped minimum in a clamped slot."""
+    """Column width that keeps the metric's never-dropped minimum in a clamped
+    slot: fixed countdown shape + percent + the short state badge (the badge is
+    the only state carrier once the guidance has yielded). The bar and the
+    guidance suffix are what yield above this minimum."""
+    value_width = _value_column_width_for_text(
+        str(metric.get("value_text") or "--")
+    )
+    base = 14 + 3 + 0 + 3 + value_width + 2
     if _metric_slot_key(metric) == "credit":
-        return 14 + 3 + 0 + 3 + _VALUE_COLUMN_MAX_WIDTH_PX + 2
+        return base
     detail, _ = _metric_guidance_texts(metric)
     reset_part = str(detail or "").split(" | ")[0]
     reset_width = _reset_column_width_for_text(
         reset_part, metric_key=_metric_slot_key(metric)
     )
-    return 14 + 3 + 0 + 3 + _VALUE_COLUMN_MAX_WIDTH_PX + 4 + reset_width + 2
+    badge_label = str(
+        metric.get("reset_badge_short_label")
+        or metric.get("reset_badge_label")
+        or ""
+    )
+    badge_block = 0
+    if badge_label:
+        badge_block = (
+            _reset_badge_width_for_label(badge_label) + _RESET_BADGE_TIME_GAP_PX
+        )
+    return base + 4 + badge_block + reset_width
 
 
 def _metric_rows_layout_for_overlay_width(
@@ -1112,7 +1162,8 @@ def _metric_width_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
     # cache hitting across consecutive ticks.
     # The renderer draws `_metric_guidance_texts()` — the countdown joined with
     # the normal-band guidance — so the joined text, not the raw reset text,
-    # is what a reserved segment width must cover.
+    # is what a reserved segment width must cover. The masked value text rides
+    # along so the search measures the same percent column as the render path.
     detail_text, short_text = _metric_guidance_texts(metric_dict)
     return (
         str(metric_dict.get("metric_key") or ""),
@@ -1120,6 +1171,7 @@ def _metric_width_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
         re.sub(r"\d", "0", short_text),
         str(metric_dict.get("reset_badge_label") or ""),
         str(metric_dict.get("reset_badge_short_label") or ""),
+        re.sub(r"\d", "0", str(metric_dict.get("value_text") or "--")),
     )
 
 
@@ -1134,6 +1186,7 @@ def _required_metric_segment_width_cached(
         short_text,
         badge_label,
         badge_short_label,
+        value_text,
     ) = signature
     has_reset_badge = bool(badge_label or badge_short_label)
     has_reset_time = bool(detail_text or short_text)
@@ -1151,6 +1204,7 @@ def _required_metric_segment_width_cached(
             has_reset_badge=has_reset_badge,
             progress_width=_metric_progress_width_for_segment(candidate_width),
             badge_mode=mode,
+            value_width=_value_column_width_for_text(value_text),
         )
         if int(layout.get("progress_width") or 0) < _metric_required_progress_floor(
             metric_key
@@ -1242,6 +1296,7 @@ def _metric_from_width_signature(
         reset_short_text,
         badge_label,
         badge_short_label,
+        value_text,
     ) = signature
     return {
         "metric_key": metric_key,
@@ -1249,6 +1304,7 @@ def _metric_from_width_signature(
         "reset_short_text": reset_short_text,
         "reset_badge_label": badge_label,
         "reset_badge_short_label": badge_short_label,
+        "value_text": value_text,
     }
 
 
@@ -1445,6 +1501,11 @@ class CodexUsageTaskbarOverlay:
         self._window_visible = False
         self._active_taskbar_hwnd = 0
         self._native_owner_hwnd = 0
+        # Hover tooltip state (tier-2 metric detail).
+        self._metric_hit_rects: list[tuple[int, int, int, int, dict[str, Any], str]] = []
+        self._metric_tooltip = None
+        self._tooltip_after_id = None
+        self._hover_metric_ref = None
         return
 
     def refresh(self) -> bool:
@@ -2623,12 +2684,113 @@ class CodexUsageTaskbarOverlay:
         canvas.pack(fill="both", expand=True)
         self._window = window
         self._canvas = canvas
+        canvas.bind("<Motion>", self._on_canvas_motion, add="+")
+        canvas.bind("<Leave>", lambda _event: self._hide_metric_tooltip(), add="+")
         try:
             window.update_idletasks()
         except Exception:
             pass
         self._prepare_native_window(window)
         return window
+
+    def _pick_metric_hit(
+        self,
+        canvas_x: int,
+        canvas_y: int,
+    ) -> tuple[dict[str, Any], str] | None:
+        for x0, y0, x1, y1, metric, profile_label in self._metric_hit_rects:
+            if x0 <= canvas_x <= x1 and y0 <= canvas_y <= y1:
+                return metric, profile_label
+        return None
+
+    def _on_canvas_motion(self, event: Any) -> None:
+        hit = self._pick_metric_hit(int(getattr(event, "x", 0)), int(getattr(event, "y", 0)))
+        hover_ref = id(hit[0]) if hit is not None else None
+        if hover_ref == self._hover_metric_ref:
+            return
+        self._hide_metric_tooltip()
+        self._hover_metric_ref = hover_ref
+        if hit is None:
+            return
+        metric, profile_label = hit
+        after = getattr(self._root, "after", None)
+        if not callable(after):
+            return
+        x_root = int(getattr(event, "x_root", 0) or 0)
+        y_root = int(getattr(event, "y_root", 0) or 0)
+        self._tooltip_after_id = after(
+            350,
+            lambda: self._show_metric_tooltip(metric, profile_label, x_root, y_root),
+        )
+        return
+
+    def _hide_metric_tooltip(self) -> None:
+        cancel = getattr(self._root, "after_cancel", None)
+        if self._tooltip_after_id is not None and callable(cancel):
+            try:
+                cancel(self._tooltip_after_id)
+            except Exception:
+                pass
+        self._tooltip_after_id = None
+        self._hover_metric_ref = None
+        tooltip = self._metric_tooltip
+        if tooltip is not None:
+            self._metric_tooltip = None
+            try:
+                tooltip.destroy()
+            except Exception:
+                pass
+        return
+
+    def _show_metric_tooltip(
+        self,
+        metric: dict[str, Any],
+        profile_label: str,
+        x_root: int,
+        y_root: int,
+    ) -> None:
+        self._tooltip_after_id = None
+        if tk is None:
+            return
+        try:
+            tooltip = tk.Toplevel(self._root)
+        except Exception:
+            return
+        tooltip.overrideredirect(True)
+        try:
+            tooltip.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            tooltip.attributes("-alpha", 0.96)
+        except Exception:
+            pass
+        label = tk.Label(
+            tooltip,
+            text=_build_metric_tooltip_text(metric, profile_label),
+            justify="left",
+            bg="#1b1e24",
+            fg="#e5e7eb",
+            font=("Segoe UI", 8, "bold"),
+            padx=8,
+            pady=5,
+            wraplength=300,
+        )
+        label.pack()
+        tooltip.update_idletasks()
+        screen_width = max(1, int(tooltip.winfo_screenwidth()))
+        screen_height = max(1, int(tooltip.winfo_screenheight()))
+        width = max(1, int(tooltip.winfo_reqwidth()))
+        height = max(1, int(tooltip.winfo_reqheight()))
+        x = int(x_root) + 14
+        y = int(y_root) + 14
+        if x + width > screen_width - 8:
+            x = int(x_root) - width - 14
+        if y + height > screen_height - 8:
+            y = int(y_root) - height - 14
+        tooltip.wm_geometry(f"+{max(0, x)}+{max(0, y)}")
+        self._metric_tooltip = tooltip
+        return
 
     def _apply_geometry(self, window: Any, geometry: dict[str, int | str]) -> None:
         try:
@@ -2667,6 +2829,7 @@ class CodexUsageTaskbarOverlay:
         height = int(geometry.get("height", 38))
         bars = [bar for bar in model.get("bars", []) if isinstance(bar, dict)]
         canvas.delete("all")
+        self._metric_hit_rects = []
         canvas.create_rectangle(0, 0, width, height, fill="#16181d", outline="#343946")
         if not bars:
             return
@@ -2729,6 +2892,7 @@ class CodexUsageTaskbarOverlay:
                     row_height,
                     progress_width=segment_progress,
                     badge_mode=overlay_badge_mode,
+                    profile_label=str(bar.get("label") or ""),
                 )
         return
 
@@ -2742,6 +2906,7 @@ class CodexUsageTaskbarOverlay:
         row_height: int,
         progress_width: int | None = None,
         badge_mode: str = "any",
+        profile_label: str = "",
     ) -> None:
         center_y = y + row_height // 2
         label = str(metric.get("key") or "")
@@ -2772,6 +2937,7 @@ class CodexUsageTaskbarOverlay:
             has_reset_badge=has_reset_badge,
             progress_width=progress_width,
             badge_mode=badge_mode,
+            value_width=_value_column_width_for_text(value_text),
         )
         bar_x = x + int(layout["bar_x"])
         bar_width = int(layout["progress_width"])
@@ -2885,6 +3051,16 @@ class CodexUsageTaskbarOverlay:
                 center_y=center_y,
                 reset_color=reset_color,
             )
+        self._metric_hit_rects.append(
+            (
+                int(x),
+                int(y),
+                int(x + width),
+                int(y + row_height),
+                metric,
+                str(profile_label or ""),
+            )
+        )
         return
 
     def _prepare_native_window(self, window: Any) -> None:
@@ -5657,10 +5833,16 @@ def _fit_metric_segment_layout(
     has_reset_badge: bool = False,
     progress_width: int | None = None,
     badge_mode: str = "any",
+    value_width: int | None = None,
 ) -> dict[str, Any]:
     segment_width = max(0, int(width))
     label_width = 14
-    value_width = _VALUE_COLUMN_MAX_WIDTH_PX
+    # Callers that know the metric pass the measured percent width ("44%" is
+    # 23px, not the 28px column maximum); the slack funds the reset badge in
+    # cramped columns.
+    value_width = (
+        _VALUE_COLUMN_MAX_WIDTH_PX if value_width is None else max(0, int(value_width))
+    )
     label_to_bar_gap = 3
     bar_to_value_gap = 3
     reset_gap = 4
