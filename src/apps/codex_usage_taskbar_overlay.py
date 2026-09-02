@@ -191,6 +191,10 @@ _OVERLAY_RIGHT_PADDING_PX = 10
 _METRIC_PROGRESS_MIN_WIDTH_PX = 28
 _METRIC_PROGRESS_PREFERRED_WIDTH_PX = 36
 _METRIC_PROGRESS_MAX_WIDTH_PX = 48
+# Display contract: the % value and reset text must stay visible even when the
+# taskbar slot is narrow. The progress bar is the last element allowed to
+# shrink, down to this text-priority floor, before any text is omitted.
+_METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX = 14
 _METRIC_SEGMENT_GAP_COMPACT_PX = 6
 _METRIC_SEGMENT_GAP_WIDE_PX = 12
 _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX = 64
@@ -738,7 +742,7 @@ def _metric_fits_badge_mode(
         progress_width=progress_width,
         badge_mode=mode,
     )
-    if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_MIN_WIDTH_PX:
+    if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX:
         return False
     badge_fit = layout.get("badge_fit")
     if not isinstance(badge_fit, dict):
@@ -868,7 +872,7 @@ def _required_metric_segment_width(
             progress_width=_metric_progress_width_for_segment(candidate_width),
             badge_mode=mode,
         )
-        if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_MIN_WIDTH_PX:
+        if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX:
             continue
         badge_fit = layout.get("badge_fit")
         if not isinstance(badge_fit, dict):
@@ -5292,7 +5296,10 @@ def _fit_metric_segment_layout(
     )
     minimum_progress_width = max(
         6,
-        min(_METRIC_PROGRESS_MIN_WIDTH_PX, int(max_progress_width)),
+        min(
+            _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+            int(max_progress_width),
+        ),
     )
 
     hidden_badge = {
@@ -5458,7 +5465,11 @@ def _fit_reset_badge_for_space(
     candidates: list[tuple[str, str, int, str, int]] = []
     allow_full_badge = normalized_badge_mode in {"any", "full"}
     allow_short_badge = normalized_badge_mode in {"any", "short"}
-    force_visible_badge = normalized_badge_mode in {"full", "short"}
+    # Display contract: the reset countdown outranks the reset badge. In short
+    # mode the badge becomes optional so the time text wins when space is
+    # tight; the metric identity ("5h"/"7d") is already drawn at the segment
+    # start, so a hidden badge never loses the metric.
+    force_visible_badge = normalized_badge_mode == "full"
 
     def add_candidate(
         variant: str,
