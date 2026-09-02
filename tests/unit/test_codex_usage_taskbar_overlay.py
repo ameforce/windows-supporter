@@ -1692,11 +1692,12 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
         metric = {
             "key": "7d",
+            "metric_key": "weekly_limit",
             "percent": 97,
             "value_text": "97%",
             "color": "#22c55e",
             "reset_text": "06d 20h 00m 00s",
-            "reset_short_text": "6d 20h",
+            "reset_short_text": "06d 20h 00m 00s",
             "reset_color": "#f59e0b",
             "reset_marker": "↑",
             "reset_badge_label": "남음",
@@ -1739,10 +1740,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(arrow_only, [])
         track_width = int(track_rect[1][2]) - int(track_rect[1][0])
         self.assertLess(track_width, taskbar_overlay._METRIC_PROGRESS_PREFERRED_WIDTH_PX)
-        self.assertGreaterEqual(
-            track_width,
-            taskbar_overlay._METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-        )
+        # The bar yields all the way to zero before the countdown drops, so at
+        # this width the track can be a thin stub.
+        self.assertGreaterEqual(track_width, 0)
 
     def test_draw_metric_segment_shrinks_progress_to_keep_badge_with_reset_time(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -2242,8 +2242,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "percent": 49,
             "value_text": "49%",
             "color": "#f59e0b",
-            "reset_text": "00d 06d 06h 51m 00s",
-            "reset_short_text": "00d 06d 06h 51m 00s",
+            "reset_text": "00d 06h 51m 00s",
+            "reset_short_text": "00d 06h 51m 00s",
             "reset_badge_label": "부족",
             "reset_badge_short_label": "부",
             "normal_guidance_text": "N 90% / 2d 20h",
@@ -2271,6 +2271,74 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(top_progress, bottom_7d_progress)
         # The 5H column exists in the grid even though the top row has no 5H.
         self.assertGreater(bottom_7d_offset, 0)
+
+    def test_clamped_rows_keep_fixed_countdowns_and_percent(self):
+        # Regression for the live defect: when the taskbar's free slot clamps
+        # the overlay (observed 456px), the shared columns keep every metric's
+        # fixed countdown shape + percent; the bar, badge, and guidance yield
+        # in that order instead of the countdown disappearing.
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 57,
+            "value_text": "57%",
+            "color": "#22c55e",
+            "reset_text": "00h 02h 54m 00s",
+            "reset_short_text": "00h 02h 54m 00s",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 59~62% / 27m",
+            "normal_guidance_short_text": "N 59~62% / 27m",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 46,
+            "value_text": "46%",
+            "color": "#f59e0b",
+            "reset_text": "00d 06h 51m 00s",
+            "reset_short_text": "00d 06h 51m 00s",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 90% / 2d 20h",
+            "normal_guidance_short_text": "N 90% / 2d 20h",
+        }
+        credit = {
+            "key": "CR",
+            "metric_key": "credit",
+            "percent": None,
+            "value_text": "227",
+        }
+        rows = [(weekly,), (five_hour, weekly, credit)]
+
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(456, rows)
+
+        for layout in layouts:
+            for index, metric in enumerate(layout.visible_metrics):
+                _offset, segment_width, segment_progress = layout.segment_geometry(index)
+                detail, short = taskbar_overlay._metric_guidance_texts(metric)
+                fit = taskbar_overlay._fit_metric_segment_layout(
+                    segment_width,
+                    detail,
+                    short,
+                    badge_label=str(metric.get("reset_badge_label") or ""),
+                    badge_short_label=str(metric.get("reset_badge_short_label") or ""),
+                    metric_key=str(metric.get("metric_key") or ""),
+                    has_reset_badge=bool(
+                        metric.get("reset_badge_label")
+                        or metric.get("reset_badge_short_label")
+                    ),
+                    progress_width=segment_progress,
+                    badge_mode="short",
+                )
+                if metric.get("metric_key") == "credit":
+                    continue
+                time_text = str(
+                    fit["badge_fit"]["time_text"] or fit["display_reset_text"] or ""
+                )
+                reset_part = detail.split(" | ")[0]
+                self.assertEqual(time_text, reset_part)
+                self.assertNotIn("|", time_text)
 
     def test_format_reset_remaining_detail_fixed_shapes_per_metric(self):
         format_detail = taskbar_overlay._format_reset_remaining_detail
