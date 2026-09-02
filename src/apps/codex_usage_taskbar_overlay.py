@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Callable
 
 from src.apps.codex_usage_taskbar_targets import (
@@ -55,7 +56,11 @@ _GEOMETRY_COORDINATE_BASIS = "physical_px"
 _EMPTY_SLOT_PADDING_PX = 8
 _MIN_EMPTY_SLOT_WIDTH_PX = 300
 _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX = 176
-_TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX = 560
+# Matches the default geometry width cap: the preferred-width search must be
+# able to express the width a 3-slot row actually needs (badge + countdown +
+# guidance + preferred bar per segment) instead of silently clamping and
+# dropping text at render time.
+_TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX = 900
 # Wide taskbar slots should breathe up to the same target used by the default overlay.
 _WIDE_EMPTY_SLOT_TARGET_WIDTH_PX = int(_DEFAULT_GEOMETRY["width"])
 _TASKBAR_SAMPLE_STEP_PX = 4
@@ -195,6 +200,19 @@ _METRIC_PROGRESS_MAX_WIDTH_PX = 48
 # taskbar slot is narrow. The progress bar is the last element allowed to
 # shrink, down to this text-priority floor, before any text is omitted.
 _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX = 14
+# Required-width reservation floor: per-metric reserved widths must leave room
+# for the preferred bar so the min-fit overlay never renders with a shrunken
+# bar while free width was still available. The cramped fallback keeps using
+# the lower text-priority floor above.
+_METRIC_REQUIRED_PROGRESS_FLOOR_PX = _METRIC_PROGRESS_PREFERRED_WIDTH_PX
+
+
+def _metric_required_progress_floor(metric_key: str) -> int:
+    # Credit never draws a progress bar, so reserving bar width for it would
+    # only inflate its segment and starve the metrics that do render one.
+    if str(metric_key or "") == "credit":
+        return 0
+    return _METRIC_REQUIRED_PROGRESS_FLOOR_PX
 # Below this equal-split segment width, per-metric reservation is impossible;
 # the compact shrink path already runs inside each segment.
 _MIN_COMPACT_SEGMENT_FOR_TEXT_PX = 140
@@ -741,6 +759,8 @@ def _metric_fits_badge_mode(
     segment_width: int,
     progress_width: int,
     badge_mode: str,
+    *,
+    min_progress_px: int | None = None,
 ) -> bool:
     metric_dict = metric if isinstance(metric, dict) else {}
     mode = _normalized_badge_mode(badge_mode)
@@ -763,7 +783,15 @@ def _metric_fits_badge_mode(
         progress_width=progress_width,
         badge_mode=mode,
     )
-    if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX:
+    progress_floor = (
+        _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
+        if min_progress_px is None
+        else int(min_progress_px)
+    )
+    if str(metric_key or "") == "credit":
+        # Credit draws no bar; only the badge/text contracts apply.
+        progress_floor = 0
+    if int(layout.get("progress_width") or 0) < progress_floor:
         return False
     badge_fit = layout.get("badge_fit")
     if not isinstance(badge_fit, dict):
@@ -793,6 +821,8 @@ def _row_fits_badge_mode(
     segment_width: int,
     progress_width: int,
     badge_mode: str,
+    *,
+    min_progress_px: int | None = None,
 ) -> bool:
     visible_metrics = tuple(metric for metric in metrics[:3] if isinstance(metric, dict))
     if not visible_metrics:
@@ -803,6 +833,7 @@ def _row_fits_badge_mode(
             int(segment_width),
             int(progress_width),
             badge_mode,
+            min_progress_px=min_progress_px,
         )
         for metric in visible_metrics
     )
@@ -811,6 +842,8 @@ def _row_fits_badge_mode(
 def _row_fits_badge_mode_for_layout(
     row_layout: _MetricRowLayout,
     badge_mode: str,
+    *,
+    min_progress_px: int | None = None,
 ) -> bool:
     visible_metrics = tuple(
         metric for metric in row_layout.visible_metrics[:3] if isinstance(metric, dict)
@@ -826,6 +859,7 @@ def _row_fits_badge_mode_for_layout(
             int(segment_width_value),
             int(segment_progress),
             badge_mode,
+            min_progress_px=min_progress_px,
         ):
             return False
     return True
@@ -835,14 +869,27 @@ def _row_fits_badge_mode_for_overlay_width(
     width: int,
     metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     badge_mode: str,
+    *,
+    min_progress_px: int | None = None,
 ) -> bool:
     row_layout = _metric_row_layout_for_overlay_width(width, metrics)
-    return _row_fits_badge_mode_for_layout(row_layout, badge_mode)
+    return _row_fits_badge_mode_for_layout(
+        row_layout,
+        badge_mode,
+        min_progress_px=min_progress_px,
+    )
 
 
 def _resolve_overlay_badge_mode(row_layouts: tuple[_MetricRowLayout, ...]) -> str:
     if all(
-        _row_fits_badge_mode_for_layout(row_layout, "full")
+        _row_fits_badge_mode_for_layout(
+            row_layout,
+            "full",
+            # Same floor the preferred-width search accepts: a row that only
+            # fits by squeezing the bar below its preferred width compacts its
+            # badges first, which frees width for the countdown text.
+            min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
+        )
         for row_layout in row_layouts
     ):
         return "full"
@@ -961,14 +1008,41 @@ def _required_metric_segment_width(
     *,
     badge_mode: str = "any",
 ) -> int:
+    return int(_required_metric_segment_width_cached(_metric_width_signature(metric), badge_mode))
+
+
+def _metric_width_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
     metric_dict = metric if isinstance(metric, dict) else {}
+    # Countdown digits tick every second; only the text *shape* (length and
+    # non-digit characters) affects layout width, so mask digits to keep the
+    # cache hitting across consecutive ticks.
+    # The renderer draws `_metric_guidance_texts()` — the countdown joined with
+    # the normal-band guidance — so the joined text, not the raw reset text,
+    # is what a reserved segment width must cover.
     detail_text, short_text = _metric_guidance_texts(metric_dict)
-    badge_label = str(metric_dict.get("reset_badge_label") or "")
-    badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
+    return (
+        str(metric_dict.get("metric_key") or ""),
+        re.sub(r"\d", "0", detail_text),
+        re.sub(r"\d", "0", short_text),
+        str(metric_dict.get("reset_badge_label") or ""),
+        str(metric_dict.get("reset_badge_short_label") or ""),
+    )
+
+
+@lru_cache(maxsize=512)
+def _required_metric_segment_width_cached(
+    signature: tuple[Any, ...],
+    badge_mode: str,
+) -> int:
+    (
+        metric_key,
+        detail_text,
+        short_text,
+        badge_label,
+        badge_short_label,
+    ) = signature
     has_reset_badge = bool(badge_label or badge_short_label)
     has_reset_time = bool(detail_text or short_text)
-    metric_key = str(metric_dict.get("metric_key") or "")
-    reset_marker = str(metric_dict.get("reset_marker") or "")
     mode = _normalized_badge_mode(badge_mode)
 
     for candidate_width in range(48, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX + 1):
@@ -979,12 +1053,14 @@ def _required_metric_segment_width(
             badge_label=badge_label,
             badge_short_label=badge_short_label,
             metric_key=metric_key,
-            reset_marker=reset_marker,
+            reset_marker="",
             has_reset_badge=has_reset_badge,
             progress_width=_metric_progress_width_for_segment(candidate_width),
             badge_mode=mode,
         )
-        if int(layout.get("progress_width") or 0) < _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX:
+        if int(layout.get("progress_width") or 0) < _metric_required_progress_floor(
+            metric_key
+        ):
             continue
         badge_fit = layout.get("badge_fit")
         if not isinstance(badge_fit, dict):
@@ -1013,38 +1089,96 @@ def _required_metric_segment_width(
     return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
 
 
+@lru_cache(maxsize=512)
+def _preferred_width_for_rows_cached(
+    rows_signature: tuple[tuple[tuple[Any, ...], ...], ...],
+) -> int:
+    rows = tuple(
+        tuple(_metric_from_width_signature(sig) for sig in row)
+        for row in rows_signature
+    )
+
+    def fits(candidate_width: int, badge_mode: str) -> bool:
+        return all(
+            _row_fits_badge_mode_for_overlay_width(
+                candidate_width,
+                visible_metrics,
+                badge_mode,
+                # Accept a candidate width only when the bar keeps its
+                # preferred width too — otherwise the min-fit search would
+                # stop at a uniform split that squeezes the bar to the
+                # cramped floor even though a wider overlay fits everything.
+                min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
+            )
+            for visible_metrics in rows
+        )
+
+    # The 300..900 sweep is too wide for a per-second layout budget when a
+    # signature change busts the cache, so scan a coarse grid first and refine
+    # within the winning step. A pass region narrower than the coarse step may
+    # be skipped and land on a slightly wider width — cosmetic, never a fit
+    # regression, because every returned candidate is verified the same way.
+    coarse_step = 8
+    for badge_mode in ("full", "short"):
+        coarse_hit = None
+        for candidate_width in range(
+            _MIN_EMPTY_SLOT_WIDTH_PX,
+            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX + 1,
+            coarse_step,
+        ):
+            if fits(candidate_width, badge_mode):
+                coarse_hit = candidate_width
+                break
+        if coarse_hit is None:
+            continue
+        refine_start = max(_MIN_EMPTY_SLOT_WIDTH_PX, coarse_hit - coarse_step + 1)
+        for candidate_width in range(refine_start, coarse_hit + 1):
+            if fits(candidate_width, badge_mode):
+                return int(candidate_width)
+        return int(coarse_hit)
+    return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
+
+
+def _metric_from_width_signature(
+    signature: tuple[Any, ...],
+) -> dict[str, Any]:
+    (
+        metric_key,
+        reset_text,
+        reset_short_text,
+        badge_label,
+        badge_short_label,
+    ) = signature
+    return {
+        "metric_key": metric_key,
+        "reset_text": reset_text,
+        "reset_short_text": reset_short_text,
+        "reset_badge_label": badge_label,
+        "reset_badge_short_label": badge_short_label,
+    }
+
+
 def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | None:
     if not isinstance(model, dict) or not bool(model.get("visible")):
         return None
 
-    rows: list[tuple[dict[str, Any], ...]] = []
+    rows: list[tuple[tuple[Any, ...], ...]] = []
     bars = model.get("bars")
     if not isinstance(bars, list):
         return None
     for bar in bars[:2]:
         if not isinstance(bar, dict) or not bool(bar.get("enabled", True)):
             continue
-        visible_metrics = _visible_metrics_for_taskbar_bar(bar)
-        rows.append(visible_metrics)
+        rows.append(
+            tuple(
+                _metric_width_signature(metric)
+                for metric in _visible_metrics_for_taskbar_bar(bar)
+            )
+        )
 
     if not rows:
         return None
-
-    for badge_mode in ("full", "short"):
-        for candidate_width in range(
-            _MIN_EMPTY_SLOT_WIDTH_PX,
-            _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX + 1,
-        ):
-            if all(
-                _row_fits_badge_mode_for_overlay_width(
-                    candidate_width,
-                    visible_metrics,
-                    badge_mode,
-                )
-                for visible_metrics in rows
-            ):
-                return int(candidate_width)
-    return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
+    return _preferred_width_for_rows_cached(tuple(rows))
 
 
 def _render_signature_value(value: Any) -> Any:
@@ -5084,13 +5218,23 @@ def _build_normal_guidance(
     )
     remaining_percent = max(0, min(100, int(current_percent)))
     normal_transition_seconds: int | None = None
+    transition_text = ""
     if remaining_percent < normal_min_percent:
         direction = _RESET_DIRECTION_SHORTAGE
         transition_seconds = remaining_seconds - (
             float(remaining_percent) / 100.0 * float(window_seconds)
         )
         normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
-        transition_text = _format_guidance_duration(normal_transition_seconds)
+        # When the burn-rate projection lands on the reset boundary itself, the
+        # countdown rendered next to the guidance already shows that time; a
+        # second copy adds width without information.
+        transition_matches_reset = (
+            abs(transition_seconds - remaining_seconds) <= 60.0
+        )
+        if not transition_matches_reset:
+            transition_text = _format_guidance_duration(
+                normal_transition_seconds
+            )
     elif remaining_percent > normal_max_percent:
         direction = _RESET_DIRECTION_SURPLUS
     else:
@@ -5101,7 +5245,7 @@ def _build_normal_guidance(
         if normal_min_percent == normal_max_percent
         else f"{normal_min_percent}~{normal_max_percent}%"
     )
-    if direction == _RESET_DIRECTION_SHORTAGE:
+    if direction == _RESET_DIRECTION_SHORTAGE and transition_text:
         text = f"N {range_text} / {transition_text}"
         short_text = text
     else:
@@ -5228,7 +5372,11 @@ def _build_reset_info(
     precision = str(reset_precision or "").strip().lower()
     if precision == "date":
         days = max(0, (parsed.date() - current.date()).days)
-        text = f"{days:02d}d 00h 00m 00s"
+        text = _format_reset_remaining_detail(
+            days * 86400,
+            metric_key=metric_key,
+            reset_precision=precision,
+        )
         direction = _reset_action_direction(metric_key, percent, days * 86400)
         profile = _reset_direction_profile(direction)
         return {
@@ -5333,11 +5481,24 @@ def _format_reset_remaining_detail(
     _ = metric_key
     _ = reset_precision
     seconds = max(0, int(seconds))
-    days = int(seconds // 86400)
-    hours = int((seconds % 86400) // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    return f"{days:02d}d {hours:02d}h {minutes:02d}m {secs:02d}s"
+    # Compact countdown contract: zero padding and the second cadence above the
+    # final hour are the noise, the minutes are information. A day-scale reset
+    # reads "4d 10h 3m" instead of "04d 10h 03m 58s" and a final-hour reset
+    # keeps its second cadence. Exact units collapse ("45m", "6h", "6d 20h").
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        minutes, secs = divmod(seconds, 60)
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    hours, minutes = divmod(seconds // 60, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        if minutes:
+            return f"{days}d {hours}h {minutes}m"
+        if hours:
+            return f"{days}d {hours}h"
+        return f"{days}d"
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
 
 def _format_reset_remaining_compact(
