@@ -941,6 +941,19 @@ def _metric_slot_keys(rows_metrics: list[tuple[dict[str, Any], ...]]) -> list[st
     return slots
 
 
+def _metric_countdown_min_width(metric: dict[str, Any]) -> int:
+    """Column width that keeps the metric's fixed countdown + percent with no
+    bar, badge, or guidance — the never-dropped minimum in a clamped slot."""
+    if _metric_slot_key(metric) == "credit":
+        return 14 + 3 + 0 + 3 + _VALUE_COLUMN_MAX_WIDTH_PX + 2
+    detail, _ = _metric_guidance_texts(metric)
+    reset_part = str(detail or "").split(" | ")[0]
+    reset_width = _reset_column_width_for_text(
+        reset_part, metric_key=_metric_slot_key(metric)
+    )
+    return 14 + 3 + 0 + 3 + _VALUE_COLUMN_MAX_WIDTH_PX + 4 + reset_width + 2
+
+
 def _metric_rows_layout_for_overlay_width(
     width: int,
     rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
@@ -997,29 +1010,54 @@ def _metric_rows_layout_for_overlay_width(
                 )
             )
     else:
-        # Degraded fallback: equal split across the shared columns; the render
-        # fit then drops text inside each column the same way on every row.
-        equal_width = _metric_segment_width_for_metrics_width(
-            metrics_width, counts, segment_gap
-        )
-        fits = all(
-            _metric_fits_badge_mode(
-                metric,
-                equal_width,
-                _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-                "short",
-            )
-            for metrics in rows_metrics
-            for metric in metrics
-        )
+        # Cramped fallback: each shared column first keeps the width that
+        # preserves its fixed countdown + percent (bar, badge, and guidance
+        # yield first); any leftover widens the columns so the render fit can
+        # re-add those elements as space allows.
+        min_by_slot: dict[str, int] = {}
         for key in slot_keys:
-            column_widths[key] = equal_width
-        if fits or equal_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
+            for metrics in rows_metrics:
+                for metric in metrics:
+                    if _metric_slot_key(metric) == key:
+                        min_by_slot[key] = _metric_countdown_min_width(metric)
+                        break
+                if key in min_by_slot:
+                    break
+        total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
+        if counts and total_min <= metrics_width:
+            extra = (metrics_width - total_min) // counts
             for key in slot_keys:
-                column_progresses[key] = _metric_progress_width_for_segment(equal_width)
+                column_width = min_by_slot[key] + extra
+                column_widths[key] = column_width
+                column_progresses[key] = min(
+                    _metric_progress_width_for_segment(column_width),
+                    _METRIC_PROGRESS_MAX_WIDTH_PX,
+                )
         else:
+            # Equal split as a last resort: even the countdown minimums do not
+            # fit, so the render fit drops text inside each column the same
+            # way on every row.
+            equal_width = _metric_segment_width_for_metrics_width(
+                metrics_width, counts, segment_gap
+            )
+            fits = all(
+                _metric_fits_badge_mode(
+                    metric,
+                    equal_width,
+                    _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+                    "short",
+                )
+                for metrics in rows_metrics
+                for metric in metrics
+            )
             for key in slot_keys:
-                column_progresses[key] = _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
+                column_widths[key] = equal_width
+            if fits or equal_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
+                for key in slot_keys:
+                    column_progresses[key] = _metric_progress_width_for_segment(equal_width)
+            else:
+                for key in slot_keys:
+                    column_progresses[key] = _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
 
     offsets_by_slot: dict[str, int] = {}
     cursor = 0
@@ -2765,7 +2803,7 @@ class CodexUsageTaskbarOverlay:
             font=("Segoe UI", 7, "bold"),
             text=label,
         )
-        if not is_credit_metric:
+        if not is_credit_metric and bar_width > 0:
             canvas.create_rectangle(
                 bar_x,
                 bar_y,
@@ -5596,6 +5634,11 @@ def _display_reset_text_for_space(
             candidates.append(detail)
         if short and short != detail:
             candidates.append(short)
+    # Reset-only fallback: the countdown keeps its fixed shape and the
+    # guidance suffix is what yields when the column is cramped.
+    reset_only = detail.split(" | ")[0] if detail else ""
+    if reset_only and reset_only != detail:
+        candidates.append(reset_only)
     for text in candidates:
         if _reset_column_width_for_text(text, metric_key=metric_key) <= int(available_px):
             return text
@@ -5640,13 +5683,10 @@ def _fit_metric_segment_layout(
             _METRIC_PROGRESS_MAX_WIDTH_PX,
         ),
     )
-    minimum_progress_width = max(
-        6,
-        min(
-            _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-            int(max_progress_width),
-        ),
-    )
+    # The bar yields all the way to zero before any countdown text drops:
+    # progress candidates below the text-priority floor only win when the
+    # higher candidates cannot keep the countdown, i.e. in clamped slots.
+    minimum_progress_width = 0
 
     hidden_badge = {
         "badge_visible": False,
@@ -5669,7 +5709,7 @@ def _fit_metric_segment_layout(
         progress: int,
         badge_fit: dict[str, Any],
         display_text: str,
-    ) -> tuple[int, int, int, int, int]:
+    ) -> tuple[int, ...]:
         time_text = str(badge_fit.get("time_text") or display_text or "")
         badge_text = str(badge_fit.get("badge_label") or "")
         time_quality = 0
@@ -5678,8 +5718,10 @@ def _fit_metric_segment_layout(
         badge_quality = 0
         if bool(badge_fit.get("badge_visible")):
             badge_quality = 2 if badge_text == full_badge_label else 1
+        # Degradation priority: countdown > guidance > badge > bar width.
         return (
             1 if time_text else 0,
+            1 if "|" in time_text else 0,
             1 if time_text and badge_quality else 0,
             badge_quality,
             time_quality,
@@ -5880,6 +5922,31 @@ def _fit_reset_badge_for_space(
             add_candidate("time_detail", "", 0, detail, detail_width)
         if short and short != detail:
             add_candidate("time_short", "", 0, short, short_width)
+        # Reset-only variants: when even the joined countdown|guidance text
+        # cannot fit, the fixed countdown shape survives and the guidance
+        # suffix is the part that yields.
+        reset_only = detail.split(" | ")[0] if detail else ""
+        if reset_only and reset_only != detail:
+            reset_only_width = _reset_column_width_for_text(
+                reset_only, metric_key=metric_key
+            )
+            if allow_full_badge:
+                add_candidate(
+                    "badge_reset_only",
+                    full_label,
+                    full_badge_width,
+                    reset_only,
+                    full_badge_width + _RESET_BADGE_TIME_GAP_PX + reset_only_width,
+                )
+            if allow_short_badge and compact_label:
+                add_candidate(
+                    "badge_reset_only_short",
+                    compact_label,
+                    short_badge_width,
+                    reset_only,
+                    short_badge_width + _RESET_BADGE_TIME_GAP_PX + reset_only_width,
+                )
+            add_candidate("time_reset_only", "", 0, reset_only, reset_only_width)
         if allow_full_badge:
             add_candidate("badge_only", full_label, full_badge_width, "", full_badge_width)
         if allow_short_badge and compact_label:
