@@ -318,11 +318,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(weekly_metric["normal_max_percent"], 61)
         self.assertEqual(
             weekly_metric["normal_guidance_text"],
-            "N 58~61% / 00d 12h 00m",
+            "N 58~61% / 12h",
         )
         self.assertEqual(
             weekly_metric["normal_guidance_short_text"],
-            "N 58~61% / 00d 12h 00m",
+            "N 58~61% / 12h",
         )
         self.assertEqual(weekly_metric["normal_transition_seconds"], 12 * 60 * 60)
         self.assertEqual(weekly_metric["reset_direction"], "shortage")
@@ -347,7 +347,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             with_five_hour["bars"][0]["metrics"][0]["normal_guidance_text"],
-            "N 60~64% / 00d 00h 30m",
+            "N 60~64% / 30m",
         )
 
     def test_codex_guidance_collapses_a_single_percent_normal_target(self):
@@ -385,7 +385,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(metric["normal_max_percent"], 88)
         self.assertEqual(
             metric["normal_guidance_text"],
-            "N 88% / 00d 09h 15m",
+            "N 88% / 9h 15m",
         )
 
     def test_datetime_precision_uses_hour_minute_countdown_within_same_day(self):
@@ -833,7 +833,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             first_metrics[0]["normal_guidance_text"],
-            "N 37~43% / 00d 00h 20m",
+            "N 37~43% / 20m",
         )
 
         first_metrics = second_model["bars"][0]["metrics"]
@@ -2004,8 +2004,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "percent": 100,
             "value_text": "100%",
             "color": "#22c55e",
-            "reset_text": "04d 03h 49m 00s",
-            "reset_short_text": "04d 03h 49m 00s",
+            "reset_text": "4d 3h 49m",
+            "reset_short_text": "4d 3h 49m",
             "reset_color": "#94a3b8",
         }
 
@@ -2020,7 +2020,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "100%"
         ][0]
         reset_text = [
-            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "04d 03h 49m 00s"
+            op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "4d 3h 49m"
         ][0]
 
         self.assertGreaterEqual(value_text[1][0] - track_rect[1][2], 30)
@@ -2036,10 +2036,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "percent": 50,
             "value_text": "50%",
             "color": "#f59e0b",
-            "reset_text": "04d 00h 00m 00s",
-            "reset_short_text": "04d 00h 00m 00s",
-            "normal_guidance_text": "N 58~61% / 00d 12h 00m",
-            "normal_guidance_short_text": "N 58~61% / 00d 12h 00m",
+            "reset_text": "4d",
+            "reset_short_text": "4d",
+            "normal_guidance_text": "N 58~61% / 12h",
+            "normal_guidance_short_text": "N 58~61% / 12h",
             "reset_color": "#ef4444",
         }
 
@@ -2051,7 +2051,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             if op[0] == "text"
         ]
         reset_op = [
-            op for op in drawn_text_ops if op[2].get("text") == "04d 00h 00m 00s"
+            op for op in drawn_text_ops if op[2].get("text") == "4d"
         ][0]
         separator_op = [
             op for op in drawn_text_ops if op[2].get("text") == "|"
@@ -2059,7 +2059,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         guidance_op = [
             op
             for op in drawn_text_ops
-            if op[2].get("text") == "N 58~61% / 00d 12h 00m"
+            if op[2].get("text") == "N 58~61% / 12h"
         ][0]
 
         self.assertEqual(reset_op[2].get("fill"), "#ef4444")
@@ -2084,21 +2084,21 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
     def test_metric_guidance_keeps_raw_reset_format_and_pipe_separator(self):
         metric = {
-            "reset_text": "04d 03h 49m 00s",
-            "reset_short_text": "04d 03h 49m 00s",
-            "normal_guidance_text": "N 87% / 00d 09h 15m",
-            "normal_guidance_short_text": "N 87% / 00d 09h 15m",
+            "reset_text": "4d 3h 49m",
+            "reset_short_text": "4d 3h 49m",
+            "normal_guidance_text": "N 87% / 9h 15m",
+            "normal_guidance_short_text": "N 87% / 9h 15m",
         }
 
         detail, short = taskbar_overlay._metric_guidance_texts(metric)
 
         self.assertEqual(
             detail,
-            "04d 03h 49m 00s | N 87% / 00d 09h 15m",
+            "4d 3h 49m | N 87% / 9h 15m",
         )
         self.assertEqual(
             short,
-            "04d 03h 49m 00s | N 87% / 00d 09h 15m",
+            "4d 3h 49m | N 87% / 9h 15m",
         )
 
     def test_metric_layout_reserves_right_breathing_room(self):
@@ -2107,8 +2107,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             (
                 {
                     "metric_key": "weekly_limit",
-                    "reset_text": "04d 03h 49m 00s",
-                    "normal_guidance_text": "N 87% / 00d 09h 15m",
+                    "reset_text": "4d 3h 49m",
+                    "normal_guidance_text": "N 87% / 9h 15m",
                 },
             ),
         )
@@ -4052,7 +4052,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertIsNotNone(descriptor)
         self.assertEqual(descriptor["key"], "CR")
-        self.assertEqual(descriptor["value_text"], "$245")
+        self.assertEqual(descriptor["value_text"], "245")
         self.assertIsNone(descriptor["percent"])
 
     def test_credit_metric_descriptor_is_absent_without_usable_balance(self):
@@ -4075,8 +4075,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             {"remaining_credit": "1,540"}
         )
 
-        self.assertEqual(fractional["value_text"], "$12.34")
-        self.assertEqual(thousands["value_text"], "$1,540")
+        self.assertEqual(fractional["value_text"], "12.34")
+        self.assertEqual(thousands["value_text"], "1,540")
 
     def _credit_runtime(self, remaining_credit, *, with_metric_descriptors=False):
         profile = {
@@ -4114,7 +4114,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         keys = [metric["key"] for metric in model["bars"][0]["metrics"]]
         self.assertEqual(keys, ["five_hour_limit", "CR"])
         credit_metric = model["bars"][0]["metrics"][1]
-        self.assertEqual(credit_metric["value_text"], "$245")
+        self.assertEqual(credit_metric["value_text"], "245")
 
     def test_overlay_model_does_not_exceed_three_metrics_and_keeps_limits_first(self):
         model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(
@@ -4171,7 +4171,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
         self.assertIn("CR", texts)
-        self.assertIn("$245", texts)
+        self.assertIn("245", texts)
 
     def test_draw_credit_segment_draws_no_progress_track(self):
         # Credit has no percent; drawing an empty track would read as a
@@ -4181,7 +4181,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         overlay._draw_metric_segment(
             canvas,
-            {"key": "CR", "metric_key": "credit", "percent": None, "value_text": "$245", "color": "#22c55e"},
+            {"key": "CR", "metric_key": "credit", "percent": None, "value_text": "245", "color": "#22c55e"},
             10,
             2,
             120,
@@ -4195,7 +4195,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         ]
         self.assertEqual(tracks, [])
         texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
-        self.assertIn("$245", texts)
+        self.assertIn("245", texts)
 
     def test_overlay_badge_mode_resolves_full_or_short_from_row_layouts(self):
         metrics = self._row_badge_metrics()

@@ -2599,6 +2599,19 @@ class CodexUsageTaskbarOverlay:
                     fill=color,
                     outline=color,
                 )
+        if is_credit_metric:
+            # Credit renders as inline "CR 665": the amount anchors left next
+            # to the label instead of the percent column's right-aligned slot,
+            # which would leave a phantom gap where the bar would be.
+            canvas.create_text(
+                x + 18,
+                center_y,
+                anchor="w",
+                fill="#f9fafb",
+                font=("Segoe UI", 7, "bold"),
+                text=value_text,
+            )
+            return
         canvas.create_text(
             value_x,
             center_y,
@@ -4845,9 +4858,9 @@ def _credit_metric_descriptor(snapshot: dict[str, Any]) -> dict[str, Any] | None
     if amount <= 0:
         return None
     if amount >= 1000:
-        display = f"${int(round(amount)):,}"
+        display = f"{int(round(amount)):,}"
     else:
-        display = f"${amount:g}"
+        display = f"{amount:g}"
     return {
         "metric_key": "credit",
         "key": "CR",
@@ -5106,9 +5119,18 @@ def _build_normal_guidance(
 
 def _format_guidance_duration(seconds: int) -> str:
     total_minutes = max(1, int(math.ceil(max(0, int(seconds)) / 60.0)))
-    days, remaining_minutes = divmod(total_minutes, 24 * 60)
-    hours, minutes = divmod(remaining_minutes, 60)
-    return f"{days:02d}d {hours:02d}h {minutes:02d}m"
+    if total_minutes < 60:
+        return f"{total_minutes}m"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours < 24:
+        if minutes:
+            return f"{hours}h {minutes}m"
+        return f"{hours}h"
+    days, remaining_minutes = divmod(hours, 24)
+    hours -= days * 24
+    if hours:
+        return f"{days}d {hours}h"
+    return f"{days}d {minutes}m"
 
 
 def _snapshot_reset_direction(
@@ -5715,6 +5737,11 @@ def _reset_column_width_for_text(text: str, *, metric_key: str = "") -> int:
         return max(8, len(value) * 7 + 2)
     if value == _RESET_PLACEHOLDER_TEXT:
         return max(12, len(value) * 5 + 2)
+    # Reset+guidance context ("time | N xx~yy% / tt") is only ever rendered as
+    # a plain text line, so it is measured at text speed regardless of the
+    # metric's reserved badge column.
+    if "|" in value:
+        return max(8, _inline_text_width(value) + 2)
     minimum = _RESET_DETAIL_COLUMN_WIDTH_PX
     if str(metric_key or "") == "five_hour_limit":
         minimum = _RESET_FIVE_HOUR_COLUMN_WIDTH_PX
