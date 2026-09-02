@@ -255,8 +255,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         metric = model["bars"][0]["metrics"][0]
         self.assertEqual(metric["value_text"], "100%")
         self.assertEqual(metric["detail_value_text"], "US$0 / US$20")
-        self.assertEqual(metric["reset_text"], "25d 00h 00m 00s")
-        self.assertEqual(metric["reset_short_text"], "25d 00h 00m 00s")
+        self.assertEqual(metric["reset_text"], "25d")
+        self.assertEqual(metric["reset_short_text"], "25d")
 
     def test_taskbar_renderer_keeps_unreported_metrics_empty(self):
         runtime = {
@@ -418,7 +418,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             now=datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(model["bars"][0]["metrics"][0]["reset_text"], "00d 02h 30m 00s")
+        self.assertEqual(model["bars"][0]["metrics"][0]["reset_text"], "2h 30m")
 
     def test_datetime_precision_uses_total_hours_for_multi_day_countdown(self):
         runtime = {
@@ -450,7 +450,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             now=datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(model["bars"][0]["metrics"][0]["reset_text"], "02d 09h 30m 00s")
+        self.assertEqual(model["bars"][0]["metrics"][0]["reset_text"], "2d 9h 30m")
 
     def test_render_signature_tracks_profile_provider_metric_freshness_and_status(self):
         runtime = {
@@ -663,10 +663,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         second_metrics = model["bars"][1]["metrics"]
         self.assertEqual([metric["value_text"] for metric in first_metrics], ["76%", "33%"])
         self.assertEqual([metric["value_text"] for metric in second_metrics], ["100%", "0%"])
-        self.assertEqual(first_metrics[0]["reset_text"], "00d 01h 35m 00s")
-        self.assertEqual(first_metrics[1]["reset_text"], "04d 03h 49m 00s")
-        self.assertEqual(second_metrics[0]["reset_text"], "00d 04h 10m 00s")
-        self.assertEqual(second_metrics[1]["reset_text"], "04d 03h 50m 00s")
+        self.assertEqual(first_metrics[0]["reset_text"], "1h 35m")
+        self.assertEqual(first_metrics[1]["reset_text"], "4d 3h 49m")
+        self.assertEqual(second_metrics[0]["reset_text"], "4h 10m")
+        self.assertEqual(second_metrics[1]["reset_text"], "4d 3h 50m")
 
     def test_model_colors_reset_time_from_remaining_usage_and_metric_window(self):
         runtime = self._runtime()
@@ -712,7 +712,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         ]
         self.assertEqual(
             reset_texts,
-            ["00d 04h 12m 00s", "00d 05h 59m 00s", "00d 00h 45m 00s", "00d 06h 07m 00s"],
+            ["4h 12m", "5h 59m", "45m", "6h 7m"],
         )
         self.assertEqual(reset_short_texts, reset_texts)
         self.assertEqual(reset_colors, ["#ef4444", "#f59e0b", "#f59e0b", "#f59e0b"])
@@ -891,7 +891,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(weekly_metric["percent"], 97)
         self.assertEqual(weekly_metric["state"], "normal")
         self.assertEqual(weekly_metric["color"], "#22c55e")
-        self.assertEqual(weekly_metric["reset_text"], "06d 20h 00m 00s")
+        self.assertEqual(weekly_metric["reset_text"], "6d 20h")
         self.assertEqual(weekly_metric["reset_direction"], "shortage")
         self.assertEqual(weekly_metric["reset_marker"], "↓")
         self.assertEqual(weekly_metric["reset_state"], "urgent")
@@ -1136,11 +1136,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metrics = model["bars"][0]["metrics"]
         self.assertEqual(
             [metric["reset_text"] for metric in first_metrics],
-            ["00d 03h 05m 00s", "00d 03h 05m 00s"],
+            ["3h 5m", "3h 5m"],
         )
         self.assertEqual(
             [metric["reset_short_text"] for metric in first_metrics],
-            ["00d 03h 05m 00s", "00d 03h 05m 00s"],
+            ["3h 5m", "3h 5m"],
         )
         self.assertEqual(
             [metric["reset_color"] for metric in first_metrics],
@@ -1161,7 +1161,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
 
         first_metric = model["bars"][0]["metrics"][0]
-        self.assertEqual(first_metric["reset_text"], "00d 00h 00m 00s")
+        self.assertEqual(first_metric["reset_text"], "0s")
         self.assertEqual(first_metric["reset_color"], "#ef4444")
         self.assertEqual(first_metric["reset_direction"], "shortage")
         self.assertEqual(first_metric["reset_badge_label"], "부족")
@@ -1180,7 +1180,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
 
         first_metric = model["bars"][0]["metrics"][0]
-        self.assertEqual(first_metric["reset_text"], "00d 00h 00m 00s")
+        self.assertEqual(first_metric["reset_text"], "0s")
         self.assertEqual(first_metric["reset_direction"], "surplus")
         self.assertEqual(first_metric["reset_badge_label"], "남음")
         self.assertEqual(first_metric["reset_badge_short_label"], "남")
@@ -1203,7 +1203,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metrics = model["bars"][0]["metrics"]
         self.assertEqual(
             [metric["reset_text"] for metric in first_metrics],
-            ["00d 04h 38m 10s", "06d 09h 35m 10s"],
+            ["4h 38m", "6d 9h 35m"],
         )
         self.assertEqual(
             [metric["reset_direction"] for metric in first_metrics],
@@ -1228,7 +1228,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         first_metrics = model["bars"][0]["metrics"]
         self.assertEqual(
             [metric["reset_text"] for metric in first_metrics],
-            ["00d 04h 38m 10s", "06d 09h 35m 10s"],
+            ["4h 38m", "6d 9h 35m"],
         )
         self.assertEqual(
             [metric["reset_direction"] for metric in first_metrics],
@@ -1248,7 +1248,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
 
         weekly_metric = model["bars"][0]["metrics"][1]
-        self.assertEqual(weekly_metric["reset_text"], "00d 00h 00m 00s")
+        self.assertEqual(weekly_metric["reset_text"], "0s")
         self.assertEqual(weekly_metric["reset_direction"], "surplus")
         self.assertEqual(weekly_metric["reset_badge_label"], "남음")
         self.assertEqual(weekly_metric["reset_badge_short_label"], "남")
@@ -2101,6 +2101,161 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "4d 3h 49m | N 87% / 9h 15m",
         )
 
+    def test_metric_width_signature_covers_joined_guidance_text(self):
+        bare = {
+            "metric_key": "five_hour_limit",
+            "reset_text": "4h 4m",
+            "reset_short_text": "4h 4m",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+        }
+        guided = dict(bare, normal_guidance_text="N 82~83%", normal_guidance_short_text="N 82~83%")
+
+        bare_required = taskbar_overlay._required_metric_segment_width(bare, badge_mode="short")
+        guided_required = taskbar_overlay._required_metric_segment_width(guided, badge_mode="short")
+
+        # The renderer draws the countdown joined with the guidance, so the
+        # guidance suffix must widen the reserved segment width.
+        self.assertGreater(guided_required, bare_required)
+
+    def test_required_segment_width_keeps_preferred_bar_with_badge_and_guidance(self):
+        metric = {
+            "metric_key": "five_hour_limit",
+            "reset_text": "4h 4m",
+            "reset_short_text": "4h 4m",
+            "normal_guidance_text": "N 82~83%",
+            "normal_guidance_short_text": "N 82~83%",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+        }
+
+        required = taskbar_overlay._required_metric_segment_width(metric, badge_mode="short")
+        detail, short = taskbar_overlay._metric_guidance_texts(metric)
+        layout = taskbar_overlay._fit_metric_segment_layout(
+            required,
+            detail,
+            short,
+            badge_label="남음",
+            badge_short_label="남",
+            metric_key="five_hour_limit",
+            has_reset_badge=True,
+            progress_width=taskbar_overlay._metric_progress_width_for_segment(required),
+            badge_mode="short",
+        )
+
+        self.assertTrue(layout["badge_fit"]["badge_visible"])
+        self.assertEqual(layout["badge_fit"]["time_text"], "4h 4m | N 82~83%")
+        self.assertGreaterEqual(
+            int(layout["progress_width"]),
+            taskbar_overlay._METRIC_REQUIRED_PROGRESS_FLOOR_PX,
+        )
+
+    def test_preferred_width_keeps_three_slot_row_texts_and_preferred_bar(self):
+        # Regression for the live defect: a 5H+7D+credit row next to a
+        # guidance-heavy 7D row used to render with the countdown dropped even
+        # though the taskbar had free width, because the preferred-width search
+        # measured the countdown without its guidance suffix and capped the
+        # overlay at 560px.
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 88,
+            "value_text": "88%",
+            "color": "#22c55e",
+            "reset_text": "4h 4m",
+            "reset_short_text": "4h 4m",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 82~83%",
+            "normal_guidance_short_text": "N 82~83%",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 51,
+            "value_text": "51%",
+            "color": "#f59e0b",
+            "reset_text": "6d 8h 1m",
+            "reset_short_text": "6d 8h 1m",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 91% / 2d 18h",
+            "normal_guidance_short_text": "N 91% / 2d 18h",
+        }
+        credit = {
+            "key": "CR",
+            "metric_key": "credit",
+            "percent": None,
+            "value_text": "227",
+        }
+        guided_weekly = dict(
+            weekly,
+            reset_text="4d 9h 55m",
+            reset_short_text="4d 9h 55m",
+            normal_guidance_text="N 64~66%",
+            normal_guidance_short_text="N 64~66%",
+        )
+        model = {
+            "visible": True,
+            "bars": [
+                {"enabled": True, "metrics": [guided_weekly]},
+                {"enabled": True, "metrics": [five_hour, weekly, credit]},
+            ],
+        }
+
+        width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+
+        self.assertIsNotNone(width)
+        for bar in model["bars"]:
+            metrics = tuple(bar["metrics"])
+            self.assertTrue(
+                taskbar_overlay._row_fits_badge_mode_for_overlay_width(
+                    width,
+                    metrics,
+                    "full",
+                    min_progress_px=taskbar_overlay._METRIC_REQUIRED_PROGRESS_FLOOR_PX,
+                ),
+            )
+
+    def test_format_reset_remaining_detail_compact_shapes(self):
+        format_detail = taskbar_overlay._format_reset_remaining_detail
+
+        self.assertEqual(format_detail(0), "0s")
+        self.assertEqual(format_detail(45), "45s")
+        self.assertEqual(format_detail(750), "12m 30s")
+        self.assertEqual(format_detail(750 - 30), "12m")
+        self.assertEqual(format_detail(4 * 3600 + 4 * 60 + 11), "4h 4m")
+        self.assertEqual(format_detail(6 * 3600), "6h")
+        self.assertEqual(
+            format_detail(4 * 86400 + 10 * 3600 + 3 * 60 + 58),
+            "4d 10h 3m",
+        )
+        self.assertEqual(format_detail(6 * 86400 + 20 * 3600), "6d 20h")
+        self.assertEqual(format_detail(25 * 86400), "25d")
+
+    def test_normal_guidance_omits_transition_time_when_it_matches_reset(self):
+        # With usage at 0% the burn-rate transition lands exactly on the reset
+        # boundary; the countdown beside the guidance already shows that time.
+        at_reset_edge = taskbar_overlay._build_normal_guidance(
+            metric_key="weekly_limit",
+            current_percent=0,
+            reset_at_value="2026-06-05T13:49:00+09:00",
+            now=datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+        )
+        self.assertEqual(at_reset_edge["direction"], "shortage")
+        # The '/ transition' suffix is omitted because it would duplicate the
+        # reset countdown rendered next to the guidance.
+        self.assertEqual(at_reset_edge["text"], "N 60~63%")
+
+        mid_window = taskbar_overlay._build_normal_guidance(
+            metric_key="weekly_limit",
+            current_percent=10,
+            reset_at_value="2026-06-05T13:49:00+09:00",
+            now=datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+        )
+        self.assertEqual(mid_window["direction"], "shortage")
+        self.assertIn(" / ", mid_window["text"])
+
     def test_metric_layout_reserves_right_breathing_room(self):
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             500,
@@ -2133,8 +2288,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         model = build_codex_usage_taskbar_overlay_model(runtime, now=now)
 
         weekly_metric = model["bars"][0]["metrics"][1]
-        self.assertEqual(weekly_metric["reset_text"], "06d 06h 07m 00s")
-        self.assertEqual(weekly_metric["reset_short_text"], "06d 06h 07m 00s")
+        self.assertEqual(weekly_metric["reset_text"], "6d 6h 7m")
+        self.assertEqual(weekly_metric["reset_short_text"], "6d 6h 7m")
 
     def test_model_hides_implausible_day_scale_five_hour_reset_time(self):
         runtime = self._runtime()
@@ -2154,8 +2309,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         weekly_metric = model["bars"][0]["metrics"][1]
         self.assertEqual(five_hour_metric["reset_text"], "")
         self.assertEqual(five_hour_metric["reset_short_text"], "")
-        self.assertEqual(weekly_metric["reset_text"], "04d 03h 50m 00s")
-        self.assertEqual(weekly_metric["reset_short_text"], "04d 03h 50m 00s")
+        self.assertEqual(weekly_metric["reset_text"], "4d 3h 50m")
+        self.assertEqual(weekly_metric["reset_short_text"], "4d 3h 50m")
 
     def test_draw_metric_segment_keeps_value_and_track_columns_stable_for_reset_widths(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -3598,10 +3753,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["orientation"], "bottom")
-        self.assertGreater(
-            geometry["width"],
-            taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
-        )
+        # The historical preferred cap was 560px; the slot contract allows the
+        # overlay to be wider than that even after the cap itself moved to 900.
+        self.assertGreater(geometry["width"], 560)
         self.assertGreaterEqual(geometry["x"], 1708)
         self.assertLessEqual(geometry["x"] + geometry["width"], 2392)
 
@@ -3631,7 +3785,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(geometry["visible"])
         self.assertGreater(
             geometry["width"],
-            taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+            560,
         )
         self.assertEqual(geometry["width"], 684)
         self.assertGreaterEqual(geometry["x"], 908)
@@ -3776,27 +3930,27 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(status_text["width"], 420)
         self.assertEqual(status_text["_telemetry"]["selected_slot"]["classification"], "status_text")
 
-    def test_bottom_taskbar_geometry_marks_text_friendly_threshold_at_559_560(self):
+    def test_bottom_taskbar_geometry_marks_text_friendly_threshold_at_899_900(self):
         status_text = calculate_taskbar_overlay_geometry(
-            1200,
+            2000,
             600,
-            (0, 0, 1200, 560),
-            occupied_spans=[(0, 100), (675, 1200)],
-            preferred_width=760,
+            (0, 0, 2000, 560),
+            occupied_spans=[(0, 100), (1015, 2000)],
+            preferred_width=1100,
             include_telemetry=True,
         )
         text_friendly = calculate_taskbar_overlay_geometry(
-            1200,
+            2000,
             600,
-            (0, 0, 1200, 560),
-            occupied_spans=[(0, 100), (676, 1200)],
-            preferred_width=760,
+            (0, 0, 2000, 560),
+            occupied_spans=[(0, 100), (1016, 2000)],
+            preferred_width=1100,
             include_telemetry=True,
         )
 
-        self.assertEqual(status_text["width"], 559)
+        self.assertEqual(status_text["width"], 899)
         self.assertEqual(status_text["_telemetry"]["selected_slot"]["classification"], "status_text")
-        self.assertEqual(text_friendly["width"], 560)
+        self.assertEqual(text_friendly["width"], 900)
         self.assertEqual(text_friendly["_telemetry"]["selected_slot"]["classification"], "text_friendly")
 
     def test_bottom_taskbar_geometry_ignores_preferred_width_without_occupied_spans(self):
@@ -4005,7 +4159,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 485)
+        self.assertEqual(width, 529)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
@@ -4200,7 +4354,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
     def test_overlay_badge_mode_resolves_full_or_short_from_row_layouts(self):
         metrics = self._row_badge_metrics()
 
-        full_layout = taskbar_overlay._metric_row_layout_for_overlay_width(506, metrics)
+        full_layout = taskbar_overlay._metric_row_layout_for_overlay_width(560, metrics)
         short_layout = taskbar_overlay._metric_row_layout_for_overlay_width(414, metrics)
 
         self.assertEqual(
@@ -4250,7 +4404,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertNotIn("남음", texts)
 
     def test_draw_uses_full_row_badges_when_full_mode_fits(self):
-        texts = self._draw_row_badge_texts(506)
+        texts = self._draw_row_badge_texts(560)
 
         self.assertIn("부족", texts)
         self.assertIn("남음", texts)
@@ -5135,8 +5289,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
-        self.assertIn("300x", window.geometry_calls[-1])
-        self.assertIn("+1192+", window.geometry_calls[-1])
+        self.assertIn("392x", window.geometry_calls[-1])
+        self.assertIn("+1100+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_hard_resamples_changed_slot_after_scheduled_delay(self):
         root = _FakeRoot()
@@ -5180,8 +5334,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(overlay._last_geometry_hard_resample_at, 101.0)
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("300x", window.geometry_calls[-1])
-        self.assertIn("+1192+", window.geometry_calls[-1])
+        self.assertIn("392x", window.geometry_calls[-1])
+        self.assertIn("+1100+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_reuses_runtime_snapshot_and_now_for_width_change(self):
         root = _FakeRoot()
@@ -5372,7 +5526,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         }
         reset_at = datetime(2026, 8, 16, 9, 0, tzinfo=timezone(timedelta(hours=9)))
         first_now = reset_at - timedelta(days=7)
-        second_now = first_now + timedelta(seconds=1)
+        # The compact day-scale countdown carries minute precision, so a visible
+        # advance needs a minute step rather than the old second step.
+        second_now = first_now + timedelta(minutes=1)
         runtime = {
             "enabled": True,
             "profiles": [
@@ -5438,7 +5594,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(first_metric["value_text"], second_metric["value_text"])
         self.assertEqual(first_metric["value_text"], "100%")
         self.assertNotEqual(first_metric["reset_text"], second_metric["reset_text"])
-        self.assertEqual(second_metric["reset_text"], "06d 23h 59m 59s")
+        self.assertEqual(second_metric["reset_text"], "6d 23h 59m")
         self.assertIsNotNone(overlay._content_after_id)
 
     def test_geometry_monitor_hard_resample_keeps_unchanged_visible_window_still(self):
@@ -5528,9 +5684,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 1)
-        self.assertIn("300x", window.geometry_calls[-1])
+        self.assertIn("392x", window.geometry_calls[-1])
         # After the empty-slot gap recovers, content-fit width remains preferred.
-        self.assertRegex(window.geometry_calls[-1], r"300x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"392x38\+\d+\+")
 
     def test_geometry_monitor_defers_transient_width_shrink_without_jitter(self):
         root = _FakeRoot()
@@ -5669,7 +5825,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
-        self.assertIn("+1472+", window.geometry_calls[-1])
+        self.assertIn("+1380+", window.geometry_calls[-1])
 
     def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
@@ -6062,9 +6218,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         geometry_tick()
 
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("300x", window.geometry_calls[-1])
+        self.assertIn("392x", window.geometry_calls[-1])
         # Content-fit preferred width stays 300; confirmed slot-edge move updates x only.
-        self.assertRegex(window.geometry_calls[-1], r"300x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"392x38\+\d+\+")
 
     def test_geometry_monitor_accepts_no_slot_when_work_area_context_changes(self):
         root = _FakeRoot()
