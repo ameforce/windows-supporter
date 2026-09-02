@@ -368,10 +368,11 @@ def build_codex_usage_taskbar_overlay_model(
                     )
                 )
         credit_metric = _credit_metric_descriptor(snapshot)
-        if credit_metric is not None and len(metrics) < 2:
-            # Display contract: credit occupies a taskbar slot only when the
-            # account actually reports a usable balance, and it never evicts a
-            # reported usage limit (5h/weekly) from the two compact slots.
+        if credit_metric is not None and len(metrics) < 3:
+            # Display contract: credit always occupies its own compact slot
+            # (5h, weekly, credit) whenever the account reports a usable
+            # balance. Credit without a percent never replaces a reported
+            # usage limit's slot order.
             metrics.append(credit_metric)
         primary_metric = metrics[0] if metrics else {
             "percent": None,
@@ -629,7 +630,7 @@ def _visible_metrics_for_taskbar_bar(bar: dict[str, Any]) -> tuple[dict[str, Any
         for metric in bar_dict.get("metrics", [])
         if isinstance(metric, dict)
     ]
-    return tuple(metrics[:2])
+    return tuple(metrics[:3])
 
 
 def _metric_guidance_texts(metric: dict[str, Any]) -> tuple[str, str]:
@@ -773,7 +774,7 @@ def _row_fits_badge_mode(
     progress_width: int,
     badge_mode: str,
 ) -> bool:
-    visible_metrics = tuple(metric for metric in metrics[:2] if isinstance(metric, dict))
+    visible_metrics = tuple(metric for metric in metrics[:3] if isinstance(metric, dict))
     if not visible_metrics:
         return True
     return all(
@@ -820,7 +821,7 @@ def _metric_row_layout_for_overlay_width(
     metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
 ) -> _MetricRowLayout:
     overlay_width = int(width)
-    visible_metrics = tuple(metric for metric in metrics[:2] if isinstance(metric, dict))
+    visible_metrics = tuple(metric for metric in metrics[:3] if isinstance(metric, dict))
     label_width = _label_width_for_overlay_width(overlay_width)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
@@ -2424,6 +2425,7 @@ class CodexUsageTaskbarOverlay:
         color = str(metric.get("color") or "#6b7280")
         flash = bool(metric.get("flash"))
         flash_phase = bool(metric.get("flash_phase"))
+        is_credit_metric = metric_key == "credit" and metric.get("percent") is None
         layout = _fit_metric_segment_layout(
             width,
             reset_text,
@@ -2464,24 +2466,25 @@ class CodexUsageTaskbarOverlay:
             font=("Segoe UI", 7, "bold"),
             text=label,
         )
-        canvas.create_rectangle(
-            bar_x,
-            bar_y,
-            bar_x + bar_width,
-            bar_y + 7,
-            fill="#2a2f38",
-            outline="#3f4654",
-        )
-        fill_width = int(round(bar_width * max(0, min(100, percent)) / 100))
-        if fill_width > 0:
+        if not is_credit_metric:
             canvas.create_rectangle(
                 bar_x,
                 bar_y,
-                bar_x + fill_width,
+                bar_x + bar_width,
                 bar_y + 7,
-                fill=color,
-                outline=color,
+                fill="#2a2f38",
+                outline="#3f4654",
             )
+            fill_width = int(round(bar_width * max(0, min(100, percent)) / 100))
+            if fill_width > 0:
+                canvas.create_rectangle(
+                    bar_x,
+                    bar_y,
+                    bar_x + fill_width,
+                    bar_y + 7,
+                    fill=color,
+                    outline=color,
+                )
         canvas.create_text(
             value_x,
             center_y,

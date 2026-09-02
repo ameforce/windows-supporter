@@ -4108,14 +4108,24 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         credit_metric = model["bars"][0]["metrics"][1]
         self.assertEqual(credit_metric["value_text"], "$245")
 
-    def test_overlay_model_does_not_exceed_two_metrics_and_keeps_limits_first(self):
+    def test_overlay_model_does_not_exceed_three_metrics_and_keeps_limits_first(self):
         model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(
             self._credit_runtime("245")
         )
 
         keys = [metric["key"] for metric in model["bars"][0]["metrics"]]
         self.assertEqual(keys[:2], ["5h", "7d"])
-        self.assertNotIn("CR", keys)
+        self.assertLessEqual(len(keys), 3)
+
+    def test_overlay_model_appends_credit_as_third_slot_when_only_one_limit_reported(self):
+        runtime = self._credit_runtime("245", with_metric_descriptors=True)
+        # The manager emits only a reported 5h descriptor here; credit must
+        # fill the next slot without inventing a weekly entry.
+        runtime["profiles"][0]["last_snapshot"]["weekly_limit"] = ""
+        model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(runtime)
+
+        keys = [metric["key"] for metric in model["bars"][0]["metrics"]]
+        self.assertEqual(keys, ["five_hour_limit", "CR"])
 
     def test_overlay_model_omits_credit_when_snapshot_has_no_balance(self):
         model = taskbar_overlay.build_codex_usage_taskbar_overlay_model(
@@ -4153,6 +4163,30 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
         self.assertIn("CR", texts)
+        self.assertIn("$245", texts)
+
+    def test_draw_credit_segment_draws_no_progress_track(self):
+        # Credit has no percent; drawing an empty track would read as a
+        # broken/zero bar. The segment is label + amount only.
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+
+        overlay._draw_metric_segment(
+            canvas,
+            {"key": "CR", "metric_key": "credit", "percent": None, "value_text": "$245", "color": "#22c55e"},
+            10,
+            2,
+            120,
+            15,
+        )
+
+        tracks = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#2a2f38"
+        ]
+        self.assertEqual(tracks, [])
+        texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
         self.assertIn("$245", texts)
 
     def test_overlay_badge_mode_resolves_full_or_short_from_row_layouts(self):
