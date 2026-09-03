@@ -7339,5 +7339,119 @@ class JunctionInkPlacementUnitTest(unittest.TestCase):
         self.assertEqual(texts["N 82~83%"], 100 + 60 + gap + 4 + gap)
 
 
+class SlotValueWidthUnitTest(unittest.TestCase):
+    def test_slot_value_width_takes_row_maximum(self):
+        def _bar(metrics):
+            return {
+                "label": "X",
+                "status_text": "",
+                "status_color": "#22c55e",
+                "metrics": [dict(metric) for metric in metrics],
+            }
+
+        def _metric(value, percent):
+            return {
+                "key": "7d",
+                "metric_key": "weekly_limit",
+                "percent": percent,
+                "value_text": value,
+                "reset_text": "03d 20h 54m 36s",
+                "reset_short_text": "3d 20h",
+                "reset_badge_label": "B",
+                "reset_badge_short_label": "B",
+                "normal_guidance_text": "N 50% / 3d 20h",
+                "normal_guidance_short_text": "N 50%",
+            }
+
+        narrow = _metric("0%", 0)
+        wide = _metric("100%", 100)
+        rows = [(_bar([narrow]),), (_bar([wide]),)]
+        row_layouts = [
+            taskbar_overlay._metric_rows_layout_for_overlay_width(700, [n["metrics"] for n in [rows[0][0], rows[1][0]]])[i]
+            for i in range(2)
+        ]
+
+        widths = taskbar_overlay._slot_value_widths(row_layouts)
+
+        self.assertEqual(
+            widths["weekly_limit"],
+            taskbar_overlay._value_column_width_for_text("100%"),
+        )
+
+    def test_slot_value_width_skips_credit(self):
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            700,
+            [
+                (
+                    {
+                        "key": "CR",
+                        "metric_key": "credit",
+                        "value_text": "164",
+                    },
+                )
+            ],
+        )
+
+        self.assertEqual(taskbar_overlay._slot_value_widths(row_layouts), {})
+
+    def test_drawn_right_block_shares_x_across_rows(self):
+        def _metric(value, percent):
+            return {
+                "key": "7d",
+                "metric_key": "weekly_limit",
+                "percent": percent,
+                "value_text": value,
+                "color": "#22c55e",
+                "reset_text": "03d 20h 54m 36s",
+                "reset_short_text": "3d 20h",
+                "reset_badge_label": "B",
+                "reset_badge_short_label": "B",
+                "normal_guidance_text": "N 50% / 3d 20h",
+                "normal_guidance_short_text": "N 50%",
+            }
+
+        def _bar(label, metrics):
+            return {
+                "label": label,
+                "status_text": "",
+                "status_color": "#22c55e",
+                "metrics": [dict(metric) for metric in metrics],
+            }
+
+        model = {
+            "visible": True,
+            "state": "ready",
+            "geometry": {"x": 0, "y": 0, "width": 700, "height": 38},
+            "bars": [
+                _bar("A", [_metric("0%", 0)]),
+                _bar("B", [_metric("100%", 100)]),
+            ],
+        }
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), {})
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        overlay._draw(model)
+
+        def _row_texts(y0, y1):
+            return {
+                str(op[2].get("text") or ""): int(op[1][0])
+                for op in canvas.ops
+                if op[0] == "text" and y0 <= int(op[1][1]) < y1
+            }
+
+        upper = _row_texts(0, 20)
+        lower = _row_texts(20, 40)
+        self.assertIn("0%", upper)
+        self.assertIn("100%", lower)
+        # Right-aligned value edges match.
+        self.assertEqual(upper["0%"], lower["100%"])
+        # Everything downstream rides on the shared column.
+        self.assertEqual(upper["B"], lower["B"])
+        self.assertEqual(upper["|"], lower["|"])
+        self.assertEqual(
+            upper["N 50% / 3d 20h"], lower["N 50% / 3d 20h"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
