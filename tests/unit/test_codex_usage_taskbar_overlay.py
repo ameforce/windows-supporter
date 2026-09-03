@@ -3989,6 +3989,73 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(geometry["visible"])
         self.assertGreaterEqual(geometry["x"], 820)
 
+    def test_bottom_taskbar_geometry_moves_to_wider_unbiased_slot_when_clamped(self):
+        # Live RCA (v0.18.0): the sampler excludes the overlay's own window
+        # rect from occupied spans, so the measured spans contain a self-made
+        # 452px free slot around the current right position. The stability
+        # check re-locks it every tick while the true widest free span
+        # (734px, left) sits unused against a preferred width of 866.
+        geometry = calculate_taskbar_overlay_geometry(
+            2560,
+            1440,
+            (0, 0, 2560, 1392),
+            occupied_spans=[(0, 102), (852, 1716), (2184, 2560)],
+            preferred_width=866,
+            previous_geometry={
+                "x": 1724,
+                "width": 452,
+                "visible": True,
+                "orientation": "bottom",
+            },
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["_slot_side"], "left")
+        self.assertLessEqual(geometry["x"] + geometry["width"], 844)
+        self.assertEqual(geometry["width"], 734)
+
+    def test_bottom_taskbar_geometry_keeps_right_slot_when_unbiased_slot_is_not_wider(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            2560,
+            1440,
+            (0, 0, 2560, 1392),
+            occupied_spans=[(0, 900), (1352, 1716), (2184, 2560)],
+            preferred_width=866,
+            previous_geometry={
+                "x": 1724,
+                "width": 452,
+                "visible": True,
+                "orientation": "bottom",
+            },
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["_slot_side"], "right")
+        self.assertEqual(geometry["x"], 1724)
+        self.assertEqual(geometry["width"], 452)
+
+    def test_bottom_taskbar_geometry_keeps_right_slot_when_selection_is_not_clamped(self):
+        # Rightmost preference is untouched when the current slot already
+        # fits the target width.
+        geometry = calculate_taskbar_overlay_geometry(
+            2560,
+            1440,
+            (0, 0, 2560, 1392),
+            occupied_spans=[(0, 102), (852, 1716), (2184, 2560)],
+            preferred_width=400,
+            previous_geometry={
+                "x": 1724,
+                "width": 452,
+                "visible": True,
+                "orientation": "bottom",
+            },
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["_slot_side"], "right")
+        self.assertEqual(geometry["x"], 1776)
+        self.assertEqual(geometry["width"], 400)
+
     def test_bottom_taskbar_geometry_uses_measured_mid_sized_right_slot(self):
         geometry = calculate_taskbar_overlay_geometry(
             2560,

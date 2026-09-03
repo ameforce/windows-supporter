@@ -3489,6 +3489,15 @@ def _fit_horizontal_geometry_to_empty_slot(
         )
         if fallback_slot is not None:
             selected_slot = fallback_slot
+        unbiased_slot = _wider_unbiased_slot_when_clamped(
+            list(normalized_spans),
+            selected_slot,
+            previous_geometry,
+            screen_width=int(screen_width),
+            target_width=target_width,
+        )
+        if unbiased_slot is not None:
+            selected_slot = unbiased_slot
     if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
@@ -3602,6 +3611,60 @@ def _wider_left_fallback_slot(
     if not left_candidates:
         return None
     return max(left_candidates, key=lambda span: (int(span[1]) - int(span[0]), int(span[0])))
+
+
+def _wider_unbiased_slot_when_clamped(
+    normalized_occupied_spans: list[tuple[int, int]],
+    selected_slot: tuple[int, int],
+    previous_geometry: dict[str, Any] | None,
+    *,
+    screen_width: int,
+    target_width: int,
+) -> tuple[int, int] | None:
+    """Return a genuinely wider slot when the selected slot is clamped.
+
+    The sampler excludes the overlay's own window rect from occupied spans,
+    so the measured spans contain a self-made free slot around the current
+    position. The stability check then re-locks that slot on every tick, even
+    when the true widest free span sits elsewhere and the overlay is clamped.
+    When the selected slot cannot fit `target_width`, merge the previous
+    window rect back into occupied and switch to a strictly wider unbiased
+    span. Unclamped selections keep the rightmost preference untouched.
+    """
+    try:
+        selected_width = int(selected_slot[1]) - int(selected_slot[0])
+    except (TypeError, ValueError):
+        return None
+    if selected_width >= int(target_width):
+        return None
+    if not isinstance(previous_geometry, dict):
+        return None
+    try:
+        prev_x = int(previous_geometry.get("x", 0))
+        prev_width = int(previous_geometry.get("width", 0))
+    except (TypeError, ValueError):
+        return None
+    if prev_width <= 0:
+        return None
+    prev_span = (prev_x, prev_x + prev_width)
+    unbiased_occupied = _normalized_occupied_spans(
+        int(screen_width), [*normalized_occupied_spans, prev_span]
+    )
+    unbiased_free = _free_spans_from_occupied_spans(
+        int(screen_width), list(unbiased_occupied), padding_px=_EMPTY_SLOT_PADDING_PX
+    )
+    prev_center = prev_x + max(1, prev_width) // 2
+    best: tuple[int, int] | None = None
+    best_width = selected_width
+    for start, end in unbiased_free:
+        width = int(end) - int(start)
+        if width <= best_width:
+            continue
+        if int(start) <= prev_center <= int(end):
+            continue
+        best = (int(start), int(end))
+        best_width = width
+    return best
 
 
 def _slot_side_for_geometry(geometry: dict[str, Any], screen_width: int) -> str:
