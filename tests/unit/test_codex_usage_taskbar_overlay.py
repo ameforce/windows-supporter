@@ -7192,6 +7192,39 @@ class GuidanceDurationVerboseUnitTest(unittest.TestCase):
         )
 
 
+class PreviousGeometryForTickUnitTest(unittest.TestCase):
+    def test_visible_model_wins(self):
+        model = {"geometry": {"x": 1, "visible": True}}
+        out = taskbar_overlay._previous_geometry_for_tick(
+            model, {"x": 2, "visible": True}
+        )
+        self.assertEqual(out["x"], 1)
+
+    def test_hidden_model_falls_back_to_snapshot(self):
+        model = {"geometry": {"x": 1, "visible": False}}
+        out = taskbar_overlay._previous_geometry_for_tick(
+            model, {"x": 2, "visible": True}
+        )
+        self.assertEqual(out["x"], 2)
+
+    def test_missing_model_falls_back_to_snapshot(self):
+        out = taskbar_overlay._previous_geometry_for_tick(
+            None, {"x": 3, "visible": True}
+        )
+        self.assertEqual(out["x"], 3)
+
+    def test_missing_everything_returns_empty(self):
+        self.assertEqual(
+            taskbar_overlay._previous_geometry_for_tick(None, None), {}
+        )
+
+    def test_snapshot_is_copied(self):
+        snapshot = {"x": 4, "visible": True}
+        out = taskbar_overlay._previous_geometry_for_tick(None, snapshot)
+        out["x"] = 999
+        self.assertEqual(snapshot["x"], 4)
+
+
 class SeparatorGapUnitTest(unittest.TestCase):
     def test_pipe_and_guidance_honor_gap_constant(self):
         canvas = _FakeCanvas()
