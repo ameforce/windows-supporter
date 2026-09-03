@@ -3480,28 +3480,39 @@ def _fit_horizontal_geometry_to_empty_slot(
             max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
             desired_width,
         )
-    selected_slot = _selected_free_slot(
+    # Side latch: while the previous side still offers a usable span, choose
+    # within it so taskbar churn on the other side cannot oscillate the
+    # overlay. Cold starts and side collapses fall back to the global logic
+    # (rightmost preference, full-fit fallback, unbiased wider slot).
+    latched_spans = _latched_side_spans(
         free_spans,
+        previous_geometry,
+        screen_width=int(screen_width),
+    )
+    slot_spans = latched_spans if latched_spans is not None else free_spans
+    selected_slot = _selected_free_slot(
+        slot_spans,
         previous_geometry=previous_geometry,
         target_width=target_width,
     )
     if selected_slot is not None:
         fallback_slot = _wider_left_fallback_slot(
-            free_spans,
+            slot_spans,
             selected_slot,
             target_width=target_width,
         )
         if fallback_slot is not None:
             selected_slot = fallback_slot
-        unbiased_slot = _wider_unbiased_slot_when_clamped(
-            list(normalized_spans),
-            selected_slot,
-            previous_geometry,
-            screen_width=int(screen_width),
-            target_width=target_width,
-        )
-        if unbiased_slot is not None:
-            selected_slot = unbiased_slot
+        if latched_spans is None:
+            unbiased_slot = _wider_unbiased_slot_when_clamped(
+                list(normalized_spans),
+                selected_slot,
+                previous_geometry,
+                screen_width=int(screen_width),
+                target_width=target_width,
+            )
+            if unbiased_slot is not None:
+                selected_slot = unbiased_slot
     if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
@@ -3563,6 +3574,43 @@ def _fit_horizontal_geometry_to_empty_slot(
             chosen_geometry=fitted,
         )
     return fitted
+
+
+def _latched_side_spans(
+    free_spans: list[tuple[int, int]],
+    previous_geometry: dict[str, Any] | None,
+    *,
+    screen_width: int,
+) -> list[tuple[int, int]] | None:
+    """Return previous-side usable spans, or None for a global re-pick.
+
+    Side identity mirrors `_slot_side_for_geometry` (span midpoint against
+    the screen midpoint). While the latched side still offers a usable span
+    the overlay never crosses sides, so width churn elsewhere cannot
+    oscillate it. Cold starts (no previous rect) and side collapses (no
+    usable span left on the previous side) return None for the global logic.
+    """
+    if not isinstance(previous_geometry, dict):
+        return None
+    try:
+        prev_x = int(previous_geometry.get("x", 0))
+        prev_width = int(previous_geometry.get("width", 0))
+    except (TypeError, ValueError):
+        return None
+    if prev_width <= 0:
+        return None
+    prev_center_twice = prev_x * 2 + prev_width
+    screen_mid_twice = int(screen_width)
+    same_side = [
+        span
+        for span in free_spans
+        if ((int(span[0]) + int(span[1])) >= screen_mid_twice)
+        == (prev_center_twice >= screen_mid_twice)
+        and int(span[1]) - int(span[0]) >= _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+    ]
+    if not same_side:
+        return None
+    return same_side
 
 
 def _selected_free_slot(
