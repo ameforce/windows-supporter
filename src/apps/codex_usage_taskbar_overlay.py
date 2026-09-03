@@ -3133,6 +3133,61 @@ class CodexUsageTaskbarOverlay:
         self._set_native_position(window, x, y, width, height)
         return
 
+    def _read_window_size(self, window: Any) -> tuple[int, int] | None:
+        """Current mapped window size, or None when it cannot be verified.
+
+        Headless doubles without winfo methods deliberately return None so
+        every caller keeps its pre-verification behavior.
+        """
+        try:
+            if not bool(window.winfo_ismapped()):
+                return None
+            update_idle = getattr(window, "update_idletasks", None)
+            if callable(update_idle):
+                update_idle()
+            return (int(window.winfo_width()), int(window.winfo_height()))
+        except Exception:
+            return None
+
+    def _converge_draw_width(
+        self,
+        window: Any,
+        geometry: dict[str, int | str],
+        width: int,
+        height: int,
+    ) -> int:
+        """Draw inside the window the user can actually see.
+
+        A silently failed Tk/Win32 resize leaves the canvas laid out at the
+        model width while the window keeps an older size. The window then
+        clips the right edge (outline and right padding invisible, texts cut
+        at the border) and the overlay reads as margin-asymmetric even though
+        the layout math is correct. Geometry ticks skip re-apply while the
+        model geometry is unchanged, so draw time is the last reliable point
+        to converge: verify, re-apply once, and never draw wider than the
+        window that will show the result.
+        """
+        size = self._read_window_size(window)
+        if size is None:
+            return width
+        if size == (width, height):
+            return width
+        try:
+            self._apply_geometry(window, geometry)
+        except Exception:
+            if 1 < size[0] < width:
+                return size[0]
+            return width
+        size = self._read_window_size(window)
+        if size == (width, height):
+            return width
+        if size is not None and 1 < size[0] < width:
+            # The window refuses the model size: honor the visible width so
+            # the right padding stays inside the window instead of being
+            # clipped off.
+            return size[0]
+        return width
+
     def _draw(self, model: dict[str, Any]) -> None:
         canvas = self._canvas
         if canvas is None:
@@ -3145,6 +3200,9 @@ class CodexUsageTaskbarOverlay:
             geometry = {}
         width = int(geometry.get("width", 760))
         height = int(geometry.get("height", 38))
+        window = self._window
+        if window is not None and bool(geometry.get("visible", True)):
+            width = self._converge_draw_width(window, geometry, width, height)
         bars = [bar for bar in model.get("bars", []) if isinstance(bar, dict)]
         canvas.delete("all")
         self._metric_hit_rects = []

@@ -7536,5 +7536,131 @@ class BarFundedAirUnitTest(unittest.TestCase):
         )
 
 
+class _FakeOverlayWindow:
+    """Fake Tk toplevel whose size geometry() can adopt or refuse."""
+
+    def __init__(self, size, adopt_geometry=True):
+        self._size = tuple(size)
+        self._adopt_geometry = adopt_geometry
+        self.geometry_calls = []
+
+    def winfo_ismapped(self):
+        return True
+
+    def update_idletasks(self):
+        pass
+
+    def winfo_width(self):
+        return self._size[0]
+
+    def winfo_height(self):
+        return self._size[1]
+
+    def geometry(self, spec):
+        self.geometry_calls.append(spec)
+        if self._adopt_geometry:
+            size_text = spec.split("+", 1)[0]
+            width, height = size_text.split("x")
+            self._size = (int(width), int(height))
+
+
+class WindowSizeSyncUnitTest(unittest.TestCase):
+    def _runtime(self):
+        return {
+            "enabled": True,
+            "collect_inflight": False,
+            "accounts": [
+                {
+                    "id": "account_1",
+                    "label": "Codex 1",
+                    "enabled": True,
+                    "runtime": {
+                        "monitor_state": "idle",
+                        "session_state": "logged_in",
+                        "collect_inflight": False,
+                    },
+                    "last_snapshot": {"five_hour_limit": "47%", "weekly_limit": "52%"},
+                }
+            ],
+        }
+
+    def _metric(self):
+        return {
+            "key": "7D",
+            "metric_key": "weekly_limit",
+            "percent": 25,
+            "value_text": "25%",
+            "reset_text": "05d 19h 56m 47s",
+            "reset_short_text": "5d 19h",
+            "reset_badge_label": "B",
+            "reset_badge_short_label": "B",
+            "normal_guidance_text": "N 84% / 4d 1h",
+            "normal_guidance_short_text": "N 84%",
+        }
+
+    def _model(self, width):
+        return {
+            "geometry": {"width": width, "height": 38, "x": 0, "y": 0},
+            "bars": [
+                {
+                    "label": "Codex 1",
+                    "status_text": "OK",
+                    "status_color": "#22c55e",
+                    "metrics": [self._metric()],
+                }
+            ],
+        }
+
+    def test_draw_reapplies_geometry_when_window_is_narrower_than_model(self):
+        overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
+        window = _FakeOverlayWindow((473, 38))
+        overlay._window = window
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(self._model(511))
+
+        self.assertEqual(len(window.geometry_calls), 1)
+        self.assertIn("511x38", window.geometry_calls[0])
+        self.assertEqual(canvas.configure_calls[-1]["width"], 511)
+
+    def test_draw_keeps_geometry_when_window_size_already_matches(self):
+        overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
+        window = _FakeOverlayWindow((511, 38))
+        overlay._window = window
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(self._model(511))
+
+        self.assertEqual(window.geometry_calls, [])
+
+    def test_draw_falls_back_to_visible_width_when_window_refuses_resize(self):
+        overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
+        window = _FakeOverlayWindow((473, 38), adopt_geometry=False)
+        overlay._window = window
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(self._model(511))
+
+        self.assertEqual(len(window.geometry_calls), 1)
+        rectangles = [op for op in canvas.ops if op[0] == "rectangle"]
+        self.assertTrue(rectangles)
+        background = rectangles[0]
+        self.assertLessEqual(background[1][2], 473)
+
+    def test_draw_skips_verification_without_a_window(self):
+        overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(self._model(511))
+
+        rectangles = [op for op in canvas.ops if op[0] == "rectangle"]
+        self.assertTrue(rectangles)
+        self.assertEqual(rectangles[0][1][2], 511)
+
+
 if __name__ == "__main__":
     unittest.main()
