@@ -6966,5 +6966,121 @@ class OverlayUiScalingUnitTest(unittest.TestCase):
         self.assertEqual(root.scaling_sets, [144.0 / 72.0])
 
 
+class SlotMinimumBarUnitTest(unittest.TestCase):
+    def _live_like_rows(self):
+        seven_day_sparse = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 0,
+            "value_text": "0%",
+            "color": "#22c55e",
+            "reset_text": "03d 21h 50m 04s",
+            "reset_short_text": "3d 21h",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 56~60% / 3d 22h",
+            "normal_guidance_short_text": "N 56~60%",
+        }
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 91,
+            "value_text": "91%",
+            "color": "#22c55e",
+            "reset_text": "04h 39m 08s",
+            "reset_short_text": "4h 39m",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 94% / 7m",
+            "normal_guidance_short_text": "N 94%",
+        }
+        seven_day_dense = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 25,
+            "value_text": "25%",
+            "color": "#f59e0b",
+            "reset_text": "05d 19h 56m 47s",
+            "reset_short_text": "5d 19h",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 84% / 4d 1h",
+            "normal_guidance_short_text": "N 84%",
+        }
+        credit = {"key": "CR", "metric_key": "credit", "value_text": "164"}
+        return (seven_day_sparse,), (five_hour, seven_day_dense, credit)
+
+    def test_slot_minimum_takes_narrowest_row_fit(self):
+        first, second = self._live_like_rows()
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            778, [first, second]
+        )
+        mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(row_layouts))
+
+        floors = taskbar_overlay._slot_minimum_progress_widths(
+            row_layouts, badge_mode=mode
+        )
+
+        self.assertEqual(floors["weekly_limit"], 18)
+        self.assertEqual(floors["five_hour_limit"], 36)
+        self.assertNotIn("credit", floors)
+
+    def test_drawn_same_slot_tracks_share_width_without_losing_text(self):
+        first, second = self._live_like_rows()
+
+        def _bar(label, metrics):
+            return {
+                "label": label,
+                "status_text": "정상",
+                "status_color": "#22c55e",
+                "metrics": [dict(metric) for metric in metrics],
+            }
+
+        model = {
+            "visible": True,
+            "state": "ready",
+            "geometry": {"x": 0, "y": 0, "width": 778, "height": 38},
+            "bars": [_bar("Kim Jong", first), _bar("X", second)],
+        }
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), {})
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        overlay._draw(model)
+
+        tracks = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[2].get("fill") == "#2a2f38"
+        ]
+        row0 = sorted(
+            (int(op[1][0]), int(op[1][2]) - int(op[1][0]))
+            for op in tracks
+            if int(op[1][1]) < 20
+        )
+        row1 = sorted(
+            (int(op[1][0]), int(op[1][2]) - int(op[1][0]))
+            for op in canvas.ops
+            if op[0] == "rectangle"
+            and op[2].get("fill") == "#2a2f38"
+            and int(op[1][1]) >= 20
+        )
+        # Both rows share one 7D column: exactly one track on row 0, and the
+        # row-1 track at the same x0 is its 7D twin. The slot minimum makes
+        # the twins equal.
+        self.assertEqual(len(row0), 1)
+        twins = [width for x0, width in row1 if x0 == row0[0][0]]
+        self.assertEqual(len(twins), 1)
+        self.assertEqual(row0[0][1], twins[0])
+
+        row1_texts = [
+            str(op[2].get("text") or "")
+            for op in canvas.ops
+            if op[0] == "text" and int(op[1][1]) >= 20
+        ]
+        self.assertTrue(any("05d" in text for text in row1_texts))
+        self.assertTrue(any("부" in text for text in row1_texts))
+        self.assertTrue(any("N 84%" in text for text in row1_texts))
+
+
 if __name__ == "__main__":
     unittest.main()
