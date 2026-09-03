@@ -1004,6 +1004,74 @@ def _metric_countdown_min_width(metric: dict[str, Any]) -> int:
     return base + 4 + badge_block + reset_width
 
 
+def _metric_segment_fit_kwargs(
+    metric: dict[str, Any],
+    progress_width: int | None,
+    *,
+    badge_mode: str = "any",
+) -> dict[str, Any]:
+    """Keyword inputs for `_fit_metric_segment_layout`, shared by draw and plan.
+
+    The draw path and the slot-minimum pre-pass must feed the fit identical
+    inputs, or the pre-pass minimum would not reproduce at draw time.
+    """
+    metric_dict = metric if isinstance(metric, dict) else {}
+    value_text = str(metric_dict.get("value_text") or "--")
+    reset_text, reset_short_text = _metric_guidance_texts(metric_dict)
+    reset_badge_label = str(metric_dict.get("reset_badge_label") or "")
+    reset_badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
+    return {
+        "detail_text": reset_text,
+        "short_text": reset_short_text,
+        "badge_label": reset_badge_label,
+        "badge_short_label": reset_badge_short_label,
+        "metric_key": str(metric_dict.get("metric_key") or ""),
+        "reset_marker": str(metric_dict.get("reset_marker") or ""),
+        "has_reset_badge": bool(reset_badge_label or reset_badge_short_label),
+        "progress_width": progress_width,
+        "badge_mode": badge_mode,
+        "value_width": _value_column_width_for_text(value_text),
+    }
+
+
+def _slot_minimum_progress_widths(
+    row_layouts: list[Any],
+    badge_mode: str = "any",
+) -> dict[str, int]:
+    """Minimum fitted bar width per metric slot across rows.
+
+    The shared grid allocates equal progress per slot, but the per-row fit
+    shrinks bars to preserve each row's longer texts, so same-column bars
+    render at different widths. Drawing every row at the slot minimum keeps
+    the grid contract (narrowing a bar never drops already-fitting texts).
+    Credit slots carry no bar and are skipped.
+    """
+    floors: dict[str, int] = {}
+    for row_layout in row_layouts:
+        visible = getattr(row_layout, "visible_metrics", ())
+        for index, metric in enumerate(tuple(visible)):
+            metric_dict = metric if isinstance(metric, dict) else {}
+            if str(metric_dict.get("metric_key") or "") == "credit":
+                continue
+            try:
+                _offset, segment_width, segment_progress = row_layout.segment_geometry(
+                    index
+                )
+            except Exception:
+                continue
+            fit = _fit_metric_segment_layout(
+                int(segment_width),
+                **_metric_segment_fit_kwargs(
+                    metric_dict, int(segment_progress), badge_mode=badge_mode
+                ),
+            )
+            key = _metric_slot_key(metric_dict)
+            progressed = int(fit.get("progress_width") or 0)
+            if key not in floors or progressed < floors[key]:
+                floors[key] = progressed
+    return floors
+
+
 def _metric_rows_layout_for_overlay_width(
     width: int,
     rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
@@ -2906,6 +2974,14 @@ class CodexUsageTaskbarOverlay:
         overlay_badge_mode = _resolve_overlay_badge_mode(
             tuple(row_layout for _bar, row_layout in row_entries)
         )
+        # Slot-minimum bars: the shared grid allocates equal progress per
+        # slot, but each row's fit would shrink its bar for its longer texts.
+        # Drawing every row at the slot minimum honors the same-bar-width
+        # grid contract (narrowing a bar never drops fitting texts).
+        slot_progress_floor = _slot_minimum_progress_widths(
+            [row_layout for _bar, row_layout in row_entries],
+            badge_mode=overlay_badge_mode,
+        )
         for index, (bar, row_layout) in enumerate(row_entries):
             y = 4 + index * row_height
             center_y = y + row_height // 2
@@ -2953,6 +3029,11 @@ class CodexUsageTaskbarOverlay:
                     progress_width=segment_progress,
                     badge_mode=overlay_badge_mode,
                     profile_label=str(bar.get("label") or ""),
+                    progress_override=slot_progress_floor.get(
+                        _metric_slot_key(
+                            metric if isinstance(metric, dict) else {}
+                        )
+                    ),
                 )
         return
 
@@ -2967,13 +3048,12 @@ class CodexUsageTaskbarOverlay:
         progress_width: int | None = None,
         badge_mode: str = "any",
         profile_label: str = "",
+        progress_override: int | None = None,
     ) -> None:
         center_y = y + row_height // 2
         label = str(metric.get("key") or "")
         value_text = str(metric.get("value_text") or "--")
-        reset_text, reset_short_text = _metric_guidance_texts(metric)
         reset_color = str(metric.get("reset_color") or "#94a3b8")
-        reset_marker = str(metric.get("reset_marker") or "")
         reset_badge_label = str(metric.get("reset_badge_label") or "")
         reset_badge_short_label = str(metric.get("reset_badge_short_label") or "")
         reset_badge_fill = str(metric.get("reset_badge_fill") or "")
@@ -2986,18 +3066,19 @@ class CodexUsageTaskbarOverlay:
         flash = bool(metric.get("flash"))
         flash_phase = bool(metric.get("flash_phase"))
         is_credit_metric = metric_key == "credit" and metric.get("percent") is None
+        # Fit inputs come from the shared helper so the slot-minimum
+        # pre-pass reproduces draw-time behavior exactly.
         layout = _fit_metric_segment_layout(
             width,
-            reset_text,
-            reset_short_text,
-            badge_label=reset_badge_label,
-            badge_short_label=reset_badge_short_label,
-            metric_key=metric_key,
-            reset_marker=reset_marker,
-            has_reset_badge=has_reset_badge,
-            progress_width=progress_width,
-            badge_mode=badge_mode,
-            value_width=_value_column_width_for_text(value_text),
+            **_metric_segment_fit_kwargs(
+                metric,
+                (
+                    int(progress_override)
+                    if progress_override is not None
+                    else progress_width
+                ),
+                badge_mode=badge_mode,
+            ),
         )
         bar_x = x + int(layout["bar_x"])
         bar_width = int(layout["progress_width"])
