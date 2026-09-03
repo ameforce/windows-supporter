@@ -199,6 +199,11 @@ _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
 _SEGMENT_RIGHT_PADDING_PX = 2
 _OVERLAY_RIGHT_PADDING_PX = 10
+# Breathing air kept clear at the overlay right edge so last-segment ink
+# never touches the border (estimate slop lets it reach the edge). Applied
+# only when slack covers it; clamped slots keep every pixel for content so
+# countdowns and badges never yield for air.
+_OVERLAY_RIGHT_AIR_RESERVE_PX = 6
 _METRIC_PROGRESS_MIN_WIDTH_PX = 28
 _METRIC_PROGRESS_PREFERRED_WIDTH_PX = 36
 _METRIC_PROGRESS_MAX_WIDTH_PX = 48
@@ -726,6 +731,30 @@ def _inline_text_width(text: str) -> int:
     return sum(9 if ord(character) > 127 else 5 for character in str(text or ""))
 
 
+def _ink_right_edge(canvas: Any, item: Any) -> int | None:
+    """Right ink edge of a canvas text item, or None when unmeasurable.
+
+    Estimates (5px/char) drift from real advances, which is exactly how a
+    centered-by-construction separator ends up hugging one side. Measuring
+    the drawn ink is exact, adapts to any font/DPI, and needs no loop:
+    place forward once per item. Headless doubles without `bbox` fall back
+    to estimates via the None path.
+    """
+    bbox_of = getattr(canvas, "bbox", None)
+    if not callable(bbox_of):
+        return None
+    try:
+        box = bbox_of(item)
+    except Exception:
+        return None
+    if not box or len(box) < 3:
+        return None
+    try:
+        return int(box[2])
+    except (TypeError, ValueError):
+        return None
+
+
 def _draw_metric_context_text(
     canvas: Any,
     text: str,
@@ -738,7 +767,7 @@ def _draw_metric_context_text(
     cursor_x = int(x)
     font = ("Segoe UI", 6, "bold")
     if reset_text:
-        canvas.create_text(
+        reset_item = canvas.create_text(
             cursor_x,
             center_y,
             anchor="w",
@@ -746,10 +775,15 @@ def _draw_metric_context_text(
             font=font,
             text=reset_text,
         )
-        cursor_x += _inline_text_width(reset_text)
+        reset_ink = _ink_right_edge(canvas, reset_item)
+        cursor_x = (
+            int(reset_ink)
+            if reset_ink is not None
+            else cursor_x + _inline_text_width(reset_text)
+        )
     if guidance_text:
         separator_x = cursor_x + _METRIC_CONTEXT_SEPARATOR_GAP_PX
-        canvas.create_text(
+        pipe_item = canvas.create_text(
             separator_x,
             center_y,
             anchor="w",
@@ -757,7 +791,12 @@ def _draw_metric_context_text(
             font=font,
             text="|",
         )
-        cursor_x = separator_x + _inline_text_width("|") + _METRIC_CONTEXT_SEPARATOR_GAP_PX
+        pipe_ink = _ink_right_edge(canvas, pipe_item)
+        cursor_x = (
+            int(pipe_ink)
+            if pipe_ink is not None
+            else separator_x + _inline_text_width("|")
+        ) + _METRIC_CONTEXT_SEPARATOR_GAP_PX
         canvas.create_text(
             cursor_x,
             center_y,
@@ -1152,7 +1191,6 @@ def _metric_rows_layout_for_overlay_width(
     label_width = _label_width_for_overlay_width(overlay_width)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
-    metrics_width = max(0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX)
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
 
     slot_keys = _metric_slot_keys(rows_metrics)
@@ -1168,9 +1206,20 @@ def _metric_rows_layout_for_overlay_width(
             if required > required_by_slot.get(key, 0):
                 required_by_slot[key] = required
 
+    base_need = sum(required_by_slot.values()) + segment_gap * max(0, counts - 1)
+    right_air = (
+        _OVERLAY_RIGHT_AIR_RESERVE_PX
+        if overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - base_need
+        >= _OVERLAY_RIGHT_AIR_RESERVE_PX
+        else 0
+    )
+    metrics_width = max(
+        0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - right_air
+    )
+
     column_widths: dict[str, int] = {}
     column_progresses: dict[str, int] = {}
-    total_required = sum(required_by_slot.values()) + segment_gap * max(0, counts - 1)
+    total_required = base_need
     if counts and total_required <= metrics_width:
         # Text-first allocation on the shared grid: reserve each column's
         # widest requirement across rows and hand the leftover to the bars,

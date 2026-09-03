@@ -7192,6 +7192,55 @@ class GuidanceDurationVerboseUnitTest(unittest.TestCase):
         )
 
 
+class RightAirReserveUnitTest(unittest.TestCase):
+    def _sparse(self):
+        return {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 0,
+            "value_text": "0%",
+            "reset_text": "03d 21h 50m 04s",
+            "reset_short_text": "3d 21h",
+            "reset_badge_label": "B",
+            "reset_badge_short_label": "B",
+            "normal_guidance_text": "N 56~59% / 3d 20h",
+            "normal_guidance_short_text": "N 56~59%",
+        }
+
+    def test_roomy_layout_keeps_air_reserve(self):
+        layout = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            778, [(self._sparse(),)]
+        )[0]
+
+        self.assertEqual(
+            778 - (layout.metrics_x + layout.metrics_width),
+            taskbar_overlay._OVERLAY_RIGHT_PADDING_PX
+            + taskbar_overlay._OVERLAY_RIGHT_AIR_RESERVE_PX,
+        )
+
+    def test_tight_layout_skips_air_reserve(self):
+        sparse = self._sparse()
+        dense = dict(
+            sparse,
+            key="5h",
+            metric_key="five_hour_limit",
+            value_text="91%",
+            reset_text="04h 39m 08s",
+            reset_short_text="4h 39m",
+            normal_guidance_text="N 94% / 7m",
+            normal_guidance_short_text="N 94%",
+        )
+        credit = {"key": "CR", "metric_key": "credit", "value_text": "164"}
+        layout = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            456, [(sparse,), (dense, sparse, credit)]
+        )[0]
+
+        self.assertEqual(
+            456 - (layout.metrics_x + layout.metrics_width),
+            taskbar_overlay._OVERLAY_RIGHT_PADDING_PX,
+        )
+
+
 class PreviousGeometryForTickUnitTest(unittest.TestCase):
     def test_visible_model_wins(self):
         model = {"geometry": {"x": 1, "visible": True}}
@@ -7246,6 +7295,48 @@ class SeparatorGapUnitTest(unittest.TestCase):
             texts["N 82~83%"],
             reset_end + gap + taskbar_overlay._inline_text_width("|") + gap,
         )
+
+
+class JunctionInkPlacementUnitTest(unittest.TestCase):
+    def test_pipe_and_guidance_follow_ink_edges_when_measurable(self):
+        class _BboxFakeCanvas(_FakeCanvas):
+            def __init__(self, widths):
+                super().__init__()
+                self._widths = dict(widths)
+
+            def bbox(self, item):
+                try:
+                    op = self.ops[int(item) - 1]
+                except (TypeError, ValueError, IndexError):
+                    return None
+                if op[0] != "text":
+                    return None
+                text = str(op[2].get("text") or "")
+                if text not in self._widths:
+                    return None
+                x = int(op[1][0])
+                width = int(self._widths[text])
+                return (x, 0, x + width, 8)
+
+        canvas = _BboxFakeCanvas(
+            {"02h 54m 00s": 60, "|": 4, "N 82~83%": 50}
+        )
+        gap = taskbar_overlay._METRIC_CONTEXT_SEPARATOR_GAP_PX
+        taskbar_overlay._draw_metric_context_text(
+            canvas,
+            "02h 54m 00s"
+            + taskbar_overlay._METRIC_CONTEXT_SEPARATOR
+            + "N 82~83%",
+            x=100,
+            center_y=10,
+            reset_color="#ef4444",
+        )
+
+        texts = {op[2].get("text"): op[1][0] for op in canvas.ops if op[0] == "text"}
+        # Ink-based placement beats estimates: reset ink ends at 160, so the
+        # pipe sits at 160 + gap even though estimates claim 75px of text.
+        self.assertEqual(texts["|"], 100 + 60 + gap)
+        self.assertEqual(texts["N 82~83%"], 100 + 60 + gap + 4 + gap)
 
 
 if __name__ == "__main__":
