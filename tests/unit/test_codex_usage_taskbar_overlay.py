@@ -4034,6 +4034,29 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(geometry["x"], 1724)
         self.assertEqual(geometry["width"], 452)
 
+    def test_bottom_taskbar_geometry_holds_band_edge_slot_against_churn(self):
+        # Anti-oscillation (v0.18.1): a 734px true-left span must not pull
+        # the overlay out of a 652px right slot; the switch margin absorbs
+        # churn-scale differences around the hysteresis band edge.
+        geometry = calculate_taskbar_overlay_geometry(
+            2560,
+            1440,
+            (0, 0, 2560, 1392),
+            occupied_spans=[(0, 102), (852, 1620), (2288, 2560)],
+            preferred_width=866,
+            previous_geometry={
+                "x": 1700,
+                "width": 600,
+                "visible": True,
+                "orientation": "bottom",
+            },
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["_slot_side"], "right")
+        self.assertEqual(geometry["x"], 1628)
+        self.assertEqual(geometry["width"], 652)
+
     def test_bottom_taskbar_geometry_keeps_right_slot_when_selection_is_not_clamped(self):
         # Rightmost preference is untouched when the current slot already
         # fits the target width.
