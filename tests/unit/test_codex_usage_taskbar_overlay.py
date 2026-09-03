@@ -7453,5 +7453,88 @@ class SlotValueWidthUnitTest(unittest.TestCase):
         )
 
 
+class BarFundedAirUnitTest(unittest.TestCase):
+    def _rows(self):
+        seven_day = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 25,
+            "value_text": "25%",
+            "reset_text": "05d 19h 56m 47s",
+            "reset_short_text": "5d 19h",
+            "reset_badge_label": "B",
+            "reset_badge_short_label": "B",
+            "normal_guidance_text": "N 84% / 4d 1h",
+            "normal_guidance_short_text": "N 84%",
+        }
+        five_hour = dict(
+            seven_day,
+            key="5h",
+            metric_key="five_hour_limit",
+            percent=91,
+            value_text="91%",
+            reset_text="04h 39m 08s",
+            reset_short_text="4h 39m",
+            normal_guidance_text="N 94% / 7m",
+            normal_guidance_short_text="N 94%",
+        )
+        return (seven_day,), (five_hour, seven_day)
+
+    def test_bar_air_subtracts_from_global_floor(self):
+        first, second = self._rows()
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            778, [first, second]
+        )
+        mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(row_layouts))
+        plain = taskbar_overlay._slot_minimum_progress_widths(
+            row_layouts, badge_mode=mode
+        )
+        funded = taskbar_overlay._slot_minimum_progress_widths(
+            row_layouts, badge_mode=mode, bar_air=6
+        )
+
+        self.assertTrue(plain)
+        for key, width in funded.items():
+            self.assertEqual(width, max(0, plain[key] - 6))
+
+    def test_bar_air_zero_is_noop(self):
+        first, second = self._rows()
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            778, [first, second]
+        )
+        mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(row_layouts))
+
+        self.assertEqual(
+            taskbar_overlay._slot_minimum_progress_widths(
+                row_layouts, badge_mode=mode, bar_air=0
+            ),
+            taskbar_overlay._slot_minimum_progress_widths(
+                row_layouts, badge_mode=mode
+            ),
+        )
+
+    def test_bar_air_never_pushes_bars_below_text_priority_floor(self):
+        first, second = self._rows()
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            176, [first, second]
+        )
+        mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(row_layouts))
+        plain = taskbar_overlay._slot_minimum_progress_widths(
+            row_layouts, badge_mode=mode
+        )
+
+        self.assertTrue(plain)
+        self.assertLess(
+            min(plain.values()),
+            taskbar_overlay._METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+        )
+        self.assertEqual(
+            taskbar_overlay._slot_minimum_progress_widths(
+                row_layouts, badge_mode=mode, bar_air=6
+            ),
+            plain,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
