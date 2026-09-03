@@ -3989,12 +3989,12 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertTrue(geometry["visible"])
         self.assertGreaterEqual(geometry["x"], 820)
 
-    def test_bottom_taskbar_geometry_moves_to_wider_unbiased_slot_when_clamped(self):
-        # Live RCA (v0.18.0): the sampler excludes the overlay's own window
-        # rect from occupied spans, so the measured spans contain a self-made
-        # 452px free slot around the current right position. The stability
-        # check re-locks it every tick while the true widest free span
-        # (734px, left) sits unused against a preferred width of 866.
+    def test_bottom_taskbar_geometry_latches_right_side_while_usable(self):
+        # Side latch (v0.18.2): while the previous side still offers a usable
+        # span the overlay never crosses sides, so width churn elsewhere
+        # cannot oscillate it. This supersedes the v0.18.0 move-out behavior
+        # for latched sides; global re-picks happen on cold starts and side
+        # collapses only.
         geometry = calculate_taskbar_overlay_geometry(
             2560,
             1440,
@@ -4010,8 +4010,50 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
 
         self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["_slot_side"], "right")
+        self.assertEqual(geometry["x"], 1724)
+        self.assertEqual(geometry["width"], 452)
+
+    def test_bottom_taskbar_geometry_latches_left_side_while_usable(self):
+        geometry = calculate_taskbar_overlay_geometry(
+            2560,
+            1440,
+            (0, 0, 2560, 1392),
+            occupied_spans=[(0, 102), (852, 1716), (2184, 2560)],
+            preferred_width=866,
+            previous_geometry={
+                "x": 200,
+                "width": 600,
+                "visible": True,
+                "orientation": "bottom",
+            },
+        )
+
+        self.assertTrue(geometry["visible"])
         self.assertEqual(geometry["_slot_side"], "left")
-        self.assertLessEqual(geometry["x"] + geometry["width"], 844)
+        self.assertEqual(geometry["x"], 110)
+        self.assertEqual(geometry["width"], 734)
+
+    def test_bottom_taskbar_geometry_escapes_collapsed_side_to_unbiased_slot(self):
+        # Collapse escape: no usable span left on the previous side, so the
+        # global logic (with the unbiased wider-slot redirect) re-picks.
+        geometry = calculate_taskbar_overlay_geometry(
+            2560,
+            1440,
+            (0, 0, 2560, 1392),
+            occupied_spans=[(0, 102), (852, 2560)],
+            preferred_width=866,
+            previous_geometry={
+                "x": 1724,
+                "width": 452,
+                "visible": True,
+                "orientation": "bottom",
+            },
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertEqual(geometry["_slot_side"], "left")
+        self.assertEqual(geometry["x"], 110)
         self.assertEqual(geometry["width"], 734)
 
     def test_bottom_taskbar_geometry_keeps_right_slot_when_unbiased_slot_is_not_wider(self):
@@ -5024,7 +5066,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(geometry["x"], 728)
         self.assertEqual(geometry["_slot_side"], "right")
 
-    def test_bottom_taskbar_geometry_prefers_recovered_right_slot_over_previous_left_slot(self):
+    def test_bottom_taskbar_geometry_latches_previous_left_slot_despite_recovered_right_slot(self):
+        # Side latch (v0.18.2): a recovered right slot must not pull the
+        # overlay across sides while the previous left side stays usable.
+        # Cross-side recovery jumps were the observed left-right oscillation
+        # vector; re-picks happen on cold starts and side collapses only.
         previous_left_geometry = {
             "x": 212,
             "y": 1041,
@@ -5044,9 +5090,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
 
         self.assertTrue(geometry["visible"])
-        self.assertEqual(geometry["x"], 1012)
+        self.assertEqual(geometry["x"], 212)
         self.assertEqual(geometry["width"], 300)
-        self.assertEqual(geometry["_slot_side"], "right")
+        self.assertEqual(geometry["_slot_side"], "left")
 
     def test_cross_center_slot_uses_final_overlay_position_for_right_side_identity(self):
         geometry = calculate_taskbar_overlay_geometry(
