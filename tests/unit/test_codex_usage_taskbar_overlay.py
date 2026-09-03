@@ -318,11 +318,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(weekly_metric["normal_max_percent"], 61)
         self.assertEqual(
             weekly_metric["normal_guidance_text"],
-            "N 58~61% / 12h",
+            "N 58~61% / 00d 12h 00m 00s",
         )
         self.assertEqual(
             weekly_metric["normal_guidance_short_text"],
-            "N 58~61% / 12h",
+            "N 58~61% / 00d 12h 00m 00s",
         )
         self.assertEqual(weekly_metric["normal_transition_seconds"], 12 * 60 * 60)
         self.assertEqual(weekly_metric["reset_direction"], "shortage")
@@ -347,7 +347,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             with_five_hour["bars"][0]["metrics"][0]["normal_guidance_text"],
-            "N 60~64% / 30m",
+            "N 60~64% / 00h 30m 00s",
         )
 
     def test_codex_guidance_collapses_a_single_percent_normal_target(self):
@@ -385,7 +385,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(metric["normal_max_percent"], 88)
         self.assertEqual(
             metric["normal_guidance_text"],
-            "N 88% / 9h 15m",
+            "N 88% / 00d 09h 14m 25s",
         )
 
     def test_datetime_precision_uses_hour_minute_countdown_within_same_day(self):
@@ -833,7 +833,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             first_metrics[0]["normal_guidance_text"],
-            "N 37~43% / 20m",
+            "N 37~43% / 00h 20m 00s",
         )
 
         first_metrics = second_model["bars"][0]["metrics"]
@@ -864,7 +864,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             first_metrics[0]["normal_guidance_text"],
-            "N 17~25% / 15m",
+            "N 17~25% / 00h 15m 00s",
         )
 
     def test_model_marks_fast_early_weekly_burn_as_shortage(self):
@@ -2403,7 +2403,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             now=datetime(2026, 6, 1, 10, 0, tzinfo=timezone(timedelta(hours=9))),
         )
         self.assertEqual(at_reset_edge["direction"], "shortage")
-        self.assertEqual(at_reset_edge["text"], "N 60~63% / 4d 3h")
+        self.assertEqual(at_reset_edge["text"], "N 60~63% / 04d 03h 49m 00s")
 
         surplus = taskbar_overlay._build_normal_guidance(
             metric_key="five_hour_limit",
@@ -7129,6 +7129,26 @@ class MetricContextSeparatorUnitTest(unittest.TestCase):
         reset, guidance = taskbar_overlay._split_metric_context_text(joined)
         self.assertEqual(reset, "02h 54m 00s")
         self.assertEqual(guidance, "N 82~83%")
+
+
+class GuidanceDurationVerboseUnitTest(unittest.TestCase):
+    def test_five_hour_shape_is_fixed_hh_mm_ss(self):
+        fmt = taskbar_overlay._format_guidance_duration_verbose
+        self.assertEqual(fmt(0), "00h 00m 00s")
+        self.assertEqual(fmt(45), "00h 00m 45s")
+        self.assertEqual(fmt(2 * 3600 + 9 * 60 + 5), "02h 09m 05s")
+        self.assertEqual(fmt(-30), "00h 00m 00s")
+
+    def test_weekly_shape_is_fixed_dd_hh_mm_ss(self):
+        fmt = taskbar_overlay._format_guidance_duration_verbose
+        weekly = lambda seconds: fmt(seconds, weekly=True)  # noqa: E731
+        self.assertEqual(weekly(0), "00d 00h 00m 00s")
+        self.assertEqual(
+            weekly(4 * 86400 + 3600 + 65), "04d 01h 01m 05s"
+        )
+        self.assertEqual(
+            weekly(5 * 86400 + 22 * 3600 + 26 * 60 + 17), "05d 22h 26m 17s"
+        )
 
 
 if __name__ == "__main__":

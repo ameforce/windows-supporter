@@ -5786,7 +5786,9 @@ def _build_normal_guidance(
         )
         normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
 
-    transition_text = _format_guidance_duration(normal_transition_seconds)
+    transition_text = _format_guidance_duration_verbose(
+        normal_transition_seconds, weekly=(str(metric_key or "") == "weekly_limit")
+    )
 
     range_text = (
         f"{normal_min_percent}%"
@@ -5805,20 +5807,20 @@ def _build_normal_guidance(
     }
 
 
-def _format_guidance_duration(seconds: int) -> str:
-    total_minutes = max(1, int(math.ceil(max(0, int(seconds)) / 60.0)))
-    if total_minutes < 60:
-        return f"{total_minutes}m"
-    hours, minutes = divmod(total_minutes, 60)
-    if hours < 24:
-        if minutes:
-            return f"{hours}h {minutes}m"
-        return f"{hours}h"
-    days, remaining_minutes = divmod(hours, 24)
-    hours -= days * 24
-    if hours:
-        return f"{days}d {hours}h"
-    return f"{days}d {minutes}m"
+def _format_guidance_duration_verbose(seconds: int, *, weekly: bool = False) -> str:
+    """Fixed-shape guidance durations: 5H `hh mm ss`, 7D `dd hh mm ss`.
+
+    Every unit always renders (zero-padded like the countdown detail
+    shapes) so columns keep a stable shape as values tick, instead of the
+    short form that drops units (`4h 6m`, `6d 0h`).
+    """
+    total_seconds = max(0, int(seconds))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if weekly:
+        days, hours = divmod(hours, 24)
+        return f"{days:02d}d {hours:02d}h {minutes:02d}m {seconds:02d}s"
+    return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
 
 
 def _snapshot_reset_direction(
