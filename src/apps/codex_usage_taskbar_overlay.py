@@ -1453,6 +1453,62 @@ def _rects_overlap(left: tuple[int, int, int, int], right: tuple[int, int, int, 
     )
 
 
+# Mirrors the main UI floor contract (main_ui._UI_BASE_SCALE): Tk resolves
+# named font point sizes through this scaling, sampled only when set.
+_OVERLAY_UI_BASE_SCALE = 1.25
+
+
+def _current_system_scaling() -> float | None:
+    """Return the live system DPI as Tk scaling units, or None when unknown."""
+    try:
+        user32 = getattr(getattr(ctypes, "windll", None), "user32", None)
+        get_dpi = getattr(user32, "GetDpiForSystem", None)
+        if not callable(get_dpi):
+            return None
+        dpi = int(get_dpi())
+    except Exception:
+        return None
+    if dpi <= 0:
+        return None
+    return float(dpi) / 72.0
+
+
+def _apply_overlay_base_ui_scaling(root: Any) -> float | None:
+    """Re-apply the minimum Tk scaling floor to the overlay root.
+
+    A session DPI change (RDP connect/disconnect, monitor swap) would
+    otherwise leave overlay glyphs rendered at the previous session's scale
+    until restart, because Tk samples scaling only when it is set. All
+    layout math in this module is pure (DPI-independent estimates), so only
+    the live font rendering needs the refresh. Returns the applied scaling.
+    """
+    tk_api = getattr(root, "tk", None)
+    tk_call = getattr(tk_api, "call", None)
+    if not callable(tk_call):
+        return None
+    try:
+        current = float(tk_call("tk", "scaling"))
+    except Exception:
+        return None
+    base = 96.0 / 72.0
+    if base <= 0:
+        return None
+    fresh = _current_system_scaling()
+    if fresh is None:
+        target = max(current, base * _OVERLAY_UI_BASE_SCALE)
+    else:
+        # Track the live system scale in both directions (a restart would
+        # observe `fresh`); the floor only guards legibility minimums.
+        target = max(fresh, base * _OVERLAY_UI_BASE_SCALE)
+    if abs(target - current) <= 1e-9:
+        return current
+    try:
+        tk_call("tk", "scaling", target)
+    except Exception:
+        return current
+    return target
+
+
 class CodexUsageTaskbarOverlay:
     def __init__(
         self,
@@ -1652,8 +1708,12 @@ class CodexUsageTaskbarOverlay:
         RDP connect/disconnect and monitor add/remove can change the effective DPI
         scale of this (DPI-unaware) process mid-flight, so coordinates captured
         before the change must never feed slot selection or regression stabilization.
+        Tk font scaling is refreshed alongside: it is sampled only when set, so
+        without this the overlay glyphs would keep the previous session's scale
+        until restart.
         """
         self.invalidate_geometry()
+        _apply_overlay_base_ui_scaling(self._root)
         self._last_metric_values.clear()
         self._flash_until.clear()
         self._last_model = None
