@@ -1082,6 +1082,45 @@ def _slot_minimum_progress_widths(
     return floors
 
 
+def _proportional_extra_shares(
+    slot_keys: list[str],
+    needs: dict[str, int],
+    extra_px: int,
+    *,
+    skip: tuple[str, ...] = (),
+) -> dict[str, int]:
+    """Split leftover width proportionally to column needs.
+
+    Equal splits inflate small-need columns (credit) while starving
+    text-heavy ones, leaving dead space beside cramped bars. Need shares
+    keep every column tight to its content and fund the starved bars first.
+    Skipped slots (credit carries no bar) take nothing. Deterministic:
+    largest fractional remainder wins, slot order breaks ties.
+    """
+    shares = {key: 0 for key in slot_keys}
+    extra = max(0, int(extra_px))
+    skipped = set(skip or ())
+    eligible = [key for key in slot_keys if key not in skipped]
+    total = sum(max(0, int(needs.get(key, 0) or 0)) for key in eligible)
+    if extra <= 0 or total <= 0 or not eligible:
+        return shares
+    remainders = []
+    used = 0
+    for index, key in enumerate(eligible):
+        need = max(0, int(needs.get(key, 0) or 0))
+        share, frac = divmod(extra * need, total)
+        shares[key] = share
+        used += share
+        remainders.append((frac, -index, key))
+    leftover = extra - used
+    for _frac, _negindex, key in sorted(remainders, reverse=True):
+        if leftover <= 0:
+            break
+        shares[key] += 1
+        leftover -= 1
+    return shares
+
+
 def _metric_rows_layout_for_overlay_width(
     width: int,
     rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
@@ -1123,10 +1162,15 @@ def _metric_rows_layout_for_overlay_width(
     if counts and total_required <= metrics_width:
         # Text-first allocation on the shared grid: reserve each column's
         # widest requirement across rows and hand the leftover to the bars,
-        # so no row's text is dropped while free width remains.
-        extra = (metrics_width - total_required) // counts
+        # so no row's text is dropped while free width remains. Leftover goes
+        # by need (starved text-heavy columns first, never credit), so bars
+        # converge instead of leaving dead space beside cramped ones.
+        extra = metrics_width - total_required
+        shares = _proportional_extra_shares(
+            slot_keys, required_by_slot, extra, skip=("credit",)
+        )
         for key in slot_keys:
-            column_width = required_by_slot[key] + extra
+            column_width = required_by_slot[key] + shares.get(key, 0)
             column_widths[key] = column_width
             column_progresses[key] = int(
                 max(
@@ -1153,9 +1197,12 @@ def _metric_rows_layout_for_overlay_width(
                     break
         total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
         if counts and total_min <= metrics_width:
-            extra = (metrics_width - total_min) // counts
+            extra = metrics_width - total_min
+            shares = _proportional_extra_shares(
+                slot_keys, min_by_slot, extra, skip=("credit",)
+            )
             for key in slot_keys:
-                column_width = min_by_slot[key] + extra
+                column_width = min_by_slot[key] + shares.get(key, 0)
                 column_widths[key] = column_width
                 column_progresses[key] = min(
                     _metric_progress_width_for_segment(column_width),

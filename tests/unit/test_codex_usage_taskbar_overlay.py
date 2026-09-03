@@ -4597,7 +4597,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             (narrow_metric, wide_metric),
         )
         narrower_row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
-            width - 1,
+            width - 8,
             (narrow_metric, wide_metric),
         )
         required_wide_segment = taskbar_overlay._required_metric_segment_width(wide_metric)
@@ -7058,7 +7058,10 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
             row_layouts, badge_mode=mode
         )
 
-        self.assertEqual(floors["weekly_limit"], 11)
+        # Need-based distribution satisfied both bars: the weekly slot no
+        # longer degrades below the shared progress.
+        self.assertEqual(floors["weekly_limit"], 36)
+        self.assertEqual(floors["five_hour_limit"], 36)
         self.assertEqual(floors["five_hour_limit"], 36)
         self.assertNotIn("credit", floors)
 
