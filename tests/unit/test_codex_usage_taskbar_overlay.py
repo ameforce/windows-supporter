@@ -7004,6 +7004,44 @@ class OverlayUiScalingUnitTest(unittest.TestCase):
 
 
 class SlotMinimumBarUnitTest(unittest.TestCase):
+    def test_global_minimum_unifies_all_slots(self):
+        short_texts = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 50,
+            "value_text": "50%",
+            "reset_text": "02h 00m 00s",
+            "reset_short_text": "02h 00m 00s",
+            "reset_badge_label": "B",
+            "reset_badge_short_label": "B",
+            "normal_guidance_text": "N 50% / 2h",
+            "normal_guidance_short_text": "N 50%",
+        }
+        long_texts = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 50,
+            "value_text": "50%",
+            "reset_text": "06d 20h 00m 00s",
+            "reset_short_text": "6d 20h",
+            "reset_badge_label": "LongerBadge",
+            "reset_badge_short_label": "LongerBadge",
+            "normal_guidance_text": "N 50~99% / 06d 20h 00m 00s with extra words here",
+            "normal_guidance_short_text": "N 50~99%",
+        }
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            500, [(short_texts, long_texts)]
+        )
+        mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(row_layouts))
+
+        floors = taskbar_overlay._slot_minimum_progress_widths(
+            row_layouts, badge_mode=mode
+        )
+
+        # P2: every track shares one width, including across slots.
+        self.assertEqual(floors["five_hour_limit"], floors["weekly_limit"])
+        self.assertEqual(floors["weekly_limit"], 7)
+
     def _live_like_rows(self):
         seven_day_sparse = {
             "key": "7d",

@@ -1048,13 +1048,14 @@ def _slot_minimum_progress_widths(
     row_layouts: list[Any],
     badge_mode: str = "any",
 ) -> dict[str, int]:
-    """Minimum fitted bar width per metric slot across rows.
+    """Minimum fitted bar width across every metric slot and row.
 
     The shared grid allocates equal progress per slot, but the per-row fit
     shrinks bars to preserve each row's longer texts, so same-column bars
-    render at different widths. Drawing every row at the slot minimum keeps
-    the grid contract (narrowing a bar never drops already-fitting texts).
-    Credit slots carry no bar and are skipped.
+    render at different widths. Drawing everything at the global minimum
+    keeps the grid contract (narrowing a bar never drops already-fitting
+    texts) and makes all tracks identical. Credit slots carry no bar and
+    are skipped.
     """
     floors: dict[str, int] = {}
     for row_layout in row_layouts:
@@ -1079,7 +1080,14 @@ def _slot_minimum_progress_widths(
             progressed = int(fit.get("progress_width") or 0)
             if key not in floors or progressed < floors[key]:
                 floors[key] = progressed
-    return floors
+    if not floors:
+        return floors
+    # P2 grid uniformity: every track shares one width. The global minimum
+    # also covers cross-slot pairs (5H vs 7D), not just same-column twins.
+    # Narrowing a bar never drops fitting texts, so this only removes the
+    # size difference, never information.
+    global_floor = min(floors.values())
+    return {key: global_floor for key in floors}
 
 
 def _proportional_extra_shares(
