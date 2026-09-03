@@ -1120,6 +1120,8 @@ def _slot_value_widths(row_layouts: list[Any]) -> dict[str, int]:
 def _slot_minimum_progress_widths(
     row_layouts: list[Any],
     badge_mode: str = "any",
+    *,
+    bar_air: int = 0,
 ) -> dict[str, int]:
     """Minimum fitted bar width across every metric slot and row.
 
@@ -1128,7 +1130,8 @@ def _slot_minimum_progress_widths(
     render at different widths. Drawing everything at the global minimum
     keeps the grid contract (narrowing a bar never drops already-fitting
     texts) and makes all tracks identical. Credit slots carry no bar and
-    are skipped.
+    are skipped. `bar_air` funds the right-edge breathing room out of the
+    bars (never texts) so tight slots keep symmetric margins too.
     """
     floors: dict[str, int] = {}
     slot_values = _slot_value_widths(row_layouts)
@@ -1165,7 +1168,12 @@ def _slot_minimum_progress_widths(
     # also covers cross-slot pairs (5H vs 7D), not just same-column twins.
     # Narrowing a bar never drops fitting texts, so this only removes the
     # size difference, never information.
-    global_floor = min(floors.values())
+    # Right air is funded out of bar excess only: never push bars below the
+    # text-priority floor for air, and never touch texts for it.
+    base_floor = min(floors.values())
+    fundable = max(0, base_floor - _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX)
+    funded = min(max(0, int(bar_air or 0)), fundable)
+    global_floor = base_floor - funded
     return {key: global_floor for key in floors}
 
 
@@ -3160,9 +3168,28 @@ class CodexUsageTaskbarOverlay:
         # slot, but each row's fit would shrink its bar for its longer texts.
         # Drawing every row at the slot minimum honors the same-bar-width
         # grid contract (narrowing a bar never drops fitting texts).
+        # Right air that the width reserve did not fund is taken from the
+        # bars (never texts) so tight slots keep symmetric margins too.
+        first_layout = row_entries[0][1] if row_entries else None
+        width_air = 0
+        if first_layout is not None:
+            try:
+                width_air = max(
+                    0,
+                    int(width)
+                    - (
+                        int(first_layout.metrics_x)
+                        + int(first_layout.metrics_width)
+                    )
+                    - int(_OVERLAY_RIGHT_PADDING_PX),
+                )
+            except (TypeError, ValueError):
+                width_air = 0
+        bar_air = max(0, int(_OVERLAY_RIGHT_AIR_RESERVE_PX) - int(width_air))
         slot_progress_floor = _slot_minimum_progress_widths(
             [row_layout for _bar, row_layout in row_entries],
             badge_mode=overlay_badge_mode,
+            bar_air=bar_air,
         )
         # One value column per slot: measured percent widths would jitter
         # value/badge/countdown x positions per row, so every row shares the
