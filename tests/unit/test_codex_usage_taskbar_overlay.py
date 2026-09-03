@@ -7192,6 +7192,55 @@ class GuidanceDurationVerboseUnitTest(unittest.TestCase):
         )
 
 
+class RightAirReserveUnitTest(unittest.TestCase):
+    def _sparse(self):
+        return {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 0,
+            "value_text": "0%",
+            "reset_text": "03d 21h 50m 04s",
+            "reset_short_text": "3d 21h",
+            "reset_badge_label": "B",
+            "reset_badge_short_label": "B",
+            "normal_guidance_text": "N 56~59% / 3d 20h",
+            "normal_guidance_short_text": "N 56~59%",
+        }
+
+    def test_roomy_layout_keeps_air_reserve(self):
+        layout = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            778, [(self._sparse(),)]
+        )[0]
+
+        self.assertEqual(
+            778 - (layout.metrics_x + layout.metrics_width),
+            taskbar_overlay._OVERLAY_RIGHT_PADDING_PX
+            + taskbar_overlay._OVERLAY_RIGHT_AIR_RESERVE_PX,
+        )
+
+    def test_tight_layout_skips_air_reserve(self):
+        sparse = self._sparse()
+        dense = dict(
+            sparse,
+            key="5h",
+            metric_key="five_hour_limit",
+            value_text="91%",
+            reset_text="04h 39m 08s",
+            reset_short_text="4h 39m",
+            normal_guidance_text="N 94% / 7m",
+            normal_guidance_short_text="N 94%",
+        )
+        credit = {"key": "CR", "metric_key": "credit", "value_text": "164"}
+        layout = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            456, [(sparse,), (dense, sparse, credit)]
+        )[0]
+
+        self.assertEqual(
+            456 - (layout.metrics_x + layout.metrics_width),
+            taskbar_overlay._OVERLAY_RIGHT_PADDING_PX,
+        )
+
+
 class PreviousGeometryForTickUnitTest(unittest.TestCase):
     def test_visible_model_wins(self):
         model = {"geometry": {"x": 1, "visible": True}}

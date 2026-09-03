@@ -199,6 +199,11 @@ _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
 _SEGMENT_RIGHT_PADDING_PX = 2
 _OVERLAY_RIGHT_PADDING_PX = 10
+# Breathing air kept clear at the overlay right edge so last-segment ink
+# never touches the border (estimate slop lets it reach the edge). Applied
+# only when slack covers it; clamped slots keep every pixel for content so
+# countdowns and badges never yield for air.
+_OVERLAY_RIGHT_AIR_RESERVE_PX = 6
 _METRIC_PROGRESS_MIN_WIDTH_PX = 28
 _METRIC_PROGRESS_PREFERRED_WIDTH_PX = 36
 _METRIC_PROGRESS_MAX_WIDTH_PX = 48
@@ -1152,7 +1157,6 @@ def _metric_rows_layout_for_overlay_width(
     label_width = _label_width_for_overlay_width(overlay_width)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
-    metrics_width = max(0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX)
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
 
     slot_keys = _metric_slot_keys(rows_metrics)
@@ -1168,9 +1172,20 @@ def _metric_rows_layout_for_overlay_width(
             if required > required_by_slot.get(key, 0):
                 required_by_slot[key] = required
 
+    base_need = sum(required_by_slot.values()) + segment_gap * max(0, counts - 1)
+    right_air = (
+        _OVERLAY_RIGHT_AIR_RESERVE_PX
+        if overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - base_need
+        >= _OVERLAY_RIGHT_AIR_RESERVE_PX
+        else 0
+    )
+    metrics_width = max(
+        0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - right_air
+    )
+
     column_widths: dict[str, int] = {}
     column_progresses: dict[str, int] = {}
-    total_required = sum(required_by_slot.values()) + segment_gap * max(0, counts - 1)
+    total_required = base_need
     if counts and total_required <= metrics_width:
         # Text-first allocation on the shared grid: reserve each column's
         # widest requirement across rows and hand the leftover to the bars,
