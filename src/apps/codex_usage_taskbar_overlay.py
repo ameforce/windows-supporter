@@ -54,10 +54,6 @@ _DEFAULT_GEOMETRY = {
 
 _GEOMETRY_COORDINATE_BASIS = "physical_px"
 _EMPTY_SLOT_PADDING_PX = 8
-# A side switch must buy a badge-block-scale upgrade: absorbs taskbar churn
-# around the hysteresis band edge so the overlay does not oscillate between
-# two nearly-even slots. The side-switch dwell still damps sustained changes.
-_SLOT_SWITCH_WIDTH_MARGIN_PX = 96
 _MIN_EMPTY_SLOT_WIDTH_PX = 300
 _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX = 176
 # Matches the default geometry width cap: the preferred-width search must be
@@ -3480,39 +3476,28 @@ def _fit_horizontal_geometry_to_empty_slot(
             max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
             desired_width,
         )
-    # Side latch: while the previous side still offers a usable span, choose
-    # within it so taskbar churn on the other side cannot oscillate the
-    # overlay. Cold starts and side collapses fall back to the global logic
-    # (rightmost preference, full-fit fallback, unbiased wider slot).
-    latched_spans = _latched_side_spans(
-        free_spans,
-        previous_geometry,
-        screen_width=int(screen_width),
-    )
-    slot_spans = latched_spans if latched_spans is not None else free_spans
     selected_slot = _selected_free_slot(
-        slot_spans,
+        free_spans,
         previous_geometry=previous_geometry,
         target_width=target_width,
     )
     if selected_slot is not None:
         fallback_slot = _wider_left_fallback_slot(
-            slot_spans,
+            free_spans,
             selected_slot,
             target_width=target_width,
         )
         if fallback_slot is not None:
             selected_slot = fallback_slot
-        if latched_spans is None:
-            unbiased_slot = _wider_unbiased_slot_when_clamped(
-                list(normalized_spans),
-                selected_slot,
-                previous_geometry,
-                screen_width=int(screen_width),
-                target_width=target_width,
-            )
-            if unbiased_slot is not None:
-                selected_slot = unbiased_slot
+        unbiased_slot = _wider_unbiased_slot_when_clamped(
+            list(normalized_spans),
+            selected_slot,
+            previous_geometry,
+            screen_width=int(screen_width),
+            target_width=target_width,
+        )
+        if unbiased_slot is not None:
+            selected_slot = unbiased_slot
     if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
@@ -3576,43 +3561,6 @@ def _fit_horizontal_geometry_to_empty_slot(
     return fitted
 
 
-def _latched_side_spans(
-    free_spans: list[tuple[int, int]],
-    previous_geometry: dict[str, Any] | None,
-    *,
-    screen_width: int,
-) -> list[tuple[int, int]] | None:
-    """Return previous-side usable spans, or None for a global re-pick.
-
-    Side identity mirrors `_slot_side_for_geometry` (span midpoint against
-    the screen midpoint). While the latched side still offers a usable span
-    the overlay never crosses sides, so width churn elsewhere cannot
-    oscillate it. Cold starts (no previous rect) and side collapses (no
-    usable span left on the previous side) return None for the global logic.
-    """
-    if not isinstance(previous_geometry, dict):
-        return None
-    try:
-        prev_x = int(previous_geometry.get("x", 0))
-        prev_width = int(previous_geometry.get("width", 0))
-    except (TypeError, ValueError):
-        return None
-    if prev_width <= 0:
-        return None
-    prev_center_twice = prev_x * 2 + prev_width
-    screen_mid_twice = int(screen_width)
-    same_side = [
-        span
-        for span in free_spans
-        if ((int(span[0]) + int(span[1])) >= screen_mid_twice)
-        == (prev_center_twice >= screen_mid_twice)
-        and int(span[1]) - int(span[0]) >= _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
-    ]
-    if not same_side:
-        return None
-    return same_side
-
-
 def _selected_free_slot(
     free_spans: list[tuple[int, int]],
     *,
@@ -3635,6 +3583,13 @@ def _selected_free_slot(
     )
     if previous_slot is not None:
         return previous_slot
+    overlap_slot = _previous_geometry_overlap_slot(
+        candidates,
+        previous_geometry=previous_geometry,
+        target_width=target_width,
+    )
+    if overlap_slot is not None:
+        return overlap_slot
     return rightmost_slot
 
 
@@ -3681,8 +3636,8 @@ def _wider_unbiased_slot_when_clamped(
     when the true widest free span sits elsewhere and the overlay is clamped.
     When the selected slot cannot fit `target_width`, merge the previous
     window rect back into occupied and switch to a strictly wider unbiased
-    span. The switch requires a margin over the selected width so churn
-    around the hysteresis band edge does not oscillate the overlay.
+    span. The strict improvement converges instead of oscillating, and the
+    side-switch dwell still damps transient candidates.
     Unclamped selections keep the rightmost preference untouched.
     """
     try:
@@ -3709,7 +3664,7 @@ def _wider_unbiased_slot_when_clamped(
     )
     prev_center = prev_x + max(1, prev_width) // 2
     best: tuple[int, int] | None = None
-    best_width = selected_width + int(_SLOT_SWITCH_WIDTH_MARGIN_PX)
+    best_width = selected_width
     for start, end in unbiased_free:
         width = int(end) - int(start)
         if width <= best_width:
@@ -3771,6 +3726,58 @@ def _previous_geometry_free_slot(
         if int(start) <= previous_center <= int(end):
             return int(start), int(end)
     return None
+
+
+def _previous_geometry_overlap_slot(
+    free_spans: list[tuple[int, int]],
+    *,
+    previous_geometry: dict[str, Any] | None,
+    target_width: int | None,
+) -> tuple[int, int] | None:
+    """Return the free span the previous rect substantially overlaps.
+
+    Center containment alone drops the previous slot when span edges breathe
+    by a few pixels, jumping to the rightmost slot even when it is narrower.
+    An overlapping span keeps the position while the unbiased wider-slot
+    redirect still handles genuine improvements, so neither edge jitter nor
+    the self-made slot can oscillate the overlay by itself.
+    """
+    if not isinstance(previous_geometry, dict) or not bool(
+        previous_geometry.get("visible", True)
+    ):
+        return None
+    if str(previous_geometry.get("orientation") or "") not in {"bottom", "top"}:
+        return None
+    try:
+        previous_x = int(previous_geometry.get("x", 0))
+        previous_width = int(previous_geometry.get("width", 0))
+    except (TypeError, ValueError):
+        return None
+    if previous_width <= 0:
+        return None
+    min_slot_width = _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+    if target_width is not None:
+        try:
+            min_slot_width = min(
+                max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(target_width)),
+                max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, previous_width),
+            )
+        except (TypeError, ValueError):
+            min_slot_width = _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+    previous_end = previous_x + previous_width
+    best: tuple[int, int] | None = None
+    best_overlap = 0
+    for start, end in free_spans:
+        span_width = int(end) - int(start)
+        if span_width < min_slot_width:
+            continue
+        overlap = min(previous_end, int(end)) - max(previous_x, int(start))
+        if overlap <= 0:
+            continue
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = (int(start), int(end))
+    return best
 
 
 def _slot_classification(width: int) -> str:
