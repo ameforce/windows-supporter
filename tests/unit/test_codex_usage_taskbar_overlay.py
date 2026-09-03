@@ -6875,5 +6875,96 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(len(keepalive_callbacks), 2)
 
 
+class _TkFakeRoot(_FakeRoot):
+    def __init__(self, scaling=96.0 / 72.0):
+        super().__init__()
+        self._scaling = float(scaling)
+        self.scaling_sets = []
+
+    @property
+    def tk(self):
+        root = self
+
+        class _Tk:
+            def call(self, *args):
+                if len(args) == 2 and args[0] == "tk" and args[1] == "scaling":
+                    return root._scaling
+                if len(args) == 3 and args[0] == "tk" and args[1] == "scaling":
+                    root._scaling = float(args[2])
+                    root.scaling_sets.append(float(args[2]))
+                    return ""
+                raise AssertionError(f"unexpected tk call: {args!r}")
+
+        return _Tk()
+
+
+class OverlayUiScalingUnitTest(unittest.TestCase):
+    def test_applies_live_system_scale_upward(self):
+        root = _TkFakeRoot(scaling=96.0 / 72.0)
+
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=144.0 / 72.0
+        ):
+            applied = taskbar_overlay._apply_overlay_base_ui_scaling(root)
+
+        self.assertEqual(applied, 144.0 / 72.0)
+        self.assertEqual(root.scaling_sets, [144.0 / 72.0])
+
+    def test_tracks_live_system_scale_downward(self):
+        root = _TkFakeRoot(scaling=144.0 / 72.0)
+
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=96.0 / 72.0
+        ):
+            applied = taskbar_overlay._apply_overlay_base_ui_scaling(root)
+
+        # A restart would observe the floor; stale-bigger must come down.
+        self.assertEqual(applied, max(96.0 / 72.0, 96.0 / 72.0 * 1.25))
+        self.assertEqual(root.scaling_sets, [96.0 / 72.0 * 1.25])
+
+    def test_keeps_floor_when_live_scale_unknown(self):
+        root = _TkFakeRoot(scaling=1.0)
+
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=None
+        ):
+            applied = taskbar_overlay._apply_overlay_base_ui_scaling(root)
+
+        self.assertEqual(applied, 96.0 / 72.0 * 1.25)
+        self.assertEqual(root.scaling_sets, [96.0 / 72.0 * 1.25])
+
+    def test_leaves_higher_scaling_untouched_without_live_scale(self):
+        root = _TkFakeRoot(scaling=144.0 / 72.0)
+
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=None
+        ):
+            applied = taskbar_overlay._apply_overlay_base_ui_scaling(root)
+
+        self.assertEqual(applied, 144.0 / 72.0)
+        self.assertEqual(root.scaling_sets, [])
+
+    def test_missing_tk_returns_none(self):
+        self.assertIsNone(taskbar_overlay._apply_overlay_base_ui_scaling(object()))
+
+    def test_topology_change_refreshes_scaling(self):
+        root = _TkFakeRoot(scaling=96.0 / 72.0)
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            lambda: {
+                "enabled": True,
+                "collect_inflight": False,
+                "accounts": [],
+            },
+        )
+
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=144.0 / 72.0
+        ):
+            overlay.prepare_for_display_topology_change()
+
+        self.assertEqual(root.scaling_sets, [144.0 / 72.0])
+
+
 if __name__ == "__main__":
     unittest.main()
