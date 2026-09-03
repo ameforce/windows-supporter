@@ -190,6 +190,10 @@ _RESET_BADGE_MIN_WIDTH_PX = 14
 _RESET_BADGE_TIME_GAP_PX = 5
 _RESET_BADGE_OUTLINE_WIDTH_PX = 1
 _METRIC_CONTEXT_SEPARATOR_COLOR = "#64748b"
+# Rendered air around the countdown|guidance separator. Matches the joined
+# "  |  " measurement (double space each side) so layout math and pixels
+# agree; single spaces read attached at 6px canvas fonts.
+_METRIC_CONTEXT_SEPARATOR_GAP_PX = 10
 _NORMAL_GUIDANCE_COLOR = "#4ade80"
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
@@ -744,7 +748,7 @@ def _draw_metric_context_text(
         )
         cursor_x += _inline_text_width(reset_text)
     if guidance_text:
-        separator_x = cursor_x + 5
+        separator_x = cursor_x + _METRIC_CONTEXT_SEPARATOR_GAP_PX
         canvas.create_text(
             separator_x,
             center_y,
@@ -753,7 +757,7 @@ def _draw_metric_context_text(
             font=font,
             text="|",
         )
-        cursor_x = separator_x + _inline_text_width("|") + 5
+        cursor_x = separator_x + _inline_text_width("|") + _METRIC_CONTEXT_SEPARATOR_GAP_PX
         canvas.create_text(
             cursor_x,
             center_y,

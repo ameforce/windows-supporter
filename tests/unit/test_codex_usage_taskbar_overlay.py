@@ -7192,5 +7192,28 @@ class GuidanceDurationVerboseUnitTest(unittest.TestCase):
         )
 
 
+class SeparatorGapUnitTest(unittest.TestCase):
+    def test_pipe_and_guidance_honor_gap_constant(self):
+        canvas = _FakeCanvas()
+        gap = taskbar_overlay._METRIC_CONTEXT_SEPARATOR_GAP_PX
+        self.assertGreaterEqual(gap, 8)
+        taskbar_overlay._draw_metric_context_text(
+            canvas,
+            "02h 54m 00s"
+            + taskbar_overlay._METRIC_CONTEXT_SEPARATOR
+            + "N 82~83%",
+            x=100,
+            center_y=10,
+            reset_color="#ef4444",
+        )
+        texts = {op[2].get("text"): op[1][0] for op in canvas.ops if op[0] == "text"}
+        reset_end = 100 + taskbar_overlay._inline_text_width("02h 54m 00s")
+        self.assertEqual(texts["|"], reset_end + gap)
+        self.assertEqual(
+            texts["N 82~83%"],
+            reset_end + gap + taskbar_overlay._inline_text_width("|") + gap,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
