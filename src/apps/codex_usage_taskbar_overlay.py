@@ -697,12 +697,22 @@ def _metric_guidance_texts(metric: dict[str, Any]) -> tuple[str, str]:
     return detail_text, short_text
 
 
+# Context separator with breathing room: at 6-7px canvas fonts a single
+# space each side reads cramped, so the join and every split site share
+# this constant.
+_METRIC_CONTEXT_SEPARATOR = "  |  "
+
+
 def _join_metric_context(reset_text: str, guidance_text: str) -> str:
-    return " | ".join(part for part in (reset_text, guidance_text) if part)
+    return _METRIC_CONTEXT_SEPARATOR.join(
+        part for part in (reset_text, guidance_text) if part
+    )
 
 
 def _split_metric_context_text(text: str) -> tuple[str, str]:
-    reset_text, separator, guidance_text = str(text or "").partition(" | ")
+    reset_text, separator, guidance_text = str(text or "").partition(
+        _METRIC_CONTEXT_SEPARATOR
+    )
     if not separator:
         return reset_text, ""
     return reset_text, guidance_text
@@ -987,7 +997,7 @@ def _metric_countdown_min_width(metric: dict[str, Any]) -> int:
     if _metric_slot_key(metric) == "credit":
         return base
     detail, _ = _metric_guidance_texts(metric)
-    reset_part = str(detail or "").split(" | ")[0]
+    reset_part = str(detail or "").split(_METRIC_CONTEXT_SEPARATOR)[0]
     reset_width = _reset_column_width_for_text(
         reset_part, metric_key=_metric_slot_key(metric)
     )
@@ -1072,6 +1082,45 @@ def _slot_minimum_progress_widths(
     return floors
 
 
+def _proportional_extra_shares(
+    slot_keys: list[str],
+    needs: dict[str, int],
+    extra_px: int,
+    *,
+    skip: tuple[str, ...] = (),
+) -> dict[str, int]:
+    """Split leftover width proportionally to column needs.
+
+    Equal splits inflate small-need columns (credit) while starving
+    text-heavy ones, leaving dead space beside cramped bars. Need shares
+    keep every column tight to its content and fund the starved bars first.
+    Skipped slots (credit carries no bar) take nothing. Deterministic:
+    largest fractional remainder wins, slot order breaks ties.
+    """
+    shares = {key: 0 for key in slot_keys}
+    extra = max(0, int(extra_px))
+    skipped = set(skip or ())
+    eligible = [key for key in slot_keys if key not in skipped]
+    total = sum(max(0, int(needs.get(key, 0) or 0)) for key in eligible)
+    if extra <= 0 or total <= 0 or not eligible:
+        return shares
+    remainders = []
+    used = 0
+    for index, key in enumerate(eligible):
+        need = max(0, int(needs.get(key, 0) or 0))
+        share, frac = divmod(extra * need, total)
+        shares[key] = share
+        used += share
+        remainders.append((frac, -index, key))
+    leftover = extra - used
+    for _frac, _negindex, key in sorted(remainders, reverse=True):
+        if leftover <= 0:
+            break
+        shares[key] += 1
+        leftover -= 1
+    return shares
+
+
 def _metric_rows_layout_for_overlay_width(
     width: int,
     rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
@@ -1113,10 +1162,15 @@ def _metric_rows_layout_for_overlay_width(
     if counts and total_required <= metrics_width:
         # Text-first allocation on the shared grid: reserve each column's
         # widest requirement across rows and hand the leftover to the bars,
-        # so no row's text is dropped while free width remains.
-        extra = (metrics_width - total_required) // counts
+        # so no row's text is dropped while free width remains. Leftover goes
+        # by need (starved text-heavy columns first, never credit), so bars
+        # converge instead of leaving dead space beside cramped ones.
+        extra = metrics_width - total_required
+        shares = _proportional_extra_shares(
+            slot_keys, required_by_slot, extra, skip=("credit",)
+        )
         for key in slot_keys:
-            column_width = required_by_slot[key] + extra
+            column_width = required_by_slot[key] + shares.get(key, 0)
             column_widths[key] = column_width
             column_progresses[key] = int(
                 max(
@@ -1143,9 +1197,12 @@ def _metric_rows_layout_for_overlay_width(
                     break
         total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
         if counts and total_min <= metrics_width:
-            extra = (metrics_width - total_min) // counts
+            extra = metrics_width - total_min
+            shares = _proportional_extra_shares(
+                slot_keys, min_by_slot, extra, skip=("credit",)
+            )
             for key in slot_keys:
-                column_width = min_by_slot[key] + extra
+                column_width = min_by_slot[key] + shares.get(key, 0)
                 column_widths[key] = column_width
                 column_progresses[key] = min(
                     _metric_progress_width_for_segment(column_width),
@@ -5776,7 +5833,9 @@ def _build_normal_guidance(
         )
         normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
 
-    transition_text = _format_guidance_duration(normal_transition_seconds)
+    transition_text = _format_guidance_duration_verbose(
+        normal_transition_seconds, weekly=(str(metric_key or "") == "weekly_limit")
+    )
 
     range_text = (
         f"{normal_min_percent}%"
@@ -5795,20 +5854,20 @@ def _build_normal_guidance(
     }
 
 
-def _format_guidance_duration(seconds: int) -> str:
-    total_minutes = max(1, int(math.ceil(max(0, int(seconds)) / 60.0)))
-    if total_minutes < 60:
-        return f"{total_minutes}m"
-    hours, minutes = divmod(total_minutes, 60)
-    if hours < 24:
-        if minutes:
-            return f"{hours}h {minutes}m"
-        return f"{hours}h"
-    days, remaining_minutes = divmod(hours, 24)
-    hours -= days * 24
-    if hours:
-        return f"{days}d {hours}h"
-    return f"{days}d {minutes}m"
+def _format_guidance_duration_verbose(seconds: int, *, weekly: bool = False) -> str:
+    """Fixed-shape guidance durations: 5H `hh mm ss`, 7D `dd hh mm ss`.
+
+    Every unit always renders (zero-padded like the countdown detail
+    shapes) so columns keep a stable shape as values tick, instead of the
+    short form that drops units (`4h 6m`, `6d 0h`).
+    """
+    total_seconds = max(0, int(seconds))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if weekly:
+        days, hours = divmod(hours, 24)
+        return f"{days:02d}d {hours:02d}h {minutes:02d}m {seconds:02d}s"
+    return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
 
 
 def _snapshot_reset_direction(
@@ -6077,7 +6136,7 @@ def _display_reset_text_for_space(
             candidates.append(short)
     # Reset-only fallback: the countdown keeps its fixed shape and the
     # guidance suffix is what yields when the column is cramped.
-    reset_only = detail.split(" | ")[0] if detail else ""
+    reset_only = detail.split(_METRIC_CONTEXT_SEPARATOR)[0] if detail else ""
     if reset_only and reset_only != detail:
         candidates.append(reset_only)
     for text in candidates:
@@ -6372,7 +6431,7 @@ def _fit_reset_badge_for_space(
         # Reset-only variants: when even the joined countdown|guidance text
         # cannot fit, the fixed countdown shape survives and the guidance
         # suffix is the part that yields.
-        reset_only = detail.split(" | ")[0] if detail else ""
+        reset_only = detail.split(_METRIC_CONTEXT_SEPARATOR)[0] if detail else ""
         if reset_only and reset_only != detail:
             reset_only_width = _reset_column_width_for_text(
                 reset_only, metric_key=metric_key
