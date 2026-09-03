@@ -190,6 +190,10 @@ _RESET_BADGE_MIN_WIDTH_PX = 14
 _RESET_BADGE_TIME_GAP_PX = 5
 _RESET_BADGE_OUTLINE_WIDTH_PX = 1
 _METRIC_CONTEXT_SEPARATOR_COLOR = "#64748b"
+# Rendered air around the countdown|guidance separator. Matches the joined
+# "  |  " measurement (double space each side) so layout math and pixels
+# agree; single spaces read attached at 6px canvas fonts.
+_METRIC_CONTEXT_SEPARATOR_GAP_PX = 10
 _NORMAL_GUIDANCE_COLOR = "#4ade80"
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
@@ -744,7 +748,7 @@ def _draw_metric_context_text(
         )
         cursor_x += _inline_text_width(reset_text)
     if guidance_text:
-        separator_x = cursor_x + 5
+        separator_x = cursor_x + _METRIC_CONTEXT_SEPARATOR_GAP_PX
         canvas.create_text(
             separator_x,
             center_y,
@@ -753,7 +757,7 @@ def _draw_metric_context_text(
             font=font,
             text="|",
         )
-        cursor_x = separator_x + _inline_text_width("|") + 5
+        cursor_x = separator_x + _inline_text_width("|") + _METRIC_CONTEXT_SEPARATOR_GAP_PX
         canvas.create_text(
             cursor_x,
             center_y,
@@ -1530,6 +1534,25 @@ def _model_geometry(model: dict[str, Any] | None) -> dict[str, Any] | None:
     return dict(geometry)
 
 
+def _previous_geometry_for_tick(
+    last_model: dict[str, Any] | None,
+    last_visible_geometry: dict[str, int | str] | None,
+) -> dict[str, Any]:
+    """Previous geometry for slot stability across invalidations and hides.
+
+    Falls back to the last applied visible geometry when the last model is
+    missing (topology reset) or hidden (no-slot gap), so those episodes keep
+    side continuity instead of re-rolling the position past the dwell gate.
+    Downstream hwnd/overlap guards still reject genuinely stale coordinates.
+    """
+    previous = _model_geometry(last_model)
+    if isinstance(previous, dict) and bool(previous.get("visible", True)):
+        return previous
+    if isinstance(last_visible_geometry, dict):
+        return dict(last_visible_geometry)
+    return previous if isinstance(previous, dict) else {}
+
+
 def _local_previous_geometry_for_target(
     previous_geometry: dict[str, Any] | None,
     target: TaskbarOverlayTarget,
@@ -1672,6 +1695,11 @@ class CodexUsageTaskbarOverlay:
         self._last_metric_values: dict[str, str] = {}
         self._flash_until: dict[str, float] = {}
         self._last_model: dict[str, Any] | None = None
+        # Last successfully applied visible geometry. Topology resets and
+        # no-slot hides must not lose side continuity: every one of those
+        # events would otherwise bypass the side-switch dwell with an empty
+        # previous geometry and re-roll the position.
+        self._last_visible_geometry: dict[str, int | str] | None = None
         self._flash_after_id = None
         self._content_after_id = None
         self._keepalive_after_id = None
@@ -1710,7 +1738,9 @@ class CodexUsageTaskbarOverlay:
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
         previous_geometry_context = self._cached_geometry_context
-        previous_geometry = _model_geometry(self._last_model) or {}
+        previous_geometry = _previous_geometry_for_tick(
+            self._last_model, self._last_visible_geometry
+        )
         geometry = self._calculate_geometry(
             preferred_width=preferred_width,
             previous_geometry=previous_geometry,
@@ -2185,9 +2215,9 @@ class CodexUsageTaskbarOverlay:
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
         previous_geometry_context = self._cached_geometry_context
-        previous_geometry = model.get("geometry", {})
-        if not isinstance(previous_geometry, dict):
-            previous_geometry = {}
+        previous_geometry = _previous_geometry_for_tick(
+            model, self._last_visible_geometry
+        )
         geometry = self._calculate_geometry(
             force_resample=True,
             withdraw_for_sampling=False,
@@ -2990,6 +3020,8 @@ class CodexUsageTaskbarOverlay:
             self._active_taskbar_hwnd = int(geometry.get("_taskbar_hwnd", 0) or 0)
         except Exception:
             self._active_taskbar_hwnd = 0
+        if isinstance(geometry, dict) and bool(geometry.get("visible", True)):
+            self._last_visible_geometry = dict(geometry)
         self._prepare_native_window(window)
         x = int(geometry.get("x", 0))
         y = int(geometry.get("y", 0))
