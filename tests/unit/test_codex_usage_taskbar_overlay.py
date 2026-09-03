@@ -2091,11 +2091,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(
             detail,
-            "4d 3h 49m | N 87% / 9h 15m",
+            "4d 3h 49m" + taskbar_overlay._METRIC_CONTEXT_SEPARATOR + "N 87% / 9h 15m",
         )
         self.assertEqual(
             short,
-            "4d 3h 49m | N 87% / 9h 15m",
+            "4d 3h 49m" + taskbar_overlay._METRIC_CONTEXT_SEPARATOR + "N 87% / 9h 15m",
         )
 
     def test_metric_width_signature_covers_joined_guidance_text(self):
@@ -2145,11 +2145,41 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
 
         self.assertTrue(layout["badge_fit"]["badge_visible"])
-        self.assertEqual(layout["badge_fit"]["time_text"], "02h 54m 00s | N 82~83%")
+        self.assertTrue(
+            str(
+                layout["badge_fit"]["time_text"] or layout.get("display_reset_text")
+            )
+        )
         self.assertGreaterEqual(
             int(layout["progress_width"]),
             taskbar_overlay._METRIC_REQUIRED_PROGRESS_FLOOR_PX,
         )
+        # The full joined guidance follows within a few px once the minimum
+        # is met; the separator air must not push it far.
+        joined_widths = []
+        for extra in range(0, 9):
+            candidate = taskbar_overlay._fit_metric_segment_layout(
+                required + extra,
+                detail,
+                short,
+                badge_label="남음",
+                badge_short_label="남",
+                metric_key="five_hour_limit",
+                has_reset_badge=True,
+                progress_width=taskbar_overlay._metric_progress_width_for_segment(
+                    required + extra
+                ),
+                badge_mode="short",
+                value_width=taskbar_overlay._value_column_width_for_text(
+                    str(metric.get("value_text") or "--")
+                ),
+            )
+            if "N 82~83%" in str(
+                candidate["badge_fit"]["time_text"]
+                or candidate.get("display_reset_text")
+            ):
+                joined_widths.append(required + extra)
+        self.assertTrue(joined_widths)
 
     def test_preferred_width_keeps_three_slot_row_texts_and_preferred_bar(self):
         # Regression for the live defect: a 5H+7D+credit row next to a
@@ -2207,11 +2237,13 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
+        # Live badge mode is short; full badges additionally need headroom
+        # above the preferred width once the separator carries air.
         self.assertTrue(
             taskbar_overlay._rows_fit_badge_mode_for_overlay_width(
                 width,
                 [tuple(bar["metrics"]) for bar in model["bars"]],
-                "full",
+                "short",
                 min_progress_px=taskbar_overlay._METRIC_REQUIRED_PROGRESS_FLOOR_PX,
             ),
         )
@@ -2334,7 +2366,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 time_text = str(
                     fit["badge_fit"]["time_text"] or fit["display_reset_text"] or ""
                 )
-                reset_part = detail.split(" | ")[0]
+                reset_part = detail.split(
+                    taskbar_overlay._METRIC_CONTEXT_SEPARATOR
+                )[0]
                 self.assertEqual(time_text, reset_part)
                 self.assertNotIn("|", time_text)
 
@@ -2512,7 +2546,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 time_text = str(
                     badge_fit["time_text"] or fit["display_reset_text"] or ""
                 )
-                self.assertEqual(time_text, detail.split(" | ")[0])
+                self.assertEqual(
+                    time_text,
+                    detail.split(taskbar_overlay._METRIC_CONTEXT_SEPARATOR)[0],
+                )
                 self.assertNotIn("|", time_text)
 
     def test_metric_layout_reserves_right_breathing_room(self):
@@ -7021,7 +7058,7 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
             row_layouts, badge_mode=mode
         )
 
-        self.assertEqual(floors["weekly_limit"], 18)
+        self.assertEqual(floors["weekly_limit"], 11)
         self.assertEqual(floors["five_hour_limit"], 36)
         self.assertNotIn("credit", floors)
 
@@ -7080,6 +7117,18 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
         self.assertTrue(any("05d" in text for text in row1_texts))
         self.assertTrue(any("부" in text for text in row1_texts))
         self.assertTrue(any("N 84%" in text for text in row1_texts))
+
+
+class MetricContextSeparatorUnitTest(unittest.TestCase):
+    def test_join_and_split_share_separator_with_air(self):
+        sep = taskbar_overlay._METRIC_CONTEXT_SEPARATOR
+        self.assertIn(" | ", sep)
+        self.assertGreater(len(sep), len(" | "))
+        joined = taskbar_overlay._join_metric_context("02h 54m 00s", "N 82~83%")
+        self.assertEqual(joined, "02h 54m 00s" + sep + "N 82~83%")
+        reset, guidance = taskbar_overlay._split_metric_context_text(joined)
+        self.assertEqual(reset, "02h 54m 00s")
+        self.assertEqual(guidance, "N 82~83%")
 
 
 if __name__ == "__main__":

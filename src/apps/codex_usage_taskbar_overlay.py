@@ -697,12 +697,22 @@ def _metric_guidance_texts(metric: dict[str, Any]) -> tuple[str, str]:
     return detail_text, short_text
 
 
+# Context separator with breathing room: at 6-7px canvas fonts a single
+# space each side reads cramped, so the join and every split site share
+# this constant.
+_METRIC_CONTEXT_SEPARATOR = "  |  "
+
+
 def _join_metric_context(reset_text: str, guidance_text: str) -> str:
-    return " | ".join(part for part in (reset_text, guidance_text) if part)
+    return _METRIC_CONTEXT_SEPARATOR.join(
+        part for part in (reset_text, guidance_text) if part
+    )
 
 
 def _split_metric_context_text(text: str) -> tuple[str, str]:
-    reset_text, separator, guidance_text = str(text or "").partition(" | ")
+    reset_text, separator, guidance_text = str(text or "").partition(
+        _METRIC_CONTEXT_SEPARATOR
+    )
     if not separator:
         return reset_text, ""
     return reset_text, guidance_text
@@ -987,7 +997,7 @@ def _metric_countdown_min_width(metric: dict[str, Any]) -> int:
     if _metric_slot_key(metric) == "credit":
         return base
     detail, _ = _metric_guidance_texts(metric)
-    reset_part = str(detail or "").split(" | ")[0]
+    reset_part = str(detail or "").split(_METRIC_CONTEXT_SEPARATOR)[0]
     reset_width = _reset_column_width_for_text(
         reset_part, metric_key=_metric_slot_key(metric)
     )
@@ -6077,7 +6087,7 @@ def _display_reset_text_for_space(
             candidates.append(short)
     # Reset-only fallback: the countdown keeps its fixed shape and the
     # guidance suffix is what yields when the column is cramped.
-    reset_only = detail.split(" | ")[0] if detail else ""
+    reset_only = detail.split(_METRIC_CONTEXT_SEPARATOR)[0] if detail else ""
     if reset_only and reset_only != detail:
         candidates.append(reset_only)
     for text in candidates:
@@ -6372,7 +6382,7 @@ def _fit_reset_badge_for_space(
         # Reset-only variants: when even the joined countdown|guidance text
         # cannot fit, the fixed countdown shape survives and the guidance
         # suffix is the part that yields.
-        reset_only = detail.split(" | ")[0] if detail else ""
+        reset_only = detail.split(_METRIC_CONTEXT_SEPARATOR)[0] if detail else ""
         if reset_only and reset_only != detail:
             reset_only_width = _reset_column_width_for_text(
                 reset_only, metric_key=metric_key
