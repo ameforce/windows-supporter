@@ -54,6 +54,10 @@ _DEFAULT_GEOMETRY = {
 
 _GEOMETRY_COORDINATE_BASIS = "physical_px"
 _EMPTY_SLOT_PADDING_PX = 8
+# A side switch must buy a badge-block-scale upgrade: absorbs taskbar churn
+# around the hysteresis band edge so the overlay does not oscillate between
+# two nearly-even slots. The side-switch dwell still damps sustained changes.
+_SLOT_SWITCH_WIDTH_MARGIN_PX = 96
 _MIN_EMPTY_SLOT_WIDTH_PX = 300
 _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX = 176
 # Matches the default geometry width cap: the preferred-width search must be
@@ -3629,7 +3633,9 @@ def _wider_unbiased_slot_when_clamped(
     when the true widest free span sits elsewhere and the overlay is clamped.
     When the selected slot cannot fit `target_width`, merge the previous
     window rect back into occupied and switch to a strictly wider unbiased
-    span. Unclamped selections keep the rightmost preference untouched.
+    span. The switch requires a margin over the selected width so churn
+    around the hysteresis band edge does not oscillate the overlay.
+    Unclamped selections keep the rightmost preference untouched.
     """
     try:
         selected_width = int(selected_slot[1]) - int(selected_slot[0])
@@ -3655,7 +3661,7 @@ def _wider_unbiased_slot_when_clamped(
     )
     prev_center = prev_x + max(1, prev_width) // 2
     best: tuple[int, int] | None = None
-    best_width = selected_width
+    best_width = selected_width + int(_SLOT_SWITCH_WIDTH_MARGIN_PX)
     for start, end in unbiased_free:
         width = int(end) - int(start)
         if width <= best_width:
