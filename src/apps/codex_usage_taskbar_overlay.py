@@ -1062,7 +1062,7 @@ def _slot_minimum_progress_widths(
         visible = getattr(row_layout, "visible_metrics", ())
         for index, metric in enumerate(tuple(visible)):
             metric_dict = metric if isinstance(metric, dict) else {}
-            if str(metric_dict.get("metric_key") or "") == "credit":
+            if _metric_slot_key(metric_dict) == "credit":
                 continue
             try:
                 _offset, segment_width, segment_progress = row_layout.segment_geometry(
@@ -3132,18 +3132,17 @@ class CodexUsageTaskbarOverlay:
         flash_phase = bool(metric.get("flash_phase"))
         is_credit_metric = metric_key == "credit" and metric.get("percent") is None
         # Fit inputs come from the shared helper so the slot-minimum
-        # pre-pass reproduces draw-time behavior exactly.
+        # pre-pass reproduces draw-time behavior exactly. A locked override
+        # renders that width exactly instead of searching downward.
+        locked = progress_override is not None
         layout = _fit_metric_segment_layout(
             width,
             **_metric_segment_fit_kwargs(
                 metric,
-                (
-                    int(progress_override)
-                    if progress_override is not None
-                    else progress_width
-                ),
+                (int(progress_override) if locked else progress_width),
                 badge_mode=badge_mode,
             ),
+            lock_progress=locked,
         )
         bar_x = x + int(layout["bar_x"])
         bar_width = int(layout["progress_width"])
@@ -6166,6 +6165,7 @@ def _fit_metric_segment_layout(
     progress_width: int | None = None,
     badge_mode: str = "any",
     value_width: int | None = None,
+    lock_progress: bool = False,
 ) -> dict[str, Any]:
     segment_width = max(0, int(width))
     label_width = 14
@@ -6242,10 +6242,22 @@ def _fit_metric_segment_layout(
             int(progress),
         )
 
-    for candidate_progress in range(
-        int(target_progress_width),
-        int(minimum_progress_width) - 1,
-        -1,
+    # A locked progress renders exactly: narrowing a bar only ever frees
+    # text room, so texts selected here are a superset of what a wider bar
+    # would allow. The downward search below stays for unlocked fits.
+    locked_target = (
+        int(requested_progress_width)
+        if requested_progress_width is not None
+        else int(target_progress_width)
+    )
+    for candidate_progress in (
+        [max(0, min(locked_target, int(max_progress_width)))]
+        if lock_progress
+        else range(
+            int(target_progress_width),
+            int(minimum_progress_width) - 1,
+            -1,
+        )
     ):
         reset_text_x = (
             bar_x
