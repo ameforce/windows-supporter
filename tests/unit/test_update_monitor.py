@@ -123,6 +123,38 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             select_update_candidate(current_tag="", remote_tags=["v0.5.7"])
         )
 
+    def test_update_candidate_skips_contained_newer_tag(self) -> None:
+        candidate = select_update_candidate(
+            current_tag="v0.18.8",
+            remote_tags=["v0.19.0", "v0.18.9"],
+            is_contained=lambda tag: tag == "v0.19.0",
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.tag, "v0.18.9")
+
+    def test_update_candidate_absent_when_only_newer_tag_is_contained(self) -> None:
+        self.assertIsNone(
+            select_update_candidate(
+                current_tag="v0.18.8",
+                remote_tags=["v0.19.0"],
+                is_contained=lambda tag: True,
+            )
+        )
+
+    def test_update_candidate_offers_on_containment_evidence_failure(self) -> None:
+        def _boom(tag: str) -> bool:
+            raise RuntimeError("no git history available")
+
+        candidate = select_update_candidate(
+            current_tag="v0.18.8",
+            remote_tags=["v0.19.0"],
+            is_contained=_boom,
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.tag, "v0.19.0")
+
     def test_current_tag_prefers_build_info_and_falls_back_to_git_describe(self) -> None:
         app_version = types.SimpleNamespace(source_tag="v0.5.6")
 

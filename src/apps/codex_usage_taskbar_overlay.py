@@ -1062,14 +1062,20 @@ def _metric_segment_fit_kwargs(
     progress_width: int | None,
     *,
     badge_mode: str = "any",
+    value_width: int | None = None,
 ) -> dict[str, Any]:
     """Keyword inputs for `_fit_metric_segment_layout`, shared by draw and plan.
 
     The draw path and the slot-minimum pre-pass must feed the fit identical
     inputs, or the pre-pass minimum would not reproduce at draw time.
+    `value_width` overrides the measured percent width so every row in a
+    slot shares one value column (otherwise value/badge/countdown x
+    positions jitter per row by measured-width deltas).
     """
     metric_dict = metric if isinstance(metric, dict) else {}
     value_text = str(metric_dict.get("value_text") or "--")
+    if value_width is None:
+        value_width = _value_column_width_for_text(value_text)
     reset_text, reset_short_text = _metric_guidance_texts(metric_dict)
     reset_badge_label = str(metric_dict.get("reset_badge_label") or "")
     reset_badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
@@ -1083,8 +1089,32 @@ def _metric_segment_fit_kwargs(
         "has_reset_badge": bool(reset_badge_label or reset_badge_short_label),
         "progress_width": progress_width,
         "badge_mode": badge_mode,
-        "value_width": _value_column_width_for_text(value_text),
+        "value_width": int(value_width),
     }
+
+
+def _slot_value_widths(row_layouts: list[Any]) -> dict[str, int]:
+    """Widest measured percent width per metric slot across rows.
+
+    Value/badge/countdown x positions derive from the value width, so
+    per-row measured widths jitter the whole right block per row. Sharing
+    one width per slot pins the grid. Credit draws inline (no value
+    column) and is skipped.
+    """
+    widths: dict[str, int] = {}
+    for row_layout in row_layouts:
+        visible = getattr(row_layout, "visible_metrics", ())
+        for metric in tuple(visible):
+            metric_dict = metric if isinstance(metric, dict) else {}
+            key = _metric_slot_key(metric_dict)
+            if key == "credit":
+                continue
+            measured = _value_column_width_for_text(
+                str(metric_dict.get("value_text") or "--")
+            )
+            if int(measured) > int(widths.get(key, 0) or 0):
+                widths[key] = int(measured)
+    return widths
 
 
 def _slot_minimum_progress_widths(
@@ -1101,6 +1131,7 @@ def _slot_minimum_progress_widths(
     are skipped.
     """
     floors: dict[str, int] = {}
+    slot_values = _slot_value_widths(row_layouts)
     for row_layout in row_layouts:
         visible = getattr(row_layout, "visible_metrics", ())
         for index, metric in enumerate(tuple(visible)):
@@ -1116,7 +1147,12 @@ def _slot_minimum_progress_widths(
             fit = _fit_metric_segment_layout(
                 int(segment_width),
                 **_metric_segment_fit_kwargs(
-                    metric_dict, int(segment_progress), badge_mode=badge_mode
+                    metric_dict,
+                    int(segment_progress),
+                    badge_mode=badge_mode,
+                    value_width=slot_values.get(
+                        _metric_slot_key(metric_dict)
+                    ),
                 ),
             )
             key = _metric_slot_key(metric_dict)
@@ -3128,6 +3164,12 @@ class CodexUsageTaskbarOverlay:
             [row_layout for _bar, row_layout in row_entries],
             badge_mode=overlay_badge_mode,
         )
+        # One value column per slot: measured percent widths would jitter
+        # value/badge/countdown x positions per row, so every row shares the
+        # slot maximum (still measured, never the padded maximum).
+        slot_value_widths = _slot_value_widths(
+            [row_layout for _bar, row_layout in row_entries]
+        )
         for index, (bar, row_layout) in enumerate(row_entries):
             y = 4 + index * row_height
             center_y = y + row_height // 2
@@ -3180,6 +3222,11 @@ class CodexUsageTaskbarOverlay:
                             metric if isinstance(metric, dict) else {}
                         )
                     ),
+                    value_width_override=slot_value_widths.get(
+                        _metric_slot_key(
+                            metric if isinstance(metric, dict) else {}
+                        )
+                    ),
                 )
         return
 
@@ -3195,6 +3242,7 @@ class CodexUsageTaskbarOverlay:
         badge_mode: str = "any",
         profile_label: str = "",
         progress_override: int | None = None,
+        value_width_override: int | None = None,
     ) -> None:
         center_y = y + row_height // 2
         label = str(metric.get("key") or "")
@@ -3222,6 +3270,7 @@ class CodexUsageTaskbarOverlay:
                 metric,
                 (int(progress_override) if locked else progress_width),
                 badge_mode=badge_mode,
+                value_width=value_width_override,
             ),
             lock_progress=locked,
         )

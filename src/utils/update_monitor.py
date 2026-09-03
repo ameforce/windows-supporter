@@ -2459,9 +2459,41 @@ class WindowsSupporterUpdater:
 
         remote_output = self._git_output(build_remote_tag_check_command())
         remote_tags = parse_remote_tag_refs(remote_output)
-        candidate = select_update_candidate(current_tag=current_tag, remote_tags=remote_tags)
+        candidate = select_update_candidate(
+            current_tag=current_tag,
+            remote_tags=remote_tags,
+            is_contained=self._is_tag_contained_in_history,
+        )
         working_tree = self._inspect_working_tree_state() if candidate is not None else UpdateWorkingTreeState()
         return candidate, working_tree, ""
+
+    def _is_tag_contained_in_history(self, tag: str) -> bool:
+        """True when the tag's commit is already an ancestor of HEAD.
+
+        Version numbers alone mislead whenever a patch line advances past a
+        released minor (hotfix 0.18.x after minor 0.19.0): the higher number
+        is content-older, and offering it would downgrade the install and nag
+        forever. Evidence failures stay fail-open (offer) to preserve current
+        behavior exactly where ancestry cannot be proven.
+        """
+        name = str(tag or "").strip()
+        if not name:
+            return False
+        try:
+            self._git_output(["git", "fetch", "origin", "tag", name])
+        except Exception:
+            pass
+        try:
+            sha = self._git_output(["git", "rev-parse", f"{name}^{{commit}}"]).strip()
+        except Exception:
+            return False
+        if not sha:
+            return False
+        try:
+            self._git_output(["git", "merge-base", "--is-ancestor", sha, "HEAD"])
+        except Exception:
+            return False
+        return True
 
     def _git_output(self, argv: list[str]) -> str:
         env = dict(os.environ)
@@ -3102,7 +3134,10 @@ def parse_remote_tag_refs(output: str) -> list[str]:
 
 
 def select_update_candidate(
-    *, current_tag: str, remote_tags: list[str] | tuple[str, ...]
+    *,
+    current_tag: str,
+    remote_tags: list[str] | tuple[str, ...],
+    is_contained: Callable[[str], bool] | None = None,
 ) -> UpdateCandidate | None:
     current_version = parse_semver_tag(current_tag)
     if current_version is None:
@@ -3113,6 +3148,12 @@ def select_update_candidate(
         version = parse_semver_tag(tag)
         if version is None or version <= current_version:
             continue
+        if is_contained is not None:
+            try:
+                if bool(is_contained(str(tag).strip())):
+                    continue
+            except Exception:
+                pass
         candidates.append(UpdateCandidate(tag=str(tag).strip(), version=version))
     if not candidates:
         return None
