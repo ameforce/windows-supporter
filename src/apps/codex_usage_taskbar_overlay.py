@@ -731,6 +731,30 @@ def _inline_text_width(text: str) -> int:
     return sum(9 if ord(character) > 127 else 5 for character in str(text or ""))
 
 
+def _ink_right_edge(canvas: Any, item: Any) -> int | None:
+    """Right ink edge of a canvas text item, or None when unmeasurable.
+
+    Estimates (5px/char) drift from real advances, which is exactly how a
+    centered-by-construction separator ends up hugging one side. Measuring
+    the drawn ink is exact, adapts to any font/DPI, and needs no loop:
+    place forward once per item. Headless doubles without `bbox` fall back
+    to estimates via the None path.
+    """
+    bbox_of = getattr(canvas, "bbox", None)
+    if not callable(bbox_of):
+        return None
+    try:
+        box = bbox_of(item)
+    except Exception:
+        return None
+    if not box or len(box) < 3:
+        return None
+    try:
+        return int(box[2])
+    except (TypeError, ValueError):
+        return None
+
+
 def _draw_metric_context_text(
     canvas: Any,
     text: str,
@@ -743,7 +767,7 @@ def _draw_metric_context_text(
     cursor_x = int(x)
     font = ("Segoe UI", 6, "bold")
     if reset_text:
-        canvas.create_text(
+        reset_item = canvas.create_text(
             cursor_x,
             center_y,
             anchor="w",
@@ -751,10 +775,15 @@ def _draw_metric_context_text(
             font=font,
             text=reset_text,
         )
-        cursor_x += _inline_text_width(reset_text)
+        reset_ink = _ink_right_edge(canvas, reset_item)
+        cursor_x = (
+            int(reset_ink)
+            if reset_ink is not None
+            else cursor_x + _inline_text_width(reset_text)
+        )
     if guidance_text:
         separator_x = cursor_x + _METRIC_CONTEXT_SEPARATOR_GAP_PX
-        canvas.create_text(
+        pipe_item = canvas.create_text(
             separator_x,
             center_y,
             anchor="w",
@@ -762,7 +791,12 @@ def _draw_metric_context_text(
             font=font,
             text="|",
         )
-        cursor_x = separator_x + _inline_text_width("|") + _METRIC_CONTEXT_SEPARATOR_GAP_PX
+        pipe_ink = _ink_right_edge(canvas, pipe_item)
+        cursor_x = (
+            int(pipe_ink)
+            if pipe_ink is not None
+            else separator_x + _inline_text_width("|")
+        ) + _METRIC_CONTEXT_SEPARATOR_GAP_PX
         canvas.create_text(
             cursor_x,
             center_y,
