@@ -25,6 +25,11 @@ class PullRequestProtectionContractTest(unittest.TestCase):
         self.assertEqual(
             ruleset["rules"][0]["parameters"]["allowed_merge_methods"], ["merge"]
         )
+        self.assertTrue(
+            ruleset["rules"][0]["parameters"][
+                "require_extra_approval_for_unattributed_changes"
+            ]
+        )
 
     def test_repository_keeps_actions_disabled_and_pr_evidence_template(self) -> None:
         self.assertFalse((REPO_ROOT / ".github" / "workflows").exists())
