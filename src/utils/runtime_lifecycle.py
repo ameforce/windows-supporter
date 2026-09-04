@@ -8,7 +8,7 @@ import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from src.utils.app_version import get_app_version
 
@@ -42,6 +42,10 @@ def is_main_runtime_invocation(argv: Sequence[str] | None = None) -> bool:
 
 
 class RuntimeProbeError(RuntimeError):
+    pass
+
+
+class RuntimeReadinessError(RuntimeError):
     pass
 
 
@@ -88,7 +92,13 @@ class NullRuntimeLifecycle:
     def mark_tray_ready(self, _tray_hwnd: int) -> None:
         return
 
-    def bind_mainloop(self, _root: Any, *, tray_hwnd: int) -> None:
+    def bind_mainloop(
+        self,
+        _root: Any,
+        *,
+        tray_hwnd: int,
+        readiness_check: Callable[[], bool] | None = None,
+    ) -> None:
         return
 
     def mark_stopping(self, _reason: str = "normal") -> None:
@@ -284,13 +294,39 @@ class RuntimeLifecycle:
             self._tray_hwnd = int(tray_hwnd)
             self.emit("tray_ready", tray_hwnd=self._tray_hwnd)
 
-    def bind_mainloop(self, root: Any, *, tray_hwnd: int) -> None:
+    def bind_mainloop(
+        self,
+        root: Any,
+        *,
+        tray_hwnd: int,
+        readiness_check: Callable[[], bool] | None = None,
+    ) -> None:
         self._tray_hwnd = int(tray_hwnd)
 
         def heartbeat() -> None:
             with self._lock:
                 if self._stopping or self._failed:
                     return
+                if readiness_check is not None:
+                    try:
+                        still_ready = bool(readiness_check())
+                    except BaseException as exc:
+                        self.record_exception(
+                            "runtime_readiness",
+                            type(exc),
+                            exc,
+                            exc.__traceback__,
+                        )
+                        return
+                    if not still_ready:
+                        exc = RuntimeReadinessError("tray readiness was lost")
+                        self.record_exception(
+                            "runtime_readiness",
+                            type(exc),
+                            exc,
+                            exc.__traceback__,
+                        )
+                        return
                 self._state = "ready"
                 self._mainloop_tick += 1
                 if self._mainloop_tick == 1:
@@ -311,7 +347,10 @@ class RuntimeLifecycle:
             self._stopping = True
             self._state = "stopping"
             self.emit("stopping", reason=str(reason))
-            self._write_probe()
+            try:
+                self._write_probe()
+            except RuntimeProbeError as exc:
+                self.emit("probe_write_error", state="stopping", error=str(exc))
 
     def mark_normal_stop(self, reason: str = "normal") -> None:
         self.emit("normal_stop", reason=str(reason))

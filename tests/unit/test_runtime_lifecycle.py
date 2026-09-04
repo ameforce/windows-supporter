@@ -113,6 +113,62 @@ class RuntimeLifecycleTest(unittest.TestCase):
             self.assertEqual(entries[-1]["phase"], "fatal_exception")
             self.assertIn("ValueError", entries[-1]["error"]["traceback"])
 
+    def test_lost_tray_readiness_invalidates_ready_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = _FakeRoot()
+            probe = Path(temp_dir) / "probe.json"
+            tray_ready = True
+            lifecycle = RuntimeLifecycle(
+                base_dir=Path(temp_dir),
+                environ={PROBE_PATH_ENV: str(probe), PROBE_TOKEN_ENV: "token-3"},
+                pid=654,
+                executable_path=r"C:\\app\\windows-supporter.exe",
+                process_start_time="2026-09-04T00:00:00+00:00",
+                file_version="0.18.18.0",
+                commit="fed9876",
+            )
+
+            lifecycle.mark_process_start()
+            lifecycle.mark_tray_ready(777)
+            lifecycle.bind_mainloop(
+                root,
+                tray_hwnd=777,
+                readiness_check=lambda: tray_ready,
+            )
+            root.calls[0][1]()
+            tray_ready = False
+            root.calls[1][1]()
+
+            payload = json.loads(probe.read_text(encoding="utf-8"))
+            self.assertEqual(payload["state"], "failed")
+            self.assertIn("tray readiness was lost", payload["error"])
+            self.assertEqual(len(root.calls), 2)
+
+    def test_stopping_probe_failure_does_not_interrupt_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lifecycle = RuntimeLifecycle(
+                base_dir=Path(temp_dir),
+                environ={},
+                pid=987,
+                executable_path="windows-supporter.exe",
+                process_start_time="2026-09-04T00:00:00+00:00",
+                file_version="0.18.18.0",
+                commit="abc9876",
+            )
+            with patch.object(
+                lifecycle,
+                "_write_probe",
+                side_effect=RuntimeProbeError("probe unavailable"),
+            ):
+                lifecycle.mark_stopping("test")
+
+            entries = [
+                json.loads(line)
+                for line in lifecycle.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(entries[-1]["phase"], "probe_write_error")
+            self.assertEqual(entries[-1]["state"], "stopping")
+
     def test_log_rotation_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             lifecycle = RuntimeLifecycle(

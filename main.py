@@ -476,7 +476,11 @@ def _run_main_app(lifecycle=None) -> None:
     except Exception:
         pass
 
-    lifecycle.bind_mainloop(root, tray_hwnd=tray_ready.hwnd)
+    lifecycle.bind_mainloop(
+        root,
+        tray_hwnd=tray_ready.hwnd,
+        readiness_check=tray.is_ready,
+    )
 
     try:
         root.mainloop()

@@ -140,6 +140,9 @@ class _FakeTray:
     def stop(self):
         self.stop_calls += 1
 
+    def is_ready(self):
+        return True
+
 
 class _FakeThread:
     def __init__(self, target=None, daemon=False, **_kwargs) -> None:

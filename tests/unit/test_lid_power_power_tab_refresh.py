@@ -377,6 +377,9 @@ class _MainTray:
     def stop(self) -> None:
         self.events.append("tray.stop")
 
+    def is_ready(self) -> bool:
+        return True
+
 
 class _MainUi:
     def __init__(self, *_args, **kwargs) -> None:

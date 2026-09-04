@@ -194,6 +194,16 @@ class SystemTrayIcon:
             raise TrayStartupError("tray worker exited before readiness")
         return TrayReady(hwnd=int(self._hwnd), class_name=self._class_name)
 
+    def is_ready(self) -> bool:
+        thread = self._thread
+        hwnd = self._hwnd
+        if thread is None or not thread.is_alive() or not hwnd or not self._icon_registered:
+            return False
+        try:
+            return bool(win32gui.IsWindow(int(hwnd)))
+        except Exception:
+            return False
+
     def stop(self) -> None:
         self._stop_event.set()
         hwnd = self._hwnd
