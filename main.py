@@ -336,6 +336,10 @@ def _run_main_app(lifecycle=None) -> None:
             pass
         return
 
+    def _queue_shutdown(callback, reason: str) -> None:
+        lifecycle.mark_stopping(reason)
+        event_queue.put(callback)
+
     def _request_codex_timeout_recovery_restart() -> bool:
         if not _claim_codex_timeout_recovery_restart():
             return False
@@ -360,7 +364,7 @@ def _run_main_app(lifecycle=None) -> None:
         event_queue=event_queue,
         repo_root=_build_update_repo_root(),
         quit_callback=root.quit,
-        exit_callback=lambda: os._exit(0),
+        exit_callback=lambda: lifecycle.mark_stopping("update_handoff"),
     )
     main_ui = WindowsSupporterMainUI(
         root,
@@ -441,8 +445,8 @@ def _run_main_app(lifecycle=None) -> None:
         )(),
         on_open_kakao_monitor=lambda: event_queue.put(main_ui.show),
         on_open_log=lambda: event_queue.put(startup_manager.open_log_file),
-        on_restart=lambda: event_queue.put(_request_restart),
-        on_exit=lambda: event_queue.put(root.quit),
+        on_restart=lambda: _queue_shutdown(_request_restart, "restart_requested"),
+        on_exit=lambda: _queue_shutdown(root.quit, "tray_exit_requested"),
         on_session_unlock=_on_session_unlock,
         on_display_topology_change=_on_display_topology_change,
         on_power_setting_change=(

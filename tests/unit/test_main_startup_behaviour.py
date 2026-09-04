@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import main
 from src.utils.tray_icon import TrayReady
@@ -127,10 +127,13 @@ class _FakePump:
 
 
 class _FakeTray:
+    instances = []
+
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
         self.start_calls = 0
         self.stop_calls = 0
+        _FakeTray.instances.append(self)
 
     def start(self, timeout=0):
         self.start_calls += 1
@@ -165,6 +168,7 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
     def setUp(self) -> None:
         _FakeUi.instances = []
         _FakeUpdater.instances = []
+        _FakeTray.instances = []
 
     def test_main_runs_update_handoff_before_gui_initialization(self) -> None:
         with patch("main.run_update_handoff_from_argv", return_value=True) as handoff:
@@ -317,6 +321,32 @@ class MainStartupBehaviourUnitTest(unittest.TestCase):
         self.assertEqual(len(_FakeUi.instances), 1)
         self.assertIs(_FakeUi.instances[0].kwargs["updater"], updater)
         self.assertEqual(instance_lock.close_calls, 1)
+
+    def test_tray_and_update_shutdown_mark_stopping_without_forced_exit(self) -> None:
+        root = _FakeRoot()
+        lifecycle = Mock()
+        with patch("main.LibConnector", return_value=_FakeLib(root)):
+            with patch("main.StartReg"):
+                with patch("main.start_update_handoff_cleanup_thread"):
+                    with patch("main.threading.Thread", _FakeThread):
+                        with patch("main.Monitor", return_value=_FakeMonitor()):
+                            with patch("main.StartupAppManager", return_value=_FakeStartupManager()):
+                                with patch("main.WindowsSupporterMainUI", _FakeUi):
+                                    with patch("main.WindowsSupporterUpdater", _FakeUpdater, create=True):
+                                        with patch("main.SharedUiEventPump", _FakePump):
+                                            with patch("main.SystemTrayIcon", _FakeTray):
+                                                with patch("main.signal.signal"):
+                                                    with patch("main.os._exit") as forced_exit:
+                                                        main._run_main_app(lifecycle)
+                                                        lifecycle.mark_stopping.reset_mock()
+                                                        _FakeTray.instances[-1].kwargs["on_exit"]()
+                                                        _FakeUpdater.instances[-1].kwargs["exit_callback"]()
+
+        self.assertEqual(
+            [call.args[0] for call in lifecycle.mark_stopping.call_args_list],
+            ["tray_exit_requested", "update_handoff"],
+        )
+        forced_exit.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -169,6 +169,37 @@ class RuntimeLifecycleTest(unittest.TestCase):
             self.assertEqual(entries[-1]["phase"], "probe_write_error")
             self.assertEqual(entries[-1]["state"], "stopping")
 
+    def test_intentional_stopping_suppresses_late_tray_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = _FakeRoot()
+            probe = Path(temp_dir) / "probe.json"
+            lifecycle = RuntimeLifecycle(
+                base_dir=Path(temp_dir),
+                environ={PROBE_PATH_ENV: str(probe), PROBE_TOKEN_ENV: "token-4"},
+                pid=111,
+                executable_path="windows-supporter.exe",
+                process_start_time="2026-09-04T00:00:00+00:00",
+                file_version="0.18.18.0",
+                commit="abc1111",
+            )
+            lifecycle.mark_process_start()
+            lifecycle.mark_tray_ready(222)
+            lifecycle.bind_mainloop(
+                root,
+                tray_hwnd=222,
+                readiness_check=lambda: False,
+            )
+            lifecycle.mark_stopping("tray_exit_requested")
+            root.calls[0][1]()
+
+            payload = json.loads(probe.read_text(encoding="utf-8"))
+            self.assertEqual(payload["state"], "stopping")
+            phases = [
+                json.loads(line)["phase"]
+                for line in lifecycle.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertNotIn("fatal_exception", phases)
+
     def test_log_rotation_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             lifecycle = RuntimeLifecycle(
