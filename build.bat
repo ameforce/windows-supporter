@@ -170,13 +170,18 @@ REM Deploy only after all candidate validation passes. The helper owns exact-pro
 REM shutdown, backup, atomic replacement, readiness verification, and rollback.
 echo | set /p="Deploying verified %EXE_NAME% transaction..."
 call :clear_log
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\deploy_runtime.py" --candidate "dist\%EXE_NAME%" --target "%ROOT_EXE%" > "%STEP_LOG%" 2>&1
-if errorlevel 1 (
+set "DEPLOY_RECEIPT=%STEP_LOG%.deploy-receipt.json"
+set "DEPLOY_DIAGNOSTIC=%STEP_LOG%.deploy-stderr.log"
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\deploy_runtime.py" --candidate "dist\%EXE_NAME%" --target "%ROOT_EXE%" 1> "%DEPLOY_RECEIPT%" 2> "%DEPLOY_DIAGNOSTIC%"
+set "DEPLOY_EXIT_CODE=%ERRORLEVEL%"
+if exist "%DEPLOY_DIAGNOSTIC%" type "%DEPLOY_DIAGNOSTIC%" 1>&2
+echo WINDOWS_SUPPORTER_DEPLOY_RECEIPT=%DEPLOY_RECEIPT%
+if not "%DEPLOY_EXIT_CODE%"=="0" (
   echo Failure
-  echo Transactional runtime deployment failed.
-  call :print_log
-  exit /b 1
+  echo Transactional runtime deployment failed. 1>&2
+  exit /b %DEPLOY_EXIT_CODE%
 )
+if exist "%DEPLOY_DIAGNOSTIC%" del "%DEPLOY_DIAGNOSTIC%" > NUL 2>&1
 echo [ Success !! ]
 
 REM Remove build byproducts

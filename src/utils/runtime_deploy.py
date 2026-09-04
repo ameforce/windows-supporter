@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ DEFAULT_READY_TIMEOUT_SECONDS = 60.0
 DEFAULT_HEARTBEAT_SAMPLES = 3
 DEFAULT_POLL_INTERVAL_SECONDS = 0.25
 DEFAULT_STOP_TIMEOUT_SECONDS = 15.0
+_COMMENTS_COMMIT_RE = re.compile(r"\(([0-9a-f]+)(?:-dirty)?\)\s*$", re.IGNORECASE)
 
 
 class DeployExitCode(IntEnum):
@@ -115,17 +117,51 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def _read_windows_artifact_identity(path: Path) -> tuple[str, str]:
+    if os.name != "nt":
+        raise RuntimeError("Windows version metadata is unavailable on this platform")
+    import win32api
+
+    language = "040904B0"
+    version = str(
+        win32api.GetFileVersionInfo(str(path), f"\\StringFileInfo\\{language}\\FileVersion")
+        or ""
+    ).strip()
+    comments = str(
+        win32api.GetFileVersionInfo(str(path), f"\\StringFileInfo\\{language}\\Comments")
+        or ""
+    ).strip()
+    commit_match = _COMMENTS_COMMIT_RE.search(comments)
+    commit = commit_match.group(1) if commit_match else ""
+    if not version or not commit:
+        raise RuntimeError("candidate FileVersion or commit metadata is missing")
+    return version, commit
+
+
+def _claim_json_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    descriptor: int | None = None
+    created = False
     try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
         )
-        os.replace(temporary, path)
-    except OSError:
-        temporary.unlink(missing_ok=True)
+        created = True
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            descriptor = None
+            stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
 
 
@@ -517,10 +553,12 @@ def deploy_runtime(
                 "timestamp": _utc_now(),
                 "candidate": str(candidate),
                 "target": str(target),
+                "target_unchanged": True,
                 "error": f"candidate executable is missing or empty: {candidate}",
             },
         )
-    if not target.is_file() or target.stat().st_size <= 0:
+    had_previous = target.exists()
+    if had_previous and (not target.is_file() or target.stat().st_size <= 0):
         raise RuntimeDeployError(
             f"installed runtime is missing or empty: {target}",
             exit_code=DeployExitCode.INVALID_INPUT,
@@ -531,6 +569,7 @@ def deploy_runtime(
                 "timestamp": _utc_now(),
                 "candidate": str(candidate),
                 "target": str(target),
+                "target_unchanged": True,
                 "error": f"installed runtime is missing or empty: {target}",
             },
         )
@@ -545,9 +584,64 @@ def deploy_runtime(
                 "timestamp": _utc_now(),
                 "candidate": str(candidate),
                 "target": str(target),
+                "target_unchanged": True,
                 "error": "candidate and installed runtime must be different files",
             },
         )
+
+    if controller is None:
+        try:
+            candidate_version, candidate_commit = _read_windows_artifact_identity(candidate)
+        except Exception as exc:
+            raise RuntimeDeployError(
+                f"candidate version metadata validation failed: {exc}",
+                exit_code=DeployExitCode.INVALID_INPUT,
+                receipt={
+                    "schema_version": 1,
+                    "operation": "deploy",
+                    "status": "failed",
+                    "timestamp": _utc_now(),
+                    "candidate": str(candidate),
+                    "target": str(target),
+                    "target_unchanged": True,
+                    "error": f"candidate version metadata validation failed: {exc}",
+                },
+            ) from exc
+        if expected_version and expected_version != candidate_version:
+            raise RuntimeDeployError(
+                "candidate FileVersion does not match --expected-version",
+                exit_code=DeployExitCode.INVALID_INPUT,
+                receipt={
+                    "schema_version": 1,
+                    "operation": "deploy",
+                    "status": "failed",
+                    "timestamp": _utc_now(),
+                    "candidate": str(candidate),
+                    "target": str(target),
+                    "target_unchanged": True,
+                    "error": "candidate FileVersion does not match --expected-version",
+                },
+            )
+        if expected_commit and expected_commit.lower() != candidate_commit.lower():
+            raise RuntimeDeployError(
+                "candidate commit does not match --expected-commit",
+                exit_code=DeployExitCode.INVALID_INPUT,
+                receipt={
+                    "schema_version": 1,
+                    "operation": "deploy",
+                    "status": "failed",
+                    "timestamp": _utc_now(),
+                    "candidate": str(candidate),
+                    "target": str(target),
+                    "target_unchanged": True,
+                    "error": "candidate commit does not match --expected-commit",
+                },
+            )
+        expected_version = candidate_version
+        expected_commit = candidate_commit
+    else:
+        candidate_version = expected_version or ""
+        candidate_commit = expected_commit or ""
 
     process_controller = controller or WindowsRuntimeProcessController()
     selected_probe = Path(probe_path) if probe_path else target.parent / ".windows-supporter.runtime-probe.json"
@@ -565,8 +659,12 @@ def deploy_runtime(
         "timestamp": _utc_now(),
         "candidate": str(candidate),
         "candidate_sha256": _sha256(candidate),
+        "candidate_version": candidate_version,
+        "candidate_commit": candidate_commit,
         "target": str(target),
-        "previous_sha256": _sha256(target),
+        "had_previous": had_previous,
+        "previous_sha256": _sha256(target) if had_previous else None,
+        "target_unchanged": True,
         "terminated_pids": [],
         "readiness": None,
         "rollback": {"status": "not-required"},
@@ -584,15 +682,13 @@ def deploy_runtime(
         )
     exact_pids: list[int] = []
     changed_target = False
-    failure_code = DeployExitCode.INVALID_INPUT
+    transition_started = False
+    transaction_claimed = False
+    backup_ready = False
+    failure_code = DeployExitCode.REPLACE_FAILED
     failure: Exception | None = None
     try:
-        copy_file(target, backup_stage)
-        if _sha256(backup_stage) != receipt["previous_sha256"]:
-            failure_code = DeployExitCode.REPLACE_FAILED
-            raise RuntimeError("backup runtime hash differs from the installed runtime")
-        replace_file(backup_stage, backup)
-        _write_json_atomic(
+        _claim_json_exclusive(
             marker,
             {
                 "schema_version": 1,
@@ -602,15 +698,28 @@ def deploy_runtime(
                 "started_at": _utc_now(),
             },
         )
+        transaction_claimed = True
+        if backup.exists():
+            raise RuntimeError("an unowned deployment backup appeared after transaction claim")
+        if had_previous:
+            copy_file(target, backup_stage)
+            if _sha256(backup_stage) != receipt["previous_sha256"]:
+                raise RuntimeError("backup runtime hash differs from the installed runtime")
+            replace_file(backup_stage, backup)
+            backup_ready = True
+        copy_file(candidate, staged)
+        if _sha256(staged) != receipt["candidate_sha256"]:
+            raise RuntimeError("staged runtime hash differs from the candidate")
         exact_pids = list(process_controller.find_exact(target))
         try:
             if exact_pids:
+                transition_started = True
                 process_controller.terminate_tree(exact_pids, DEFAULT_STOP_TIMEOUT_SECONDS)
         except Exception as exc:
             failure_code = DeployExitCode.STOP_FAILED
             raise RuntimeError(f"failed to stop exact installed runtime: {exc}") from exc
         receipt["terminated_pids"] = exact_pids
-        copy_file(candidate, staged)
+        transition_started = True
         try:
             replace_file(staged, target)
             changed_target = True
@@ -642,6 +751,7 @@ def deploy_runtime(
             failure_code = DeployExitCode.READINESS_FAILED
             raise RuntimeError(str(exc)) from exc
         receipt["status"] = "success"
+        receipt["target_unchanged"] = False
         receipt["readiness"] = readiness
         receipt["target_sha256"] = _sha256(target)
         marker.unlink(missing_ok=True)
@@ -653,35 +763,65 @@ def deploy_runtime(
         backup_stage.unlink(missing_ok=True)
         staged.unlink(missing_ok=True)
 
+    if not transition_started and not changed_target:
+        cleanup_errors: list[str] = []
+        if backup_ready:
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                cleanup_errors.append(f"backup cleanup failed: {cleanup_exc}")
+        if transaction_claimed:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                cleanup_errors.append(f"marker cleanup failed: {cleanup_exc}")
+        receipt["rollback"] = {
+            "status": "target-unchanged",
+            "cleanup_errors": cleanup_errors,
+        }
+        receipt["error"] = str(failure or "deployment preparation failed")
+        if cleanup_errors:
+            failure_code = DeployExitCode.ROLLBACK_FAILED
+        raise RuntimeDeployError(
+            receipt["error"],
+            exit_code=failure_code,
+            receipt=receipt,
+        ) from failure
+
     rollback: dict[str, Any] = {"status": "failed", "error": ""}
     try:
         running = list(process_controller.find_exact(target))
         if running:
             process_controller.terminate_tree(running, DEFAULT_STOP_TIMEOUT_SECONDS)
-        if changed_target or backup.is_file():
+        if had_previous:
             if not backup.is_file():
                 raise FileNotFoundError(backup)
             copy_file(backup, restore_stage)
             replace_file(restore_stage, target)
-        readiness = _launch_and_verify(
-            target,
-            controller=process_controller,
-            probe_path=selected_probe,
-            token=str(token_factory()),
-            timeout_seconds=timeout_seconds,
-            heartbeat_samples=heartbeat_samples,
-            poll_interval=poll_interval,
-            expected_version=None,
-            expected_commit=None,
-            base_environment=os.environ if base_environment is None else base_environment,
-            sleep=sleep,
-            monotonic=monotonic,
-        )
-        rollback = {
-            "status": "ready",
-            "target_sha256": _sha256(target),
-            "readiness": readiness,
-        }
+            readiness = _launch_and_verify(
+                target,
+                controller=process_controller,
+                probe_path=selected_probe,
+                token=str(token_factory()),
+                timeout_seconds=timeout_seconds,
+                heartbeat_samples=heartbeat_samples,
+                poll_interval=poll_interval,
+                expected_version=None,
+                expected_commit=None,
+                base_environment=(
+                    os.environ if base_environment is None else base_environment
+                ),
+                sleep=sleep,
+                monotonic=monotonic,
+            )
+            rollback = {
+                "status": "ready",
+                "target_sha256": _sha256(target),
+                "readiness": readiness,
+            }
+        else:
+            target.unlink(missing_ok=True)
+            rollback = {"status": "restored-absent"}
         marker.unlink(missing_ok=True)
         backup.unlink(missing_ok=True)
     except Exception as rollback_exc:

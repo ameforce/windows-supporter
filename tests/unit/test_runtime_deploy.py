@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -11,6 +12,7 @@ from pathlib import Path
 from src.utils.runtime_deploy import (
     DeployExitCode,
     RuntimeDeployError,
+    _claim_json_exclusive,
     cli,
     deploy_runtime,
 )
@@ -220,6 +222,102 @@ class RuntimeDeployTest(unittest.TestCase):
             self.assertEqual(raised.exception.exit_code, DeployExitCode.REPLACE_FAILED)
             self.assertEqual(raised.exception.receipt["rollback"]["status"], "ready")
             self.assertEqual(target.read_bytes(), b"old-runtime")
+
+    def test_backup_preparation_failure_leaves_running_runtime_untouched(self):
+        with tempfile.TemporaryDirectory() as root:
+            candidate, target = self._paths(root)
+            controller = FakeController()
+
+            def fail_backup_copy(source, destination):
+                if ".backup-" in Path(destination).name:
+                    raise OSError("disk full")
+                return shutil.copy2(source, destination)
+
+            with self.assertRaises(RuntimeDeployError) as raised:
+                deploy_runtime(
+                    candidate,
+                    target,
+                    controller=controller,
+                    copy_file=fail_backup_copy,
+                )
+
+            self.assertEqual(raised.exception.exit_code, DeployExitCode.REPLACE_FAILED)
+            self.assertEqual(
+                raised.exception.receipt["rollback"]["status"], "target-unchanged"
+            )
+            self.assertEqual(target.read_bytes(), b"old-runtime")
+            self.assertEqual(controller.terminated, [])
+            self.assertEqual(controller.launches, [])
+            self.assertFalse(target.with_name("windows-supporter.previous.exe").exists())
+            self.assertFalse(
+                target.with_name("windows-supporter.promotion-pending.json").exists()
+            )
+
+    def test_transaction_claim_is_exclusive_and_preserves_first_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "promotion-pending.json"
+            first = {"owner": "first"}
+            _claim_json_exclusive(marker, first)
+
+            with self.assertRaises(FileExistsError):
+                _claim_json_exclusive(marker, {"owner": "second"})
+
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), first)
+
+    def test_fresh_install_promotes_candidate_without_previous_runtime(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            candidate = base / "dist" / "windows-supporter.exe"
+            target = base / "installed" / "windows-supporter.exe"
+            candidate.parent.mkdir()
+            target.parent.mkdir()
+            candidate.write_bytes(b"new-runtime")
+            controller = FakeController(exact_pids=())
+
+            receipt = deploy_runtime(
+                candidate,
+                target,
+                controller=controller,
+                probe_path=base / "probe.json",
+                token_factory=lambda: "fresh-token",
+                timeout_seconds=0.05,
+                heartbeat_samples=1,
+                poll_interval=0.01,
+                sleep=controller.sleep,
+            )
+
+            self.assertFalse(receipt["had_previous"])
+            self.assertIsNone(receipt["previous_sha256"])
+            self.assertEqual(target.read_bytes(), b"new-runtime")
+
+    def test_failed_fresh_install_restores_absent_target(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            candidate = base / "dist" / "windows-supporter.exe"
+            target = base / "installed" / "windows-supporter.exe"
+            candidate.parent.mkdir()
+            target.parent.mkdir()
+            candidate.write_bytes(b"new-runtime")
+            controller = FakeController(exact_pids=(), fail_new=True)
+
+            with self.assertRaises(RuntimeDeployError) as raised:
+                deploy_runtime(
+                    candidate,
+                    target,
+                    controller=controller,
+                    probe_path=base / "probe.json",
+                    token_factory=lambda: "fresh-token",
+                    timeout_seconds=0.02,
+                    heartbeat_samples=1,
+                    poll_interval=0.01,
+                    sleep=controller.sleep,
+                )
+
+            self.assertEqual(raised.exception.exit_code, DeployExitCode.READINESS_FAILED)
+            self.assertEqual(
+                raised.exception.receipt["rollback"]["status"], "restored-absent"
+            )
+            self.assertFalse(target.exists())
 
     def test_launch_failure_has_distinct_code_and_rolls_back(self):
         with tempfile.TemporaryDirectory() as root:

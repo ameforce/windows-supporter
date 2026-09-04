@@ -859,6 +859,29 @@ def _executable_file_identity(path: Path) -> tuple[int, int, int, int] | None:
     return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
 
 
+def cleanup_update_build_artifacts(repo_root: str | os.PathLike[str]) -> list[str]:
+    root = Path(repo_root).resolve()
+    targets = (
+        root / "build",
+        root / "dist",
+        root / "windows-supporter.spec",
+    )
+    removed: list[str] = []
+    for target in targets:
+        if not target.exists():
+            continue
+        if target.is_symlink() or getattr(os.path, "isjunction", lambda _path: False)(target):
+            raise UpdateHandoffError(f"refusing to remove linked build artifact: {target}")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        if target.exists():
+            raise UpdateHandoffError(f"build artifact cleanup did not remove: {target}")
+        removed.append(str(target))
+    return removed
+
+
 def is_git_checkout_root(repo_root: str | os.PathLike[str]) -> bool:
     return (Path(repo_root) / ".git").exists()
 
@@ -1888,6 +1911,7 @@ def run_update_handoff(
     launch=popen_no_window,
     runtime_deployer=deploy_runtime,
     runtime_restarter=restart_runtime,
+    artifact_cleaner=cleanup_update_build_artifacts,
     progress_ui_factory=UpdateHandoffProgressUi,
     max_attempts: int = 2,
 ) -> int:
@@ -1914,6 +1938,8 @@ def run_update_handoff(
         published_build_labels: set[str] = set()
         publish_build_lock = threading.Lock()
         step_log_tailer: _BuildStepLogTailer | None = None
+        deployment_completed = False
+        deployment_receipt: dict[str, Any] | None = None
 
         def publish_handoff_progress(snapshot: dict[str, Any], *, first: bool = False) -> None:
             if progress_ui is not None:
@@ -2030,6 +2056,17 @@ def run_update_handoff(
                 root_executable,
                 base_environment=relaunch_environment,
             )
+            if not isinstance(deployment_receipt, dict) or deployment_receipt.get(
+                "status"
+            ) != "success":
+                raise UpdateHandoffError("deployment helper returned no success receipt")
+            deployment_completed = True
+            failed_step = "빌드 산출물 정리"
+            removed_artifacts = artifact_cleaner(repo_root)
+            append_update_log(
+                log_path,
+                f"removed build artifacts: {', '.join(removed_artifacts) or 'none'}",
+            )
             for gui_name, gui_command in _extract_git_gui_relaunch_commands(state):
                 try:
                     launch(gui_command, cwd=repo_root)
@@ -2061,13 +2098,39 @@ def run_update_handoff(
             recovery_error = ""
             recovered_at = None
             recovery_receipt: dict[str, Any] | None = None
-            if isinstance(exc, RuntimeDeployError):
+            if deployment_completed:
+                recovery_status = "complete"
+                recovered_at = time.time()
+                recovery_receipt = {
+                    "status": "new-runtime-ready",
+                    "deployment": deployment_receipt,
+                }
+                recovery_error = "new runtime remains ready; build artifact cleanup failed"
+                append_update_log(log_path, recovery_error)
+            elif isinstance(exc, RuntimeDeployError):
                 rollback = exc.receipt.get("rollback", {})
                 if isinstance(rollback, dict) and rollback.get("status") == "ready":
                     recovery_status = "complete"
                     recovered_at = time.time()
                     recovery_receipt = dict(rollback)
                     append_update_log(log_path, "deployment helper restored and verified the previous runtime")
+                elif (
+                    exc.receipt.get("target_unchanged") is True
+                    and "preserved_transaction" not in exc.receipt
+                ):
+                    try:
+                        recovery_receipt = runtime_restarter(
+                            root_executable,
+                            base_environment=relaunch_environment,
+                        )
+                        recovery_status = "complete"
+                        recovered_at = time.time()
+                        append_update_log(
+                            log_path,
+                            "unchanged previous runtime restarted with readiness verification",
+                        )
+                    except (OSError, RuntimeDeployError) as recovery_exc:
+                        recovery_error = str(recovery_exc)
                 else:
                     rollback_error = (
                         rollback.get("error") if isinstance(rollback, dict) else None
@@ -2095,11 +2158,14 @@ def run_update_handoff(
                         f"previous executable recovery failed: {recovery_error}",
                     )
 
-            recovery_detail = (
-                "이전 버전으로 안전하게 복구했습니다."
-                if recovery_status == "complete"
-                else "이전 버전 자동 복구에도 실패했습니다."
-            )
+            if deployment_completed:
+                recovery_detail = "새 버전은 정상 실행 중이지만 빌드 산출물 정리가 필요합니다."
+            else:
+                recovery_detail = (
+                    "이전 버전으로 안전하게 복구했습니다."
+                    if recovery_status == "complete"
+                    else "이전 버전 자동 복구에도 실패했습니다."
+                )
             diagnostic_error = f"{exc} (recovery={recovery_status}: {recovery_error})"
             error_detail = (
                 f"{failed_step} 단계에서 업데이트를 완료하지 못했습니다. "

@@ -63,9 +63,9 @@ UI, browser, screenshot, 앱 실행은 금지한다.
 7. policy/docs/ref/worktree-only release에서는 build 내부의 non-UI artifact validation 외에 실제 app launch, UI E2E, screenshot을 추가하지 않는다.
 8. build exit code, tagged source SHA, artifact path와 SHA-256을 기록한다.
 9. `windows-supporter.exe`의 `FileVersion`, `ProductVersion`, `Comments`가 tag와 commit을 가리키는지 확인한다.
-10. runtime·packaging release는 candidate 검증 뒤 `tools/deploy_runtime.py`를 별도 호출한다. helper가 출력한 success receipt에서 exact target, candidate/target SHA-256, probe token에 결합된 PID·tray HWND, heartbeat 3회 이상과 startup path를 확인한다.
+10. runtime·packaging release는 candidate 검증 뒤 `tools/deploy_runtime.py`를 별도 호출한다. helper stdout의 단일 UTF-8 JSON success receipt를 보존하고 exact target, candidate/target SHA-256, probe token에 결합된 PID·tray HWND, heartbeat 3회 이상과 startup path를 확인한다. normal `build.bat`은 `WINDOWS_SUPPORTER_DEPLOY_RECEIPT=<path>`로 보존 위치를 알린다.
 11. helper 실패 시 rollback receipt가 이전 artifact 복원과 이전 runtime readiness를 모두 증명해야 한다. readiness 또는 rollback이 실패하면 publish·cleanup을 중단한다.
-12. `build`, `dist`, generated spec, backup/promotion marker가 의도치 않게 남지 않았는지 확인한다.
+12. helper 또는 updater 성공 후 `build`, `dist`, generated spec, backup/promotion marker가 의도치 않게 남지 않았는지 확인한다.
 
 `build.bat`의 normal mode도 같은 transactional deploy helper를 사용한다. candidate만 root executable로 옮기거나 실행 준비를 확인하지 않은 채 성공으로 종료하는 경로를 추가하지 않는다.
 

@@ -219,11 +219,91 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             self.assertEqual(state["status"], "complete")
             self.assertEqual(root_executable.read_bytes(), b"new-executable")
             self.assertEqual(len(deploy_calls), 1)
-            self.assertTrue(deploy_calls[0][0].samefile(repo / "dist" / "windows-supporter.exe"))
+            self.assertEqual(
+                deploy_calls[0][0],
+                (repo / "dist" / "windows-supporter.exe").resolve(),
+            )
             self.assertEqual(
                 deploy_calls[0][2]["base_environment"]["PYINSTALLER_RESET_ENVIRONMENT"],
                 "1",
             )
+            self.assertFalse((repo / "dist").exists())
+
+    def test_cleanup_failure_keeps_verified_new_runtime_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"old-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"old-executable")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            restarts = []
+
+            def successful_deploy(candidate, target, **_kwargs):
+                shutil.copy2(candidate, target)
+                return {"status": "success", "readiness": {"pid": 600}}
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=BuildSubprocess(root_executable, returncode=0),
+                runtime_deployer=successful_deploy,
+                runtime_restarter=lambda *_args, **_kwargs: restarts.append(True),
+                artifact_cleaner=lambda _root: (_ for _ in ()).throw(
+                    OSError("cleanup denied")
+                ),
+                progress_ui_factory=None,
+                max_attempts=1,
+            )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(root_executable.read_bytes(), b"new-executable")
+            self.assertEqual(restarts, [])
+            self.assertEqual(state["recovery_status"], "complete")
+            self.assertEqual(
+                state["recovery_receipt"]["status"], "new-runtime-ready"
+            )
+
+    def test_unchanged_target_deploy_failure_restarts_previous_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"old-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"old-executable")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            restarts = []
+
+            def failed_deploy(*_args, **_kwargs):
+                raise RuntimeDeployError(
+                    "backup preparation failed",
+                    exit_code=DeployExitCode.REPLACE_FAILED,
+                    receipt={
+                        "target_unchanged": True,
+                        "rollback": {"status": "target-unchanged"},
+                    },
+                )
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=BuildSubprocess(root_executable, returncode=0),
+                runtime_deployer=failed_deploy,
+                runtime_restarter=lambda target, **kwargs: restarts.append(
+                    (Path(target), dict(kwargs))
+                )
+                or {"status": "success"},
+                progress_ui_factory=None,
+                max_attempts=1,
+            )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(restarts), 1)
+            self.assertEqual(state["recovery_status"], "complete")
 
 
 if __name__ == "__main__":

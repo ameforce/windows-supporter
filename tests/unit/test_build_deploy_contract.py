@@ -12,6 +12,13 @@ class BuildDeployContractTest(unittest.TestCase):
         self.assertNotIn('taskkill /f /t /im "%EXE_NAME%"', script)
         self.assertIn('tools\\deploy_runtime.py', script)
         self.assertIn('WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY', script)
+        deploy_line = next(
+            line for line in script.splitlines() if 'tools\\deploy_runtime.py' in line
+        )
+        self.assertNotIn("2>&1", deploy_line)
+        self.assertIn('1> "%DEPLOY_RECEIPT%"', deploy_line)
+        self.assertIn('2> "%DEPLOY_DIAGNOSTIC%"', deploy_line)
+        self.assertIn("WINDOWS_SUPPORTER_DEPLOY_RECEIPT=", script)
         self.assertLess(
             script.index('dist\\%EXE_NAME%" --google-calendar-resource-smoke'),
             script.index('tools\\deploy_runtime.py'),
