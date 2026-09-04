@@ -13,6 +13,22 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 
+from src.utils.runtime_lifecycle import (
+    NullRuntimeLifecycle,
+    RuntimeLifecycle,
+    is_main_runtime_invocation,
+)
+
+
+_RUNTIME_LIFECYCLE = (
+    RuntimeLifecycle.from_current_process()
+    if __name__ == "__main__" and is_main_runtime_invocation(sys.argv)
+    else NullRuntimeLifecycle()
+)
+if _RUNTIME_LIFECYCLE.active:
+    _RUNTIME_LIFECYCLE.install_exception_hooks()
+    _RUNTIME_LIFECYCLE.mark_process_start()
+
 from src.utils.LibConnector import LibConnector
 from src.apps.Monitor import Monitor
 from src.apps.main_ui import WindowsSupporterMainUI
@@ -251,14 +267,27 @@ def main() -> None:
         return
     single_instance_lock = _acquire_single_instance_lock()
     if single_instance_lock is None:
+        _RUNTIME_LIFECYCLE.mark_already_running()
+        _RUNTIME_LIFECYCLE.mark_stopping("already_running")
         return
+    _RUNTIME_LIFECYCLE.mark_mutex_acquired()
     try:
-        _run_main_app()
+        _run_main_app(_RUNTIME_LIFECYCLE)
+        _RUNTIME_LIFECYCLE.mark_normal_stop()
+    except BaseException as exc:
+        _RUNTIME_LIFECYCLE.record_exception(
+            "main",
+            type(exc),
+            exc,
+            exc.__traceback__,
+        )
+        raise
     finally:
         single_instance_lock.close()
 
 
-def _run_main_app() -> None:
+def _run_main_app(lifecycle=None) -> None:
+    lifecycle = lifecycle or _RUNTIME_LIFECYCLE
     try:
         start_update_handoff_cleanup_thread(current_executable=sys.executable)
     except Exception:
@@ -270,6 +299,8 @@ def _run_main_app() -> None:
     except Exception:
         pass
     root = lib.tk.Tk()
+    lifecycle.install_tk_exception_hook(root)
+    lifecycle.mark_tk_ready()
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         candidates = [
@@ -305,6 +336,10 @@ def _run_main_app() -> None:
             pass
         return
 
+    def _queue_shutdown(callback, reason: str) -> None:
+        lifecycle.mark_stopping(reason)
+        event_queue.put(callback)
+
     def _request_codex_timeout_recovery_restart() -> bool:
         if not _claim_codex_timeout_recovery_restart():
             return False
@@ -329,7 +364,7 @@ def _run_main_app() -> None:
         event_queue=event_queue,
         repo_root=_build_update_repo_root(),
         quit_callback=root.quit,
-        exit_callback=lambda: os._exit(0),
+        exit_callback=lambda: lifecycle.mark_stopping("update_handoff"),
     )
     main_ui = WindowsSupporterMainUI(
         root,
@@ -357,6 +392,7 @@ def _run_main_app() -> None:
         updater.start()
     except Exception:
         pass
+    lifecycle.mark_components_ready()
 
     def _run_bg(fn) -> None:
         try:
@@ -409,8 +445,8 @@ def _run_main_app() -> None:
         )(),
         on_open_kakao_monitor=lambda: event_queue.put(main_ui.show),
         on_open_log=lambda: event_queue.put(startup_manager.open_log_file),
-        on_restart=lambda: event_queue.put(_request_restart),
-        on_exit=lambda: event_queue.put(root.quit),
+        on_restart=lambda: _queue_shutdown(_request_restart, "restart_requested"),
+        on_exit=lambda: _queue_shutdown(root.quit, "tray_exit_requested"),
         on_session_unlock=_on_session_unlock,
         on_display_topology_change=_on_display_topology_change,
         on_power_setting_change=(
@@ -430,10 +466,8 @@ def _run_main_app() -> None:
             lid_power_policy is not None and lid_power_policy.is_supported
         ),
     )
-    try:
-        tray.start()
-    except Exception:
-        tray = None
+    tray_ready = tray.start(timeout=15.0)
+    lifecycle.mark_tray_ready(tray_ready.hwnd)
 
     def _on_sigint(signum, frame) -> None:
         try:
@@ -446,9 +480,16 @@ def _run_main_app() -> None:
     except Exception:
         pass
 
+    lifecycle.bind_mainloop(
+        root,
+        tray_hwnd=tray_ready.hwnd,
+        readiness_check=tray.is_ready,
+    )
+
     try:
         root.mainloop()
     finally:
+        lifecycle.mark_stopping("mainloop_exit")
         try:
             monitor.shutdown()
         except Exception:

@@ -1,8 +1,15 @@
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 import src.utils.tray_icon as tray_icon
-from src.utils.tray_icon import SystemTrayIcon
+from src.utils.tray_icon import (
+    SystemTrayIcon,
+    TrayReady,
+    TrayStartupError,
+    TrayStartupTimeout,
+)
 
 
 class SystemTrayIconRestartUnitTest(unittest.TestCase):
@@ -134,6 +141,51 @@ class SystemTrayIconRestartUnitTest(unittest.TestCase):
         self.assertEqual(result, 0)
         add_icon.assert_called_once_with()
         self.assertEqual(calls, ["taskbar_created"])
+
+    def test_start_waits_for_hidden_window_and_icon_registration(self) -> None:
+        tray = self._build_tray()
+
+        def create_window() -> None:
+            tray._hwnd = 321
+            tray._icon_registered = True
+
+        with patch.object(tray, "_create_window", side_effect=create_window), patch(
+            "src.utils.tray_icon.win32gui.PumpMessages",
+            side_effect=lambda: tray._stop_event.wait(0.2),
+        ):
+            ready = tray.start(timeout=1.0)
+            tray.stop()
+
+        self.assertEqual(ready, TrayReady(hwnd=321, class_name=tray._class_name))
+
+    def test_start_propagates_create_window_failure(self) -> None:
+        tray = self._build_tray()
+        with patch.object(tray, "_create_window", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(TrayStartupError, "boom"):
+                tray.start(timeout=1.0)
+
+    def test_start_rejects_swallowed_icon_registration_failure(self) -> None:
+        tray = self._build_tray()
+        tray._hwnd = 444
+        with patch(
+            "src.utils.tray_icon.win32gui.Shell_NotifyIcon",
+            side_effect=RuntimeError("notify failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "notify failed"):
+                tray._add_icon(required=True)
+
+    def test_start_times_out_when_worker_never_becomes_ready(self) -> None:
+        tray = self._build_tray()
+        entered = threading.Event()
+
+        def stalled_create_window() -> None:
+            entered.set()
+            time.sleep(0.2)
+
+        with patch.object(tray, "_create_window", side_effect=stalled_create_window):
+            with self.assertRaises(TrayStartupTimeout):
+                tray.start(timeout=0.01)
+        self.assertTrue(entered.wait(0.2))
 
 
 if __name__ == "__main__":
