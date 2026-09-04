@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import main
+from src.utils.tray_icon import TrayReady
 
 
 class _FakeRoot:
@@ -131,8 +132,10 @@ class _FakeTray:
         self.start_calls = 0
         self.stop_calls = 0
 
-    def start(self):
+    def start(self, timeout=0):
         self.start_calls += 1
+        self.timeout = float(timeout)
+        return TrayReady(hwnd=909, class_name="WindowsSupporterTray_909")
 
     def stop(self):
         self.stop_calls += 1

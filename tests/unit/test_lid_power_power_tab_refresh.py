@@ -11,6 +11,7 @@ import main
 from src.apps.lid_power_policy import LidPowerPolicyService, PowerCapabilities
 from src.apps.lid_power_settings_ui import LidPowerSettingsView
 from src.apps.main_ui import WindowsSupporterMainUI
+from src.utils.tray_icon import TrayReady
 from src.utils.ui_event_pump import SharedUiEventPump
 
 
@@ -369,8 +370,9 @@ class _MainTray:
     def __init__(self, events: list[str], **_kwargs) -> None:
         self.events = events
 
-    def start(self) -> None:
+    def start(self, timeout=0) -> TrayReady:
         self.events.append("tray.start")
+        return TrayReady(hwnd=707, class_name="WindowsSupporterTray_707")
 
     def stop(self) -> None:
         self.events.append("tray.stop")
