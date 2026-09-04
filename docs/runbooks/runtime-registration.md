@@ -30,8 +30,15 @@ main 물리 checkout에서 `git pull`, `git reset`, `git switch`, `git merge`처
 ## build와 process
 
 - final release build는 main physical worktree의 tagged source에서 실행한다.
-- `build.bat`는 running root executable을 중단하고 새 artifact를 promote할 수 있으므로 실행 전에 이를 알린다.
-- policy/docs/ref/worktree-only release에서는 child environment에 `WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1`을 전달해 post-build 앱 launch를 막는다.
+- `build.bat`의 build phase는 running root executable을 중단하거나 root artifact를 교체하지 않는다.
+- final candidate build에는 child environment로 `WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY=1`을 전달한다.
+- runtime·packaging release의 승격은 `tools/deploy_runtime.py`만 수행한다. helper는 candidate 검증 후 exact-path process tree 종료, backup, atomic replacement, launch, tray/Tk readiness와 heartbeat 검증을 하나의 transaction으로 수행한다.
+- helper는 marker를 exclusive-create해 동시 배포를 배제한다. backup과 staged candidate가 모두 검증되기 전에는 running runtime을 건드리지 않으며, preparation 실패는 target-unchanged receipt로 끝낸다.
+- candidate-only build 전후의 root executable identity가 같고, 배포 영수증의 명시적 `recovery_action=restart-unchanged-runtime`과 `rollback.status=target-unchanged`가 함께 있을 때만 이전 runtime을 재기동한다. build가 root executable을 바꿨다면 복원 후보의 검증·원자적 복원·재기동을 `restart_runtime(restore_source=...)`의 단일 transaction으로 수행한다. 재기동도 같은 marker를 exclusive-create하며, marker 선점 경쟁에서 진 호출자는 `transaction_conflict`와 `preserved_transaction`을 기록한다. 전환 후·rollback 실패는 재기동하지 않는다.
+- root executable이 없는 fresh checkout은 previous artifact 없는 transaction으로 설치하고, 실패하면 target 부재 상태로 되돌린다.
+- 새 runtime의 launch/readiness가 실패하면 helper는 이전 artifact를 복원하고 이전 runtime readiness까지 확인한 뒤 비영 종료 코드와 JSON rollback receipt를 반환한다.
+- marker 또는 backup이 이미 존재하면 ownership을 추정하지 않고 그대로 보존한 채 실패한다. 별도 조사 없이 덮어쓰거나 삭제하지 않는다.
+- normal `build.bat`은 helper stdout/stderr를 합치지 않고 JSON receipt를 별도 UTF-8 파일에 보존한다. updater는 배포 성공 뒤 build/dist/spec을 exact repo child로 정리한다.
 - build worker boundary smoke는 UI acceptance가 아니다. 실제 앱/UI launch를 별도 검증으로 주장하지 않는다.
 - build 중단 시 task-owned cmd/PyInstaller tree가 남았는지 확인하고, exact task-owned process만 정리한다.
 

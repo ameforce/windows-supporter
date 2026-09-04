@@ -8,6 +8,7 @@
       "triggers": [
         "main.py",
         "src/utils/StartReg.py",
+        "src/utils/runtime_deploy.py",
         "src/utils/update_handoff_recovery.py",
         "src/utils/worktree_runtime.py",
         "src/utils/update_monitor.py"
@@ -15,6 +16,7 @@
       "direct_execution_paths": [
         "main.py",
         "src/utils/StartReg.py",
+        "src/utils/runtime_deploy.py",
         "src/utils/update_handoff_recovery.py",
         "src/utils/worktree_runtime.py",
         "src/utils/update_monitor.py"
@@ -24,6 +26,7 @@
         "src/apps/dashboard_ui.py",
         "src/apps/update_settings_ui.py",
         "src/utils/StartReg.py",
+        "src/utils/runtime_deploy.py",
         "src/utils/update_monitor.py"
       ],
       "build_package_artifact_paths": [
@@ -70,8 +73,10 @@
       "triggers": [
         "build.bat",
         "pyproject.toml",
+        "src/utils/runtime_deploy.py",
         "uv.lock",
         "tools/generate_build_metadata.py",
+        "tools/deploy_runtime.py",
         "tools/remove_path_with_retry.bat",
         "tools/stop_stale_pyinstaller_workers.ps1",
         "tools/verify_pyinstaller_archive.py",
@@ -84,6 +89,7 @@
       "direct_execution_paths": [
         "build.bat",
         "tools/generate_build_metadata.py",
+        "tools/deploy_runtime.py",
         "tools/remove_path_with_retry.bat",
         "tools/stop_stale_pyinstaller_workers.ps1",
         "tools/verify_codex_usage_worker_smoke.py",
@@ -91,7 +97,9 @@
       ],
       "changed_contract_consumers": [
         "main.py",
-        "src/utils/app_version.py"
+        "src/utils/app_version.py",
+        "src/utils/runtime_deploy.py",
+        "src/utils/update_monitor.py"
       ],
       "build_package_artifact_paths": [
         "pyproject.toml",
@@ -130,6 +138,7 @@
       "release_deploy_consumers": [
         "main.py",
         "src/utils/StartReg.py",
+        "src/utils/runtime_deploy.py",
         "src/utils/worktree_runtime.py",
         "src/utils/update_monitor.py"
       ],
