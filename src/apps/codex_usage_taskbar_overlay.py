@@ -3041,6 +3041,10 @@ class CodexUsageTaskbarOverlay:
         window = tk.Toplevel(self._root)
         window.withdraw()
         window.overrideredirect(True)
+        # Font point sizes render at the root's Tk scaling: apply the
+        # legibility floor here so the very first draw and the layout
+        # estimators agree on the same effective glyph width.
+        _apply_overlay_base_ui_scaling(self._root)
         try:
             window.attributes("-topmost", True)
         except Exception:
@@ -3312,7 +3316,13 @@ class CodexUsageTaskbarOverlay:
         bars = [bar for bar in model.get("bars", []) if isinstance(bar, dict)]
         canvas.delete("all")
         self._metric_hit_rects = []
-        canvas.create_rectangle(0, 0, width, height, fill="#16181d", outline="#343946")
+        # The outline of a canvas rectangle is centered on its boundary path:
+        # with coords (0,0,w,h) the right/bottom outlines land on columns
+        # w/h, which are outside the drawable area and get clipped. Inset by
+        # one pixel so all four borders render and the margins stay symmetric.
+        canvas.create_rectangle(
+            0, 0, width - 1, height - 1, fill="#16181d", outline="#343946"
+        )
         if not bars:
             return
         row_count = min(2, len(bars))
