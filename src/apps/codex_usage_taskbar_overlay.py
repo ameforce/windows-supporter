@@ -198,12 +198,15 @@ _NORMAL_GUIDANCE_COLOR = "#4ade80"
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
 _SEGMENT_RIGHT_PADDING_PX = 2
-_OVERLAY_RIGHT_PADDING_PX = 10
+# Equal outer margins: the label inset draws the first glyph 6px from the
+# window edge, so the metrics region ends 4px before the right edge and the
+# 2px in-segment pad lands the last glyph 6px out — symmetric with left.
+_OVERLAY_RIGHT_PADDING_PX = 4
 # Breathing air kept clear at the overlay right edge so last-segment ink
-# never touches the border (estimate slop lets it reach the edge). Applied
-# only when slack covers it; clamped slots keep every pixel for content so
-# countdowns and badges never yield for air.
-_OVERLAY_RIGHT_AIR_RESERVE_PX = 6
+# never touches the border (estimate slop lets it reach the edge). Superseded
+# by the exact Tk font measurer + equal-margin contract; kept at zero so the
+# draw-side air funding logic stays inert.
+_OVERLAY_RIGHT_AIR_RESERVE_PX = 0
 _METRIC_PROGRESS_MIN_WIDTH_PX = 28
 _METRIC_PROGRESS_PREFERRED_WIDTH_PX = 36
 _METRIC_PROGRESS_MAX_WIDTH_PX = 48
@@ -728,6 +731,10 @@ def _split_metric_context_text(text: str) -> tuple[str, str]:
 
 
 def _inline_text_width(text: str) -> int:
+    """Exact width with a live Tk font, otherwise the per-char estimate."""
+    measured = _tk_measure_text(str(text or ""), 6)
+    if measured is not None:
+        return measured
     scale = _overlay_text_width_scale()
     return int(
         sum(9 if ord(character) > 127 else 5 for character in str(text or ""))
@@ -1789,6 +1796,51 @@ def _set_overlay_text_width_scale(scale: float) -> None:
 
 
 _OVERLAY_GEOMETRY_DEBUG_ENV = "WINDOWS_SUPPORTER_OVERLAY_GEOMETRY_DEBUG"
+
+# Real-font measurement: when a live Tk root exists, Tkinter's Font.measure
+# gives exact pixel widths for the very fonts the canvas draws with. Pure
+# per-character estimates stay the fallback for headless doubles.
+_TK_MEASURE_CONTEXT: dict[str, Any] = {"root": None, "fonts": {}}
+_CONTEXT_FONT_BY_PT = {6: ("Segoe UI", 6, "bold"), 7: ("Segoe UI", 7, "bold")}
+_CONTEXT_PT_BY_FONT = {
+    ("Segoe UI", 6, "bold"): 6,
+    ("Segoe UI", 7, "bold"): 7,
+}
+
+
+def _install_tkfont_measurer(root: Any) -> None:
+    """Attach a Tk font measurer, silently no-op for headless roots."""
+    try:
+        tk_api = getattr(root, "tk", None)
+        call = getattr(tk_api, "call", None)
+        if not callable(call):
+            return
+        import tkinter.font as tkfont  # noqa: PLC0415
+
+        _TK_MEASURE_CONTEXT["root"] = root
+        _TK_MEASURE_CONTEXT["fonts"] = {
+            pt: tkfont.Font(root=root, font=spec) for pt, spec in _CONTEXT_FONT_BY_PT.items()
+        }
+        # The active scale must follow this root's applied scaling from now on.
+        _set_overlay_text_width_scale(1.0)
+    except Exception:
+        return
+
+
+def _tk_measure_text(text: str, pt: int) -> int | None:
+    root = _TK_MEASURE_CONTEXT.get("root")
+    fonts = _TK_MEASURE_CONTEXT.get("fonts") or {}
+    font = fonts.get(int(pt))
+    if root is None or font is None:
+        return None
+    try:
+        measure = getattr(font, "measure")
+        if not callable(measure):
+            return None
+        width = int(measure(str(text or "")))
+        return width if width >= 0 else None
+    except Exception:
+        return None
 
 
 def _overlay_geometry_debug_path() -> str:
@@ -3121,6 +3173,9 @@ class CodexUsageTaskbarOverlay:
             window.update_idletasks()
         except Exception:
             pass
+        # A real Toplevel means a live Tk root: install the exact font
+        # measurer so text budgets match drawn ink from the very first draw.
+        _install_tkfont_measurer(self._root)
         self._prepare_native_window(window)
         return window
 
@@ -6886,17 +6941,24 @@ def _reset_badge_width_for_label(label: str) -> int:
         return 0
     # Keep this helper pure for deterministic unit tests. The estimate is
     # deliberately conservative so unknown DPI/font details bias toward hiding
-    # reset time instead of overlapping the badge.
-    scale = _overlay_text_width_scale()
-    label_width = sum(9 if ord(ch) > 127 else 6 for ch in text)
+    # reset time instead of overlapping the badge; a live Tk measurer replaces
+    # the guess with the real glyph advance.
+    measured = _tk_measure_text(text, 6)
+    if measured is not None:
+        label_width = measured
+    else:
+        scale = _overlay_text_width_scale()
+        label_width = int(
+            sum(9 if ord(ch) > 127 else 6 for ch in text) * scale
+        )
     padded = (
         label_width
         + _RESET_BADGE_HORIZONTAL_PADDING_PX * 2
         + _RESET_BADGE_OUTLINE_WIDTH_PX * 2
     )
     return max(
-        int(_RESET_BADGE_MIN_WIDTH_PX * scale),
-        int(padded * scale),
+        _RESET_BADGE_MIN_WIDTH_PX,
+        padded,
     )
 
 
@@ -6933,19 +6995,18 @@ def _reset_column_width_for_text(text: str, *, metric_key: str = "") -> int:
         minimum = _RESET_FIVE_HOUR_COLUMN_WIDTH_PX
     elif str(metric_key or "") == "weekly_limit":
         minimum = _RESET_WEEKLY_COLUMN_WIDTH_PX
-    return max(int(minimum * scale), int((len(value) * 5 + 2) * scale))
+    return max(minimum, _inline_text_width(value) + 2)
 
 
 def _value_column_width_for_text(value_text: str) -> int:
     text = str(value_text or "")
-    scale = _overlay_text_width_scale()
-    estimated_width = len(text) * 7 + 2
+    measured = _tk_measure_text(text, 7)
+    estimated_width = (
+        measured if measured is not None else len(text) * 7 + 2
+    )
     return min(
-        int(_VALUE_COLUMN_MAX_WIDTH_PX * scale),
-        max(
-            int(_VALUE_COLUMN_MIN_WIDTH_PX * scale),
-            int(estimated_width * scale),
-        ),
+        _VALUE_COLUMN_MAX_WIDTH_PX,
+        max(_VALUE_COLUMN_MIN_WIDTH_PX, int(estimated_width)),
     )
 
 

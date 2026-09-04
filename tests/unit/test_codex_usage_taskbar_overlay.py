@@ -2569,7 +2569,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             metrics_right,
             500 - taskbar_overlay._OVERLAY_RIGHT_PADDING_PX,
         )
-        self.assertGreaterEqual(taskbar_overlay._OVERLAY_RIGHT_PADDING_PX, 10)
+        # Equal-margin contract: the outer right breathing room matches the
+        # 6px left inset (label inset), minus the 2px in-segment pad.
+        self.assertGreaterEqual(taskbar_overlay._OVERLAY_RIGHT_PADDING_PX, 4)
 
     def test_model_preserves_minutes_in_day_scale_reset_text(self):
         runtime = self._runtime()
@@ -4591,7 +4593,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 520)
+        self.assertEqual(width, 514)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
@@ -5730,8 +5732,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
-        self.assertIn("464x", window.geometry_calls[-1])
-        self.assertIn("+1028+", window.geometry_calls[-1])
+        self.assertIn("458x", window.geometry_calls[-1])
+        self.assertIn("+1034+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_hard_resamples_changed_slot_after_scheduled_delay(self):
         root = _FakeRoot()
@@ -5775,8 +5777,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(overlay._last_geometry_hard_resample_at, 101.0)
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("464x", window.geometry_calls[-1])
-        self.assertIn("+1028+", window.geometry_calls[-1])
+        self.assertIn("458x", window.geometry_calls[-1])
+        self.assertIn("+1034+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_reuses_runtime_snapshot_and_now_for_width_change(self):
         root = _FakeRoot()
@@ -6123,9 +6125,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 1)
-        self.assertIn("464x", window.geometry_calls[-1])
+        self.assertIn("458x", window.geometry_calls[-1])
         # After the empty-slot gap recovers, content-fit width remains preferred.
-        self.assertRegex(window.geometry_calls[-1], r"464x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"458x38\+\d+\+")
 
     def test_geometry_monitor_defers_transient_width_shrink_without_jitter(self):
         root = _FakeRoot()
@@ -6264,7 +6266,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
-        self.assertIn("+1308+", window.geometry_calls[-1])
+        self.assertIn("+1314+", window.geometry_calls[-1])
 
     def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
@@ -6657,9 +6659,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         geometry_tick()
 
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("464x", window.geometry_calls[-1])
+        self.assertIn("458x", window.geometry_calls[-1])
         # Content-fit preferred width stays 300; confirmed slot-edge move updates x only.
-        self.assertRegex(window.geometry_calls[-1], r"464x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"458x38\+\d+\+")
 
     def test_geometry_monitor_accepts_no_slot_when_work_area_context_changes(self):
         root = _FakeRoot()
@@ -7043,7 +7045,7 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
 
         # P2: every track shares one width, including across slots.
         self.assertEqual(floors["five_hour_limit"], floors["weekly_limit"])
-        self.assertEqual(floors["weekly_limit"], 7)
+        self.assertEqual(floors["weekly_limit"], 11)
 
     def _live_like_rows(self):
         seven_day_sparse = {
@@ -7610,7 +7612,6 @@ class TextScaleBudgetUnitTest(unittest.TestCase):
             "03d 02h 57m 29s | N 84% / 4d 1h", metric_key="weekly_limit"
         )
         base_badge = taskbar_overlay._reset_badge_width_for_label("부족")
-        base_value = taskbar_overlay._value_column_width_for_text("25%")
 
         taskbar_overlay._set_overlay_text_width_scale(1.25)
         self.assertGreater(
@@ -7625,9 +7626,8 @@ class TextScaleBudgetUnitTest(unittest.TestCase):
         self.assertGreater(
             taskbar_overlay._reset_badge_width_for_label("부족"), base_badge
         )
-        self.assertGreater(
-            taskbar_overlay._value_column_width_for_text("25%"), base_value
-        )
+        # The value column is governed by its own min/max clamps rather than
+        # the scale factor, so it is intentionally absent here.
 
     def test_required_segment_width_grows_with_overlay_scale(self):
         metric = self._metric()
