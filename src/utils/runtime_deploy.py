@@ -665,12 +665,14 @@ def deploy_runtime(
         "had_previous": had_previous,
         "previous_sha256": _sha256(target) if had_previous else None,
         "target_unchanged": True,
+        "transaction_conflict": False,
         "terminated_pids": [],
         "readiness": None,
         "rollback": {"status": "not-required"},
     }
     if marker.exists() or backup.exists():
         receipt["error"] = "an unfinished deployment transaction already exists"
+        receipt["transaction_conflict"] = True
         receipt["preserved_transaction"] = {
             "marker": str(marker) if marker.exists() else None,
             "backup": str(backup) if backup.exists() else None,
@@ -688,16 +690,27 @@ def deploy_runtime(
     failure_code = DeployExitCode.REPLACE_FAILED
     failure: Exception | None = None
     try:
-        _claim_json_exclusive(
-            marker,
-            {
-                "schema_version": 1,
-                "target": str(target),
-                "backup": str(backup),
-                "candidate_sha256": receipt["candidate_sha256"],
-                "started_at": _utc_now(),
-            },
-        )
+        try:
+            _claim_json_exclusive(
+                marker,
+                {
+                    "schema_version": 1,
+                    "target": str(target),
+                    "backup": str(backup),
+                    "candidate_sha256": receipt["candidate_sha256"],
+                    "started_at": _utc_now(),
+                },
+            )
+        except FileExistsError as exc:
+            failure_code = DeployExitCode.INVALID_INPUT
+            receipt["transaction_conflict"] = True
+            receipt["preserved_transaction"] = {
+                "marker": str(marker),
+                "backup": str(backup) if backup.exists() else None,
+            }
+            raise RuntimeError(
+                "another deployment transaction acquired the target concurrently"
+            ) from exc
         transaction_claimed = True
         if backup.exists():
             raise RuntimeError("an unowned deployment backup appeared after transaction claim")
@@ -723,6 +736,7 @@ def deploy_runtime(
         try:
             replace_file(staged, target)
             changed_target = True
+            receipt["target_unchanged"] = False
         except Exception as exc:
             failure_code = DeployExitCode.REPLACE_FAILED
             raise RuntimeError(f"atomic candidate replacement failed: {exc}") from exc
@@ -829,6 +843,16 @@ def deploy_runtime(
         failure_code = DeployExitCode.ROLLBACK_FAILED
     finally:
         restore_stage.unlink(missing_ok=True)
+    try:
+        receipt["target_unchanged"] = (
+            target.is_file()
+            and receipt["previous_sha256"] is not None
+            and _sha256(target) == receipt["previous_sha256"]
+            if had_previous
+            else not target.exists()
+        )
+    except OSError:
+        receipt["target_unchanged"] = False
     receipt["rollback"] = rollback
     receipt["error"] = str(failure or "deployment failed")
     raise RuntimeDeployError(

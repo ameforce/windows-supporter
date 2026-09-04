@@ -265,6 +265,32 @@ class RuntimeDeployTest(unittest.TestCase):
 
             self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), first)
 
+    def test_transaction_claim_race_is_reported_as_preserved_conflict(self):
+        with tempfile.TemporaryDirectory() as root:
+            candidate, target = self._paths(root)
+            marker = target.with_name("windows-supporter.promotion-pending.json")
+            controller = FakeController()
+
+            def lose_claim(path, _payload):
+                path.write_text('{"owner":"first"}', encoding="utf-8")
+                raise FileExistsError(path)
+
+            with patch(
+                "src.utils.runtime_deploy._claim_json_exclusive",
+                side_effect=lose_claim,
+            ), self.assertRaises(RuntimeDeployError) as raised:
+                deploy_runtime(candidate, target, controller=controller)
+
+            receipt = raised.exception.receipt
+            self.assertEqual(raised.exception.exit_code, DeployExitCode.INVALID_INPUT)
+            self.assertTrue(receipt["target_unchanged"])
+            self.assertTrue(receipt["transaction_conflict"])
+            self.assertEqual(receipt["rollback"]["status"], "target-unchanged")
+            self.assertEqual(receipt["preserved_transaction"]["marker"], str(marker))
+            self.assertEqual(target.read_bytes(), b"old-runtime")
+            self.assertEqual(controller.terminated, [])
+            self.assertEqual(controller.launches, [])
+
     def test_fresh_install_promotes_candidate_without_previous_runtime(self):
         with tempfile.TemporaryDirectory() as root:
             base = Path(root)
@@ -386,6 +412,35 @@ class RuntimeDeployTest(unittest.TestCase):
             self.assertTrue(
                 target.with_name("windows-supporter.promotion-pending.json").exists()
             )
+
+    def test_failed_restore_copy_reports_changed_target(self):
+        with tempfile.TemporaryDirectory() as root:
+            candidate, target = self._paths(root)
+            controller = FakeController(fail_new=True)
+
+            def fail_restore_copy(source, destination):
+                if ".restore-" in Path(destination).name:
+                    raise OSError("restore copy denied")
+                return shutil.copy2(source, destination)
+
+            with self.assertRaises(RuntimeDeployError) as raised:
+                deploy_runtime(
+                    candidate,
+                    target,
+                    controller=controller,
+                    probe_path=Path(root) / "probe.json",
+                    token_factory=lambda: "new-token",
+                    timeout_seconds=0.02,
+                    heartbeat_samples=1,
+                    poll_interval=0.01,
+                    sleep=controller.sleep,
+                    copy_file=fail_restore_copy,
+                )
+
+            self.assertEqual(raised.exception.exit_code, DeployExitCode.ROLLBACK_FAILED)
+            self.assertEqual(raised.exception.receipt["rollback"]["status"], "failed")
+            self.assertFalse(raised.exception.receipt["target_unchanged"])
+            self.assertEqual(target.read_bytes(), b"new-runtime")
 
     def test_cli_invalid_arguments_emit_json_failure_receipt(self):
         stdout = StringIO()

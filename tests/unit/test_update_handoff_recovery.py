@@ -305,6 +305,85 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             self.assertEqual(len(restarts), 1)
             self.assertEqual(state["recovery_status"], "complete")
 
+    def test_transaction_claim_loser_does_not_restart_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"old-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"old-executable")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            restarts = []
+
+            def failed_deploy(*_args, **_kwargs):
+                raise RuntimeDeployError(
+                    "another deployment owns the transaction",
+                    exit_code=DeployExitCode.INVALID_INPUT,
+                    receipt={
+                        "target_unchanged": True,
+                        "transaction_conflict": True,
+                        "preserved_transaction": {
+                            "marker": str(repo / "windows-supporter.promotion-pending.json"),
+                            "backup": None,
+                        },
+                        "rollback": {"status": "target-unchanged"},
+                    },
+                )
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=BuildSubprocess(root_executable, returncode=0),
+                runtime_deployer=failed_deploy,
+                runtime_restarter=lambda *_args, **_kwargs: restarts.append(True),
+                progress_ui_factory=None,
+                max_attempts=1,
+            )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(restarts, [])
+            self.assertEqual(state["recovery_status"], "failed")
+
+    def test_failed_rollback_never_restarts_unverified_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"old-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"old-executable")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            restarts = []
+
+            def failed_deploy(*_args, **_kwargs):
+                root_executable.write_bytes(b"new-unverified")
+                raise RuntimeDeployError(
+                    "rollback failed",
+                    exit_code=DeployExitCode.ROLLBACK_FAILED,
+                    receipt={
+                        "target_unchanged": True,
+                        "rollback": {"status": "failed", "error": "restore copy denied"},
+                    },
+                )
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=BuildSubprocess(root_executable, returncode=0),
+                runtime_deployer=failed_deploy,
+                runtime_restarter=lambda *_args, **_kwargs: restarts.append(True),
+                progress_ui_factory=None,
+                max_attempts=1,
+            )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(restarts, [])
+            self.assertEqual(root_executable.read_bytes(), b"new-unverified")
+            self.assertEqual(state["recovery_status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

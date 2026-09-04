@@ -34,6 +34,7 @@ main 물리 checkout에서 `git pull`, `git reset`, `git switch`, `git merge`처
 - final candidate build에는 child environment로 `WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY=1`을 전달한다.
 - runtime·packaging release의 승격은 `tools/deploy_runtime.py`만 수행한다. helper는 candidate 검증 후 exact-path process tree 종료, backup, atomic replacement, launch, tray/Tk readiness와 heartbeat 검증을 하나의 transaction으로 수행한다.
 - helper는 marker를 exclusive-create해 동시 배포를 배제한다. backup과 staged candidate가 모두 검증되기 전에는 running runtime을 건드리지 않으며, preparation 실패는 target-unchanged receipt로 끝낸다.
+- marker 선점 경쟁에서 진 호출자는 `transaction_conflict`와 `preserved_transaction`을 기록하고 runtime을 재기동하지 않는다. `rollback.status=target-unchanged`가 아닌 실패도 `target_unchanged` 값만으로 재기동하지 않는다.
 - root executable이 없는 fresh checkout은 previous artifact 없는 transaction으로 설치하고, 실패하면 target 부재 상태로 되돌린다.
 - 새 runtime의 launch/readiness가 실패하면 helper는 이전 artifact를 복원하고 이전 runtime readiness까지 확인한 뒤 비영 종료 코드와 JSON rollback receipt를 반환한다.
 - marker 또는 backup이 이미 존재하면 ownership을 추정하지 않고 그대로 보존한 채 실패한다. 별도 조사 없이 덮어쓰거나 삭제하지 않는다.
