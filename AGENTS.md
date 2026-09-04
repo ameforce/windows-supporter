@@ -46,7 +46,7 @@
 - 전체 `unittest discover` 또는 전체 E2E는 기본 검증이 아니다. 사용자가 명시적으로 요청했거나 공용 기반 변경 때문에 targeted selection이 불가능하다는 구체적 증거가 있을 때만 이유를 먼저 기록하고 실행한다.
 - 동일 source tree의 immutable targeted evidence는 task/main/develop에서 재사용한다. conflict/content drift가 있을 때만 그 차이에 직접 대응하는 검증을 추가한다.
 - 실패하면 실패한 test와 직접 영향 범위부터 수정·재실행하며 관련성 증거 없이 범위를 확대하지 않는다.
-- **[REL-CLEAN-TAGGED-BUILD]** task 범위와 별개로 version release를 닫을 때는 clean tagged `main`의 동일 SHA에서 `WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1`로 post-build 앱 launch를 막은 final build를 한 번 만들거나, 같은 SHA의 이미 검증된 artifact를 재사용한다. metadata와 artifact identity를 read-back한다.
+- **[REL-CLEAN-TAGGED-BUILD]** task 범위와 별개로 version release를 닫을 때는 clean tagged `main`의 동일 SHA에서 `WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY=1`로 permanent runtime을 건드리지 않는 final candidate build를 한 번 만들거나, 같은 SHA의 이미 검증된 artifact를 재사용한다. runtime·packaging release는 별도 transactional deploy helper로만 승격하고 readiness/rollback receipt를 read-back한다. metadata와 artifact identity를 read-back한다.
 
 ## delivery workflow gates
 

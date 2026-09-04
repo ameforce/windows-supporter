@@ -403,33 +403,34 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
             self.assertTrue(wait_for_update_handoff_ack(state_path))
 
-    def test_build_bat_supports_updater_owned_relaunch(self) -> None:
+    def test_build_bat_routes_runtime_promotion_to_transactional_helper(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read()
 
-        self.assertIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN", script)
-        self.assertIn("SKIP_POST_BUILD_RUN", script)
-        self.assertIn("Skipping post-build launch", script)
+        staged_validation_index = script.index("tools\\verify_codex_usage_worker_smoke.py")
+        deploy_index = script.index("tools\\deploy_runtime.py")
+        cleanup_index = script.index("Remove build byproducts")
 
-    def test_build_bat_artifact_only_mode_avoids_global_process_and_root_exe_mutation(self) -> None:
+        self.assertNotIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN", script)
+        self.assertNotIn('taskkill /f /t /im "%EXE_NAME%"', script)
+        self.assertNotIn('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"', script)
+        self.assertLess(staged_validation_index, deploy_index)
+        self.assertLess(deploy_index, cleanup_index)
+
+    def test_build_bat_artifact_only_mode_exits_after_candidate_validation(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read()
 
-        self.assertIn("WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY", script)
-        taskkill_guard = script.index('if "%ARTIFACT_ONLY%"=="0" (')
-        taskkill_index = script.index('taskkill /f /t /im "%EXE_NAME%"')
-        taskkill_guard_end = script.index("\n)", taskkill_index)
         staged_validation_index = script.index("tools\\verify_codex_usage_worker_smoke.py")
         artifact_exit = script.index(
             'if "%ARTIFACT_ONLY%"=="1" (', staged_validation_index
         )
-        move_index = script.index('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"')
+        deploy_index = script.index("tools\\deploy_runtime.py")
 
-        self.assertLess(taskkill_guard, taskkill_index)
-        self.assertLess(taskkill_index, taskkill_guard_end)
-        self.assertLess(artifact_exit, move_index)
+        self.assertIn("WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY", script)
         self.assertLess(staged_validation_index, artifact_exit)
-        self.assertIn("dist\\%EXE_NAME%", script[artifact_exit:move_index])
+        self.assertLess(artifact_exit, deploy_index)
+        self.assertIn("dist\\%EXE_NAME%", script[artifact_exit:deploy_index])
 
     def test_build_bat_can_emit_step_log_for_updater_progress(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
@@ -439,207 +440,17 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("WINDOWS_SUPPORTER_STEP_LOG=%STEP_LOG%", script)
         self.assertIn('if "%EMIT_STEP_LOG%"=="1"', script)
 
-    def test_build_bat_terminates_running_process_tree(self) -> None:
-        with open("build.bat", "r", encoding="utf-8") as fp:
-            script = fp.read().lower()
-
-        self.assertIn('taskkill /f /t /im "%exe_name%"', script)
-
-    def test_build_bat_treats_taskkill_128_as_not_running(self) -> None:
-        if os.name != "nt":
-            self.skipTest("build.bat is a Windows command path")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            temp_dir = Path(tmp)
-            (temp_dir / "taskkill.cmd").write_text(
-                "@echo off\r\nexit /b 128\r\n",
-                encoding="utf-8",
-            )
-            (temp_dir / "powershell.cmd").write_text(
-                "@echo off\r\nexit /b 1\r\n",
-                encoding="utf-8",
-            )
-            env = dict(os.environ)
-            env["PATH"] = f"{temp_dir}{os.pathsep}{env['PATH']}"
-            env["TEMP"] = str(temp_dir)
-            env["TMP"] = str(temp_dir)
-
-            result = subprocess.run(
-                ["cmd", "/d", "/c", "build.bat"],
-                cwd=Path.cwd(),
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-
-        self.assertIn("[ Not running ]", result.stdout)
-        self.assertNotIn("Failed to stop the running windows-supporter.exe process.", result.stdout)
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_build_bat_wait_loops_do_not_depend_on_timeout_stdin(self) -> None:
-        with open("build.bat", "r", encoding="utf-8") as fp:
-            script = fp.read()
-
-        self.assertNotIn("timeout /t", script.lower())
-        self.assertIn("call :sleep_one_second", script)
-        self.assertIn(":sleep_one_second", script)
-        self.assertIn("ping.exe", script.lower())
-
-    def test_build_bat_validates_pyinstaller_archive_before_launch(self) -> None:
+    def test_build_bat_validates_pyinstaller_archive_before_deploy(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
             script = fp.read()
 
         validation_index = script.index("tools\\verify_pyinstaller_archive.py")
-        move_index = script.index("Moving %EXE_NAME%")
+        deploy_index = script.index("tools\\deploy_runtime.py")
         cleanup_index = script.index("Remove build byproducts")
-        launch_index = script.index("Running %EXE_NAME%")
 
-        self.assertLess(validation_index, move_index)
+        self.assertLess(validation_index, deploy_index)
         self.assertLess(validation_index, cleanup_index)
-        self.assertLess(validation_index, launch_index)
         self.assertIn("playwright\\driver\\node.exe", script)
-
-    def test_build_bat_rolls_back_when_promoted_worker_boundary_is_blocked(self) -> None:
-        with open("build.bat", "r", encoding="utf-8") as fp:
-            script = fp.read()
-
-        staged_validation_index = script.index(
-            '"tools\\verify_codex_usage_worker_smoke.py" "dist\\%EXE_NAME%"'
-        )
-        backup_index = script.index("call :backup_root_executable")
-        move_index = script.index('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"')
-        promoted_validation_index = script.index(
-            '"tools\\verify_codex_usage_worker_smoke.py" "%ROOT_EXE%"'
-        )
-        rollback_index = script.index(
-            "call :restore_root_executable", promoted_validation_index
-        )
-        cleanup_index = script.index("Remove build byproducts")
-
-        self.assertLess(staged_validation_index, backup_index)
-        self.assertLess(backup_index, move_index)
-        self.assertLess(move_index, promoted_validation_index)
-        self.assertLess(promoted_validation_index, rollback_index)
-        self.assertLess(rollback_index, cleanup_index)
-        self.assertIn(":backup_root_executable", script)
-        self.assertIn(":restore_root_executable", script)
-        backup_helper_index = script.index("\n:backup_root_executable")
-        restore_helper_index = script.index("\n:restore_root_executable")
-        backup_helper = script[backup_helper_index:restore_helper_index]
-        self.assertIn('mklink /H "%ROOT_EXE_BACKUP%" "%ROOT_EXE%"', backup_helper)
-        self.assertIn('move /Y "%ROOT_EXE%" "%ROOT_EXE_BACKUP%"', backup_helper)
-        self.assertNotIn('copy /Y "%ROOT_EXE%" "%ROOT_EXE_BACKUP%"', backup_helper)
-
-    def test_build_bat_rollback_helpers_restore_the_previous_file(self) -> None:
-        if os.name != "nt":
-            self.skipTest("build.bat rollback helpers are a Windows command path")
-
-        with open("build.bat", "r", encoding="utf-8") as fp:
-            script = fp.read()
-        helper_start = script.index("\n:backup_root_executable") + 1
-        helper_end = script.index("\n:remove_pyinstaller_byproducts", helper_start) + 1
-        rollback_helpers = script[helper_start:helper_end]
-
-        with tempfile.TemporaryDirectory() as tmp:
-            temp_dir = Path(tmp)
-            root_exe = temp_dir / "windows-supporter-rollback-test.exe"
-            expected_exe = temp_dir / "expected.exe"
-            candidate_exe = temp_dir / "candidate.exe"
-            backup_exe = temp_dir / "windows-supporter-rollback-test.previous.exe"
-            step_log = temp_dir / "rollback.log"
-            transaction = temp_dir / "windows-supporter-rollback-test.promotion-pending"
-            expected_exe.write_bytes(b"known-good")
-            root_exe.write_bytes(b"known-good")
-            original_file_index = root_exe.stat().st_ino
-            candidate_exe.write_bytes(b"blocked-candidate")
-            harness = temp_dir / "rollback-helper-test.bat"
-            harness.write_text(
-                "\r\n".join(
-                    [
-                        "@echo off",
-                        "setlocal EnableExtensions DisableDelayedExpansion",
-                        f'set "ROOT_EXE={root_exe}"',
-                        f'set "ROOT_EXE_BACKUP={backup_exe}"',
-                        'set "ROOT_BACKUP_CREATED=0"',
-                        'set "EXE_NAME=windows-supporter-rollback-test.exe"',
-                        f'set "STEP_LOG={step_log}"',
-                        f'set "ROOT_PROMOTION_TRANSACTION={transaction}"',
-                        "call :backup_root_executable",
-                        "if errorlevel 1 exit /b 10",
-                        f'move /Y "{candidate_exe}" "%ROOT_EXE%" > NUL',
-                        "if errorlevel 1 exit /b 11",
-                        "call :recover_interrupted_promotion",
-                        "if errorlevel 1 exit /b 12",
-                        f'fc /B "{expected_exe}" "%ROOT_EXE%" > NUL',
-                        "if errorlevel 1 exit /b 13",
-                        'if exist "%ROOT_EXE_BACKUP%" exit /b 14',
-                        'if exist "%ROOT_PROMOTION_TRANSACTION%" exit /b 15',
-                        "exit /b 0",
-                        rollback_helpers,
-                        ":clear_log",
-                        'if exist "%STEP_LOG%" del /F /Q "%STEP_LOG%" > NUL 2>&1',
-                        "exit /b 0",
-                        ":wait_for_process_stop",
-                        "exit /b 0",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            result = subprocess.run(
-                ["cmd", "/d", "/c", str(harness)],
-                cwd=temp_dir,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-            restored_file_index = root_exe.stat().st_ino
-
-        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
-        self.assertEqual(restored_file_index, original_file_index)
-
-    def test_build_bat_sleep_helper_runs_with_redirected_stdin(self) -> None:
-        if os.name != "nt":
-            self.skipTest("build.bat sleep helper is a Windows command path")
-
-        with open("build.bat", "r", encoding="utf-8") as fp:
-            lines = fp.read().splitlines()
-
-        helper_index = next(
-            index
-            for index, line in enumerate(lines)
-            if line.strip().lower() == ":sleep_one_second"
-        )
-        sleep_command = lines[helper_index + 1].strip()
-        self.assertIn("ping.exe", sleep_command.lower())
-        self.assertIn("127.0.0.1", sleep_command)
-        self.assertNotIn("powershell", sleep_command.lower())
-
-        with tempfile.TemporaryDirectory() as tmp:
-            harness = Path(tmp) / "sleep-helper.bat"
-            harness.write_text(
-                f"@echo off\r\n{sleep_command}\r\nexit /b %ERRORLEVEL%\r\n",
-                encoding="utf-8",
-            )
-            result = subprocess.run(
-                ["cmd", "/d", "/c", str(harness)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-            )
-
-        output = f"{result.stdout}\n{result.stderr}"
-        self.assertEqual(result.returncode, 0, output)
-        self.assertNotIn("Input redirection is not supported", output)
 
     def test_update_progress_snapshot_exposes_korean_copy_and_progressbar(self) -> None:
         build_step = get_update_progress_step("build")
@@ -953,8 +764,8 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             progress.close()
 
     def test_build_output_progress_is_distributed_from_early_visible_percentages(self) -> None:
-        shutdown = build_update_build_output_progress_snapshot(
-            "Shutting down the running windows-supporter.exe process...[ Success !! ]"
+        stale_workers = build_update_build_output_progress_snapshot(
+            "Stopping stale PyInstaller workers...[ Success !! ]"
         )
         uv_sync = build_update_build_output_progress_snapshot(
             "Syncing uv environment...[ Success !! ]"
@@ -963,32 +774,32 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             "Building main.py to windows-supporter.exe...[ Success !! ]"
         )
 
-        self.assertIsNotNone(shutdown)
+        self.assertIsNotNone(stale_workers)
         self.assertIsNotNone(uv_sync)
         self.assertIsNotNone(build)
-        assert shutdown is not None
+        assert stale_workers is not None
         assert uv_sync is not None
         assert build is not None
-        self.assertLessEqual(shutdown["percent"], 20)
+        self.assertLessEqual(stale_workers["percent"], 20)
         self.assertLessEqual(uv_sync["percent"], 35)
         self.assertLess(build["percent"], 80)
-        self.assertLess(shutdown["percent"], uv_sync["percent"])
+        self.assertLess(stale_workers["percent"], uv_sync["percent"])
         self.assertLess(uv_sync["percent"], build["percent"])
 
     def test_build_output_progress_uses_korean_stage_copy_without_raw_build_line(self) -> None:
-        raw_line = "Shutting down the running windows-supporter.exe process...[ Not running ]"
+        raw_line = "Artifact-only build complete: dist\\windows-supporter.exe"
         snapshot = build_update_build_output_progress_snapshot(raw_line)
 
         self.assertIsNotNone(snapshot)
         assert snapshot is not None
         activity = snapshot.get("activity", {})
-        self.assertEqual(activity.get("id"), "shutdown")
+        self.assertEqual(activity.get("id"), "candidate_ready")
         self.assertEqual(activity.get("source"), "build")
-        self.assertIn("실행 중인 앱", snapshot["label"])
-        self.assertIn("다음 단계", snapshot["detail"])
+        self.assertIn("준비 완료", snapshot["label"])
+        self.assertIn("배포 도우미", snapshot["detail"])
         self.assertNotIn("build.bat", snapshot["detail"])
-        self.assertNotIn("Not running", snapshot["detail"])
-        self.assertNotIn("Shutting down", str(activity.get("line") or ""))
+        self.assertNotIn("dist", snapshot["detail"])
+        self.assertNotIn("Artifact-only", str(activity.get("line") or ""))
 
     def test_failed_progress_can_preserve_last_meaningful_percent(self) -> None:
         snapshot = build_update_progress_snapshot(
@@ -1015,7 +826,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 "1432 INFO: PyInstaller: checking Analysis",
                 "2179 INFO: Building PYZ (ZlibArchive)",
                 "3120 INFO: Building PKG (CArchive) windows-supporter.pkg",
-                "Moving windows-supporter.exe...",
+                "Artifact-only build complete: dist\\windows-supporter.exe",
             ]
         )
         progress_ui = FakeProgressUi()
@@ -1732,7 +1543,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         self.assertGreater(fake_subprocess.calls, first_call_count)
 
-    def test_run_update_handoff_builds_with_skip_env_and_relaunches(self) -> None:
+    def test_run_update_handoff_builds_candidate_then_deploys_transactionally(self) -> None:
         class FakeSubprocess:
             def __init__(self) -> None:
                 self.calls = []
@@ -1765,7 +1576,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 self.retry_calls += 1
                 return False
 
-        launches = []
+        deployment_calls = []
         fake_subprocess = FakeSubprocess()
         progress_instances = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -1786,8 +1597,10 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, dict(kwargs)))
-                or StablePopen(),
+                runtime_deployer=lambda candidate, target, **kwargs: deployment_calls.append(
+                    (Path(candidate), Path(target), dict(kwargs))
+                )
+                or {"schema_version": 1, "operation": "deploy", "status": "success"},
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     FakeProgressUi(**kwargs)
                 )
@@ -1795,22 +1608,22 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             )
             state = read_update_handoff_state(state_path)
             self.assertTrue(Path(fake_subprocess.calls[0][1]["cwd"]).samefile(repo))
-            self.assertTrue(
-                Path(launches[0][0][0]).samefile(repo / "windows-supporter.exe")
+            self.assertEqual(
+                deployment_calls[0][0],
+                (repo / "dist" / "windows-supporter.exe").resolve(),
             )
-            self.assertTrue(Path(launches[0][1]["cwd"]).samefile(repo))
+            self.assertTrue(deployment_calls[0][1].samefile(repo / "windows-supporter.exe"))
 
         self.assertEqual(rc, 0)
         self.assertEqual(fake_subprocess.calls[0][0], ["cmd", "/c", "build.bat"])
         self.assertEqual(
-            fake_subprocess.calls[0][1]["env"]["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"],
+            fake_subprocess.calls[0][1]["env"]["WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY"],
             "1",
         )
-        self.assertEqual(
-            launches[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"],
-            "1",
-        )
+        self.assertNotIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN", fake_subprocess.calls[0][1]["env"])
+        self.assertEqual(deployment_calls[0][2]["base_environment"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
         self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["deployment_receipt"]["status"], "success")
         self.assertEqual(state["progress"]["label"], "업데이트 완료")
         self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
         self.assertLessEqual(progress_instances[0].snapshots[0]["percent"], 5)
@@ -1836,6 +1649,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout="built", stderr="")
 
         launches = []
+        deployment_calls = []
         fake_subprocess = FakeSubprocess()
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -1862,20 +1676,21 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 subprocess_module=fake_subprocess,
                 launch=lambda command, **kwargs: launches.append((command, dict(kwargs)))
                 or StablePopen(),
+                runtime_deployer=lambda candidate, target, **kwargs: deployment_calls.append(
+                    (Path(candidate), Path(target), dict(kwargs))
+                )
+                or {"schema_version": 1, "operation": "deploy", "status": "success"},
                 progress_ui_factory=lambda **_kwargs: None,
             )
-            self.assertTrue(
-                Path(launches[0][0][0]).samefile(repo / "windows-supporter.exe")
-            )
+            self.assertTrue(deployment_calls[0][1].samefile(repo / "windows-supporter.exe"))
             self.assertTrue(Path(launches[0][1]["cwd"]).samefile(repo))
-            self.assertTrue(Path(launches[1][1]["cwd"]).samefile(repo))
 
         self.assertEqual(rc, 0)
         self.assertEqual(
-            launches[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"],
+            deployment_calls[0][2]["base_environment"]["PYINSTALLER_RESET_ENVIRONMENT"],
             "1",
         )
-        self.assertEqual(launches[1][0], ["C:/Apps/Fork/Fork.exe"])
+        self.assertEqual(launches[0][0], ["C:/Apps/Fork/Fork.exe"])
 
     def test_run_no_window_with_progress_pumps_ui_while_waiting_for_build_output(self) -> None:
         class SlowStdout:
@@ -1961,12 +1776,10 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             def __init__(self, owner) -> None:
                 self.owner = owner
                 self.lines = [
-                    "Shutting down the running windows-supporter.exe process...[ Success !! ]\n",
                     "Syncing uv environment...[ Success !! ]\n",
                     "Generating version metadata...[ Success !! ]\n",
                     "Building main.py to windows-supporter.exe...[ Success !! ]\n",
-                    "Moving windows-supporter.exe...[ Success !! ]\n",
-                    "Skipping post-build launch because WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1.\n",
+                    "Artifact-only build complete: dist\\windows-supporter.exe\n",
                 ]
 
             def readline(self):
@@ -2048,7 +1861,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, kwargs)) or StablePopen(),
+                runtime_deployer=lambda *_args, **_kwargs: {
+                    "schema_version": 1,
+                    "operation": "deploy",
+                    "status": "success",
+                },
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     FakeProgressUi(process=fake_subprocess.process, **kwargs)
                 )
@@ -2058,11 +1875,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         labels = [snapshot["label"] for snapshot in progress_instances[0].snapshots]
         details = [snapshot["detail"] for snapshot in progress_instances[0].snapshots]
         self.assertEqual(rc, 0)
-        self.assertIn("실행 중인 앱 확인 중", labels)
+        self.assertIn("기존 앱 정리 중", labels)
         self.assertIn("빌드 환경 동기화 중", labels)
         self.assertIn("버전 정보 생성 중", labels)
         self.assertIn("실행 파일 빌드 중", labels)
-        self.assertIn("실행 파일 배치 중", labels)
+        self.assertIn("실행 파일 준비 완료", labels)
         self.assertIn("Windows Supporter 재실행 중", labels)
         self.assertTrue(progress_instances[0].streamed_before_exit)
         self.assertFalse(any("build.bat 단계" in detail for detail in details))
@@ -2099,7 +1916,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                     return "Building main.py to windows-supporter.exe...[ Success !! ]\n"
                 if self.index == 3:
                     self.index += 1
-                    return "Skipping post-build launch because WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1.\n"
+                    return "Artifact-only build complete: dist\\windows-supporter.exe\n"
                 time.sleep(0.05)
                 self.owner.returncode = 0
                 return ""
@@ -2183,7 +2000,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, kwargs)) or StablePopen(),
+                runtime_deployer=lambda *_args, **_kwargs: {
+                    "schema_version": 1,
+                    "operation": "deploy",
+                    "status": "success",
+                },
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     FakeProgressUi(process=fake_subprocess.process, **kwargs)
                 )
@@ -2336,7 +2157,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         fake_subprocess = FakeSubprocess()
         progress_instances = []
-        launches = []
+        restart_calls = []
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -2350,14 +2171,22 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=fake_subprocess,
-                launch=lambda command, **kwargs: launches.append((command, kwargs)) or StablePopen(),
+                runtime_deployer=lambda *_args, **_kwargs: {
+                    "schema_version": 1,
+                    "operation": "deploy",
+                    "status": "success",
+                },
+                runtime_restarter=lambda target, **kwargs: restart_calls.append(
+                    (Path(target), dict(kwargs))
+                )
+                or {"schema_version": 1, "operation": "restart", "status": "success"},
                 progress_ui_factory=lambda **kwargs: progress_instances.append(
                     RetryingProgressUi(**kwargs)
                 )
                 or progress_instances[-1],
                 max_attempts=2,
             )
-            self.assertTrue(Path(launches[0][1]["cwd"]).samefile(repo))
+            self.assertTrue(restart_calls[0][0].samefile(repo / "windows-supporter.exe"))
 
         self.assertEqual(rc, 0)
         self.assertEqual(len(fake_subprocess.calls), 2)

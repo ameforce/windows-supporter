@@ -18,13 +18,9 @@ from typing import Any, Callable
 
 from src.utils.app_version import get_app_version
 from src.utils.progress_subprocess import run_no_window_with_progress
+from src.utils.runtime_deploy import RuntimeDeployError, deploy_runtime, restart_runtime
 from src.utils.subprocess_utils import popen_no_window, run_no_window
-from src.utils.update_handoff_recovery import (
-    UpdateHandoffError,
-    build_relaunch_environment,
-    restore_previous_executable,
-    wait_for_process_stability,
-)
+from src.utils.update_handoff_recovery import UpdateHandoffError, build_relaunch_environment
 from src.utils.update_settings import (
     get_update_settings_path,
     load_update_settings,
@@ -54,7 +50,6 @@ UPDATE_HANDOFF_FILENAME = "update_handoff.json"
 UPDATE_HANDOFF_EXECUTABLE_NAME = "windows-supporter-updater.exe"
 UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS = 15.0
 UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS = 1800
-UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS = 5.0
 UPDATE_PROGRESS_TITLE = "Windows Supporter 업데이트"
 UPDATE_PROGRESS_FAILURE_TITLE = "Windows Supporter 업데이트 실패"
 UPDATE_PROGRESS_LOG_BUTTON_TEXT = "로그 열기"
@@ -309,14 +304,6 @@ UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
 UPDATE_PROGRESS_STEP_BY_KEY = {step.key: step for step in UPDATE_PROGRESS_STEPS}
 BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
     BuildOutputProgressRule(
-        "Shutting down the running",
-        "shutdown",
-        "실행 중인 앱 확인 중",
-        "실행 중인 앱이 없으면 바로 다음 단계로 진행합니다.",
-        "실행 중인 앱 상태를 확인했습니다.",
-        16,
-    ),
-    BuildOutputProgressRule(
         "Stopping stale PyInstaller workers",
         "stale_workers",
         "빌드 작업자 정리 중",
@@ -381,12 +368,12 @@ BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
         80,
     ),
     BuildOutputProgressRule(
-        "Moving windows-supporter.exe",
-        "place_executable",
-        "실행 파일 배치 중",
-        "검증된 실행 파일을 업데이트 위치에 배치합니다.",
-        "검증된 실행 파일을 배치했습니다.",
-        84,
+        "Artifact-only build complete",
+        "candidate_ready",
+        "실행 파일 준비 완료",
+        "검증된 후보 실행 파일을 배포 도우미에 넘길 준비를 합니다.",
+        "후보 실행 파일 검증을 마쳤습니다.",
+        88,
     ),
     BuildOutputProgressRule(
         "Remove build byproducts",
@@ -397,11 +384,11 @@ BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
         90,
     ),
     BuildOutputProgressRule(
-        "Skipping post-build launch",
-        "handoff_relaunch",
-        "재실행 준비 중",
-        "업데이트 프로세스가 새 앱을 안전하게 시작할 준비를 합니다.",
-        "새 앱 재실행 준비를 마쳤습니다.",
+        "Deploying verified",
+        "transactional_deploy",
+        "실행 파일 안전 배포 중",
+        "기존 앱을 백업하고 새 앱의 준비 상태까지 확인합니다.",
+        "새 앱의 실행 준비 상태를 확인했습니다.",
         92,
     ),
 )
@@ -866,6 +853,32 @@ def _executable_file_identity(path: Path) -> tuple[int, int, int, int] | None:
     except OSError:
         return None
     return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def cleanup_update_build_artifacts(repo_root: str | os.PathLike[str]) -> list[str]:
+    root = Path(repo_root).resolve()
+    targets = (
+        root / "build",
+        root / "dist",
+        root / "windows-supporter.spec",
+    )
+    removed: list[str] = []
+    for target in targets:
+        is_link = target.is_symlink() or getattr(
+            os.path, "isjunction", lambda _path: False
+        )(target)
+        if not target.exists() and not is_link:
+            continue
+        if is_link:
+            raise UpdateHandoffError(f"refusing to remove linked build artifact: {target}")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        if target.exists():
+            raise UpdateHandoffError(f"build artifact cleanup did not remove: {target}")
+        removed.append(str(target))
+    return removed
 
 
 def is_git_checkout_root(repo_root: str | os.PathLike[str]) -> bool:
@@ -1895,6 +1908,9 @@ def run_update_handoff(
     *,
     subprocess_module=subprocess,
     launch=popen_no_window,
+    runtime_deployer=deploy_runtime,
+    runtime_restarter=restart_runtime,
+    artifact_cleaner=cleanup_update_build_artifacts,
     progress_ui_factory=UpdateHandoffProgressUi,
     max_attempts: int = 2,
 ) -> int:
@@ -1921,6 +1937,8 @@ def run_update_handoff(
         published_build_labels: set[str] = set()
         publish_build_lock = threading.Lock()
         step_log_tailer: _BuildStepLogTailer | None = None
+        deployment_completed = False
+        deployment_receipt: dict[str, Any] | None = None
 
         def publish_handoff_progress(snapshot: dict[str, Any], *, first: bool = False) -> None:
             if progress_ui is not None:
@@ -1983,7 +2001,7 @@ def run_update_handoff(
             )
             publish_handoff_progress(build_progress)
             env = dict(os.environ)
-            env["WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN"] = "1"
+            env["WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY"] = "1"
             env["WINDOWS_SUPPORTER_EMIT_STEP_LOG"] = "1"
             env["GIT_TERMINAL_PROMPT"] = "0"
             try:
@@ -2018,8 +2036,16 @@ def run_update_handoff(
                 raise UpdateHandoffError(
                     f"build.bat failed with exit code {getattr(result, 'returncode', 1)}"
                 )
+            root_identity_after_build = _executable_file_identity(root_executable)
+            if (
+                root_identity_before_build is None
+                or root_identity_after_build != root_identity_before_build
+            ):
+                raise UpdateHandoffError(
+                    "artifact-only build changed the installed runtime before deployment"
+                )
 
-            failed_step = "새 버전 기동 확인"
+            failed_step = "새 버전 배포 및 준비 확인"
             relaunch_progress = build_update_progress_snapshot(
                 "relaunch",
                 state="running",
@@ -2032,18 +2058,22 @@ def run_update_handoff(
                 status="running",
                 progress=relaunch_progress,
             )
-            exe_path = str(root_executable)
-            proc = launch([exe_path], cwd=repo_root, env=relaunch_environment)
-            if proc is None:
-                raise UpdateHandoffError("failed to relaunch windows-supporter.exe")
-            is_stable, returncode = wait_for_process_stability(
-                proc,
-                timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
+            deployment_receipt = runtime_deployer(
+                Path(repo_root) / "dist" / "windows-supporter.exe",
+                root_executable,
+                base_environment=relaunch_environment,
             )
-            if not is_stable:
-                raise UpdateHandoffError(
-                    f"windows-supporter.exe exited during startup with code {returncode}"
-                )
+            if not isinstance(deployment_receipt, dict) or deployment_receipt.get(
+                "status"
+            ) != "success":
+                raise UpdateHandoffError("deployment helper returned no success receipt")
+            deployment_completed = True
+            failed_step = "빌드 산출물 정리"
+            removed_artifacts = artifact_cleaner(repo_root)
+            append_update_log(
+                log_path,
+                f"removed build artifacts: {', '.join(removed_artifacts) or 'none'}",
+            )
             for gui_name, gui_command in _extract_git_gui_relaunch_commands(state):
                 try:
                     launch(gui_command, cwd=repo_root)
@@ -2062,6 +2092,7 @@ def run_update_handoff(
                 state_path,
                 status="complete",
                 completed_at=time.time(),
+                deployment_receipt=deployment_receipt,
                 progress=complete_progress,
             )
             append_update_log(log_path, "handoff completed")
@@ -2073,85 +2104,84 @@ def run_update_handoff(
             recovery_status = "failed"
             recovery_error = ""
             recovered_at = None
-            preserved_launch_error = ""
-            root_identity_after_build = _executable_file_identity(root_executable)
-            if (
-                root_identity_before_build is not None
-                and root_identity_after_build == root_identity_before_build
-            ):
-                try:
-                    recovery_proc = launch(
-                        [str(root_executable)],
-                        cwd=repo_root,
-                        env=relaunch_environment,
-                    )
-                    if recovery_proc is None:
-                        raise UpdateHandoffError(
-                            "failed to relaunch the preserved windows-supporter.exe"
-                        )
-                    recovery_stable, recovery_returncode = wait_for_process_stability(
-                        recovery_proc,
-                        timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
-                    )
-                    if not recovery_stable:
-                        raise UpdateHandoffError(
-                            "preserved windows-supporter.exe exited during startup "
-                            f"with code {recovery_returncode}"
-                        )
+            recovery_receipt: dict[str, Any] | None = None
+            if deployment_completed:
+                recovery_status = "complete"
+                recovered_at = time.time()
+                recovery_receipt = {
+                    "status": "new-runtime-ready",
+                    "deployment": deployment_receipt,
+                }
+                recovery_error = "new runtime remains ready; build artifact cleanup failed"
+                append_update_log(log_path, recovery_error)
+            elif isinstance(exc, RuntimeDeployError):
+                rollback = exc.receipt.get("rollback", {})
+                if isinstance(rollback, dict) and rollback.get("status") == "ready":
                     recovery_status = "complete"
                     recovered_at = time.time()
-                    append_update_log(
-                        log_path,
-                        "preserved executable relaunched without copying",
+                    recovery_receipt = dict(rollback)
+                    append_update_log(log_path, "deployment helper restored and verified the previous runtime")
+                elif (
+                    exc.receipt.get("target_unchanged") is True
+                    and exc.receipt.get("recovery_action")
+                    == "restart-unchanged-runtime"
+                    and isinstance(rollback, dict)
+                    and rollback.get("status") == "target-unchanged"
+                    and exc.receipt.get("transaction_conflict") is not True
+                    and "preserved_transaction" not in exc.receipt
+                ):
+                    try:
+                        recovery_receipt = runtime_restarter(
+                            root_executable,
+                            base_environment=relaunch_environment,
+                        )
+                        recovery_status = "complete"
+                        recovered_at = time.time()
+                        append_update_log(
+                            log_path,
+                            "unchanged previous runtime restarted with readiness verification",
+                        )
+                    except (OSError, RuntimeDeployError) as recovery_exc:
+                        recovery_error = str(recovery_exc)
+                else:
+                    rollback_error = (
+                        rollback.get("error") if isinstance(rollback, dict) else None
                     )
-                except (OSError, UpdateHandoffError) as preserved_exc:
-                    preserved_launch_error = str(preserved_exc)
-                    append_update_log(
-                        log_path,
-                        f"preserved executable relaunch failed: {preserved_launch_error}",
-                    )
-
-            if recovery_status != "complete":
+                    recovery_error = str(rollback_error or exc)
+            else:
+                root_identity_after_build = _executable_file_identity(root_executable)
                 try:
-                    restore_previous_executable(recovery_executable, root_executable)
-                    recovery_proc = launch(
-                        [str(root_executable)],
-                        cwd=repo_root,
-                        env=relaunch_environment,
+                    restore_source = None
+                    if (
+                        root_identity_before_build is None
+                        or root_identity_after_build != root_identity_before_build
+                    ):
+                        if not recovery_executable.is_file():
+                            raise FileNotFoundError(recovery_executable)
+                        restore_source = recovery_executable
+                    recovery_receipt = runtime_restarter(
+                        root_executable,
+                        restore_source=restore_source,
+                        base_environment=relaunch_environment,
                     )
-                    if recovery_proc is None:
-                        raise UpdateHandoffError(
-                            "failed to relaunch the previous windows-supporter.exe"
-                        )
-                    recovery_stable, recovery_returncode = wait_for_process_stability(
-                        recovery_proc,
-                        timeout_seconds=UPDATE_RELAUNCH_STABILITY_TIMEOUT_SECONDS,
-                    )
-                    if not recovery_stable:
-                        raise UpdateHandoffError(
-                            "previous windows-supporter.exe exited during startup "
-                            f"with code {recovery_returncode}"
-                        )
                     recovery_status = "complete"
                     recovered_at = time.time()
-                    append_update_log(log_path, "previous executable restored and relaunched")
-                except (OSError, UpdateHandoffError) as recovery_exc:
+                    append_update_log(log_path, "previous runtime restarted with readiness verification")
+                except (OSError, RuntimeDeployError) as recovery_exc:
                     recovery_error = str(recovery_exc)
-                    if preserved_launch_error:
-                        recovery_error = (
-                            f"preserved relaunch failed: {preserved_launch_error}; "
-                            f"copy restore failed: {recovery_error}"
-                        )
                     append_update_log(
                         log_path,
                         f"previous executable recovery failed: {recovery_error}",
                     )
 
-            recovery_detail = (
-                "이전 버전으로 안전하게 복구했습니다."
-                if recovery_status == "complete"
-                else "이전 버전 자동 복구에도 실패했습니다."
-            )
+            if deployment_completed:
+                recovery_detail = "새 버전은 정상 실행 중이지만 빌드 산출물 정리가 필요합니다."
+            else:
+                recovery_detail = (
+                    "이전 버전으로 안전하게 복구했습니다."
+                    if recovery_status == "complete"
+                    else "이전 버전 자동 복구에도 실패했습니다."
+                )
             diagnostic_error = f"{exc} (recovery={recovery_status}: {recovery_error})"
             error_detail = (
                 f"{failed_step} 단계에서 업데이트를 완료하지 못했습니다. "
@@ -2184,6 +2214,7 @@ def run_update_handoff(
                 attempt=attempt,
                 recovery_status=recovery_status,
                 recovery_error=recovery_error,
+                recovery_receipt=recovery_receipt,
                 recovered_at=recovered_at,
                 progress=failed_progress,
             )

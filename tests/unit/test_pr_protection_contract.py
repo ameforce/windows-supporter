@@ -25,6 +25,19 @@ class PullRequestProtectionContractTest(unittest.TestCase):
         self.assertEqual(
             ruleset["rules"][0]["parameters"]["allowed_merge_methods"], ["merge"]
         )
+        self.assertTrue(
+            ruleset["rules"][0]["parameters"][
+                "require_extra_approval_for_unattributed_changes"
+            ]
+        )
+
+    def test_review_profile_routes_transactional_deploy_surfaces(self) -> None:
+        profile = json.loads(
+            (REPO_ROOT / ".codex" / "review-gate.json").read_text(encoding="utf-8")
+        )
+        encoded = json.dumps(profile, ensure_ascii=False)
+        self.assertIn("src/utils/runtime_deploy.py", encoded)
+        self.assertIn("tools/deploy_runtime.py", encoded)
 
     def test_repository_keeps_actions_disabled_and_pr_evidence_template(self) -> None:
         self.assertFalse((REPO_ROOT / ".github" / "workflows").exists())
@@ -115,7 +128,7 @@ class PullRequestProtectionContractTest(unittest.TestCase):
             "실제 Tk 창을 띄우면 UI-visible test",
             "전체 `unittest discover` 또는 전체 E2E는 기본 검증이 아니다",
             "policy/docs/ref/worktree-only 변경에는 UI/runtime smoke를 실행하지 않는다",
-            "child environment: `WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1`",
+            "child environment: `WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY=1`",
             "clean tagged `main`",
             "실패한 test와 직접 영향 범위를 먼저 수정·재실행",
         ):
