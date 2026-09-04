@@ -550,8 +550,16 @@ def restart_runtime(
             },
         ) from exc
     exact_pids: list[int] = []
-    restore_sha256 = _sha256(selected_restore) if selected_restore else None
+    restore_sha256: str | None = None
     try:
+        if selected_restore is not None:
+            try:
+                restore_sha256 = _sha256(selected_restore)
+            except OSError as exc:
+                raise RuntimeDeployError(
+                    f"runtime recovery source validation failed: {exc}",
+                    exit_code=DeployExitCode.REPLACE_FAILED,
+                ) from exc
         process_controller = controller or WindowsRuntimeProcessController()
         selected_probe = Path(probe_path) if probe_path else target.parent / ".windows-supporter.runtime-probe.json"
         if backup.exists():
@@ -615,8 +623,10 @@ def restart_runtime(
             exit_code=DeployExitCode.READINESS_FAILED,
         ) from exc
     finally:
-        restore_stage.unlink(missing_ok=True)
-        marker.unlink(missing_ok=True)
+        try:
+            restore_stage.unlink(missing_ok=True)
+        finally:
+            marker.unlink(missing_ok=True)
     return {
         "schema_version": 1,
         "operation": "restart",

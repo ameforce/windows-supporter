@@ -339,6 +339,49 @@ class RuntimeDeployTest(unittest.TestCase):
             self.assertEqual(receipt["status"], "success")
             self.assertEqual(target.read_bytes(), b"trusted-old-runtime")
 
+    def test_restart_source_hash_failure_releases_owned_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            _candidate, target = self._paths(root)
+            recovery = Path(root) / "recovery.exe"
+            recovery.write_bytes(b"trusted-old-runtime")
+            marker = target.with_name("windows-supporter.promotion-pending.json")
+
+            with patch(
+                "src.utils.runtime_deploy._sha256",
+                side_effect=OSError("recovery source read denied"),
+            ), self.assertRaises(RuntimeDeployError):
+                restart_runtime(target, restore_source=recovery)
+
+            self.assertFalse(marker.exists())
+
+    def test_restart_stage_cleanup_failure_still_releases_owned_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            _candidate, target = self._paths(root)
+            recovery = Path(root) / "recovery.exe"
+            recovery.write_bytes(b"trusted-old-runtime")
+            marker = target.with_name("windows-supporter.promotion-pending.json")
+            original_unlink = Path.unlink
+
+            def fail_copy_after_stage(source, destination):
+                shutil.copy2(source, destination)
+                raise OSError("staging interrupted")
+
+            def fail_stage_unlink(path, *args, **kwargs):
+                if ".restart-" in path.name:
+                    raise OSError("stage cleanup denied")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", new=fail_stage_unlink), self.assertRaises(
+                Exception
+            ):
+                restart_runtime(
+                    target,
+                    restore_source=recovery,
+                    copy_file=fail_copy_after_stage,
+                )
+
+            self.assertFalse(marker.exists())
+
     def test_transaction_claim_race_is_reported_as_preserved_conflict(self):
         with tempfile.TemporaryDirectory() as root:
             candidate, target = self._paths(root)
