@@ -6,8 +6,9 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from src.utils.runtime_deploy import DeployExitCode, RuntimeDeployError
+from src.utils.runtime_deploy import DeployExitCode, RuntimeDeployError, deploy_runtime
 from src.utils.update_monitor import (
     build_update_handoff_payload,
     read_update_handoff_state,
@@ -284,6 +285,7 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
                     exit_code=DeployExitCode.REPLACE_FAILED,
                     receipt={
                         "target_unchanged": True,
+                        "recovery_action": "restart-unchanged-runtime",
                         "rollback": {"status": "target-unchanged"},
                     },
                 )
@@ -302,6 +304,40 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             state = read_update_handoff_state(state_path)
 
             self.assertEqual(rc, 1)
+            self.assertEqual(len(restarts), 1)
+            self.assertEqual(state["recovery_status"], "complete")
+
+    def test_candidate_metadata_preflight_failure_restarts_unchanged_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"old-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"old-executable")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            restarts = []
+
+            with patch(
+                "src.utils.runtime_deploy._read_windows_artifact_identity",
+                side_effect=RuntimeError("invalid version resource"),
+            ):
+                rc = run_update_handoff(
+                    state_path,
+                    subprocess_module=BuildSubprocess(root_executable, returncode=0),
+                    runtime_deployer=deploy_runtime,
+                    runtime_restarter=lambda target, **kwargs: restarts.append(
+                        (Path(target), dict(kwargs))
+                    )
+                    or {"status": "success"},
+                    progress_ui_factory=None,
+                    max_attempts=1,
+                )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(root_executable.read_bytes(), b"old-root")
             self.assertEqual(len(restarts), 1)
             self.assertEqual(state["recovery_status"], "complete")
 

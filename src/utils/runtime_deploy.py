@@ -522,6 +522,32 @@ def restart_runtime(
     }
 
 
+def _pretransition_failure_receipt(
+    candidate: Path,
+    target: Path,
+    error: str,
+) -> dict[str, Any]:
+    try:
+        restartable_target = target.is_file() and target.stat().st_size > 0
+    except OSError:
+        restartable_target = False
+    return {
+        "schema_version": 1,
+        "operation": "deploy",
+        "status": "failed",
+        "timestamp": _utc_now(),
+        "candidate": str(candidate),
+        "target": str(target),
+        "target_unchanged": True,
+        "transaction_conflict": False,
+        "rollback": {"status": "target-unchanged"},
+        "recovery_action": (
+            "restart-unchanged-runtime" if restartable_target else "none"
+        ),
+        "error": error,
+    }
+
+
 def deploy_runtime(
     candidate_path: str | os.PathLike[str],
     target_path: str | os.PathLike[str],
@@ -543,99 +569,51 @@ def deploy_runtime(
     candidate = Path(candidate_path).resolve()
     target = Path(target_path).resolve()
     if not candidate.is_file() or candidate.stat().st_size <= 0:
+        error = f"candidate executable is missing or empty: {candidate}"
         raise RuntimeDeployError(
-            f"candidate executable is missing or empty: {candidate}",
+            error,
             exit_code=DeployExitCode.INVALID_INPUT,
-            receipt={
-                "schema_version": 1,
-                "operation": "deploy",
-                "status": "failed",
-                "timestamp": _utc_now(),
-                "candidate": str(candidate),
-                "target": str(target),
-                "target_unchanged": True,
-                "error": f"candidate executable is missing or empty: {candidate}",
-            },
+            receipt=_pretransition_failure_receipt(candidate, target, error),
         )
     had_previous = target.exists()
     if had_previous and (not target.is_file() or target.stat().st_size <= 0):
+        error = f"installed runtime is missing or empty: {target}"
         raise RuntimeDeployError(
-            f"installed runtime is missing or empty: {target}",
+            error,
             exit_code=DeployExitCode.INVALID_INPUT,
-            receipt={
-                "schema_version": 1,
-                "operation": "deploy",
-                "status": "failed",
-                "timestamp": _utc_now(),
-                "candidate": str(candidate),
-                "target": str(target),
-                "target_unchanged": True,
-                "error": f"installed runtime is missing or empty: {target}",
-            },
+            receipt=_pretransition_failure_receipt(candidate, target, error),
         )
     if _same_path(candidate, target):
+        error = "candidate and installed runtime must be different files"
         raise RuntimeDeployError(
-            "candidate and installed runtime must be different files",
+            error,
             exit_code=DeployExitCode.INVALID_INPUT,
-            receipt={
-                "schema_version": 1,
-                "operation": "deploy",
-                "status": "failed",
-                "timestamp": _utc_now(),
-                "candidate": str(candidate),
-                "target": str(target),
-                "target_unchanged": True,
-                "error": "candidate and installed runtime must be different files",
-            },
+            receipt=_pretransition_failure_receipt(candidate, target, error),
         )
 
     if controller is None:
         try:
             candidate_version, candidate_commit = _read_windows_artifact_identity(candidate)
         except Exception as exc:
+            error = f"candidate version metadata validation failed: {exc}"
             raise RuntimeDeployError(
-                f"candidate version metadata validation failed: {exc}",
+                error,
                 exit_code=DeployExitCode.INVALID_INPUT,
-                receipt={
-                    "schema_version": 1,
-                    "operation": "deploy",
-                    "status": "failed",
-                    "timestamp": _utc_now(),
-                    "candidate": str(candidate),
-                    "target": str(target),
-                    "target_unchanged": True,
-                    "error": f"candidate version metadata validation failed: {exc}",
-                },
+                receipt=_pretransition_failure_receipt(candidate, target, error),
             ) from exc
         if expected_version and expected_version != candidate_version:
+            error = "candidate FileVersion does not match --expected-version"
             raise RuntimeDeployError(
-                "candidate FileVersion does not match --expected-version",
+                error,
                 exit_code=DeployExitCode.INVALID_INPUT,
-                receipt={
-                    "schema_version": 1,
-                    "operation": "deploy",
-                    "status": "failed",
-                    "timestamp": _utc_now(),
-                    "candidate": str(candidate),
-                    "target": str(target),
-                    "target_unchanged": True,
-                    "error": "candidate FileVersion does not match --expected-version",
-                },
+                receipt=_pretransition_failure_receipt(candidate, target, error),
             )
         if expected_commit and expected_commit.lower() != candidate_commit.lower():
+            error = "candidate commit does not match --expected-commit"
             raise RuntimeDeployError(
-                "candidate commit does not match --expected-commit",
+                error,
                 exit_code=DeployExitCode.INVALID_INPUT,
-                receipt={
-                    "schema_version": 1,
-                    "operation": "deploy",
-                    "status": "failed",
-                    "timestamp": _utc_now(),
-                    "candidate": str(candidate),
-                    "target": str(target),
-                    "target_unchanged": True,
-                    "error": "candidate commit does not match --expected-commit",
-                },
+                receipt=_pretransition_failure_receipt(candidate, target, error),
             )
         expected_version = candidate_version
         expected_commit = candidate_commit
@@ -666,6 +644,9 @@ def deploy_runtime(
         "previous_sha256": _sha256(target) if had_previous else None,
         "target_unchanged": True,
         "transaction_conflict": False,
+        "recovery_action": (
+            "restart-unchanged-runtime" if had_previous else "none"
+        ),
         "terminated_pids": [],
         "readiness": None,
         "rollback": {"status": "not-required"},
@@ -673,6 +654,7 @@ def deploy_runtime(
     if marker.exists() or backup.exists():
         receipt["error"] = "an unfinished deployment transaction already exists"
         receipt["transaction_conflict"] = True
+        receipt["recovery_action"] = "none"
         receipt["preserved_transaction"] = {
             "marker": str(marker) if marker.exists() else None,
             "backup": str(backup) if backup.exists() else None,
@@ -704,6 +686,7 @@ def deploy_runtime(
         except FileExistsError as exc:
             failure_code = DeployExitCode.INVALID_INPUT
             receipt["transaction_conflict"] = True
+            receipt["recovery_action"] = "none"
             receipt["preserved_transaction"] = {
                 "marker": str(marker),
                 "backup": str(backup) if backup.exists() else None,
@@ -727,12 +710,14 @@ def deploy_runtime(
         try:
             if exact_pids:
                 transition_started = True
+                receipt["recovery_action"] = "none"
                 process_controller.terminate_tree(exact_pids, DEFAULT_STOP_TIMEOUT_SECONDS)
         except Exception as exc:
             failure_code = DeployExitCode.STOP_FAILED
             raise RuntimeError(f"failed to stop exact installed runtime: {exc}") from exc
         receipt["terminated_pids"] = exact_pids
         transition_started = True
+        receipt["recovery_action"] = "none"
         try:
             replace_file(staged, target)
             changed_target = True

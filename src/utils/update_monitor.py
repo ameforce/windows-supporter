@@ -2119,6 +2119,8 @@ def run_update_handoff(
                     append_update_log(log_path, "deployment helper restored and verified the previous runtime")
                 elif (
                     exc.receipt.get("target_unchanged") is True
+                    and exc.receipt.get("recovery_action")
+                    == "restart-unchanged-runtime"
                     and isinstance(rollback, dict)
                     and rollback.get("status") == "target-unchanged"
                     and exc.receipt.get("transaction_conflict") is not True
