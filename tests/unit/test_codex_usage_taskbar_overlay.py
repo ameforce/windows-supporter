@@ -7748,6 +7748,27 @@ class WindowSizeSyncUnitTest(unittest.TestCase):
         self.assertTrue(rectangles)
         self.assertEqual(rectangles[0][1][2], 511)
 
+    def test_native_client_rect_reading(self):
+        overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
+        window = _FakeOverlayWindow((473, 38))
+        overlay._window = window
+        self.assertEqual(overlay._read_window_size(window), (473, 38))
+
+    def test_draw_clamps_to_native_client_width(self):
+        # A mapped window refusing the model resize: draw must clamp to the
+        # visible width so the right outline stays inside the window.
+        overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
+        window = _FakeOverlayWindow((473, 38), adopt_geometry=False)
+        overlay._window = window
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(self._model(511))
+
+        rectangles = [op for op in canvas.ops if op[0] == "rectangle"]
+        self.assertTrue(rectangles)
+        self.assertLessEqual(rectangles[0][1][2], 473)
+
 
 if __name__ == "__main__":
     unittest.main()

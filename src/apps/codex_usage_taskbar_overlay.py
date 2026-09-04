@@ -1739,6 +1739,33 @@ def _set_overlay_text_width_scale(scale: float) -> None:
     return
 
 
+_OVERLAY_GEOMETRY_DEBUG_ENV = "WINDOWS_SUPPORTER_OVERLAY_GEOMETRY_DEBUG"
+
+
+def _overlay_geometry_debug_path() -> str:
+    return os.path.join(
+        os.environ.get("TEMP", os.path.dirname(os.path.abspath(__file__))),
+        "windows_supporter_overlay_geometry.log",
+    )
+
+
+def _debug_overlay_geometry(line: str) -> None:
+    """Env-gated one-line-per-draw geometry trace for live-width RCA.
+
+    Enabled only with WINDOWS_SUPPORTER_OVERLAY_GEOMETRY_DEBUG=1; writes are
+    append-only and never raise into the draw path.
+    """
+    try:
+        if os.environ.get(_OVERLAY_GEOMETRY_DEBUG_ENV, "") != "1":
+            return
+        with open(
+            _overlay_geometry_debug_path(), "a", encoding="utf-8", errors="replace"
+        ) as handle:
+            handle.write(line.rstrip("\n") + "\n")
+    except Exception:
+        return
+
+
 def _current_system_scaling() -> float | None:
     """Return the live system DPI as Tk scaling units, or None when unknown."""
     try:
@@ -3168,12 +3195,48 @@ class CodexUsageTaskbarOverlay:
         self._set_native_position(window, x, y, width, height)
         return
 
-    def _read_window_size(self, window: Any) -> tuple[int, int] | None:
-        """Current mapped window size, or None when it cannot be verified.
+    def _read_native_window_size(self, window: Any) -> tuple[int, int] | None:
+        """On-screen client size from the native HWND via GetClientRect.
 
-        Headless doubles without winfo methods deliberately return None so
-        every caller keeps its pre-verification behavior.
+        Tk winfo can lag (draws run before deiconify) and can disagree with
+        the composed window on DPI-virtualized displays; the native client
+        rect is the ground truth the screenshot will show.
         """
+        try:
+            hwnd = int(_get_window_handle(window))
+        except Exception:
+            return None
+        if hwnd <= 0 or not hasattr(ctypes, "windll"):
+            return None
+        try:
+            class _Rect(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            rect = _Rect()
+            if not ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect)):
+                return None
+            width = int(rect.right) - int(rect.left)
+            height = int(rect.bottom) - int(rect.top)
+            if width <= 0 or height <= 0:
+                return None
+            return (width, height)
+        except Exception:
+            return None
+
+    def _read_window_size(self, window: Any) -> tuple[int, int] | None:
+        """Actual on-screen window size: native client rect first, Tk fallback.
+
+        Headless doubles without winfo/native handles deliberately return None
+        so every caller keeps its pre-verification behavior.
+        """
+        native = self._read_native_window_size(window)
+        if native is not None:
+            return native
         try:
             if not bool(window.winfo_ismapped()):
                 return None
@@ -3235,9 +3298,17 @@ class CodexUsageTaskbarOverlay:
             geometry = {}
         width = int(geometry.get("width", 760))
         height = int(geometry.get("height", 38))
+        model_width = width
         window = self._window
         if window is not None and bool(geometry.get("visible", True)):
             width = self._converge_draw_width(window, geometry, width, height)
+        _debug_overlay_geometry(
+            f"draw t={time.time():.3f} model={model_width} chosen={width} "
+            f"scale={_overlay_text_width_scale():.4f} "
+            f"win={self._read_window_size(window) if window is not None else None} "
+            f"x={geometry.get('x')} y={geometry.get('y')} "
+            f"visible={geometry.get('visible', True)}"
+        )
         bars = [bar for bar in model.get("bars", []) if isinstance(bar, dict)]
         canvas.delete("all")
         self._metric_hit_rects = []
