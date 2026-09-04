@@ -7695,11 +7695,13 @@ class GuidanceInkClampUnitTest(unittest.TestCase):
             canvas, text, x=0, center_y=5, reset_color="#fff", max_right_px=220
         )
 
-        deletes = [op for op in canvas.ops if op[0] == "delete"]
-        self.assertTrue(deletes)
+        # Right-anchored guidance: it is truncated before drawing, so no
+        # oversized text is ever placed (no delete/replace pass needed).
         texts = [op for op in canvas.ops if op[0] == "text"]
         self.assertTrue(texts[-1][2]["text"].endswith("…"))
         self.assertLess(len(texts[-1][2]["text"]), len(text))
+        self.assertEqual(texts[-1][2]["anchor"], "e")
+        self.assertEqual(texts[-1][1][0], 220)
         self.assertLessEqual(end, 220)
 
     def test_guidance_kept_when_ink_inside_limit(self):
@@ -7712,6 +7714,10 @@ class GuidanceInkClampUnitTest(unittest.TestCase):
 
         deletes = [op for op in canvas.ops if op[0] == "delete"]
         self.assertFalse(deletes)
+        # Right-aligned at the boundary regardless of ink length.
+        texts = [op for op in canvas.ops if op[0] == "text"]
+        self.assertEqual(texts[-1][2]["anchor"], "e")
+        self.assertEqual(texts[-1][1][0], 400)
         self.assertLessEqual(end, 400)
 
     def test_truncate_returns_empty_when_ellipsis_does_not_fit(self):
