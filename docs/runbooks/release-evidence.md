@@ -11,11 +11,15 @@
 ## artifact evidence
 
 - final tagged build command와 exit result
-- post-build launch suppression `WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN=1`
+- candidate-only build environment `WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY=1`
 - executable absolute path, SHA-256, size와 timestamp
 - `FileVersion`, `ProductVersion`, `Comments`
 - artifact가 가리키는 release tag와 commit
 - build/dist/spec/backup/promotion marker 잔류 여부
+- transactional deploy JSON receipt와 exit code
+- normal build가 출력한 `WINDOWS_SUPPORTER_DEPLOY_RECEIPT` path와 JSON parse read-back
+- success receipt의 exact target, candidate/target SHA-256, readiness PID·tray HWND·heartbeat samples·startup path
+- 실패 시 rollback artifact SHA-256와 이전 runtime readiness receipt
 
 명령 성공만으로 artifact를 증명하지 않고 파일 metadata와 hash를 read-back한다.
 

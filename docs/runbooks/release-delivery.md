@@ -50,6 +50,7 @@
 - `docs/runbooks/validation-and-release-build.md`의 release closure overlay를 실행한다.
 - task가 policy/docs/ref/worktree-only여도 tagged artifact는 필요하지만 UI-visible test나 앱 launch는 필요하지 않다.
 - build source가 clean exact tag인지, artifact metadata가 tag와 commit을 가리키는지 확인한다.
+- runtime·packaging release는 candidate build와 transactional deploy를 분리하고, deploy success/rollback receipt와 readiness evidence를 고정한 뒤에만 publish로 진행한다.
 
 ## 6. develop back-merge
 
@@ -65,10 +66,11 @@
 ## 7. publish와 read-back
 
 1. 최종 local main/tag/develop identity를 고정한다.
-2. `git push origin main`, `git push origin vX.Y.Z`, `git push origin develop` 순으로 publish한다.
-3. 각 push 후 exact remote ref/tag object/peeled commit을 read-back한다.
-4. 공개 후 mismatch를 발견해도 force rewrite하지 않는다. revert 또는 다음 patch로 복구한다.
-5. GitHub Actions run은 completion gate가 아니다.
+2. runtime·packaging release는 transactional deploy receipt가 success이고 120초 canary가 유지됐는지 다시 확인한다. readiness 또는 rollback 실패가 있으면 publish하지 않는다.
+3. `git push origin main`, `git push origin vX.Y.Z`, `git push origin develop` 순으로 publish한다.
+4. 각 push 후 exact remote ref/tag object/peeled commit을 read-back한다.
+5. 공개 후 mismatch를 발견해도 force rewrite하지 않는다. revert 또는 다음 patch로 복구한다.
+6. GitHub Actions run은 completion gate가 아니다.
 
 ## 8. cleanup과 종료
 

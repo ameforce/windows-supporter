@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 import ctypes
@@ -57,6 +58,20 @@ if win32ts is not None:
         pass
 
 _WTS_API = None
+
+
+@dataclass(frozen=True, slots=True)
+class TrayReady:
+    hwnd: int
+    class_name: str
+
+
+class TrayStartupError(RuntimeError):
+    pass
+
+
+class TrayStartupTimeout(TrayStartupError):
+    pass
 
 
 def _get_wtsapi32():
@@ -136,6 +151,9 @@ class SystemTrayIcon:
         self._hwnd: int | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._startup_error: BaseException | None = None
+        self._icon_registered = False
         self._wm_notify = win32con.WM_USER + 20
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
         self._class_name = f"WindowsSupporterTray_{os.getpid()}"
@@ -146,10 +164,17 @@ class SystemTrayIcon:
         self._power_registration: PowerNotificationRegistration | None = None
         return
 
-    def start(self) -> None:
+    def start(self, timeout: float = 15.0) -> TrayReady:
         if self._thread is not None and self._thread.is_alive():
-            return
+            if self._hwnd and self._icon_registered:
+                return TrayReady(hwnd=int(self._hwnd), class_name=self._class_name)
+            if not self._ready_event.wait(timeout=max(0.01, float(timeout))):
+                raise TrayStartupTimeout("tray startup timed out")
+            return self._raise_or_return_ready()
         self._stop_event.clear()
+        self._ready_event.clear()
+        self._startup_error = None
+        self._icon_registered = False
         t = threading.Thread(
             target=self._run,
             name="windows-supporter-tray",
@@ -157,7 +182,27 @@ class SystemTrayIcon:
         )
         self._thread = t
         t.start()
-        return
+        if not self._ready_event.wait(timeout=max(0.01, float(timeout))):
+            self.stop()
+            raise TrayStartupTimeout("tray startup timed out")
+        return self._raise_or_return_ready()
+
+    def _raise_or_return_ready(self) -> TrayReady:
+        if self._startup_error is not None:
+            raise TrayStartupError(str(self._startup_error)) from self._startup_error
+        if not self._hwnd or not self._icon_registered:
+            raise TrayStartupError("tray worker exited before readiness")
+        return TrayReady(hwnd=int(self._hwnd), class_name=self._class_name)
+
+    def is_ready(self) -> bool:
+        thread = self._thread
+        hwnd = self._hwnd
+        if thread is None or not thread.is_alive() or not hwnd or not self._icon_registered:
+            return False
+        try:
+            return bool(win32gui.IsWindow(int(hwnd)))
+        except Exception:
+            return False
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -178,13 +223,20 @@ class SystemTrayIcon:
     def _run(self) -> None:
         try:
             self._create_window()
+            if self._stop_event.is_set():
+                raise TrayStartupError("tray startup was cancelled")
+            if not self._hwnd or not self._icon_registered:
+                raise TrayStartupError("tray window or notification icon is not ready")
+            self._ready_event.set()
             win32gui.PumpMessages()
-        except Exception:
+        except BaseException as exc:
+            self._startup_error = exc
             try:
                 self._hwnd = None
             except Exception:
                 pass
         finally:
+            self._ready_event.set()
             self._thread = None
         return
 
@@ -230,21 +282,27 @@ class SystemTrayIcon:
         )
         self._hwnd = hwnd
         win32gui.UpdateWindow(hwnd)
-        self._add_icon()
+        self._add_icon(required=True)
         self._register_session_notifications()
         self._register_power_notifications()
         return
 
-    def _add_icon(self) -> None:
+    def _add_icon(self, *, required: bool = False) -> None:
         hwnd = self._hwnd
         if not hwnd:
+            if required:
+                raise TrayStartupError("tray window was not created")
             return
         hicon, tooltip = self._get_hicon(), self._tooltip
         flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
         nid = (hwnd, 0, flags, self._wm_notify, hicon, tooltip)
         try:
             win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
-        except Exception:
+            self._icon_registered = True
+        except Exception as exc:
+            self._icon_registered = False
+            if required:
+                raise TrayStartupError(f"notification icon registration failed: {exc}") from exc
             return
         return
 
@@ -257,6 +315,8 @@ class SystemTrayIcon:
             win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, nid)
         except Exception:
             return
+        finally:
+            self._icon_registered = False
         return
 
     def _resolve_icon_path(self) -> str | None:
