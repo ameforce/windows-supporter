@@ -6936,6 +6936,9 @@ class _TkFakeRoot(_FakeRoot):
 
 
 class OverlayUiScalingUnitTest(unittest.TestCase):
+    def tearDown(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.0)
+
     def test_applies_live_system_scale_upward(self):
         root = _TkFakeRoot(scaling=96.0 / 72.0)
 
@@ -7562,6 +7565,90 @@ class _FakeOverlayWindow:
             size_text = spec.split("+", 1)[0]
             width, height = size_text.split("x")
             self._size = (int(width), int(height))
+
+
+class TextScaleBudgetUnitTest(unittest.TestCase):
+    def setUp(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.0)
+
+    def tearDown(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.0)
+
+    def _metric(self):
+        return {
+            "key": "7D",
+            "metric_key": "weekly_limit",
+            "percent": 25,
+            "value_text": "25%",
+            "reset_text": "05d 19h 56m 47s",
+            "reset_short_text": "5d 19h",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 84% / 4d 1h",
+            "normal_guidance_short_text": "N 84%",
+        }
+
+    def test_default_scale_is_identity(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.0)
+        inline = taskbar_overlay._inline_text_width("03d 02h 57m 29s")
+        reset = taskbar_overlay._reset_column_width_for_text(
+            "03d 02h 57m 29s | N 84% / 4d 1h", metric_key="weekly_limit"
+        )
+        badge = taskbar_overlay._reset_badge_width_for_label("부족")
+        value = taskbar_overlay._value_column_width_for_text("25%")
+        self.assertEqual(
+            inline,
+            sum(9 if ord(c) > 127 else 5 for c in "03d 02h 57m 29s"),
+        )
+        self.assertGreater(reset, 0)
+        self.assertGreater(badge, 0)
+        self.assertGreater(value, 0)
+
+    def test_text_budgets_grow_with_overlay_scale(self):
+        base_inline = taskbar_overlay._inline_text_width("03d 02h 57m 29s")
+        base_reset = taskbar_overlay._reset_column_width_for_text(
+            "03d 02h 57m 29s | N 84% / 4d 1h", metric_key="weekly_limit"
+        )
+        base_badge = taskbar_overlay._reset_badge_width_for_label("부족")
+        base_value = taskbar_overlay._value_column_width_for_text("25%")
+
+        taskbar_overlay._set_overlay_text_width_scale(1.25)
+        self.assertGreater(
+            taskbar_overlay._inline_text_width("03d 02h 57m 29s"), base_inline
+        )
+        self.assertGreater(
+            taskbar_overlay._reset_column_width_for_text(
+                "03d 02h 57m 29s | N 84% / 4d 1h", metric_key="weekly_limit"
+            ),
+            base_reset,
+        )
+        self.assertGreater(
+            taskbar_overlay._reset_badge_width_for_label("부족"), base_badge
+        )
+        self.assertGreater(
+            taskbar_overlay._value_column_width_for_text("25%"), base_value
+        )
+
+    def test_required_segment_width_grows_with_overlay_scale(self):
+        metric = self._metric()
+        base = taskbar_overlay._required_metric_segment_width(
+            metric, badge_mode="short"
+        )
+        taskbar_overlay._set_overlay_text_width_scale(1.25)
+        scaled = taskbar_overlay._required_metric_segment_width(
+            metric, badge_mode="short"
+        )
+        self.assertGreater(scaled, base)
+
+    def test_row_layout_reserves_wider_columns_at_overlay_scale(self):
+        metric = self._metric()
+        rows = [(metric,)]
+        base = taskbar_overlay._metric_rows_layout_for_overlay_width(778, rows)
+        taskbar_overlay._set_overlay_text_width_scale(1.25)
+        scaled = taskbar_overlay._metric_rows_layout_for_overlay_width(778, rows)
+        self.assertGreaterEqual(
+            scaled[0].segment_widths[0], base[0].segment_widths[0]
+        )
 
 
 class WindowSizeSyncUnitTest(unittest.TestCase):
