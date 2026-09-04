@@ -447,6 +447,7 @@ def _launch_and_verify(
 def restart_runtime(
     target_path: str | os.PathLike[str],
     *,
+    restore_source: str | os.PathLike[str] | None = None,
     controller: RuntimeProcessController | None = None,
     probe_path: str | os.PathLike[str] | None = None,
     token_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
@@ -458,11 +459,17 @@ def restart_runtime(
     base_environment: Mapping[str, str] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    copy_file: Callable[[Path, Path], Any] = shutil.copy2,
+    replace_file: Callable[[Path, Path], Any] = os.replace,
 ) -> dict[str, Any]:
     target = Path(target_path).resolve()
+    selected_restore = Path(restore_source).resolve() if restore_source else None
     marker = target.with_name("windows-supporter.promotion-pending.json")
     backup = target.with_name("windows-supporter.previous.exe")
-    if not target.is_file():
+    restore_stage = target.with_name(
+        f".{target.name}.restart-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    if selected_restore is None and not target.is_file():
         raise RuntimeDeployError(
             f"runtime executable is missing: {target}",
             exit_code=DeployExitCode.INVALID_INPUT,
@@ -473,6 +480,27 @@ def restart_runtime(
                 "timestamp": _utc_now(),
                 "target": str(target),
                 "error": f"runtime executable is missing: {target}",
+            },
+        )
+    if selected_restore is not None and target.exists() and not target.is_file():
+        raise RuntimeDeployError(
+            f"runtime target is not a file: {target}",
+            exit_code=DeployExitCode.INVALID_INPUT,
+        )
+    if selected_restore is not None and (
+        not selected_restore.is_file() or selected_restore.stat().st_size <= 0
+    ):
+        raise RuntimeDeployError(
+            f"runtime recovery executable is missing or empty: {selected_restore}",
+            exit_code=DeployExitCode.INVALID_INPUT,
+            receipt={
+                "schema_version": 1,
+                "operation": "restart",
+                "status": "failed",
+                "timestamp": _utc_now(),
+                "target": str(target),
+                "restore_source": str(selected_restore),
+                "error": f"runtime recovery executable is missing or empty: {selected_restore}",
             },
         )
     if marker.exists() or backup.exists():
@@ -522,6 +550,7 @@ def restart_runtime(
             },
         ) from exc
     exact_pids: list[int] = []
+    restore_sha256 = _sha256(selected_restore) if selected_restore else None
     try:
         process_controller = controller or WindowsRuntimeProcessController()
         selected_probe = Path(probe_path) if probe_path else target.parent / ".windows-supporter.runtime-probe.json"
@@ -530,6 +559,13 @@ def restart_runtime(
                 "an unowned deployment backup appeared after restart claim",
                 exit_code=DeployExitCode.INVALID_INPUT,
             )
+        if selected_restore is not None:
+            copy_file(selected_restore, restore_stage)
+            if _sha256(restore_stage) != restore_sha256:
+                raise RuntimeDeployError(
+                    "staged recovery runtime hash differs from the source",
+                    exit_code=DeployExitCode.REPLACE_FAILED,
+                )
         exact_pids = list(process_controller.find_exact(target))
         if exact_pids:
             try:
@@ -539,6 +575,19 @@ def restart_runtime(
                     f"runtime restart stop failed: {exc}",
                     exit_code=DeployExitCode.STOP_FAILED,
                 ) from exc
+        if selected_restore is not None:
+            try:
+                replace_file(restore_stage, target)
+            except Exception as exc:
+                raise RuntimeDeployError(
+                    f"runtime recovery replacement failed: {exc}",
+                    exit_code=DeployExitCode.REPLACE_FAILED,
+                ) from exc
+            if _sha256(target) != restore_sha256:
+                raise RuntimeDeployError(
+                    "restored runtime hash differs from the recovery source",
+                    exit_code=DeployExitCode.REPLACE_FAILED,
+                )
         readiness = _launch_and_verify(
             target,
             controller=process_controller,
@@ -566,6 +615,7 @@ def restart_runtime(
             exit_code=DeployExitCode.READINESS_FAILED,
         ) from exc
     finally:
+        restore_stage.unlink(missing_ok=True)
         marker.unlink(missing_ok=True)
     return {
         "schema_version": 1,
@@ -573,6 +623,8 @@ def restart_runtime(
         "status": "success",
         "timestamp": _utc_now(),
         "target": str(target),
+        "restored_from": str(selected_restore) if selected_restore else None,
+        "target_sha256": _sha256(target),
         "terminated_pids": exact_pids,
         "readiness": readiness,
     }

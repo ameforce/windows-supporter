@@ -20,11 +20,7 @@ from src.utils.app_version import get_app_version
 from src.utils.progress_subprocess import run_no_window_with_progress
 from src.utils.runtime_deploy import RuntimeDeployError, deploy_runtime, restart_runtime
 from src.utils.subprocess_utils import popen_no_window, run_no_window
-from src.utils.update_handoff_recovery import (
-    UpdateHandoffError,
-    build_relaunch_environment,
-    restore_previous_executable,
-)
+from src.utils.update_handoff_recovery import UpdateHandoffError, build_relaunch_environment
 from src.utils.update_settings import (
     get_update_settings_path,
     load_update_settings,
@@ -2155,13 +2151,17 @@ def run_update_handoff(
             else:
                 root_identity_after_build = _executable_file_identity(root_executable)
                 try:
+                    restore_source = None
                     if (
                         root_identity_before_build is None
                         or root_identity_after_build != root_identity_before_build
                     ):
-                        restore_previous_executable(recovery_executable, root_executable)
+                        if not recovery_executable.is_file():
+                            raise FileNotFoundError(recovery_executable)
+                        restore_source = recovery_executable
                     recovery_receipt = runtime_restarter(
                         root_executable,
+                        restore_source=restore_source,
                         base_environment=relaunch_environment,
                     )
                     recovery_status = "complete"

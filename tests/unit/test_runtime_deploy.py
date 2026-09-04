@@ -269,6 +269,9 @@ class RuntimeDeployTest(unittest.TestCase):
     def test_restart_preserves_existing_deployment_transaction(self):
         with tempfile.TemporaryDirectory() as root:
             _candidate, target = self._paths(root)
+            recovery = Path(root) / "recovery.exe"
+            recovery.write_bytes(b"old-runtime")
+            target.write_bytes(b"owner-new-runtime")
             marker = target.with_name("windows-supporter.promotion-pending.json")
             marker.write_text('{"owner":"deploy"}', encoding="utf-8")
             controller = FakeController()
@@ -277,6 +280,7 @@ class RuntimeDeployTest(unittest.TestCase):
                 restart_runtime(
                     target,
                     controller=controller,
+                    restore_source=recovery,
                     timeout_seconds=0.05,
                     heartbeat_samples=1,
                     poll_interval=0.01,
@@ -285,8 +289,55 @@ class RuntimeDeployTest(unittest.TestCase):
 
             self.assertEqual(raised.exception.exit_code, DeployExitCode.INVALID_INPUT)
             self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"owner": "deploy"})
+            self.assertEqual(target.read_bytes(), b"owner-new-runtime")
             self.assertEqual(controller.terminated, [])
             self.assertEqual(controller.launches, [])
+
+    def test_restart_restores_source_inside_owned_transaction(self):
+        with tempfile.TemporaryDirectory() as root:
+            _candidate, target = self._paths(root)
+            recovery = Path(root) / "recovery.exe"
+            recovery.write_bytes(b"trusted-old-runtime")
+            target.write_bytes(b"unverified-runtime")
+            controller = FakeController(exact_pids=())
+
+            receipt = restart_runtime(
+                target,
+                controller=controller,
+                restore_source=recovery,
+                timeout_seconds=0.05,
+                heartbeat_samples=1,
+                poll_interval=0.01,
+                sleep=controller.sleep,
+            )
+
+            self.assertEqual(receipt["status"], "success")
+            self.assertEqual(target.read_bytes(), b"trusted-old-runtime")
+            self.assertEqual(receipt["restored_from"], str(recovery.resolve()))
+            self.assertFalse(
+                target.with_name("windows-supporter.promotion-pending.json").exists()
+            )
+
+    def test_restart_can_restore_missing_target_inside_owned_transaction(self):
+        with tempfile.TemporaryDirectory() as root:
+            _candidate, target = self._paths(root)
+            recovery = Path(root) / "recovery.exe"
+            recovery.write_bytes(b"trusted-old-runtime")
+            target.unlink()
+            controller = FakeController(exact_pids=())
+
+            receipt = restart_runtime(
+                target,
+                controller=controller,
+                restore_source=recovery,
+                timeout_seconds=0.05,
+                heartbeat_samples=1,
+                poll_interval=0.01,
+                sleep=controller.sleep,
+            )
+
+            self.assertEqual(receipt["status"], "success")
+            self.assertEqual(target.read_bytes(), b"trusted-old-runtime")
 
     def test_transaction_claim_race_is_reported_as_preserved_conflict(self):
         with tempfile.TemporaryDirectory() as root:

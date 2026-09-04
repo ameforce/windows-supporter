@@ -62,6 +62,23 @@ class UnexpectedlyMutatingSuccessfulBuildSubprocess:
         return types.SimpleNamespace(returncode=0, stdout="built", stderr="")
 
 
+class ConcurrentDeploymentBuildSubprocess:
+    def __init__(self, root_executable: Path) -> None:
+        self._root_executable = root_executable
+
+    def run(self, argv, **kwargs):
+        _ = argv, kwargs
+        self._root_executable.write_bytes(b"owner-new-runtime")
+        marker = self._root_executable.with_name(
+            "windows-supporter.promotion-pending.json"
+        )
+        marker.write_text('{"owner":"deploy"}', encoding="utf-8")
+        candidate = self._root_executable.parent / "dist" / "windows-supporter.exe"
+        candidate.parent.mkdir(exist_ok=True)
+        candidate.write_bytes(b"new-executable")
+        return types.SimpleNamespace(returncode=0, stdout="built", stderr="")
+
+
 def write_handoff_state(state_path: Path, repo: Path, previous_executable: Path) -> None:
     payload = build_update_handoff_payload(repo_root=repo, log_path=state_path.with_suffix(".log"))
     payload["recovery_executable_path"] = str(previous_executable)
@@ -145,9 +162,11 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=UnexpectedlyMutatingFailedBuildSubprocess(root_executable),
-                runtime_restarter=lambda target, **kwargs: restarts.append(
-                    (Path(target), dict(kwargs))
-                ) or {"status": "success"},
+                runtime_restarter=lambda target, **kwargs: (
+                    shutil.copy2(kwargs["restore_source"], target),
+                    restarts.append((Path(target), dict(kwargs))),
+                    {"status": "success"},
+                )[-1],
                 progress_ui_factory=None,
                 max_attempts=1,
             )
@@ -406,10 +425,11 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
                     root_executable
                 ),
                 runtime_deployer=lambda *_args, **_kwargs: deploy_calls.append(True),
-                runtime_restarter=lambda target, **kwargs: restarts.append(
-                    (Path(target), dict(kwargs))
-                )
-                or {"status": "success"},
+                runtime_restarter=lambda target, **kwargs: (
+                    shutil.copy2(kwargs["restore_source"], target),
+                    restarts.append((Path(target), dict(kwargs))),
+                    {"status": "success"},
+                )[-1],
                 progress_ui_factory=None,
                 max_attempts=1,
             )
@@ -420,6 +440,45 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             self.assertEqual(root_executable.read_bytes(), b"verified-old-root")
             self.assertEqual(len(restarts), 1)
             self.assertEqual(state["recovery_status"], "complete")
+
+    def test_concurrent_deployment_marker_prevents_restore_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"verified-old-root")
+            marker = repo / "windows-supporter.promotion-pending.json"
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"verified-old-root")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            deploy_calls = []
+            restart_calls = []
+
+            def refuse_restart(target, **kwargs):
+                restart_calls.append((Path(target), dict(kwargs)))
+                raise RuntimeDeployError(
+                    "another deployment owns the transaction",
+                    exit_code=DeployExitCode.INVALID_INPUT,
+                    receipt={"transaction_conflict": True},
+                )
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=ConcurrentDeploymentBuildSubprocess(root_executable),
+                runtime_deployer=lambda *_args, **_kwargs: deploy_calls.append(True),
+                runtime_restarter=refuse_restart,
+                progress_ui_factory=None,
+                max_attempts=1,
+            )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(deploy_calls, [])
+            self.assertEqual(len(restart_calls), 1)
+            self.assertEqual(root_executable.read_bytes(), b"owner-new-runtime")
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"owner": "deploy"})
+            self.assertEqual(state["recovery_status"], "failed")
 
     def test_transaction_claim_loser_does_not_restart_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
