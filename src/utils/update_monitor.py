@@ -2040,6 +2040,14 @@ def run_update_handoff(
                 raise UpdateHandoffError(
                     f"build.bat failed with exit code {getattr(result, 'returncode', 1)}"
                 )
+            root_identity_after_build = _executable_file_identity(root_executable)
+            if (
+                root_identity_before_build is None
+                or root_identity_after_build != root_identity_before_build
+            ):
+                raise UpdateHandoffError(
+                    "artifact-only build changed the installed runtime before deployment"
+                )
 
             failed_step = "새 버전 배포 및 준비 확인"
             relaunch_progress = build_update_progress_snapshot(

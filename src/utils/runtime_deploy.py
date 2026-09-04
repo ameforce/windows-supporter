@@ -460,6 +460,8 @@ def restart_runtime(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     target = Path(target_path).resolve()
+    marker = target.with_name("windows-supporter.promotion-pending.json")
+    backup = target.with_name("windows-supporter.previous.exe")
     if not target.is_file():
         raise RuntimeDeployError(
             f"runtime executable is missing: {target}",
@@ -473,10 +475,62 @@ def restart_runtime(
                 "error": f"runtime executable is missing: {target}",
             },
         )
-    process_controller = controller or WindowsRuntimeProcessController()
-    selected_probe = Path(probe_path) if probe_path else target.parent / ".windows-supporter.runtime-probe.json"
-    exact_pids = list(process_controller.find_exact(target))
+    if marker.exists() or backup.exists():
+        raise RuntimeDeployError(
+            "an unfinished deployment transaction prevents runtime restart",
+            exit_code=DeployExitCode.INVALID_INPUT,
+            receipt={
+                "schema_version": 1,
+                "operation": "restart",
+                "status": "failed",
+                "timestamp": _utc_now(),
+                "target": str(target),
+                "transaction_conflict": True,
+                "preserved_transaction": {
+                    "marker": str(marker) if marker.exists() else None,
+                    "backup": str(backup) if backup.exists() else None,
+                },
+                "error": "an unfinished deployment transaction prevents runtime restart",
+            },
+        )
     try:
+        _claim_json_exclusive(
+            marker,
+            {
+                "schema_version": 1,
+                "operation": "restart",
+                "target": str(target),
+                "started_at": _utc_now(),
+            },
+        )
+    except FileExistsError as exc:
+        raise RuntimeDeployError(
+            "another deployment transaction acquired the target concurrently",
+            exit_code=DeployExitCode.INVALID_INPUT,
+            receipt={
+                "schema_version": 1,
+                "operation": "restart",
+                "status": "failed",
+                "timestamp": _utc_now(),
+                "target": str(target),
+                "transaction_conflict": True,
+                "preserved_transaction": {
+                    "marker": str(marker),
+                    "backup": str(backup) if backup.exists() else None,
+                },
+                "error": "another deployment transaction acquired the target concurrently",
+            },
+        ) from exc
+    exact_pids: list[int] = []
+    try:
+        process_controller = controller or WindowsRuntimeProcessController()
+        selected_probe = Path(probe_path) if probe_path else target.parent / ".windows-supporter.runtime-probe.json"
+        if backup.exists():
+            raise RuntimeDeployError(
+                "an unowned deployment backup appeared after restart claim",
+                exit_code=DeployExitCode.INVALID_INPUT,
+            )
+        exact_pids = list(process_controller.find_exact(target))
         if exact_pids:
             try:
                 process_controller.terminate_tree(exact_pids, DEFAULT_STOP_TIMEOUT_SECONDS)
@@ -511,6 +565,8 @@ def restart_runtime(
             f"runtime restart readiness failed: {exc}",
             exit_code=DeployExitCode.READINESS_FAILED,
         ) from exc
+    finally:
+        marker.unlink(missing_ok=True)
     return {
         "schema_version": 1,
         "operation": "restart",
@@ -531,7 +587,10 @@ def _pretransition_failure_receipt(
         restartable_target = target.is_file() and target.stat().st_size > 0
     except OSError:
         restartable_target = False
-    return {
+    marker = target.with_name("windows-supporter.promotion-pending.json")
+    backup = target.with_name("windows-supporter.previous.exe")
+    transaction_conflict = marker.exists() or backup.exists()
+    receipt = {
         "schema_version": 1,
         "operation": "deploy",
         "status": "failed",
@@ -539,13 +598,21 @@ def _pretransition_failure_receipt(
         "candidate": str(candidate),
         "target": str(target),
         "target_unchanged": True,
-        "transaction_conflict": False,
+        "transaction_conflict": transaction_conflict,
         "rollback": {"status": "target-unchanged"},
         "recovery_action": (
-            "restart-unchanged-runtime" if restartable_target else "none"
+            "restart-unchanged-runtime"
+            if restartable_target and not transaction_conflict
+            else "none"
         ),
         "error": error,
     }
+    if transaction_conflict:
+        receipt["preserved_transaction"] = {
+            "marker": str(marker) if marker.exists() else None,
+            "backup": str(backup) if backup.exists() else None,
+        }
+    return receipt
 
 
 def deploy_runtime(

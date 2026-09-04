@@ -49,6 +49,19 @@ class UnexpectedlyMutatingFailedBuildSubprocess:
         return types.SimpleNamespace(returncode=1, stdout="", stderr="failed")
 
 
+class UnexpectedlyMutatingSuccessfulBuildSubprocess:
+    def __init__(self, root_executable: Path) -> None:
+        self._root_executable = root_executable
+
+    def run(self, argv, **kwargs):
+        _ = argv, kwargs
+        self._root_executable.write_bytes(b"unverified-root")
+        candidate = self._root_executable.parent / "dist" / "windows-supporter.exe"
+        candidate.parent.mkdir(exist_ok=True)
+        candidate.write_bytes(b"new-executable")
+        return types.SimpleNamespace(returncode=0, stdout="built", stderr="")
+
+
 def write_handoff_state(state_path: Path, repo: Path, previous_executable: Path) -> None:
     payload = build_update_handoff_payload(repo_root=repo, log_path=state_path.with_suffix(".log"))
     payload["recovery_executable_path"] = str(previous_executable)
@@ -338,6 +351,73 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
 
             self.assertEqual(rc, 1)
             self.assertEqual(root_executable.read_bytes(), b"old-root")
+            self.assertEqual(len(restarts), 1)
+            self.assertEqual(state["recovery_status"], "complete")
+
+    def test_candidate_metadata_failure_preserves_existing_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"old-root")
+            marker = repo / "windows-supporter.promotion-pending.json"
+            marker.write_text('{"owner":"deploy"}', encoding="utf-8")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"old-executable")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            restarts = []
+
+            with patch(
+                "src.utils.runtime_deploy._read_windows_artifact_identity",
+                side_effect=RuntimeError("invalid version resource"),
+            ):
+                rc = run_update_handoff(
+                    state_path,
+                    subprocess_module=BuildSubprocess(root_executable, returncode=0),
+                    runtime_deployer=deploy_runtime,
+                    runtime_restarter=lambda *_args, **_kwargs: restarts.append(True),
+                    progress_ui_factory=None,
+                    max_attempts=1,
+                )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(restarts, [])
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"owner": "deploy"})
+            self.assertEqual(state["recovery_status"], "failed")
+
+    def test_successful_build_cannot_change_installed_runtime_before_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"verified-old-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"verified-old-root")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            deploy_calls = []
+            restarts = []
+
+            rc = run_update_handoff(
+                state_path,
+                subprocess_module=UnexpectedlyMutatingSuccessfulBuildSubprocess(
+                    root_executable
+                ),
+                runtime_deployer=lambda *_args, **_kwargs: deploy_calls.append(True),
+                runtime_restarter=lambda target, **kwargs: restarts.append(
+                    (Path(target), dict(kwargs))
+                )
+                or {"status": "success"},
+                progress_ui_factory=None,
+                max_attempts=1,
+            )
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(deploy_calls, [])
+            self.assertEqual(root_executable.read_bytes(), b"verified-old-root")
             self.assertEqual(len(restarts), 1)
             self.assertEqual(state["recovery_status"], "complete")
 

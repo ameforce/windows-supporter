@@ -16,6 +16,7 @@ from src.utils.runtime_deploy import (
     _claim_json_exclusive,
     cli,
     deploy_runtime,
+    restart_runtime,
 )
 
 
@@ -264,6 +265,28 @@ class RuntimeDeployTest(unittest.TestCase):
                 _claim_json_exclusive(marker, {"owner": "second"})
 
             self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), first)
+
+    def test_restart_preserves_existing_deployment_transaction(self):
+        with tempfile.TemporaryDirectory() as root:
+            _candidate, target = self._paths(root)
+            marker = target.with_name("windows-supporter.promotion-pending.json")
+            marker.write_text('{"owner":"deploy"}', encoding="utf-8")
+            controller = FakeController()
+
+            with self.assertRaises(RuntimeDeployError) as raised:
+                restart_runtime(
+                    target,
+                    controller=controller,
+                    timeout_seconds=0.05,
+                    heartbeat_samples=1,
+                    poll_interval=0.01,
+                    sleep=controller.sleep,
+                )
+
+            self.assertEqual(raised.exception.exit_code, DeployExitCode.INVALID_INPUT)
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"owner": "deploy"})
+            self.assertEqual(controller.terminated, [])
+            self.assertEqual(controller.launches, [])
 
     def test_transaction_claim_race_is_reported_as_preserved_conflict(self):
         with tempfile.TemporaryDirectory() as root:
