@@ -7746,7 +7746,7 @@ class WindowSizeSyncUnitTest(unittest.TestCase):
 
         rectangles = [op for op in canvas.ops if op[0] == "rectangle"]
         self.assertTrue(rectangles)
-        self.assertEqual(rectangles[0][1][2], 511)
+        self.assertEqual(rectangles[0][1][2], 510)
 
     def test_native_client_rect_reading(self):
         overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
@@ -7768,6 +7768,21 @@ class WindowSizeSyncUnitTest(unittest.TestCase):
         rectangles = [op for op in canvas.ops if op[0] == "rectangle"]
         self.assertTrue(rectangles)
         self.assertLessEqual(rectangles[0][1][2], 473)
+
+    def test_background_rect_insets_border_inside_canvas(self):
+        # Tk centers a rectangle outline on its boundary path: coords
+        # (0,0,w,h) push the right/bottom outlines onto columns w/h, which
+        # are outside the drawable area, so the right border never rendered
+        # and the widget looked left-bordered only. The background rect must
+        # be inset by one pixel so all four borders render inside the canvas.
+        overlay = taskbar_overlay.CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime())
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(self._model(511))
+
+        background = [op for op in canvas.ops if op[0] == "rectangle"][0]
+        self.assertEqual(background[1], (0, 0, 510, 37))
 
 
 if __name__ == "__main__":
