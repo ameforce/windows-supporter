@@ -809,6 +809,29 @@ def _draw_metric_context_text(
             if pipe_ink is not None
             else separator_x + _inline_text_width("|")
         ) + _METRIC_CONTEXT_SEPARATOR_GAP_PX
+        boundary = int(max_right_px) if max_right_px is not None else None
+        if boundary is not None and pipe_ink is not None:
+            # Right-aligned guidance: when the canvas can measure real ink,
+            # anchor the guidance to the segment boundary so the outer right
+            # margin matches the left inset on every row, regardless of how
+            # long the text is. Left-anchored guidance leaves trailing slack
+            # whenever it is shorter than its estimated budget.
+            budget = max(0, boundary - int(cursor_x))
+            fitted = guidance_text
+            if _inline_text_width(guidance_text) > budget:
+                fitted = _truncate_to_ink_width(guidance_text, budget)
+            if not fitted:
+                canvas.delete(pipe_item)
+                return int(cursor_x)
+            canvas.create_text(
+                boundary,
+                center_y,
+                anchor="e",
+                fill=_NORMAL_GUIDANCE_COLOR,
+                font=font,
+                text=fitted,
+            )
+            return boundary
         # Estimated budgets can still underestimate real glyph advances after
         # a scaling change, which once pushed guidance ink into the canvas
         # edge. The real drawn bbox is the ground truth: when the drawn
