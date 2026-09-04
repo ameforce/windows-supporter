@@ -728,7 +728,11 @@ def _split_metric_context_text(text: str) -> tuple[str, str]:
 
 
 def _inline_text_width(text: str) -> int:
-    return sum(9 if ord(character) > 127 else 5 for character in str(text or ""))
+    scale = _overlay_text_width_scale()
+    return int(
+        sum(9 if ord(character) > 127 else 5 for character in str(text or ""))
+        * scale
+    )
 
 
 def _ink_right_edge(canvas: Any, item: Any) -> int | None:
@@ -1705,6 +1709,34 @@ def _rects_overlap(left: tuple[int, int, int, int], right: tuple[int, int, int, 
 # Mirrors the main UI floor contract (main_ui._UI_BASE_SCALE): Tk resolves
 # named font point sizes through this scaling, sampled only when set.
 _OVERLAY_UI_BASE_SCALE = 1.25
+# Tk renders named font points at `tk scaling` pixels/point; the layout
+# estimators below assume the 96dpi base (96/72), so they must be scaled by
+# (active_scaling / base) or the drawn ink exceeds every budget. Kept at 1.0
+# until _apply_overlay_base_ui_scaling observes a target different from base.
+_OVERLAY_TEXT_WIDTH_SCALE = 1.0
+
+
+def _overlay_text_width_scale() -> float:
+    return float(_OVERLAY_TEXT_WIDTH_SCALE)
+
+
+def _set_overlay_text_width_scale(scale: float) -> None:
+    global _OVERLAY_TEXT_WIDTH_SCALE
+    try:
+        _OVERLAY_TEXT_WIDTH_SCALE = max(1.0, float(scale))
+    except Exception:
+        _OVERLAY_TEXT_WIDTH_SCALE = 1.0
+    # Budgets derived from text widths are cached keyed on text only; the
+    # scale factor is not part of the key, so any change invalidates them.
+    try:
+        _required_metric_segment_width_cached.cache_clear()
+    except Exception:
+        pass
+    try:
+        _preferred_width_for_rows_cached.cache_clear()
+    except Exception:
+        pass
+    return
 
 
 def _current_system_scaling() -> float | None:
@@ -1750,11 +1782,14 @@ def _apply_overlay_base_ui_scaling(root: Any) -> float | None:
         # observe `fresh`); the floor only guards legibility minimums.
         target = max(fresh, base * _OVERLAY_UI_BASE_SCALE)
     if abs(target - current) <= 1e-9:
+        _set_overlay_text_width_scale(max(1.0, current / base))
         return current
     try:
         tk_call("tk", "scaling", target)
     except Exception:
+        _set_overlay_text_width_scale(max(1.0, current / base))
         return current
+    _set_overlay_text_width_scale(max(1.0, target / base))
     return target
 
 
@@ -6720,12 +6755,16 @@ def _reset_badge_width_for_label(label: str) -> int:
     # Keep this helper pure for deterministic unit tests. The estimate is
     # deliberately conservative so unknown DPI/font details bias toward hiding
     # reset time instead of overlapping the badge.
+    scale = _overlay_text_width_scale()
     label_width = sum(9 if ord(ch) > 127 else 6 for ch in text)
-    return max(
-        _RESET_BADGE_MIN_WIDTH_PX,
+    padded = (
         label_width
         + _RESET_BADGE_HORIZONTAL_PADDING_PX * 2
-        + _RESET_BADGE_OUTLINE_WIDTH_PX * 2,
+        + _RESET_BADGE_OUTLINE_WIDTH_PX * 2
+    )
+    return max(
+        int(_RESET_BADGE_MIN_WIDTH_PX * scale),
+        int(padded * scale),
     )
 
 
@@ -6747,29 +6786,34 @@ def _reset_column_width_for_text(text: str, *, metric_key: str = "") -> int:
     value = str(text or "")
     if not value:
         return 0
+    scale = _overlay_text_width_scale()
     if value in set(_RESET_DIRECTION_MARKERS.values()) - {""}:
-        return max(8, len(value) * 7 + 2)
+        return max(int(8 * scale), int((len(value) * 7 + 2) * scale))
     if value == _RESET_PLACEHOLDER_TEXT:
-        return max(12, len(value) * 5 + 2)
+        return max(int(12 * scale), int((len(value) * 5 + 2) * scale))
     # Reset+guidance context ("time | N xx~yy% / tt") is only ever rendered as
     # a plain text line, so it is measured at text speed regardless of the
     # metric's reserved badge column.
     if "|" in value:
-        return max(8, _inline_text_width(value) + 2)
+        return max(int(8 * scale), int(_inline_text_width(value) + 2))
     minimum = _RESET_DETAIL_COLUMN_WIDTH_PX
     if str(metric_key or "") == "five_hour_limit":
         minimum = _RESET_FIVE_HOUR_COLUMN_WIDTH_PX
     elif str(metric_key or "") == "weekly_limit":
         minimum = _RESET_WEEKLY_COLUMN_WIDTH_PX
-    return max(minimum, len(value) * 5 + 2)
+    return max(int(minimum * scale), int((len(value) * 5 + 2) * scale))
 
 
 def _value_column_width_for_text(value_text: str) -> int:
     text = str(value_text or "")
+    scale = _overlay_text_width_scale()
     estimated_width = len(text) * 7 + 2
     return min(
-        _VALUE_COLUMN_MAX_WIDTH_PX,
-        max(_VALUE_COLUMN_MIN_WIDTH_PX, int(estimated_width)),
+        int(_VALUE_COLUMN_MAX_WIDTH_PX * scale),
+        max(
+            int(_VALUE_COLUMN_MIN_WIDTH_PX * scale),
+            int(estimated_width * scale),
+        ),
     )
 
 
