@@ -766,6 +766,7 @@ def _draw_metric_context_text(
     x: int,
     center_y: int,
     reset_color: str,
+    max_right_px: int | None = None,
 ) -> int:
     reset_text, guidance_text = _split_metric_context_text(text)
     cursor_x = int(x)
@@ -801,7 +802,12 @@ def _draw_metric_context_text(
             if pipe_ink is not None
             else separator_x + _inline_text_width("|")
         ) + _METRIC_CONTEXT_SEPARATOR_GAP_PX
-        canvas.create_text(
+        # Estimated budgets can still underestimate real glyph advances after
+        # a scaling change, which once pushed guidance ink into the canvas
+        # edge. The real drawn bbox is the ground truth: when the drawn
+        # guidance crosses the boundary, drop and re-fit it with an ellipsis
+        # so the right margin (and the border beyond it) always survives.
+        guidance_item = canvas.create_text(
             cursor_x,
             center_y,
             anchor="w",
@@ -809,8 +815,51 @@ def _draw_metric_context_text(
             font=font,
             text=guidance_text,
         )
+        guidance_ink = _ink_right_edge(canvas, guidance_item)
+        if (
+            max_right_px is not None
+            and guidance_ink is not None
+            and int(guidance_ink) > int(max_right_px)
+        ):
+            budget = max(0, int(max_right_px) - int(cursor_x))
+            fitted = _truncate_to_ink_width(guidance_text, budget)
+            if fitted != guidance_text:
+                canvas.delete(guidance_item)
+                canvas.create_text(
+                    cursor_x,
+                    center_y,
+                    anchor="w",
+                    fill=_NORMAL_GUIDANCE_COLOR,
+                    font=font,
+                    text=fitted,
+                )
+                guidance_text = fitted
+                if not fitted:
+                    canvas.delete(pipe_item)
         cursor_x += _inline_text_width(guidance_text)
     return cursor_x
+
+
+def _truncate_to_ink_width(text: str, budget_px: int) -> str:
+    """Trim trailing characters (with an ellipsis) until the estimate fits.
+
+    Uses the same estimator as the layout budgets; the draw path already
+    proved the real ink overflows, so cutting to the estimator width with a
+    small margin reliably lands inside the boundary.
+    """
+    value = str(text or "")
+    budget = max(0, int(budget_px))
+    if not value or _inline_text_width(value) <= budget:
+        return value
+    ellipsis = "…"
+    if _inline_text_width(ellipsis) > budget:
+        return ""
+    while value:
+        candidate = value + ellipsis
+        if _inline_text_width(candidate) <= budget:
+            return candidate
+        value = value[:-1]
+    return ellipsis
 
 
 def _metric_fits_badge_mode(
@@ -3578,6 +3627,7 @@ class CodexUsageTaskbarOverlay:
                     x=badge_right_x + _RESET_BADGE_TIME_GAP_PX,
                     center_y=center_y,
                     reset_color=reset_color,
+                    max_right_px=x + width - _SEGMENT_RIGHT_PADDING_PX,
                 )
         elif show_reset:
             _draw_metric_context_text(
@@ -3586,6 +3636,7 @@ class CodexUsageTaskbarOverlay:
                 x=reset_text_x,
                 center_y=center_y,
                 reset_color=reset_color,
+                max_right_px=x + width - _SEGMENT_RIGHT_PADDING_PX,
             )
         self._metric_hit_rects.append(
             (

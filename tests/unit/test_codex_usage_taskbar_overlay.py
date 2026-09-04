@@ -7651,6 +7651,74 @@ class TextScaleBudgetUnitTest(unittest.TestCase):
         )
 
 
+class _MeasuringCanvas:
+    """Fake canvas whose create_text items report configurable real ink."""
+
+    def __init__(self, char_px=5):
+        self.char_px = char_px
+        self.ops = []
+        self._texts = {}
+
+    def create_text(self, x, y, **kwargs):
+        item = len(self.ops) + 1
+        text = str(kwargs.get("text") or "")
+        self._texts[item] = text
+        self.ops.append(("text", (x, y), dict(kwargs)))
+        return item
+
+    def create_rectangle(self, *args, **kwargs):
+        item = len(self.ops) + 1
+        self.ops.append(("rectangle", args, dict(kwargs)))
+        return item
+
+    def create_oval(self, *args, **kwargs):
+        item = len(self.ops) + 1
+        self.ops.append(("oval", args, dict(kwargs)))
+        return item
+
+    def bbox(self, item):
+        text = self._texts.get(int(item), "")
+        x = self.ops[int(item) - 1][1][0]
+        return (x, 0, x + self.char_px * len(text), 10)
+
+    def delete(self, item):
+        self._texts.pop(int(item), None)
+        self.ops.append(("delete", (int(item),), {}))
+
+
+class GuidanceInkClampUnitTest(unittest.TestCase):
+    def test_guidance_truncated_when_real_ink_crosses_limit(self):
+        canvas = _MeasuringCanvas(char_px=8)
+        text = "02d 22h 26m 31s  |  N 42~47% / 02d 22h 26m 32s"
+
+        end = taskbar_overlay._draw_metric_context_text(
+            canvas, text, x=0, center_y=5, reset_color="#fff", max_right_px=220
+        )
+
+        deletes = [op for op in canvas.ops if op[0] == "delete"]
+        self.assertTrue(deletes)
+        texts = [op for op in canvas.ops if op[0] == "text"]
+        self.assertTrue(texts[-1][2]["text"].endswith("…"))
+        self.assertLess(len(texts[-1][2]["text"]), len(text))
+        self.assertLessEqual(end, 220)
+
+    def test_guidance_kept_when_ink_inside_limit(self):
+        canvas = _MeasuringCanvas(char_px=5)
+        text = "02d 22h 26m 31s  |  N 42~47%"
+
+        end = taskbar_overlay._draw_metric_context_text(
+            canvas, text, x=0, center_y=5, reset_color="#fff", max_right_px=400
+        )
+
+        deletes = [op for op in canvas.ops if op[0] == "delete"]
+        self.assertFalse(deletes)
+        self.assertLessEqual(end, 400)
+
+    def test_truncate_returns_empty_when_ellipsis_does_not_fit(self):
+        self.assertEqual(taskbar_overlay._truncate_to_ink_width("abcdef", 4), "")
+        self.assertEqual(taskbar_overlay._truncate_to_ink_width("abcdef", 25), "abc…")
+
+
 class WindowSizeSyncUnitTest(unittest.TestCase):
     def _runtime(self):
         return {
