@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import shutil
 import tempfile
 import types
 import unittest
 from pathlib import Path
 
+from src.utils.runtime_deploy import DeployExitCode, RuntimeDeployError
 from src.utils.update_monitor import (
     build_update_handoff_payload,
     read_update_handoff_state,
@@ -20,7 +21,10 @@ class BuildSubprocess:
         self._returncode = returncode
 
     def run(self, argv, **kwargs):
-        self._root_executable.write_bytes(b"new-executable")
+        candidate = self._root_executable.parent / "dist" / "windows-supporter.exe"
+        candidate.parent.mkdir(exist_ok=True)
+        candidate.write_bytes(b"new-executable")
+        self.last_env = dict(kwargs.get("env") or {})
         return types.SimpleNamespace(
             returncode=self._returncode,
             stdout="built" if self._returncode == 0 else "",
@@ -34,24 +38,14 @@ class PreservingFailedBuildSubprocess:
         return types.SimpleNamespace(returncode=1, stdout="", stderr="failed")
 
 
-class StableProcess:
-    """Fake process whose mutable wait history proves the health check ran."""
+class UnexpectedlyMutatingFailedBuildSubprocess:
+    def __init__(self, root_executable: Path) -> None:
+        self._root_executable = root_executable
 
-    def __init__(self) -> None:
-        self.wait_timeouts: list[float] = []
-
-    def wait(self, timeout: float | None = None) -> int:
-        self.wait_timeouts.append(float(timeout or 0.0))
-        raise subprocess.TimeoutExpired(cmd=["windows-supporter.exe"], timeout=timeout)
-
-
-class ExitedProcess:
-    def __init__(self, returncode: int) -> None:
-        self.returncode = returncode
-
-    def wait(self, timeout: float | None = None) -> int:
-        _ = timeout
-        return self.returncode
+    def run(self, argv, **kwargs):
+        _ = argv, kwargs
+        self._root_executable.write_bytes(b"unexpected-root-change")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="failed")
 
 
 def write_handoff_state(state_path: Path, repo: Path, previous_executable: Path) -> None:
@@ -71,14 +65,14 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             previous_executable.write_bytes(b"copy-fallback")
             state_path = Path(tmp) / "update_handoff.json"
             write_handoff_state(state_path, repo, previous_executable)
-            stable_process = StableProcess()
-            launches = []
+            restarts = []
 
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=PreservingFailedBuildSubprocess(),
-                launch=lambda command, **kwargs: launches.append((list(command), dict(kwargs)))
-                or stable_process,
+                runtime_restarter=lambda target, **kwargs: restarts.append(
+                    (Path(target), dict(kwargs))
+                ) or {"status": "success"},
                 progress_ui_factory=None,
                 max_attempts=1,
             )
@@ -86,7 +80,7 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
 
             self.assertEqual(rc, 1)
             self.assertEqual(root_executable.read_bytes(), b"trusted-root")
-            self.assertEqual(len(launches), 1)
+            self.assertEqual(len(restarts), 1)
             self.assertEqual(state["recovery_status"], "complete")
 
     def test_missing_recovery_executable_reports_failure_without_launching(self) -> None:
@@ -99,13 +93,15 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             missing_previous_executable = Path(tmp) / "missing-updater.exe"
             state_path = Path(tmp) / "update_handoff.json"
             write_handoff_state(state_path, repo, missing_previous_executable)
-            launches = []
+            restarts = []
 
             # When
             rc = run_update_handoff(
                 state_path,
-                subprocess_module=BuildSubprocess(root_executable, returncode=1),
-                launch=lambda command, **kwargs: launches.append((list(command), dict(kwargs))),
+                subprocess_module=UnexpectedlyMutatingFailedBuildSubprocess(root_executable),
+                runtime_restarter=lambda target, **kwargs: restarts.append(
+                    (Path(target), dict(kwargs))
+                ),
                 progress_ui_factory=None,
                 max_attempts=1,
             )
@@ -116,7 +112,7 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             self.assertEqual(state["status"], "failed")
             self.assertEqual(state["recovery_status"], "failed")
             self.assertIn("missing-updater.exe", state["recovery_error"])
-            self.assertEqual(launches, [])
+            self.assertEqual(restarts, [])
 
     def test_build_failure_restores_and_relaunches_previous_executable(self) -> None:
         # Given
@@ -129,15 +125,15 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             previous_executable.write_bytes(b"old-executable")
             state_path = Path(tmp) / "update_handoff.json"
             write_handoff_state(state_path, repo, previous_executable)
-            launches = []
-            stable_process = StableProcess()
+            restarts = []
 
             # When
             rc = run_update_handoff(
                 state_path,
-                subprocess_module=BuildSubprocess(root_executable, returncode=1),
-                launch=lambda command, **kwargs: launches.append((list(command), dict(kwargs)))
-                or stable_process,
+                subprocess_module=UnexpectedlyMutatingFailedBuildSubprocess(root_executable),
+                runtime_restarter=lambda target, **kwargs: restarts.append(
+                    (Path(target), dict(kwargs))
+                ) or {"status": "success"},
                 progress_ui_factory=None,
                 max_attempts=1,
             )
@@ -146,12 +142,10 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             # Then
             self.assertEqual(rc, 1)
             self.assertEqual(root_executable.read_bytes(), b"old-executable")
-            self.assertEqual(len(launches), 1)
-            self.assertEqual(len(launches[0][0]), 1)
-            self.assertTrue(Path(launches[0][0][0]).samefile(root_executable))
-            self.assertEqual(launches[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+            self.assertEqual(len(restarts), 1)
+            self.assertTrue(restarts[0][0].samefile(root_executable))
+            self.assertEqual(restarts[0][1]["base_environment"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
             self.assertEqual(state["recovery_status"], "complete")
-            self.assertTrue(stable_process.wait_timeouts)
 
     def test_new_executable_early_exit_is_failed_and_rolled_back(self) -> None:
         # Given
@@ -164,18 +158,21 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             previous_executable.write_bytes(b"old-executable")
             state_path = Path(tmp) / "update_handoff.json"
             write_handoff_state(state_path, repo, previous_executable)
-            processes = [ExitedProcess(7), StableProcess()]
-            launches = []
+            deploy_calls = []
 
-            def launch(command, **kwargs):
-                launches.append((list(command), dict(kwargs)))
-                return processes.pop(0)
+            def failed_deploy(candidate, target, **kwargs):
+                deploy_calls.append((Path(candidate), Path(target), dict(kwargs)))
+                raise RuntimeDeployError(
+                    "exited during startup",
+                    exit_code=DeployExitCode.READINESS_FAILED,
+                    receipt={"rollback": {"status": "ready", "readiness": {"pid": 500}}},
+                )
 
             # When
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=BuildSubprocess(root_executable, returncode=0),
-                launch=launch,
+                runtime_deployer=failed_deploy,
                 progress_ui_factory=None,
                 max_attempts=1,
             )
@@ -186,8 +183,8 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             self.assertEqual(state["status"], "failed")
             self.assertIn("exited during startup", state["error"])
             self.assertEqual(state["recovery_status"], "complete")
-            self.assertEqual(root_executable.read_bytes(), b"old-executable")
-            self.assertEqual(len(launches), 2)
+            self.assertEqual(root_executable.read_bytes(), b"old-root")
+            self.assertEqual(len(deploy_calls), 1)
 
     def test_success_is_recorded_only_after_new_executable_stays_alive(self) -> None:
         # Given
@@ -200,13 +197,18 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             previous_executable.write_bytes(b"old-executable")
             state_path = Path(tmp) / "update_handoff.json"
             write_handoff_state(state_path, repo, previous_executable)
-            stable_process = StableProcess()
+            deploy_calls = []
+
+            def successful_deploy(candidate, target, **kwargs):
+                deploy_calls.append((Path(candidate), Path(target), dict(kwargs)))
+                shutil.copy2(candidate, target)
+                return {"schema_version": 1, "status": "success", "readiness": {"pid": 600}}
 
             # When
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=BuildSubprocess(root_executable, returncode=0),
-                launch=lambda command, **kwargs: stable_process,
+                runtime_deployer=successful_deploy,
                 progress_ui_factory=None,
                 max_attempts=1,
             )
@@ -215,8 +217,13 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             # Then
             self.assertEqual(rc, 0)
             self.assertEqual(state["status"], "complete")
-            self.assertTrue(stable_process.wait_timeouts)
             self.assertEqual(root_executable.read_bytes(), b"new-executable")
+            self.assertEqual(len(deploy_calls), 1)
+            self.assertTrue(deploy_calls[0][0].samefile(repo / "dist" / "windows-supporter.exe"))
+            self.assertEqual(
+                deploy_calls[0][2]["base_environment"]["PYINSTALLER_RESET_ENVIRONMENT"],
+                "1",
+            )
 
 
 if __name__ == "__main__":

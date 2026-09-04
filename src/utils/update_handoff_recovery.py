@@ -2,14 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
-
-
-class WaitableProcess(Protocol):
-    def wait(self, timeout: float | None = None) -> int: ...
 
 
 class UpdateHandoffError(RuntimeError):
@@ -24,18 +18,6 @@ def build_relaunch_environment(base_environment: Mapping[str, str]) -> dict[str,
     environment = dict(base_environment)
     environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     return environment
-
-
-def wait_for_process_stability(
-    process: WaitableProcess,
-    *,
-    timeout_seconds: float,
-) -> tuple[bool, int | None]:
-    try:
-        returncode = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        return True, None
-    return False, int(returncode)
 
 
 def restore_previous_executable(source: Path, destination: Path) -> None:
