@@ -31,6 +31,14 @@ class PullRequestProtectionContractTest(unittest.TestCase):
             ]
         )
 
+    def test_review_profile_routes_transactional_deploy_surfaces(self) -> None:
+        profile = json.loads(
+            (REPO_ROOT / ".codex" / "review-gate.json").read_text(encoding="utf-8")
+        )
+        encoded = json.dumps(profile, ensure_ascii=False)
+        self.assertIn("src/utils/runtime_deploy.py", encoded)
+        self.assertIn("tools/deploy_runtime.py", encoded)
+
     def test_repository_keeps_actions_disabled_and_pr_evidence_template(self) -> None:
         self.assertFalse((REPO_ROOT / ".github" / "workflows").exists())
         template = (REPO_ROOT / ".github/pull_request_template.md").read_text(

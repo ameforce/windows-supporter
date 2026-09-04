@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+from unittest.mock import patch
 from pathlib import Path
 
 from src.utils.runtime_deploy import (
@@ -398,6 +399,23 @@ class RuntimeDeployTest(unittest.TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertIn("required", payload["error"])
         self.assertIn("argument error", stderr.getvalue())
+
+    def test_candidate_metadata_mismatch_is_rejected_before_process_mutation(self):
+        with tempfile.TemporaryDirectory() as root:
+            candidate, target = self._paths(root)
+
+            with patch(
+                "src.utils.runtime_deploy._read_windows_artifact_identity",
+                return_value=("0.18.18.0", "abc1234"),
+            ), self.assertRaises(RuntimeDeployError) as raised:
+                deploy_runtime(
+                    candidate,
+                    target,
+                    expected_version="0.18.17.0",
+                )
+
+            self.assertEqual(raised.exception.exit_code, DeployExitCode.INVALID_INPUT)
+            self.assertTrue(raised.exception.receipt["target_unchanged"])
 
 
 if __name__ == "__main__":

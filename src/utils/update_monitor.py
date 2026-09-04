@@ -868,9 +868,12 @@ def cleanup_update_build_artifacts(repo_root: str | os.PathLike[str]) -> list[st
     )
     removed: list[str] = []
     for target in targets:
-        if not target.exists():
+        is_link = target.is_symlink() or getattr(
+            os.path, "isjunction", lambda _path: False
+        )(target)
+        if not target.exists() and not is_link:
             continue
-        if target.is_symlink() or getattr(os.path, "isjunction", lambda _path: False)(target):
+        if is_link:
             raise UpdateHandoffError(f"refusing to remove linked build artifact: {target}")
         if target.is_dir():
             shutil.rmtree(target)
