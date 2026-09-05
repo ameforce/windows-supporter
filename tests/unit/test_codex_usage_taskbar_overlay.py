@@ -7859,5 +7859,99 @@ class WindowSizeSyncUnitTest(unittest.TestCase):
         self.assertEqual(background[1], (0, 0, 510, 37))
 
 
+class TkMeasureCacheUnitTest(unittest.TestCase):
+    """Overlay font measurement is a synchronous Tk round trip on the UI
+    thread; the fit paths re-request the same short strings hundreds of
+    times per draw. v0.18.16 shipped live measuring without a cache and the
+    overlay UI thread burned ~55% of a core redrawing every second. These
+    tests pin the cache contract: a warm cache serves repeated fits with
+    zero new measurement round trips."""
+
+    def setUp(self):
+        taskbar_overlay._tk_measure_text_live.cache_clear()
+
+    def tearDown(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.0)
+        taskbar_overlay._tk_measure_text_live.cache_clear()
+        taskbar_overlay._required_metric_segment_width_cached.cache_clear()
+        taskbar_overlay._preferred_width_for_rows_cached.cache_clear()
+
+    def _counting_measurer(self):
+        calls = []
+
+        def measure_uncached(text, pt):
+            calls.append((str(text), int(pt)))
+            return len(str(text)) * 7 + int(pt)
+
+        return calls, measure_uncached
+
+    def test_identical_width_reuses_cached_measurement(self):
+        calls, measure_uncached = self._counting_measurer()
+        with patch.object(
+            taskbar_overlay, "_tk_measure_text_uncached", measure_uncached
+        ):
+            self.assertEqual(
+                taskbar_overlay._tk_measure_text("5h", 6), len("5h") * 7 + 6
+            )
+            self.assertEqual(
+                taskbar_overlay._tk_measure_text("5h", 6), len("5h") * 7 + 6
+            )
+        self.assertEqual(calls, [("5h", 6)])
+
+    def test_unavailable_measurer_is_not_cached(self):
+        calls = []
+
+        def measure_none(text, pt):
+            calls.append((str(text), int(pt)))
+            return None
+
+        with patch.object(taskbar_overlay, "_tk_measure_text_uncached", measure_none):
+            self.assertIsNone(taskbar_overlay._tk_measure_text("5h", 6))
+            self.assertIsNone(taskbar_overlay._tk_measure_text("5h", 6))
+        # A failed measurement must not stick: each call keeps retrying so a
+        # measurer installed later starts winning immediately.
+        self.assertEqual(len(calls), 2)
+
+    def test_scale_change_invalidates_cached_widths(self):
+        calls, measure_uncached = self._counting_measurer()
+        with patch.object(
+            taskbar_overlay, "_tk_measure_text_uncached", measure_uncached
+        ):
+            taskbar_overlay._tk_measure_text("5h", 6)
+            taskbar_overlay._set_overlay_text_width_scale(2.0)
+            taskbar_overlay._tk_measure_text("5h", 6)
+        self.assertEqual(calls, [("5h", 6), ("5h", 6)])
+
+    def test_repeated_badge_fit_issues_no_new_measurements(self):
+        calls, measure_uncached = self._counting_measurer()
+        kwargs = dict(
+            badge_label="Reset in 52m",
+            badge_short_label="R52m",
+            available_px=120,
+            badge_mode="any",
+        )
+        with patch.object(
+            taskbar_overlay, "_tk_measure_text_uncached", measure_uncached
+        ):
+            first = taskbar_overlay._fit_reset_badge_for_space(
+                "12m 30s | 3 to 5%",
+                "12m 30s",
+                metric_key="five_hour_limit",
+                **kwargs,
+            )
+            warm_calls = len(calls)
+            second = taskbar_overlay._fit_reset_badge_for_space(
+                "12m 30s | 3 to 5%",
+                "12m 30s",
+                metric_key="five_hour_limit",
+                **kwargs,
+            )
+        self.assertEqual(first, second)
+        # Warm pass: zero new round trips, and even the first pass only ever
+        # measures each (text, pt) pair once.
+        self.assertEqual(len(calls), warm_calls)
+        self.assertEqual(len(calls), len(set(calls)))
+
+
 if __name__ == "__main__":
     unittest.main()
