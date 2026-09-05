@@ -1815,6 +1815,10 @@ def _set_overlay_text_width_scale(scale: float) -> None:
         _preferred_width_for_rows_cached.cache_clear()
     except Exception:
         pass
+    try:
+        _tk_measure_text_live.cache_clear()
+    except Exception:
+        pass
     return
 
 
@@ -1844,13 +1848,16 @@ def _install_tkfont_measurer(root: Any) -> None:
         _TK_MEASURE_CONTEXT["fonts"] = {
             pt: tkfont.Font(root=root, font=spec) for pt, spec in _CONTEXT_FONT_BY_PT.items()
         }
+        # New root/fonts measure with their own metrics; stale widths would
+        # poison every subsequent fit.
+        _tk_measure_text_live.cache_clear()
         # The active scale must follow this root's applied scaling from now on.
         _set_overlay_text_width_scale(1.0)
     except Exception:
         return
 
 
-def _tk_measure_text(text: str, pt: int) -> int | None:
+def _tk_measure_text_uncached(text: str, pt: int) -> int | None:
     root = _TK_MEASURE_CONTEXT.get("root")
     fonts = _TK_MEASURE_CONTEXT.get("fonts") or {}
     font = fonts.get(int(pt))
@@ -1863,6 +1870,35 @@ def _tk_measure_text(text: str, pt: int) -> int | None:
         width = int(measure(str(text or "")))
         return width if width >= 0 else None
     except Exception:
+        return None
+
+
+class _LiveMeasureUnavailable(Exception):
+    """Internal signal: no live Tk measurer produced a width on this call."""
+
+
+@lru_cache(maxsize=512)
+def _tk_measure_text_live(text: str, pt: int) -> int:
+    measured = _tk_measure_text_uncached(text, pt)
+    if measured is None:
+        # lru_cache does not store raised exceptions, so a headless or
+        # not-yet-installed measurer keeps retrying on every call.
+        raise _LiveMeasureUnavailable()
+    return measured
+
+
+def _tk_measure_text(text: str, pt: int) -> int | None:
+    """Exact text width, cached per (text, pt) across draws.
+
+    The fit paths re-measure the same short strings hundreds of times per
+    draw and each uncached call is a synchronous Tk interpreter round trip
+    on the UI thread. Only successful live measurements are cached; the
+    cache is cleared when the measurer root/fonts or the width scale
+    changes.
+    """
+    try:
+        return _tk_measure_text_live(str(text or ""), int(pt))
+    except _LiveMeasureUnavailable:
         return None
 
 
