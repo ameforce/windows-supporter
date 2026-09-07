@@ -323,6 +323,51 @@ class _FakeButton(_FakeWidget):
         return None
 
 
+class _FakeTextWidget(_FakeWidget):
+    def __init__(self, owner, parent, **kwargs):
+        super().__init__(owner, parent, **kwargs)
+        self.text = ""
+        self.scroll_start = 0.0
+        self.yview_moveto_calls: list[float] = []
+        self.yview_scroll_calls: list[tuple[int, str]] = []
+        self.top_index = "1.0"
+
+    def delete(self, _start, _end=None):
+        self.text = ""
+        return None
+
+    def insert(self, _index, value):
+        self.text = str(value)
+        return None
+
+    def get(self, _start, _end):
+        return self.text
+
+    def yview(self):
+        return self.scroll_start, min(1.0, self.scroll_start + 0.2)
+
+    def yview_moveto(self, value):
+        self.scroll_start = float(value)
+        self.yview_moveto_calls.append(float(value))
+        return None
+
+    def index(self, _index):
+        return self.top_index
+
+    def count(self, _start, target, _option):
+        return (max(0, int(str(target).split(".", 1)[0]) - 1),)
+
+    def yview_scroll(self, count, mode):
+        self.yview_scroll_calls.append((int(count), str(mode)))
+        self.scroll_start = 0.8
+        return None
+
+
+class _FakeScrollbar(_FakeWidget):
+    def set(self, *_args):
+        return None
+
+
 class _FakeTk:
     def __init__(self) -> None:
         self.toplevels: list[_FakeWidget] = []
@@ -393,6 +438,26 @@ class _FakeTk:
 
     def destroy_call_count(self) -> int:
         return sum(widget.destroy_calls for widget in self.all_widgets())
+
+
+class _FakeTkWithText(_FakeTk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.texts: list[_FakeTextWidget] = []
+        self.scrollbars: list[_FakeScrollbar] = []
+
+    def Text(self, parent, **kwargs):
+        widget = _FakeTextWidget(self, parent, **kwargs)
+        self.texts.append(widget)
+        return widget
+
+    def Scrollbar(self, parent, **kwargs):
+        widget = _FakeScrollbar(self, parent, **kwargs)
+        self.scrollbars.append(widget)
+        return widget
+
+    def all_widgets(self) -> list[_FakeWidget]:
+        return [*super().all_widgets(), *self.texts, *self.scrollbars]
 
 
 class _ScrollingText:
@@ -613,13 +678,19 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             "src.apps.wrike_worktime_panel._show_window_without_activation",
             side_effect=lambda window: window.native_show(),
         )
+        active_patcher = patch(
+            "src.apps.wrike_worktime_panel._show_window_activated",
+            side_effect=lambda window: window.native_show(),
+        )
         foreground_patcher = patch(
             "src.apps.wrike_worktime_panel._window_is_foreground",
             return_value=False,
         )
         self.show_without_activation = noactivate_patcher.start()
+        self.show_activated = active_patcher.start()
         self.window_is_foreground = foreground_patcher.start()
         self.addCleanup(noactivate_patcher.stop)
+        self.addCleanup(active_patcher.stop)
         self.addCleanup(foreground_patcher.stop)
 
     def test_detail_scroll_survives_sync_refresh_and_same_date_title_change(self) -> None:
@@ -646,6 +717,58 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         # Selecting another date intentionally starts its details at the top.
         panel._set_detail_text(detail, "다른 날짜 상세", date_key="2026-04-07")
         self.assertEqual(detail.yview_moveto_calls[-1], 0.0)
+
+    def test_detail_scroll_survives_structure_rebuild_only_for_same_date(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTkWithText()
+        holder = {"model": _model()}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+        self.assertTrue(panel.show(activate=False))
+        first_detail = panel._widgets["detail_text"]
+        first_detail.scroll_start = 0.8
+        first_detail.top_index = "49.71"
+
+        holder["model"] = _model(prompt=WorktimeActivityPrompt("08:35"))
+        observed_before_restore: list[float] = []
+        original_reconcile = panel._reconcile_geometry
+
+        def reconcile_after_rebuild(*args, **kwargs):
+            observed_before_restore.append(
+                panel._widgets["detail_text"].scroll_start
+            )
+            return original_reconcile(*args, **kwargs)
+
+        with patch.object(
+            panel,
+            "_reconcile_geometry",
+            side_effect=reconcile_after_rebuild,
+        ):
+            self.assertTrue(panel.refresh_now())
+        rebuilt_detail = panel._widgets["detail_text"]
+        self.assertIsNot(rebuilt_detail, first_detail)
+        self.assertEqual(observed_before_restore, [0.0])
+        self.assertEqual(rebuilt_detail.scroll_start, 0.8)
+        self.assertEqual(rebuilt_detail.yview_scroll_calls, [(48, "units")])
+
+        rebuilt_detail.scroll_start = 0.6
+        holder["model"] = _model(
+            week_start=date(2026, 4, 13),
+            today_index=2,
+        )
+        self.assertTrue(panel.refresh_now())
+        date_changed_detail = panel._widgets["detail_text"]
+        self.assertEqual(panel._selected_date_key, "2026-04-15")
+        self.assertEqual(date_changed_detail.scroll_start, 0.0)
+
+    def test_actual_detail_duration_does_not_use_target_day_limit(self) -> None:
+        panel, _provider, _callbacks = _make_panel(
+            _FakeRoot(),
+            _FakeTk(),
+            {"model": _model()},
+        )
+        self.assertEqual(panel._format_target_minutes(1_500), "24:00")
+        self.assertEqual(panel._format_actual_minutes(1_500), "25:00")
+        self.assertEqual(panel._format_actual_minutes(1_560), "26:00")
 
     def test_show_reuses_window_has_distinct_timers_and_rearms_dismissal(self) -> None:
         root = _FakeRoot()
@@ -1063,7 +1186,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
         self.assertEqual(window.withdraw_calls, 3)
 
-    def test_legacy_activate_argument_remains_passive(self) -> None:
+    def test_explicit_activate_argument_requests_foreground(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         panel, _provider, _callbacks = _make_panel(
@@ -1074,7 +1197,8 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertTrue(panel.show(activate=True))
         window = fake_tk.toplevels[0]
         self.assertTrue(panel.is_visible())
-        self.show_without_activation.assert_called_once_with(window)
+        self.show_activated.assert_called_once_with(window)
+        self.show_without_activation.assert_not_called()
 
         self.assertTrue(panel.show(activate=True))
         self.assertTrue(panel.is_visible())
@@ -1374,7 +1498,8 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertTrue(window.overrideredirect())
         self.assertIn(("-topmost", True), window.attribute_calls)
         self.assertIn((False, False), window.resizable_calls)
-        self.show_without_activation.assert_called_once_with(window)
+        self.show_activated.assert_called_once_with(window)
+        self.show_without_activation.assert_not_called()
         self.assertEqual(panel._shell.kwargs["highlightbackground"], "#E5E7EB")
 
         dismiss_id = root.active_id(6_000)
@@ -1499,7 +1624,8 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.window_is_foreground.return_value = False
         panel.toggle(activate=True)
         self.assertTrue(panel.is_visible())
-        self.assertEqual(self.show_without_activation.call_count, 2)
+        self.assertEqual(self.show_activated.call_count, 2)
+        self.assertEqual(self.show_without_activation.call_count, 0)
         self.assertEqual(window.withdraw_calls, 1)
 
         self.window_is_foreground.return_value = True

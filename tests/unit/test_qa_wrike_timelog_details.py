@@ -5,6 +5,7 @@ Native foreground ownership remains a separate coordinated acceptance probe.
 """
 
 from dataclasses import replace
+import copy
 from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
@@ -14,9 +15,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
+from src.apps.wrike_worktime_panel import WorktimeActivityPrompt, WorktimePanelLine
 from src.apps.Wrike import Wrike
 from src.apps.wrike_timelog_snapshot import (
     TimelogDay, make_fresh_snapshot, make_loading_snapshot, make_error_snapshot,
+    loading_from_last_good, error_from_last_good,
 )
 from tests.unit.test_wrike_worktime_panel import (
     _FakeRoot, _FakeTk, _FakeWidget, _make_panel, _model,
@@ -202,6 +205,12 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertEqual(window.deiconify_calls, 0)
         self.assertEqual(window.lift_calls, 0)
 
+    def test_explicit_activation_opt_in_preserves_supported_active_show(self):
+        self.make(_details())
+        self.panel.hide()
+        self.assertTrue(self.panel.show(activate=True))
+        self.active.assert_called_once_with(self.tk.toplevels[0])
+
     def test_sync_only_refresh_preserves_detail_scroll_without_replacing_text(self):
         rows = tuple(
             TimelogDetailRow("2026-04-06", f"L{i}", "T1", 15, f"Action {i}")
@@ -248,6 +257,61 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertEqual(text.yview()[0], 0.0)
         self.assertEqual(self.panel._selected_date_key, "2026-04-07")
 
+    def test_recorded_entry_and_total_above_one_day_are_not_capped(self):
+        self.make(_details(rows=(
+            TimelogDetailRow("2026-04-06", "L1", "T1", 1500, "Long recorded entry"),
+            TimelogDetailRow("2026-04-06", "L2", "T2", 60, "Another entry"),
+        )))
+        self.assertIn("실제 기록 합계 26:00", self.detail_text())
+        self.assertIn("25:00", self.detail_text())
+        self.assertNotIn("24:00", self.detail_text())
+        self.assertEqual(self.panel._format_target_minutes(1500), "24:00")
+        self.tk.button("목표 수정").invoke()
+        entry = self.panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "25:00")
+        self.tk.button("저장").invoke()
+        self.callbacks["edit_plan"].assert_not_called()
+        self.assertTrue(self.panel._inline_editor_active)
+        self.assertTrue(self.panel._widgets["inline_error"].kwargs["text"])
+
+    def test_structure_changes_preserve_same_date_detail_scroll_and_unsaved_editor(self):
+        rows = tuple(TimelogDetailRow("2026-04-07", f"L{i}", "T1", 15, f"Action {i}") for i in range(30))
+        self.make(_details(rows=rows))
+        self.select(1)
+        self.tk.button("목표 수정").invoke()
+        entry = self.panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "07:37")
+        for transition in ("prompt_appears", "prompt_disappears", "today_lines_change"):
+            with self.subTest(transition=transition):
+                before_text = self.panel._widgets["detail_text"]
+                before_text.yview_moveto(0.8)
+                model = self.holder["model"]
+                if transition == "prompt_appears":
+                    model = replace(model, prompt=WorktimeActivityPrompt("08:35"))
+                elif transition == "prompt_disappears":
+                    model = replace(model, prompt=None)
+                else:
+                    model = replace(model, today_lines=model.today_lines + (WorktimePanelLine("Additional summary", "#111827"),))
+                self.holder["model"] = model
+                self.assertTrue(self.panel.refresh_now())
+                after_text = self.panel._widgets["detail_text"]
+                self.assertIsNot(after_text, before_text)
+                self.assertEqual(after_text.yview()[0], 0.8)
+                self.assertEqual(self.panel._selected_date_key, "2026-04-07")
+                self.assertEqual(self.panel._widgets["inline_entry"].get(), "07:37")
+                self.assertTrue(self.panel._inline_editor_active)
+                self.active.assert_not_called()
+        self.holder["model"] = replace(
+            _model(week_start=date(2026, 4, 13)),
+            day_details=_details(start=date(2026, 4, 13), state="loading"),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertEqual(self.panel._selected_date_key, "2026-04-13")
+        self.assertEqual(self.panel._widgets["detail_text"].yview()[0], 0.0)
+        self.assertFalse(self.panel._inline_editor_active)
+
 
 class IndependentDetailWorkerAcceptance(unittest.TestCase):
     def setUp(self):
@@ -267,7 +331,7 @@ class IndependentDetailWorkerAcceptance(unittest.TestCase):
             {"id": "L3", "taskId": "T2", "trackedDate": "2026-04-07", "minutes": 30, "comment": "Tuesday"},
         ]
 
-    def publish(self, rows=None, *, generation=1):
+    def publish(self, rows=None, *, generation=1, force_title_refresh=False):
         details = self.app._Wrike__build_timelog_day_details(self.rows() if rows is None else rows, self.week)
         snapshot = make_fresh_snapshot(
             days=tuple(TimelogDay(day.date(), detail.total_minutes) for day, detail in zip(self.week, details)),
@@ -277,6 +341,7 @@ class IndependentDetailWorkerAcceptance(unittest.TestCase):
         with patch.object(self.app, "_Wrike__start_timelog_title_lookup") as start:
             self.assertTrue(self.app._Wrike__apply_timelog_snapshot_result(
                 generation, snapshot=snapshot, day_details=details, account_fingerprint=self.fingerprint,
+                force_title_refresh=force_title_refresh,
             ))
         return snapshot, details, start
 
@@ -285,7 +350,7 @@ class IndependentDetailWorkerAcceptance(unittest.TestCase):
         self.assertEqual([row.timelog_id for row in details[0].rows], ["L1", "L2"])
         self.assertEqual(details[0].total_minutes, 60)
         self.assertEqual(details[1].total_minutes, 30)
-        start.assert_called_once_with(1, self.fingerprint, ("T1", "T2"))
+        start.assert_called_once_with(1, self.fingerprint, ("T1", "T2"), force=False)
         self.assertTrue(self.app._Wrike__detail_days_match_snapshot(details, snapshot))
 
     def test_successful_refresh_replaces_deleted_and_moved_logs(self):
@@ -298,10 +363,9 @@ class IndependentDetailWorkerAcceptance(unittest.TestCase):
         self.assertEqual(details[2].rows[0].comment, "MOVED")
         self.assertEqual(details[2].total_minutes, 75)
 
-    def test_old_generation_and_wrong_account_cannot_supply_titles(self):
+    def test_wrong_account_cannot_supply_titles(self):
         self.publish(generation=2)
         apply = self.app._Wrike__apply_timelog_title_lookup
-        self.assertFalse(apply(1, self.fingerprint, ("T1",), {"T1": "OLD-GENERATION"}))
         self.assertFalse(apply(2, "b" * 64, ("T1",), {"T1": "OTHER-ACCOUNT"}))
         self.assertEqual(self.app._Wrike__timelog_title_cache, {})
         self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "")
@@ -309,11 +373,11 @@ class IndependentDetailWorkerAcceptance(unittest.TestCase):
     def test_token_change_discards_all_details_and_rejects_inflight_result(self):
         self.publish()
         self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1",), {"T1": "OLD ACCOUNT TITLE"})
-        self.app._Wrike__timelog_title_lookup_generations.add(1)
+        self.app._Wrike__timelog_title_lookup_inflight["T1"] = 1
         self.app._Wrike__set_wrike_api_token_session("QA-SYNTHETIC-TOKEN-B")
         self.assertEqual(self.app._Wrike__timelog_day_details, ())
         self.assertEqual(self.app._Wrike__timelog_title_cache, {})
-        self.assertEqual(self.app._Wrike__timelog_title_lookup_generations, set())
+        self.assertEqual(self.app._Wrike__timelog_title_lookup_inflight, {})
         self.assertIsNone(self.app.get_timelog_snapshot().total_recorded_minutes)
         self.assertFalse(self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1",), {"T1": "DELAYED PRIVATE TITLE"}))
 
@@ -328,11 +392,11 @@ class IndependentDetailWorkerAcceptance(unittest.TestCase):
         self.assertEqual(self.app._Wrike__timelog_day_details[1].rows[0].title_state, "missing")
         self.assertEqual(self.app._Wrike__timelog_day_details[1].rows[0].minutes, 30)
 
-    def test_successful_refresh_retries_transient_title_failure(self):
+    def test_manual_refresh_retries_transient_title_failure(self):
         self.publish()
         self.assertTrue(self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"), None))
-        _, _, start = self.publish(generation=2)
-        start.assert_called_once_with(2, self.fingerprint, ("T1", "T2"))
+        _, _, start = self.publish(generation=2, force_title_refresh=True)
+        start.assert_called_once_with(2, self.fingerprint, ("T1", "T2"), force=True)
 
     def test_cache_remains_aggregate_only_after_title_resolution(self):
         self.publish()
@@ -400,6 +464,188 @@ class IndependentDetailWorkerAcceptance(unittest.TestCase):
             self.assertEqual(len(pending_ui), 1)
             pending_ui[0]()
         self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "ASYNC-TITLE")
+
+    def capture_title_workers(self, titles=None):
+        self.app._Wrike__root = object()
+        workers, pending = [], []
+        def create(*, target, daemon):
+            self.assertTrue(daemon)
+            workers.append(target)
+            return Mock()
+        def queue(root, callback):
+            pending.append(callback)
+            return True
+        self.enterContext(patch("src.apps.Wrike.threading.Thread", side_effect=create))
+        self.enterContext(patch.object(self.app, "_Wrike__ui_safe", side_effect=queue))
+        query = self.enterContext(patch.object(self.app, "_Wrike__query_task_titles", return_value=titles))
+        return workers, pending, query
+
+    def retained_refresh_title_result(self, state):
+        fresh, _, _ = self.publish()
+        workers, pending, _ = self.capture_title_workers({"T1": "DELAYED TITLE"})
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1",))
+        self.assertEqual(len(workers), 1)
+        if state == "loading":
+            self.app._Wrike__timelog_snapshot = loading_from_last_good(fresh, generation=2)
+        else:
+            self.app._Wrike__timelog_snapshot = error_from_last_good(fresh, generation=2, error_code="request_failed")
+        workers[0]()
+        pending[0]()
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "DELAYED TITLE")
+        self.assertEqual(self.app.get_timelog_snapshot().state.value, state)
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].total_minutes, 60)
+
+    def test_pending_title_result_survives_loading_refresh_of_retained_details(self):
+        self.retained_refresh_title_result("loading")
+
+    def test_pending_title_result_survives_failed_refresh_of_retained_details(self):
+        self.retained_refresh_title_result("error")
+
+    def test_slow_title_query_survives_repeated_data_refresh_without_duplicate_workers(self):
+        self.publish()
+        workers, pending, _ = self.capture_title_workers({"T1": "LATEST MATCHING TITLE", "T2": "Second title"})
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"))
+        for generation in range(2, 7):
+            self.publish(self.rows(comment=f"Refresh {generation}"), generation=generation)
+            self.app._Wrike__start_timelog_title_lookup(generation, self.fingerprint, ("T1", "T2"))
+        self.assertEqual(len(workers), 1)
+        workers[0]()
+        pending[0]()
+        row = self.app._Wrike__timelog_day_details[0].rows[0]
+        self.assertEqual(row.task_title, "LATEST MATCHING TITLE")
+        self.assertEqual(row.comment, "Refresh 6")
+        self.assertEqual(self.app.get_timelog_snapshot().generation, 6)
+
+    def test_actual_pending_callback_cannot_cross_account_change(self):
+        self.publish()
+        workers, pending, _ = self.capture_title_workers({"T1": "PRIVATE ACCOUNT A"})
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1",))
+        workers[0]()
+        self.app._Wrike__set_wrike_api_token_session("QA-SYNTHETIC-TOKEN-B")
+        pending[0]()
+        self.assertEqual(self.app._Wrike__timelog_title_cache, {})
+        self.assertEqual(self.app._Wrike__timelog_day_details, ())
+
+    def test_ready_and_missing_cache_recover_at_ttl_without_five_second_flood(self):
+        clock = self.enterContext(patch.object(self.app._Wrike__lib, "datetime", wraps=datetime))
+        start_time = datetime(2026, 4, 6, 12, 0)
+        clock.now.return_value = start_time
+        self.publish()
+        self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"), {"T1": "ORIGINAL NAME"})
+        workers, pending, _ = self.capture_title_workers({"T1": "RENAMED TICKET", "T2": "PERMISSION RESTORED"})
+        for elapsed in range(0, 300, 5):
+            clock.now.return_value = start_time + timedelta(seconds=elapsed)
+            self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"))
+        self.assertEqual(len(workers), 0)
+        clock.now.return_value = start_time + timedelta(seconds=300)
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"))
+        self.assertEqual(len(workers), 1)
+        workers[0]()
+        pending[0]()
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "RENAMED TICKET")
+        self.assertEqual(self.app._Wrike__timelog_day_details[1].rows[0].task_title, "PERMISSION RESTORED")
+        clock.now.return_value = start_time + timedelta(seconds=305)
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"))
+        self.assertEqual(len(workers), 1)
+
+    def test_unavailable_cache_retries_at_sixty_seconds_without_flood(self):
+        clock = self.enterContext(patch.object(self.app._Wrike__lib, "datetime", wraps=datetime))
+        start_time = datetime(2026, 4, 6, 12, 0)
+        clock.now.return_value = start_time
+        self.publish()
+        self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1",), None)
+        workers, pending, _ = self.capture_title_workers({"T1": "RECOVERED"})
+        for elapsed in range(0, 60, 5):
+            clock.now.return_value = start_time + timedelta(seconds=elapsed)
+            self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1",))
+        self.assertEqual(len(workers), 0)
+        clock.now.return_value = start_time + timedelta(seconds=60)
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1",))
+        self.assertEqual(len(workers), 1)
+        workers[0]()
+        pending[0]()
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "RECOVERED")
+
+    def test_manual_panel_refresh_bypasses_ready_and_missing_cache(self):
+        self.publish()
+        self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"), {"T1": "ORIGINAL NAME"})
+        workers, pending, _ = self.capture_title_workers({"T1": "RENAMED MANUALLY", "T2": "RESTORED MANUALLY"})
+        self.app._Wrike__background_active = True
+        self.enterContext(patch.object(self.app, "_Wrike__get_week_dates", return_value=self.week))
+        self.enterContext(patch.object(self.app, "_Wrike__resolve_contact_identity", return_value=("QAUSER", "QA", None)))
+        self.enterContext(patch.object(self.app, "_Wrike__query_authoritative_timelogs_week", return_value=(self.rows(), None)))
+        self.app._Wrike__panel_refresh()
+        self.assertEqual(len(workers), 1)
+        workers[0]()
+        pending[0]()
+        self.assertEqual(len(workers), 2)
+        workers[1]()
+        pending[1]()
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "RENAMED MANUALLY")
+        self.assertEqual(self.app._Wrike__timelog_day_details[1].rows[0].task_title, "RESTORED MANUALLY")
+
+    def test_forced_monitor_refresh_keeps_title_cache_ttl(self):
+        self.publish()
+        self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1", "T2"), {"T1": "CACHED NAME"})
+        workers, pending, query = self.capture_title_workers({"T1": "UNEXPECTED NETWORK LOOKUP"})
+        self.app._Wrike__background_active = True
+        self.enterContext(patch.object(self.app, "_Wrike__get_week_dates", return_value=self.week))
+        self.enterContext(patch.object(self.app, "_Wrike__resolve_contact_identity", return_value=("QAUSER", "QA", None)))
+        self.enterContext(patch.object(self.app, "_Wrike__query_authoritative_timelogs_week", return_value=(self.rows(), None)))
+        for index in range(4):
+            self.app._Wrike__request_timelog_snapshot_refresh(force=True)
+            self.assertEqual(len(workers), index + 1)
+            workers[index]()
+            pending[index]()
+            self.assertEqual(len(workers), index + 1)
+        query.assert_not_called()
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "CACHED NAME")
+
+    def test_failed_token_settings_save_restores_details_cache_and_pending_owner(self):
+        self.publish()
+        self.app._Wrike__apply_timelog_title_lookup(1, self.fingerprint, ("T1",), {"T1": "READY TITLE"})
+        workers, pending, _ = self.capture_title_workers({"T2": "PENDING OLD ACCOUNT TITLE"})
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T2",))
+        fields = (
+            "wrike_api_token_session", "timelog_snapshot", "timelog_last_good",
+            "timelog_day_details", "timelog_day_details_generation", "timelog_title_cache",
+            "timelog_title_lookup_sequence", "timelog_title_lookup_inflight",
+        )
+        before = {name: copy.deepcopy(getattr(self.app, "_Wrike__" + name)) for name in fields}
+        with patch.object(self.app, "_Wrike__save_settings", return_value=False), patch.object(
+            self.app._Wrike__secret_store, "protect", return_value="dpapi:qa-synthetic",
+        ):
+            ok, error = self.app.update_settings({"api_token": "QA-SYNTHETIC-TOKEN-B"})
+        self.assertFalse(ok)
+        self.assertEqual(error, "settings save failed")
+        for name, value in before.items():
+            with self.subTest(field=name):
+                self.assertEqual(getattr(self.app, "_Wrike__" + name), value)
+        new_account = self.app._Wrike__timelog_token_fingerprint("QA-SYNTHETIC-TOKEN-B")
+        pending_owner = before["timelog_title_lookup_inflight"]["T2"]
+        self.assertFalse(self.app._Wrike__apply_timelog_title_lookup(
+            1, new_account, ("T2",), {"T2": "OTHER ACCOUNT PRIVATE TITLE"}, lookup_id=pending_owner,
+        ))
+        self.assertEqual(self.app._Wrike__timelog_title_lookup_inflight, before["timelog_title_lookup_inflight"])
+        workers[0]()
+        pending[0]()
+        self.assertEqual(self.app._Wrike__timelog_day_details[1].rows[0].task_title, "PENDING OLD ACCOUNT TITLE")
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "READY TITLE")
+        self.assertEqual(self.app.get_timelog_snapshot().total_recorded_minutes, 90)
+
+    def test_old_callback_cannot_overwrite_newer_title_lookup(self):
+        self.publish()
+        workers, pending, query = self.capture_title_workers({"T1": "OLD TITLE"})
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1",))
+        workers[0]()
+        pending[0]()
+        query.return_value = {"T1": "NEWEST TITLE"}
+        self.app._Wrike__start_timelog_title_lookup(1, self.fingerprint, ("T1",), force=True)
+        self.assertEqual(len(workers), 2)
+        workers[1]()
+        pending[1]()
+        pending[0]()
+        self.assertEqual(self.app._Wrike__timelog_day_details[0].rows[0].task_title, "NEWEST TITLE")
 
 
 if __name__ == "__main__":

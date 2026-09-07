@@ -226,8 +226,9 @@ class Wrike:
         # snapshot remains a daily aggregate by design.
         self.__timelog_day_details: tuple[TimelogDayDetails, ...] = ()
         self.__timelog_day_details_generation = 0
-        self.__timelog_title_cache: dict[str, tuple[str, str]] = {}
-        self.__timelog_title_lookup_generations: set[int] = set()
+        self.__timelog_title_cache: dict[str, tuple[str, str, datetime]] = {}
+        self.__timelog_title_lookup_sequence = 0
+        self.__timelog_title_lookup_inflight: dict[str, int] = {}
         self.__secret_store = SecretStore("windows-supporter:wrike-api-token")
         self.__vacation_secret_store = SecretStore("windows-supporter:vacation-ical-url")
         self.__google_calendar_oauth_secret_store = SecretStore(
@@ -546,7 +547,7 @@ class Wrike:
         panel = self.__ensure_worktime_panel(root)
         if panel is None:
             return
-        panel.toggle()
+        panel.toggle(activate=False)
         if panel.is_visible():
             self.__request_timelog_snapshot_refresh(force=True)
         return
@@ -712,7 +713,7 @@ class Wrike:
             self.__timelog_day_details = ()
             self.__timelog_day_details_generation = 0
             self.__timelog_title_cache = {}
-            self.__timelog_title_lookup_generations.clear()
+            self.__timelog_title_lookup_inflight.clear()
         watcher = self.__activity_watcher
         if watcher is not None:
             try:
@@ -950,7 +951,12 @@ class Wrike:
             for key in date_keys
         )
 
-    def __request_timelog_snapshot_refresh(self, force: bool = False):
+    def __request_timelog_snapshot_refresh(
+        self,
+        force: bool = False,
+        *,
+        revalidate_titles: bool = False,
+    ):
         root = self.__root
         if root is None or not self.__background_active:
             return None
@@ -1010,6 +1016,7 @@ class Wrike:
                     week_dates,
                     root,
                     lifecycle_generation,
+                    bool(revalidate_titles),
                 ),
                 daemon=True,
             )
@@ -1030,6 +1037,7 @@ class Wrike:
         week_dates: list,
         root,
         lifecycle_generation: int,
+        force_title_refresh: bool,
     ) -> None:
         fresh_snapshot = None
         day_details = None
@@ -1083,6 +1091,7 @@ class Wrike:
                 day_details=day_details,
                 account_fingerprint=account_fingerprint,
                 error_code=error_code,
+                force_title_refresh=force_title_refresh,
             )
 
         if not self.__ui_safe(root, apply_result):
@@ -1103,6 +1112,7 @@ class Wrike:
         day_details: tuple[TimelogDayDetails, ...] | None = None,
         account_fingerprint: str | None = None,
         error_code: str | None = None,
+        force_title_refresh: bool = False,
     ) -> bool:
         save_snapshot = None
         save_fingerprint = ""
@@ -1153,6 +1163,7 @@ class Wrike:
                 notify_snapshot = snapshot
                 self.__timelog_day_details = day_details or ()
                 self.__timelog_day_details_generation = int(generation)
+                title_cache_now = self.__lib.datetime.now()
                 title_lookup_ids = tuple(
                     sorted(
                         {
@@ -1160,10 +1171,17 @@ class Wrike:
                             for detail in self.__timelog_day_details
                             for row in detail.rows
                             if row.task_id
-                            and self.__timelog_title_cache.get(
+                            and not self.__timelog_title_cache_is_fresh(
                                 row.task_id,
-                                ("loading", ""),
-                            )[0] not in {"ready", "missing"}
+                                title_cache_now,
+                                force=bool(force_title_refresh),
+                                cache=self.__timelog_title_cache,
+                            )
+                            and (
+                                bool(force_title_refresh)
+                                or row.task_id
+                                not in self.__timelog_title_lookup_inflight
+                            )
                         }
                     )
                 )
@@ -1195,8 +1213,34 @@ class Wrike:
                 generation,
                 str(account_fingerprint or ""),
                 title_lookup_ids,
+                force=bool(force_title_refresh),
             )
         return True
+
+    @staticmethod
+    def __timelog_title_cache_is_fresh(
+        task_id: str,
+        now: datetime,
+        *,
+        force: bool,
+        cache: dict[str, tuple[str, str, datetime]] | None = None,
+    ) -> bool:
+        if force or cache is None:
+            return False
+        entry = cache.get(task_id)
+        if entry is None or len(entry) != 3:
+            return False
+        state, _title, fetched_at = entry
+        if state in {"ready", "missing"}:
+            ttl = timedelta(minutes=5)
+        elif state == "unavailable":
+            ttl = timedelta(minutes=1)
+        else:
+            return False
+        try:
+            return timedelta(0) <= now - fetched_at < ttl
+        except Exception:
+            return False
 
     def __build_timelog_day_details(
         self,
@@ -1242,10 +1286,9 @@ class Wrike:
                     continue
             except (TypeError, ValueError):
                 continue
-            cached_state, cached_title = title_cache.get(
-                task_id,
-                ("loading", ""),
-            )
+            cache_entry = title_cache.get(task_id)
+            cached_state = cache_entry[0] if cache_entry is not None else "loading"
+            cached_title = cache_entry[1] if cache_entry is not None else ""
             if not task_id:
                 cached_state = "ready"
             rows_by_date[date_key].append(
@@ -1293,6 +1336,8 @@ class Wrike:
         generation: int,
         account_fingerprint: str,
         task_ids: tuple[str, ...],
+        *,
+        force: bool = False,
     ) -> None:
         if not task_ids:
             return
@@ -1301,16 +1346,42 @@ class Wrike:
         if root is None or not token:
             return
         with self.__timelog_snapshot_lock:
-            if (
-                int(generation) != self.__timelog_day_details_generation
-                or int(generation) in self.__timelog_title_lookup_generations
+            if str(account_fingerprint).lower() != self.__timelog_token_fingerprint(
+                self.__wrike_api_token_session
             ):
                 return
-            self.__timelog_title_lookup_generations.add(int(generation))
+            now = self.__lib.datetime.now()
+            requested_ids = tuple(
+                dict.fromkeys(
+                    task_id
+                    for task_id in task_ids
+                    if (
+                        type(task_id) is str
+                        and task_id
+                        and (
+                            bool(force)
+                            or task_id not in self.__timelog_title_lookup_inflight
+                        )
+                        and not self.__timelog_title_cache_is_fresh(
+                            task_id,
+                            now,
+                            force=bool(force),
+                            cache=self.__timelog_title_cache,
+                        )
+                    )
+                )
+            )
+            if not requested_ids:
+                return
+            self.__timelog_title_lookup_sequence += 1
+            lookup_id = int(self.__timelog_title_lookup_sequence)
+            self.__timelog_title_lookup_inflight.update(
+                {task_id: lookup_id for task_id in requested_ids}
+            )
         lifecycle_generation = int(self.__lifecycle_generation)
 
         def run_lookup() -> None:
-            titles = self.__query_task_titles(token, task_ids)
+            titles = self.__query_task_titles(token, requested_ids)
 
             def apply_result() -> None:
                 if lifecycle_generation != int(self.__lifecycle_generation):
@@ -1318,19 +1389,24 @@ class Wrike:
                 self.__apply_timelog_title_lookup(
                     generation,
                     account_fingerprint,
-                    task_ids,
+                    requested_ids,
                     titles,
+                    lookup_id=lookup_id,
                 )
 
             if not self.__ui_safe(root, apply_result):
                 with self.__timelog_snapshot_lock:
-                    self.__timelog_title_lookup_generations.discard(int(generation))
+                    for task_id in requested_ids:
+                        if self.__timelog_title_lookup_inflight.get(task_id) == lookup_id:
+                            self.__timelog_title_lookup_inflight.pop(task_id, None)
 
         try:
             threading.Thread(target=run_lookup, daemon=True).start()
         except Exception:
             with self.__timelog_snapshot_lock:
-                self.__timelog_title_lookup_generations.discard(int(generation))
+                for task_id in requested_ids:
+                    if self.__timelog_title_lookup_inflight.get(task_id) == lookup_id:
+                        self.__timelog_title_lookup_inflight.pop(task_id, None)
 
     def __query_task_titles(
         self,
@@ -1374,21 +1450,42 @@ class Wrike:
         account_fingerprint: str,
         requested_ids: tuple[str, ...],
         titles: dict[str, str] | None,
+        *,
+        lookup_id: int | None = None,
     ) -> bool:
-        """Apply title state only if the authoritative detail generation survives."""
+        """Apply a current-account title response to retained matching details."""
 
         with self.__timelog_snapshot_lock:
-            self.__timelog_title_lookup_generations.discard(int(generation))
             if (
-                int(generation) != self.__timelog_day_details_generation
-                or int(generation) != int(self.__timelog_snapshot.generation)
-                or str(account_fingerprint).lower()
+                str(account_fingerprint).lower()
                 != self.__timelog_token_fingerprint(self.__wrike_api_token_session)
             ):
                 return False
             safe_ids = tuple(
-                value for value in requested_ids if type(value) is str and value
+                value
+                for value in requested_ids
+                if (
+                    type(value) is str
+                    and value
+                    and (
+                        lookup_id is None
+                        or self.__timelog_title_lookup_inflight.get(value) == lookup_id
+                    )
+                )
             )
+            if lookup_id is not None:
+                for value in requested_ids:
+                    if self.__timelog_title_lookup_inflight.get(value) == lookup_id:
+                        self.__timelog_title_lookup_inflight.pop(value, None)
+            current_ids = {
+                row.task_id
+                for detail in self.__timelog_day_details
+                for row in detail.rows
+                if row.task_id
+            }
+            safe_ids = tuple(value for value in safe_ids if value in current_ids)
+            if not safe_ids:
+                return False
             if titles is None:
                 updates = {value: ("unavailable", "") for value in safe_ids}
             else:
@@ -1397,7 +1494,13 @@ class Wrike:
                     if value in titles else ("missing", "")
                     for value in safe_ids
                 }
-            self.__timelog_title_cache.update(updates)
+            fetched_at = self.__lib.datetime.now()
+            self.__timelog_title_cache.update(
+                {
+                    task_id: (state, title, fetched_at)
+                    for task_id, (state, title) in updates.items()
+                }
+            )
             self.__timelog_day_details = tuple(
                 TimelogDayDetails(
                     date_key=detail.date_key,
@@ -1410,8 +1513,14 @@ class Wrike:
                             task_id=row.task_id,
                             minutes=row.minutes,
                             comment=row.comment,
-                            task_title=updates.get(row.task_id, (row.title_state, row.task_title))[1],
-                            title_state=updates.get(row.task_id, (row.title_state, row.task_title))[0],
+                            task_title=updates.get(
+                                row.task_id,
+                                (row.title_state, row.task_title),
+                            )[1],
+                            title_state=updates.get(
+                                row.task_id,
+                                (row.title_state, row.task_title),
+                            )[0],
                         )
                         for row in detail.rows
                     ),
@@ -2029,7 +2138,10 @@ class Wrike:
         return True
 
     def __panel_refresh(self) -> None:
-        self.__request_timelog_snapshot_refresh(force=True)
+        self.__request_timelog_snapshot_refresh(
+            force=True,
+            revalidate_titles=True,
+        )
         return
 
     def __panel_clock_in_now(self) -> None:
@@ -5078,7 +5190,7 @@ class Wrike:
                     self.__timelog_day_details = ()
                     self.__timelog_day_details_generation = 0
                     self.__timelog_title_cache = {}
-                    self.__timelog_title_lookup_generations.clear()
+                    self.__timelog_title_lookup_inflight.clear()
                     self.__timelog_snapshot = (
                         make_loading_snapshot(generation=generation)
                         if token
@@ -5262,6 +5374,11 @@ class Wrike:
             "timelog_last_refresh_requested_at",
             "timelog_snapshot",
             "timelog_last_good",
+            "timelog_day_details",
+            "timelog_day_details_generation",
+            "timelog_title_cache",
+            "timelog_title_lookup_sequence",
+            "timelog_title_lookup_inflight",
             "vacation_calendar_provider",
             "vacation_ical_url_protected",
             "vacation_ical_url_session",
