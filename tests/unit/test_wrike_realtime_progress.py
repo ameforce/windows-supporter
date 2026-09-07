@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from src.apps.Monitor import Monitor
 from src.apps.Wrike import Wrike
 from src.apps.wrike_ical import CalendarError, CalendarErrorCode, CalendarSuccess
+from src.apps.wrike_timelog_details import TimelogDayDetails
 from src.apps.wrike_ui import WrikeSettingsView
 from src.apps.wrike_worktime import BreakInterval
 from src.apps.wrike_timelog_snapshot import (
@@ -149,11 +150,11 @@ class _FakePanel:
         self.idle_timeout_ms = int(value)
         self.idle_timeout_updates.append(int(value))
 
-    def toggle(self, activate=True):
+    def toggle(self, activate=False):
         self.toggle_calls.append(bool(activate))
         self.visible = not self.visible
 
-    def show(self, activate=True):
+    def show(self, activate=False):
         self.show_calls.append(bool(activate))
         self.visible = bool(self.show_result and self.show_maps)
         return bool(self.show_result)
@@ -290,8 +291,45 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             json.loads(first_query["trackedDate"][0]),
             {"start": "2026-04-06", "end": "2026-04-12"},
         )
+        self.assertEqual(first_query["plainText"], ["true"])
         second_query = parse_qs(urlparse(urls[1]).query)
         self.assertEqual(second_query["nextPageToken"], ["page-2"])
+
+    def test_detail_rows_keep_comments_in_memory_and_dedupe_title_lookup(self) -> None:
+        wrike = self._new_wrike()
+        week = self._week_datetimes()
+        details = wrike._Wrike__build_timelog_day_details(
+            [
+                {
+                    "id": "log-a",
+                    "trackedDate": "2026-04-06",
+                    "_authoritative_minutes": 30,
+                    "taskId": "task-a",
+                    "comment": "첫 코멘트",
+                },
+                {
+                    "id": "log-b",
+                    "trackedDate": "2026-04-06",
+                    "_authoritative_minutes": 45,
+                    "taskId": "task-a",
+                    "comment": "둘째 코멘트",
+                },
+            ],
+            week,
+        )
+        self.assertTrue(all(isinstance(item, TimelogDayDetails) for item in details))
+        self.assertEqual(details[0].total_minutes, 75)
+        self.assertEqual([row.comment for row in details[0].rows], ["첫 코멘트", "둘째 코멘트"])
+        self.assertEqual({row.task_id for row in details[0].rows}, {"task-a"})
+        self.assertEqual(details[1].state, "available")
+        self.assertEqual(details[1].rows, ())
+
+        api_get = Mock(return_value={"data": [{"id": "task-a", "title": "작업 A"}]})
+        wrike._Wrike__api_get_json = api_get
+        titles = wrike._Wrike__query_task_titles("token", ("task-a", "task-a"))
+        self.assertEqual(titles, {"task-a": "작업 A"})
+        api_get.assert_called_once()
+        self.assertIn("/tasks/task-a", api_get.call_args.args[0])
 
     def test_authoritative_pagination_token_is_strict_and_opaque(self) -> None:
         malformed_tokens = (
@@ -2353,7 +2391,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(panel.idle_timeout_ms, 6000)
         self.assertEqual(panel.idle_timeout_updates, [6000, 6000, 6000, 6000])
         self.assertEqual(panel.show_calls, [False, False])
-        self.assertEqual(panel.toggle_calls, [True, True])
+        self.assertEqual(panel.toggle_calls, [False, False])
         self.assertEqual(request_refresh.call_count, 2)
         self.assertEqual(
             [item.kwargs.get("force") for item in request_refresh.call_args_list],

@@ -9,6 +9,8 @@ import re
 import time
 from typing import Any, Callable
 
+from src.apps.wrike_timelog_details import TimelogDayDetails
+
 
 _REFRESH_INTERVAL_MS = 1_000
 _COUNTDOWN_INTERVAL_MS = 200
@@ -118,6 +120,7 @@ class WorktimePanelModel:
     break_active: bool
     rows: tuple[WorktimePanelDayRow, ...]
     prompt: WorktimeActivityPrompt | None = None
+    day_details: tuple[TimelogDayDetails, ...] = ()
 
     def __post_init__(self) -> None:
         _require_string(self.week_range, name="week_range")
@@ -150,6 +153,15 @@ class WorktimePanelModel:
             self.prompt, WorktimeActivityPrompt
         ):
             raise TypeError("prompt must be a WorktimeActivityPrompt or None")
+        if not isinstance(self.day_details, tuple):
+            raise TypeError("day_details must be an immutable tuple")
+        if self.day_details and (
+            len(self.day_details) != len(self.rows)
+            or any(not isinstance(item, TimelogDayDetails) for item in self.day_details)
+            or {item.date_key for item in self.day_details}
+            != {item.date_key for item in self.rows}
+        ):
+            raise ValueError("day_details must cover exactly the displayed rows")
 
     @property
     def has_clock_in(self) -> bool:
@@ -224,6 +236,7 @@ class WorktimeQuickPanel:
         self._content = None
         self._model: WorktimePanelModel | None = None
         self._selected_date_key: str | None = None
+        self._rendered_detail_date_key: str | None = None
         self._structure_signature: tuple[bool, int] | None = None
         self._widgets: dict[str, Any] = {}
         self._refresh_after_id = None
@@ -245,7 +258,7 @@ class WorktimeQuickPanel:
         self._placed = False
         self._destroyed = False
 
-    def show(self, activate: bool = True) -> bool:
+    def show(self, activate: bool = False) -> bool:
         """Show, re-anchor at the pointer, and verify native mapped state."""
 
         if type(activate) is not bool:
@@ -262,10 +275,9 @@ class WorktimeQuickPanel:
             self._geometry_retry_pending = not self._reconcile_geometry(
                 anchor_to_pointer=True
             )
-        if activate:
-            if not _show_window_activated(window):
-                return self._fail_show(window)
-        elif not _show_window_without_activation(window):
+        # A global shortcut must never take foreground ownership.  User clicks
+        # still focus their own Tk controls through the window manager.
+        if not _show_window_without_activation(window):
             return self._fail_show(window)
         _safe_call(window, "update_idletasks")
         if not self._geometry_retry_pending:
@@ -302,16 +314,16 @@ class WorktimeQuickPanel:
         if window is not None and self._window_exists(window):
             _safe_call(window, "withdraw")
 
-    def toggle(self, activate: bool = True) -> None:
+    def toggle(self, activate: bool = False) -> None:
         """Hide a foreground panel, or surface/reopen it for the hotkey."""
 
         if self.is_visible():
             if activate and not _window_is_foreground(self._window):
-                self.show(activate=True)
+                self.show(activate=False)
             else:
                 self.hide()
         else:
-            self.show(activate=activate)
+            self.show(activate=False)
 
     def set_idle_timeout_ms(self, idle_timeout_ms: int) -> None:
         """Set the dismissal delay, clamped to the minimum safe duration."""
@@ -377,6 +389,7 @@ class WorktimeQuickPanel:
         self._content = None
         self._model = None
         self._selected_date_key = None
+        self._rendered_detail_date_key = None
         self._structure_signature = None
         self._widgets = {}
         self._geometry_retry_pending = False
@@ -452,6 +465,34 @@ class WorktimeQuickPanel:
     def _model_structure_signature(model: WorktimePanelModel) -> tuple[bool, int]:
         return model.prompt is not None, len(model.today_lines)
 
+    @staticmethod
+    def _detail_for_selected_date(
+        model: WorktimePanelModel,
+        date_key: str | None,
+    ) -> TimelogDayDetails | None:
+        if not date_key:
+            return None
+        return next(
+            (detail for detail in model.day_details if detail.date_key == date_key),
+            None,
+        )
+
+    def _selected_detail_text(self, model: WorktimePanelModel) -> str:
+        detail = self._detail_for_selected_date(model, self._selected_date_key)
+        if detail is None or detail.state == "loading":
+            return "상세 기록을 불러오는 중입니다."
+        if detail.state == "unavailable":
+            return "상세 기록을 확인할 수 없습니다."
+        if not detail.rows:
+            return "해당 날짜에 Wrike 기록이 없습니다. · 합계 0분"
+        lines = [f"실제 기록 합계 {self._format_target_minutes(detail.total_minutes)}"]
+        for row in detail.rows:
+            comment = row.comment.strip() or "코멘트 없음"
+            lines.append(
+                f"{row.ticket_text} · {self._format_target_minutes(row.minutes)}\n{comment}"
+            )
+        return "\n".join(lines)
+
     def _ensure_tk(self) -> Any | None:
         if self._tk is not None:
             return self._tk
@@ -471,6 +512,7 @@ class WorktimeQuickPanel:
             self._content = None
             self._model = None
             self._selected_date_key = None
+            self._rendered_detail_date_key = None
             self._structure_signature = None
             self._widgets = {}
             self._placed = False
@@ -996,6 +1038,59 @@ class WorktimeQuickPanel:
                 )
             row_widgets.append(widgets_for_row)
 
+        detail_card = tk.Frame(
+            content,
+            bg=_CARD_BG,
+            highlightthickness=1,
+            highlightbackground=_BORDER,
+        )
+        detail_card.pack(fill="x", pady=(0, section_gap))
+        detail_title = tk.Label(
+            detail_card,
+            text="선택 날짜 실제 기록",
+            bg=_CARD_BG,
+            fg=_TEXT,
+            anchor="w",
+            font=("Segoe UI", 10, "bold"),
+        )
+        detail_title.pack(fill="x", padx=10, pady=title_padding)
+        detail_text_factory = getattr(tk, "Text", None)
+        if callable(detail_text_factory):
+            detail_area = tk.Frame(detail_card, bg=_CARD_BG)
+            detail_area.pack(fill="x", padx=10, pady=(0, 6))
+            detail_text = detail_text_factory(
+                detail_area,
+                height=5,
+                bg=_CARD_BG,
+                fg=_MUTED,
+                wrap="word",
+                relief="flat",
+                highlightthickness=0,
+                font=("Segoe UI", 9),
+            )
+            detail_scroll = tk.Scrollbar(detail_area, command=detail_text.yview)
+            detail_text.configure(yscrollcommand=detail_scroll.set, state="disabled")
+            detail_text.pack(side="left", fill="both", expand=True)
+            detail_scroll.pack(side="right", fill="y")
+        else:
+            # Headless test doubles do not implement Text.  Production Tk uses
+            # the bounded, scrollable branch above.
+            detail_text = tk.Label(
+                detail_card,
+                text="",
+                bg=_CARD_BG,
+                fg=_MUTED,
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9),
+            )
+            detail_text.pack(fill="x", padx=10, pady=(0, 6))
+        self._set_detail_text(
+            detail_text,
+            self._selected_detail_text(model),
+            date_key=self._selected_date_key,
+        )
+
         inline_editor = tk.Frame(
             content,
             bg=_CARD_BG,
@@ -1124,6 +1219,7 @@ class WorktimeQuickPanel:
             "sync": sync_label,
             "today_lines": tuple(today_line_labels),
             "rows": tuple(row_widgets),
+            "detail_text": detail_text,
             "refresh_button": refresh_button,
             "clock_button": clock_button,
             "break_button": break_button,
@@ -1194,6 +1290,12 @@ class WorktimeQuickPanel:
             )
             today_label.configure(text="오늘" if row.today else "", bg=row_bg)
 
+        self._set_detail_text(
+            widgets["detail_text"],
+            self._selected_detail_text(model),
+            date_key=self._selected_date_key,
+        )
+
         widgets["clock_button"].configure(
             text="출근 수정" if model.has_clock_in else "지금 출근"
         )
@@ -1233,6 +1335,49 @@ class WorktimeQuickPanel:
                 font=("Segoe UI", 9, emphasis),
             )
             _safe_call(today_label, "configure", bg=row_bg)
+        self._set_detail_text(
+            self._widgets.get("detail_text"),
+            self._selected_detail_text(model),
+            date_key=self._selected_date_key,
+        )
+
+    def _set_detail_text(
+        self,
+        widget: Any,
+        value: str,
+        *,
+        date_key: str | None,
+    ) -> None:
+        if widget is None:
+            return
+        if (
+            callable(getattr(widget, "delete", None))
+            and callable(getattr(widget, "insert", None))
+            and callable(getattr(widget, "yview", None))
+        ):
+            same_date = date_key == self._rendered_detail_date_key
+            try:
+                current = str(widget.get("1.0", "end-1c"))
+            except Exception:
+                current = None
+            if same_date and current == value:
+                return
+            scroll_start = 0.0
+            if same_date:
+                try:
+                    yview = widget.yview()
+                    scroll_start = float(yview[0])
+                except Exception:
+                    scroll_start = 0.0
+            _safe_call(widget, "configure", state="normal")
+            _safe_call(widget, "delete", "1.0", "end")
+            _safe_call(widget, "insert", "1.0", value)
+            _safe_call(widget, "configure", state="disabled")
+            _safe_call(widget, "yview_moveto", scroll_start)
+            self._rendered_detail_date_key = date_key
+            return
+        _safe_call(widget, "configure", text=value)
+        self._rendered_detail_date_key = date_key
 
     def _retarget_target_editor(self, row: WorktimePanelDayRow) -> None:
         if (
@@ -1900,115 +2045,9 @@ def _window_is_foreground(window: Any) -> bool:
 
 
 def _show_window_activated(window: Any) -> bool:
-    """Show a short-lived topmost panel and request native foreground ownership."""
+    """Compatibility shim retained for tests; panel display is always passive."""
 
-    _safe_call(window, "deiconify")
-    _safe_call(window, "attributes", "-topmost", True)
-    _safe_call(window, "lift")
-    _safe_call(window, "focus_force")
-    _safe_call(window, "update_idletasks")
-    hwnd = _native_window_handle(window)
-    if hwnd <= 0:
-        return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.ShowWindow.restype = wintypes.BOOL
-        user32.SetWindowPos.argtypes = [
-            wintypes.HWND,
-            wintypes.HWND,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            wintypes.UINT,
-        ]
-        user32.SetWindowPos.restype = wintypes.BOOL
-        user32.BringWindowToTop.argtypes = [wintypes.HWND]
-        user32.BringWindowToTop.restype = wintypes.BOOL
-        user32.GetForegroundWindow.argtypes = []
-        user32.GetForegroundWindow.restype = wintypes.HWND
-        user32.GetWindowThreadProcessId.argtypes = [
-            wintypes.HWND,
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-        user32.AttachThreadInput.argtypes = [
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.BOOL,
-        ]
-        user32.AttachThreadInput.restype = wintypes.BOOL
-        user32.SetActiveWindow.argtypes = [wintypes.HWND]
-        user32.SetActiveWindow.restype = wintypes.HWND
-        user32.SetFocus.argtypes = [wintypes.HWND]
-        user32.SetFocus.restype = wintypes.HWND
-        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-        user32.SetForegroundWindow.restype = wintypes.BOOL
-        kernel32.GetCurrentThreadId.argtypes = []
-        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-        sw_show = 5
-        swp_nosize = 0x0001
-        swp_nomove = 0x0002
-        swp_showwindow = 0x0040
-        swp_noownerzorder = 0x0200
-        native = wintypes.HWND(hwnd)
-        user32.ShowWindow(native, sw_show)
-        user32.SetWindowPos(
-            native,
-            wintypes.HWND(-1),
-            0,
-            0,
-            0,
-            0,
-            swp_nosize | swp_nomove | swp_showwindow | swp_noownerzorder,
-        )
-
-        foreground = int(user32.GetForegroundWindow() or 0)
-        foreground_thread = 0
-        current_thread = int(kernel32.GetCurrentThreadId() or 0)
-        if foreground > 0:
-            process_id = wintypes.DWORD()
-            foreground_thread = int(
-                user32.GetWindowThreadProcessId(
-                    wintypes.HWND(foreground),
-                    ctypes.byref(process_id),
-                )
-                or 0
-            )
-        attached = False
-        if (
-            foreground_thread > 0
-            and current_thread > 0
-            and foreground_thread != current_thread
-        ):
-            attached = bool(
-                user32.AttachThreadInput(
-                    wintypes.DWORD(current_thread),
-                    wintypes.DWORD(foreground_thread),
-                    True,
-                )
-            )
-        try:
-            user32.BringWindowToTop(native)
-            user32.SetActiveWindow(native)
-            user32.SetFocus(native)
-            user32.SetForegroundWindow(native)
-        finally:
-            if attached:
-                user32.AttachThreadInput(
-                    wintypes.DWORD(current_thread),
-                    wintypes.DWORD(foreground_thread),
-                    False,
-                )
-    except Exception:
-        return False
-    _safe_call(window, "focus_force")
-    return _window_is_foreground(window)
+    return _show_window_without_activation(window)
 
 
 def _show_window_without_activation(window: Any) -> bool:

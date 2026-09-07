@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
 from src.apps.wrike_worktime_panel import (
     WorktimeActivityPrompt,
     WorktimePanelDayRow,
@@ -394,6 +395,37 @@ class _FakeTk:
         return sum(widget.destroy_calls for widget in self.all_widgets())
 
 
+class _ScrollingText:
+    """Small Text double for scroll preservation without a Tk interpreter."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.scroll_start = 0.0
+        self.delete_calls = 0
+        self.yview_moveto_calls: list[float] = []
+        self.configure_calls: list[dict] = []
+
+    def configure(self, **kwargs) -> None:
+        self.configure_calls.append(dict(kwargs))
+
+    def get(self, _start, _end) -> str:
+        return self.text
+
+    def delete(self, _start, _end) -> None:
+        self.delete_calls += 1
+        self.text = ""
+
+    def insert(self, _index, value) -> None:
+        self.text = str(value)
+
+    def yview(self):
+        return self.scroll_start, min(1.0, self.scroll_start + 0.2)
+
+    def yview_moveto(self, value) -> None:
+        self.scroll_start = float(value)
+        self.yview_moveto_calls.append(float(value))
+
+
 def _model(
     *,
     actual_text: str = "Wrike 기록 1:30 · 현재 기대 2:00",
@@ -409,6 +441,7 @@ def _model(
     row_targets: tuple[int, ...] | None = None,
     today_index: int = 0,
     row_suffix: str = "",
+    day_details: tuple[TimelogDayDetails, ...] = (),
 ) -> WorktimePanelModel:
     week_days = tuple(week_start + timedelta(days=index) for index in range(7))
     targets = (
@@ -451,6 +484,7 @@ def _model(
         break_active=break_active,
         rows=rows,
         prompt=prompt,
+        day_details=day_details,
     )
 
 
@@ -579,20 +613,39 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             "src.apps.wrike_worktime_panel._show_window_without_activation",
             side_effect=lambda window: window.native_show(),
         )
-        active_patcher = patch(
-            "src.apps.wrike_worktime_panel._show_window_activated",
-            side_effect=lambda window: window.native_show(),
-        )
         foreground_patcher = patch(
             "src.apps.wrike_worktime_panel._window_is_foreground",
             return_value=False,
         )
         self.show_without_activation = noactivate_patcher.start()
-        self.show_activated = active_patcher.start()
         self.window_is_foreground = foreground_patcher.start()
         self.addCleanup(noactivate_patcher.stop)
-        self.addCleanup(active_patcher.stop)
         self.addCleanup(foreground_patcher.stop)
+
+    def test_detail_scroll_survives_sync_refresh_and_same_date_title_change(self) -> None:
+        panel, _provider, _callbacks = _make_panel(
+            _FakeRoot(),
+            _FakeTk(),
+            {"model": _model()},
+        )
+        detail = _ScrollingText()
+        panel._set_detail_text(detail, "긴 상세", date_key="2026-04-06")
+        detail.scroll_start = 0.8
+        writes_after_initial = detail.delete_calls
+
+        # A sync-only model refresh must leave the Text and its scroll intact.
+        panel._set_detail_text(detail, "긴 상세", date_key="2026-04-06")
+        self.assertEqual(detail.delete_calls, writes_after_initial)
+        self.assertEqual(detail.scroll_start, 0.8)
+
+        # A title arriving for the same date changes text but preserves reading position.
+        panel._set_detail_text(detail, "해결된 티켓 · 긴 상세", date_key="2026-04-06")
+        self.assertEqual(detail.text, "해결된 티켓 · 긴 상세")
+        self.assertEqual(detail.yview_moveto_calls[-1], 0.8)
+
+        # Selecting another date intentionally starts its details at the top.
+        panel._set_detail_text(detail, "다른 날짜 상세", date_key="2026-04-07")
+        self.assertEqual(detail.yview_moveto_calls[-1], 0.0)
 
     def test_show_reuses_window_has_distinct_timers_and_rearms_dismissal(self) -> None:
         root = _FakeRoot()
@@ -722,6 +775,49 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         row_widgets[2][3].bindings["<Button-1>"](SimpleNamespace())
         self.assertEqual(panel._selected_date_key, "2026-04-15")
         self.assertEqual(row_widgets[2][0].kwargs["bg"], "#BFDBFE")
+
+    def test_selected_row_renders_only_its_detail_and_preserves_inline_input(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        monday = "2026-04-06"
+        tuesday = "2026-04-07"
+        details = tuple(
+            TimelogDayDetails(
+                date_key=(date(2026, 4, 6) + timedelta(days=index)).isoformat(),
+                state="available",
+                total_minutes=90 if index == 0 else (30 if index == 1 else 0),
+                rows=(
+                    TimelogDetailRow(
+                        date_key=monday if index == 0 else tuesday,
+                        timelog_id=f"entry-{index}",
+                        task_id=f"task-{index}",
+                        minutes=90 if index == 0 else 30,
+                        comment="월요일 코멘트" if index == 0 else "화요일 코멘트",
+                        task_title="월요일 티켓" if index == 0 else "화요일 티켓",
+                        title_state="ready",
+                    ),
+                ) if index < 2 else (),
+            )
+            for index in range(7)
+        )
+        holder = {"model": _model(day_details=details)}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+        panel.show()
+        self.assertIn("월요일 티켓", panel._widgets["detail_text"].kwargs["text"])
+        self.assertNotIn("화요일 티켓", panel._widgets["detail_text"].kwargs["text"])
+
+        panel._widgets["rows"][1][0].bindings["<Button-1>"](SimpleNamespace())
+        self.assertIn("화요일 티켓", panel._widgets["detail_text"].kwargs["text"])
+        self.assertNotIn("월요일 티켓", panel._widgets["detail_text"].kwargs["text"])
+
+        fake_tk.button("목표 수정").invoke()
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "07:15")
+        holder["model"] = _model(day_details=details, actual_text="새 동기화")
+        panel.refresh_now()
+        self.assertEqual(entry.get(), "07:15")
+        self.assertEqual(panel._selected_date_key, tuesday)
 
     def test_time_edits_share_one_panel_local_inline_editor(self) -> None:
         root = _FakeRoot()
@@ -967,7 +1063,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
         self.assertEqual(window.withdraw_calls, 3)
 
-    def test_failed_active_foreground_acquisition_withdraws_and_can_retry(self) -> None:
+    def test_legacy_activate_argument_remains_passive(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         panel, _provider, _callbacks = _make_panel(
@@ -975,16 +1071,11 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             fake_tk,
             {"model": _model()},
         )
-        self.show_activated.side_effect = None
-        self.show_activated.return_value = False
-
-        self.assertFalse(panel.show(activate=True))
+        self.assertTrue(panel.show(activate=True))
         window = fake_tk.toplevels[0]
-        self.assertFalse(panel.is_visible())
-        self.assertEqual(window.withdraw_calls, 2)
-        self.assertEqual(root.after_calls, [])
+        self.assertTrue(panel.is_visible())
+        self.show_without_activation.assert_called_once_with(window)
 
-        self.show_activated.side_effect = lambda target: target.native_show()
         self.assertTrue(panel.show(activate=True))
         self.assertTrue(panel.is_visible())
         self.assertEqual(len(fake_tk.toplevels), 1)
@@ -1283,7 +1374,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertTrue(window.overrideredirect())
         self.assertIn(("-topmost", True), window.attribute_calls)
         self.assertIn((False, False), window.resizable_calls)
-        self.show_activated.assert_called_once_with(window)
+        self.show_without_activation.assert_called_once_with(window)
         self.assertEqual(panel._shell.kwargs["highlightbackground"], "#E5E7EB")
 
         dismiss_id = root.active_id(6_000)
@@ -1408,7 +1499,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.window_is_foreground.return_value = False
         panel.toggle(activate=True)
         self.assertTrue(panel.is_visible())
-        self.assertEqual(self.show_activated.call_count, 2)
+        self.assertEqual(self.show_without_activation.call_count, 2)
         self.assertEqual(window.withdraw_calls, 1)
 
         self.window_is_foreground.return_value = True
