@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from src.apps.Monitor import Monitor
 from src.apps.Wrike import Wrike
 from src.apps.wrike_ical import CalendarError, CalendarErrorCode, CalendarSuccess
+from src.apps.wrike_timelog_details import TimelogDayDetails
 from src.apps.wrike_ui import WrikeSettingsView
 from src.apps.wrike_worktime import BreakInterval
 from src.apps.wrike_timelog_snapshot import (
@@ -24,6 +25,7 @@ from src.apps.wrike_timelog_snapshot import (
     TimelogSnapshotState,
     WrikeTimelogSnapshotStore,
     apply_stale_threshold,
+    loading_from_last_good,
     make_fresh_snapshot,
     make_loading_snapshot,
 )
@@ -149,11 +151,11 @@ class _FakePanel:
         self.idle_timeout_ms = int(value)
         self.idle_timeout_updates.append(int(value))
 
-    def toggle(self, activate=True):
+    def toggle(self, activate=False):
         self.toggle_calls.append(bool(activate))
         self.visible = not self.visible
 
-    def show(self, activate=True):
+    def show(self, activate=False):
         self.show_calls.append(bool(activate))
         self.visible = bool(self.show_result and self.show_maps)
         return bool(self.show_result)
@@ -290,8 +292,120 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             json.loads(first_query["trackedDate"][0]),
             {"start": "2026-04-06", "end": "2026-04-12"},
         )
+        self.assertEqual(first_query["plainText"], ["true"])
         second_query = parse_qs(urlparse(urls[1]).query)
         self.assertEqual(second_query["nextPageToken"], ["page-2"])
+
+    def test_detail_rows_keep_comments_in_memory_and_dedupe_title_lookup(self) -> None:
+        wrike = self._new_wrike()
+        week = self._week_datetimes()
+        details = wrike._Wrike__build_timelog_day_details(
+            [
+                {
+                    "id": "log-a",
+                    "trackedDate": "2026-04-06",
+                    "_authoritative_minutes": 30,
+                    "taskId": "task-a",
+                    "comment": "첫 코멘트",
+                },
+                {
+                    "id": "log-b",
+                    "trackedDate": "2026-04-06",
+                    "_authoritative_minutes": 45,
+                    "taskId": "task-a",
+                    "comment": "둘째 코멘트",
+                },
+            ],
+            week,
+        )
+        self.assertTrue(all(isinstance(item, TimelogDayDetails) for item in details))
+        self.assertEqual(details[0].total_minutes, 75)
+        self.assertEqual([row.comment for row in details[0].rows], ["첫 코멘트", "둘째 코멘트"])
+        self.assertEqual({row.task_id for row in details[0].rows}, {"task-a"})
+        self.assertEqual(details[1].state, "available")
+        self.assertEqual(details[1].rows, ())
+
+        api_get = Mock(return_value={"data": [{"id": "task-a", "title": "작업 A"}]})
+        wrike._Wrike__api_get_json = api_get
+        titles = wrike._Wrike__query_task_titles("token", ("task-a", "task-a"))
+        self.assertEqual(titles, {"task-a": "작업 A"})
+        api_get.assert_called_once()
+        self.assertIn("/tasks/task-a", api_get.call_args.args[0])
+
+    def test_retained_details_accept_current_title_but_reject_newer_lookup(self) -> None:
+        wrike = self._new_wrike()
+        wrike._Wrike__wrike_api_token_session = "title-account"
+        fingerprint = wrike._Wrike__timelog_token_fingerprint("title-account")
+        details = wrike._Wrike__build_timelog_day_details(
+            [
+                {
+                    "id": "log-1",
+                    "trackedDate": "2026-04-06",
+                    "_authoritative_minutes": 30,
+                    "taskId": "task-1",
+                    "comment": "retained detail",
+                }
+            ],
+            self._week_datetimes(),
+        )
+        fresh = self._fresh_snapshot((30, 0, 0, 0, 0, 0, 0), generation=1)
+        wrike._Wrike__timelog_day_details = details
+        wrike._Wrike__timelog_day_details_generation = 1
+        wrike._Wrike__timelog_snapshot = loading_from_last_good(
+            fresh,
+            generation=2,
+        )
+        wrike._Wrike__timelog_refresh_generation = 2
+        wrike._Wrike__timelog_title_lookup_inflight = {"task-1": 10}
+
+        self.assertTrue(
+            wrike._Wrike__apply_timelog_title_lookup(
+                1,
+                fingerprint,
+                ("task-1",),
+                {"task-1": "현재 계정 제목"},
+                lookup_id=10,
+            )
+        )
+        self.assertEqual(
+            wrike._Wrike__timelog_day_details[0].rows[0].task_title,
+            "현재 계정 제목",
+        )
+
+        wrike._Wrike__timelog_title_lookup_inflight["task-1"] = 11
+        self.assertFalse(
+            wrike._Wrike__apply_timelog_title_lookup(
+                1,
+                fingerprint,
+                ("task-1",),
+                {"task-1": "늦은 제목"},
+                lookup_id=10,
+            )
+        )
+        self.assertEqual(
+            wrike._Wrike__timelog_day_details[0].rows[0].task_title,
+            "현재 계정 제목",
+        )
+
+    def test_title_cache_ttl_and_manual_refresh_revalidation(self) -> None:
+        wrike = self._new_wrike()
+        now = _FrozenDateTime.current
+        cache = {"task-1": ("ready", "이전 제목", now)}
+        self.assertTrue(
+            wrike._Wrike__timelog_title_cache_is_fresh(
+                "task-1", now, force=False, cache=cache
+            )
+        )
+        self.assertFalse(
+            wrike._Wrike__timelog_title_cache_is_fresh(
+                "task-1", now, force=True, cache=cache
+            )
+        )
+        self.assertFalse(
+            wrike._Wrike__timelog_title_cache_is_fresh(
+                "task-1", now + timedelta(minutes=5), force=False, cache=cache
+            )
+        )
 
     def test_authoritative_pagination_token_is_strict_and_opaque(self) -> None:
         malformed_tokens = (
@@ -656,6 +770,25 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
                     account_fingerprint=fingerprint_a,
                 )
             )
+            details = wrike._Wrike__build_timelog_day_details(
+                [
+                    {
+                        "id": "log-a",
+                        "trackedDate": "2026-04-06",
+                        "_authoritative_minutes": 60,
+                        "taskId": "task-a",
+                        "comment": "기존 계정 상세",
+                    }
+                ],
+                self._week_datetimes(),
+            )
+            wrike._Wrike__timelog_day_details = details
+            wrike._Wrike__timelog_day_details_generation = generation
+            wrike._Wrike__timelog_title_cache = {
+                "task-a": ("ready", "기존 제목", _FrozenDateTime.current)
+            }
+            wrike._Wrike__timelog_title_lookup_sequence = 37
+            wrike._Wrike__timelog_title_lookup_inflight = {"task-a": 37}
 
             with patch.object(wrike, "_Wrike__save_settings", return_value=False):
                 ok, error = wrike.update_settings(
@@ -668,6 +801,39 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
                 "account-a-token",
             )
             self.assertEqual(wrike.get_timelog_snapshot(), account_a)
+            self.assertEqual(wrike._Wrike__timelog_day_details, details)
+            self.assertEqual(
+                wrike._Wrike__timelog_title_cache,
+                {"task-a": ("ready", "기존 제목", _FrozenDateTime.current)},
+            )
+            self.assertEqual(wrike._Wrike__timelog_title_lookup_sequence, 37)
+            self.assertEqual(
+                wrike._Wrike__timelog_title_lookup_inflight,
+                {"task-a": 37},
+            )
+
+            self.assertTrue(
+                wrike._Wrike__apply_timelog_title_lookup(
+                    generation,
+                    fingerprint_a,
+                    ("task-a",),
+                    {"task-a": "이전 계정 제목"},
+                    lookup_id=37,
+                )
+            )
+            self.assertEqual(
+                wrike._Wrike__timelog_day_details[0].rows[0].task_title,
+                "이전 계정 제목",
+            )
+            self.assertFalse(
+                wrike._Wrike__apply_timelog_title_lookup(
+                    generation,
+                    wrike._Wrike__timelog_token_fingerprint("account-b-token"),
+                    ("task-a",),
+                    {"task-a": "새 계정 제목"},
+                    lookup_id=38,
+                )
+            )
 
             account_b = self._fresh_snapshot(
                 (120, 0, 0, 0, 0, 0, 0),
@@ -2353,7 +2519,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(panel.idle_timeout_ms, 6000)
         self.assertEqual(panel.idle_timeout_updates, [6000, 6000, 6000, 6000])
         self.assertEqual(panel.show_calls, [False, False])
-        self.assertEqual(panel.toggle_calls, [True, True])
+        self.assertEqual(panel.toggle_calls, [False, False])
         self.assertEqual(request_refresh.call_count, 2)
         self.assertEqual(
             [item.kwargs.get("force") for item in request_refresh.call_args_list],
