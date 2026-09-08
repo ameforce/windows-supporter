@@ -14,7 +14,7 @@ from src.apps.Monitor import Monitor
 from src.apps.Wrike import Wrike
 from src.apps.wrike_timelog_details import TimelogDetailRow
 from src.apps.wrike_worktime_state import WorktimeStateStore
-from tests.unit.test_qa_wrike_timelog_details import _QaTk, _details
+from tests.unit.test_qa_wrike_timelog_details import _QaTk, _QaText, _details
 from tests.unit import test_wrike_realtime_progress as _realtime
 from tests.unit.test_wrike_worktime_panel import _FakeRoot, _make_panel, _model
 
@@ -384,6 +384,299 @@ class BreakPanelReadabilityRegressions(unittest.TestCase):
         self.assertEqual(text.kwargs["state"], "disabled")
         self.assertIn("긴 상세 내용 29", text.get("1.0", "end-1c"))
         self.assertEqual(tk.toplevels[0].focus_force_calls, 0)
+
+
+class _ReviewTaggedText(_QaText):
+    """Observe Text insertions and tags without interpreting product row structure."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fragments = []
+        self.tag_options = {}
+
+    def tag_configure(self, tag, **kwargs):
+        self.tag_options[tag] = kwargs
+
+    def delete(self, *args):
+        self.fragments.clear()
+        return super().delete(*args)
+
+    def insert(self, index, value, tag=None):
+        if index not in ("1.0", "end"):
+            raise AssertionError(index)
+        if index == "1.0":
+            self.entry_text = str(value)
+        else:
+            self.entry_text += str(value)
+        self.fragments.append((str(value), tag))
+
+    def tags_for(self, needle):
+        return [tag for text, tag in self.fragments if needle in text]
+
+
+class _ReviewTaggedTk(_QaTk):
+    def Text(self, parent, **kwargs):
+        widget = _ReviewTaggedText(self, parent, **kwargs)
+        self.labels.append(widget)
+        return widget
+
+
+class ReviewFindingRegressions(unittest.TestCase):
+    def wiring(self):
+        fixture = BreakWrikeWiringRegressions(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        return fixture
+
+    def panel(self, model, edit=None):
+        root, tk = _FakeRoot(), _ReviewTaggedTk()
+        holder = {"model": model}
+        panel, _, _ = _make_panel(root, tk, holder)
+        panel._on_edit_manual_break = edit
+        self.enterContext(patch("src.apps.wrike_worktime_panel._show_window_without_activation", side_effect=lambda window: window.native_show()))
+        self.assertTrue(panel.show())
+        return panel, holder
+
+    def test_3946451098_calendar_cross_midnight_clips_both_selected_days(self):
+        fixture = self.wiring()
+        app = fixture.app
+        app._Wrike__ical_parsed_events = [{
+            "summary": "QA calendar break", "dtstart": datetime(2026, 4, 6, 23),
+            "dtend": datetime(2026, 4, 7, 1), "all_day": False,
+            "rrule": {}, "exdates": [],
+        }]
+        app._Wrike__ical_keywords = ["QA calendar break"]
+        app._Wrike__ical_events_for_date = None
+        app._Wrike__ical_matched = None
+        # Restore the real calendar cache reader over the fixture's synthetic shortcut.
+        with patch.object(app, "_Wrike__ensure_ical_day_cache", Wrike._Wrike__ensure_ical_day_cache.__get__(app, Wrike)):
+            rows = fixture.panel.model_provider().manual_breaks
+        actual = [(row.date_key, row.start_time, row.end_time) for row in rows if not row.editable]
+        print("3946451098 calendar rows:", actual)
+        self.assertEqual(actual, [(DAY, "23:00", "24:00"), ("2026-04-07", "00:00", "01:00")])
+
+    def test_3946451101_multiline_comment_does_not_change_semantic_styles(self):
+        rows = (
+            TimelogDetailRow(DAY, "L1", "T1", 15, "comment first\ncomment second", "First heading", "ready"),
+            TimelogDetailRow(DAY, "L2", "T2", 30, "last comment", "Second heading", "ready"),
+        )
+        panel, _ = self.panel(replace(_model(), day_details=_details(rows=rows)))
+        widget = panel._widgets["detail_text"]
+        actual = {text: widget.tags_for(text) for text in ("First heading", "Second heading", "comment first", "comment second", "last comment")}
+        print("3946451101 semantic styles:", actual)
+        self.assertEqual(actual, {
+            "First heading": ["detail_heading"], "Second heading": ["detail_heading"],
+            "comment first": ["detail_comment"], "comment second": ["detail_comment"],
+            "last comment": ["detail_comment"],
+        })
+
+    def test_3946451105_other_date_cannot_silently_save_hidden_day(self):
+        fixture = self.wiring()
+        model = fixture.panel.model_provider()
+        panel, _ = self.panel(model, fixture.panel.callbacks["edit_manual_break"])
+        panel._select_row_command(0)
+        panel._edit_manual_break_command(model.manual_breaks[0])
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "12:05 - 12:25")
+        panel._select_row_command(1)
+        active = panel._inline_editor_active
+        title = panel._widgets["inline_title"].kwargs.get("text", "")
+        before = fixture.path.read_bytes()
+        panel._save_inline_editor_command()
+        changed = fixture.path.read_bytes() != before
+        print("3946451105 selection/editor/save:", panel._selected_date_key, active, title, "Monday changed", changed)
+        clearly_bound = DAY in title or "04/06" in title or "4월 6일" in title
+        self.assertTrue(not active or clearly_bound, "An editor left active on another selected day must visibly name its bound date")
+        if not active:
+            self.assertFalse(changed)
+
+    def test_3946451109_retry_retains_first_activity_in_persisted_prompt(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.dict("os.environ", {"APPDATA": temp.name}):
+            app = Wrike()
+        store = WorktimeStateStore(Path(temp.name) / "qa-state.json")
+        app._Wrike__worktime_state_store = store
+        self.enterContext(patch.object(app, "_Wrike__plan_for_date", return_value={"explicit": True, "clock_in": None, "target_net_minutes": 480}))
+        self.enterContext(patch.object(app, "_Wrike__vacation_result_for_date", return_value={"automatic_prompt_allowed": True, "all_day": False}))
+        self.enterContext(patch.object(app, "_Wrike__show_panel_action_error"))
+        surface = self.enterContext(patch.object(app, "_Wrike__surface_activity_panel", return_value=True))
+        first, retry = datetime(2026, 4, 6, 8, 5, 50), datetime(2026, 4, 6, 8, 6, 50)
+        with patch("src.apps.wrike_worktime_state.os.replace", side_effect=OSError("QA injected transient save failure")):
+            app._Wrike__on_worktime_activity(first)
+        self.assertIsNone(store.get_activity_prompt(DAY))
+        surface.assert_not_called()
+        app._Wrike__on_worktime_activity(retry)
+        persisted = WorktimeStateStore(Path(temp.name) / "qa-state.json").get_activity_prompt(DAY)
+        print("3946451109 persisted prompt:", persisted)
+        self.assertEqual(persisted["detected_at"], first.isoformat())
+        surface.assert_called_once_with(date(2026, 4, 6))
+
+    def test_3946451112_view_switch_then_same_date_refresh_keeps_scroll(self):
+        fixture = self.wiring()
+        panel, holder = self.panel(fixture.panel.model_provider())
+        panel._select_row_command(0)
+        panel._set_detail_view("breaks")
+        widget = panel._widgets["detail_text"]
+        widget.yview_moveto(0.8)
+        holder["model"] = replace(holder["model"], sync_text="QA refreshed")
+        self.assertTrue(panel.refresh_now())
+        print("3946451112 scroll after same-date refresh:", widget.yview()[0])
+        self.assertEqual(widget.yview()[0], 0.8)
+
+    def test_same_date_append_preserves_draft_and_stale_save_is_refused(self):
+        fixture = self.wiring()
+        # This fixture also has an unrelated Wednesday active break. Remove it
+        # from this synthetic setup so Monday's public toggle can append a row.
+        fixture.original["days"]["2026-04-08"]["active_break_started_at"] = None
+        fixture.path.write_text(json.dumps(fixture.original), encoding="utf-8")
+        fixture.store = WorktimeStateStore(fixture.path)
+        fixture.app._Wrike__worktime_state_store = fixture.store
+        model = fixture.panel.model_provider()
+        panel, holder = self.panel(model, fixture.panel.callbacks["edit_manual_break"])
+        panel._select_row_command(0)
+        panel._edit_manual_break_command(model.manual_breaks[0])
+        original_identity = panel._manual_break_edit
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "12:05 - 12:25")
+        self.assertTrue(fixture.store.toggle_manual_break(datetime(2026, 4, 6, 17))["ok"])
+        self.assertTrue(fixture.store.toggle_manual_break(datetime(2026, 4, 6, 17, 15))["ok"])
+        holder["model"] = fixture.panel.model_provider()
+        self.assertTrue(panel.refresh_now())
+        self.assertTrue(panel._inline_editor_active)
+        self.assertEqual(entry.get(), "12:05 - 12:25")
+        self.assertEqual(panel._manual_break_edit, original_identity)
+        before = fixture.path.read_bytes()
+        panel._save_inline_editor_command()
+        self.assertEqual(fixture.path.read_bytes(), before)
+        self.assertTrue(panel._inline_editor_active)
+        self.assertTrue(panel._widgets["inline_error"].kwargs.get("text"))
+
+    def test_pre_break_001_reselect_same_row_keeps_draft_and_fingerprint_together(self):
+        fixture = self.wiring()
+        model = fixture.panel.model_provider()
+        results = []
+        real_edit = fixture.panel.callbacks["edit_manual_break"]
+
+        def edit(*args):
+            result = real_edit(*args)
+            results.append(result)
+            return result
+
+        panel, holder = self.panel(model, edit)
+        panel._select_row_command(0)
+        original_row = model.manual_breaks[0]
+        panel._edit_manual_break_command(original_row)
+        entry = panel._widgets["inline_entry"]
+        draft = "12:05 - 12:35"
+        entry.delete(0, "end")
+        entry.insert(0, draft)
+        # Model a second editor through the real public store API and real disk.
+        self.assertEqual(fixture.store.update_completed_manual_break(
+            DAY, original_row.index, "2026-04-06T12:10:00", "2026-04-06T12:40:00",
+            original_row.fingerprint,
+        ), (True, None))
+        holder["model"] = fixture.panel.model_provider()
+        self.assertTrue(panel.refresh_now())
+        latest_row = holder["model"].manual_breaks[0]
+        self.assertNotEqual(latest_row.fingerprint, original_row.fingerprint)
+        latest_bytes = fixture.path.read_bytes()
+        panel._save_inline_editor_command()
+        self.assertFalse(results[-1][0])
+        self.assertEqual(fixture.path.read_bytes(), latest_bytes)
+        panel._edit_manual_break_command(latest_row)
+        retained_input = entry.get()
+        retained_fingerprint = panel._manual_break_edit.fingerprint
+        preserved = retained_input == draft and retained_fingerprint == original_row.fingerprint
+        restarted = retained_input == "12:10 - 12:40" and retained_fingerprint == latest_row.fingerprint
+        panel._save_inline_editor_command()
+        final_span = WorktimeStateStore(fixture.path).get_completed_manual_breaks(DAY)["breaks"][0]
+        print("PRE-BREAK-001 reselect:", {
+            "first_save": results[0][0], "input": retained_input,
+            "fingerprint_rebound": retained_fingerprint == latest_row.fingerprint,
+            "second_save": results[-1][0], "final_span": final_span,
+        })
+        self.assertTrue(preserved or restarted, "Draft text and original fingerprint must stay together unless both restart from the latest row")
+        self.assertEqual(final_span["start"], "2026-04-06T12:10:00")
+        self.assertEqual(final_span["end"], "2026-04-06T12:40:00")
+
+
+class ActivityRetryBoundaryRegressions(unittest.TestCase):
+    """Persisted observations across retry and user-intent boundaries."""
+
+    def make_app(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.dict("os.environ", {"APPDATA": temp.name}):
+            app = Wrike()
+        path = Path(temp.name) / "qa-retry-state.json"
+        store = WorktimeStateStore(path)
+        app._Wrike__worktime_state_store = store
+        self.assertEqual(store.update_day_plan(DAY, 480, None), (True, None))
+        self.enterContext(patch.object(app, "_Wrike__vacation_result_for_date", return_value={"automatic_prompt_allowed": True, "all_day": False}))
+        self.enterContext(patch.object(app, "_Wrike__show_panel_action_error"))
+        surface = self.enterContext(patch.object(app, "_Wrike__surface_activity_panel", return_value=True))
+        return app, store, path, surface
+
+    def fail_activity_write(self, app, detected):
+        with patch("src.apps.wrike_worktime_state.os.replace", side_effect=OSError("QA injected transient write failure")):
+            app._Wrike__on_worktime_activity(detected)
+
+    def test_next_day_discards_failed_previous_day_activity(self):
+        app, store, path, surface = self.make_app()
+        self.fail_activity_write(app, datetime(2026, 4, 6, 23, 59, 50))
+        self.assertIsNone(store.get_activity_prompt(DAY))
+        next_activity = datetime(2026, 4, 7, 8, 5, 50)
+        app._Wrike__on_worktime_activity(next_activity)
+        reopened = WorktimeStateStore(path)
+        self.assertIsNone(reopened.get_activity_prompt(DAY))
+        self.assertEqual(reopened.get_activity_prompt("2026-04-07")["detected_at"], next_activity.isoformat())
+        surface.assert_called_once_with(next_activity.date())
+
+    def test_intentional_clock_in_cancels_retry_before_new_eligible_activity(self):
+        app, store, path, surface = self.make_app()
+        self.fail_activity_write(app, datetime(2026, 4, 6, 8, 5, 50))
+        self.assertEqual(store.update_day_plan(DAY, 480, "08:00"), (True, None))
+        app._Wrike__on_worktime_activity(datetime(2026, 4, 6, 8, 6))
+        self.assertIsNone(store.get_activity_prompt(DAY))
+        surface.assert_not_called()
+        self.assertEqual(store.update_day_plan(DAY, 480, None), (True, None))
+        next_activity = datetime(2026, 4, 6, 8, 6, 10)
+        app._Wrike__on_worktime_activity(next_activity)
+        self.assertEqual(WorktimeStateStore(path).get_activity_prompt(DAY)["detected_at"], next_activity.isoformat())
+
+    def test_observed_pending_skipped_or_snoozed_prompt_cancels_previous_retry(self):
+        for status in ("pending", "skipped", "snoozed"):
+            with self.subTest(status=status):
+                app, store, path, surface = self.make_app()
+                self.fail_activity_write(app, datetime(2026, 4, 6, 8, 5, 50))
+                confirmed = datetime(2026, 4, 6, 8, 5, 55)
+                self.assertEqual(store.record_activity_prompt_pending(DAY, confirmed), (True, None))
+                if status == "skipped":
+                    self.assertEqual(store.skip_activity_prompt(DAY), (True, None))
+                elif status == "snoozed":
+                    self.assertEqual(store.snooze_activity_prompt(DAY, datetime(2026, 4, 6, 8, 30)), (True, None))
+                before = path.read_bytes()
+                app._Wrike__on_worktime_activity(datetime(2026, 4, 6, 8, 6))
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(surface.call_count, 1 if status == "pending" else 0)
+                self.assertEqual(store.clear_activity_prompt(DAY), (True, None))
+                next_activity = datetime(2026, 4, 6, 8, 6, 10)
+                app._Wrike__on_worktime_activity(next_activity)
+                self.assertEqual(WorktimeStateStore(path).get_activity_prompt(DAY)["detected_at"], next_activity.isoformat())
+
+    def test_retry_after_snooze_expiry_preserves_first_post_snooze_activity(self):
+        app, store, path, surface = self.make_app()
+        self.assertEqual(store.record_activity_prompt_pending(DAY, datetime(2026, 4, 6, 8)), (True, None))
+        self.assertEqual(store.snooze_activity_prompt(DAY, datetime(2026, 4, 6, 8, 30)), (True, None))
+        first = datetime(2026, 4, 6, 8, 30, 50)
+        self.fail_activity_write(app, first)
+        self.assertEqual(store.get_activity_prompt(DAY)["status"], "snoozed")
+        surface.assert_not_called()
+        app._Wrike__on_worktime_activity(datetime(2026, 4, 6, 8, 31, 50))
+        self.assertEqual(WorktimeStateStore(path).get_activity_prompt(DAY), {"status": "pending", "detected_at": first.isoformat()})
+        surface.assert_called_once_with(first.date())
 
 
 if __name__ == "__main__":

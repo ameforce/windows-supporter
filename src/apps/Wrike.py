@@ -196,6 +196,7 @@ class Wrike:
         self.__worktime_panel_root = None
         self.__activity_watcher = None
         self.__activity_prompt_surfaced_day = ""
+        self.__activity_prompt_save_detected_at = None
         self.__activity_prompt_save_retry_not_before = None
         self.__activity_prompt_save_last_failure_key = None
         self.__settings_version = 9
@@ -2142,18 +2143,21 @@ class Wrike:
                 for interval in self.__collect_break_intervals_for_day(target_day, now):
                     if interval.label == "수동" or interval.end is None:
                         continue
+                    day_start = datetime.combine(target_day, datetime.min.time())
+                    day_end = day_start + timedelta(days=1)
+                    start = max(interval.start, day_start)
+                    end = min(interval.end, day_end)
+                    if end <= start:
+                        continue
                     rows.append(
                         WorktimePanelManualBreak(
                             date_key=key,
                             label=str(interval.label or "캘린더"),
-                            start_time=interval.start.strftime("%H:%M"),
+                            start_time=start.strftime("%H:%M"),
                             end_time=(
                                 "24:00"
-                                if interval.end == datetime.combine(
-                                    target_day + timedelta(days=1),
-                                    datetime.min.time(),
-                                )
-                                else interval.end.strftime("%H:%M")
+                                if end == day_end
+                                else end.strftime("%H:%M")
                             ),
                             editable=False,
                         )
@@ -2377,23 +2381,38 @@ class Wrike:
         self.__activity_prompt_surfaced_day = day_key
         return True
 
+    def __clear_activity_prompt_save_retry(self) -> None:
+        self.__activity_prompt_save_detected_at = None
+        self.__activity_prompt_save_retry_not_before = None
+        self.__activity_prompt_save_last_failure_key = None
+
     def __on_worktime_activity(self, detected_at) -> None:
         if not isinstance(detected_at, datetime) or detected_at.tzinfo is not None:
             return
+        first_detected_at = self.__activity_prompt_save_detected_at
+        if (
+            isinstance(first_detected_at, datetime)
+            and first_detected_at.date() != detected_at.date()
+        ):
+            self.__clear_activity_prompt_save_retry()
         if (detected_at.hour, detected_at.minute) < (8, 0):
+            self.__clear_activity_prompt_save_retry()
             return
         plan = self.__plan_for_date(detected_at.date())
         explicit = bool(plan.get("explicit", False))
-        if plan.get("clock_in"):
-            return
-        if not explicit and detected_at.weekday() >= 5:
-            return
-        if int(plan.get("target_net_minutes", 0)) <= 0:
+        if (
+            plan.get("clock_in")
+            or (not explicit and detected_at.weekday() >= 5)
+            or int(plan.get("target_net_minutes", 0)) <= 0
+        ):
+            self.__clear_activity_prompt_save_retry()
             return
         vacation = self.__vacation_result_for_date(detected_at.date())
-        if vacation.get("automatic_prompt_allowed") is not True:
-            return
-        if bool(vacation.get("all_day")):
+        if (
+            vacation.get("automatic_prompt_allowed") is not True
+            or bool(vacation.get("all_day"))
+        ):
+            self.__clear_activity_prompt_save_retry()
             return
         try:
             prompt = self.__worktime_state_store.get_activity_prompt(
@@ -2404,8 +2423,10 @@ class Wrike:
         if isinstance(prompt, dict):
             status = str(prompt.get("status") or "")
             if status == "skipped":
+                self.__clear_activity_prompt_save_retry()
                 return
             if status == "pending":
+                self.__clear_activity_prompt_save_retry()
                 self.__surface_activity_panel(detected_at.date())
                 return
             if status == "snoozed":
@@ -2414,8 +2435,10 @@ class Wrike:
                         str(prompt.get("snooze_until") or "")
                     )
                 except Exception:
+                    self.__clear_activity_prompt_save_retry()
                     return
                 if snooze_until.tzinfo is not None or detected_at < snooze_until:
+                    self.__clear_activity_prompt_save_retry()
                     return
         retry_not_before = self.__activity_prompt_save_retry_not_before
         if (
@@ -2423,10 +2446,13 @@ class Wrike:
             and detected_at < retry_not_before
         ):
             return
+        if self.__activity_prompt_save_detected_at is None:
+            self.__activity_prompt_save_detected_at = detected_at
+        first_detected_at = self.__activity_prompt_save_detected_at
         try:
             ok, error = self.__worktime_state_store.record_activity_prompt_pending(
                 detected_at.date(),
-                detected_at,
+                first_detected_at,
             )
         except Exception:
             ok, error = False, "state_write_exception"
@@ -2442,8 +2468,7 @@ class Wrike:
                     + self.__activity_prompt_save_error_message(failure_key)
                 )
             return
-        self.__activity_prompt_save_retry_not_before = None
-        self.__activity_prompt_save_last_failure_key = None
+        self.__clear_activity_prompt_save_retry()
         self.__surface_activity_panel(detected_at.date())
         return
 

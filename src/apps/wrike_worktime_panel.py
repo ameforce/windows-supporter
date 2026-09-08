@@ -514,12 +514,12 @@ class WorktimeQuickPanel:
                 or model.prompt.detected_time != self._inline_editor_context
             )
         elif self._inline_editor_kind == _INLINE_EDITOR_MANUAL_BREAK:
-            # Keep a draft and its original fingerprint while the selected day
-            # remains in this week.  The state store owns stale-list conflict
-            # detection, so a same-day append must not silently discard input.
-            stale = self._manual_break_edit is None or not any(
-                row.date_key == self._manual_break_edit.date_key
-                for row in model.rows
+            # Keep same-day drafts with their original conflict precondition.
+            # Moving the selection must not leave a hidden day's editor active.
+            stale = (
+                self._manual_break_edit is None
+                or self._manual_break_edit.date_key != self._selected_date_key
+                or self._row_for_date(model, self._manual_break_edit.date_key) is None
             )
         if stale:
             self._close_inline_editor(reconcile=self._visible)
@@ -559,21 +559,27 @@ class WorktimeQuickPanel:
             None,
         )
 
-    def _selected_detail_text(self, model: WorktimePanelModel) -> str:
+    def _selected_detail_parts(
+        self, model: WorktimePanelModel,
+    ) -> tuple[tuple[str, str], ...]:
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state == "loading":
-            return "상세 기록을 불러오는 중입니다."
+            return (("상세 기록을 불러오는 중입니다.", "detail_comment"),)
         if detail.state == "unavailable":
-            return "상세 기록을 확인할 수 없습니다."
+            return (("상세 기록을 확인할 수 없습니다.", "detail_comment"),)
         if not detail.rows:
-            return "해당 날짜에 Wrike 기록이 없습니다. · 합계 0분"
-        lines = [f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}"]
+            return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_comment"),)
+        parts = [(f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}", "detail_heading")]
         for row in detail.rows:
-            comment = row.comment.strip() or "코멘트 없음"
-            lines.append(
-                f"{row.ticket_text} · {self._format_actual_minutes(row.minutes)}\n{comment}"
-            )
-        return "\n".join(lines)
+            parts.append((
+                f"\n{row.ticket_text} · {self._format_actual_minutes(row.minutes)}",
+                "detail_heading",
+            ))
+            parts.append((f"\n{row.comment.strip() or '코멘트 없음'}", "detail_comment"))
+        return tuple(parts)
+
+    def _selected_detail_text(self, model: WorktimePanelModel) -> str:
+        return "".join(text for text, _tag in self._selected_detail_parts(model))
 
     def _selected_manual_breaks(
         self,
@@ -645,11 +651,12 @@ class WorktimeQuickPanel:
             "configure",
             state="normal" if editable_rows else "disabled",
         )
-        date_key = None if reset_scroll else self._selected_date_key
         self._set_detail_text(
             widgets.get("detail_text"),
             self._selected_detail_view_text(model),
-            date_key=date_key,
+            date_key=self._selected_date_key,
+            reset_scroll=reset_scroll,
+            tagged_parts=None if breaks_view else self._selected_detail_parts(model),
         )
 
     def _set_detail_view(self, view: str) -> None:
@@ -1577,6 +1584,8 @@ class WorktimeQuickPanel:
         value: str,
         *,
         date_key: str | None,
+        reset_scroll: bool = False,
+        tagged_parts: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
         if widget is None:
             return
@@ -1590,10 +1599,10 @@ class WorktimeQuickPanel:
                 current = str(widget.get("1.0", "end-1c"))
             except Exception:
                 current = None
-            if same_date and current == value:
+            if same_date and current == value and not reset_scroll:
                 return
             scroll_start = 0.0
-            if same_date:
+            if same_date and not reset_scroll:
                 try:
                     yview = widget.yview()
                     scroll_start = float(yview[0])
@@ -1602,7 +1611,7 @@ class WorktimeQuickPanel:
             _safe_call(widget, "configure", state="normal")
             _safe_call(widget, "delete", "1.0", "end")
             tag_configure = getattr(widget, "tag_configure", None)
-            if callable(tag_configure) and self._detail_view == "timelog":
+            if callable(tag_configure) and tagged_parts is not None:
                 try:
                     tag_configure(
                         "detail_heading",
@@ -1618,10 +1627,8 @@ class WorktimeQuickPanel:
                         lmargin2=12,
                         spacing3=4,
                     )
-                    lines = value.splitlines(keepends=True)
-                    for index, line in enumerate(lines):
-                        tag = "detail_heading" if index == 0 or index % 2 else "detail_comment"
-                        widget.insert("end", line, tag)
+                    for text, tag in tagged_parts:
+                        widget.insert("end", text, tag)
                 except Exception:
                     _safe_call(widget, "delete", "1.0", "end")
                     _safe_call(widget, "insert", "1.0", value)
@@ -1738,6 +1745,7 @@ class WorktimeQuickPanel:
         row = model.rows[row_index]
         changed = row.date_key != self._selected_date_key
         self._selected_date_key = row.date_key
+        self._reconcile_inline_editor_for_model(model)
         self._update_row_selection(model)
         if (
             changed
@@ -2125,11 +2133,22 @@ class WorktimeQuickPanel:
     ) -> None:
         if not break_row.editable or self._on_edit_manual_break is None:
             return
+        context = f"{break_row.date_key}:{break_row.index}"
+        restart = (
+            self._inline_editor_active
+            and self._inline_editor_kind == _INLINE_EDITOR_MANUAL_BREAK
+            and self._inline_editor_context == context
+            and self._manual_break_edit is not None
+            and self._manual_break_edit.fingerprint != break_row.fingerprint
+        )
         self._manual_break_edit = break_row
-        self._focus_or_show_inline_editor(
+        # Explicitly reopening a changed row must replace its draft and
+        # precondition together; ordinary refresh keeps both unchanged.
+        show_editor = self._show_inline_editor if restart else self._focus_or_show_inline_editor
+        show_editor(
             _INLINE_EDITOR_MANUAL_BREAK,
             f"{break_row.start_time} - {break_row.end_time}",
-            context=f"{break_row.date_key}:{break_row.index}",
+            context=context,
         )
 
     def _edit_first_manual_break(self) -> None:
