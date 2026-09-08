@@ -1276,7 +1276,28 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             holder["model"] = _model(actual_text="텍스트만 변경", prompt=None)
             panel.refresh_now()
             self.assertEqual(window.geometry_calls[-1], "740x600-800-100")
-            self.assertEqual(work_area.call_count, 2)
+            self.assertEqual(work_area.call_count, 3)
+
+    def test_first_show_uses_compact_density_for_a_640_pixel_work_area(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+
+        with patch(
+            "src.apps.wrike_worktime_panel._work_area_for_point",
+            return_value=(0, 0, 800, 640),
+        ):
+            self.assertTrue(panel.show(activate=False))
+
+        self.assertEqual(panel._content.pack_kwargs["padx"], 6)
+        self.assertEqual(panel._content.pack_kwargs["pady"], 3)
+        self.assertEqual(panel._widgets["rows"][0][0].pack_kwargs["pady"], 0)
+        self.assertTrue(panel._widgets["actions"].packed)
+        self.assertTrue(panel._widgets["countdown"].packed)
 
     def test_timeout_clamps_and_runtime_update_rearms_with_new_delay(self) -> None:
         root = _FakeRoot()
