@@ -1633,6 +1633,7 @@ def merge_snapshot_with_previous(
         key for key in USAGE_METRIC_KEYS if key in set(current.reported_metric_keys)
     )
     has_reported_metric_contract = bool(reported_metric_keys)
+    fresh_metric_keys = {key for key in reported_metric_keys if merged.get(key)}
     for key in USAGE_METRIC_KEYS:
         if not merged.get(key) and (
             not has_reported_metric_contract or key in reported_metric_keys
@@ -1652,7 +1653,10 @@ def merge_snapshot_with_previous(
         if has_reported_metric_contract and metric_key not in reported_metric_keys:
             merged[key] = ""
             continue
-        if not merged.get(key):
+        # A freshly observed value and its reset belong to the same window.
+        # After a manual reset the page may report 100% without a deadline;
+        # borrowing the previous window's deadline would fabricate freshness.
+        if not merged.get(key) and metric_key not in fresh_metric_keys:
             merged[key] = prev_payload.get(key, "")
     if not merged.get("captured_at"):
         merged["captured_at"] = prev_payload.get("captured_at", "")
