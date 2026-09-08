@@ -1024,7 +1024,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(
             {target_day for target_day, _now in collector_calls},
-            {monday, tuesday, wednesday, friday},
+            {monday + timedelta(days=index) for index in range(7)},
         )
         self.assertTrue(
             all(now == _FrozenDateTime.current for _target_day, now in collector_calls)

@@ -76,6 +76,7 @@ from src.apps.wrike_worktime_panel import (
     WorktimeActivityPrompt,
     WorktimePanelDayRow,
     WorktimePanelLine,
+    WorktimePanelManualBreak,
     WorktimePanelModel,
     WorktimeQuickPanel,
 )
@@ -195,6 +196,9 @@ class Wrike:
         self.__worktime_panel_root = None
         self.__activity_watcher = None
         self.__activity_prompt_surfaced_day = ""
+        self.__activity_prompt_save_detected_at = None
+        self.__activity_prompt_save_retry_not_before = None
+        self.__activity_prompt_save_last_failure_key = None
         self.__settings_version = 9
         self.__playwright_checked = False
         self.__playwright_ready = False
@@ -1597,6 +1601,7 @@ class Wrike:
                 clock_in_now=self.__panel_clock_in_now,
                 edit_clock_in=self.__panel_edit_clock_in,
                 edit_plan=self.__panel_save_target_minutes,
+                edit_manual_break=self.__panel_edit_manual_break,
                 toggle_break=self.__panel_toggle_break,
                 open_settings=self.__open_settings_tab,
                 prompt_accept=self.__panel_prompt_accept,
@@ -1879,6 +1884,7 @@ class Wrike:
         week_start = now.date() - timedelta(days=now.weekday())
         week_days = [week_start + timedelta(days=index) for index in range(7)]
         day_details = self.__panel_day_details(snapshot, week_days)
+        manual_break_rows = self.__panel_manual_break_rows(week_days, now)
         overview = self.__today_overview(now, snapshot)
         delta_text, delta_color = self.__delta_text(
             overview.realtime_delta_minutes
@@ -2092,7 +2098,73 @@ class Wrike:
             rows=tuple(rows),
             prompt=self.__visible_activity_prompt(now, today_plan),
             day_details=day_details,
+            manual_breaks=manual_break_rows,
         )
+
+    def __panel_manual_break_rows(
+        self,
+        week_days: list,
+        now: datetime,
+    ) -> tuple[WorktimePanelManualBreak, ...]:
+        rows: list[WorktimePanelManualBreak] = []
+        for target_day in week_days:
+            key = target_day.isoformat()
+            try:
+                raw = self.__worktime_state_store.get_completed_manual_breaks(
+                    target_day
+                )
+                fingerprint = str(raw.get("fingerprint") or "")
+                for item in raw.get("breaks") or []:
+                    start = datetime.fromisoformat(str(item.get("start") or ""))
+                    end = datetime.fromisoformat(str(item.get("end") or ""))
+                    if start.tzinfo is not None or end.tzinfo is not None:
+                        continue
+                    rows.append(
+                        WorktimePanelManualBreak(
+                            date_key=key,
+                            label="수동 휴게",
+                            start_time=start.strftime("%H:%M"),
+                            end_time=(
+                                "24:00"
+                                if end == datetime.combine(
+                                    target_day + timedelta(days=1),
+                                    datetime.min.time(),
+                                )
+                                else end.strftime("%H:%M")
+                            ),
+                            editable=True,
+                            index=int(item["index"]),
+                            fingerprint=fingerprint,
+                        )
+                    )
+            except Exception:
+                pass
+            try:
+                for interval in self.__collect_break_intervals_for_day(target_day, now):
+                    if interval.label == "수동" or interval.end is None:
+                        continue
+                    day_start = datetime.combine(target_day, datetime.min.time())
+                    day_end = day_start + timedelta(days=1)
+                    start = max(interval.start, day_start)
+                    end = min(interval.end, day_end)
+                    if end <= start:
+                        continue
+                    rows.append(
+                        WorktimePanelManualBreak(
+                            date_key=key,
+                            label=str(interval.label or "캘린더"),
+                            start_time=start.strftime("%H:%M"),
+                            end_time=(
+                                "24:00"
+                                if end == day_end
+                                else end.strftime("%H:%M")
+                            ),
+                            editable=False,
+                        )
+                    )
+            except Exception:
+                pass
+        return tuple(rows)
 
     def __show_panel_action_error(self, message: str) -> None:
         root = self.__root
@@ -2187,6 +2259,40 @@ class Wrike:
             self.__show_panel_action_error("휴게 상태를 저장하지 못했습니다")
         return
 
+    def __panel_edit_manual_break(
+        self,
+        row: WorktimePanelManualBreak,
+        start_time: str,
+        end_time: str,
+    ) -> tuple[bool, str | None]:
+        if not isinstance(row, WorktimePanelManualBreak) or not row.editable:
+            return False, "수정할 수동 휴게가 없습니다."
+        try:
+            target_day = datetime.strptime(row.date_key, "%Y-%m-%d").date()
+            start = datetime.strptime(
+                f"{row.date_key} {start_time}",
+                "%Y-%m-%d %H:%M",
+            )
+            end = (
+                datetime.combine(target_day + timedelta(days=1), datetime.min.time())
+                if end_time == "24:00"
+                else datetime.strptime(
+                    f"{row.date_key} {end_time}",
+                    "%Y-%m-%d %H:%M",
+                )
+            )
+            if target_day.isoformat() != row.date_key:
+                raise ValueError
+        except Exception:
+            return False, "휴게 시간은 HH:MM 형식이어야 합니다."
+        return self.__worktime_state_store.update_completed_manual_break(
+            row.date_key,
+            row.index,
+            start,
+            end,
+            row.fingerprint,
+        )
+
     def __panel_prompt_accept(self, detected_time: str) -> None:
         now = self.__lib.datetime.now()
         if self.__live_activity_prompt_detected_at(
@@ -2275,23 +2381,38 @@ class Wrike:
         self.__activity_prompt_surfaced_day = day_key
         return True
 
+    def __clear_activity_prompt_save_retry(self) -> None:
+        self.__activity_prompt_save_detected_at = None
+        self.__activity_prompt_save_retry_not_before = None
+        self.__activity_prompt_save_last_failure_key = None
+
     def __on_worktime_activity(self, detected_at) -> None:
         if not isinstance(detected_at, datetime) or detected_at.tzinfo is not None:
             return
+        first_detected_at = self.__activity_prompt_save_detected_at
+        if (
+            isinstance(first_detected_at, datetime)
+            and first_detected_at.date() != detected_at.date()
+        ):
+            self.__clear_activity_prompt_save_retry()
         if (detected_at.hour, detected_at.minute) < (8, 0):
+            self.__clear_activity_prompt_save_retry()
             return
         plan = self.__plan_for_date(detected_at.date())
         explicit = bool(plan.get("explicit", False))
-        if plan.get("clock_in"):
-            return
-        if not explicit and detected_at.weekday() >= 5:
-            return
-        if int(plan.get("target_net_minutes", 0)) <= 0:
+        if (
+            plan.get("clock_in")
+            or (not explicit and detected_at.weekday() >= 5)
+            or int(plan.get("target_net_minutes", 0)) <= 0
+        ):
+            self.__clear_activity_prompt_save_retry()
             return
         vacation = self.__vacation_result_for_date(detected_at.date())
-        if vacation.get("automatic_prompt_allowed") is not True:
-            return
-        if bool(vacation.get("all_day")):
+        if (
+            vacation.get("automatic_prompt_allowed") is not True
+            or bool(vacation.get("all_day"))
+        ):
+            self.__clear_activity_prompt_save_retry()
             return
         try:
             prompt = self.__worktime_state_store.get_activity_prompt(
@@ -2302,8 +2423,10 @@ class Wrike:
         if isinstance(prompt, dict):
             status = str(prompt.get("status") or "")
             if status == "skipped":
+                self.__clear_activity_prompt_save_retry()
                 return
             if status == "pending":
+                self.__clear_activity_prompt_save_retry()
                 self.__surface_activity_panel(detected_at.date())
                 return
             if status == "snoozed":
@@ -2312,21 +2435,51 @@ class Wrike:
                         str(prompt.get("snooze_until") or "")
                     )
                 except Exception:
+                    self.__clear_activity_prompt_save_retry()
                     return
                 if snooze_until.tzinfo is not None or detected_at < snooze_until:
+                    self.__clear_activity_prompt_save_retry()
                     return
+        retry_not_before = self.__activity_prompt_save_retry_not_before
+        if (
+            isinstance(retry_not_before, datetime)
+            and detected_at < retry_not_before
+        ):
+            return
+        if self.__activity_prompt_save_detected_at is None:
+            self.__activity_prompt_save_detected_at = detected_at
+        first_detected_at = self.__activity_prompt_save_detected_at
         try:
-            ok, _error = self.__worktime_state_store.record_activity_prompt_pending(
+            ok, error = self.__worktime_state_store.record_activity_prompt_pending(
                 detected_at.date(),
-                detected_at,
+                first_detected_at,
             )
         except Exception:
-            ok = False
+            ok, error = False, "state_write_exception"
         if not ok:
-            self.__show_panel_action_error("활동 알림을 저장하지 못했습니다")
+            self.__activity_prompt_save_retry_not_before = (
+                detected_at + timedelta(seconds=60)
+            )
+            failure_key = str(error or "state_write_failed").strip() or "state_write_failed"
+            if failure_key != self.__activity_prompt_save_last_failure_key:
+                self.__activity_prompt_save_last_failure_key = failure_key
+                self.__show_panel_action_error(
+                    "활동 알림을 아직 저장하지 못했습니다. 자동 감지는 1분 뒤 다시 시도합니다. "
+                    + self.__activity_prompt_save_error_message(failure_key)
+                )
             return
+        self.__clear_activity_prompt_save_retry()
         self.__surface_activity_panel(detected_at.date())
         return
+
+    @staticmethod
+    def __activity_prompt_save_error_message(failure_key: str) -> str:
+        if failure_key == "state_write_exception":
+            return "상태 저장 중 예외가 발생했습니다."
+        if failure_key == "state_write_failed":
+            return "상태 파일에 기록할 수 없습니다."
+        safe_reason = " ".join(str(failure_key).split())[:160]
+        return f"상태 저장을 완료하지 못했습니다. ({safe_reason})"
 
     # ------------------------------------------------------------------
     # Workday overview: persisted plan, break sources, calendar cache

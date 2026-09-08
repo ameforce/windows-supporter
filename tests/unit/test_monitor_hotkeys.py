@@ -59,7 +59,7 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
 
         self.assertEqual([], press_keys)
         self.assertEqual(
-            ["ctrl+alt+c", "ctrl+alt+k", "ctrl+alt+w", "ctrl+alt+b"],
+            ["ctrl+alt+c", "ctrl+alt+k", "ctrl+alt+w"],
             hotkeys,
         )
         self.assertNotIn("ctrl+c", hotkeys)
@@ -89,7 +89,7 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
 
         self.assertEqual([], press_keys)
         self.assertEqual(
-            ["ctrl+alt+c", "ctrl+alt+k", "ctrl+alt+w", "ctrl+alt+b"],
+            ["ctrl+alt+c", "ctrl+alt+k", "ctrl+alt+w"],
             hotkeys,
         )
         self.assertNotIn("ctrl+c", hotkeys)
@@ -110,7 +110,7 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
 
             hotkeys = [combo for combo, _suppress in lib.keyboard.add_hotkey_calls]
             self.assertEqual(
-                ["ctrl+alt+c", "ctrl+alt+k", "ctrl+alt+w", "ctrl+alt+b", "alt+q", "ctrl+q"],
+                ["ctrl+alt+c", "ctrl+alt+k", "ctrl+alt+w", "alt+q", "ctrl+q"],
                 hotkeys,
             )
 
@@ -121,7 +121,6 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
                     "ctrl+alt+c",
                     "ctrl+alt+k",
                     "ctrl+alt+w",
-                    "ctrl+alt+b",
                     "alt+q",
                     "ctrl+q",
                     "ctrl+s",
@@ -129,14 +128,14 @@ class MonitorHotkeyUnitTest(unittest.TestCase):
                 hotkeys,
             )
             self.assertEqual(
-                ["hotkey#5:alt+q", "hotkey#6:ctrl+q"],
+                ["hotkey#4:alt+q", "hotkey#5:ctrl+q"],
                 lib.keyboard.remove_hotkey_calls,
             )
 
             monitor._Monitor__sync_foreground_hotkeys(None)
 
         self.assertEqual(
-            ["hotkey#5:alt+q", "hotkey#6:ctrl+q", "hotkey#7:ctrl+s"],
+                ["hotkey#4:alt+q", "hotkey#5:ctrl+q", "hotkey#6:ctrl+s"],
             lib.keyboard.remove_hotkey_calls,
         )
 
