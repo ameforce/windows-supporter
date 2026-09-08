@@ -382,15 +382,16 @@ async () => {
       if (profileResult.status === 404) {
         identity.profileName = cleanProfileName(user.displayName || user.name || '');
       } else if (profile && profile.user_id === userId) {
-        identity.profileName = cleanProfileName(profile.display_name)
-          || cleanProfileName(user.displayName || user.name || '');
+        const customName = typeof profile.display_name === 'string'
+          ? normalize(profile.display_name) : '';
+        identity.profileName = customName && customName.length <= 96
+          ? customName : cleanProfileName(user.displayName || user.name || '');
       }
     } catch (_) {
       // Preserve usage collection and the last verified name on transient identity errors.
     }
     return identity;
   };
-  const sessionIdentity = await collectSessionIdentity();
   const collectResetCandidates = (boundary, labelEl) => {
     const resetCandidates = [];
     const resetAtCandidates = [];
@@ -512,6 +513,10 @@ async () => {
       boundary_role: boundary.getAttribute ? (boundary.getAttribute('role') || '') : '',
     });
   }
+  // Readiness retries must inspect the DOM without repeating slow identity calls.
+  // The monitor only accepts snapshots with a usage-limit block, not credits alone.
+  const sessionIdentity = metricBlocks.some((block) => block.metric_key !== 'remaining_credit')
+    ? await collectSessionIdentity() : { profileName: '', accountId: '', planType: '' };
   return {
     url: location.href,
     title: document.title,
@@ -591,10 +596,13 @@ _PROFILE_NAME_REJECT_FRAGMENT_PATTERN = re.compile(
 )
 
 
-def sanitize_profile_name(value: Any) -> str:
+def sanitize_profile_name(value: Any, *, verified: bool = False) -> str:
     text = normalize_usage_value(str(value or ""))
     if not text or len(text) > 96:
         return ""
+    if verified:
+        # Structured, identity-bound names are literal user data, not menu labels.
+        return text
     text = re.sub(
         r"^(?:account|profile|user)\s+menu\s*[:：\-]?\s*",
         "",
@@ -1777,6 +1785,7 @@ class CodexUsageMonitor:
         self.__monitor_state = "idle"
         self.__session_state = "logged_out"
         self.__profile_name = ""
+        self.__profile_name_verified = False
         self.__account_id = ""
         self.__auth_attention_required = False
         self.__auth_attention_reason = ""
@@ -2070,6 +2079,7 @@ class CodexUsageMonitor:
             self.__snapshot_backfill_allowed = False
             self.__set_session_state("logged_out")
             self.__profile_name = ""
+            self.__profile_name_verified = False
             self.__account_id = ""
             self.__clear_auth_attention()
             self.__save_state()
@@ -2212,8 +2222,9 @@ class CodexUsageMonitor:
         self.__session_state = normalized
         return
 
-    def __set_profile_name(self, value: Any) -> None:
-        self.__profile_name = sanitize_profile_name(value)
+    def __set_profile_name(self, value: Any, *, verified: bool = False) -> None:
+        self.__profile_name = sanitize_profile_name(value, verified=verified)
+        self.__profile_name_verified = bool(verified and self.__profile_name)
         return
 
     def __probe_identity_matches_bound_account(self, incoming_account_id: Any) -> bool:
@@ -2230,9 +2241,12 @@ class CodexUsageMonitor:
         normalized_account = normalize_usage_value(account_id)
         if normalized_account:
             self.__account_id = normalized_account
-        sanitized_name = sanitize_profile_name(profile_name)
+        # The current probe emits names only from the identity-bound profile API
+        # or its explicit session fallback; it no longer reads names from the DOM.
+        sanitized_name = sanitize_profile_name(profile_name, verified=True)
         if sanitized_name:
             self.__profile_name = sanitized_name
+            self.__profile_name_verified = True
         return
 
     def __set_auth_attention(self, reason: str, source: str = "") -> None:
@@ -4450,7 +4464,10 @@ class CodexUsageMonitor:
         snap = UsageSnapshot.from_dict(raw_snapshot)
         self.__last_snapshot = snap
         self.__usage_history = self.__normalize_usage_history(raw_history)
-        self.__set_profile_name(data.get("profile_name", ""))
+        self.__set_profile_name(
+            data.get("profile_name", ""),
+            verified=data.get("profile_name_verified") is True,
+        )
         raw_account_id = normalize_usage_value(data.get("account_id", ""))
         if raw_account_id:
             self.__account_id = raw_account_id
@@ -4486,6 +4503,7 @@ class CodexUsageMonitor:
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
             "account_id": str(self.__account_id or ""),
+            "profile_name_verified": bool(self.__profile_name_verified),
             "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),
             "auth_attention_required": bool(self.__auth_attention_required),
             "auth_attention_reason": str(self.__auth_attention_reason or ""),

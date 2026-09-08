@@ -8,6 +8,8 @@ import unittest
 
 from playwright.sync_api import sync_playwright
 
+from src.apps.codex_usage_browser_types import PlaywrightSessionConfig, parse_usage_probe
+from src.apps.codex_usage_playwright_driver import CodexUsagePlaywrightDriver
 from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
     USAGE_LIMIT_RESET_AT_KEY_BY_METRIC,
@@ -138,6 +140,80 @@ class ProfileFailureBoundaryQA(unittest.TestCase):
         self.assertNotIn("synthetic-qa-token", json.dumps(probe))
         self.profile["display_name"] = "Daeng - ameforce"
         self.assertEqual(self.probe()["profileName"], "Daeng - ameforce")
+
+    def test_verified_structured_name_keeps_literal_words_in_browser(self):
+        # GitHub review 3955829757: API names are data, not decorated menu labels.
+        for name in ("Alice Pro", "Profile"):
+            with self.subTest(name=name):
+                self.profile["display_name"] = name
+                self.assertEqual(self.probe()["profileName"], name)
+
+    def test_verified_structured_name_survives_binding_and_persistence(self):
+        # Keep browser provenance, but supply the literal expected field to isolate
+        # Python binding/reload from the independent JavaScript stripping failure.
+        for name in ("Alice Pro", "Profile"):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.profile["display_name"] = name
+                probe = self.probe()
+                probe["profileName"] = name
+                probe = parse_usage_probe(probe)
+                monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+                self.assertIsNotNone(monitor._CodexUsageMonitor__build_snapshot_from_probe(probe))
+                with self.subTest(name=name, stage="bind"):
+                    self.assertEqual(monitor.get_runtime_status()["profile_name"], name)
+                monitor._CodexUsageMonitor__save_state()
+                reloaded = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+                with self.subTest(name=name, stage="reload"):
+                    self.assertEqual(reloaded.get_runtime_status()["profile_name"], name)
+
+    def test_incomplete_dom_does_not_multiply_identity_timeouts(self):
+        # GitHub review 3955829763. Exercise the real readiness loop and script;
+        # accelerate only browser timers, retaining requested timeout durations.
+        self.page.evaluate("""() => {
+            document.querySelector('main').innerHTML = '<article><h2>Credits remaining</h2><p>100</p></article>';
+            const originalTimer = window.setTimeout.bind(window);
+            const originalFetch = window.fetch.bind(window);
+            window.qaTimeouts = [];
+            window.qaProfileCalls = 0;
+            window.qaSessionCalls = 0;
+            window.qaStallProfile = true;
+            window.setTimeout = (callback, delay, ...args) => {
+                window.qaTimeouts.push(delay);
+                return originalTimer(callback, Math.min(delay, 25), ...args);
+            };
+            window.fetch = async (path, options) => {
+                if (String(path).includes('/api/auth/session')) window.qaSessionCalls++;
+                if (!String(path).includes('/calpico/')) return originalFetch(path, options);
+                window.qaProfileCalls++;
+                if (!window.qaStallProfile) return originalFetch(path, options);
+                return new Promise((resolve, reject) => {
+                    options.signal.addEventListener('abort', () => reject(
+                        new DOMException('Synthetic unavailable profile', 'AbortError')
+                    ), {once: true});
+                });
+            };
+        }""")
+        driver = CodexUsagePlaywrightDriver(
+            PlaywrightSessionConfig("synthetic-profile", self.page.url, USAGE_PAGE_PROBE_SCRIPT),
+            sleep=lambda _: None,
+        )
+        probe = driver._evaluate_probe_until_ready(self.page)
+        self.assertIsNotNone(probe)
+        self.assertEqual({block["metric_key"] for block in probe["metricBlocks"]}, {"remaining_credit"})
+        counts = self.page.evaluate("({profileCalls: window.qaProfileCalls, sessionCalls: window.qaSessionCalls, requestedTimeouts: window.qaTimeouts})")
+        self.assertEqual(counts["profileCalls"], 0, counts)
+        self.assertEqual(counts["sessionCalls"], 0, counts)
+        self.page.evaluate("""() => {
+            window.qaStallProfile = false;
+            document.querySelector('main').innerHTML = '<article><h2>Weekly usage limit</h2><p>100% remaining</p></article>';
+        }""")
+        ready = driver._evaluate_probe_until_ready(self.page)
+        self.assertEqual(ready["profileName"], "Daeng - enmsoftware")
+        self.assertEqual(self.page.evaluate("window.qaProfileCalls"), 1)
+        self.profile["display_name"] = "Daeng - ameforce"
+        refreshed = driver._evaluate_probe_until_ready(self.page)
+        self.assertEqual(refreshed["profileName"], "Daeng - ameforce")
+        self.assertEqual(self.page.evaluate("window.qaProfileCalls"), 2)
 
 
 class ResetMergeIsolationQA(unittest.TestCase):
