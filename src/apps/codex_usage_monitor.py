@@ -336,159 +336,61 @@ async () => {
     if (/(log in|sign in|logout|log out|로그인|로그아웃|설정|settings)/i.test(lowered)) return '';
     return text;
   };
-  const safeQueryAll = (selector) => {
+  const fetchIdentityJson = async (path, headers = {}) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
     try {
-      return Array.from(document.querySelectorAll(selector));
-    } catch (_) {
-      return [];
-    }
-  };
-  const collectStoredProfileName = () => {
-    const userIds = new Set();
-    try {
-      for (let index = 0; index < localStorage.length; index += 1) {
-        const key = String(localStorage.key(index) || '');
-        const match = key.match(/(?:^|\/)(user-[A-Za-z0-9_-]+)/);
-        if (match && match[1]) userIds.add(match[1]);
-      }
-    } catch (_) {}
-    if (!userIds.size) return '';
-    const parseMaybeJson = (value) => {
-      if (typeof value !== 'string') return value;
-      const text = value.trim();
-      if (!text || !/^[\[{"]/.test(text)) return value;
-      try {
-        return JSON.parse(text);
-      } catch (_) {
-        return value;
-      }
-    };
-    const candidateFromObject = (obj) => {
-      if (!obj || typeof obj !== 'object') return '';
-      const rawUserId = String(obj.user_id || obj.userId || '');
-      if (rawUserId && userIds.has(rawUserId)) {
-        for (const key of ['display_name', 'displayName', 'name', 'full_name', 'fullName']) {
-          const candidate = cleanProfileName(obj[key]);
-          if (candidate) return candidate;
-        }
-      }
-      const author = obj.author;
-      if (author && typeof author === 'object') {
-        const authorUserId = String(author.user_id || author.userId || '');
-        if (authorUserId && userIds.has(authorUserId)) {
-          for (const key of ['display_name', 'displayName', 'name', 'full_name', 'fullName']) {
-            const candidate = cleanProfileName(author[key]);
-            if (candidate) return candidate;
-          }
-        }
-      }
-      return '';
-    };
-    const walk = (value, depth = 0, seen = new Set()) => {
-      if (depth > 6 || value == null) return '';
-      value = parseMaybeJson(value);
-      if (value == null || typeof value !== 'object') return '';
-      if (seen.has(value)) return '';
-      seen.add(value);
-      const direct = candidateFromObject(value);
-      if (direct) return direct;
-      if (Array.isArray(value)) {
-        for (const item of value.slice(0, 80)) {
-          const candidate = walk(item, depth + 1, seen);
-          if (candidate) return candidate;
-        }
-        return '';
-      }
-      for (const item of Object.values(value).slice(0, 120)) {
-        const candidate = walk(item, depth + 1, seen);
-        if (candidate) return candidate;
-      }
-      return '';
-    };
-    try {
-      for (let index = 0; index < localStorage.length; index += 1) {
-        const key = String(localStorage.key(index) || '');
-        if (!/(cache\/user-|oai\/apps|account|profile|session)/i.test(key)) continue;
-        const raw = localStorage.getItem(key) || '';
-        if (!raw || raw.length > 1000000) continue;
-        const candidate = walk(raw);
-        if (candidate) return candidate;
-      }
-    } catch (_) {}
-    return '';
-  };
-  const collectSessionIdentity = async () => {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2500);
-      const response = await fetch('/api/auth/session', {
+      const response = await fetch(path, {
         credentials: 'include',
         cache: 'no-store',
+        redirect: 'error',
+        headers,
         signal: controller.signal,
       });
+      return { status: response.status, data: response.ok ? await response.json() : null };
+    } finally {
       clearTimeout(timeout);
-      if (!response.ok) return { profileName: '', accountId: '', planType: '' };
-      const session = await response.json();
-      const user = session && session.user && typeof session.user === 'object'
-        ? session.user
-        : {};
-      const account = session && session.account && typeof session.account === 'object'
-        ? session.account
-        : {};
-      return {
-        profileName: cleanProfileName(user.name || user.displayName || ''),
-        accountId: String(
-          account.id || account.account_id || account.accountId
-          || session.account_id || session.accountId
-          || user.account_id || user.accountId || ''
-        ).trim(),
-        planType: String(
-          account.planType || account.plan_type || session.planType || session.plan_type || ''
-        ).trim(),
-      };
-    } catch (_) {
-      return { profileName: '', accountId: '', planType: '' };
     }
+  };
+  const collectSessionIdentity = async () => {
+    const identity = { profileName: '', accountId: '', planType: '' };
+    try {
+      const result = await fetchIdentityJson('/api/auth/session');
+      const session = result.data;
+      if (!session || typeof session !== 'object') return identity;
+      const user = session.user && typeof session.user === 'object' ? session.user : {};
+      const account = session.account && typeof session.account === 'object' ? session.account : {};
+      identity.accountId = String(
+        account.id || account.account_id || account.accountId
+        || session.account_id || session.accountId
+        || user.account_id || user.accountId || ''
+      ).trim();
+      identity.planType = String(
+        account.planType || account.plan_type || session.planType || session.plan_type || ''
+      ).trim();
+      const userId = typeof user.id === 'string' ? user.id.trim() : '';
+      if (!userId || typeof session.accessToken !== 'string' || !session.accessToken) {
+        return identity;
+      }
+      // ChatGPT's editable profile is separate from the login provider's name.
+      // Resolve it for this exact session user, without opening a menu or trusting caches.
+      const profileResult = await fetchIdentityJson(
+        '/backend-api/calpico/chatgpt/profile/' + encodeURIComponent(userId),
+        { Authorization: 'Bearer ' + session.accessToken }
+      );
+      const profile = profileResult.data;
+      if (profileResult.status === 404) {
+        identity.profileName = cleanProfileName(user.displayName || user.name || '');
+      } else if (profile && profile.user_id === userId) {
+        identity.profileName = cleanProfileName(profile.display_name)
+          || cleanProfileName(user.displayName || user.name || '');
+      }
+    } catch (_) {
+      // Preserve usage collection and the last verified name on transient identity errors.
+    }
+    return identity;
   };
   const sessionIdentity = await collectSessionIdentity();
-  const collectProfileName = async () => {
-    if (sessionIdentity.profileName) return sessionIdentity.profileName;
-    const stored = collectStoredProfileName();
-    if (stored) return stored;
-    const selectors = [
-      '[data-testid*="profile" i]',
-      '[data-testid*="account" i]',
-      '[aria-label*="profile" i]',
-      '[aria-label*="account" i]',
-      '[aria-label*="프로필" i]',
-      '[aria-label*="계정" i]',
-      'button[aria-haspopup="menu"]',
-      'button[aria-expanded]',
-    ];
-    const seen = new Set();
-    for (const selector of selectors) {
-      for (const node of safeQueryAll(selector)) {
-        const nodeIdentity = normalize([
-          node.getAttribute ? node.getAttribute('data-testid') : '',
-          node.getAttribute ? node.getAttribute('aria-label') : '',
-          node.getAttribute ? node.getAttribute('title') : '',
-        ].join(' ')).toLowerCase();
-        if (!/(profile|account|프로필|계정)/i.test(nodeIdentity)) continue;
-        for (const raw of [
-          node.getAttribute ? node.getAttribute('aria-label') : '',
-          node.getAttribute ? node.getAttribute('title') : '',
-          node.innerText || node.textContent || '',
-        ]) {
-          const candidate = cleanProfileName(raw);
-          if (candidate && !seen.has(candidate)) {
-            seen.add(candidate);
-            return candidate;
-          }
-        }
-      }
-    }
-    return '';
-  };
   const collectResetCandidates = (boundary, labelEl) => {
     const resetCandidates = [];
     const resetAtCandidates = [];
@@ -614,7 +516,7 @@ async () => {
     url: location.href,
     title: document.title,
     mainText: normalize(scope.innerText || scope.textContent || ''),
-    profileName: await collectProfileName(),
+    profileName: sessionIdentity.profileName,
     accountId: sessionIdentity.accountId,
     planType: sessionIdentity.planType,
     metricBlocks,
