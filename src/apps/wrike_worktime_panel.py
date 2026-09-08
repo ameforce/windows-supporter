@@ -23,6 +23,7 @@ _TARGET_HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-4]):[0-5]\d")
 _INLINE_EDITOR_TARGET = "target_minutes"
 _INLINE_EDITOR_CLOCK_IN = "clock_in"
 _INLINE_EDITOR_PROMPT = "prompt_clock_in"
+_INLINE_EDITOR_MANUAL_BREAK = "manual_break"
 
 _BG = "#F3F4F6"
 _CARD_BG = "#FFFFFF"
@@ -104,6 +105,34 @@ class WorktimeActivityPrompt:
 
 
 @dataclass(frozen=True, slots=True)
+class WorktimePanelManualBreak:
+    """One selected-week break row; only raw manual rows are editable."""
+
+    date_key: str
+    label: str
+    start_time: str
+    end_time: str
+    editable: bool
+    index: int | None = None
+    fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        _require_iso_date_key(self.date_key)
+        _require_nonempty_string(self.label, name="label")
+        if _HHMM_PATTERN.fullmatch(self.start_time) is None:
+            raise ValueError("start_time must use HH:MM format")
+        if _TARGET_HHMM_PATTERN.fullmatch(self.end_time) is None:
+            raise ValueError("end_time must use HH:MM or 24:00 format")
+        if type(self.editable) is not bool:
+            raise TypeError("editable must be a bool")
+        if self.editable:
+            if type(self.index) is not int or self.index < 0 or not self.fingerprint:
+                raise ValueError("editable manual break requires index and fingerprint")
+        elif self.index is not None or self.fingerprint:
+            raise ValueError("readonly break must not expose edit identity")
+
+
+@dataclass(frozen=True, slots=True)
 class WorktimePanelModel:
     """Deeply immutable snapshot rendered by :class:`WorktimeQuickPanel`.
 
@@ -121,6 +150,7 @@ class WorktimePanelModel:
     rows: tuple[WorktimePanelDayRow, ...]
     prompt: WorktimeActivityPrompt | None = None
     day_details: tuple[TimelogDayDetails, ...] = ()
+    manual_breaks: tuple[WorktimePanelManualBreak, ...] = ()
 
     def __post_init__(self) -> None:
         _require_string(self.week_range, name="week_range")
@@ -162,6 +192,13 @@ class WorktimePanelModel:
             != {item.date_key for item in self.rows}
         ):
             raise ValueError("day_details must cover exactly the displayed rows")
+        if not isinstance(self.manual_breaks, tuple) or any(
+            not isinstance(item, WorktimePanelManualBreak)
+            for item in self.manual_breaks
+        ):
+            raise TypeError("manual_breaks must contain WorktimePanelManualBreak values")
+        if any(item.date_key not in {row.date_key for row in self.rows} for item in self.manual_breaks):
+            raise ValueError("manual_breaks must belong to displayed rows")
 
     @property
     def has_clock_in(self) -> bool:
@@ -201,6 +238,7 @@ class WorktimeQuickPanel:
         prompt_edit: Callable[[str, str], bool],
         prompt_snooze: Callable[[], None],
         prompt_skip: Callable[[], None],
+        edit_manual_break: Callable[[WorktimePanelManualBreak, str, str], tuple[bool, str | None]] | None = None,
         tk_module: Any | None = None,
         idle_timeout_ms: int = _DEFAULT_IDLE_TIMEOUT_MS,
         monotonic: Callable[[], float] = time.monotonic,
@@ -235,6 +273,7 @@ class WorktimeQuickPanel:
         self._on_prompt_edit = prompt_edit
         self._on_prompt_snooze = prompt_snooze
         self._on_prompt_skip = prompt_skip
+        self._on_edit_manual_break = edit_manual_break
         self._monotonic = monotonic
         self._tk = tk_module
 
@@ -245,7 +284,7 @@ class WorktimeQuickPanel:
         self._selected_date_key: str | None = None
         self._rendered_detail_date_key: str | None = None
         self._pending_detail_scroll: _DetailScrollAnchor | None = None
-        self._structure_signature: tuple[bool, int] | None = None
+        self._structure_signature: tuple[Any, ...] | None = None
         self._widgets: dict[str, Any] = {}
         self._refresh_after_id = None
         self._refresh_token: object | None = None
@@ -259,6 +298,8 @@ class WorktimeQuickPanel:
         self._inline_editor_active = False
         self._inline_editor_kind: str | None = None
         self._inline_editor_context: str | None = None
+        self._manual_break_edit: WorktimePanelManualBreak | None = None
+        self._detail_view = "timelog"
         self._idle_timeout_ms = self._clamp_idle_timeout_ms(idle_timeout_ms)
         self._pointer_inside = False
         self._geometry_retry_pending = False
@@ -472,12 +513,39 @@ class WorktimeQuickPanel:
                 model.prompt is None
                 or model.prompt.detected_time != self._inline_editor_context
             )
+        elif self._inline_editor_kind == _INLINE_EDITOR_MANUAL_BREAK:
+            # Keep same-day drafts with their original conflict precondition.
+            # Moving the selection must not leave a hidden day's editor active.
+            stale = (
+                self._manual_break_edit is None
+                or self._manual_break_edit.date_key != self._selected_date_key
+                or self._row_for_date(model, self._manual_break_edit.date_key) is None
+            )
         if stale:
             self._close_inline_editor(reconcile=self._visible)
 
     @staticmethod
-    def _model_structure_signature(model: WorktimePanelModel) -> tuple[bool, int]:
+    def _model_structure_signature(model: WorktimePanelModel) -> tuple[Any, ...]:
         return model.prompt is not None, len(model.today_lines)
+
+    def _uses_compact_density(self) -> bool:
+        """Fit all controls in the work area used for the first placement."""
+
+        window = self._window
+        if window is None:
+            return False
+        current = self._window_rect(window)
+        pointer_x, pointer_y = _pointer_position(window, self._root)
+        use_pointer = not self._placed or current is None
+        if use_pointer:
+            work_area = _work_area_for_point(pointer_x, pointer_y, window, self._root)
+        else:
+            work_area = _work_area_for_window(window, self._root)
+        try:
+            work_height = int(work_area[3]) - int(work_area[1])
+        except (IndexError, TypeError, ValueError):
+            return False
+        return 480 <= work_height <= 720
 
     @staticmethod
     def _detail_for_selected_date(
@@ -491,21 +559,112 @@ class WorktimeQuickPanel:
             None,
         )
 
-    def _selected_detail_text(self, model: WorktimePanelModel) -> str:
+    def _selected_detail_parts(
+        self, model: WorktimePanelModel,
+    ) -> tuple[tuple[str, str], ...]:
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state == "loading":
-            return "상세 기록을 불러오는 중입니다."
+            return (("상세 기록을 불러오는 중입니다.", "detail_comment"),)
         if detail.state == "unavailable":
-            return "상세 기록을 확인할 수 없습니다."
+            return (("상세 기록을 확인할 수 없습니다.", "detail_comment"),)
         if not detail.rows:
-            return "해당 날짜에 Wrike 기록이 없습니다. · 합계 0분"
-        lines = [f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}"]
+            return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_comment"),)
+        parts = [(f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}", "detail_heading")]
         for row in detail.rows:
-            comment = row.comment.strip() or "코멘트 없음"
-            lines.append(
-                f"{row.ticket_text} · {self._format_actual_minutes(row.minutes)}\n{comment}"
-            )
-        return "\n".join(lines)
+            parts.append((
+                f"\n{row.ticket_text} · {self._format_actual_minutes(row.minutes)}",
+                "detail_heading",
+            ))
+            parts.append((f"\n{row.comment.strip() or '코멘트 없음'}", "detail_comment"))
+        return tuple(parts)
+
+    def _selected_detail_text(self, model: WorktimePanelModel) -> str:
+        return "".join(text for text, _tag in self._selected_detail_parts(model))
+
+    def _selected_manual_breaks(
+        self,
+        model: WorktimePanelModel,
+    ) -> tuple[WorktimePanelManualBreak, ...]:
+        return tuple(
+            row for row in model.manual_breaks
+            if row.date_key == self._selected_date_key
+        )
+
+    def _selected_manual_break_text(self, model: WorktimePanelModel) -> str:
+        rows = self._selected_manual_breaks(model)
+        if not rows:
+            return "표시할 수동 또는 캘린더 휴게가 없습니다."
+        return "\n".join(
+            f"{row.label} · {row.start_time}–{row.end_time}"
+            + (" · 읽기 전용" if not row.editable else "")
+            for row in rows
+        )
+
+    def _selected_detail_view_text(self, model: WorktimePanelModel) -> str:
+        if self._detail_view == "breaks":
+            return self._selected_manual_break_text(model)
+        return self._selected_detail_text(model)
+
+    def _update_detail_presentation(
+        self,
+        model: WorktimePanelModel,
+        *,
+        reset_scroll: bool = False,
+    ) -> None:
+        widgets = self._widgets
+        breaks_view = self._detail_view == "breaks"
+        _safe_call(
+            widgets.get("detail_title"),
+            "configure",
+            text=(
+                "선택 날짜 휴게 기록"
+                if breaks_view
+                else "선택 날짜 실제 기록 · 티켓 / 시간 / 코멘트"
+            ),
+        )
+        _safe_call(
+            widgets.get("detail_timelog_button"),
+            "configure",
+            relief="sunken" if not breaks_view else "solid",
+        )
+        _safe_call(
+            widgets.get("detail_breaks_button"),
+            "configure",
+            relief="sunken" if breaks_view else "solid",
+        )
+        rows = self._selected_manual_breaks(model)
+        menu = widgets.get("manual_break_menu")
+        menu_button = widgets.get("manual_break_menu_button")
+        if menu is not None:
+            _safe_call(menu, "delete", 0, "end")
+            for row in rows:
+                if row.editable:
+                    _safe_call(
+                        menu,
+                        "add_command",
+                        label=f"{row.start_time}–{row.end_time} 수정",
+                        command=lambda row=row: self._edit_manual_break_command(row),
+                    )
+        editable_rows = tuple(row for row in rows if row.editable)
+        _safe_call(
+            menu_button,
+            "configure",
+            state="normal" if editable_rows else "disabled",
+        )
+        self._set_detail_text(
+            widgets.get("detail_text"),
+            self._selected_detail_view_text(model),
+            date_key=self._selected_date_key,
+            reset_scroll=reset_scroll,
+            tagged_parts=None if breaks_view else self._selected_detail_parts(model),
+        )
+
+    def _set_detail_view(self, view: str) -> None:
+        if view not in {"timelog", "breaks"}:
+            return
+        self._detail_view = view
+        if self._model is not None:
+            self._update_detail_presentation(self._model, reset_scroll=True)
 
     def _ensure_tk(self) -> Any | None:
         if self._tk is not None:
@@ -891,11 +1050,11 @@ class WorktimeQuickPanel:
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = preserved_detail_scroll
 
-        compact = model.prompt is not None
-        section_gap = 4 if compact else 8
-        title_padding = (4, 1) if compact else (7, 2)
-        row_padding = 1 if compact else 2
-        _safe_call(content, "pack_configure", padx=8, pady=4 if compact else 8)
+        compact = model.prompt is not None or self._uses_compact_density()
+        section_gap = 3 if compact else 8
+        title_padding = (3, 0) if compact else (7, 2)
+        row_padding = 0 if compact else 2
+        _safe_call(content, "pack_configure", padx=6 if compact else 8, pady=3 if compact else 8)
 
         header = tk.Frame(
             content,
@@ -929,7 +1088,7 @@ class WorktimeQuickPanel:
             anchor="w",
             font=("Segoe UI", 9),
         )
-        sync_label.pack(fill="x", padx=10, pady=(0, 4 if compact else 7))
+        sync_label.pack(fill="x", padx=10, pady=(0, 3 if compact else 7))
 
         today_card = tk.Frame(
             content,
@@ -971,7 +1130,7 @@ class WorktimeQuickPanel:
             )
             label.pack(fill="x", padx=10, pady=0)
             today_line_labels.append(label)
-        tk.Frame(today_card, bg=_CARD_BG, height=2 if compact else 5).pack(fill="x")
+        tk.Frame(today_card, bg=_CARD_BG, height=1 if compact else 5).pack(fill="x")
 
         week_card = tk.Frame(
             content,
@@ -990,7 +1149,7 @@ class WorktimeQuickPanel:
         ).pack(
             fill="x",
             padx=10,
-            pady=(4, 1) if compact else (7, 3),
+            pady=(2, 0) if compact else (7, 3),
         )
         row_widgets = []
         for row_index, row in enumerate(model.rows):
@@ -1065,28 +1224,94 @@ class WorktimeQuickPanel:
             highlightbackground=_BORDER,
         )
         detail_card.pack(fill="x", pady=(0, section_gap))
+        detail_header = tk.Frame(detail_card, bg=_CARD_BG)
+        detail_header.pack(fill="x", padx=10, pady=title_padding)
         detail_title = tk.Label(
-            detail_card,
-            text="선택 날짜 실제 기록",
+            detail_header,
+            text="선택 날짜 실제 기록 · 티켓 / 시간 / 코멘트",
             bg=_CARD_BG,
             fg=_TEXT,
             anchor="w",
             font=("Segoe UI", 10, "bold"),
         )
-        detail_title.pack(fill="x", padx=10, pady=title_padding)
+        detail_title.pack(side="left", fill="x", expand=True)
+        detail_timelog_button = tk.Button(
+            detail_header,
+            text="타임로그",
+            command=lambda: self._set_detail_view("timelog"),
+            bg=_CARD_BG,
+            fg=_TEXT,
+            activebackground="#E5E7EB",
+            relief="sunken",
+            borderwidth=1,
+            padx=5,
+            pady=2,
+            font=("Segoe UI", 8),
+        )
+        detail_timelog_button.pack(side="right", padx=(3, 0))
+        detail_breaks_button = tk.Button(
+            detail_header,
+            text="휴게 기록",
+            command=lambda: self._set_detail_view("breaks"),
+            bg=_CARD_BG,
+            fg=_TEXT,
+            activebackground="#E5E7EB",
+            relief="solid",
+            borderwidth=1,
+            padx=5,
+            pady=2,
+            font=("Segoe UI", 8),
+        )
+        detail_breaks_button.pack(side="right", padx=(3, 0))
+        manual_break_menu = None
+        menu_factory = getattr(tk, "Menu", None)
+        menu_button_factory = getattr(tk, "Menubutton", None)
+        if callable(menu_factory) and callable(menu_button_factory):
+            manual_break_menu = menu_factory(detail_header, tearoff=False)
+            manual_break_menu_button = menu_button_factory(
+                detail_header,
+                text="수동 휴게 수정",
+                menu=manual_break_menu,
+                bg=_CARD_BG,
+                fg=_TEXT,
+                activebackground="#E5E7EB",
+                relief="solid",
+                borderwidth=1,
+                padx=5,
+                pady=2,
+                font=("Segoe UI", 8),
+            )
+        else:
+            # Production Tk has a menu. This compact fallback keeps headless
+            # widget doubles usable without creating another vertical card.
+            manual_break_menu_button = tk.Button(
+                detail_header,
+                text="수동 휴게 수정",
+                command=lambda: self._edit_first_manual_break(),
+                bg=_CARD_BG,
+                fg=_TEXT,
+                activebackground="#E5E7EB",
+                relief="solid",
+                borderwidth=1,
+                padx=5,
+                pady=2,
+                font=("Segoe UI", 8),
+            )
+        manual_break_menu_button.pack(side="right", padx=(3, 0))
         detail_text_factory = getattr(tk, "Text", None)
         if callable(detail_text_factory):
             detail_area = tk.Frame(detail_card, bg=_CARD_BG)
-            detail_area.pack(fill="x", padx=10, pady=(0, 6))
+            detail_area.pack(fill="x", padx=10, pady=(0, 8))
             detail_text = detail_text_factory(
                 detail_area,
                 height=5,
                 bg=_CARD_BG,
-                fg=_MUTED,
+                fg=_TEXT,
                 wrap="word",
-                relief="flat",
-                highlightthickness=0,
-                font=("Segoe UI", 9),
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=_BORDER,
+                font=("Segoe UI", 10),
             )
             detail_scroll = tk.Scrollbar(detail_area, command=detail_text.yview)
             detail_text.configure(yscrollcommand=detail_scroll.set, state="disabled")
@@ -1105,12 +1330,6 @@ class WorktimeQuickPanel:
                 font=("Segoe UI", 9),
             )
             detail_text.pack(fill="x", padx=10, pady=(0, 6))
-        self._set_detail_text(
-            detail_text,
-            self._selected_detail_text(model),
-            date_key=self._selected_date_key,
-        )
-
         inline_editor = tk.Frame(
             content,
             bg=_CARD_BG,
@@ -1239,7 +1458,12 @@ class WorktimeQuickPanel:
             "sync": sync_label,
             "today_lines": tuple(today_line_labels),
             "rows": tuple(row_widgets),
+            "detail_title": detail_title,
             "detail_text": detail_text,
+            "detail_timelog_button": detail_timelog_button,
+            "detail_breaks_button": detail_breaks_button,
+            "manual_break_menu": manual_break_menu,
+            "manual_break_menu_button": manual_break_menu_button,
             "refresh_button": refresh_button,
             "clock_button": clock_button,
             "break_button": break_button,
@@ -1255,6 +1479,7 @@ class WorktimeQuickPanel:
             "prompt_label": prompt_label,
             "prompt_buttons": prompt_buttons,
         }
+        self._update_detail_presentation(model)
         if self._inline_editor_active and self._inline_editor_kind is not None:
             initial_value = preserved_inline_value
             if initial_value is None:
@@ -1310,11 +1535,7 @@ class WorktimeQuickPanel:
             )
             today_label.configure(text="오늘" if row.today else "", bg=row_bg)
 
-        self._set_detail_text(
-            widgets["detail_text"],
-            self._selected_detail_text(model),
-            date_key=self._selected_date_key,
-        )
+        self._update_detail_presentation(model)
 
         widgets["clock_button"].configure(
             text="출근 수정" if model.has_clock_in else "지금 출근"
@@ -1355,11 +1576,7 @@ class WorktimeQuickPanel:
                 font=("Segoe UI", 9, emphasis),
             )
             _safe_call(today_label, "configure", bg=row_bg)
-        self._set_detail_text(
-            self._widgets.get("detail_text"),
-            self._selected_detail_text(model),
-            date_key=self._selected_date_key,
-        )
+        self._update_detail_presentation(model, reset_scroll=True)
 
     def _set_detail_text(
         self,
@@ -1367,6 +1584,8 @@ class WorktimeQuickPanel:
         value: str,
         *,
         date_key: str | None,
+        reset_scroll: bool = False,
+        tagged_parts: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
         if widget is None:
             return
@@ -1380,10 +1599,10 @@ class WorktimeQuickPanel:
                 current = str(widget.get("1.0", "end-1c"))
             except Exception:
                 current = None
-            if same_date and current == value:
+            if same_date and current == value and not reset_scroll:
                 return
             scroll_start = 0.0
-            if same_date:
+            if same_date and not reset_scroll:
                 try:
                     yview = widget.yview()
                     scroll_start = float(yview[0])
@@ -1391,7 +1610,30 @@ class WorktimeQuickPanel:
                     scroll_start = 0.0
             _safe_call(widget, "configure", state="normal")
             _safe_call(widget, "delete", "1.0", "end")
-            _safe_call(widget, "insert", "1.0", value)
+            tag_configure = getattr(widget, "tag_configure", None)
+            if callable(tag_configure) and tagged_parts is not None:
+                try:
+                    tag_configure(
+                        "detail_heading",
+                        foreground=_TEXT,
+                        font=("Segoe UI", 10, "bold"),
+                        spacing3=2,
+                    )
+                    tag_configure(
+                        "detail_comment",
+                        foreground=_MUTED,
+                        font=("Segoe UI", 9),
+                        lmargin1=12,
+                        lmargin2=12,
+                        spacing3=4,
+                    )
+                    for text, tag in tagged_parts:
+                        widget.insert("end", text, tag)
+                except Exception:
+                    _safe_call(widget, "delete", "1.0", "end")
+                    _safe_call(widget, "insert", "1.0", value)
+            else:
+                _safe_call(widget, "insert", "1.0", value)
             _safe_call(widget, "configure", state="disabled")
             _safe_call(widget, "yview_moveto", scroll_start)
             self._rendered_detail_date_key = date_key
@@ -1503,6 +1745,7 @@ class WorktimeQuickPanel:
         row = model.rows[row_index]
         changed = row.date_key != self._selected_date_key
         self._selected_date_key = row.date_key
+        self._reconcile_inline_editor_for_model(model)
         self._update_row_selection(model)
         if (
             changed
@@ -1584,6 +1827,21 @@ class WorktimeQuickPanel:
             return None, "HH:MM (00:00–23:59) 형식으로 입력해 주세요."
         return text, None
 
+    @staticmethod
+    def _parse_manual_break_times(
+        value: object,
+    ) -> tuple[str | None, str | None, str | None]:
+        pieces = [part.strip() for part in str(value or "").split("-", 1)]
+        if (
+            len(pieces) != 2
+            or _HHMM_PATTERN.fullmatch(pieces[0]) is None
+            or _TARGET_HHMM_PATTERN.fullmatch(pieces[1]) is None
+        ):
+            return None, None, "HH:MM - HH:MM 또는 24:00 형식으로 입력해 주세요."
+        if pieces[1] <= pieces[0]:
+            return None, None, "휴게 종료 시간은 시작 시간보다 뒤여야 합니다."
+        return pieces[0], pieces[1], None
+
     def _current_inline_editor_value(self) -> str | None:
         if not self._inline_editor_active:
             return None
@@ -1611,6 +1869,11 @@ class WorktimeQuickPanel:
             return str(model.clock_in_time or "")
         if kind == _INLINE_EDITOR_PROMPT:
             return str(context or "")
+        if kind == _INLINE_EDITOR_MANUAL_BREAK and self._manual_break_edit is not None:
+            return (
+                f"{self._manual_break_edit.start_time} - "
+                f"{self._manual_break_edit.end_time}"
+            )
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     @staticmethod
@@ -1624,6 +1887,8 @@ class WorktimeQuickPanel:
             return "오늘 출근 시간", "HH:MM (00:00–23:59)"
         if kind == _INLINE_EDITOR_PROMPT:
             return "감지된 출근 시간", "HH:MM (00:00–23:59)"
+        if kind == _INLINE_EDITOR_MANUAL_BREAK:
+            return "완료한 수동 휴게", "HH:MM - HH:MM"
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     def _show_inline_editor(
@@ -1644,6 +1909,7 @@ class WorktimeQuickPanel:
         self._inline_editor_context = context
         _safe_call(self._widgets.get("inline_title"), "configure", text=title)
         _safe_call(self._widgets.get("inline_hint"), "configure", text=hint)
+        _safe_call(entry, "configure", width=17 if kind == _INLINE_EDITOR_MANUAL_BREAK else 8)
         _set_entry_text(entry, str(initial_value))
         _safe_call(self._widgets.get("inline_error"), "configure", text="")
         _safe_call(
@@ -1685,6 +1951,8 @@ class WorktimeQuickPanel:
         self._inline_editor_active = False
         self._inline_editor_kind = None
         self._inline_editor_context = None
+        self._manual_break_edit = None
+        _safe_call(self._widgets.get("inline_entry"), "configure", width=8)
         _safe_call(self._widgets.get("inline_editor"), "pack_forget")
         _safe_call(self._widgets.get("inline_error"), "configure", text="")
         if reconcile and self._visible:
@@ -1702,6 +1970,7 @@ class WorktimeQuickPanel:
         raw_value = getter() if callable(getter) else ""
         callback: Callable[[], bool] | None = None
         failure_message = "근무시간을 저장하지 못했습니다."
+        manual_result: dict[str, str | None] = {"error": None}
 
         if kind == _INLINE_EDITOR_TARGET:
             target_minutes, error = self._parse_target_minutes(raw_value)
@@ -1729,6 +1998,25 @@ class WorktimeQuickPanel:
                         failure_message = (
                             "출근 시간을 저장하지 못했거나 요청이 만료되었습니다."
                         )
+        elif kind == _INLINE_EDITOR_MANUAL_BREAK:
+            start_time, end_time, error = self._parse_manual_break_times(raw_value)
+            break_row = self._manual_break_edit
+            if break_row is None:
+                error = "수정할 수동 휴게가 만료되었습니다. 새로고침 후 다시 시도해 주세요."
+            elif self._on_edit_manual_break is None:
+                error = "수동 휴게 수정 기능을 사용할 수 없습니다."
+            elif error is None and start_time is not None and end_time is not None:
+                def save_manual_break() -> bool:
+                    ok, result_error = self._on_edit_manual_break(
+                        break_row,
+                        start_time,
+                        end_time,
+                    )
+                    manual_result["error"] = str(result_error or "") or None
+                    return ok is True
+
+                callback = save_manual_break
+                failure_message = "수동 휴게를 저장하지 못했습니다."
         else:
             error = "편집 상태가 만료되었습니다."
 
@@ -1750,6 +2038,8 @@ class WorktimeQuickPanel:
             saved = False
         finally:
             self._interaction_depth = max(0, self._interaction_depth - 1)
+        if not saved and manual_result["error"]:
+            failure_message = str(manual_result["error"])
         if saved:
             if self._inline_editor_active:
                 self._close_inline_editor(reconcile=True)
@@ -1836,6 +2126,41 @@ class WorktimeQuickPanel:
             self._format_target_minutes(row.target_minutes),
             context=row.date_key,
         )
+
+    def _edit_manual_break_command(
+        self,
+        break_row: WorktimePanelManualBreak,
+    ) -> None:
+        if not break_row.editable or self._on_edit_manual_break is None:
+            return
+        context = f"{break_row.date_key}:{break_row.index}"
+        restart = (
+            self._inline_editor_active
+            and self._inline_editor_kind == _INLINE_EDITOR_MANUAL_BREAK
+            and self._inline_editor_context == context
+            and self._manual_break_edit is not None
+            and self._manual_break_edit.fingerprint != break_row.fingerprint
+        )
+        self._manual_break_edit = break_row
+        # Explicitly reopening a changed row must replace its draft and
+        # precondition together; ordinary refresh keeps both unchanged.
+        show_editor = self._show_inline_editor if restart else self._focus_or_show_inline_editor
+        show_editor(
+            _INLINE_EDITOR_MANUAL_BREAK,
+            f"{break_row.start_time} - {break_row.end_time}",
+            context=context,
+        )
+
+    def _edit_first_manual_break(self) -> None:
+        model = self._model
+        if model is None:
+            return
+        row = next(
+            (row for row in self._selected_manual_breaks(model) if row.editable),
+            None,
+        )
+        if row is not None:
+            self._edit_manual_break_command(row)
 
     def _toggle_break_command(self) -> None:
         self._run_command(self._on_toggle_break)

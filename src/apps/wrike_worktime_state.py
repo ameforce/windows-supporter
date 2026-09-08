@@ -8,6 +8,7 @@ but never become a manual clock-in value.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -378,7 +379,12 @@ class WorktimeStateStore:
                 if (
                     start is None
                     or end is None
-                    or end <= start
+                    # A historical v3 writer could persist an equality row
+                    # when its two sampled instants matched.  Preserve that
+                    # inert legacy row so one bad entry cannot block every
+                    # later state write. New and edited intervals still use
+                    # the stricter end-after-start rule below.
+                    or end < start
                     or start < day_start
                     or start >= day_end
                     or end > day_end
@@ -454,7 +460,7 @@ class WorktimeStateStore:
                 self._state = self._empty_state()
                 self._write_blocked_reason = (
                     "기존 상태 파일을 읽지 못해 덮어쓰기를 차단했습니다. "
-                    "파일을 확인하거나 백업 후 삭제해 주세요."
+                    "파일 상태를 확인해 주세요. 기존 기록은 보존됩니다."
                 )
                 return
             try:
@@ -463,7 +469,7 @@ class WorktimeStateStore:
                 self._state = self._empty_state()
                 self._write_blocked_reason = (
                     "기존 상태 파일 형식이나 버전을 지원하지 않아 덮어쓰기를 "
-                    "차단했습니다. 파일을 확인하거나 백업 후 삭제해 주세요."
+                    "차단했습니다. 파일 상태를 확인해 주세요. 기존 기록은 보존됩니다."
                 )
                 return
             self._state = decoded
@@ -510,11 +516,18 @@ class WorktimeStateStore:
 
     def _append_completed_span_locked(self, start: datetime, end: datetime) -> None:
         for segment_start, segment_end in self._split_span(start, end):
+            serialized_start = self._format_iso(segment_start)
+            serialized_end = self._format_iso(segment_end)
+            # Persisted v3 values have second precision. A fractional interval
+            # inside one second is positive in memory but becomes a zero row
+            # after serialization, which would poison a future strict reload.
+            if serialized_end <= serialized_start:
+                continue
             key = segment_start.strftime("%Y-%m-%d")
             entry = self._ensure_day_locked(key)
             entry["manual_breaks"].append({
-                "start": self._format_iso(segment_start),
-                "end": self._format_iso(segment_end),
+                "start": serialized_start,
+                "end": serialized_end,
             })
 
     def _active_locked(self) -> tuple[str | None, datetime | None]:
@@ -768,6 +781,121 @@ class WorktimeStateStore:
                         intervals.append(BreakInterval(clipped_start, clipped_end, "수동"))
         intervals.sort(key=lambda item: item.start)
         return intervals
+
+    @staticmethod
+    def _manual_breaks_fingerprint(raw_breaks: list) -> str:
+        """Fingerprint the exact canonical day list used by an edit request."""
+
+        payload = json.dumps(
+            raw_breaks,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def get_completed_manual_breaks(self, day) -> dict:
+        """Return raw completed rows, including inert legacy zero intervals."""
+
+        key = self._day_key(day)
+        with self._lock:
+            entry = self._state["days"].get(key)
+            raw_breaks = (
+                entry.get("manual_breaks")
+                if isinstance(entry, dict) and isinstance(entry.get("manual_breaks"), list)
+                else []
+            )
+            canonical = copy.deepcopy(raw_breaks)
+            return {
+                "date": key,
+                "fingerprint": self._manual_breaks_fingerprint(canonical),
+                "breaks": [
+                    {
+                        "index": index,
+                        "start": str(item.get("start") or ""),
+                        "end": str(item.get("end") or ""),
+                    }
+                    for index, item in enumerate(canonical)
+                    if isinstance(item, dict)
+                ],
+            }
+
+    def _completed_break_edit_time(
+        self,
+        value,
+        key: str,
+        field: str,
+        *,
+        allow_day_end: bool = False,
+    ) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            parsed = self._parse_iso_seconds(value)
+        else:
+            parsed = None
+        if parsed is None or parsed.tzinfo is not None:
+            raise ValueError(f"수동 휴게 {field} 시간이 올바르지 않습니다.")
+        day_end = datetime.strptime(key, "%Y-%m-%d") + timedelta(days=1)
+        if parsed.strftime("%Y-%m-%d") != key and not (
+            allow_day_end and parsed == day_end
+        ):
+            raise ValueError("수동 휴게는 같은 날짜 안에서만 수정할 수 있습니다.")
+        return parsed.replace(microsecond=0)
+
+    def update_completed_manual_break(
+        self,
+        day,
+        index,
+        start,
+        end,
+        expected_fingerprint,
+    ) -> tuple[bool, str | None]:
+        """Atomically edit one completed raw row if its list still matches."""
+
+        try:
+            key = self._day_key(day)
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                raise ValueError("수동 휴게 항목 번호가 올바르지 않습니다.")
+            if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
+                raise ValueError("수동 휴게 수정 기준이 없습니다. 새로고침 후 다시 시도해 주세요.")
+            start_value = self._completed_break_edit_time(start, key, "시작")
+            end_value = self._completed_break_edit_time(
+                end,
+                key,
+                "종료",
+                allow_day_end=True,
+            )
+            if end_value <= start_value:
+                raise ValueError("수동 휴게 종료 시간은 시작 시간보다 뒤여야 합니다.")
+        except ValueError as exc:
+            return False, str(exc)
+
+        with self._lock:
+            if self._write_blocked_reason:
+                return False, self._write_error_locked()
+            entry = self._state["days"].get(key)
+            raw_breaks = (
+                entry.get("manual_breaks")
+                if isinstance(entry, dict) and isinstance(entry.get("manual_breaks"), list)
+                else None
+            )
+            if raw_breaks is None or index >= len(raw_breaks):
+                return False, "수동 휴게 항목이 변경되어 저장하지 않았습니다. 새로고침 후 다시 시도해 주세요."
+            if self._manual_breaks_fingerprint(raw_breaks) != expected_fingerprint:
+                return False, "수동 휴게 목록이 변경되어 저장하지 않았습니다. 새로고침 후 다시 시도해 주세요."
+            if not isinstance(raw_breaks[index], dict):
+                return False, "수동 휴게 항목이 올바르지 않습니다. 새로고침 후 다시 시도해 주세요."
+
+            previous = copy.deepcopy(self._state)
+            raw_breaks[index] = {
+                "start": self._format_iso(start_value),
+                "end": self._format_iso(end_value),
+            }
+            if not self._save_locked():
+                self._state = previous
+                return False, self._write_error_locked()
+        return True, None
 
     def get_manual_break_state(self, now=None) -> dict:
         now_value = self._now(now)
