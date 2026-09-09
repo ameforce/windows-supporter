@@ -11,6 +11,8 @@ from unittest.mock import patch
 from src.utils.github_release_update import (
     DOWNLOAD_CHUNK_SIZE,
     GITHUB_LATEST_RELEASE_URL,
+    GITHUB_RELEASES_URL,
+    GITHUB_TAGS_URL,
     GitHubReleaseClient,
     GitHubReleaseUpdateError,
     ReleaseCandidate,
@@ -85,6 +87,7 @@ def release_payload(
     installer_name: str,
     digest: str | None,
     sidecar_url: str | None = None,
+    tag: str = "v0.22.0",
 ) -> dict:
     asset = {
         "name": installer_name,
@@ -101,10 +104,10 @@ def release_payload(
             }
         )
     return {
-        "tag_name": "v0.22.0",
+        "tag_name": tag,
         "draft": False,
         "prerelease": False,
-        "html_url": "https://github.com/ameforce/windows-supporter/releases/tag/v0.22.0",
+        "html_url": f"https://github.com/ameforce/windows-supporter/releases/tag/{tag}",
         "body": "installer update",
         "assets": assets,
     }
@@ -251,6 +254,59 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
         assert candidate is not None
         self.assertEqual(candidate.installer_sha256, digest.upper())
         self.assertEqual(opener.calls[-1], sidecar_url)
+
+    def test_semver_newer_release_is_found_when_latest_endpoint_is_stale(self) -> None:
+        installer_name = "WindowsSupporter-v0.22.6-Setup.exe"
+        installer_url = f"https://objects.githubusercontent.com/{installer_name}"
+        digest = "a" * 64
+        release = release_payload(
+            installer_url=installer_url,
+            installer_name=installer_name,
+            digest=digest,
+            tag="v0.22.6",
+        )
+        opener = FakeOpener(
+            {
+                GITHUB_LATEST_RELEASE_URL: json.dumps(
+                    {"tag_name": "v0.22.5", "draft": False, "prerelease": False}
+                ).encode("utf-8"),
+                GITHUB_RELEASES_URL: json.dumps([release]).encode("utf-8"),
+            }
+        )
+
+        candidate = GitHubReleaseClient(opener=opener).fetch_latest((0, 22, 5))
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.tag, "v0.22.6")
+        self.assertNotIn(GITHUB_TAGS_URL, opener.calls)
+
+    def test_newer_public_tag_without_release_is_not_reported_as_current(self) -> None:
+        opener = FakeOpener(
+            {
+                GITHUB_LATEST_RELEASE_URL: json.dumps(
+                    {"tag_name": "v0.22.5", "draft": False, "prerelease": False}
+                ).encode("utf-8"),
+                GITHUB_RELEASES_URL: b"[]",
+                GITHUB_TAGS_URL: json.dumps([{"name": "v0.22.6"}]).encode("utf-8"),
+            }
+        )
+
+        with self.assertRaisesRegex(GitHubReleaseUpdateError, "v0.22.6.*최신으로 표시하지 않습니다"):
+            GitHubReleaseClient(opener=opener).fetch_latest((0, 22, 5))
+
+    def test_no_newer_public_tag_still_reports_current(self) -> None:
+        opener = FakeOpener(
+            {
+                GITHUB_LATEST_RELEASE_URL: json.dumps(
+                    {"tag_name": "v0.22.5", "draft": False, "prerelease": False}
+                ).encode("utf-8"),
+                GITHUB_RELEASES_URL: b"[]",
+                GITHUB_TAGS_URL: json.dumps([{"name": "v0.22.5"}]).encode("utf-8"),
+            }
+        )
+
+        self.assertIsNone(GitHubReleaseClient(opener=opener).fetch_latest((0, 22, 5)))
 
     def test_download_rejects_hash_mismatch_and_leaves_no_installer(self) -> None:
         installer_name = "WindowsSupporter-v0.22.0-Setup.exe"
