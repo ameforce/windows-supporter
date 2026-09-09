@@ -117,20 +117,46 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
-def _read_windows_artifact_identity(path: Path) -> tuple[str, str]:
+def read_windows_artifact_metadata(path: str | os.PathLike[str]) -> dict[str, str]:
+    """Read the version-resource fields used to identify a frozen runtime."""
+
     if os.name != "nt":
         raise RuntimeError("Windows version metadata is unavailable on this platform")
     import win32api
 
+    resolved_path = Path(path)
     language = "040904B0"
     version = str(
-        win32api.GetFileVersionInfo(str(path), f"\\StringFileInfo\\{language}\\FileVersion")
+        win32api.GetFileVersionInfo(
+            str(resolved_path), f"\\StringFileInfo\\{language}\\FileVersion"
+        )
+        or ""
+    ).strip()
+    product_version = str(
+        win32api.GetFileVersionInfo(
+            str(resolved_path), f"\\StringFileInfo\\{language}\\ProductVersion"
+        )
         or ""
     ).strip()
     comments = str(
-        win32api.GetFileVersionInfo(str(path), f"\\StringFileInfo\\{language}\\Comments")
+        win32api.GetFileVersionInfo(
+            str(resolved_path), f"\\StringFileInfo\\{language}\\Comments"
+        )
         or ""
     ).strip()
+    if not version:
+        raise RuntimeError("Windows artifact FileVersion metadata is missing")
+    return {
+        "file_version": version,
+        "product_version": product_version,
+        "comments": comments,
+    }
+
+
+def _read_windows_artifact_identity(path: Path) -> tuple[str, str]:
+    metadata = read_windows_artifact_metadata(path)
+    version = metadata["file_version"]
+    comments = metadata["comments"]
     commit_match = _COMMENTS_COMMIT_RE.search(comments)
     commit = commit_match.group(1) if commit_match else ""
     if not version or not commit:
