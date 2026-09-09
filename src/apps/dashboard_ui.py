@@ -6,6 +6,10 @@ from src.utils.update_monitor import format_update_status_parts
 
 
 class DashboardView:
+    # Two cards must retain enough width for their action buttons and status
+    # copy. Below this threshold a single column is narrower overall and lets
+    # the outer vertical scroll handle the additional height.
+    _TWO_COLUMN_MIN_WIDTH = 800
     _CALLBACK_ALIASES = {
         "ai_usage.settings": "codex.settings",
         "ai_usage.toggle": "codex.toggle",
@@ -28,6 +32,9 @@ class DashboardView:
         self._toggle_buttons: dict[str, Any] = {}
         self._dashboard_scroll_canvas = None
         self._dashboard_scroll_container = None
+        self._dashboard_scrollbar = None
+        self._dashboard_grid = None
+        self._dashboard_section_cards: list[Any] = []
         self._tk = None
         self._ttk = None
         return
@@ -72,6 +79,7 @@ class DashboardView:
         window_id = canvas.create_window((0, 0), window=container, anchor="nw")
         self._dashboard_scroll_canvas = canvas
         self._dashboard_scroll_container = container
+        self._dashboard_scrollbar = scrollbar
 
         def sync_scroll_region(_event: Any = None) -> None:
             try:
@@ -116,6 +124,8 @@ class DashboardView:
         grid = tk.Frame(container, bg=bg)
         grid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         section_cards: list[Any] = []
+        self._dashboard_grid = grid
+        self._dashboard_section_cards = section_cards
         for column in (0, 1):
             grid.columnconfigure(column, weight=1, uniform="dashboard_section")
 
@@ -168,6 +178,53 @@ class DashboardView:
         sync_scroll_region()
         return
 
+    def preferred_size(self) -> tuple[int, int]:
+        """Return the dashboard content size before the outer shell chrome.
+
+        The canvas itself intentionally has a small Tk requested size, so the
+        root window cannot infer the embedded frame's real requirement. Expose
+        that requirement to the shell's fit policy instead of reserving a large
+        fixed dashboard window.
+        """
+        container = self._dashboard_scroll_container
+        if container is None:
+            return (0, 0)
+        # A withdrawn Tk root is still 1x1 while its first view is built. In
+        # that state a Configure event can incorrectly collapse the dashboard
+        # to one column, making the measurement itself too narrow and too tall.
+        # Seed the intended two-column intrinsic layout before measuring; the
+        # normal Configure binding will switch to one column after a truly
+        # narrow window is applied.
+        try:
+            if (
+                self._dashboard_scroll_canvas is not None
+                and int(self._dashboard_scroll_canvas.winfo_width()) <= 1
+                and self._dashboard_grid is not None
+            ):
+                self._layout_dashboard_cards(
+                    self._dashboard_grid,
+                    self._dashboard_section_cards,
+                    available_width=self._TWO_COLUMN_MIN_WIDTH,
+                )
+        except Exception:
+            pass
+        try:
+            container.update_idletasks()
+        except Exception:
+            pass
+        try:
+            width = int(container.winfo_reqwidth())
+            height = int(container.winfo_reqheight())
+        except Exception:
+            return (0, 0)
+        scrollbar = self._dashboard_scrollbar
+        if scrollbar is not None:
+            try:
+                width += max(0, int(scrollbar.winfo_reqwidth()))
+            except Exception:
+                pass
+        return max(1, width), max(1, height)
+
     def _layout_dashboard_cards(
         self,
         grid: Any,
@@ -181,7 +238,7 @@ class DashboardView:
                 width = int(grid.winfo_width())
             except Exception:
                 width = 0
-        columns = 1 if width > 1 and width < 700 else 2
+        columns = 1 if width > 1 and width < self._TWO_COLUMN_MIN_WIDTH else 2
         if getattr(grid, "_windows_supporter_dashboard_columns", None) == columns:
             return
         try:

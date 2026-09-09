@@ -77,9 +77,9 @@ class WindowsSupporterMainUI:
         self._power_view = None
         self._power_built = False
         self._current_tab = None
-        # 탭 기본 크기는 각 탭 콘텐츠의 요구 크기(스크롤 없이 주요 항목이
-        # 보이는 크기)를 기준으로 한다. _apply_tab_geometry가 모니터 작업
-        # 영역으로 상한을 걸고 _ui_scale이 Tk scaling 배율을 보정한다.
+        # 탭 크기는 실제 콘텐츠 요구 크기를 우선한다. 이 값들은 콘텐츠가
+        # 아직 mount되지 않았거나 요청 크기를 측정할 수 없는 탭의 fallback
+        # 이며, _apply_tab_geometry가 작업 영역과 Tk scaling을 함께 반영한다.
         self._tab_sizes = {
             self._TAB_DASHBOARD: (1080, 660),
             self._TAB_STARTUP: (1160, 660),
@@ -119,6 +119,27 @@ class WindowsSupporterMainUI:
 
     def show(self, tab: str | None = None) -> None:
         root = self._root
+        hidden = False
+        try:
+            hidden = str(root.state()).lower() in {"withdrawn", "iconic"}
+        except Exception:
+            pass
+
+        # 더블클릭/트레이 재진입 때 먼저 창을 보이게 하면 fallback geometry가
+        # 한 프레임 노출된 뒤 콘텐츠 측정 결과로 다시 튀는 flash가 생긴다.
+        # 숨겨진 창은 콘텐츠를 만들고 fit한 다음 한 번만 deiconify한다.
+        if hidden:
+            try:
+                root.withdraw()
+            except Exception:
+                pass
+
+        if tab:
+            self._select_tab(str(tab))
+        else:
+            self._select_tab(self._load_last_tab())
+        self._ensure_selected_tab_built()
+
         try:
             root.deiconify()
         except Exception:
@@ -128,12 +149,6 @@ class WindowsSupporterMainUI:
             root.focus_force()
         except Exception:
             pass
-
-        if tab:
-            self._select_tab(str(tab))
-        else:
-            self._select_tab(self._load_last_tab())
-        self._ensure_selected_tab_built()
         return
 
     def hide(self) -> None:
@@ -467,44 +482,164 @@ class WindowsSupporterMainUI:
     def _apply_tab_geometry(self, tab_key: str) -> None:
         root = self._root
         try:
-            size = self._tab_sizes.get(tab_key)
+            root.update_idletasks()
         except Exception:
-            size = None
-        if not size:
-            return
-        w, h = self._scaled_size(size)
-        if int(w) <= 0 or int(h) <= 0:
-            return
+            pass
+
         try:
             min_size = self._tab_minsizes.get(tab_key) or (1, 1)
         except Exception:
             min_size = (1, 1)
-        min_width, min_height = self._scaled_size(min_size)
-        work_width, work_height = self._work_area_size()
-        max_width = max(320, int(work_width) - 32)
-        max_height = max(280, int(work_height) - 48)
-        w = min(int(w), max_width)
-        h = min(int(h), max_height)
-        min_width = min(int(min_size[0]), max_width, int(w))
-        min_height = min(int(min_size[1]), max_height, int(h))
-        try:
-            cur_w = int(root.winfo_width())
-            cur_h = int(root.winfo_height())
-        except Exception:
-            cur_w = -1
-            cur_h = -1
-        try:
-            root.minsize(max(1, min_width), max(1, min_height))
-        except Exception:
-            pass
-        if cur_w != int(w) or cur_h != int(h):
+        fallback_min_width, fallback_min_height = self._scaled_size(min_size)
+        last_geometry = None
+
+        # A narrow window changes wrapping and therefore the requested height of
+        # the content. Two passes settle that feedback loop without resizing on
+        # every status refresh.
+        for _ in range(2):
+            preferred_width, preferred_height = self._preferred_window_size(tab_key)
+            work_width, work_height = self._work_area_size()
+            max_width = max(320, int(work_width) - 32)
+            max_height = max(280, int(work_height) - 48)
+            width = min(max(1, int(preferred_width)), max_width)
+            height = min(max(1, int(preferred_height)), max_height)
+
+            # A measured dashboard can be smaller than the historical fallback
+            # minimum. Do not reintroduce the old blank area by forcing that
+            # minimum back above the content-fit size.
+            min_width = min(int(fallback_min_width), max_width, width)
+            min_height = min(int(fallback_min_height), max_height, height)
+            width = max(width, min_width)
+            height = max(height, min_height)
+            geometry = self._centered_geometry(
+                width,
+                height,
+                work_width=work_width,
+                work_height=work_height,
+            )
+
+            if geometry == last_geometry:
+                break
+            last_geometry = geometry
             try:
-                root.geometry(f"{int(w)}x{int(h)}")
+                root.minsize(max(1, min_width), max(1, min_height))
+            except Exception:
+                pass
+            try:
+                root.geometry(geometry)
+            except Exception:
+                pass
+            try:
+                root.update_idletasks()
             except Exception:
                 pass
         return
 
-    def _work_area_size(self) -> tuple[int, int]:
+    def _tab_widget(self, tab_key: str):
+        return {
+            self._TAB_DASHBOARD: self._tab_dashboard,
+            self._TAB_STARTUP: self._tab_startup,
+            self._TAB_KAKAO: self._tab_kakao,
+            self._TAB_WRIKE: self._tab_wrike,
+            self._TAB_AI_USAGE: self._tab_ai_usage or self._tab_codex,
+            self._TAB_UPDATE: self._tab_update,
+            self._TAB_POWER: self._tab_power,
+        }.get(str(tab_key))
+
+    def _tab_view(self, tab_key: str):
+        return {
+            self._TAB_DASHBOARD: self._dashboard_view,
+            self._TAB_STARTUP: self._startup_view,
+            self._TAB_WRIKE: self._wrike_view,
+            self._TAB_AI_USAGE: self._ai_usage_view or self._codex_view,
+            self._TAB_UPDATE: self._update_view,
+            self._TAB_POWER: self._power_view,
+        }.get(str(tab_key))
+
+    @staticmethod
+    def _widget_requested_size(widget: Any) -> tuple[int, int] | None:
+        if widget is None:
+            return None
+        try:
+            width = int(widget.winfo_reqwidth())
+            height = int(widget.winfo_reqheight())
+        except Exception:
+            return None
+        if width <= 1 or height <= 1:
+            return None
+        return width, height
+
+    def _window_chrome_size(self, tab: Any) -> tuple[int, int]:
+        notebook = self._notebook
+        notebook_size = self._widget_requested_size(notebook)
+        tab_size = self._widget_requested_size(tab)
+        footer_size = self._widget_requested_size(self._footer_frame)
+        chrome_width = 0
+        chrome_height = footer_size[1] if footer_size else 0
+        if notebook_size and tab_size:
+            chrome_width = max(0, notebook_size[0] - tab_size[0])
+            chrome_height += max(0, notebook_size[1] - tab_size[1])
+        return chrome_width, chrome_height
+
+    def _preferred_window_size(self, tab_key: str) -> tuple[int, int]:
+        try:
+            fallback = self._scaled_size(
+                self._tab_sizes.get(tab_key) or (960, 600)
+            )
+        except Exception:
+            fallback = (960, 600)
+
+        tab = self._tab_widget(tab_key)
+        if tab is None:
+            return fallback
+
+        measured = None
+        view = self._tab_view(tab_key)
+        getter = getattr(view, "preferred_size", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if isinstance(value, (tuple, list)) and len(value) >= 2:
+                    measured = (int(value[0]), int(value[1]))
+            except Exception:
+                measured = None
+        if measured is None:
+            measured = self._widget_requested_size(tab)
+        if not measured or measured[0] <= 1 or measured[1] <= 1:
+            return fallback
+
+        chrome_width, chrome_height = self._window_chrome_size(tab)
+        return (
+            max(1, int(measured[0]) + chrome_width),
+            max(1, int(measured[1]) + chrome_height),
+        )
+
+    def _centered_geometry(
+        self,
+        width: int,
+        height: int,
+        *,
+        work_width: int,
+        work_height: int,
+    ) -> str:
+        base = f"{int(width)}x{int(height)}"
+        root = self._root
+        if not callable(getattr(root, "winfo_x", None)) or not callable(
+            getattr(root, "winfo_y", None)
+        ):
+            return base
+        left, top = self._work_area_origin()
+        x = int(left) + max(0, (int(work_width) - int(width)) // 2)
+        y = int(top) + max(0, (int(work_height) - int(height)) // 2)
+        # Keep the explicit '+' separator for negative absolute coordinates;
+        # Tk otherwise interprets '-10' as a right/bottom offset.
+        return f"{base}+{x}+{y}"
+
+    def _work_area_origin(self) -> tuple[int, int]:
+        left, top, _right, _bottom = self._work_area_rect()
+        return left, top
+
+    def _work_area_rect(self) -> tuple[int, int, int, int]:
         root = self._root
         try:
             hwnd = int(root.winfo_id())
@@ -539,16 +674,26 @@ class WindowsSupporterMainUI:
             info = _MonitorInfo()
             info.cbSize = ctypes.sizeof(_MonitorInfo)
             if monitor and get_monitor_info(monitor, ctypes.byref(info)):
-                width = int(info.rcWork.right - info.rcWork.left)
-                height = int(info.rcWork.bottom - info.rcWork.top)
-                if width > 0 and height > 0:
-                    return width, height
+                left = int(info.rcWork.left)
+                top = int(info.rcWork.top)
+                right = int(info.rcWork.right)
+                bottom = int(info.rcWork.bottom)
+                if right > left and bottom > top:
+                    return left, top, right, bottom
         except Exception:
             pass
         try:
-            return int(root.winfo_screenwidth()), int(root.winfo_screenheight())
+            width = int(root.winfo_screenwidth())
+            height = int(root.winfo_screenheight())
+            if width > 0 and height > 0:
+                return 0, 0, width, height
         except Exception:
-            return 1920, 1080
+            pass
+        return 0, 0, 1920, 1080
+
+    def _work_area_size(self) -> tuple[int, int]:
+        left, top, right, bottom = self._work_area_rect()
+        return max(1, int(right - left)), max(1, int(bottom - top))
 
     def _ensure_selected_tab_built(self) -> None:
         nb = self._notebook
