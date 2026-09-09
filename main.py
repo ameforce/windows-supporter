@@ -43,6 +43,7 @@ from src.apps.google_calendar_oauth import (
     GoogleCalendarSuccess,
     load_bundled_desktop_client_config,
 )
+from src.utils.github_release_update import GitHubReleaseClient
 from src.utils.tray_icon import SystemTrayIcon
 from src.utils.ui_event_pump import SharedUiEventPump
 from src.utils.update_monitor import (
@@ -365,6 +366,7 @@ def _run_main_app(lifecycle=None) -> None:
         repo_root=_build_update_repo_root(),
         quit_callback=root.quit,
         exit_callback=lambda: lifecycle.mark_stopping("update_handoff"),
+        release_client=GitHubReleaseClient(),
     )
     main_ui = WindowsSupporterMainUI(
         root,
