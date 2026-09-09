@@ -2229,6 +2229,7 @@ def run_release_update_handoff(
     downloaded_path: Path | None = None
     restored = False
     installed_artifact: dict[str, Any] | None = None
+    installer_log_path: Path | None = None
 
     def publish(snapshot: dict[str, Any], *, first: bool = False) -> None:
         nonlocal progress_floor
@@ -2312,15 +2313,28 @@ def run_release_update_handoff(
             log_path=log_path,
         )
         publish(install_progress)
+        installer_log_path = (
+            Path(get_update_state_dir())
+            / f"release-installer-{candidate.version[0]}.{candidate.version[1]}.{candidate.version[2]}.log"
+        )
+        installer_log_path.parent.mkdir(parents=True, exist_ok=True)
         installer_command = [
             str(downloaded_path),
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
-            f'/DIR="{install_dir}"',
+            # Pass each switch as one argv item.  subprocess.Popen performs the
+            # Windows quoting needed for paths with spaces; embedding literal
+            # quotes here makes Inno Setup treat them as part of the folder name.
+            f"/DIR={install_dir}",
+            f"/LOG={installer_log_path}",
         ]
-        update_handoff_state(state_path, installer_command=installer_command)
+        update_handoff_state(
+            state_path,
+            installer_command=installer_command,
+            installer_log_path=str(installer_log_path),
+        )
         installer_process = installer_launcher(
             installer_command,
             cwd=str(install_dir),
@@ -2385,6 +2399,7 @@ def run_release_update_handoff(
             completed_at=time.time(),
             candidate=candidate.as_payload(),
             installer_path=str(downloaded_path),
+            installer_log_path=str(installer_log_path) if installer_log_path else "",
             installed_artifact=installed_artifact,
             progress=complete_progress,
         )
@@ -2435,6 +2450,7 @@ def run_release_update_handoff(
                 failed_step="installer 업데이트",
                 error=diagnostic,
                 recovery_status="restored" if restored else "failed",
+                installer_log_path=str(installer_log_path) if installer_log_path else "",
                 progress=failed_progress,
             )
             append_update_log(log_path, f"GitHub Release installer handoff failed: {diagnostic}")
