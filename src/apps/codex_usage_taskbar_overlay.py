@@ -236,6 +236,8 @@ _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX = 64
 _PROFILE_LABEL_COLUMN_COMPACT_MIN_WIDTH_PX = 28
 _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX = 76
 _PROFILE_LABEL_COLUMN_WIDTH_RATIO = 0.17
+_PROFILE_LABEL_FONT_PT = 8
+_PROFILE_LABEL_TEXT_END_GAP_PX = 6
 _STATUS_DOT_ONLY_WIDTH_PX = 14
 _STATUS_WITH_TEXT_WIDTH_PX = 24
 _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX = 420
@@ -615,23 +617,83 @@ def calculate_taskbar_overlay_geometry(
     )
 
 
-def _label_width_for_overlay_width(width: int) -> int:
+def _profile_label_text_width(label: Any) -> int:
+    """Return the width needed to render a profile label without clipping.
+
+    The label is drawn with the 8pt bold Segoe UI font below. Use the live Tk
+    measurer when the overlay has a real root; the conservative estimate keeps
+    headless layout/tests from allowing the label to collide with the status
+    indicator before a native draw is available.
+    """
+    text = str(label or "")
+    if not text:
+        return 0
+    measured = _tk_measure_text(text, _PROFILE_LABEL_FONT_PT)
+    if measured is not None:
+        return int(measured)
+    scale = _overlay_text_width_scale()
+    return int(
+        sum(10 if ord(character) > 127 else 6 for character in text) * scale
+    )
+
+
+def _label_width_for_overlay_width(
+    width: int,
+    profile_labels: tuple[str, ...] | list[str] | None = None,
+) -> int:
     overlay_width = max(0, int(width))
     if overlay_width < _MIN_EMPTY_SLOT_WIDTH_PX:
-        return min(
+        base_width = min(
             _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
             max(
                 _PROFILE_LABEL_COLUMN_COMPACT_MIN_WIDTH_PX,
                 int(overlay_width * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
             ),
         )
-    return min(
-        _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX,
-        max(
-            _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
-            int(overlay_width * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
-        ),
-    )
+    else:
+        base_width = min(
+            _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX,
+            max(
+                _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
+                int(overlay_width * _PROFILE_LABEL_COLUMN_WIDTH_RATIO),
+            ),
+        )
+
+    # The compact fallback intentionally keeps the established metric region
+    # intact. At that size the label renderer uses a pixel-aware ellipsis; the
+    # full label is reserved by the preferred-width path as soon as the slot
+    # can support a normal overlay.
+    required_label_width = 0
+    if overlay_width >= _MIN_EMPTY_SLOT_WIDTH_PX:
+        required_label_width = max(
+            (
+                _profile_label_text_width(label) + _PROFILE_LABEL_TEXT_END_GAP_PX
+                for label in tuple(profile_labels or ())
+            ),
+            default=0,
+        )
+    return max(base_width, required_label_width)
+
+
+def _fit_profile_label_text(label: Any, available_width: int) -> str:
+    """Fit a profile name by pixels, preserving the full name when possible."""
+    text = str(label or "")
+    width = max(0, int(available_width))
+    if not text or width <= 0:
+        return ""
+    if _profile_label_text_width(text) <= width:
+        return text
+
+    ellipsis = "…"
+    if _profile_label_text_width(ellipsis) > width:
+        return ""
+    fitted = ""
+    for character in text:
+        candidate = f"{fitted}{character}{ellipsis}"
+        if _profile_label_text_width(candidate) > width:
+            break
+        fitted += character
+    return f"{fitted}{ellipsis}"
 
 
 def _status_width_for_overlay_width(width: int) -> int:
@@ -1027,8 +1089,13 @@ def _rows_fit_badge_mode_for_overlay_width(
     badge_mode: str,
     *,
     min_progress_px: int | None = None,
+    profile_labels: tuple[str, ...] | list[str] | None = None,
 ) -> bool:
-    row_layouts = _metric_rows_layout_for_overlay_width(width, rows)
+    row_layouts = _metric_rows_layout_for_overlay_width(
+        width,
+        rows,
+        profile_labels=profile_labels,
+    )
     return all(
         _row_fits_badge_mode_for_layout(
             row_layout,
@@ -1302,6 +1369,8 @@ def _proportional_extra_shares(
 def _metric_rows_layout_for_overlay_width(
     width: int,
     rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
+    *,
+    profile_labels: tuple[str, ...] | list[str] | None = None,
 ) -> list[_MetricRowLayout]:
     """Shared-column layout for every visible row at one overlay width.
 
@@ -1315,7 +1384,7 @@ def _metric_rows_layout_for_overlay_width(
         tuple(metric for metric in tuple(row)[:3] if isinstance(metric, dict))
         for row in rows
     ]
-    label_width = _label_width_for_overlay_width(overlay_width)
+    label_width = _label_width_for_overlay_width(overlay_width, profile_labels)
     status_width = _status_width_for_overlay_width(overlay_width)
     metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
@@ -1456,8 +1525,14 @@ def _metric_rows_layout_for_overlay_width(
 def _metric_row_layout_for_overlay_width(
     width: int,
     metrics: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    *,
+    profile_labels: tuple[str, ...] | list[str] | None = None,
 ) -> _MetricRowLayout:
-    return _metric_rows_layout_for_overlay_width(width, [metrics])[0]
+    return _metric_rows_layout_for_overlay_width(
+        width,
+        [metrics],
+        profile_labels=profile_labels,
+    )[0]
 
 
 def _required_metric_segment_width(
@@ -1553,6 +1628,7 @@ def _required_metric_segment_width_cached(
 @lru_cache(maxsize=512)
 def _preferred_width_for_rows_cached(
     rows_signature: tuple[tuple[tuple[Any, ...], ...], ...],
+    profile_labels: tuple[str, ...] = (),
 ) -> int:
     rows = tuple(
         tuple(_metric_from_width_signature(sig) for sig in row)
@@ -1572,6 +1648,7 @@ def _preferred_width_for_rows_cached(
             # stop at a uniform split that squeezes the bar to the
             # cramped floor even though a wider overlay fits everything.
             min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
+            profile_labels=profile_labels,
         )
 
     # The 300..900 sweep is too wide for a per-second layout budget when a
@@ -1626,6 +1703,7 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
         return None
 
     rows: list[tuple[tuple[Any, ...], ...]] = []
+    profile_labels: list[str] = []
     bars = model.get("bars")
     if not isinstance(bars, list):
         return None
@@ -1638,10 +1716,11 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
                 for metric in _visible_metrics_for_taskbar_bar(bar)
             )
         )
+        profile_labels.append(str(bar.get("label") or ""))
 
     if not rows:
         return None
-    return _preferred_width_for_rows_cached(tuple(rows))
+    return _preferred_width_for_rows_cached(tuple(rows), tuple(profile_labels))
 
 
 def _render_signature_value(value: Any) -> Any:
@@ -1828,10 +1907,15 @@ _OVERLAY_GEOMETRY_DEBUG_ENV = "WINDOWS_SUPPORTER_OVERLAY_GEOMETRY_DEBUG"
 # gives exact pixel widths for the very fonts the canvas draws with. Pure
 # per-character estimates stay the fallback for headless doubles.
 _TK_MEASURE_CONTEXT: dict[str, Any] = {"root": None, "fonts": {}}
-_CONTEXT_FONT_BY_PT = {6: ("Segoe UI", 6, "bold"), 7: ("Segoe UI", 7, "bold")}
+_CONTEXT_FONT_BY_PT = {
+    6: ("Segoe UI", 6, "bold"),
+    7: ("Segoe UI", 7, "bold"),
+    8: ("Segoe UI", 8, "bold"),
+}
 _CONTEXT_PT_BY_FONT = {
     ("Segoe UI", 6, "bold"): 6,
     ("Segoe UI", 7, "bold"): 7,
+    ("Segoe UI", 8, "bold"): 8,
 }
 
 
@@ -3496,6 +3580,7 @@ class CodexUsageTaskbarOverlay:
         row_layouts = _metric_rows_layout_for_overlay_width(
             width,
             [_visible_metrics_for_taskbar_bar(bar) for bar in draw_bars],
+            profile_labels=tuple(str(bar.get("label") or "") for bar in draw_bars),
         )
         row_entries = list(zip(draw_bars, row_layouts))
         overlay_badge_mode = _resolve_overlay_badge_mode(
@@ -3546,7 +3631,7 @@ class CodexUsageTaskbarOverlay:
                 anchor="w",
                 fill="#e5e7eb",
                 font=("Segoe UI", 8, "bold"),
-                text=label[:8],
+                text=_fit_profile_label_text(label, row_layout.label_width),
             )
             dot_x = 6 + row_layout.label_width + 1
             canvas.create_oval(
