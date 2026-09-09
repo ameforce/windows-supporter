@@ -1,4 +1,4 @@
-# hotfix/v0.22.3 Release 업데이트 버전 불일치 RCA
+# hotfix/v0.22.4 Release 업데이트 버전 불일치 RCA
 
 ## 분류와 의도
 
