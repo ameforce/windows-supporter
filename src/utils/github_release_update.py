@@ -26,7 +26,9 @@ GITHUB_RELEASE_HOSTS = frozenset(
     }
 )
 SHA256_RE = re.compile(r"(?i)(?:sha256:)?(?P<digest>[0-9a-f]{64})")
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+# Keep download reads small enough that the updater can refresh the visible
+# progress state several times per second on a normal installer download.
+DOWNLOAD_CHUNK_SIZE = 64 * 1024
 MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 20
 
@@ -109,6 +111,31 @@ def _validate_download_url(url: str) -> None:
     parsed = urllib.parse.urlparse(str(url or "").strip())
     if parsed.scheme != "https" or parsed.hostname not in GITHUB_RELEASE_HOSTS:
         raise GitHubReleaseUpdateError("release asset URL is not an allowed GitHub HTTPS URL")
+
+
+def _response_content_length(response: Any) -> int | None:
+    """Return a trusted positive Content-Length when the response exposes one."""
+    values: list[Any] = []
+    headers = getattr(response, "headers", None)
+    get_header = getattr(headers, "get", None)
+    if callable(get_header):
+        values.append(get_header("Content-Length"))
+
+    getheader = getattr(response, "getheader", None)
+    if callable(getheader):
+        try:
+            values.append(getheader("Content-Length"))
+        except Exception:
+            pass
+
+    for value in values:
+        try:
+            length = int(str(value or "").strip())
+        except (TypeError, ValueError):
+            continue
+        if length > 0:
+            return length
+    return None
 
 
 def _asset_name_for_version(version: tuple[int, int, int]) -> str:
@@ -240,6 +267,8 @@ class GitHubReleaseClient:
         self,
         candidate: ReleaseCandidate,
         destination_dir: str | os.PathLike[str],
+        *,
+        progress_callback: Callable[[int, int | None], None] | None = None,
     ) -> Path:
         _validate_download_url(candidate.installer_url)
         destination = Path(destination_dir).resolve()
@@ -256,6 +285,9 @@ class GitHubReleaseClient:
         try:
             response = self._open(candidate.installer_url)
             try:
+                total_bytes = _response_content_length(response)
+                if progress_callback is not None:
+                    progress_callback(0, total_bytes)
                 with os.fdopen(fd, "wb") as output:
                     fd = -1
                     while True:
@@ -267,6 +299,11 @@ class GitHubReleaseClient:
                             raise GitHubReleaseUpdateError("installer 크기가 허용 한도를 초과했습니다.")
                         digest.update(chunk)
                         output.write(chunk)
+                        if progress_callback is not None:
+                            progress_callback(
+                                total,
+                                total_bytes if total_bytes is not None else total,
+                            )
             finally:
                 close = getattr(response, "close", None)
                 if callable(close):
