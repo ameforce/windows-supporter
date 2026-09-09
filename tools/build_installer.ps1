@@ -3,6 +3,7 @@ param(
     [string]$Version = "",
     [string]$OutputDirectory = "",
     [string]$CompilerPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+    [string]$BootstrapCompilerPath = "gcc.exe",
     [switch]$SkipBuild,
     [switch]$KeepBuildArtifacts
 )
@@ -11,6 +12,9 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $installerDefinition = Join-Path $repoRoot "installer\windows-supporter.iss"
 $compiler = (Resolve-Path -LiteralPath $CompilerPath -ErrorAction Stop).Path
+$bootstrapCompilerCommand = Get-Command $BootstrapCompilerPath -CommandType Application -ErrorAction Stop
+$bootstrapCompiler = $bootstrapCompilerCommand.Source
+$bootstrapSource = Join-Path $repoRoot "installer\installer_bootstrap.c"
 
 function Invoke-GitText {
     param([string[]]$Arguments)
@@ -58,6 +62,8 @@ $sourceExe = Join-Path $repoRoot "dist\windows-supporter.exe"
 $installerName = "WindowsSupporter-v$Version-Setup.exe"
 $installerPath = Join-Path $outputDirectory $installerName
 $sidecarPath = "$installerPath.sha256"
+$coreInstallerPath = Join-Path $outputDirectory "WindowsSupporter-v$Version-Core.exe"
+$bootstrapStubPath = Join-Path $outputDirectory "WindowsSupporter-v$Version-Bootstrap.exe"
 
 if (-not $SkipBuild) {
     $previousArtifactOnly = $env:WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY
@@ -110,11 +116,41 @@ if ($comments -notmatch "^(?:v)?$escapedVersion(?:\.\d+)?\s+\(") {
     throw "Source executable Comments '$comments' does not identify release version $Version."
 }
 
-Remove-Item -LiteralPath $installerPath, $sidecarPath -Force -ErrorAction SilentlyContinue
-& $compiler "/DAppVersion=$Version" "/DSourceExe=$sourceExe" "/O$outputDirectory" $installerDefinition
+Remove-Item -LiteralPath $installerPath, $sidecarPath, $coreInstallerPath, $bootstrapStubPath -Force -ErrorAction SilentlyContinue
+& $compiler "/DAppVersion=$Version" "/DSourceExe=$sourceExe" "/O$outputDirectory" "/FWindowsSupporter-v$Version-Core" $installerDefinition
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE."
 }
+if (-not (Test-Path -LiteralPath $coreInstallerPath -PathType Leaf)) {
+    throw "Expected core installer artifact was not found: $coreInstallerPath"
+}
+
+& $bootstrapCompiler -O2 -s -static -mwindows -o $bootstrapStubPath $bootstrapSource -lshell32
+if ($LASTEXITCODE -ne 0) {
+    throw "Installer bootstrap compilation failed with exit code $LASTEXITCODE."
+}
+if (-not (Test-Path -LiteralPath $bootstrapStubPath -PathType Leaf)) {
+    throw "Expected installer bootstrap artifact was not found: $bootstrapStubPath"
+}
+
+$bootstrapStream = [IO.File]::OpenRead($bootstrapStubPath)
+$coreStream = [IO.File]::OpenRead($coreInstallerPath)
+$finalStream = [IO.File]::Open($installerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+try {
+    $bootstrapStream.CopyTo($finalStream)
+    $coreStream.CopyTo($finalStream)
+    $magic = [Text.Encoding]::ASCII.GetBytes("WSUSETUP")
+    $finalStream.Write($magic, 0, $magic.Length)
+    $payloadLength = [BitConverter]::GetBytes([UInt64]$coreStream.Length)
+    $finalStream.Write($payloadLength, 0, $payloadLength.Length)
+}
+finally {
+    $finalStream.Dispose()
+    $coreStream.Dispose()
+    $bootstrapStream.Dispose()
+}
+Remove-Item -LiteralPath $coreInstallerPath, $bootstrapStubPath -Force
+
 if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
     throw "Expected installer artifact was not found: $installerPath"
 }
@@ -135,6 +171,7 @@ if (-not $KeepBuildArtifacts) {
 Write-Output "INSTALLER_ARTIFACT=$installerPath"
 Write-Output "INSTALLER_SHA256=$hash"
 Write-Output "INSTALLER_SHA256_FILE=$sidecarPath"
+Write-Output "INSTALLER_FORMAT=legacy-compatible-bootstrap"
 Write-Output "SOURCE_EXE_FILE_VERSION=$($sourceVersionInfo.FileVersion)"
 Write-Output "SOURCE_EXE_PRODUCT_VERSION=$($sourceVersionInfo.ProductVersion)"
 Write-Output "SOURCE_EXE_COMMENTS=$comments"
