@@ -93,6 +93,17 @@ def release_payload(
 
 
 class GitHubReleaseUpdateUnitTest(unittest.TestCase):
+    def test_installer_builder_binds_asset_name_to_tag_and_embedded_runtime_version(self) -> None:
+        script = Path("tools/build_installer.ps1").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'Invoke-GitText @("describe", "--tags", "--exact-match", "HEAD")',
+            script,
+        )
+        self.assertIn("$sourceVersionInfo = (Get-Item -LiteralPath $sourceExe).VersionInfo", script)
+        self.assertIn("Source executable $field", script)
+        self.assertIn("Source executable Comments", script)
+
     def test_github_release_asset_redirect_host_is_allowed(self) -> None:
         final_url = "https://release-assets.githubusercontent.com/github-production-release-asset/test"
 
@@ -294,6 +305,7 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
 
             def installer_launcher(argv, **kwargs):
                 installer_calls.append((list(argv), dict(kwargs)))
+                executable.write_bytes(b"new v0.22.0 executable")
                 return FakeProcess()
 
             def target_launcher(argv, **kwargs):
@@ -310,6 +322,11 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
                     release_client=client,
                     installer_launcher=installer_launcher,
                     target_launcher=target_launcher,
+                    artifact_metadata_reader=lambda _path: {
+                        "file_version": "0.22.0.0",
+                        "product_version": "0.22.0.0",
+                        "comments": "v0.22.0 (release-commit)",
+                    },
                     process_exists=lambda _pid: False,
                     progress_ui_factory=lambda **kwargs: progress_instances.append(
                         FakeProgressUi(**kwargs)
@@ -328,3 +345,212 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         self.assertEqual(target_calls[0][0], [str(executable)])
         self.assertEqual(progress_instances[0].snapshots[-1]["step_key"], "complete")
         self.assertTrue(progress_instances[0].closed)
+
+    def test_release_handoff_rejects_installer_that_leaves_old_runtime(self) -> None:
+        class FakeReleaseClient:
+            def download_installer(self, candidate, destination_dir):
+                destination = Path(destination_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                path = destination / candidate.installer_name
+                path.write_bytes(b"verified installer")
+                return path
+
+        class FakeProcess:
+            def wait(self, *, timeout: float) -> int:
+                del timeout
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "installed"
+            root.mkdir()
+            executable = root / "windows-supporter.exe"
+            executable.write_bytes(b"old executable")
+            candidate = UpdateCandidate(
+                tag="v0.22.0",
+                version=(0, 22, 0),
+                installer_name="WindowsSupporter-v0.22.0-Setup.exe",
+                installer_url="https://github.com/ameforce/windows-supporter/releases/download/v0.22.0/WindowsSupporter-v0.22.0-Setup.exe",
+                installer_sha256="a" * 64,
+            )
+            state_path = Path(tmp) / "update_handoff.json"
+            state_path.write_text(
+                json.dumps(
+                    build_update_handoff_payload(
+                        repo_root=root,
+                        target_tag=candidate.tag,
+                        mode=UPDATE_RELEASE_MODE,
+                        candidate=candidate,
+                        source_pid=0,
+                        install_dir=root,
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                update_monitor_module,
+                "get_update_state_dir",
+                return_value=Path(tmp) / "state",
+            ):
+                rc = run_release_update_handoff(
+                    state_path,
+                    release_client=FakeReleaseClient(),
+                    installer_launcher=lambda *_args, **_kwargs: FakeProcess(),
+                    target_launcher=lambda *_args, **_kwargs: FakeProcess(),
+                    artifact_metadata_reader=lambda _path: {
+                        "file_version": "0.22.0.0",
+                        "product_version": "0.22.0.0",
+                        "comments": "v0.22.0 (release-commit)",
+                    },
+                    process_exists=lambda _pid: False,
+                    progress_ui_factory=lambda **_kwargs: None,
+                )
+            state = read_update_handoff_state(state_path)
+            restored_bytes = executable.read_bytes()
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("교체하지 않았습니다", state["error"])
+        self.assertEqual(restored_bytes, b"old executable")
+
+    def test_release_handoff_does_not_install_while_source_process_is_alive(self) -> None:
+        class FakeReleaseClient:
+            def download_installer(self, candidate, destination_dir):
+                raise AssertionError("installer download must not start")
+
+        class FakeProcess:
+            def wait(self, *, timeout: float) -> int:
+                del timeout
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "installed"
+            root.mkdir()
+            executable = root / "windows-supporter.exe"
+            executable.write_bytes(b"old executable")
+            candidate = UpdateCandidate(
+                tag="v0.22.0",
+                version=(0, 22, 0),
+                installer_name="WindowsSupporter-v0.22.0-Setup.exe",
+                installer_url="https://github.com/ameforce/windows-supporter/releases/download/v0.22.0/WindowsSupporter-v0.22.0-Setup.exe",
+                installer_sha256="a" * 64,
+            )
+            state_path = Path(tmp) / "update_handoff.json"
+            state_path.write_text(
+                json.dumps(
+                    build_update_handoff_payload(
+                        repo_root=root,
+                        target_tag=candidate.tag,
+                        mode=UPDATE_RELEASE_MODE,
+                        candidate=candidate,
+                        source_pid=4123,
+                        install_dir=root,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            installer_calls = []
+            target_calls = []
+            clock_values = iter((0.0, 26.0))
+
+            with patch.object(
+                update_monitor_module,
+                "get_update_state_dir",
+                return_value=Path(tmp) / "state",
+            ):
+                rc = run_release_update_handoff(
+                    state_path,
+                    release_client=FakeReleaseClient(),
+                    installer_launcher=lambda *args, **kwargs: installer_calls.append(
+                        (args, kwargs)
+                    )
+                    or FakeProcess(),
+                    target_launcher=lambda *args, **kwargs: target_calls.append(
+                        (args, kwargs)
+                    )
+                    or FakeProcess(),
+                    process_exists=lambda pid: int(pid) == 4123,
+                    sleep=lambda _seconds: None,
+                    monotonic=lambda: next(clock_values),
+                    progress_ui_factory=lambda **_kwargs: None,
+                )
+            state = read_update_handoff_state(state_path)
+            restored_bytes = executable.read_bytes()
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("프로세스가 종료되지 않아", state["error"])
+        self.assertEqual(installer_calls, [])
+        self.assertEqual(target_calls, [])
+        self.assertEqual(restored_bytes, b"old executable")
+
+    def test_release_handoff_rejects_installed_runtime_with_wrong_version(self) -> None:
+        class FakeReleaseClient:
+            def download_installer(self, candidate, destination_dir):
+                destination = Path(destination_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                path = destination / candidate.installer_name
+                path.write_bytes(b"verified installer")
+                return path
+
+        class FakeProcess:
+            def wait(self, *, timeout: float) -> int:
+                del timeout
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "installed"
+            root.mkdir()
+            executable = root / "windows-supporter.exe"
+            executable.write_bytes(b"old executable")
+            candidate = UpdateCandidate(
+                tag="v0.22.0",
+                version=(0, 22, 0),
+                installer_name="WindowsSupporter-v0.22.0-Setup.exe",
+                installer_url="https://github.com/ameforce/windows-supporter/releases/download/v0.22.0/WindowsSupporter-v0.22.0-Setup.exe",
+                installer_sha256="a" * 64,
+            )
+            state_path = Path(tmp) / "update_handoff.json"
+            state_path.write_text(
+                json.dumps(
+                    build_update_handoff_payload(
+                        repo_root=root,
+                        target_tag=candidate.tag,
+                        mode=UPDATE_RELEASE_MODE,
+                        candidate=candidate,
+                        source_pid=0,
+                        install_dir=root,
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            def installer_launcher(*_args, **_kwargs):
+                executable.write_bytes(b"wrong v0.21.1 executable")
+                return FakeProcess()
+
+            with patch.object(
+                update_monitor_module,
+                "get_update_state_dir",
+                return_value=Path(tmp) / "state",
+            ):
+                rc = run_release_update_handoff(
+                    state_path,
+                    release_client=FakeReleaseClient(),
+                    installer_launcher=installer_launcher,
+                    target_launcher=lambda *_args, **_kwargs: FakeProcess(),
+                    artifact_metadata_reader=lambda _path: {
+                        "file_version": "0.21.1.0",
+                        "product_version": "0.21.1.0",
+                        "comments": "v0.21.1 (old-commit)",
+                    },
+                    process_exists=lambda _pid: False,
+                    progress_ui_factory=lambda **_kwargs: None,
+                )
+            state = read_update_handoff_state(state_path)
+            restored_bytes = executable.read_bytes()
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("버전이 요청한 Release와 다릅니다", state["error"])
+        self.assertEqual(restored_bytes, b"old executable")

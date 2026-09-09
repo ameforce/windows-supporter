@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # noqa: SIZE_OK — legacy updater/UI integration module; recovery logic stays extracted.
 
+import hashlib
 import json
 import os
 import re
@@ -23,7 +24,12 @@ from src.utils.github_release_update import (
     ReleaseCandidate,
 )
 from src.utils.progress_subprocess import run_no_window_with_progress
-from src.utils.runtime_deploy import RuntimeDeployError, deploy_runtime, restart_runtime
+from src.utils.runtime_deploy import (
+    RuntimeDeployError,
+    deploy_runtime,
+    read_windows_artifact_metadata,
+    restart_runtime,
+)
 from src.utils.subprocess_utils import popen_no_window, run_no_window
 from src.utils.update_handoff_recovery import UpdateHandoffError, build_relaunch_environment
 from src.utils.update_settings import (
@@ -895,6 +901,94 @@ def _executable_file_identity(path: Path) -> tuple[int, int, int, int] | None:
     except OSError:
         return None
     return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+_WINDOWS_FILE_VERSION_RE = re.compile(
+    r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+    r"(?:\.(?P<revision>\d+))?$",
+    re.IGNORECASE,
+)
+_ARTIFACT_COMMENT_VERSION_RE = re.compile(
+    r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+    r"(?:\.\d+)?(?:\s+|\()",
+    re.IGNORECASE,
+)
+
+
+def _parse_windows_file_version(value: Any) -> tuple[int, int, int, int] | None:
+    match = _WINDOWS_FILE_VERSION_RE.fullmatch(str(value or "").strip())
+    if match is None:
+        return None
+    return tuple(
+        int(match.group(name) or 0)
+        for name in ("major", "minor", "patch", "revision")
+    )
+
+
+def _parse_artifact_comment_version(value: Any) -> tuple[int, int, int] | None:
+    match = _ARTIFACT_COMMENT_VERSION_RE.match(str(value or "").strip())
+    if match is None:
+        return None
+    return tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
+
+
+def _verify_release_installed_artifact(
+    installed_path: Path,
+    *,
+    candidate: UpdateCandidate,
+    previous_sha256: str,
+    metadata_reader: Callable[[Path], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Prove that the installer replaced the runtime with the requested release."""
+
+    if not installed_path.is_file():
+        raise UpdateHandoffError("installer 종료 후 새 windows-supporter.exe를 찾을 수 없습니다.")
+
+    installed_sha256 = _sha256_file(installed_path)
+    if previous_sha256 and installed_sha256 == previous_sha256:
+        raise UpdateHandoffError(
+            "installer가 설치된 windows-supporter.exe를 교체하지 않았습니다."
+        )
+
+    try:
+        metadata = metadata_reader(installed_path)
+    except Exception as exc:
+        raise UpdateHandoffError(
+            f"설치된 windows-supporter.exe 버전 메타데이터를 읽을 수 없습니다: {exc}"
+        ) from exc
+    if not isinstance(metadata, Mapping):
+        raise UpdateHandoffError("설치된 windows-supporter.exe 버전 메타데이터가 올바르지 않습니다.")
+
+    expected_version = tuple(candidate.version)
+    checked_metadata: dict[str, Any] = {
+        "sha256": installed_sha256,
+        "file_version": str(metadata.get("file_version") or "").strip(),
+        "product_version": str(metadata.get("product_version") or "").strip(),
+        "comments": str(metadata.get("comments") or "").strip(),
+    }
+    for field in ("file_version", "product_version"):
+        parsed = _parse_windows_file_version(checked_metadata[field])
+        if parsed is None or parsed[:3] != expected_version:
+            raise UpdateHandoffError(
+                "설치된 windows-supporter.exe 버전이 요청한 Release와 다릅니다. "
+                f"expected={candidate.tag} actual={checked_metadata[field] or 'missing'}"
+            )
+
+    comment_version = _parse_artifact_comment_version(checked_metadata["comments"])
+    if comment_version != expected_version:
+        raise UpdateHandoffError(
+            "설치된 windows-supporter.exe 표시 버전이 요청한 Release와 다릅니다. "
+            f"expected={candidate.tag} actual={checked_metadata['comments'] or 'missing'}"
+        )
+    return checked_metadata
 
 
 def cleanup_update_build_artifacts(repo_root: str | os.PathLike[str]) -> list[str]:
@@ -1998,6 +2092,7 @@ def run_release_update_handoff(
     release_client: GitHubReleaseClient | None = None,
     installer_launcher=popen_no_window,
     target_launcher=popen_no_window,
+    artifact_metadata_reader: Callable[[Path], Mapping[str, Any]] = read_windows_artifact_metadata,
     progress_ui_factory=UpdateHandoffProgressUi,
     process_exists: Callable[[int], bool] = _process_exists,
     sleep: Callable[[float], None] = time.sleep,
@@ -2015,6 +2110,7 @@ def run_release_update_handoff(
     )
     downloaded_path: Path | None = None
     restored = False
+    installed_artifact: dict[str, Any] | None = None
 
     def publish(snapshot: dict[str, Any], *, first: bool = False) -> None:
         if progress_ui is not None:
@@ -2031,8 +2127,6 @@ def run_release_update_handoff(
         client = release_client or GitHubReleaseClient()
         release_candidate = ReleaseCandidate.from_payload(candidate.as_payload())
         install_dir = Path(str(state.get("install_dir") or repo_root)).resolve()
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(root_executable, backup_path)
 
         start_progress = build_update_progress_snapshot(
             "handoff_start",
@@ -2063,7 +2157,13 @@ def run_release_update_handoff(
                 sleep=sleep,
                 monotonic=monotonic,
             ):
-                append_update_log(log_path, "source process did not exit before installer launch")
+                raise UpdateHandoffError(
+                    "기존 Windows Supporter 프로세스가 종료되지 않아 installer를 실행하지 않았습니다."
+                )
+
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        previous_sha256 = _sha256_file(root_executable)
+        shutil.copy2(root_executable, backup_path)
 
         download_progress = build_update_progress_snapshot(
             "release_download",
@@ -2107,8 +2207,17 @@ def run_release_update_handoff(
         return_code = wait(timeout=UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS)
         if int(return_code or 0) != 0:
             raise UpdateHandoffError(f"GitHub Release installer가 exit code {return_code}로 종료됐습니다.")
-        if not root_executable.is_file():
-            raise UpdateHandoffError("installer 종료 후 새 windows-supporter.exe를 찾을 수 없습니다.")
+        installed_artifact = _verify_release_installed_artifact(
+            root_executable,
+            candidate=candidate,
+            previous_sha256=previous_sha256,
+            metadata_reader=artifact_metadata_reader,
+        )
+        append_update_log(
+            log_path,
+            "verified installed runtime: "
+            + json.dumps(installed_artifact, ensure_ascii=False, sort_keys=True),
+        )
 
         relaunch_progress = build_update_progress_snapshot(
             "relaunch",
@@ -2139,6 +2248,7 @@ def run_release_update_handoff(
             completed_at=time.time(),
             candidate=candidate.as_payload(),
             installer_path=str(downloaded_path),
+            installed_artifact=installed_artifact,
             progress=complete_progress,
         )
         append_update_log(log_path, "GitHub Release installer handoff completed")
