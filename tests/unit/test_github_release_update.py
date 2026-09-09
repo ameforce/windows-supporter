@@ -25,9 +25,10 @@ import src.utils.update_monitor as update_monitor_module
 
 
 class FakeResponse:
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, *, final_url: str = "") -> None:
         self._body = body
         self._position = 0
+        self._final_url = final_url
         self.closed = False
 
     def read(self, size: int = -1) -> bytes:
@@ -41,6 +42,9 @@ class FakeResponse:
 
     def close(self) -> None:
         self.closed = True
+
+    def geturl(self) -> str:
+        return self._final_url
 
 
 class FakeOpener:
@@ -89,6 +93,19 @@ def release_payload(
 
 
 class GitHubReleaseUpdateUnitTest(unittest.TestCase):
+    def test_github_release_asset_redirect_host_is_allowed(self) -> None:
+        final_url = "https://release-assets.githubusercontent.com/github-production-release-asset/test"
+
+        def opener(_request, *, timeout: float):
+            del timeout
+            return FakeResponse(b"", final_url=final_url)
+
+        response = GitHubReleaseClient(opener=opener)._open(
+            "https://github.com/ameforce/windows-supporter/releases/download/v0.22.0/WindowsSupporter-v0.22.0-Setup.exe"
+        )
+
+        response.close()
+
     def test_latest_release_uses_github_digest_and_downloads_atomically(self) -> None:
         installer_name = "WindowsSupporter-v0.22.0-Setup.exe"
         installer_url = f"https://objects.githubusercontent.com/{installer_name}"
