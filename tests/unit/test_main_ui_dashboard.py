@@ -308,6 +308,29 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             ensure_dashboard.assert_called_once()
             self.assertEqual(load_last_tab(valid_tabs=ui._valid_tab_keys(), path=path), "dashboard")
 
+    def test_hidden_show_fits_before_deiconifying_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, root, _, _, _ = self._build_ui(path)
+            events = []
+            root.state = lambda: "withdrawn"
+            root.withdraw = lambda: events.append("withdraw")
+            root.deiconify = lambda: events.append("deiconify")
+
+            with patch.object(
+                ui,
+                "_ensure_dashboard_built",
+                side_effect=lambda: events.append("build"),
+            ):
+                with patch.object(
+                    ui,
+                    "_apply_tab_geometry",
+                    side_effect=lambda _tab: events.append("fit"),
+                ):
+                    ui.show()
+
+            self.assertEqual(events[:4], ["withdraw", "build", "fit", "deiconify"])
+
     def test_dashboard_uses_compact_default_geometry(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
@@ -712,6 +735,27 @@ class MainUiDashboardUnitTest(unittest.TestCase):
 
 
 class DashboardViewFormattingUnitTest(unittest.TestCase):
+    def test_preferred_size_uses_embedded_dashboard_and_scrollbar_requirements(self):
+        class _RequestedWidget:
+            def __init__(self, width, height):
+                self.width = width
+                self.height = height
+
+            def update_idletasks(self):
+                return None
+
+            def winfo_reqwidth(self):
+                return self.width
+
+            def winfo_reqheight(self):
+                return self.height
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._dashboard_scroll_container = _RequestedWidget(948, 491)
+        view._dashboard_scrollbar = _RequestedWidget(17, 491)
+
+        self.assertEqual(view.preferred_size(), (965, 491))
+
     def test_ai_usage_callback_prefers_primary_and_falls_back_to_codex(self):
         calls = []
         view = DashboardView(
