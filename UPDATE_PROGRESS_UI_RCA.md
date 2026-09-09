@@ -27,7 +27,7 @@
 ## 회귀 위험
 
 - raw 로그를 숨기면서 진단 정보까지 잃을 수 있음: 전체 stdout/stderr는 기존 update log에 유지한다.
-- retry에서 이전 attempt의 percent/activity가 섞일 수 있음: `handoff_start`에서 UI 이력과 percent floor를 초기화한다.
+- retry에서 이전 attempt의 percent/activity가 섞일 수 있음: `handoff_start`에서 UI 이력은 새로 시작하되, 마지막 유효 percent floor는 이어받는다.
 - 동적 높이로 창이 흔들릴 수 있음: 상태 클래스와 activity 유무가 바뀔 때만 geometry를 재계산한다.
 - borderless가 taskbar·Alt+Tab·Snap·시스템 메뉴를 제공하지 않음: 이 정책을 짧은 topmost 업데이트 helper로 한정하고, 제목·부제 drag와 Escape/Alt+F4/`WM_DELETE_WINDOW`의 동일한 상태 기반 close guard를 테스트로 고정한다.
 - Tk의 `-10` geometry는 음수 절대 X가 아니라 우측 기준 offset으로 해석됨: drag 좌표는 `+-10` 형태가 되도록 각 축 앞에 `+` separator를 명시하고, `(-10, -20)` 실제 `winfo_x/y` 회귀 테스트와 smoke metric을 둔다.
@@ -44,3 +44,32 @@
 - 125%·150%는 Tk client 영역의 동등 scaling으로 검증한다. 실제 Windows 디스플레이 DPI 120/144에서 모니터 간 이동과 `WM_DPICHANGED`는 이번 환경에서 별도로 검증하지 못한다. 음수 좌표를 막지 않는 drag geometry와 캡처별 widget rect로 최소 회귀를 확인한다.
 - 완료 상태 fixture의 렌더링은 검증했지만, production helper가 완료 snapshot 직후 창을 닫는 기존 수명 주기는 보존했다. 따라서 완료 화면의 실제 체류 시간은 별도 UX 후속 검토 대상이다.
 - 이번 산출물은 commit 전 dirty worktree 검증용이다. 후속 릴리스에서는 clean commit 기준으로 테스트 결과와 최종 EXE SHA256을 다시 연결해야 한다.
+
+## 진행률 점프 RCA (2026-09-09)
+
+### 증상
+
+- Release installer 다운로드가 새 helper 프로세스에서 `0%`로 다시 시작한 뒤, 고정된 `54%`로 점프했다.
+- 부모 updater의 Git 사전 처리와 child handoff가 서로 다른 진행률 lifecycle을 사용해 단계 사이의 큰 점프가 발생했다.
+- build output은 `20/24/32/...`처럼 드문 marker만 고정 percent에 매핑되어, 실제 빌드 초반 작업이 진행되어도 화면이 오래 멈추거나 다음 marker에서 크게 뛰었다.
+
+### 근본 원인
+
+1. `UpdateProgressStep`이 단계별 단일 percent만 보유해 단계 내부의 진행을 표현할 수 없었다.
+2. 부모 프로세스가 handoff state를 기록해도 child helper가 `handoff_start=0`으로 lifecycle을 다시 만들었다. Release 경로는 이 reset 직후 고정 `release_download=54`를 게시했다.
+3. 다운로드는 1 MiB 단위로만 읽고 callback이 없어 byte 진행률을 계산할 근거가 없었다.
+4. build/deploy/cleanup은 실제 세부 marker와 별도의 고정 지점만 사용했고, deployment 이후 구간도 relaunch percent로 한 번에 건너뛰었다.
+
+### 개선 계약
+
+- 모든 visible phase는 start/end percent range를 갖고, 알려진 byte/build 이벤트는 해당 range 안에서만 보간한다.
+- handoff payload와 child helper는 마지막 유효 percent를 공유하며, helper와 retry 모두 monotonic floor 아래로 내려가지 않는다.
+- Release 다운로드는 64 KiB 단위 callback으로 누적 byte/Content-Length를 게시한다. 중간까지 길이를 알 수 없으면 시작 percent와 byte detail을 유지하고, 완료 callback에서는 누적 byte를 실제 total로 사용해 종료 구간까지 반영한다.
+- Git handoff는 `git_shutdown → build_prepare → build → deploy → cleanup_build → relaunch`로 이어지며 build marker와 배포/정리 경계를 각각 화면에 게시한다.
+- installer 실행처럼 내부 진행률을 관찰할 수 없는 작업은 가짜 시간 기반 증가를 만들지 않고 시작/완료 경계만 표시한다.
+
+### 검증
+
+- Release download callback, phase range/monotonic floor, handoff state carry, build/deploy/cleanup stage를 targeted unit test로 고정한다.
+- Tk UI smoke에서 inherited percent와 build marker percent를 확인한다.
+- artifact-only build로 실제 runtime 교체 없이 packaging과 update handoff 경로를 다시 확인한다.

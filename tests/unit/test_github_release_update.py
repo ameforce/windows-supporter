@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.utils.github_release_update import (
+    DOWNLOAD_CHUNK_SIZE,
     GITHUB_LATEST_RELEASE_URL,
     GitHubReleaseClient,
     GitHubReleaseUpdateError,
@@ -25,13 +26,22 @@ import src.utils.update_monitor as update_monitor_module
 
 
 class FakeResponse:
-    def __init__(self, body: bytes, *, final_url: str = "") -> None:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        final_url: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._body = body
         self._position = 0
         self._final_url = final_url
+        self.headers = dict(headers or {})
+        self.read_sizes: list[int] = []
         self.closed = False
 
     def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(int(size))
         if self._position >= len(self._body):
             return b""
         if size is None or size < 0:
@@ -48,9 +58,11 @@ class FakeResponse:
 
 
 class FakeOpener:
-    def __init__(self, responses: dict[str, bytes]) -> None:
+    def __init__(self, responses: dict[str, bytes], *, include_content_length: bool = True) -> None:
         self.responses = dict(responses)
+        self.include_content_length = bool(include_content_length)
         self.calls: list[str] = []
+        self.last_response: FakeResponse | None = None
 
     def __call__(self, request, *, timeout: float):
         del timeout
@@ -58,7 +70,13 @@ class FakeOpener:
         self.calls.append(url)
         if url not in self.responses:
             raise AssertionError(f"unexpected URL: {url}")
-        return FakeResponse(self.responses[url])
+        headers = (
+            {"Content-Length": str(len(self.responses[url]))}
+            if self.include_content_length
+            else {}
+        )
+        self.last_response = FakeResponse(self.responses[url], headers=headers)
+        return self.last_response
 
 
 def release_payload(
@@ -146,6 +164,67 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
             downloaded = client.download_installer(candidate, tmp)
             self.assertEqual(downloaded.read_bytes(), installer_bytes)
             self.assertFalse(list(Path(tmp).glob("*.download")))
+
+    def test_download_reports_progress_for_each_small_read(self) -> None:
+        installer_name = "WindowsSupporter-v0.22.0-Setup.exe"
+        installer_url = f"https://objects.githubusercontent.com/{installer_name}"
+        installer_bytes = b"x" * (DOWNLOAD_CHUNK_SIZE * 2 + 123)
+        digest = hashlib.sha256(installer_bytes).hexdigest()
+        candidate = types.SimpleNamespace(
+            installer_name=installer_name,
+            installer_url=installer_url,
+            installer_sha256=digest,
+        )
+        opener = FakeOpener({installer_url: installer_bytes})
+        progress: list[tuple[int, int | None]] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            downloaded = GitHubReleaseClient(opener=opener).download_installer(
+                candidate,
+                tmp,
+                progress_callback=lambda downloaded_bytes, total_bytes: progress.append(
+                    (downloaded_bytes, total_bytes)
+                ),
+            )
+            self.assertEqual(downloaded.read_bytes(), installer_bytes)
+
+        self.assertIsNotNone(opener.last_response)
+        assert opener.last_response is not None
+        self.assertEqual(
+            opener.last_response.read_sizes[:3],
+            [DOWNLOAD_CHUNK_SIZE, DOWNLOAD_CHUNK_SIZE, DOWNLOAD_CHUNK_SIZE],
+        )
+        self.assertEqual(progress[0], (0, len(installer_bytes)))
+        self.assertEqual(progress[-1], (len(installer_bytes), len(installer_bytes)))
+        self.assertGreater(len(progress), 2)
+
+    def test_download_infers_total_on_final_callback_when_header_is_missing(self) -> None:
+        installer_name = "WindowsSupporter-v0.22.0-Setup.exe"
+        installer_url = f"https://objects.githubusercontent.com/{installer_name}"
+        installer_bytes = b"x" * (DOWNLOAD_CHUNK_SIZE + 17)
+        digest = hashlib.sha256(installer_bytes).hexdigest()
+        candidate = types.SimpleNamespace(
+            installer_name=installer_name,
+            installer_url=installer_url,
+            installer_sha256=digest,
+        )
+        opener = FakeOpener(
+            {installer_url: installer_bytes},
+            include_content_length=False,
+        )
+        progress: list[tuple[int, int | None]] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            GitHubReleaseClient(opener=opener).download_installer(
+                candidate,
+                tmp,
+                progress_callback=lambda downloaded_bytes, total_bytes: progress.append(
+                    (downloaded_bytes, total_bytes)
+                ),
+            )
+
+        self.assertEqual(progress[0], (0, None))
+        self.assertEqual(progress[-1], (len(installer_bytes), len(installer_bytes)))
 
     def test_latest_release_falls_back_to_sha256_sidecar(self) -> None:
         installer_name = "WindowsSupporter-v0.22.0-Setup.exe"
@@ -246,12 +325,17 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
                 self.destination = destination
                 self.calls = []
 
-            def download_installer(self, candidate, destination_dir):
+            def download_installer(self, candidate, destination_dir, *, progress_callback=None):
                 self.calls.append((candidate, Path(destination_dir)))
                 destination = Path(destination_dir)
                 destination.mkdir(parents=True, exist_ok=True)
                 path = destination / candidate.installer_name
-                path.write_bytes(b"verified installer")
+                installer_bytes = b"verified installer"
+                path.write_bytes(installer_bytes)
+                if progress_callback is not None:
+                    progress_callback(0, len(installer_bytes))
+                    progress_callback(len(installer_bytes) // 2, len(installer_bytes))
+                    progress_callback(len(installer_bytes), len(installer_bytes))
                 return path
 
         class FakeProcess:
@@ -343,12 +427,28 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         self.assertIn("/VERYSILENT", installer_calls[0][0])
         self.assertIn('/DIR="' + str(root) + '"', installer_calls[0][0])
         self.assertEqual(target_calls[0][0], [str(executable)])
+        self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
+        self.assertEqual(progress_instances[0].snapshots[0]["percent"], 18)
+        all_percents = [int(snapshot["percent"]) for snapshot in progress_instances[0].snapshots]
+        self.assertEqual(all_percents, sorted(all_percents))
+        download_snapshots = [
+            snapshot
+            for snapshot in progress_instances[0].snapshots
+            if snapshot.get("step_key") == "release_download"
+        ]
+        self.assertGreaterEqual(len(download_snapshots), 4)
+        download_percents = [int(snapshot["percent"]) for snapshot in download_snapshots]
+        self.assertEqual(download_percents[0], 22)
+        self.assertEqual(download_percents[-1], 70)
+        self.assertEqual(download_percents, sorted(download_percents))
+        self.assertTrue(any("50%" in str(snapshot["detail"]) for snapshot in download_snapshots))
         self.assertEqual(progress_instances[0].snapshots[-1]["step_key"], "complete")
         self.assertTrue(progress_instances[0].closed)
 
     def test_release_handoff_rejects_installer_that_leaves_old_runtime(self) -> None:
         class FakeReleaseClient:
-            def download_installer(self, candidate, destination_dir):
+            def download_installer(self, candidate, destination_dir, *, progress_callback=None):
+                del progress_callback
                 destination = Path(destination_dir)
                 destination.mkdir(parents=True, exist_ok=True)
                 path = destination / candidate.installer_name
@@ -415,7 +515,8 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
 
     def test_release_handoff_does_not_install_while_source_process_is_alive(self) -> None:
         class FakeReleaseClient:
-            def download_installer(self, candidate, destination_dir):
+            def download_installer(self, candidate, destination_dir, *, progress_callback=None):
+                del progress_callback
                 raise AssertionError("installer download must not start")
 
         class FakeProcess:
@@ -486,7 +587,8 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
 
     def test_release_handoff_rejects_installed_runtime_with_wrong_version(self) -> None:
         class FakeReleaseClient:
-            def download_installer(self, candidate, destination_dir):
+            def download_installer(self, candidate, destination_dir, *, progress_callback=None):
+                del progress_callback
                 destination = Path(destination_dir)
                 destination.mkdir(parents=True, exist_ok=True)
                 path = destination / candidate.installer_name

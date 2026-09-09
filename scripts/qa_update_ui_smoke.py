@@ -611,8 +611,8 @@ def run_smoke(output_path: Path, screenshot_path: Path | None = None) -> dict[st
         "ok": all(
             [
                 any("자동 확인" in label for label in labels),
-                any("업데이트 프로세스 시작" in label for label in labels),
-                any(label == "0%" for label in labels),
+                any("업데이트 프로세스 연결 중" in label for label in labels),
+                any(label == "34%" for label in labels),
                 any(label == "custom-canvas" for label in labels),
                 any(label == "borderless-shell" for label in labels),
                 any(label == "log-visible" for label in labels),

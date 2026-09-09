@@ -46,6 +46,7 @@ from src.utils.update_monitor import (
     build_update_handoff_command,
     build_update_handoff_payload,
     build_update_progress_snapshot,
+    build_release_download_progress_snapshot,
     close_running_git_gui_processes,
     cleanup_update_handoff_executable,
     get_update_handoff_executable_path,
@@ -467,7 +468,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(build_step.label, "빌드 실행 중")
         self.assertEqual(snapshot["title"], "Windows Supporter 업데이트")
         self.assertEqual(snapshot["label"], "빌드 실행 중")
-        self.assertEqual(snapshot["percent"], 74)
+        self.assertEqual(snapshot["percent"], 45)
         self.assertTrue(snapshot["progressbar"]["visible"])
         self.assertEqual(snapshot["progressbar"]["mode"], "determinate")
         self.assertEqual(failed["title"], "Windows Supporter 업데이트 실패")
@@ -477,6 +478,20 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(failed["labels"]["log"], UPDATE_PROGRESS_LOG_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["retry"], UPDATE_PROGRESS_RETRY_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["manual_action"], UPDATE_PROGRESS_MANUAL_ACTION_TEXT)
+
+    def test_release_download_progress_maps_bytes_to_download_stage(self) -> None:
+        snapshots = [
+            build_release_download_progress_snapshot("v0.22.3", 0, 100),
+            build_release_download_progress_snapshot("v0.22.3", 50, 100),
+            build_release_download_progress_snapshot("v0.22.3", 100, 100),
+        ]
+
+        self.assertEqual([snapshot["percent"] for snapshot in snapshots], [22, 46, 70])
+        self.assertTrue(all(snapshot["progressbar"]["visible"] for snapshot in snapshots))
+        self.assertIn("50%", snapshots[1]["detail"])
+        unknown_length = build_release_download_progress_snapshot("v0.22.3", 4096, None)
+        self.assertEqual(unknown_length["percent"], 22)
+        self.assertIn("4.0 KiB", unknown_length["detail"])
 
     def test_update_handoff_progress_ui_uses_borderless_shell_and_collapses_empty_activity(self) -> None:
         try:
@@ -780,8 +795,8 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         assert stale_workers is not None
         assert uv_sync is not None
         assert build is not None
-        self.assertLessEqual(stale_workers["percent"], 20)
-        self.assertLessEqual(uv_sync["percent"], 35)
+        self.assertEqual(stale_workers["percent"], 47)
+        self.assertEqual(uv_sync["percent"], 54)
         self.assertLess(build["percent"], 80)
         self.assertLess(stale_workers["percent"], uv_sync["percent"])
         self.assertLess(uv_sync["percent"], build["percent"])
@@ -1626,13 +1641,17 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(state["deployment_receipt"]["status"], "success")
         self.assertEqual(state["progress"]["label"], "업데이트 완료")
         self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
-        self.assertLessEqual(progress_instances[0].snapshots[0]["percent"], 5)
+        self.assertEqual(progress_instances[0].snapshots[0]["percent"], 34)
         self.assertEqual(
             [snapshot["label"] for snapshot in progress_instances[0].snapshots],
             [
-                "업데이트 프로세스 시작",
+                "업데이트 프로세스 연결 중",
                 "기존 앱 정리 중",
                 "빌드 준비 중",
+                "새 버전 배포 중",
+                "새 버전 배포 중",
+                "임시 산출물 정리 중",
+                "임시 산출물 정리 중",
                 "Windows Supporter 재실행 중",
                 "업데이트 완료",
             ],
@@ -2054,7 +2073,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         self.assertEqual(snapshots_during_ack[0]["state"], "updating")
         self.assertEqual(snapshots_during_ack[0]["progress"]["step_key"], "handoff")
-        self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 68)
+        self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 34)
         self.assertEqual(quit_calls, [True])
 
     def test_auto_update_settings_persist_and_gate_scheduling(self) -> None:
@@ -2247,7 +2266,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "updating")
         self.assertEqual(snapshot["progress"]["label"], "업데이트 실행 준비 중")
-        self.assertEqual(snapshot["progress"]["percent"], 68)
+        self.assertEqual(snapshot["progress"]["percent"], 34)
         self.assertEqual(len(launches), 1)
         self.assertEqual(
             launches[0][0],
