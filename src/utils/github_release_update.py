@@ -17,6 +17,12 @@ GITHUB_REPOSITORY = "ameforce/windows-supporter"
 GITHUB_LATEST_RELEASE_URL = (
     f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 )
+GITHUB_RELEASES_URL = (
+    f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases?per_page=100"
+)
+GITHUB_TAGS_URL = (
+    f"https://api.github.com/repos/{GITHUB_REPOSITORY}/tags?per_page=100"
+)
 GITHUB_RELEASE_HOSTS = frozenset(
     {
         "api.github.com",
@@ -154,11 +160,15 @@ class GitHubReleaseClient:
         self,
         *,
         api_url: str = GITHUB_LATEST_RELEASE_URL,
+        releases_url: str = GITHUB_RELEASES_URL,
+        tags_url: str = GITHUB_TAGS_URL,
         opener: Callable[..., Any] = urllib.request.urlopen,
         timeout: float = HTTP_TIMEOUT_SECONDS,
         user_agent: str = "Windows-Supporter-Updater",
     ) -> None:
         self._api_url = str(api_url or GITHUB_LATEST_RELEASE_URL).strip()
+        self._releases_url = str(releases_url or GITHUB_RELEASES_URL).strip()
+        self._tags_url = str(tags_url or GITHUB_TAGS_URL).strip()
         self._opener = opener
         self._timeout = max(1.0, float(timeout))
         self._user_agent = str(user_agent or "Windows-Supporter-Updater")
@@ -184,7 +194,7 @@ class GitHubReleaseClient:
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
             raise GitHubReleaseUpdateError(f"GitHub Release 요청 실패: {exc}") from exc
 
-    def _read_json(self, url: str) -> dict[str, Any]:
+    def _read_json_value(self, url: str) -> Any:
         response = self._open(url)
         try:
             raw = response.read()
@@ -196,6 +206,10 @@ class GitHubReleaseClient:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GitHubReleaseUpdateError("GitHub Release 응답 JSON을 해석할 수 없습니다.") from exc
+        return payload
+
+    def _read_json(self, url: str) -> dict[str, Any]:
+        payload = self._read_json_value(url)
         if not isinstance(payload, dict):
             raise GitHubReleaseUpdateError("GitHub Release 응답 형식이 올바르지 않습니다.")
         return payload
@@ -213,9 +227,11 @@ class GitHubReleaseClient:
         except UnicodeDecodeError as exc:
             raise GitHubReleaseUpdateError("installer hash 파일 인코딩을 해석할 수 없습니다.") from exc
 
-    def fetch_latest(self, current_version: tuple[int, int, int]) -> ReleaseCandidate | None:
-        current = tuple(int(part) for part in current_version)
-        payload = self._read_json(self._api_url)
+    def _candidate_from_release_payload(
+        self,
+        payload: Mapping[str, Any],
+        current: tuple[int, int, int],
+    ) -> ReleaseCandidate | None:
         if bool(payload.get("draft")) or bool(payload.get("prerelease")):
             return None
 
@@ -262,6 +278,55 @@ class GitHubReleaseClient:
             release_url=str(payload.get("html_url") or "").strip(),
             release_body=str(payload.get("body") or ""),
         )
+
+    def _newer_public_tag(self, current: tuple[int, int, int]) -> str:
+        payload = self._read_json_value(self._tags_url)
+        if not isinstance(payload, list):
+            raise GitHubReleaseUpdateError("GitHub tags 응답 형식이 올바르지 않습니다.")
+        newer: list[tuple[tuple[int, int, int], str]] = []
+        for item in payload:
+            if not isinstance(item, Mapping):
+                continue
+            tag = normalize_release_tag(item.get("name"))
+            version = parse_release_version(tag)
+            if version is not None and version > current:
+                newer.append((version, tag))
+        if not newer:
+            return ""
+        return max(newer, key=lambda item: item[0])[1]
+
+    def fetch_latest(self, current_version: tuple[int, int, int]) -> ReleaseCandidate | None:
+        current = tuple(int(part) for part in current_version)
+        latest_payload = self._read_json(self._api_url)
+        latest_candidate = self._candidate_from_release_payload(latest_payload, current)
+        if latest_candidate is not None:
+            return latest_candidate
+
+        # /releases/latest is ordered by GitHub's publication rules, not by
+        # the semantic version embedded in the tag. Read the public release
+        # collection before declaring that there is no update.
+        releases_payload = self._read_json_value(self._releases_url)
+        if not isinstance(releases_payload, list):
+            raise GitHubReleaseUpdateError("GitHub releases 응답 형식이 올바르지 않습니다.")
+        release_candidates: list[ReleaseCandidate] = []
+        for item in releases_payload:
+            if not isinstance(item, Mapping):
+                continue
+            candidate = self._candidate_from_release_payload(item, current)
+            if candidate is not None:
+                release_candidates.append(candidate)
+        if release_candidates:
+            return max(release_candidates, key=lambda candidate: candidate.version)
+
+        # A tag can be pushed before its Release and installer assets are
+        # published. That state must never be presented to users as "latest".
+        newer_tag = self._newer_public_tag(current)
+        if newer_tag:
+            raise GitHubReleaseUpdateError(
+                f"공개 태그 {newer_tag}가 있지만 설치 가능한 GitHub Release가 없습니다. "
+                "릴리즈 installer 배포가 완료될 때까지 최신으로 표시하지 않습니다."
+            )
+        return None
 
     def download_installer(
         self,
