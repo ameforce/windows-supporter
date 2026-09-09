@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any, Callable
 
-from src.apps.wrike_timelog_details import TimelogDayDetails
+from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
 
 
 _REFRESH_INTERVAL_MS = 1_000
@@ -569,36 +569,61 @@ class WorktimeQuickPanel:
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state != "available" or not detail.rows:
             return 4
-        # One short entry needs room for its field labels; further entries can
-        # scroll rather than shrinking the type or the surrounding controls.
-        return min(12, max(8, 5 + len(detail.rows) * 3))
+        groups = self._group_timelog_rows(detail.rows)
+        # Reserve space for the summary and one heading per ticket.  Individual
+        # logs are nested below their ticket, so repeated entries no longer
+        # need the old three-line-per-row allowance.
+        content_lines = sum(len(group) + 1 for group in groups)
+        return min(12, max(8, 4 + content_lines))
+
+    @staticmethod
+    def _group_timelog_rows(
+        rows: tuple[TimelogDetailRow, ...],
+    ) -> tuple[tuple[TimelogDetailRow, ...], ...]:
+        """Keep one ordered group for each ticket represented by the logs."""
+
+        grouped: dict[tuple[str, str], list[TimelogDetailRow]] = {}
+        for row in rows:
+            # Unlinked logs have no shared ticket identity, so keep each one
+            # visible instead of accidentally merging unrelated entries.
+            key = (
+                ("task", row.task_id)
+                if row.task_id
+                else ("timelog", row.timelog_id)
+            )
+            grouped.setdefault(key, []).append(row)
+        return tuple(tuple(group) for group in grouped.values())
 
     def _selected_detail_parts(
         self, model: WorktimePanelModel,
     ) -> tuple[tuple[str, str], ...]:
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state == "loading":
-            return (("상세 기록을 불러오는 중입니다.", "detail_comment"),)
+            return (("상세 기록을 불러오는 중입니다.", "detail_status"),)
         if detail.state == "unavailable":
-            return (("상세 기록을 확인할 수 없습니다.", "detail_comment"),)
+            return (("상세 기록을 확인할 수 없습니다.", "detail_status"),)
         if not detail.rows:
-            return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_comment"),)
+            return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_status"),)
         parts: list[tuple[str, str]] = [(
             f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}"
             f" · {len(detail.rows)}건\n",
             "detail_summary",
         )]
-        for index, row in enumerate(detail.rows, start=1):
-            comment = row.comment.strip() or "코멘트 없음"
+        for group in self._group_timelog_rows(detail.rows):
+            ticket = group[0]
+            group_total = sum(row.minutes for row in group)
             parts.extend((
-                (f"\n기록 {index}  ·  ", "detail_entry"),
-                (self._format_actual_minutes(row.minutes), "detail_duration"),
-                ("\n", "detail_entry"),
-                ("티켓  ", "detail_field"),
-                (f"{row.ticket_text}\n", "detail_ticket"),
-                ("코멘트\n", "detail_comment_label"),
-                (f"{comment}\n", "detail_comment"),
+                ("• ", "detail_group"),
+                (f"{ticket.ticket_text} · ", "detail_group"),
+                (self._format_actual_minutes(group_total), "detail_group_duration"),
+                ("\n", "detail_group"),
             ))
+            for row in group:
+                parts.extend((
+                    ("  ◦ ", "detail_child"),
+                    (self._format_actual_minutes(row.minutes), "detail_child_duration"),
+                    ("\n", "detail_child"),
+                ))
         return tuple(parts)
 
     def _selected_detail_text(self, model: WorktimePanelModel) -> str:
@@ -1663,47 +1688,40 @@ class WorktimeQuickPanel:
                         spacing3=6,
                     )
                     tag_configure(
-                        "detail_entry",
-                        foreground=_DETAIL_TIME_TEXT,
-                        font=("Segoe UI", 9, "bold"),
-                        spacing1=4,
-                        spacing3=2,
-                    )
-                    tag_configure(
-                        "detail_duration",
-                        foreground=_DETAIL_TIME_TEXT,
-                        background=_DETAIL_TIME_BG,
-                        font=("Segoe UI", 9, "bold"),
-                    )
-                    tag_configure(
-                        "detail_field",
+                        "detail_status",
                         foreground=_MUTED,
-                        font=("Segoe UI", 9, "bold"),
-                        lmargin1=12,
-                        lmargin2=12,
-                    )
-                    tag_configure(
-                        "detail_ticket",
-                        foreground=_TEXT,
-                        font=("Segoe UI", 10, "bold"),
+                        font=("Segoe UI", 9),
                         lmargin1=12,
                         lmargin2=12,
                         spacing3=4,
                     )
                     tag_configure(
-                        "detail_comment_label",
-                        foreground=_MUTED,
-                        font=("Segoe UI", 9, "bold"),
+                        "detail_group",
+                        foreground=_TEXT,
+                        font=("Segoe UI", 10, "bold"),
                         lmargin1=12,
                         lmargin2=12,
+                        spacing1=3,
+                        spacing3=2,
                     )
                     tag_configure(
-                        "detail_comment",
+                        "detail_group_duration",
+                        foreground=_DETAIL_TIME_TEXT,
+                        background=_DETAIL_TIME_BG,
+                        font=("Segoe UI", 9, "bold"),
+                    )
+                    tag_configure(
+                        "detail_child",
                         foreground=_MUTED,
                         font=("Segoe UI", 9),
                         lmargin1=28,
                         lmargin2=28,
-                        spacing3=6,
+                        spacing3=3,
+                    )
+                    tag_configure(
+                        "detail_child_duration",
+                        foreground=_DETAIL_TIME_TEXT,
+                        font=("Segoe UI", 9, "bold"),
                     )
                     for text, tag in tagged_parts:
                         widget.insert("end", text, tag)

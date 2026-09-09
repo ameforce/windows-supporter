@@ -21,5 +21,9 @@ dist/
 windows-supporter.exe
 *.egg-info/
 
+# Runtime and installer artifacts
+.windows-supporter.runtime-probe.json
+unins000.*
+
 # Logs
 *.log
