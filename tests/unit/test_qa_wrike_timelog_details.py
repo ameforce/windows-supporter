@@ -110,24 +110,30 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
     def select(self, index):
         self.panel._widgets["rows"][index][1].bindings["<Button-1>"](SimpleNamespace())
 
-    def test_selecting_date_keeps_each_log_and_excludes_other_dates(self):
+    def test_selecting_date_groups_same_ticket_and_excludes_other_dates(self):
         rows = (
             TimelogDetailRow("2026-04-06", "L1", "T1", 15, "first action", "Shared ticket", "ready"),
             TimelogDetailRow("2026-04-06", "L2", "T1", 45, "second action", "Shared ticket", "ready"),
             TimelogDetailRow("2026-04-07", "L3", "T2", 30, "Tuesday only", "Other ticket", "ready"),
         )
         self.make(_details(rows=rows))
-        self.assertEqual(self.detail_text().count("Shared ticket"), 2)
-        self.assertIn("first action", self.detail_text())
-        self.assertIn("second action", self.detail_text())
-        self.assertNotIn("Other ticket", self.detail_text())
+        text = self.detail_text()
+        self.assertEqual(text.count("Shared ticket"), 1)
+        self.assertIn("• Shared ticket · 01:00", text)
+        self.assertIn("  ◦ 00:15", text)
+        self.assertIn("  ◦ 00:45", text)
+        self.assertNotIn("first action", text)
+        self.assertNotIn("second action", text)
+        self.assertNotIn("Other ticket", text)
         self.select(1)
         self.assertIn("Other ticket", self.detail_text())
-        self.assertIn("Tuesday only", self.detail_text())
+        self.assertIn("• Other ticket · 00:30", self.detail_text())
+        self.assertIn("  ◦ 00:30", self.detail_text())
+        self.assertNotIn("Tuesday only", self.detail_text())
         self.assertNotIn("Shared ticket", self.detail_text())
         self.assertEqual(self.panel._selected_date_key, "2026-04-07")
 
-    def test_detail_text_separates_ticket_time_and_comment_for_scanning(self):
+    def test_detail_text_groups_ticket_and_hides_comments_for_scanning(self):
         rows = (
             TimelogDetailRow(
                 "2026-04-06",
@@ -152,12 +158,15 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         text = self.detail_text()
 
         self.assertIn("실제 기록 합계 03:30 · 2건", text)
-        self.assertIn("기록 1  ·  01:15", text)
-        self.assertIn("기록 2  ·  02:15", text)
-        self.assertIn("티켓  아주 긴 라이선스 검증 티켓 제목", text)
-        self.assertIn("코멘트\n첫 번째 작업 설명", text)
-        self.assertLess(text.index("기록 1"), text.index("첫 번째 작업 설명"))
-        self.assertGreaterEqual(self.panel._widgets["detail_text"].kwargs["height"], 11)
+        self.assertIn("• 아주 긴 라이선스 검증 티켓 제목 · 03:30", text)
+        self.assertIn("  ◦ 01:15", text)
+        self.assertIn("  ◦ 02:15", text)
+        self.assertEqual(text.count("아주 긴 라이선스 검증 티켓 제목"), 1)
+        self.assertNotIn("첫 번째 작업 설명", text)
+        self.assertNotIn("두 번째 작업 설명", text)
+        self.assertNotIn("코멘트", text)
+        self.assertNotIn("티켓  ", text)
+        self.assertGreaterEqual(self.panel._widgets["detail_text"].kwargs["height"], 8)
 
     def test_detail_viewport_grows_when_loaded_rows_replace_empty_snapshot(self):
         self.make(_details())
@@ -226,16 +235,21 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertNotIn("OLD PRIVATE COMMENT", self.detail_text())
         self.assertNotIn("기록이 없습니다", self.detail_text())
 
-    def test_missing_title_preserves_minutes_and_comment_with_distinct_fallback(self):
+    def test_missing_title_preserves_minutes_and_hides_comments_with_distinct_fallback(self):
+        task_ids = ("", "T1", "T2")
         rows = tuple(
-            TimelogDetailRow("2026-04-06", f"L{index}", "T" if index else "", 15, f"comment-{state}", title_state=state)
+            TimelogDetailRow("2026-04-06", f"L{index}", task_ids[index], 15, f"comment-{state}", title_state=state)
             for index, state in enumerate(("missing", "loading", "unavailable"))
         )
         self.make(_details(rows=rows))
+        text = self.detail_text()
+        self.assertIn("실제 기록 합계 00:45 · 3건", text)
         for row in rows:
-            self.assertIn(row.comment, self.detail_text())
-            self.assertIn(row.ticket_text, self.detail_text())
-        self.assertNotIn("기록이 없습니다", self.detail_text())
+            self.assertNotIn(row.comment, text)
+            self.assertIn(row.ticket_text, text)
+        self.assertEqual(text.count("  ◦ 00:15"), 3)
+        self.assertNotIn("코멘트", text)
+        self.assertNotIn("기록이 없습니다", text)
 
     def test_default_show_reopen_toggle_and_refresh_use_passive_path(self):
         self.make(_details())

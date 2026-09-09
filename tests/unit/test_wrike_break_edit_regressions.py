@@ -382,7 +382,10 @@ class BreakPanelReadabilityRegressions(unittest.TestCase):
             self.assertTrue(panel.refresh_now())
         self.assertEqual(text.yview()[0], 0.8)
         self.assertEqual(text.kwargs["state"], "disabled")
-        self.assertIn("긴 상세 내용 29", text.get("1.0", "end-1c"))
+        rendered = text.get("1.0", "end-1c")
+        self.assertIn("• Ticket title · 07:30", rendered)
+        self.assertEqual(rendered.count("  ◦ 00:15"), 30)
+        self.assertNotIn("긴 상세 내용 29", rendered)
         self.assertEqual(tk.toplevels[0].focus_force_calls, 0)
 
 
@@ -454,20 +457,30 @@ class ReviewFindingRegressions(unittest.TestCase):
         print("3946451098 calendar rows:", actual)
         self.assertEqual(actual, [(DAY, "23:00", "24:00"), ("2026-04-07", "00:00", "01:00")])
 
-    def test_3946451101_multiline_comment_does_not_change_semantic_styles(self):
+    def test_3946451101_grouped_timelog_uses_nested_duration_styles(self):
         rows = (
             TimelogDetailRow(DAY, "L1", "T1", 15, "comment first\ncomment second", "First heading", "ready"),
-            TimelogDetailRow(DAY, "L2", "T2", 30, "last comment", "Second heading", "ready"),
+            TimelogDetailRow(DAY, "L2", "T1", 30, "another comment", "First heading", "ready"),
+            TimelogDetailRow(DAY, "L3", "T2", 60, "last comment", "Second heading", "ready"),
         )
         panel, _ = self.panel(replace(_model(), day_details=_details(rows=rows)))
         widget = panel._widgets["detail_text"]
-        actual = {text: widget.tags_for(text) for text in ("First heading", "Second heading", "comment first", "comment second", "last comment")}
+        actual = {
+            text: widget.tags_for(text)
+            for text in ("First heading", "Second heading", "00:45", "00:15", "00:30")
+        }
         print("3946451101 semantic styles:", actual)
         self.assertEqual(actual, {
-            "First heading": ["detail_heading"], "Second heading": ["detail_heading"],
-            "comment first": ["detail_comment"], "comment second": ["detail_comment"],
-            "last comment": ["detail_comment"],
+            "First heading": ["detail_group"], "Second heading": ["detail_group"],
+            "00:45": ["detail_group_duration"], "00:15": ["detail_child_duration"],
+            "00:30": ["detail_child_duration"],
         })
+        rendered = widget.get("1.0", "end-1c")
+        self.assertIn("• First heading · 00:45\n  ◦ 00:15\n  ◦ 00:30", rendered)
+        self.assertIn("• Second heading · 01:00\n  ◦ 01:00", rendered)
+        self.assertNotIn("comment first", rendered)
+        self.assertNotIn("comment second", rendered)
+        self.assertNotIn("last comment", rendered)
 
     def test_3946451105_other_date_cannot_silently_save_hidden_day(self):
         fixture = self.wiring()
