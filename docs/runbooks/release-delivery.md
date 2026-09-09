@@ -51,6 +51,7 @@
 - task가 policy/docs/ref/worktree-only여도 tagged artifact는 필요하지만 UI-visible test나 앱 launch는 필요하지 않다.
 - build source가 clean exact tag인지, artifact metadata가 tag와 commit을 가리키는지 확인한다.
 - runtime·packaging release는 candidate build와 transactional deploy를 분리하고, deploy success/rollback receipt와 readiness evidence를 고정한 뒤에만 publish로 진행한다.
+- installer를 배포하는 release는 `tools/build_installer.ps1`로 `WindowsSupporter-vX.Y.Z-Setup.exe`와 동일 이름의 `.sha256` sidecar를 clean exact tag에서 생성한다. 두 asset을 같은 GitHub Release에 업로드하고 `gh release view`로 asset 이름·URL·draft/prerelease 상태를 read-back한다.
 
 ## 6. develop back-merge
 
