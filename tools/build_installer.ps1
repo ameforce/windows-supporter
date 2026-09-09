@@ -32,6 +32,15 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "Version must be an exact semantic version such as 0.22.0."
 }
 
+$headTag = Invoke-GitText @("describe", "--tags", "--exact-match", "HEAD")
+$headVersion = $headTag.Trim()
+if ($headVersion.StartsWith("v", [StringComparison]::OrdinalIgnoreCase)) {
+    $headVersion = $headVersion.Substring(1)
+}
+if ($headVersion -ne $Version) {
+    throw "Installer version $Version does not match the exact HEAD tag $headTag."
+}
+
 if (-not $SkipBuild) {
     $status = Invoke-GitText @("status", "--porcelain", "--untracked-files=all")
     if ($status) {
@@ -87,6 +96,20 @@ if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
     throw "Expected PyInstaller artifact was not found: $sourceExe"
 }
 
+$sourceVersionInfo = (Get-Item -LiteralPath $sourceExe).VersionInfo
+$escapedVersion = [regex]::Escape($Version)
+$versionPrefixPattern = "^(?:v)?$escapedVersion(?:\.\d+)?(?:\s|$)"
+foreach ($field in @("FileVersion", "ProductVersion")) {
+    $value = [string]$sourceVersionInfo.$field
+    if ($value -notmatch $versionPrefixPattern) {
+        throw "Source executable $field $value does not match release version $Version."
+    }
+}
+$comments = [string]$sourceVersionInfo.Comments
+if ($comments -notmatch "^(?:v)?$escapedVersion(?:\.\d+)?\s+\(") {
+    throw "Source executable Comments '$comments' does not identify release version $Version."
+}
+
 Remove-Item -LiteralPath $installerPath, $sidecarPath -Force -ErrorAction SilentlyContinue
 & $compiler "/DAppVersion=$Version" "/DSourceExe=$sourceExe" "/O$outputDirectory" $installerDefinition
 if ($LASTEXITCODE -ne 0) {
@@ -112,3 +135,6 @@ if (-not $KeepBuildArtifacts) {
 Write-Output "INSTALLER_ARTIFACT=$installerPath"
 Write-Output "INSTALLER_SHA256=$hash"
 Write-Output "INSTALLER_SHA256_FILE=$sidecarPath"
+Write-Output "SOURCE_EXE_FILE_VERSION=$($sourceVersionInfo.FileVersion)"
+Write-Output "SOURCE_EXE_PRODUCT_VERSION=$($sourceVersionInfo.ProductVersion)"
+Write-Output "SOURCE_EXE_COMMENTS=$comments"

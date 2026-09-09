@@ -7,7 +7,12 @@
 - `WindowsSupporter-vX.Y.Z-Setup.exe`
 - `WindowsSupporter-vX.Y.Z-Setup.exe.sha256`
 
-installer를 임시 경로에 다운로드한 뒤 SHA-256을 확인하고, 검증이 끝난 installer만 현재 설치 경로에 `/VERYSILENT /CLOSEAPPLICATIONS`로 적용한다. 설치 실패 시 기존 실행 파일 백업을 복원하고 앱을 다시 시작한다.
+installer를 임시 경로에 다운로드한 뒤 SHA-256을 확인하고, 기존 Windows
+Supporter 프로세스가 종료된 경우에만 검증이 끝난 installer를 현재 설치
+경로에 /VERYSILENT /CLOSEAPPLICATIONS 옵션으로 적용한다. installer 종료
+후에는 설치된 실행 파일의 hash, FileVersion, ProductVersion, Comments를
+Release candidate와 대조한 뒤에만 새 앱을 실행하고 완료로 기록한다. 설치
+실패 또는 버전 불일치 시 기존 실행 파일 백업을 복원하고 앱을 다시 시작한다.
 
 GitHub Actions workflow는 추가하지 않는다. 빌드, asset 업로드, Release read-back은 로컬 릴리즈 절차와 `gh` CLI 증거가 소유한다.
 
