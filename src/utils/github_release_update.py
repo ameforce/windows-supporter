@@ -18,7 +18,12 @@ GITHUB_LATEST_RELEASE_URL = (
     f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 )
 GITHUB_RELEASE_HOSTS = frozenset(
-    {"api.github.com", "github.com", "objects.githubusercontent.com"}
+    {
+        "api.github.com",
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    }
 )
 SHA256_RE = re.compile(r"(?i)(?:sha256:)?(?P<digest>[0-9a-f]{64})")
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
