@@ -68,7 +68,7 @@ class UpdateSettingsView:
         ).grid(row=0, column=0, columnspan=3, sticky="w")
         tk.Label(
             body,
-            text="Git checkout 기반 자동 업데이트 확인과 수동 업데이트 실행을 관리합니다.",
+            text="GitHub Release installer 기반 자동 업데이트 확인과 수동 업데이트 실행을 관리합니다.",
             bg=card_bg,
             fg=muted,
             font=("Segoe UI", 9),

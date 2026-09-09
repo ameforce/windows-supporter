@@ -14,9 +14,14 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from src.utils.app_version import get_app_version
+from src.utils.github_release_update import (
+    GitHubReleaseClient,
+    GitHubReleaseUpdateError,
+    ReleaseCandidate,
+)
 from src.utils.progress_subprocess import run_no_window_with_progress
 from src.utils.runtime_deploy import RuntimeDeployError, deploy_runtime, restart_runtime
 from src.utils.subprocess_utils import popen_no_window, run_no_window
@@ -50,6 +55,9 @@ UPDATE_HANDOFF_FILENAME = "update_handoff.json"
 UPDATE_HANDOFF_EXECUTABLE_NAME = "windows-supporter-updater.exe"
 UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS = 15.0
 UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS = 1800
+UPDATE_RELEASE_MODE = "github_release_installer"
+UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS = 900
+UPDATE_RELEASE_SOURCE_EXIT_TIMEOUT_SECONDS = 25.0
 UPDATE_PROGRESS_TITLE = "Windows Supporter 업데이트"
 UPDATE_PROGRESS_FAILURE_TITLE = "Windows Supporter 업데이트 실패"
 UPDATE_PROGRESS_LOG_BUTTON_TEXT = "로그 열기"
@@ -251,6 +259,38 @@ def close_running_git_gui_processes(
 class UpdateCandidate:
     tag: str
     version: tuple[int, int, int]
+    installer_name: str = ""
+    installer_url: str = ""
+    installer_sha256: str = ""
+    release_url: str = ""
+    release_body: str = ""
+
+    @classmethod
+    def from_release(cls, candidate: ReleaseCandidate) -> "UpdateCandidate":
+        return cls(
+            tag=candidate.tag,
+            version=candidate.version,
+            installer_name=candidate.installer_name,
+            installer_url=candidate.installer_url,
+            installer_sha256=candidate.installer_sha256,
+            release_url=candidate.release_url,
+            release_body=candidate.release_body,
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "tag": self.tag,
+            "version": list(self.version),
+            "installer_name": self.installer_name,
+            "installer_url": self.installer_url,
+            "installer_sha256": self.installer_sha256,
+            "release_url": self.release_url,
+            "release_body": self.release_body,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "UpdateCandidate":
+        return cls.from_release(ReleaseCandidate.from_payload(payload))
 
 
 @dataclass(frozen=True)
@@ -287,6 +327,8 @@ UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("checking", "업데이트 확인 중", "현재 버전과 원격 릴리스를 확인합니다.", 6),
     UpdateProgressStep("available", "업데이트 준비 완료", "새 버전을 설치할 수 있습니다.", 14),
     UpdateProgressStep("accepted", "업데이트 요청 접수", "선택한 버전을 설치할 준비를 시작합니다.", 20),
+    UpdateProgressStep("release_download", "installer 다운로드 중", "GitHub Release installer를 안전하게 다운로드합니다.", 54),
+    UpdateProgressStep("release_install", "installer 설치 중", "검증된 installer를 현재 설치 위치에 적용합니다.", 82),
     UpdateProgressStep("preflight", "업데이트 사전 점검 중", "Git 상태와 로컬 변경 여부를 확인합니다.", 28),
     UpdateProgressStep("stash", "변경 사항 스태시 중", "커밋되지 않은 변경을 stash로 보존합니다.", 38),
     UpdateProgressStep("cleanup", "빌드 산출물 정리 중", "무시된 빌드 산출물을 allowlist 범위에서 정리합니다.", 46),
@@ -930,9 +972,13 @@ def build_update_handoff_payload(
     working_tree: UpdateWorkingTreeState | None = None,
     log_path: str | os.PathLike[str] | None = None,
     preflight: dict[str, Any] | None = None,
+    mode: str = "",
+    candidate: UpdateCandidate | Mapping[str, Any] | None = None,
+    source_pid: int | None = None,
+    install_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     tree = working_tree or UpdateWorkingTreeState()
-    return {
+    payload: dict[str, Any] = {
         "version": 1,
         "status": "pending",
         "repo_root": str(Path(repo_root).resolve()),
@@ -951,6 +997,19 @@ def build_update_handoff_payload(
         "preflight": dict(preflight or {}),
         "progress": build_update_progress_snapshot("handoff", state="pending"),
     }
+    if str(mode or "").strip():
+        payload["mode"] = str(mode).strip()
+    if candidate is not None:
+        payload["candidate"] = (
+            candidate.as_payload()
+            if isinstance(candidate, UpdateCandidate)
+            else dict(candidate)
+        )
+    if source_pid is not None:
+        payload["source_pid"] = int(source_pid)
+    if install_dir is not None:
+        payload["install_dir"] = str(Path(install_dir).resolve())
+    return payload
 
 
 def _resolve_script_path(
@@ -1903,6 +1962,245 @@ class UpdateHandoffProgressUi:
         return
 
 
+def _process_exists(pid: int) -> bool:
+    process_id = int(pid or 0)
+    if process_id <= 0 or process_id == os.getpid():
+        return False
+    try:
+        os.kill(process_id, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _wait_for_process_exit(
+    pid: int,
+    *,
+    timeout_seconds: float = UPDATE_RELEASE_SOURCE_EXIT_TIMEOUT_SECONDS,
+    process_exists: Callable[[int], bool] = _process_exists,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> bool:
+    process_id = int(pid or 0)
+    if process_id <= 0 or process_id == os.getpid():
+        return True
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while process_exists(process_id) and monotonic() < deadline:
+        sleep(0.1)
+    return not process_exists(process_id)
+
+
+def run_release_update_handoff(
+    state_path: str | os.PathLike[str],
+    *,
+    release_client: GitHubReleaseClient | None = None,
+    installer_launcher=popen_no_window,
+    target_launcher=popen_no_window,
+    progress_ui_factory=UpdateHandoffProgressUi,
+    process_exists: Callable[[int], bool] = _process_exists,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> int:
+    state_path = str(state_path)
+    state = read_update_handoff_state(state_path)
+    repo_root = str(state.get("repo_root") or "").strip()
+    log_path = str(state.get("log_path") or get_update_log_path())
+    root_executable = Path(repo_root) / "windows-supporter.exe"
+    progress_ui = progress_ui_factory(log_path=log_path) if callable(progress_ui_factory) else None
+    backup_path = (
+        Path(get_update_state_dir())
+        / f"windows-supporter-pre-release-update-{os.getpid()}-{int(time.time())}.exe"
+    )
+    downloaded_path: Path | None = None
+    restored = False
+
+    def publish(snapshot: dict[str, Any], *, first: bool = False) -> None:
+        if progress_ui is not None:
+            if first:
+                progress_ui.show(snapshot)
+            else:
+                progress_ui.set_snapshot(snapshot)
+        update_handoff_state(state_path, status="running", progress=snapshot)
+
+    try:
+        if not repo_root or not root_executable.is_file():
+            raise UpdateHandoffError("설치 대상 windows-supporter.exe를 찾을 수 없습니다.")
+        candidate = UpdateCandidate.from_payload(state.get("candidate") or {})
+        client = release_client or GitHubReleaseClient()
+        release_candidate = ReleaseCandidate.from_payload(candidate.as_payload())
+        install_dir = Path(str(state.get("install_dir") or repo_root)).resolve()
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root_executable, backup_path)
+
+        start_progress = build_update_progress_snapshot(
+            "handoff_start",
+            state="running",
+            detail="GitHub Release installer 업데이트 프로세스를 시작했습니다.",
+            log_path=log_path,
+        )
+        publish(start_progress, first=True)
+        update_handoff_state(
+            state_path,
+            status="running",
+            acknowledged_at=time.time(),
+            progress=start_progress,
+        )
+
+        source_pid = int(state.get("source_pid") or 0)
+        if source_pid > 0 and source_pid != os.getpid():
+            shutdown_progress = build_update_progress_snapshot(
+                "shutdown",
+                state="running",
+                detail="기존 Windows Supporter 종료를 확인하는 중입니다.",
+                log_path=log_path,
+            )
+            publish(shutdown_progress)
+            if not _wait_for_process_exit(
+                source_pid,
+                process_exists=process_exists,
+                sleep=sleep,
+                monotonic=monotonic,
+            ):
+                append_update_log(log_path, "source process did not exit before installer launch")
+
+        download_progress = build_update_progress_snapshot(
+            "release_download",
+            state="running",
+            detail=f"{candidate.tag} installer를 다운로드하고 SHA-256을 확인합니다.",
+            log_path=log_path,
+        )
+        publish(download_progress)
+        downloaded_path = client.download_installer(
+            release_candidate,
+            Path(get_update_state_dir()) / "release-downloads",
+        )
+        append_update_log(log_path, f"verified installer: {downloaded_path}")
+
+        install_progress = build_update_progress_snapshot(
+            "release_install",
+            state="running",
+            detail="검증된 installer를 현재 설치 경로에 적용합니다.",
+            log_path=log_path,
+        )
+        publish(install_progress)
+        installer_command = [
+            str(downloaded_path),
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+            f'/DIR="{install_dir}"',
+        ]
+        update_handoff_state(state_path, installer_command=installer_command)
+        installer_process = installer_launcher(
+            installer_command,
+            cwd=str(install_dir),
+            env=build_relaunch_environment(os.environ),
+        )
+        if installer_process is None:
+            raise UpdateHandoffError("GitHub Release installer 실행을 시작하지 못했습니다.")
+        wait = getattr(installer_process, "wait", None)
+        if not callable(wait):
+            raise UpdateHandoffError("GitHub Release installer 프로세스 상태를 확인할 수 없습니다.")
+        return_code = wait(timeout=UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS)
+        if int(return_code or 0) != 0:
+            raise UpdateHandoffError(f"GitHub Release installer가 exit code {return_code}로 종료됐습니다.")
+        if not root_executable.is_file():
+            raise UpdateHandoffError("installer 종료 후 새 windows-supporter.exe를 찾을 수 없습니다.")
+
+        relaunch_progress = build_update_progress_snapshot(
+            "relaunch",
+            state="running",
+            detail="새 Windows Supporter를 재실행합니다.",
+            log_path=log_path,
+        )
+        publish(relaunch_progress)
+        target_process = target_launcher(
+            [str(root_executable)],
+            cwd=str(install_dir),
+            env=build_relaunch_environment(os.environ),
+        )
+        if target_process is None:
+            raise UpdateHandoffError("installer 적용 후 Windows Supporter 재실행을 시작하지 못했습니다.")
+
+        complete_progress = build_update_progress_snapshot(
+            "complete",
+            state="complete",
+            detail=f"{candidate.tag} installer 업데이트가 완료되었습니다.",
+            log_path=log_path,
+        )
+        if progress_ui is not None:
+            progress_ui.set_snapshot(complete_progress)
+        update_handoff_state(
+            state_path,
+            status="complete",
+            completed_at=time.time(),
+            candidate=candidate.as_payload(),
+            installer_path=str(downloaded_path),
+            progress=complete_progress,
+        )
+        append_update_log(log_path, "GitHub Release installer handoff completed")
+        backup_path.unlink(missing_ok=True)
+        if downloaded_path is not None:
+            downloaded_path.unlink(missing_ok=True)
+        if progress_ui is not None:
+            progress_ui.close()
+        return 0
+    except Exception as exc:
+        recovery_error = ""
+        try:
+            if backup_path.is_file():
+                shutil.copy2(backup_path, root_executable)
+                restored = True
+                backup_path.unlink(missing_ok=True)
+        except Exception as recovery_exc:
+            recovery_error = str(recovery_exc)
+        if restored and not process_exists(int(state.get("source_pid") or 0)):
+            try:
+                target_launcher(
+                    [str(root_executable)],
+                    cwd=repo_root,
+                    env=build_relaunch_environment(os.environ),
+                )
+            except Exception as relaunch_exc:
+                recovery_error = str(relaunch_exc)
+        diagnostic = str(exc)
+        if recovery_error:
+            diagnostic = f"{diagnostic} (recovery={recovery_error})"
+        failed_progress = build_update_progress_snapshot(
+            "failed",
+            state="failed",
+            detail="GitHub Release installer 업데이트에 실패했습니다.",
+            log_path=log_path,
+            failed_step="installer 업데이트",
+            can_retry=True,
+            can_manual_action=True,
+        )
+        try:
+            if progress_ui is not None:
+                progress_ui.set_snapshot(failed_progress)
+            update_handoff_state(
+                state_path,
+                status="failed",
+                failed_at=time.time(),
+                failed_step="installer 업데이트",
+                error=diagnostic,
+                recovery_status="restored" if restored else "failed",
+                progress=failed_progress,
+            )
+            append_update_log(log_path, f"GitHub Release installer handoff failed: {diagnostic}")
+        except Exception:
+            pass
+        if progress_ui is not None:
+            try:
+                progress_ui.close()
+            except Exception:
+                pass
+        return 1
+
+
 def run_update_handoff(
     state_path: str | os.PathLike[str],
     *,
@@ -1916,6 +2214,8 @@ def run_update_handoff(
 ) -> int:
     state_path = str(state_path)
     state = read_update_handoff_state(state_path)
+    if str(state.get("mode") or "").strip() == UPDATE_RELEASE_MODE:
+        return run_release_update_handoff(state_path)
     repo_root = str(state.get("repo_root") or "").strip()
     log_path = str(state.get("log_path") or get_update_log_path())
     if not repo_root:
@@ -2272,6 +2572,7 @@ class WindowsSupporterUpdater:
         settings_path_provider=get_update_settings_path,
         git_gui_process_detector=None,
         progress_ui_factory=UpdateHandoffProgressUi,
+        release_client: GitHubReleaseClient | None = None,
     ) -> None:
         self._root = root
         self._event_queue = event_queue
@@ -2291,6 +2592,7 @@ class WindowsSupporterUpdater:
         self._worktree_runner = worktree_runner
         self._settings_path_provider = settings_path_provider
         self._progress_ui_factory = progress_ui_factory
+        self._release_client = release_client
         self._preflight_progress_ui = None
         self._show_preflight_progress_ui = False
         if callable(git_gui_process_detector):
@@ -2309,6 +2611,7 @@ class WindowsSupporterUpdater:
         self._state = "idle"
         self._current_tag = ""
         self._latest_tag = ""
+        self._latest_candidate: UpdateCandidate | None = None
         self._last_error = ""
         self._working_tree_state = UpdateWorkingTreeState()
         self._progress_snapshot = build_update_progress_snapshot("idle", state="idle")
@@ -2363,6 +2666,7 @@ class WindowsSupporterUpdater:
             "state": self._state,
             "current_tag": self._current_tag,
             "latest_tag": self._latest_tag,
+            "update_source": "github_release" if self._release_client is not None else "git_checkout",
             "last_error": self._last_error,
             "auto_update": self.get_settings_snapshot(),
             "working_tree": {
@@ -2413,7 +2717,10 @@ class WindowsSupporterUpdater:
 
     def _mark_unavailable_if_needed(self) -> bool:
         message = ""
-        if not is_git_checkout_root(self._repo_root):
+        if self._release_client is not None:
+            if not (Path(self._repo_root) / "windows-supporter.exe").is_file():
+                message = "설치된 windows-supporter.exe 경로를 찾을 수 없습니다."
+        elif not is_git_checkout_root(self._repo_root):
             message = GIT_CHECKOUT_UNAVAILABLE_MESSAGE
         elif not is_primary_worktree(self._repo_root, runner=self._worktree_runner):
             message = NON_PRIMARY_WORKTREE_UNAVAILABLE_MESSAGE
@@ -2479,6 +2786,24 @@ class WindowsSupporterUpdater:
     def _collect_update_candidate(
         self,
     ) -> tuple[UpdateCandidate | None, UpdateWorkingTreeState, str]:
+        if self._release_client is not None:
+            describe = ""
+            try:
+                version = self._app_version_provider()
+                current_tag = resolve_current_tag(app_version=version, git_describe=describe)
+                self._current_tag = current_tag
+                current_version = parse_semver_tag(current_tag)
+                if current_version is None:
+                    return None, UpdateWorkingTreeState(), "현재 설치 버전을 확인할 수 없습니다."
+                release = self._release_client.fetch_latest(current_version)
+                if release is None:
+                    return None, UpdateWorkingTreeState(), ""
+                return UpdateCandidate.from_release(release), UpdateWorkingTreeState(), ""
+            except GitHubReleaseUpdateError as exc:
+                return None, UpdateWorkingTreeState(), str(exc)
+            except Exception as exc:
+                return None, UpdateWorkingTreeState(), f"GitHub Release 업데이트 확인 실패: {exc}"
+
         describe = self._git_output(["git", "describe", "--tags", "--long", "--match", "v[0-9]*"])
         current_tag = resolve_current_tag(
             app_version=self._app_version_provider(),
@@ -2568,6 +2893,7 @@ class WindowsSupporterUpdater:
             )
         if candidate is None:
             self._latest_tag = ""
+            self._latest_candidate = None
             self._state = "error" if error else "current"
             self._progress_snapshot = (
                 build_update_progress_snapshot(
@@ -2587,6 +2913,7 @@ class WindowsSupporterUpdater:
             return
 
         self._latest_tag = candidate.tag
+        self._latest_candidate = candidate
         self._state = "update_available"
         self._progress_snapshot = build_update_progress_snapshot(
             "available",
@@ -2605,28 +2932,29 @@ class WindowsSupporterUpdater:
                 detail=f"{candidate.tag} 업데이트 요청을 접수했습니다.",
                 show_ui=True,
             )
-            try:
-                working_tree = self._inspect_working_tree_state()
-            except Exception as exc:
-                self._state = "error"
-                self._last_error = f"Git 상태를 확인할 수 없습니다: {exc}"
-                self._publish_update_progress(
-                    "failed",
-                    state="failed",
-                    detail=self._last_error,
-                    failed_step="Git 상태 확인",
-                    can_retry=True,
-                    can_manual_action=True,
-                )
-                return
-            self._working_tree_state = working_tree
-            if working_tree.has_source_changes:
-                self._show_warning(
-                    "Windows Supporter 업데이트",
-                    UPDATE_SOURCE_CHANGE_NOTICE,
-                )
-            if not self._prepare_repository_for_update(working_tree):
-                return
+            if self._release_client is None:
+                try:
+                    working_tree = self._inspect_working_tree_state()
+                except Exception as exc:
+                    self._state = "error"
+                    self._last_error = f"Git 상태를 확인할 수 없습니다: {exc}"
+                    self._publish_update_progress(
+                        "failed",
+                        state="failed",
+                        detail=self._last_error,
+                        failed_step="Git 상태 확인",
+                        can_retry=True,
+                        can_manual_action=True,
+                    )
+                    return
+                self._working_tree_state = working_tree
+                if working_tree.has_source_changes:
+                    self._show_warning(
+                        "Windows Supporter 업데이트",
+                        UPDATE_SOURCE_CHANGE_NOTICE,
+                    )
+                if not self._prepare_repository_for_update(working_tree):
+                    return
             self.launch_update()
         else:
             self._session.dismiss(candidate.tag)
@@ -3048,6 +3376,10 @@ class WindowsSupporterUpdater:
                 working_tree=self._working_tree_state,
                 log_path=log_path,
                 preflight=self._preflight_result,
+                mode=UPDATE_RELEASE_MODE if self._release_client is not None else "",
+                candidate=self._latest_candidate if self._release_client is not None else None,
+                source_pid=os.getpid() if self._release_client is not None else None,
+                install_dir=self._repo_root if self._release_client is not None else None,
             )
             payload["recovery_executable_path"] = str(
                 get_update_handoff_executable_path(handoff_path.parent)
