@@ -336,158 +336,61 @@ async () => {
     if (/(log in|sign in|logout|log out|로그인|로그아웃|설정|settings)/i.test(lowered)) return '';
     return text;
   };
-  const safeQueryAll = (selector) => {
+  const fetchIdentityJson = async (path, headers = {}) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
     try {
-      return Array.from(document.querySelectorAll(selector));
-    } catch (_) {
-      return [];
-    }
-  };
-  const collectStoredProfileName = () => {
-    const userIds = new Set();
-    try {
-      for (let index = 0; index < localStorage.length; index += 1) {
-        const key = String(localStorage.key(index) || '');
-        const match = key.match(/(?:^|\/)(user-[A-Za-z0-9_-]+)/);
-        if (match && match[1]) userIds.add(match[1]);
-      }
-    } catch (_) {}
-    if (!userIds.size) return '';
-    const parseMaybeJson = (value) => {
-      if (typeof value !== 'string') return value;
-      const text = value.trim();
-      if (!text || !/^[\[{"]/.test(text)) return value;
-      try {
-        return JSON.parse(text);
-      } catch (_) {
-        return value;
-      }
-    };
-    const candidateFromObject = (obj) => {
-      if (!obj || typeof obj !== 'object') return '';
-      const rawUserId = String(obj.user_id || obj.userId || '');
-      if (rawUserId && userIds.has(rawUserId)) {
-        for (const key of ['display_name', 'displayName', 'name', 'full_name', 'fullName']) {
-          const candidate = cleanProfileName(obj[key]);
-          if (candidate) return candidate;
-        }
-      }
-      const author = obj.author;
-      if (author && typeof author === 'object') {
-        const authorUserId = String(author.user_id || author.userId || '');
-        if (authorUserId && userIds.has(authorUserId)) {
-          for (const key of ['display_name', 'displayName', 'name', 'full_name', 'fullName']) {
-            const candidate = cleanProfileName(author[key]);
-            if (candidate) return candidate;
-          }
-        }
-      }
-      return '';
-    };
-    const walk = (value, depth = 0, seen = new Set()) => {
-      if (depth > 6 || value == null) return '';
-      value = parseMaybeJson(value);
-      if (value == null || typeof value !== 'object') return '';
-      if (seen.has(value)) return '';
-      seen.add(value);
-      const direct = candidateFromObject(value);
-      if (direct) return direct;
-      if (Array.isArray(value)) {
-        for (const item of value.slice(0, 80)) {
-          const candidate = walk(item, depth + 1, seen);
-          if (candidate) return candidate;
-        }
-        return '';
-      }
-      for (const item of Object.values(value).slice(0, 120)) {
-        const candidate = walk(item, depth + 1, seen);
-        if (candidate) return candidate;
-      }
-      return '';
-    };
-    try {
-      for (let index = 0; index < localStorage.length; index += 1) {
-        const key = String(localStorage.key(index) || '');
-        if (!/(cache\/user-|oai\/apps|account|profile|session)/i.test(key)) continue;
-        const raw = localStorage.getItem(key) || '';
-        if (!raw || raw.length > 1000000) continue;
-        const candidate = walk(raw);
-        if (candidate) return candidate;
-      }
-    } catch (_) {}
-    return '';
-  };
-  const collectSessionIdentity = async () => {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2500);
-      const response = await fetch('/api/auth/session', {
+      const response = await fetch(path, {
         credentials: 'include',
         cache: 'no-store',
+        redirect: 'error',
+        headers,
         signal: controller.signal,
       });
+      return { status: response.status, data: response.ok ? await response.json() : null };
+    } finally {
       clearTimeout(timeout);
-      if (!response.ok) return { profileName: '', accountId: '', planType: '' };
-      const session = await response.json();
-      const user = session && session.user && typeof session.user === 'object'
-        ? session.user
-        : {};
-      const account = session && session.account && typeof session.account === 'object'
-        ? session.account
-        : {};
-      return {
-        profileName: cleanProfileName(user.name || user.displayName || ''),
-        accountId: String(
-          account.id || account.account_id || account.accountId
-          || session.account_id || session.accountId
-          || user.account_id || user.accountId || ''
-        ).trim(),
-        planType: String(
-          account.planType || account.plan_type || session.planType || session.plan_type || ''
-        ).trim(),
-      };
-    } catch (_) {
-      return { profileName: '', accountId: '', planType: '' };
     }
   };
-  const sessionIdentity = await collectSessionIdentity();
-  const collectProfileName = async () => {
-    if (sessionIdentity.profileName) return sessionIdentity.profileName;
-    const stored = collectStoredProfileName();
-    if (stored) return stored;
-    const selectors = [
-      '[data-testid*="profile" i]',
-      '[data-testid*="account" i]',
-      '[aria-label*="profile" i]',
-      '[aria-label*="account" i]',
-      '[aria-label*="프로필" i]',
-      '[aria-label*="계정" i]',
-      'button[aria-haspopup="menu"]',
-      'button[aria-expanded]',
-    ];
-    const seen = new Set();
-    for (const selector of selectors) {
-      for (const node of safeQueryAll(selector)) {
-        const nodeIdentity = normalize([
-          node.getAttribute ? node.getAttribute('data-testid') : '',
-          node.getAttribute ? node.getAttribute('aria-label') : '',
-          node.getAttribute ? node.getAttribute('title') : '',
-        ].join(' ')).toLowerCase();
-        if (!/(profile|account|프로필|계정)/i.test(nodeIdentity)) continue;
-        for (const raw of [
-          node.getAttribute ? node.getAttribute('aria-label') : '',
-          node.getAttribute ? node.getAttribute('title') : '',
-          node.innerText || node.textContent || '',
-        ]) {
-          const candidate = cleanProfileName(raw);
-          if (candidate && !seen.has(candidate)) {
-            seen.add(candidate);
-            return candidate;
-          }
-        }
+  const collectSessionIdentity = async () => {
+    const identity = { profileName: '', accountId: '', planType: '' };
+    try {
+      const result = await fetchIdentityJson('/api/auth/session');
+      const session = result.data;
+      if (!session || typeof session !== 'object') return identity;
+      const user = session.user && typeof session.user === 'object' ? session.user : {};
+      const account = session.account && typeof session.account === 'object' ? session.account : {};
+      identity.accountId = String(
+        account.id || account.account_id || account.accountId
+        || session.account_id || session.accountId
+        || user.account_id || user.accountId || ''
+      ).trim();
+      identity.planType = String(
+        account.planType || account.plan_type || session.planType || session.plan_type || ''
+      ).trim();
+      const userId = typeof user.id === 'string' ? user.id.trim() : '';
+      if (!userId || typeof session.accessToken !== 'string' || !session.accessToken) {
+        return identity;
       }
+      // ChatGPT's editable profile is separate from the login provider's name.
+      // Resolve it for this exact session user, without opening a menu or trusting caches.
+      const profileResult = await fetchIdentityJson(
+        '/backend-api/calpico/chatgpt/profile/' + encodeURIComponent(userId),
+        { Authorization: 'Bearer ' + session.accessToken }
+      );
+      const profile = profileResult.data;
+      if (profileResult.status === 404) {
+        identity.profileName = cleanProfileName(user.displayName || user.name || '');
+      } else if (profile && profile.user_id === userId) {
+        const customName = typeof profile.display_name === 'string'
+          ? normalize(profile.display_name) : '';
+        identity.profileName = customName && customName.length <= 96
+          ? customName : cleanProfileName(user.displayName || user.name || '');
+      }
+    } catch (_) {
+      // Preserve usage collection and the last verified name on transient identity errors.
     }
-    return '';
+    return identity;
   };
   const collectResetCandidates = (boundary, labelEl) => {
     const resetCandidates = [];
@@ -610,11 +513,15 @@ async () => {
       boundary_role: boundary.getAttribute ? (boundary.getAttribute('role') || '') : '',
     });
   }
+  // Readiness retries must inspect the DOM without repeating slow identity calls.
+  // The monitor only accepts snapshots with a usage-limit block, not credits alone.
+  const sessionIdentity = metricBlocks.some((block) => block.metric_key !== 'remaining_credit')
+    ? await collectSessionIdentity() : { profileName: '', accountId: '', planType: '' };
   return {
     url: location.href,
     title: document.title,
     mainText: normalize(scope.innerText || scope.textContent || ''),
-    profileName: await collectProfileName(),
+    profileName: sessionIdentity.profileName,
     accountId: sessionIdentity.accountId,
     planType: sessionIdentity.planType,
     metricBlocks,
@@ -689,10 +596,13 @@ _PROFILE_NAME_REJECT_FRAGMENT_PATTERN = re.compile(
 )
 
 
-def sanitize_profile_name(value: Any) -> str:
+def sanitize_profile_name(value: Any, *, verified: bool = False) -> str:
     text = normalize_usage_value(str(value or ""))
     if not text or len(text) > 96:
         return ""
+    if verified:
+        # Structured, identity-bound names are literal user data, not menu labels.
+        return text
     text = re.sub(
         r"^(?:account|profile|user)\s+menu\s*[:：\-]?\s*",
         "",
@@ -1731,6 +1641,7 @@ def merge_snapshot_with_previous(
         key for key in USAGE_METRIC_KEYS if key in set(current.reported_metric_keys)
     )
     has_reported_metric_contract = bool(reported_metric_keys)
+    fresh_metric_keys = {key for key in reported_metric_keys if merged.get(key)}
     for key in USAGE_METRIC_KEYS:
         if not merged.get(key) and (
             not has_reported_metric_contract or key in reported_metric_keys
@@ -1750,7 +1661,10 @@ def merge_snapshot_with_previous(
         if has_reported_metric_contract and metric_key not in reported_metric_keys:
             merged[key] = ""
             continue
-        if not merged.get(key):
+        # A freshly observed value and its reset belong to the same window.
+        # After a manual reset the page may report 100% without a deadline;
+        # borrowing the previous window's deadline would fabricate freshness.
+        if not merged.get(key) and metric_key not in fresh_metric_keys:
             merged[key] = prev_payload.get(key, "")
     if not merged.get("captured_at"):
         merged["captured_at"] = prev_payload.get("captured_at", "")
@@ -1871,6 +1785,7 @@ class CodexUsageMonitor:
         self.__monitor_state = "idle"
         self.__session_state = "logged_out"
         self.__profile_name = ""
+        self.__profile_name_verified = False
         self.__account_id = ""
         self.__auth_attention_required = False
         self.__auth_attention_reason = ""
@@ -2164,6 +2079,7 @@ class CodexUsageMonitor:
             self.__snapshot_backfill_allowed = False
             self.__set_session_state("logged_out")
             self.__profile_name = ""
+            self.__profile_name_verified = False
             self.__account_id = ""
             self.__clear_auth_attention()
             self.__save_state()
@@ -2306,8 +2222,9 @@ class CodexUsageMonitor:
         self.__session_state = normalized
         return
 
-    def __set_profile_name(self, value: Any) -> None:
-        self.__profile_name = sanitize_profile_name(value)
+    def __set_profile_name(self, value: Any, *, verified: bool = False) -> None:
+        self.__profile_name = sanitize_profile_name(value, verified=verified)
+        self.__profile_name_verified = bool(verified and self.__profile_name)
         return
 
     def __probe_identity_matches_bound_account(self, incoming_account_id: Any) -> bool:
@@ -2324,9 +2241,12 @@ class CodexUsageMonitor:
         normalized_account = normalize_usage_value(account_id)
         if normalized_account:
             self.__account_id = normalized_account
-        sanitized_name = sanitize_profile_name(profile_name)
+        # The current probe emits names only from the identity-bound profile API
+        # or its explicit session fallback; it no longer reads names from the DOM.
+        sanitized_name = sanitize_profile_name(profile_name, verified=True)
         if sanitized_name:
             self.__profile_name = sanitized_name
+            self.__profile_name_verified = True
         return
 
     def __set_auth_attention(self, reason: str, source: str = "") -> None:
@@ -4544,7 +4464,10 @@ class CodexUsageMonitor:
         snap = UsageSnapshot.from_dict(raw_snapshot)
         self.__last_snapshot = snap
         self.__usage_history = self.__normalize_usage_history(raw_history)
-        self.__set_profile_name(data.get("profile_name", ""))
+        self.__set_profile_name(
+            data.get("profile_name", ""),
+            verified=data.get("profile_name_verified") is True,
+        )
         raw_account_id = normalize_usage_value(data.get("account_id", ""))
         if raw_account_id:
             self.__account_id = raw_account_id
@@ -4580,6 +4503,7 @@ class CodexUsageMonitor:
             "session_state": str(self.__session_state or "logged_out"),
             "profile_name": str(self.__profile_name or ""),
             "account_id": str(self.__account_id or ""),
+            "profile_name_verified": bool(self.__profile_name_verified),
             "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),
             "auth_attention_required": bool(self.__auth_attention_required),
             "auth_attention_reason": str(self.__auth_attention_reason or ""),
