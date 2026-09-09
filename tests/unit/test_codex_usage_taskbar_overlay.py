@@ -1353,6 +1353,70 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(status_dot[1][0] - profile_label[1][0], 64)
         self.assertGreaterEqual(metric_label[1][0] - status_dot[1][2], 10)
 
+    def test_draw_renders_full_profile_names_and_reserves_their_pixel_width(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["label"] = "Daeng - enmsoftware"
+        runtime["accounts"][1]["label"] = "Daeng - ameforce"
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        preferred_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+            model
+        )
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            preferred_width,
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+
+        self.assertGreater(
+            layouts[0].label_width,
+            taskbar_overlay._PROFILE_LABEL_COLUMN_MAX_WIDTH_PX,
+        )
+        for layout, bar in zip(layouts, model["bars"], strict=True):
+            self.assertEqual(
+                taskbar_overlay._fit_profile_label_text(
+                    bar["label"], layout.label_width
+                ),
+                bar["label"],
+            )
+
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        overlay._draw(
+            dict(
+                model,
+                geometry={
+                    "x": 1400,
+                    "y": 1000,
+                    "width": preferred_width,
+                    "height": 38,
+                    "orientation": "bottom",
+                    "visible": True,
+                },
+            )
+        )
+
+        rendered_labels = [
+            str(op[2].get("text") or "")
+            for op in canvas.ops
+            if op[0] == "text"
+            and op[2].get("font") == ("Segoe UI", 8, "bold")
+        ]
+        self.assertEqual(
+            rendered_labels[:2],
+            ["Daeng - enmsoftware", "Daeng - ameforce"],
+        )
+
+    def test_compact_profile_label_uses_pixel_fit_instead_of_a_character_cap(self):
+        label = "Daeng - enmsoftware"
+        fitted = taskbar_overlay._fit_profile_label_text(label, 64)
+
+        self.assertTrue(fitted.endswith("…"))
+        self.assertLessEqual(
+            taskbar_overlay._profile_label_text_width(fitted),
+            64,
+        )
+
     def test_draw_keeps_metric_columns_clear_when_preferred_cap_shows_status_text(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
         canvas = _FakeCanvas()
