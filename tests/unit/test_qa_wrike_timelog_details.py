@@ -127,6 +127,53 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertNotIn("Shared ticket", self.detail_text())
         self.assertEqual(self.panel._selected_date_key, "2026-04-07")
 
+    def test_detail_text_separates_ticket_time_and_comment_for_scanning(self):
+        rows = (
+            TimelogDetailRow(
+                "2026-04-06",
+                "L1",
+                "T1",
+                75,
+                "첫 번째 작업 설명",
+                "아주 긴 라이선스 검증 티켓 제목",
+                "ready",
+            ),
+            TimelogDetailRow(
+                "2026-04-06",
+                "L2",
+                "T1",
+                135,
+                "두 번째 작업 설명",
+                "아주 긴 라이선스 검증 티켓 제목",
+                "ready",
+            ),
+        )
+        self.make(_details(rows=rows))
+        text = self.detail_text()
+
+        self.assertIn("실제 기록 합계 03:30 · 2건", text)
+        self.assertIn("기록 1  ·  01:15", text)
+        self.assertIn("기록 2  ·  02:15", text)
+        self.assertIn("티켓  아주 긴 라이선스 검증 티켓 제목", text)
+        self.assertIn("코멘트\n첫 번째 작업 설명", text)
+        self.assertLess(text.index("기록 1"), text.index("첫 번째 작업 설명"))
+        self.assertGreaterEqual(self.panel._widgets["detail_text"].kwargs["height"], 11)
+
+    def test_detail_viewport_grows_when_loaded_rows_replace_empty_snapshot(self):
+        self.make(_details())
+        text = self.panel._widgets["detail_text"]
+        self.assertEqual(text.kwargs["height"], 4)
+
+        row = TimelogDetailRow(
+            "2026-04-06", "L1", "T1", 45, "loaded action", "Loaded ticket", "ready",
+        )
+        self.holder["model"] = replace(
+            self.holder["model"],
+            day_details=_details(rows=(row,)),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertEqual(text.kwargs["height"], 8)
+
     def test_loading_and_unavailable_never_claim_empty(self):
         self.make(_details(state="loading"))
         seen = []

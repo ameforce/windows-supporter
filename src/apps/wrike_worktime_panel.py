@@ -35,6 +35,8 @@ _TODAY_BG = "#DBEAFE"
 _SELECTED_BG = "#BFDBFE"
 _PROMPT_BG = "#FFF7ED"
 _PROMPT_BORDER = "#FDBA74"
+_DETAIL_TIME_BG = "#DBEAFE"
+_DETAIL_TIME_TEXT = "#1D4ED8"
 _SYNC_COLORS = {
     "ok": "#059669",
     "synced": "#059669",
@@ -559,6 +561,18 @@ class WorktimeQuickPanel:
             None,
         )
 
+    def _detail_text_height(self, model: WorktimePanelModel) -> int:
+        """Keep the detail viewport readable without letting long logs own the panel."""
+
+        if self._detail_view == "breaks":
+            return min(8, max(4, len(self._selected_manual_breaks(model)) + 2))
+        detail = self._detail_for_selected_date(model, self._selected_date_key)
+        if detail is None or detail.state != "available" or not detail.rows:
+            return 4
+        # One short entry needs room for its field labels; further entries can
+        # scroll rather than shrinking the type or the surrounding controls.
+        return min(12, max(8, 5 + len(detail.rows) * 3))
+
     def _selected_detail_parts(
         self, model: WorktimePanelModel,
     ) -> tuple[tuple[str, str], ...]:
@@ -569,13 +583,22 @@ class WorktimeQuickPanel:
             return (("상세 기록을 확인할 수 없습니다.", "detail_comment"),)
         if not detail.rows:
             return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_comment"),)
-        parts = [(f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}", "detail_heading")]
-        for row in detail.rows:
-            parts.append((
-                f"\n{row.ticket_text} · {self._format_actual_minutes(row.minutes)}",
-                "detail_heading",
+        parts: list[tuple[str, str]] = [(
+            f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}"
+            f" · {len(detail.rows)}건\n",
+            "detail_summary",
+        )]
+        for index, row in enumerate(detail.rows, start=1):
+            comment = row.comment.strip() or "코멘트 없음"
+            parts.extend((
+                (f"\n기록 {index}  ·  ", "detail_entry"),
+                (self._format_actual_minutes(row.minutes), "detail_duration"),
+                ("\n", "detail_entry"),
+                ("티켓  ", "detail_field"),
+                (f"{row.ticket_text}\n", "detail_ticket"),
+                ("코멘트\n", "detail_comment_label"),
+                (f"{comment}\n", "detail_comment"),
             ))
-            parts.append((f"\n{row.comment.strip() or '코멘트 없음'}", "detail_comment"))
         return tuple(parts)
 
     def _selected_detail_text(self, model: WorktimePanelModel) -> str:
@@ -619,7 +642,7 @@ class WorktimeQuickPanel:
             text=(
                 "선택 날짜 휴게 기록"
                 if breaks_view
-                else "선택 날짜 실제 기록 · 티켓 / 시간 / 코멘트"
+                else "선택 날짜 타임로그"
             ),
         )
         _safe_call(
@@ -631,6 +654,11 @@ class WorktimeQuickPanel:
             widgets.get("detail_breaks_button"),
             "configure",
             relief="sunken" if breaks_view else "solid",
+        )
+        _safe_call(
+            widgets.get("detail_text"),
+            "configure",
+            height=self._detail_text_height(model),
         )
         rows = self._selected_manual_breaks(model)
         menu = widgets.get("manual_break_menu")
@@ -1228,7 +1256,7 @@ class WorktimeQuickPanel:
         detail_header.pack(fill="x", padx=10, pady=title_padding)
         detail_title = tk.Label(
             detail_header,
-            text="선택 날짜 실제 기록 · 티켓 / 시간 / 코멘트",
+            text="선택 날짜 타임로그",
             bg=_CARD_BG,
             fg=_TEXT,
             anchor="w",
@@ -1304,16 +1332,30 @@ class WorktimeQuickPanel:
             detail_area.pack(fill="x", padx=10, pady=(0, 8))
             detail_text = detail_text_factory(
                 detail_area,
-                height=5,
+                height=self._detail_text_height(model),
                 bg=_CARD_BG,
                 fg=_TEXT,
                 wrap="word",
-                relief="solid",
+                relief="flat",
                 highlightthickness=1,
                 highlightbackground=_BORDER,
+                highlightcolor=_BORDER,
                 font=("Segoe UI", 10),
+                padx=10,
+                pady=7,
+                takefocus=False,
+                cursor="arrow",
             )
-            detail_scroll = tk.Scrollbar(detail_area, command=detail_text.yview)
+            detail_scroll = tk.Scrollbar(
+                detail_area,
+                command=detail_text.yview,
+                width=10,
+                relief="flat",
+                borderwidth=0,
+                bg=_BG,
+                troughcolor=_BG,
+                activebackground=_MUTED,
+            )
             detail_text.configure(yscrollcommand=detail_scroll.set, state="disabled")
             detail_text.pack(side="left", fill="both", expand=True)
             detail_scroll.pack(side="right", fill="y")
@@ -1614,18 +1656,54 @@ class WorktimeQuickPanel:
             if callable(tag_configure) and tagged_parts is not None:
                 try:
                     tag_configure(
-                        "detail_heading",
+                        "detail_summary",
+                        foreground=_TEXT,
+                        font=("Segoe UI", 11, "bold"),
+                        spacing1=2,
+                        spacing3=6,
+                    )
+                    tag_configure(
+                        "detail_entry",
+                        foreground=_DETAIL_TIME_TEXT,
+                        font=("Segoe UI", 9, "bold"),
+                        spacing1=4,
+                        spacing3=2,
+                    )
+                    tag_configure(
+                        "detail_duration",
+                        foreground=_DETAIL_TIME_TEXT,
+                        background=_DETAIL_TIME_BG,
+                        font=("Segoe UI", 9, "bold"),
+                    )
+                    tag_configure(
+                        "detail_field",
+                        foreground=_MUTED,
+                        font=("Segoe UI", 9, "bold"),
+                        lmargin1=12,
+                        lmargin2=12,
+                    )
+                    tag_configure(
+                        "detail_ticket",
                         foreground=_TEXT,
                         font=("Segoe UI", 10, "bold"),
-                        spacing3=2,
+                        lmargin1=12,
+                        lmargin2=12,
+                        spacing3=4,
+                    )
+                    tag_configure(
+                        "detail_comment_label",
+                        foreground=_MUTED,
+                        font=("Segoe UI", 9, "bold"),
+                        lmargin1=12,
+                        lmargin2=12,
                     )
                     tag_configure(
                         "detail_comment",
                         foreground=_MUTED,
                         font=("Segoe UI", 9),
-                        lmargin1=12,
-                        lmargin2=12,
-                        spacing3=4,
+                        lmargin1=28,
+                        lmargin2=28,
+                        spacing3=6,
                     )
                     for text, tag in tagged_parts:
                         widget.insert("end", text, tag)
