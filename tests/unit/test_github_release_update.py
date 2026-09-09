@@ -124,6 +124,15 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
         self.assertIn("$sourceVersionInfo = (Get-Item -LiteralPath $sourceExe).VersionInfo", script)
         self.assertIn("Source executable $field", script)
         self.assertIn("Source executable Comments", script)
+        self.assertIn("BootstrapCompilerPath", script)
+        self.assertIn("installer_bootstrap.c", script)
+        self.assertIn('"/FWindowsSupporter-v$Version-Core"', script)
+        self.assertIn("[IO.FileMode]::CreateNew", script)
+        self.assertIn('INSTALLER_FORMAT=legacy-compatible-bootstrap', script)
+        bootstrap = Path("installer/installer_bootstrap.c").read_text(encoding="utf-8")
+        self.assertIn("PAYLOAD_MAGIC", bootstrap)
+        self.assertIn("CommandLineToArgvW", bootstrap)
+        self.assertIn("normalize_legacy_value", bootstrap)
 
     def test_github_release_asset_redirect_host_is_allowed(self) -> None:
         final_url = "https://release-assets.githubusercontent.com/github-production-release-asset/test"
@@ -416,7 +425,7 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
                 self.closed = True
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "installed"
+            root = Path(tmp) / "installed folder"
             root.mkdir()
             executable = root / "windows-supporter.exe"
             executable.write_bytes(b"old executable")
@@ -481,7 +490,13 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(installer_calls), 1)
         self.assertIn("/VERYSILENT", installer_calls[0][0])
-        self.assertIn('/DIR="' + str(root) + '"', installer_calls[0][0])
+        self.assertIn("/DIR=" + str(root), installer_calls[0][0])
+        self.assertNotIn('/DIR="' + str(root) + '"', installer_calls[0][0])
+        self.assertTrue(any(item.startswith("/LOG=") for item in installer_calls[0][0]))
+        self.assertEqual(
+            state["installer_log_path"],
+            str(Path(tmp) / "state" / "release-installer-0.22.0.log"),
+        )
         self.assertEqual(target_calls[0][0], [str(executable)])
         self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
         self.assertEqual(progress_instances[0].snapshots[0]["percent"], 18)
