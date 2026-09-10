@@ -8,11 +8,12 @@ Flex work record.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import os
 import re
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 # The work-record route preserves the destination through Flex login when the
@@ -116,8 +117,38 @@ class FlexDaySchedule:
 
 
 def _parse_datetime(value: Any) -> datetime | None:
+    has_explicit_zone = False
     if isinstance(value, datetime):
         parsed = value
+    elif isinstance(value, dict):
+        raw_timestamp = _first_value(
+            value,
+            "timestamp",
+            "epochMillis",
+            "epochMilliseconds",
+            "milliseconds",
+        )
+        try:
+            timestamp = float(raw_timestamp)
+        except (TypeError, ValueError):
+            return None
+        if abs(timestamp) >= 100_000_000_000:
+            timestamp /= 1000.0
+        try:
+            parsed = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            zone_name = str(
+                _first_value(value, "zoneId", "timezone", "timeZone") or ""
+            ).strip()
+            if zone_name:
+                has_explicit_zone = True
+                try:
+                    parsed = parsed.astimezone(ZoneInfo(zone_name))
+                except Exception:
+                    parsed = parsed.astimezone()
+            else:
+                parsed = parsed.astimezone()
+        except (OverflowError, OSError, ValueError):
+            return None
     elif isinstance(value, str):
         raw = value.strip()
         if not raw:
@@ -130,6 +161,8 @@ def _parse_datetime(value: Any) -> datetime | None:
             return None
     else:
         return None
+    if has_explicit_zone and parsed.tzinfo is not None:
+        return parsed.replace(tzinfo=None)
     if parsed.tzinfo is not None:
         return parsed.astimezone().replace(tzinfo=None)
     return parsed
@@ -795,6 +828,133 @@ def _extract_employee_number_from_payloads(payloads: list[Any]) -> str:
     return ""
 
 
+def _extract_work_form_names_from_payloads(payloads: list[Any]) -> dict[str, str]:
+    """Build the Flex work-form id to display-name map from browser responses."""
+
+    result: dict[str, str] = {}
+    for payload in payloads:
+        if not isinstance(payload, (dict, list)):
+            continue
+        for candidate in _iter_browser_json_dicts(payload):
+            raw_forms = candidate.get("workForms")
+            for work_form in _as_list(raw_forms):
+                if not isinstance(work_form, dict):
+                    continue
+                form_id = _first_value(
+                    work_form,
+                    "customerWorkFormId",
+                    "workFormId",
+                    "formId",
+                    "idHash",
+                    "id",
+                )
+                if form_id is None:
+                    continue
+                display = work_form.get("display")
+                form_name = _first_value(
+                    work_form,
+                    "formName",
+                    "workFormName",
+                    "name",
+                    "label",
+                    "title",
+                )
+                if form_name is None and isinstance(display, dict):
+                    form_name = _first_value(display, "name", "label", "title")
+                if form_name is not None:
+                    result[str(form_id).strip()] = str(form_name).strip()
+    return {key: value for key, value in result.items() if key and value}
+
+
+def _modern_flex_schedule_payload(
+    payload: dict,
+    *,
+    work_form_names: dict[str, str],
+) -> dict | None:
+    """Translate Flex's current ``dailySchedules`` envelope to our parser model."""
+
+    raw_days = payload.get("dailySchedules")
+    if not isinstance(raw_days, list):
+        return None
+    normalized_days: list[dict[str, Any]] = []
+    for raw_day in raw_days:
+        if not isinstance(raw_day, dict):
+            continue
+        target_day = _parse_day(_first_value(raw_day, "date", "workDate", "day"))
+        if target_day is None:
+            continue
+        normalized_blocks: list[dict[str, Any]] = []
+        raw_blocks = _first_value(raw_day, "timeBlocks", "blocks")
+        for raw_block in _as_list(raw_blocks):
+            if not isinstance(raw_block, dict):
+                continue
+            value = raw_block.get("value")
+            if not isinstance(value, dict):
+                value = raw_block
+            start = _first_value(
+                value,
+                "startTimestamp",
+                "blockFrom",
+                "from",
+                "start",
+                "startAt",
+            )
+            end = _first_value(
+                value,
+                "endTimestampExclusive",
+                "blockTo",
+                "to",
+                "end",
+                "endAt",
+            )
+            if _parse_datetime(start) is None:
+                continue
+            raw_type = str(
+                _first_value(raw_block, "type", "blockType", "sourceType", "workType")
+                or _first_value(value, "type", "blockType", "sourceType", "workType")
+                or ""
+            ).strip().upper().replace("-", "_")
+            form_id = _first_value(
+                value,
+                "workFormId",
+                "customerWorkFormId",
+                "formId",
+            )
+            form_name = work_form_names.get(str(form_id or "").strip(), "")
+            if not form_name:
+                if raw_type == "REST":
+                    form_name = "휴게"
+                elif raw_type in {"WORK", "WORK_RECORD", "SCHEDULE"}:
+                    form_name = "근무"
+                else:
+                    form_name = raw_type or "근무"
+            normalized_blocks.append(
+                {
+                    "type": "WORK_RECORD",
+                    "formName": form_name,
+                    "blockFrom": start,
+                    "blockTo": end,
+                }
+            )
+        if normalized_blocks:
+            normalized_days.append(
+                {
+                    "date": target_day.isoformat(),
+                    "workBlocks": normalized_blocks,
+                }
+            )
+    if not normalized_days:
+        return None
+    return {
+        "userWorkSchedules": [
+            {
+                "employeeNumber": "",
+                "days": normalized_days,
+            }
+        ]
+    }
+
+
 def _parse_browser_response_payloads(
     payloads: list[Any],
     *,
@@ -802,6 +962,7 @@ def _parse_browser_response_payloads(
     now: datetime,
 ) -> tuple[dict[date, FlexDaySchedule], str]:
     detected_employee_number = _extract_employee_number_from_payloads(payloads)
+    work_form_names = _extract_work_form_names_from_payloads(payloads)
     wanted_employee_number = (
         str(employee_number or "").strip() or detected_employee_number
     )
@@ -810,6 +971,12 @@ def _parse_browser_response_payloads(
             continue
         candidates = list(_iter_browser_json_dicts(payload))
         if isinstance(payload, dict):
+            modern_payload = _modern_flex_schedule_payload(
+                payload,
+                work_form_names=work_form_names,
+            )
+            if modern_payload is not None:
+                candidates.insert(0, modern_payload)
             candidates.insert(0, payload)
         for candidate in candidates:
             try:
