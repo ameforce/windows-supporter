@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from src.utils.github_release_update import (
     DOWNLOAD_CHUNK_SIZE,
+    DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS,
     GITHUB_LATEST_RELEASE_URL,
     GITHUB_RELEASES_URL,
     GITHUB_TAGS_URL,
@@ -177,7 +178,7 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
             self.assertEqual(downloaded.read_bytes(), installer_bytes)
             self.assertFalse(list(Path(tmp).glob("*.download")))
 
-    def test_download_reports_progress_for_each_small_read(self) -> None:
+    def test_download_uses_large_reads_and_throttles_progress_publication(self) -> None:
         installer_name = "WindowsSupporter-v0.22.0-Setup.exe"
         installer_url = f"https://objects.githubusercontent.com/{installer_name}"
         installer_bytes = b"x" * (DOWNLOAD_CHUNK_SIZE * 2 + 123)
@@ -189,6 +190,7 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
         )
         opener = FakeOpener({installer_url: installer_bytes})
         progress: list[tuple[int, int | None]] = []
+        timestamps = iter((0.0, 0.05, DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS + 0.05, 0.3))
 
         with tempfile.TemporaryDirectory() as tmp:
             downloaded = GitHubReleaseClient(opener=opener).download_installer(
@@ -197,6 +199,7 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
                 progress_callback=lambda downloaded_bytes, total_bytes: progress.append(
                     (downloaded_bytes, total_bytes)
                 ),
+                progress_monotonic=lambda: next(timestamps),
             )
             self.assertEqual(downloaded.read_bytes(), installer_bytes)
 
@@ -208,7 +211,8 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
         )
         self.assertEqual(progress[0], (0, len(installer_bytes)))
         self.assertEqual(progress[-1], (len(installer_bytes), len(installer_bytes)))
-        self.assertGreater(len(progress), 2)
+        self.assertEqual(len(progress), 3)
+        self.assertLess(len(progress), len(opener.last_response.read_sizes))
 
     def test_download_infers_total_on_final_callback_when_header_is_missing(self) -> None:
         installer_name = "WindowsSupporter-v0.22.0-Setup.exe"
@@ -509,10 +513,17 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(download_snapshots), 4)
         download_percents = [int(snapshot["percent"]) for snapshot in download_snapshots]
-        self.assertEqual(download_percents[0], 22)
-        self.assertEqual(download_percents[-1], 70)
+        self.assertEqual(download_percents[0], 24)
+        self.assertEqual(download_percents[-1], 68)
         self.assertEqual(download_percents, sorted(download_percents))
         self.assertTrue(any("50%" in str(snapshot["detail"]) for snapshot in download_snapshots))
+        stage_keys = [str(snapshot["step_key"]) for snapshot in progress_instances[0].snapshots]
+        self.assertIn("release_source_exit", stage_keys)
+        self.assertIn("release_backup", stage_keys)
+        self.assertIn("release_verify", stage_keys)
+        self.assertIn("release_install_prepare", stage_keys)
+        self.assertIn("release_validate", stage_keys)
+        self.assertIn("release_relaunch", stage_keys)
         self.assertEqual(progress_instances[0].snapshots[-1]["step_key"], "complete")
         self.assertTrue(progress_instances[0].closed)
 
