@@ -118,6 +118,50 @@ class WorktimeActivityPrompt:
 
 
 @dataclass(frozen=True, slots=True)
+class WorktimeOvertimePrompt:
+    """Optional prompt shown after the projected/scheduled quit time."""
+
+    detected_time: str
+    scheduled_quit_time: str
+    assigned_minutes: int = 0
+
+    def __post_init__(self) -> None:
+        if _HHMM_PATTERN.fullmatch(self.detected_time) is None:
+            raise ValueError("detected_time must use 24-hour HH:MM format")
+        if _TARGET_HHMM_PATTERN.fullmatch(self.scheduled_quit_time) is None:
+            raise ValueError("scheduled_quit_time must use HH:MM or 24:00 format")
+        if type(self.assigned_minutes) is not int:
+            raise TypeError("assigned_minutes must be an int")
+        if not 0 <= self.assigned_minutes <= 1440:
+            raise ValueError("assigned_minutes must be between 0 and 1440")
+
+
+@dataclass(frozen=True, slots=True)
+class WorktimeOvertimeState:
+    """Live overtime state rendered in the quick panel."""
+
+    status: str
+    start_time: str
+    elapsed_minutes: int
+    scheduled_quit_time: str
+    assigned_minutes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.status != "active":
+            raise ValueError("overtime state status must be active")
+        if _HHMM_PATTERN.fullmatch(self.start_time) is None:
+            raise ValueError("start_time must use 24-hour HH:MM format")
+        if _TARGET_HHMM_PATTERN.fullmatch(self.scheduled_quit_time) is None:
+            raise ValueError("scheduled_quit_time must use HH:MM or 24:00 format")
+        if type(self.elapsed_minutes) is not int or self.elapsed_minutes < 0:
+            raise ValueError("elapsed_minutes must be a non-negative int")
+        if type(self.assigned_minutes) is not int:
+            raise TypeError("assigned_minutes must be an int")
+        if not 0 <= self.assigned_minutes <= 1440:
+            raise ValueError("assigned_minutes must be between 0 and 1440")
+
+
+@dataclass(frozen=True, slots=True)
 class WorktimePanelManualBreak:
     """One selected-week break row; only raw manual rows are editable."""
 
@@ -164,6 +208,8 @@ class WorktimePanelModel:
     prompt: WorktimeActivityPrompt | None = None
     day_details: tuple[TimelogDayDetails, ...] = ()
     manual_breaks: tuple[WorktimePanelManualBreak, ...] = ()
+    overtime_prompt: WorktimeOvertimePrompt | None = None
+    overtime_state: WorktimeOvertimeState | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.week_range, name="week_range")
@@ -196,6 +242,18 @@ class WorktimePanelModel:
             self.prompt, WorktimeActivityPrompt
         ):
             raise TypeError("prompt must be a WorktimeActivityPrompt or None")
+        if self.overtime_prompt is not None and not isinstance(
+            self.overtime_prompt, WorktimeOvertimePrompt
+        ):
+            raise TypeError(
+                "overtime_prompt must be a WorktimeOvertimePrompt or None"
+            )
+        if self.overtime_state is not None and not isinstance(
+            self.overtime_state, WorktimeOvertimeState
+        ):
+            raise TypeError(
+                "overtime_state must be a WorktimeOvertimeState or None"
+            )
         if not isinstance(self.day_details, tuple):
             raise TypeError("day_details must be an immutable tuple")
         if self.day_details and (
@@ -255,6 +313,9 @@ class WorktimeQuickPanel:
         tk_module: Any | None = None,
         idle_timeout_ms: int = _DEFAULT_IDLE_TIMEOUT_MS,
         monotonic: Callable[[], float] = time.monotonic,
+        overtime_prompt_accept: Callable[[str], None] | None = None,
+        overtime_prompt_skip: Callable[[], None] | None = None,
+        overtime_end: Callable[[], None] | None = None,
     ) -> None:
         callbacks = {
             "model_provider": model_provider,
@@ -287,6 +348,19 @@ class WorktimeQuickPanel:
         self._on_prompt_snooze = prompt_snooze
         self._on_prompt_skip = prompt_skip
         self._on_edit_manual_break = edit_manual_break
+        self._on_overtime_prompt_accept = (
+            overtime_prompt_accept
+            if overtime_prompt_accept is not None
+            else lambda _detected_time: None
+        )
+        self._on_overtime_prompt_skip = (
+            overtime_prompt_skip
+            if overtime_prompt_skip is not None
+            else lambda: None
+        )
+        self._on_overtime_end = (
+            overtime_end if overtime_end is not None else lambda: None
+        )
         self._monotonic = monotonic
         self._tk = tk_module
 
@@ -549,9 +623,14 @@ class WorktimeQuickPanel:
 
     @staticmethod
     def _model_structure_signature(model: WorktimePanelModel) -> tuple[Any, ...]:
-        return model.prompt is not None, min(
-            _MAX_COMPACT_TODAY_LINES,
-            max(1, len(model.today_lines)),
+        return (
+            model.prompt is not None,
+            model.overtime_prompt is not None,
+            model.overtime_state is not None,
+            min(
+                _MAX_COMPACT_TODAY_LINES,
+                max(1, len(model.today_lines)),
+            ),
         )
 
     @staticmethod
@@ -1150,7 +1229,12 @@ class WorktimeQuickPanel:
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = preserved_detail_scroll
 
-        compact = model.prompt is not None or self._uses_compact_density()
+        compact = (
+            model.prompt is not None
+            or model.overtime_prompt is not None
+            or model.overtime_state is not None
+            or self._uses_compact_density()
+        )
         section_gap = 2 if compact else 8
         title_padding = (2, 0) if compact else (7, 2)
         row_padding = 0 if compact else 2
@@ -1495,6 +1579,13 @@ class WorktimeQuickPanel:
             "휴게 종료" if model.break_active else "휴게 시작",
             self._toggle_break_command,
         )
+        overtime_end_button = None
+        if model.overtime_state is not None:
+            overtime_end_button = self._button(
+                actions,
+                "초과근무 종료",
+                self._overtime_end_command,
+            )
         plan_button = self._button(actions, "목표 수정", self._edit_plan_command)
         settings_button = self._button(actions, "설정", self._settings_command)
         countdown_label = tk.Label(
@@ -1556,6 +1647,52 @@ class WorktimeQuickPanel:
                 skip_button,
             )
 
+        overtime_prompt_label = None
+        overtime_prompt_buttons: tuple[Any, ...] = ()
+        if model.overtime_prompt is not None:
+            overtime_prompt = model.overtime_prompt
+            overtime_card = tk.Frame(
+                content,
+                bg="#ECFDF5",
+                highlightthickness=1,
+                highlightbackground="#86EFAC",
+            )
+            overtime_card.pack(fill="x", pady=(section_gap, 0))
+            assigned_text = (
+                f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
+                if overtime_prompt.assigned_minutes > 0
+                else ""
+            )
+            overtime_prompt_label = tk.Label(
+                overtime_card,
+                text=(
+                    f"퇴근 예정 {overtime_prompt.scheduled_quit_time} 이후 활동이 감지되었습니다."
+                    f"{assigned_text} 초과근무를 측정할까요?"
+                ),
+                bg="#ECFDF5",
+                fg="#166534",
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9, "bold"),
+            )
+            overtime_prompt_label.pack(fill="x", padx=10, pady=(4, 2))
+            overtime_prompt_actions = tk.Frame(overtime_card, bg="#ECFDF5")
+            overtime_prompt_actions.pack(fill="x", padx=8, pady=(0, 4))
+            overtime_start_button = self._button(
+                overtime_prompt_actions,
+                "초과근무 시작",
+                self._overtime_prompt_accept_current_command,
+            )
+            overtime_skip_button = self._button(
+                overtime_prompt_actions,
+                "오늘은 안 함",
+                self._overtime_prompt_skip_command,
+            )
+            overtime_prompt_buttons = (
+                overtime_start_button,
+                overtime_skip_button,
+            )
+
         self._widgets = {
             "week_range": week_range_label,
             "sync": sync_label,
@@ -1570,6 +1707,7 @@ class WorktimeQuickPanel:
             "refresh_button": refresh_button,
             "clock_button": clock_button,
             "break_button": break_button,
+            "overtime_end_button": overtime_end_button,
             "plan_button": plan_button,
             "settings_button": settings_button,
             "inline_editor": inline_editor,
@@ -1581,6 +1719,8 @@ class WorktimeQuickPanel:
             "countdown": countdown_label,
             "prompt_label": prompt_label,
             "prompt_buttons": prompt_buttons,
+            "overtime_prompt_label": overtime_prompt_label,
+            "overtime_prompt_buttons": overtime_prompt_buttons,
         }
         self._update_detail_presentation(model)
         if self._inline_editor_active and self._inline_editor_kind is not None:
@@ -1640,6 +1780,9 @@ class WorktimeQuickPanel:
         widgets["break_button"].configure(
             text="휴게 종료" if model.break_active else "휴게 시작"
         )
+        overtime_end_button = widgets.get("overtime_end_button")
+        if overtime_end_button is not None:
+            overtime_end_button.configure(text="초과근무 종료")
         self._update_countdown_label()
 
         if model.prompt is not None:
@@ -1649,6 +1792,21 @@ class WorktimeQuickPanel:
             )
             accept_button = widgets["prompt_buttons"][0]
             accept_button.configure(text=f"{prompt.detected_time}으로 출근")
+        if model.overtime_prompt is not None:
+            overtime_prompt = model.overtime_prompt
+            assigned_text = (
+                f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
+                if overtime_prompt.assigned_minutes > 0
+                else ""
+            )
+            overtime_label = widgets.get("overtime_prompt_label")
+            if overtime_label is not None:
+                overtime_label.configure(
+                    text=(
+                        f"퇴근 예정 {overtime_prompt.scheduled_quit_time} 이후 활동이 감지되었습니다."
+                        f"{assigned_text} 초과근무를 측정할까요?"
+                    )
+                )
 
     def _update_row_selection(self, model: WorktimePanelModel) -> None:
         for row_widgets, row in zip(self._widgets.get("rows", ()), model.rows):
@@ -2314,6 +2472,21 @@ class WorktimeQuickPanel:
 
     def _prompt_skip_command(self) -> None:
         self._run_command(self._on_prompt_skip)
+
+    def _overtime_prompt_accept_current_command(self) -> None:
+        model = self._model
+        if model is None or model.overtime_prompt is None:
+            return
+        self._run_command(
+            self._on_overtime_prompt_accept,
+            model.overtime_prompt.detected_time,
+        )
+
+    def _overtime_prompt_skip_command(self) -> None:
+        self._run_command(self._on_overtime_prompt_skip)
+
+    def _overtime_end_command(self) -> None:
+        self._run_command(self._on_overtime_end)
 
     def _reconcile_geometry(
         self,
