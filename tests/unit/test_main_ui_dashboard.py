@@ -336,10 +336,10 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             path = os.path.join(tmp, "main_ui_state.json")
             ui, _, _, _, _ = self._build_ui(path)
 
-            # 6개 기능 섹션이 2열 카드로 배치되므로 기본 높이는 스크롤
-            # 없이 전체 요약이 보이는 크기를 따른다.
-            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (1080, 660))
-            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (940, 500))
+            # 6개 기능 섹션이 2열 카드로 배치되며, mount 전 fallback도
+            # 작업 영역을 과도하게 점유하지 않는 compact 기준을 따른다.
+            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (1000, 480))
+            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (760, 400))
 
     def test_show_restores_persisted_valid_tab(self):
         with tempfile.TemporaryDirectory() as tmp:

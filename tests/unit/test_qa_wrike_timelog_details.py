@@ -122,18 +122,18 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertIn("• Shared ticket · 01:00", text)
         self.assertIn("  ◦ 00:15", text)
         self.assertIn("  ◦ 00:45", text)
-        self.assertNotIn("first action", text)
-        self.assertNotIn("second action", text)
+        self.assertIn("first action", text)
+        self.assertIn("second action", text)
         self.assertNotIn("Other ticket", text)
         self.select(1)
         self.assertIn("Other ticket", self.detail_text())
         self.assertIn("• Other ticket · 00:30", self.detail_text())
         self.assertIn("  ◦ 00:30", self.detail_text())
-        self.assertNotIn("Tuesday only", self.detail_text())
+        self.assertIn("Tuesday only", self.detail_text())
         self.assertNotIn("Shared ticket", self.detail_text())
         self.assertEqual(self.panel._selected_date_key, "2026-04-07")
 
-    def test_detail_text_groups_ticket_and_hides_comments_for_scanning(self):
+    def test_detail_text_groups_ticket_and_keeps_each_comment_readable(self):
         rows = (
             TimelogDetailRow(
                 "2026-04-06",
@@ -162,8 +162,8 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertIn("  ◦ 01:15", text)
         self.assertIn("  ◦ 02:15", text)
         self.assertEqual(text.count("아주 긴 라이선스 검증 티켓 제목"), 1)
-        self.assertNotIn("첫 번째 작업 설명", text)
-        self.assertNotIn("두 번째 작업 설명", text)
+        self.assertIn("첫 번째 작업 설명", text)
+        self.assertIn("두 번째 작업 설명", text)
         self.assertNotIn("코멘트", text)
         self.assertNotIn("티켓  ", text)
         self.assertGreaterEqual(self.panel._widgets["detail_text"].kwargs["height"], 8)
@@ -235,7 +235,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertNotIn("OLD PRIVATE COMMENT", self.detail_text())
         self.assertNotIn("기록이 없습니다", self.detail_text())
 
-    def test_missing_title_preserves_minutes_and_hides_comments_with_distinct_fallback(self):
+    def test_missing_title_preserves_minutes_and_comments_with_distinct_fallback(self):
         task_ids = ("", "T1", "T2")
         rows = tuple(
             TimelogDetailRow("2026-04-06", f"L{index}", task_ids[index], 15, f"comment-{state}", title_state=state)
@@ -245,7 +245,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         text = self.detail_text()
         self.assertIn("실제 기록 합계 00:45 · 3건", text)
         for row in rows:
-            self.assertNotIn(row.comment, text)
+            self.assertIn(row.comment, text)
             self.assertIn(row.ticket_text, text)
         self.assertEqual(text.count("  ◦ 00:15"), 3)
         self.assertNotIn("코멘트", text)
