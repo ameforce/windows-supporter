@@ -128,7 +128,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.select(1)
         self.assertIn("Other ticket", self.detail_text())
         self.assertIn("• Other ticket · 00:30 · 1건", self.detail_text())
-        self.assertNotIn("  ◦ 00:30", self.detail_text())
+        self.assertIn("  ◦ 00:30 · 메모: Tuesday only", self.detail_text())
         self.assertIn("Tuesday only", self.detail_text())
         self.assertNotIn("Shared ticket", self.detail_text())
         self.assertEqual(self.panel._selected_date_key, "2026-04-07")
@@ -167,12 +167,12 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertIn("메모: 첫 번째 작업 설명", text)
         self.assertIn("메모: 두 번째 작업 설명", text)
         self.assertNotIn("티켓  ", text)
-        self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 5)
+        self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 8)
 
     def test_detail_viewport_uses_a_bounded_readable_height_for_loaded_rows(self):
         self.make(_details())
         text = self.panel._widgets["detail_text"]
-        self.assertEqual(text.kwargs["height"], 4)
+        self.assertEqual(text.kwargs["height"], 5)
         window = self.tk.toplevels[0]
         window.requested_height = 420
         before_geometry_count = len(window.geometry_calls)
@@ -190,7 +190,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             day_details=_details(rows=rows),
         )
         self.assertTrue(self.panel.refresh_now())
-        self.assertEqual(text.kwargs["height"], 5)
+        self.assertEqual(text.kwargs["height"], 8)
         self.assertEqual(len(window.geometry_calls), before_geometry_count + 1)
         self.assertIn("x420", window.geometry_calls[-1])
 
@@ -201,11 +201,11 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             day_details=_details(),
         )
         self.assertTrue(self.panel.refresh_now())
-        self.assertEqual(text.kwargs["height"], 4)
+        self.assertEqual(text.kwargs["height"], 5)
         self.assertEqual(len(window.geometry_calls), before_geometry_count + 1)
         self.assertIn("x360", window.geometry_calls[-1])
 
-    def test_single_loaded_row_does_not_expand_the_compact_viewport(self):
+    def test_single_loaded_row_gets_a_readable_nested_viewport(self):
         self.make(_details())
         text = self.panel._widgets["detail_text"]
         window = self.tk.toplevels[0]
@@ -218,7 +218,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             day_details=_details(rows=(row,)),
         )
         self.assertTrue(self.panel.refresh_now())
-        self.assertEqual(text.kwargs["height"], 4)
+        self.assertEqual(text.kwargs["height"], 8)
         self.assertEqual(len(window.geometry_calls), before_geometry_count)
 
     def test_loading_and_unavailable_never_claim_empty(self):

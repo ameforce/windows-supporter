@@ -479,7 +479,8 @@ class ReviewFindingRegressions(unittest.TestCase):
         self.assertIn("• First heading · 티켓 합계 00:45 · 2건", rendered)
         self.assertIn("  ◦ 00:15 · 메모: comment first comment second", rendered)
         self.assertIn("  ◦ 00:30 · 메모: another comment", rendered)
-        self.assertIn("• Second heading · 01:00 · 1건 · 메모: last comment", rendered)
+        self.assertIn("• Second heading · 01:00 · 1건", rendered)
+        self.assertIn("  ◦ 01:00 · 메모: last comment", rendered)
 
     def test_3946451105_other_date_cannot_silently_save_hidden_day(self):
         fixture = self.wiring()
