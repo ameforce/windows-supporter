@@ -59,7 +59,7 @@ class _FlexFixtureHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionAbortedError):
                 return
             return
-        if path.endswith("/time-tracking/work-record/my"):
+        if path.endswith("/time-tracking/my-work-record"):
             body = """<!doctype html>
             <html lang='ko'>
               <head>
@@ -124,7 +124,7 @@ class FlexBrowserFlowE2ETests(unittest.TestCase):
             str(profile_dir),
             work_url=(
                 f"http://127.0.0.1:{server.server_address[1]}"
-                "/time-tracking/work-record/my"
+                "/time-tracking/my-work-record"
             ),
             headless=True,
             timeout_ms=10_000,
