@@ -66,6 +66,7 @@ from src.apps.flex_worktime import (
     FLEX_WEB_URL,
     FlexBrowserClient,
     FlexBrowserError,
+    FlexBrowserSyncResult,
     FlexDaySchedule,
 )
 from src.apps.overtime_state import OvertimeStateStore
@@ -297,6 +298,7 @@ class Wrike:
         self.__vacation_ical_week_cache: dict[str, dict] = {}
         self.__flex_enabled = False
         self.__flex_employee_number = ""
+        self.__flex_detected_employee_number = ""
         self.__flex_poll_interval_sec = 300.0
         self.__overtime_notice_interval_min = 10
         self.__flex_browser_profile_dir = self.__lib.os.path.join(
@@ -736,10 +738,7 @@ class Wrike:
     # ------------------------------------------------------------------
 
     def __flex_configured(self) -> bool:
-        return bool(
-            self.__flex_enabled
-            and str(self.__flex_employee_number or "").strip()
-        )
+        return bool(self.__flex_enabled)
 
     def __ensure_flex_browser_worker_started(self) -> bool:
         with self.__flex_browser_worker_lock:
@@ -801,6 +800,7 @@ class Wrike:
                         end_date,
                         employee_number=employee_number,
                         now=now,
+                        return_metadata=True,
                     )
                 else:
                     raise FlexBrowserError("알 수 없는 Flex 브라우저 작업입니다.", code="invalid_command")
@@ -879,10 +879,9 @@ class Wrike:
         if not self.__flex_enabled:
             self.__flex_state = "disabled"
             return
-        if not self.__flex_configured():
+        if not str(self.__flex_employee_number or "").strip():
             self.__flex_state = "unconfigured"
-            self.__flex_last_error = "Flex 사번을 입력하고 본인 계정으로 로그인해 주세요."
-            return
+            self.__flex_last_error = "본인 계정으로 로그인하면 Flex 사번을 자동 감지합니다."
         self.__request_flex_sync(force=True)
         self.__schedule_flex_poll(root)
 
@@ -943,6 +942,7 @@ class Wrike:
 
     def __run_flex_sync(self, generation: int, root) -> None:
         schedules = None
+        detected_employee_number = ""
         error = None
         try:
             now = self.__lib.datetime.now()
@@ -955,7 +955,13 @@ class Wrike:
                 timeout_sec=self.__time_log_login_timeout_sec + 30.0,
             )
             if ok:
-                schedules = result
+                if isinstance(result, FlexBrowserSyncResult):
+                    schedules = result.schedules
+                    detected_employee_number = str(
+                        result.employee_number or ""
+                    ).strip()
+                else:
+                    schedules = result
             else:
                 error = result
         except Exception as exc:
@@ -966,6 +972,7 @@ class Wrike:
             self.__apply_flex_sync_result(
                 generation,
                 schedules,
+                detected_employee_number,
                 error,
             )
 
@@ -985,6 +992,7 @@ class Wrike:
         self,
         generation: int,
         schedules: dict | None,
+        detected_employee_number: str,
         error: tuple[str, str] | None,
     ) -> None:
         with self.__flex_schedule_lock:
@@ -995,6 +1003,16 @@ class Wrike:
                 self.__flex_state = "error"
                 self.__flex_last_error = str(error[0] or "Flex 동기화 실패")
                 return
+            detected_employee_number = str(
+                detected_employee_number or ""
+            ).strip()[:120]
+            if detected_employee_number:
+                if detected_employee_number == str(
+                    self.__flex_employee_number or ""
+                ).strip():
+                    self.__flex_detected_employee_number = ""
+                else:
+                    self.__flex_detected_employee_number = detected_employee_number
             self.__flex_schedule_by_date = dict(schedules or {})
             self.__flex_last_success_ts = self.__lib.datetime.now()
             self.__flex_last_error = ""
@@ -1028,6 +1046,10 @@ class Wrike:
                 ),
                 "error": str(self.__flex_last_error or ""),
                 "schedule_days": len(self.__flex_schedule_by_date),
+                "employee_number": str(self.__flex_employee_number or ""),
+                "detected_employee_number": str(
+                    self.__flex_detected_employee_number or ""
+                ),
             }
 
     def __open_flex_worktime_page(self) -> bool:
@@ -1049,8 +1071,6 @@ class Wrike:
 
         if not self.__flex_enabled:
             return False, "Flex 일정 자동 반영을 먼저 켜 주세요."
-        if not str(self.__flex_employee_number or "").strip():
-            return False, "Flex 사번을 입력해 주세요."
         if not self.__background_active or self.__root is None:
             return False, "근무시간 백그라운드가 아직 시작되지 않았습니다."
         if not self.__request_flex_sync(force=True):
@@ -1059,6 +1079,31 @@ class Wrike:
 
     def open_flex_worktime_page(self) -> bool:
         return self.__open_flex_worktime_page()
+
+    def confirm_flex_employee_number(
+        self,
+        employee_number: str,
+    ) -> tuple[bool, str | None]:
+        """Persist the employee number found in the authenticated Flex session."""
+
+        candidate = str(employee_number or "").strip()[:120]
+        if not candidate:
+            return False, "Flex 사번이 비어 있습니다."
+        with self.__flex_schedule_lock:
+            detected = str(self.__flex_detected_employee_number or "").strip()
+            if detected and candidate != detected:
+                return False, "현재 Flex 로그인 계정에서 감지한 사번과 다릅니다."
+            previous = str(self.__flex_employee_number or "").strip()
+            self.__flex_employee_number = candidate
+            self.__flex_detected_employee_number = ""
+        if not self.__save_settings():
+            with self.__flex_schedule_lock:
+                self.__flex_employee_number = previous
+                self.__flex_detected_employee_number = candidate
+            return False, "Flex 사번 저장에 실패했습니다."
+        self.__cancel_flex_after()
+        self.__schedule_flex_poll()
+        return True, None
 
     # ------------------------------------------------------------------
     # Local overtime prompt, timer, and Flex handoff
@@ -6208,6 +6253,9 @@ class Wrike:
             "flex_browser_configured": bool(
                 str(self.__flex_employee_number or "").strip()
             ),
+            "flex_detected_employee_number": str(
+                self.__flex_detected_employee_number or ""
+            ),
             "flex_status": self.__flex_status_snapshot(),
             "overtime_notice_interval_min": int(
                 self.__overtime_notice_interval_min
@@ -6277,6 +6325,7 @@ class Wrike:
             "vacation_ical_week_cache",
             "flex_enabled",
             "flex_employee_number",
+            "flex_detected_employee_number",
             "flex_poll_interval_sec",
             "overtime_notice_interval_min",
         )
@@ -6468,6 +6517,8 @@ class Wrike:
         self.__monitor_interval_sec = float(monitor_interval)
         self.__flex_enabled = bool(flex_enabled)
         self.__flex_employee_number = flex_employee_number
+        if not self.__flex_enabled or flex_employee_number:
+            self.__flex_detected_employee_number = ""
         self.__flex_poll_interval_sec = float(flex_poll_interval)
         self.__overtime_notice_interval_min = int(overtime_notice_interval)
         self.__lunch_break_enabled = bool(lunch_enabled)
@@ -6942,6 +6993,7 @@ class Wrike:
         self.__flex_employee_number = str(
             data.get("flex_employee_number", "") or ""
         ).strip()[:120]
+        self.__flex_detected_employee_number = ""
         try:
             self.__flex_poll_interval_sec = float(
                 data.get("flex_poll_interval_sec", self.__flex_poll_interval_sec)

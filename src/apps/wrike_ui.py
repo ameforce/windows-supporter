@@ -4,6 +4,7 @@ from datetime import date, datetime
 from math import isfinite
 from typing import Any
 import threading
+import time
 
 from src.apps.wrike_worktime import normalize_hhmm_input
 
@@ -24,6 +25,7 @@ class WrikeSettingsView:
 
         self._tk = None
         self._ttk = None
+        self._messagebox = None
         self._win = None
         self._scroll_canvas = None
         self._scroll_body = None
@@ -84,6 +86,9 @@ class WrikeSettingsView:
         self._folder_path_label = None
         self._folder_restoring = False
         self._autosave_after_id = None
+        self._flex_status_poll_after_id = None
+        self._flex_status_poll_started_at = 0.0
+        self._flex_prompted_employee_numbers: set[str] = set()
         self._loading_settings = False
         self._status_colors = {
             "info": "#6B7280",
@@ -339,7 +344,7 @@ class WrikeSettingsView:
         ).grid(row=row, column=1, sticky="w", pady=6)
         row += 1
 
-        add_label("Flex 사번")
+        add_label("Flex 사번 (자동 감지)")
         add_entry(self._flex_employee_number_var)
         row += 1
 
@@ -386,6 +391,7 @@ class WrikeSettingsView:
             content,
             text=(
                 "관리자용 Flex API 인증정보를 요구하지 않습니다. 앱 전용 Flex 브라우저에서 본인 계정으로 로그인하면 로그인 세션을 유지하며 근무정보를 읽습니다. "
+                "사번은 로그인 후 자동 감지하며, 확인한 뒤 저장합니다. 감지되지 않으면 직접 입력할 수 있습니다. "
                 "비밀번호·토큰·클라이언트 시크릿은 저장하지 않으며, 초과근무 종료 후에는 Flex 근무 기록 페이지를 엽니다."
             ),
             bg=card_bg,
@@ -754,13 +760,15 @@ class WrikeSettingsView:
             return
         try:
             import tkinter as tk
-            from tkinter import ttk
+            from tkinter import messagebox, ttk
         except Exception:
             self._tk = None
             self._ttk = None
+            self._messagebox = None
             return
         self._tk = tk
         self._ttk = ttk
+        self._messagebox = messagebox
         return
 
     def _create_scroll_body(self, parent: Any, bg: str) -> Any:
@@ -1707,8 +1715,132 @@ class WrikeSettingsView:
                 break_state = None
             if isinstance(break_state, dict):
                 self._refresh_break_button_label(break_state)
+        self._refresh_flex_status_from_backend()
         self._refresh_google_status_from_backend()
         self._refresh_vacation_status_from_backend()
+        return
+
+    def _refresh_flex_status_from_backend(
+        self,
+        *,
+        prompt: bool = True,
+        settings: Any = None,
+    ) -> dict[str, Any]:
+        if not isinstance(settings, dict):
+            try:
+                settings = self._wrike.get_settings_snapshot()
+            except Exception:
+                settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        flex_status = settings.get("flex_status")
+        if not isinstance(flex_status, dict):
+            flex_status = {}
+        state = str(flex_status.get("state") or "unconfigured")
+        error = str(flex_status.get("error") or "").strip()
+        employee_number = str(
+            settings.get(
+                "flex_employee_number",
+                flex_status.get("employee_number", ""),
+            )
+            or ""
+        ).strip()
+        detected_employee_number = str(
+            settings.get(
+                "flex_detected_employee_number",
+                flex_status.get("detected_employee_number", ""),
+            )
+            or ""
+        ).strip()
+        configured = bool(employee_number)
+        status_text = (
+            f"{state} · 브라우저 세션 "
+            f"{'사번 설정됨' if configured else '로그인 후 사번 자동 감지'}"
+        )
+        if detected_employee_number:
+            status_text += f" · 감지된 사번 {detected_employee_number}"
+        if error:
+            status_text += f" · {error}"
+        if configured and self._flex_employee_number_var is not None:
+            try:
+                current = str(self._flex_employee_number_var.get() or "").strip()
+            except Exception:
+                current = ""
+            if current != employee_number:
+                previous_loading = self._loading_settings
+                self._loading_settings = True
+                try:
+                    self._flex_employee_number_var.set(employee_number)
+                except Exception:
+                    pass
+                finally:
+                    self._loading_settings = previous_loading
+        if self._flex_status_var is not None:
+            try:
+                self._flex_status_var.set(status_text)
+            except Exception:
+                pass
+        if prompt and detected_employee_number:
+            self._prompt_for_flex_employee_number(detected_employee_number)
+        return {
+            "state": state,
+            "employee_number": employee_number,
+            "detected_employee_number": detected_employee_number,
+        }
+
+    def _prompt_for_flex_employee_number(self, employee_number: str) -> None:
+        candidate = str(employee_number or "").strip()
+        if not candidate or candidate in self._flex_prompted_employee_numbers:
+            return
+        messagebox = self._messagebox
+        if messagebox is None:
+            return
+        self._flex_prompted_employee_numbers.add(candidate)
+        try:
+            accepted = bool(
+                messagebox.askyesno(
+                    "Flex 사번 확인",
+                    f"로그인한 Flex 계정에서 사번 {candidate}을(를) 확인했습니다.\n"
+                    "이 사번을 Windows Supporter에 저장할까요?",
+                    parent=self._win,
+                )
+            )
+        except Exception:
+            return
+        if not accepted:
+            self._set_status(
+                f"Flex 사번 {candidate}을(를) 저장하지 않았습니다. 필요하면 직접 입력해 주세요.",
+                level="info",
+            )
+            return
+        confirmer = getattr(self._wrike, "confirm_flex_employee_number", None)
+        try:
+            result = (
+                confirmer(candidate)
+                if callable(confirmer)
+                else (False, "Flex 사번 확인 기능을 사용할 수 없습니다.")
+            )
+        except Exception:
+            result = (False, "Flex 사번 저장에 실패했습니다.")
+        ok = bool(isinstance(result, tuple) and len(result) == 2 and result[0])
+        error = (
+            str(result[1] or "").strip()
+            if isinstance(result, tuple) and len(result) == 2
+            else ""
+        )
+        if ok:
+            if self._flex_employee_number_var is not None:
+                previous_loading = self._loading_settings
+                self._loading_settings = True
+                try:
+                    self._flex_employee_number_var.set(candidate)
+                except Exception:
+                    pass
+                finally:
+                    self._loading_settings = previous_loading
+            self._set_status(f"Flex 사번 {candidate} 저장 완료", level="ok")
+        else:
+            self._set_status(error or "Flex 사번 저장 실패", level="error")
         return
 
     def _mark_ical_dirty(self, _event: Any = None) -> None:
@@ -1777,24 +1909,7 @@ class WrikeSettingsView:
                             )
                         )
                     )
-                flex_status = settings.get("flex_status")
-                if not isinstance(flex_status, dict):
-                    flex_status = {}
-                state = str(flex_status.get("state") or "unconfigured")
-                error = str(flex_status.get("error") or "").strip()
-                configured = bool(
-                    settings.get(
-                        "flex_browser_configured",
-                        bool(str(settings.get("flex_employee_number") or "").strip()),
-                    )
-                )
-                status_text = (
-                    f"{state} · 브라우저 세션 {'사번 설정됨' if configured else '사번 미설정'}"
-                )
-                if error:
-                    status_text += f" · {error}"
-                if self._flex_status_var is not None:
-                    self._flex_status_var.set(status_text)
+                self._refresh_flex_status_from_backend(prompt=False, settings=settings)
             except Exception:
                 pass
             try:
@@ -1876,9 +1991,41 @@ class WrikeSettingsView:
             return
         ok, error = sync()
         if ok:
-            self._set_status("Flex 동기화 요청됨", level="ok")
+            self._set_status(
+                "Flex 로그인 브라우저를 여는 중입니다. 로그인 후 사번을 자동 감지합니다.",
+                level="info",
+            )
+            self._start_flex_status_poll()
         else:
             self._set_status(str(error or "Flex 동기화 실패"), level="error")
+        return
+
+    def _start_flex_status_poll(self) -> None:
+        win = self._win
+        after_cancel = getattr(win, "after_cancel", None)
+        if self._flex_status_poll_after_id is not None and callable(after_cancel):
+            try:
+                after_cancel(self._flex_status_poll_after_id)
+            except Exception:
+                pass
+        self._flex_status_poll_after_id = None
+        self._flex_status_poll_started_at = time.monotonic()
+        self._poll_flex_status()
+        return
+
+    def _poll_flex_status(self) -> None:
+        self._flex_status_poll_after_id = None
+        snapshot = self._refresh_flex_status_from_backend()
+        if (
+            str(snapshot.get("state") or "") == "loading"
+            and time.monotonic() - self._flex_status_poll_started_at < 300.0
+        ):
+            after = getattr(self._win, "after", None)
+            if callable(after):
+                try:
+                    self._flex_status_poll_after_id = after(700, self._poll_flex_status)
+                except Exception:
+                    self._flex_status_poll_after_id = None
         return
 
     def _on_open_flex(self) -> None:
@@ -2498,23 +2645,10 @@ class WrikeSettingsView:
             if ok:
                 try:
                     settings = self._wrike.get_settings_snapshot()
-                    flex_status = settings.get("flex_status", {})
-                    if not isinstance(flex_status, dict):
-                        flex_status = {}
-                    configured = bool(
-                        settings.get(
-                            "flex_browser_configured",
-                            bool(str(settings.get("flex_employee_number") or "").strip()),
-                        )
+                    self._refresh_flex_status_from_backend(
+                        prompt=False,
+                        settings=settings,
                     )
-                    status_text = (
-                        f"{str(flex_status.get('state') or 'unconfigured')} · "
-                        f"브라우저 세션 {'사번 설정됨' if configured else '사번 미설정'}"
-                    )
-                    if flex_status.get("error"):
-                        status_text += f" · {flex_status['error']}"
-                    if self._flex_status_var is not None:
-                        self._flex_status_var.set(status_text)
                 except Exception:
                     pass
                 if ical_dirty:
