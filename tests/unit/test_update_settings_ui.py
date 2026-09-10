@@ -49,6 +49,22 @@ class _FakeUpdater:
 
 
 class UpdateSettingsViewUnitTest(unittest.TestCase):
+    def test_preferred_size_is_compact_and_uses_the_mounted_body(self) -> None:
+        class _Body:
+            def update_idletasks(self):
+                return None
+
+            def winfo_reqwidth(self):
+                return 610
+
+            def winfo_reqheight(self):
+                return 290
+
+        view = UpdateSettingsView(root=object(), updater=_FakeUpdater())
+        self.assertEqual(view.preferred_size(), (0, 0))
+        view._body = _Body()
+        self.assertEqual(view.preferred_size(), (630, 306))
+
     def test_save_settings_rejects_interval_below_supported_range(self) -> None:
         updater = _FakeUpdater()
         view = UpdateSettingsView(root=object(), updater=updater)
