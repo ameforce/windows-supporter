@@ -18,8 +18,10 @@ _DEFAULT_IDLE_TIMEOUT_MS = 6_000
 _MIN_IDLE_TIMEOUT_MS = 1_200
 # The quick panel is intentionally a compact, non-modal summary. These are
 # safety fallbacks; normal content still determines the requested size.
-_MIN_PANEL_WIDTH = 560
-_MIN_PANEL_HEIGHT = 360
+_MIN_PANEL_WIDTH = 520
+_MIN_PANEL_HEIGHT = 330
+_COMPACT_PANEL_MAX_WIDTH = 660
+_COMPACT_PANEL_MAX_HEIGHT = 540
 _POINTER_OFFSET_PX = 16
 _DATE_KEY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -328,7 +330,8 @@ class WorktimeQuickPanel:
         self.refresh_now()
         if not (not self._placed and self._geometry_retry_pending):
             self._geometry_retry_pending = not self._reconcile_geometry(
-                anchor_to_pointer=True
+                anchor_to_pointer=True,
+                resize_to_request=True,
             )
         if activate:
             if not _show_window_activated(window):
@@ -338,7 +341,8 @@ class WorktimeQuickPanel:
         _safe_call(window, "update_idletasks")
         if not self._geometry_retry_pending:
             self._geometry_retry_pending = not self._reconcile_geometry(
-                anchor_to_pointer=True
+                anchor_to_pointer=True,
+                resize_to_request=True,
             )
         _safe_call(window, "update_idletasks")
         if not self._geometry_retry_pending:
@@ -417,6 +421,11 @@ class WorktimeQuickPanel:
 
         signature = self._model_structure_signature(model)
         rebuilt = signature != self._structure_signature or not self._widgets
+        prior_detail_height = (
+            self._detail_text_height(self._model)
+            if self._model is not None
+            else None
+        )
         if rebuilt:
             self._render_structure(model)
             self._structure_signature = signature
@@ -424,8 +433,11 @@ class WorktimeQuickPanel:
             self._update_rendered_model(model)
 
         self._model = model
-        if rebuilt:
-            self._geometry_retry_pending = not self._reconcile_geometry()
+        detail_height_changed = prior_detail_height != self._detail_text_height(model)
+        if rebuilt or detail_height_changed:
+            self._geometry_retry_pending = not self._reconcile_geometry(
+                resize_to_request=True
+            )
             if not self._geometry_retry_pending:
                 self._restore_pending_detail_scroll()
         return True
@@ -565,13 +577,13 @@ class WorktimeQuickPanel:
             return min(8, max(4, len(self._selected_manual_breaks(model)) + 2))
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state != "available" or not detail.rows:
-            return 4
+            return 5
         groups = self._group_timelog_rows(detail.rows)
-        # Reserve space for the summary and one heading per ticket.  Individual
-        # logs are nested below their ticket, so repeated entries no longer
-        # need the old three-line-per-row allowance.
-        content_lines = sum(len(group) + 1 for group in groups)
-        return min(12, max(8, 4 + content_lines))
+        # A single record is self-explanatory on its ticket row. Multiple
+        # records need a ticket subtotal plus child rows. The bounded Text
+        # viewport scrolls instead of making this non-resizable panel grow.
+        content_lines = sum(1 if len(group) == 1 else len(group) + 1 for group in groups)
+        return min(9, max(6, 3 + content_lines))
 
     @staticmethod
     def _group_timelog_rows(
@@ -609,10 +621,27 @@ class WorktimeQuickPanel:
         for group in self._group_timelog_rows(detail.rows):
             ticket = group[0]
             group_total = sum(row.minutes for row in group)
+            if len(group) == 1:
+                row = ticket
+                comment = " ".join(str(row.comment or "").split())
+                parts.extend((
+                    ("• ", "detail_group"),
+                    (f"{ticket.ticket_text} · ", "detail_group"),
+                    (self._format_actual_minutes(group_total), "detail_group_duration"),
+                    (" · 1건", "detail_group"),
+                ))
+                if comment:
+                    parts.extend((
+                        (" · 메모: ", "detail_child"),
+                        (comment, "detail_comment"),
+                    ))
+                parts.append(("\n", "detail_group"))
+                continue
             parts.extend((
                 ("• ", "detail_group"),
-                (f"{ticket.ticket_text} · ", "detail_group"),
+                (f"{ticket.ticket_text} · 티켓 합계 ", "detail_group"),
                 (self._format_actual_minutes(group_total), "detail_group_duration"),
+                (f" · {len(group)}건", "detail_group"),
                 ("\n", "detail_group"),
             ))
             for row in group:
@@ -623,7 +652,7 @@ class WorktimeQuickPanel:
                 ))
                 if comment:
                     parts.extend((
-                        (" · ", "detail_child"),
+                        (" · 메모: ", "detail_child"),
                         (comment, "detail_comment"),
                     ))
                 parts.append(("\n", "detail_child"))
@@ -702,11 +731,12 @@ class WorktimeQuickPanel:
                         command=lambda row=row: self._edit_manual_break_command(row),
                     )
         editable_rows = tuple(row for row in rows if row.editable)
-        _safe_call(
-            menu_button,
-            "configure",
-            state="normal" if editable_rows else "disabled",
-        )
+        if breaks_view and editable_rows:
+            _safe_call(menu_button, "configure", state="normal")
+            _safe_call(menu_button, "pack", side="right", padx=(3, 0))
+        else:
+            _safe_call(menu_button, "configure", state="disabled")
+            _safe_call(menu_button, "pack_forget")
         self._set_detail_text(
             widgets.get("detail_text"),
             self._selected_detail_view_text(model),
@@ -721,6 +751,9 @@ class WorktimeQuickPanel:
         self._detail_view = view
         if self._model is not None:
             self._update_detail_presentation(self._model, reset_scroll=True)
+            self._geometry_retry_pending = not self._reconcile_geometry(
+                resize_to_request=True
+            )
 
     def _ensure_tk(self) -> Any | None:
         if self._tk is not None:
@@ -1357,7 +1390,7 @@ class WorktimeQuickPanel:
         detail_text_factory = getattr(tk, "Text", None)
         if callable(detail_text_factory):
             detail_area = tk.Frame(detail_card, bg=_CARD_BG)
-            detail_area.pack(fill="x", padx=10, pady=(0, 8))
+            detail_area.pack(fill="x", padx=8, pady=(0, 6))
             detail_text = detail_text_factory(
                 detail_area,
                 height=self._detail_text_height(model),
@@ -1368,9 +1401,9 @@ class WorktimeQuickPanel:
                 highlightthickness=1,
                 highlightbackground=_BORDER,
                 highlightcolor=_BORDER,
-                font=("Segoe UI", 10),
-                padx=10,
-                pady=7,
+                font=("Segoe UI", 9),
+                padx=8,
+                pady=5,
                 takefocus=False,
                 cursor="arrow",
             )
@@ -2301,8 +2334,14 @@ class WorktimeQuickPanel:
             return False
         _safe_call(window, "update_idletasks")
 
-        requested_width = _positive_int_call(window, "winfo_reqwidth", 680)
-        requested_height = _positive_int_call(window, "winfo_reqheight", 480)
+        requested_width = min(
+            _COMPACT_PANEL_MAX_WIDTH,
+            _positive_int_call(window, "winfo_reqwidth", 680),
+        )
+        requested_height = min(
+            _COMPACT_PANEL_MAX_HEIGHT,
+            _positive_int_call(window, "winfo_reqheight", 480),
+        )
         current = self._window_rect(window)
         pointer_x, pointer_y = _pointer_position(window, self._root)
         use_pointer = bool(anchor_to_pointer or not self._placed or current is None)

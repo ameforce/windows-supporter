@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, timedelta
 import re
 from types import SimpleNamespace
@@ -12,6 +12,7 @@ from src.apps.wrike_worktime_panel import (
     WorktimeActivityPrompt,
     WorktimePanelDayRow,
     WorktimePanelLine,
+    WorktimePanelManualBreak,
     WorktimePanelModel,
     WorktimeQuickPanel,
 )
@@ -787,7 +788,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
 
         self.assertEqual(len(fake_tk.toplevels), 1)
         self.assertIs(fake_tk.toplevels[0], window)
-        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
+        self.assertEqual(window.geometry_calls, ["660x500+116+116"])
         self.assertEqual(len(window.geometry_calls), geometry_count)
         self.assertEqual(fake_tk.live_buttons(), first_buttons)
         self.assertEqual(provider.call_count, 2)
@@ -1108,7 +1109,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             holder["model"] = _model(today_lines=one_line)
             panel.refresh_now()
 
-        reconcile.assert_called_once_with()
+        reconcile.assert_called_once_with(resize_to_request=True)
         self.assertTrue(original_button.destroyed)
         self.assertIsNot(fake_tk.button("새로고침"), original_button)
         self.assertIn("한 줄만", fake_tk.live_label_texts())
@@ -1156,7 +1157,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(window.focus_force_calls, 0)
         self.assertEqual(window.grab_set_calls, 0)
         self.assertEqual(window.wait_window_calls, 0)
-        self.assertEqual(window.geometry_calls[-1], "700x500+116+116")
+        self.assertEqual(window.geometry_calls[-1], "660x500+116+116")
 
     def test_failed_noactivate_or_unmapped_show_withdraws_and_can_retry(self) -> None:
         root = _FakeRoot()
@@ -1217,12 +1218,12 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         window.geometry_failures = 1
 
         self.assertTrue(panel.show(activate=False))
-        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
+        self.assertEqual(window.geometry_calls, ["660x500+116+116"])
         self.assertEqual((window.width, window.height), (1, 1))
         rendered_model = panel._model
 
         self.assertTrue(panel.refresh_now())
-        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
+        self.assertEqual(window.geometry_calls, ["660x500+116+116"])
         self.assertIs(panel._model, rendered_model)
 
         with (
@@ -1236,15 +1237,15 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(provider.call_count, 3)
         self.assertEqual(
             window.geometry_calls,
-            ["700x500+116+116", "700x500+116+116"],
+            ["660x500+116+116", "660x500+116+116"],
         )
         self.assertEqual(
             (window.x, window.y, window.width, window.height),
-            (116, 116, 700, 500),
+            (116, 116, 660, 500),
         )
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
-    def test_user_geometry_is_untouched_in_place_and_reconciled_on_structure(self) -> None:
+    def test_same_structure_preserves_position_and_structure_reflows_compactly(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model()}
@@ -1269,13 +1270,13 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 prompt=WorktimeActivityPrompt("08:35"),
             )
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "740x620-1000+50")
+            self.assertEqual(window.geometry_calls[-1], "660x540-1000+50")
             self.assertEqual(work_area.call_count, 1)
 
             work_area.return_value = (-800, -100, 0, 500)
             holder["model"] = _model(actual_text="텍스트만 변경", prompt=None)
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "740x600-800-100")
+            self.assertEqual(window.geometry_calls[-1], "660x540-800-40")
             self.assertEqual(work_area.call_count, 2)
 
     def test_first_show_uses_compact_density_for_a_640_pixel_work_area(self) -> None:
@@ -1544,7 +1545,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             return_value=(0, 0, 1920, 1080),
         ):
             self.assertTrue(panel.show(activate=False))
-        self.assertEqual(window.geometry_calls[-1], "700x500+784+284")
+        self.assertEqual(window.geometry_calls[-1], "660x500+824+284")
 
     def test_first_show_uses_compact_density_on_a_normal_work_area(self) -> None:
         root = _FakeRoot()
@@ -1588,8 +1589,31 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(window.width, 560)
-        self.assertEqual(window.height, 360)
+        self.assertEqual(window.width, 520)
+        self.assertEqual(window.height, 330)
+
+    def test_manual_break_edit_control_is_visible_only_in_breaks_view(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        editable_break = WorktimePanelManualBreak(
+            "2026-04-06",
+            "수동 휴게",
+            "12:00",
+            "12:30",
+            True,
+            index=0,
+            fingerprint="manual-break-0",
+        )
+        holder = {"model": replace(_model(), manual_breaks=(editable_break,))}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+
+        self.assertTrue(panel.show(activate=False))
+        button = panel._widgets["manual_break_menu_button"]
+        self.assertFalse(button.packed)
+
+        panel._set_detail_view("breaks")
+        self.assertTrue(button.packed)
+        self.assertEqual(button.kwargs["state"], "normal")
 
     def test_countdown_and_common_inline_target_validation_are_view_local(self) -> None:
         root = _FakeRoot()
