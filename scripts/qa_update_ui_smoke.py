@@ -196,7 +196,7 @@ MATRIX_FIXTURES = (
     "complete",
     "long-text",
 )
-CAPTURE_FIXTURES = MATRIX_FIXTURES + ("shutdown",)
+CAPTURE_FIXTURES = MATRIX_FIXTURES + ("shutdown", "release-install")
 MATRIX_SCALINGS = (("100", 1.3333333333), ("125", 1.6666666667), ("150", 2.0))
 
 
@@ -245,6 +245,20 @@ def _apply_fixture(progress: UpdateHandoffProgressUi, fixture: str, log_path: st
         )
         if snapshot is not None:
             progress.set_snapshot(snapshot)
+        return
+    if fixture == "release-install":
+        snapshot = build_update_progress_snapshot(
+            "release_install",
+            state="running",
+            progress_mode="indeterminate",
+            detail="installer가 파일을 적용하는 동안 실제 완료를 기다립니다.",
+            log_path=log_path,
+        )
+        snapshot["activity"] = {
+            "id": "release_install",
+            "line": "installer가 새 버전을 적용하고 있습니다.",
+        }
+        progress.set_snapshot(snapshot)
         return
     if fixture == "middle-empty":
         return
