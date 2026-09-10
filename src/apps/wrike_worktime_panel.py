@@ -23,6 +23,10 @@ _MIN_PANEL_HEIGHT = 330
 _COMPACT_PANEL_MAX_WIDTH = 660
 _COMPACT_PANEL_MAX_HEIGHT = 540
 _MAX_COMPACT_TODAY_LINES = 2
+# Detail text is a bounded viewport: leave enough room for the summary and
+# the first few ticket/detail rows while keeping long days scrollable.
+_DETAIL_EMPTY_TEXT_HEIGHT = 5
+_DETAIL_TEXT_HEIGHT_WITH_ROWS = 8
 _POINTER_OFFSET_PX = 16
 _DATE_KEY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -597,13 +601,12 @@ class WorktimeQuickPanel:
             return min(6, max(3, len(self._selected_manual_breaks(model)) + 1))
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state != "available" or not detail.rows:
-            return 4
-        groups = self._group_timelog_rows(detail.rows)
-        # A single record is self-explanatory on its ticket row. Multiple
-        # records need a ticket subtotal plus child rows. The bounded Text
-        # viewport scrolls instead of making this non-resizable panel grow.
-        content_lines = sum(1 if len(group) == 1 else len(group) + 1 for group in groups)
-        return min(5, max(4, 2 + content_lines))
+            return _DETAIL_EMPTY_TEXT_HEIGHT
+        # Every ticket gets a heading and every record gets a nested child row,
+        # including a ticket with only one record. Eight rows leave a useful
+        # initial slice visible; Text scrolling handles unusually long days
+        # instead of making this panel grow without bound.
+        return _DETAIL_TEXT_HEIGHT_WITH_ROWS
 
     @staticmethod
     def _group_timelog_rows(
@@ -641,25 +644,13 @@ class WorktimeQuickPanel:
         for group in self._group_timelog_rows(detail.rows):
             ticket = group[0]
             group_total = sum(row.minutes for row in group)
-            if len(group) == 1:
-                row = ticket
-                comment = " ".join(str(row.comment or "").split())
-                parts.extend((
-                    ("• ", "detail_group"),
-                    (f"{ticket.ticket_text} · ", "detail_group"),
-                    (self._format_actual_minutes(group_total), "detail_group_duration"),
-                    (" · 1건", "detail_group"),
-                ))
-                if comment:
-                    parts.extend((
-                        (" · 메모: ", "detail_child"),
-                        (comment, "detail_comment"),
-                    ))
-                parts.append(("\n", "detail_group"))
-                continue
             parts.extend((
                 ("• ", "detail_group"),
-                (f"{ticket.ticket_text} · 티켓 합계 ", "detail_group"),
+                (
+                    f"{ticket.ticket_text} · "
+                    + ("티켓 합계 " if len(group) > 1 else ""),
+                    "detail_group",
+                ),
                 (self._format_actual_minutes(group_total), "detail_group_duration"),
                 (f" · {len(group)}건", "detail_group"),
                 ("\n", "detail_group"),
