@@ -39,11 +39,13 @@ if errorlevel 1 (
 echo [ Success !! ]
 
 REM Remove stale virtual environment if its base Python path is no longer valid
+echo | set /p="Repairing project virtual environment..."
 call "tools\ensure_venv_ready.bat" "%CURRENT_DIR:~0,-1%"
 if errorlevel 1 (
   echo Failed to repair the project virtual environment.
   exit /b 1
 )
+echo [ Success !! ]
 
 REM Bootstrap the pinned uv build tool without modifying the global PATH
 echo | set /p="Preparing pinned uv build tool..."

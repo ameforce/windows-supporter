@@ -73,3 +73,24 @@
 - Release download callback, phase range/monotonic floor, handoff state carry, build/deploy/cleanup stage를 targeted unit test로 고정한다.
 - Tk UI smoke에서 inherited percent와 build marker percent를 확인한다.
 - artifact-only build로 실제 runtime 교체 없이 packaging과 update handoff 경로를 다시 확인한다.
+
+## v0.22.9 전송 성능·상태 세분화 보강 (2026-09-10)
+
+### 추가 원인
+
+- Release installer를 64 KiB마다 읽은 뒤, 매번 Tk redraw와 handoff JSON 전체 read/write까지 수행했다. 고속 회선에서는 네트워크가 아니라 UI·상태 저장 호출 수가 처리량을 제한할 수 있었다.
+- 다운로드 화면에는 누적 용량·비율만 있었으므로 사용자는 현재 전송 속도와 완료 예상 시간을 알 수 없었다.
+- Release 경로의 앱 종료, 백업, installer 준비, 설치 결과 검증, 재실행은 실제로 관찰 가능한 경계인데도 하나의 넓은 단계로 합쳐져 있었다.
+
+### 보강 계약
+
+- installer stream은 1 MiB 단위로 처리해 hash·disk write overhead를 줄이고, progress/state publication은 최대 5 Hz로 throttle한다. 시작과 정확한 완료 byte는 항상 발행한다.
+- 5초 sliding window에서 0.4초 이상 쌓인 실제 byte sample로 속도를 계산한다. `Content-Length`와 유효 속도가 모두 있을 때만 MB/s와 `약 HH:MM:SS 남음`을 표시한다.
+- Release lifecycle은 `상태 기록 → helper 시작 → 기존 앱 종료 → 이전 버전 백업 → 다운로드 → SHA-256 확인 → installer 준비/설치 → 설치 결과 확인 → 재실행`으로 나눈다.
+- installer 내부의 정직한 byte 진행률을 얻을 수 없는 동안에는 percent를 가짜로 올리지 않는다. 고정된 현재 percent 위에 activity pulse를 표시하고 process poll 중 Tk event를 계속 pump한다.
+
+### 검증
+
+- downloader 단위 테스트는 1 MiB read, 200 ms throttle, 초기·최종 callback 보존을 확인한다.
+- progress 단위 테스트는 known/unknown total의 MB/s·ETA 표시 조건, telemetry sample window, release 각 단계의 monotonic 순서를 확인한다.
+- Tk smoke는 초기·installer 적용 중·완료 화면에서 clipping, drag, borderless shell을 확인한다.

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,8 @@ UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS = 1800
 UPDATE_RELEASE_MODE = "github_release_installer"
 UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS = 900
 UPDATE_RELEASE_SOURCE_EXIT_TIMEOUT_SECONDS = 25.0
+RELEASE_DOWNLOAD_RATE_WINDOW_SECONDS = 5.0
+RELEASE_DOWNLOAD_RATE_MIN_SAMPLE_SECONDS = 0.4
 UPDATE_PROGRESS_TITLE = "Windows Supporter 업데이트"
 UPDATE_PROGRESS_FAILURE_TITLE = "Windows Supporter 업데이트 실패"
 UPDATE_PROGRESS_LOG_BUTTON_TEXT = "로그 열기"
@@ -308,6 +311,34 @@ class UpdateProgressStep:
     end_percent: int | None = None
 
 
+@dataclass
+class ReleaseDownloadTelemetry:
+    """Derive a stable transfer rate from bounded, real download samples."""
+
+    samples: deque[tuple[float, int]]
+
+    def __init__(self) -> None:
+        self.samples = deque()
+
+    def observe(self, downloaded_bytes: int, *, now: float) -> float | None:
+        downloaded = max(0, int(downloaded_bytes or 0))
+        observed_at = float(now)
+        if self.samples and downloaded < self.samples[-1][1]:
+            # A retry starts a new byte stream.  Never blend it with the
+            # previous attempt's samples into a fictional transfer rate.
+            self.samples.clear()
+        self.samples.append((observed_at, downloaded))
+        cutoff = observed_at - RELEASE_DOWNLOAD_RATE_WINDOW_SECONDS
+        while len(self.samples) > 1 and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+        started_at, started_bytes = self.samples[0]
+        elapsed = observed_at - started_at
+        advanced = downloaded - started_bytes
+        if elapsed < RELEASE_DOWNLOAD_RATE_MIN_SAMPLE_SECONDS or advanced <= 0:
+            return None
+        return advanced / elapsed
+
+
 @dataclass(frozen=True)
 class BuildOutputProgressRule:
     marker: str
@@ -334,9 +365,17 @@ UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("checking", "업데이트 확인 중", "현재 버전과 원격 릴리스를 확인합니다.", 2, 8),
     UpdateProgressStep("available", "업데이트 준비 완료", "새 버전을 설치할 수 있습니다.", 8),
     UpdateProgressStep("accepted", "업데이트 요청 접수", "선택한 버전을 설치할 준비를 시작합니다.", 8, 12),
-    UpdateProgressStep("release_prepare", "installer 업데이트 준비 중", "검증된 Release installer 업데이트를 준비합니다.", 12, 18),
-    UpdateProgressStep("release_download", "installer 다운로드 중", "GitHub Release installer를 안전하게 다운로드합니다.", 22, 70),
-    UpdateProgressStep("release_install", "installer 설치 중", "검증된 installer를 현재 설치 위치에 적용합니다.", 70, 94),
+    UpdateProgressStep("release_prepare", "installer 업데이트 준비 중", "검증된 Release installer 업데이트를 준비합니다.", 12, 16),
+    UpdateProgressStep("release_handoff_state", "업데이트 정보 기록 중", "전용 업데이트 프로세스가 읽을 상태를 기록합니다.", 16, 17),
+    UpdateProgressStep("release_handoff_launch", "업데이트 프로세스 시작 중", "installer 업데이트 전용 프로세스를 시작합니다.", 17, 18),
+    UpdateProgressStep("release_source_exit", "기존 앱 종료 확인 중", "installer 실행 전 기존 앱의 종료를 확인합니다.", 18, 21),
+    UpdateProgressStep("release_backup", "이전 버전 백업 중", "문제 발생 시 되돌릴 현재 실행 파일을 보관합니다.", 21, 24),
+    UpdateProgressStep("release_download", "installer 다운로드 중", "GitHub Release installer를 안전하게 다운로드합니다.", 24, 68),
+    UpdateProgressStep("release_verify", "다운로드 검증 완료", "installer SHA-256 무결성을 확인했습니다.", 68, 70),
+    UpdateProgressStep("release_install_prepare", "installer 실행 준비 중", "설치 경로와 installer 로그를 준비합니다.", 70, 72),
+    UpdateProgressStep("release_install", "installer 설치 중", "검증된 installer를 현재 설치 위치에 적용합니다.", 72, 90),
+    UpdateProgressStep("release_validate", "설치 결과 확인 중", "새 실행 파일의 버전과 교체 여부를 확인합니다.", 90, 94),
+    UpdateProgressStep("release_relaunch", "새 버전 재실행 중", "설치된 Windows Supporter를 다시 시작합니다.", 94, 98),
     UpdateProgressStep("preflight", "업데이트 사전 점검 중", "Git 상태와 로컬 변경 여부를 확인합니다.", 12, 16),
     UpdateProgressStep("stash", "변경 사항 스태시 중", "커밋되지 않은 변경을 stash로 보존합니다.", 20, 24),
     UpdateProgressStep("cleanup", "빌드 산출물 정리 중", "무시된 빌드 산출물을 allowlist 범위에서 정리합니다.", 31, 34),
@@ -363,6 +402,14 @@ BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
         "이전 빌드에서 남은 작업을 안전하게 정리합니다.",
         "남아 있던 빌드 작업을 정리했습니다.",
         47,
+    ),
+    BuildOutputProgressRule(
+        "Repairing project virtual environment",
+        "venv_repair",
+        "Python 환경 확인 중",
+        "프로젝트의 고정 Python 환경을 점검합니다.",
+        "프로젝트 Python 환경을 확인했습니다.",
+        49,
     ),
     BuildOutputProgressRule(
         "Preparing pinned uv",
@@ -419,6 +466,22 @@ BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
         "필수 구성 요소가 실행 파일에 포함됐는지 확인합니다.",
         "실행 파일 구성을 검증했습니다.",
         81,
+    ),
+    BuildOutputProgressRule(
+        "Validating frozen Google Calendar resource loader",
+        "validate_calendar_resource",
+        "일정 구성 요소 검증 중",
+        "실행 파일의 Google Calendar 리소스를 확인합니다.",
+        "일정 구성 요소를 검증했습니다.",
+        82,
+    ),
+    BuildOutputProgressRule(
+        "Validating Codex usage worker boundary",
+        "validate_codex_worker",
+        "Codex 작업자 검증 중",
+        "실행 파일의 Codex 작업자 경계를 확인합니다.",
+        "Codex 작업자를 검증했습니다.",
+        83,
     ),
     BuildOutputProgressRule(
         "Artifact-only build complete",
@@ -510,6 +573,7 @@ def build_update_progress_snapshot(
     detail: str | None = None,
     percent: int | None = None,
     phase_fraction: float | None = None,
+    progress_mode: str = "determinate",
     log_path: str = "",
     failed_step: str = "",
     can_retry: bool = False,
@@ -532,7 +596,7 @@ def build_update_progress_snapshot(
         "percent": resolved_percent,
         "progressbar": {
             "visible": True,
-            "mode": "determinate",
+            "mode": "indeterminate" if progress_mode == "indeterminate" else "determinate",
             "value": resolved_percent,
             "maximum": 100,
         },
@@ -582,12 +646,34 @@ def _format_download_size(byte_count: int) -> str:
     return f"{value:.1f} {unit}"
 
 
+def _format_download_speed(bytes_per_second: float | None) -> str:
+    try:
+        speed = max(0.0, float(bytes_per_second or 0.0))
+    except (TypeError, ValueError):
+        return ""
+    if speed <= 0.0:
+        return ""
+    if speed >= 1_000_000.0:
+        return f"{speed / 1_000_000.0:.1f} MB/s"
+    return f"{speed / 1_000.0:.0f} KB/s"
+
+
+def _format_download_eta(seconds: float) -> str:
+    remaining = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(remaining, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"약 {hours:d}:{minutes:02d}:{seconds:02d} 남음"
+    return f"약 {minutes:02d}:{seconds:02d} 남음"
+
+
 def build_release_download_progress_snapshot(
     tag: str,
     downloaded_bytes: int,
     total_bytes: int | None,
     *,
     log_path: str = "",
+    bytes_per_second: float | None = None,
 ) -> dict[str, Any]:
     """Map byte-level installer progress into the visible release-download range."""
     downloaded = max(0, int(downloaded_bytes or 0))
@@ -598,20 +684,33 @@ def build_release_download_progress_snapshot(
 
     start_percent = get_update_progress_step("release_download").percent
     end_percent = get_update_progress_end_percent("release_download")
+    speed_text = _format_download_speed(bytes_per_second)
     if total > 0:
         ratio = min(1.0, downloaded / total)
         percent = start_percent + int(round((end_percent - start_percent) * ratio))
+        eta_text = ""
+        try:
+            rate = float(bytes_per_second or 0.0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        if rate > 0.0 and downloaded < total:
+            eta_text = _format_download_eta((total - downloaded) / rate)
+        telemetry = " · ".join(part for part in (speed_text, eta_text) if part)
         detail = (
             f"{str(tag or '').strip()} installer 다운로드 중 · "
             f"{_format_download_size(downloaded)} / {_format_download_size(total)} "
             f"({int(round(ratio * 100))}%)"
         )
+        if telemetry:
+            detail = f"{detail} · {telemetry}"
     else:
         percent = start_percent
         detail = (
             f"{str(tag or '').strip()} installer 다운로드 중 · "
             f"{_format_download_size(downloaded)}"
         )
+        if speed_text:
+            detail = f"{detail} · {speed_text}"
 
     return build_update_progress_snapshot(
         "release_download",
@@ -1177,7 +1276,7 @@ def build_update_handoff_payload(
 ) -> dict[str, Any]:
     tree = working_tree or UpdateWorkingTreeState()
     handoff_percent = (
-        get_update_progress_end_percent("release_prepare")
+        get_update_progress_end_percent("release_handoff_launch")
         if str(mode or "").strip() == UPDATE_RELEASE_MODE
         else get_update_progress_step("handoff").percent
     )
@@ -1543,6 +1642,9 @@ class UpdateHandoffProgressUi:
         self._layout_key = None
         self._positioned = False
         self._progress_color = "#2563EB"
+        self._progress_mode = "determinate"
+        self._progress_pulse_offset = 0
+        self._progress_pulse_after_id = None
         self._preferred_focus_button = None
         self.retry_requested = False
         self._closed = False
@@ -1761,6 +1863,12 @@ class UpdateHandoffProgressUi:
         try:
             state = str(snapshot.get("state") or "")
             step_key = str(snapshot.get("step_key") or "")
+            progressbar = snapshot.get("progressbar", {})
+            progress_mode = (
+                str(progressbar.get("mode") or "determinate")
+                if isinstance(progressbar, dict)
+                else "determinate"
+            )
             percent = max(0, min(100, int(snapshot.get("percent") or 0)))
             if step_key == "handoff_start":
                 self._activity_lines = []
@@ -1807,6 +1915,12 @@ class UpdateHandoffProgressUi:
                 if failure or cancelled
                 else "#2563EB"
             )
+            self._progress_mode = (
+                "indeterminate"
+                if progress_mode == "indeterminate" and not terminal
+                else "determinate"
+            )
+            self._set_progress_pulse_active(self._progress_mode == "indeterminate")
             self._fit_window_to_content(state)
             self._draw_progress(percent)
             self._last_state = state
@@ -2100,8 +2214,52 @@ class UpdateHandoffProgressUi:
                     width=height,
                     capstyle="round",
                 )
+            if self._progress_mode == "indeterminate" and fill_width > inset:
+                filled_span = max(1, fill_width - inset)
+                pulse_width = max(14, min(48, filled_span // 5))
+                travel = max(1, filled_span - pulse_width)
+                pulse_left = inset + (self._progress_pulse_offset % (travel + 1))
+                pulse_right = min(fill_width, pulse_left + pulse_width)
+                canvas.create_line(
+                    pulse_left,
+                    center,
+                    pulse_right,
+                    center,
+                    fill="#93C5FD",
+                    width=height,
+                    capstyle="round",
+                )
         except Exception:
             pass
+        return
+
+    def _set_progress_pulse_active(self, active: bool) -> None:
+        root = self._root
+        if root is None:
+            return
+        if not active:
+            pending = self._progress_pulse_after_id
+            self._progress_pulse_after_id = None
+            if pending is not None:
+                try:
+                    root.after_cancel(pending)
+                except Exception:
+                    pass
+            return
+        if self._progress_pulse_after_id is None:
+            try:
+                self._progress_pulse_after_id = root.after(120, self._advance_progress_pulse)
+            except Exception:
+                self._progress_pulse_after_id = None
+        return
+
+    def _advance_progress_pulse(self) -> None:
+        self._progress_pulse_after_id = None
+        if self._root is None or self._progress_mode != "indeterminate":
+            return
+        self._progress_pulse_offset += 18
+        self._draw_progress(self._last_percent)
+        self._set_progress_pulse_active(True)
         return
 
     def pump(self) -> None:
@@ -2119,6 +2277,7 @@ class UpdateHandoffProgressUi:
         root = self._root
         if root is None:
             return
+        self._set_progress_pulse_active(False)
         try:
             root.destroy()
         except Exception:
@@ -2199,6 +2358,38 @@ def _wait_for_process_exit(
     return not process_exists(process_id)
 
 
+def _wait_for_installer_exit(
+    process: Any,
+    *,
+    timeout_seconds: float,
+    progress_ui: Any = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> int:
+    """Wait without freezing the indeterminate installer activity signal."""
+    poll = getattr(process, "poll", None)
+    if not callable(poll):
+        wait = getattr(process, "wait", None)
+        if not callable(wait):
+            raise UpdateHandoffError("GitHub Release installer 프로세스 상태를 확인할 수 없습니다.")
+        return int(wait(timeout=timeout_seconds) or 0)
+
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        result = poll()
+        if result is not None:
+            return int(result or 0)
+        if monotonic() >= deadline:
+            raise TimeoutError("GitHub Release installer 종료를 기다리는 시간이 초과되었습니다.")
+        pump = getattr(progress_ui, "pump", None)
+        if callable(pump):
+            try:
+                pump()
+            except Exception:
+                pass
+        sleep(0.1)
+
+
 def run_release_update_handoff(
     state_path: str | os.PathLike[str],
     *,
@@ -2217,7 +2408,7 @@ def run_release_update_handoff(
     log_path = str(state.get("log_path") or get_update_log_path())
     handoff_percent = _get_handoff_progress_percent(
         state,
-        get_update_progress_end_percent("release_prepare"),
+        get_update_progress_end_percent("release_handoff_launch"),
     )
     progress_floor = handoff_percent
     root_executable = Path(repo_root) / "windows-supporter.exe"
@@ -2265,12 +2456,25 @@ def run_release_update_handoff(
             progress=start_progress,
         )
 
+        source_exit_progress = build_update_progress_snapshot(
+            "release_source_exit",
+            state="running",
+            phase_fraction=0.0,
+            detail="installer 실행 전 기존 Windows Supporter 종료 상태를 확인합니다.",
+            log_path=log_path,
+        )
+        source_exit_progress["activity"] = {
+            "id": "release_source_exit",
+            "line": "기존 앱 종료 상태를 확인합니다.",
+        }
+        publish(source_exit_progress)
         source_pid = int(state.get("source_pid") or 0)
         if source_pid > 0 and source_pid != os.getpid():
             shutdown_progress = build_update_progress_snapshot(
-                "shutdown",
+                "release_source_exit",
                 state="running",
-                detail="기존 Windows Supporter 종료를 확인하는 중입니다.",
+                phase_fraction=0.5,
+                detail="기존 Windows Supporter가 완전히 종료될 때까지 기다립니다.",
                 log_path=log_path,
             )
             publish(shutdown_progress)
@@ -2284,17 +2488,51 @@ def run_release_update_handoff(
                     "기존 Windows Supporter 프로세스가 종료되지 않아 installer를 실행하지 않았습니다."
                 )
 
+        publish(
+            build_update_progress_snapshot(
+                "release_source_exit",
+                state="running",
+                phase_fraction=1.0,
+                detail="기존 앱 종료 상태를 확인했습니다.",
+                log_path=log_path,
+            )
+        )
+        publish(
+            build_update_progress_snapshot(
+                "release_backup",
+                state="running",
+                phase_fraction=0.0,
+                detail="문제 발생 시 복구할 현재 실행 파일을 백업합니다.",
+                log_path=log_path,
+            )
+        )
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         previous_sha256 = _sha256_file(root_executable)
         shutil.copy2(root_executable, backup_path)
+        publish(
+            build_update_progress_snapshot(
+                "release_backup",
+                state="running",
+                phase_fraction=1.0,
+                detail="이전 실행 파일 백업을 완료했습니다.",
+                log_path=log_path,
+            )
+        )
+
+        download_telemetry = ReleaseDownloadTelemetry()
 
         def publish_download_progress(downloaded_bytes: int, total_bytes: int | None) -> None:
+            bytes_per_second = download_telemetry.observe(
+                downloaded_bytes,
+                now=monotonic(),
+            )
             publish(
                 build_release_download_progress_snapshot(
                     candidate.tag,
                     downloaded_bytes,
                     total_bytes,
                     log_path=log_path,
+                    bytes_per_second=bytes_per_second,
                 )
             )
 
@@ -2305,14 +2543,27 @@ def run_release_update_handoff(
             progress_callback=publish_download_progress,
         )
         append_update_log(log_path, f"verified installer: {downloaded_path}")
-
-        install_progress = build_update_progress_snapshot(
-            "release_install",
+        download_verified_progress = build_update_progress_snapshot(
+            "release_verify",
             state="running",
-            detail="검증된 installer를 현재 설치 경로에 적용합니다.",
+            phase_fraction=1.0,
+            detail="installer SHA-256 검증을 완료했습니다.",
             log_path=log_path,
         )
-        publish(install_progress)
+        download_verified_progress["activity"] = {
+            "id": "release_verify",
+            "line": "다운로드한 installer 무결성을 확인했습니다.",
+        }
+        publish(download_verified_progress)
+
+        install_prepare_progress = build_update_progress_snapshot(
+            "release_install_prepare",
+            state="running",
+            phase_fraction=0.0,
+            detail="검증된 installer 실행 경로와 로그를 준비합니다.",
+            log_path=log_path,
+        )
+        publish(install_prepare_progress)
         installer_log_path = (
             Path(get_update_state_dir())
             / f"release-installer-{candidate.version[0]}.{candidate.version[1]}.{candidate.version[2]}.log"
@@ -2335,6 +2586,28 @@ def run_release_update_handoff(
             installer_command=installer_command,
             installer_log_path=str(installer_log_path),
         )
+        publish(
+            build_update_progress_snapshot(
+                "release_install_prepare",
+                state="running",
+                phase_fraction=1.0,
+                detail="installer를 실행할 준비를 마쳤습니다.",
+                log_path=log_path,
+            )
+        )
+        install_progress = build_update_progress_snapshot(
+            "release_install",
+            state="running",
+            phase_fraction=0.0,
+            progress_mode="indeterminate",
+            detail="installer가 파일을 적용하는 동안 실제 완료를 기다립니다.",
+            log_path=log_path,
+        )
+        install_progress["activity"] = {
+            "id": "release_install",
+            "line": "installer가 새 버전을 적용하고 있습니다.",
+        }
+        publish(install_progress)
         installer_process = installer_launcher(
             installer_command,
             cwd=str(install_dir),
@@ -2342,12 +2615,33 @@ def run_release_update_handoff(
         )
         if installer_process is None:
             raise UpdateHandoffError("GitHub Release installer 실행을 시작하지 못했습니다.")
-        wait = getattr(installer_process, "wait", None)
-        if not callable(wait):
-            raise UpdateHandoffError("GitHub Release installer 프로세스 상태를 확인할 수 없습니다.")
-        return_code = wait(timeout=UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS)
+        return_code = _wait_for_installer_exit(
+            installer_process,
+            timeout_seconds=UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS,
+            progress_ui=progress_ui,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
         if int(return_code or 0) != 0:
             raise UpdateHandoffError(f"GitHub Release installer가 exit code {return_code}로 종료됐습니다.")
+        publish(
+            build_update_progress_snapshot(
+                "release_install",
+                state="running",
+                phase_fraction=1.0,
+                detail="installer 파일 적용이 끝났습니다. 설치 결과를 확인합니다.",
+                log_path=log_path,
+            )
+        )
+        publish(
+            build_update_progress_snapshot(
+                "release_validate",
+                state="running",
+                phase_fraction=0.0,
+                detail="새 실행 파일의 교체 여부와 버전 정보를 확인합니다.",
+                log_path=log_path,
+            )
+        )
         installed_artifact = _verify_release_installed_artifact(
             root_executable,
             candidate=candidate,
@@ -2362,18 +2656,19 @@ def run_release_update_handoff(
 
         publish(
             build_update_progress_snapshot(
-                "release_install",
+                "release_validate",
                 state="running",
-                detail="검증된 installer 설치를 완료했습니다.",
+                detail="새 실행 파일의 버전과 무결성을 확인했습니다.",
                 phase_fraction=1.0,
                 log_path=log_path,
             )
         )
 
         relaunch_progress = build_update_progress_snapshot(
-            "relaunch",
+            "release_relaunch",
             state="running",
-            detail="새 Windows Supporter를 재실행합니다.",
+            phase_fraction=0.0,
+            detail="설치된 새 Windows Supporter를 재실행합니다.",
             log_path=log_path,
         )
         publish(relaunch_progress)
@@ -2384,6 +2679,15 @@ def run_release_update_handoff(
         )
         if target_process is None:
             raise UpdateHandoffError("installer 적용 후 Windows Supporter 재실행을 시작하지 못했습니다.")
+        publish(
+            build_update_progress_snapshot(
+                "release_relaunch",
+                state="running",
+                phase_fraction=1.0,
+                detail="새 Windows Supporter 재실행을 요청했습니다.",
+                log_path=log_path,
+            )
+        )
 
         complete_progress = build_update_progress_snapshot(
             "complete",
@@ -3762,27 +4066,36 @@ class WindowsSupporterUpdater:
     def launch_update(self) -> bool:
         if self._mark_unavailable_if_needed():
             return False
+        is_release_update = self._release_client is not None
         handoff_percent = (
-            get_update_progress_end_percent("release_prepare")
-            if self._release_client is not None
+            get_update_progress_end_percent("release_handoff_launch")
+            if is_release_update
             else get_update_progress_step("handoff").percent
         )
         try:
             handoff_path = Path(self._handoff_path_provider())
             log_path = get_update_log_path(handoff_path.parent)
+            if is_release_update:
+                self._publish_update_progress(
+                    "release_handoff_state",
+                    state="running",
+                    phase_fraction=0.0,
+                    detail="전용 업데이트 프로세스가 읽을 상태를 준비합니다.",
+                    show_ui=self._show_preflight_progress_ui,
+                )
             payload = build_update_handoff_payload(
                 repo_root=self._repo_root,
                 target_tag=self._latest_tag,
                 working_tree=self._working_tree_state,
                 log_path=log_path,
                 preflight=self._preflight_result,
-                mode=UPDATE_RELEASE_MODE if self._release_client is not None else "",
-                candidate=self._latest_candidate if self._release_client is not None else None,
-                source_pid=os.getpid() if self._release_client is not None else None,
-                install_dir=self._repo_root if self._release_client is not None else None,
+                mode=UPDATE_RELEASE_MODE if is_release_update else "",
+                candidate=self._latest_candidate if is_release_update else None,
+                source_pid=os.getpid() if is_release_update else None,
+                install_dir=self._repo_root if is_release_update else None,
             )
             payload["progress"] = build_update_progress_snapshot(
-                "handoff",
+                "release_handoff_launch" if is_release_update else "handoff",
                 state="pending",
                 percent=handoff_percent,
                 log_path=str(log_path),
@@ -3791,6 +4104,14 @@ class WindowsSupporterUpdater:
                 get_update_handoff_executable_path(handoff_path.parent)
             )
             self._handoff_writer(handoff_path, payload)
+            if is_release_update:
+                self._publish_update_progress(
+                    "release_handoff_state",
+                    state="running",
+                    phase_fraction=1.0,
+                    detail="업데이트 상태 기록을 완료했습니다.",
+                    show_ui=self._show_preflight_progress_ui,
+                )
             command = self._handoff_command_builder(handoff_path)
         except Exception as exc:
             self._state = "error"
@@ -3806,14 +4127,31 @@ class WindowsSupporterUpdater:
             )
             return False
 
+        if is_release_update:
+            self._publish_update_progress(
+                "release_handoff_launch",
+                state="running",
+                phase_fraction=0.0,
+                detail="installer 업데이트 전용 프로세스를 시작합니다.",
+                show_ui=self._show_preflight_progress_ui,
+            )
         proc = self._popen(command, cwd=self._repo_root)
         self._state = "updating"
-        self._publish_update_progress(
-            "handoff",
-            state="running",
-            percent=handoff_percent,
-            show_ui=self._show_preflight_progress_ui,
-        )
+        if is_release_update:
+            self._publish_update_progress(
+                "release_handoff_launch",
+                state="running",
+                phase_fraction=1.0,
+                detail="전용 업데이트 프로세스를 시작했습니다.",
+                show_ui=self._show_preflight_progress_ui,
+            )
+        else:
+            self._publish_update_progress(
+                "handoff",
+                state="running",
+                percent=handoff_percent,
+                show_ui=self._show_preflight_progress_ui,
+            )
         if proc is None:
             self._state = "error"
             self._last_error = "failed to launch update handoff"
