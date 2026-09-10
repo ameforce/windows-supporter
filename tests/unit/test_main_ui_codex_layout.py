@@ -217,15 +217,57 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui, root, _ = self._build_ui()
         ui._current_tab = ui._TAB_AI_USAGE
         fallback = ui._tab_sizes[ui._TAB_AI_USAGE]
-        ui._last_auto_geometry_size = (900, 520)
+        ui._auto_geometry_sizes.add((900, 520))
 
         ui._on_root_configure(SimpleNamespace(widget=root, width=900, height=520))
         self.assertNotIn(ui._TAB_AI_USAGE, ui._tab_user_sizes)
+        self.assertNotIn((900, 520), ui._auto_geometry_sizes)
+
+        # An actual later resize to a familiar automatic size is still user
+        # intent; the deferred auto event above must not poison that state.
+        ui._on_root_configure(SimpleNamespace(widget=root, width=900, height=520))
+        self.assertEqual(ui._tab_user_sizes[ui._TAB_AI_USAGE], (900, 520))
 
         ui._on_root_configure(SimpleNamespace(widget=root, width=760, height=460))
         self.assertEqual(ui._tab_user_sizes[ui._TAB_AI_USAGE], (760, 460))
         self.assertEqual(ui._tab_sizes[ui._TAB_AI_USAGE], fallback)
         self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (760, 460))
+
+    def test_synchronous_minsize_configure_is_not_saved_as_a_user_resize(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+
+            def winfo_width(self):
+                return 900
+
+            def winfo_height(self):
+                return 520
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._current_tab = ui._TAB_AI_USAGE
+        original_minsize = root.minsize
+
+        def minsize_with_configure(width, height):
+            original_minsize(width, height)
+            ui._on_root_configure(
+                SimpleNamespace(widget=root, width=width, height=height)
+            )
+
+        root.minsize = minsize_with_configure
+        ui._apply_tab_geometry(ui._TAB_AI_USAGE)
+
+        self.assertEqual(ui._tab_user_sizes, {})
+        self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (900, 520))
 
     def test_narrow_notebook_uses_short_tab_labels(self) -> None:
         class _TabNotebook:
@@ -245,12 +287,24 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._tab_ai_usage = "ai"
         ui._tab_update = "update"
 
-        ui._apply_notebook_labels_for_width(760)
+        ui._current_tab = ui._TAB_AI_USAGE
+        ui._on_root_configure(
+            SimpleNamespace(widget=ui._root, width=760, height=460)
+        )
 
         labels = {str(widget): options["text"] for widget, options in notebook.calls}
         self.assertEqual(labels["startup"], "Startup")
         self.assertEqual(labels["kakao"], "Kakao")
         self.assertEqual(labels["ai"], "AI")
+
+        notebook.calls.clear()
+        ui._on_root_configure(
+            SimpleNamespace(widget=ui._root, width=900, height=520)
+        )
+        labels = {str(widget): options["text"] for widget, options in notebook.calls}
+        self.assertEqual(labels["startup"], "Startup Apps")
+        self.assertEqual(labels["kakao"], "KakaoTalk")
+        self.assertEqual(labels["ai"], "AI 사용량")
 
     def test_work_area_winapi_uses_pointer_sized_monitor_handles(self) -> None:
         class _Callable:

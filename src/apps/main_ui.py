@@ -81,7 +81,8 @@ class WindowsSupporterMainUI:
         # 책임이다. 탭 전환 때 현재 창 크기를 fallback에 덮어쓰면, 긴 화면을
         # 본 뒤 작은 화면까지 같은 여백을 물려받는다.
         self._tab_user_sizes: dict[str, tuple[int, int]] = {}
-        self._last_auto_geometry_size: tuple[int, int] | None = None
+        self._auto_geometry_sizes: set[tuple[int, int]] = set()
+        self._applying_tab_geometry = False
         # 탭 크기는 실제 콘텐츠 요구 크기를 우선한다. 이 값들은 콘텐츠가
         # 아직 mount되지 않았거나 요청 크기를 측정할 수 없는 탭의 compact
         # fallback이며, _apply_tab_geometry가 작업 영역 상한을 적용한다.
@@ -422,9 +423,17 @@ class WindowsSupporterMainUI:
             return
         if width <= 1 or height <= 1:
             return
-        if self._last_auto_geometry_size == (width, height):
+        if self._applying_tab_geometry:
+            return
+        if (width, height) in self._auto_geometry_sizes:
+            # An automatic geometry request can produce a Configure event just
+            # after the scoped transaction ends. Consume that one event rather
+            # than retaining this size forever: a later real user resize to the
+            # same dimensions must still be honoured.
+            self._auto_geometry_sizes.discard((width, height))
             return
         self._tab_user_sizes[str(tab_key)] = (width, height)
+        self._apply_notebook_labels_for_width(width)
         return
 
     def _apply_notebook_labels_for_width(self, width: int | None = None) -> None:
@@ -584,42 +593,57 @@ class WindowsSupporterMainUI:
         # A narrow window changes wrapping and therefore the requested height of
         # the content. Two passes settle that feedback loop without resizing on
         # every status refresh.
-        for _ in range(2):
-            preferred_width, preferred_height = self._preferred_window_size(tab_key)
-            work_width, work_height = self._work_area_size()
-            max_width = max(320, int(work_width) - 32)
-            max_height = max(280, int(work_height) - 48)
-            width = min(max(1, int(preferred_width)), max_width)
-            height = min(max(1, int(preferred_height)), max_height)
+        self._applying_tab_geometry = True
+        try:
+            for _ in range(2):
+                preferred_width, preferred_height = self._preferred_window_size(tab_key)
+                work_width, work_height = self._work_area_size()
+                max_width = max(320, int(work_width) - 32)
+                max_height = max(280, int(work_height) - 48)
+                width = min(max(1, int(preferred_width)), max_width)
+                height = min(max(1, int(preferred_height)), max_height)
 
-            # A measured dashboard can be smaller than the historical fallback
-            # minimum. Do not reintroduce the old blank area by forcing that
-            # minimum back above the content-fit size.
-            min_width = min(int(fallback_min_width), max_width, width)
-            min_height = min(int(fallback_min_height), max_height, height)
-            width = max(width, min_width)
-            height = max(height, min_height)
-            geometry = self._centered_geometry(
-                width,
-                height,
-                work_width=work_width,
-                work_height=work_height,
-            )
+                # A measured dashboard can be smaller than the historical fallback
+                # minimum. Do not reintroduce the old blank area by forcing that
+                # minimum back above the content-fit size.
+                min_width = min(int(fallback_min_width), max_width, width)
+                min_height = min(int(fallback_min_height), max_height, height)
+                width = max(width, min_width)
+                height = max(height, min_height)
+                geometry = self._centered_geometry(
+                    width,
+                    height,
+                    work_width=work_width,
+                    work_height=work_height,
+                )
 
-            if geometry == last_geometry:
-                break
-            last_geometry = geometry
+                if geometry == last_geometry:
+                    break
+                last_geometry = geometry
+                self._auto_geometry_sizes.add((int(min_width), int(min_height)))
+                try:
+                    root.minsize(max(1, min_width), max(1, min_height))
+                except Exception:
+                    pass
+                self._auto_geometry_sizes.add((int(width), int(height)))
+                try:
+                    root.geometry(geometry)
+                except Exception:
+                    pass
+                self._apply_notebook_labels_for_width(width)
+                try:
+                    root.update_idletasks()
+                except Exception:
+                    pass
+        finally:
+            self._applying_tab_geometry = False
+        # Tk delivers geometry Configure events before its next idle turn. Keep
+        # a brief deferred-event guard, then clear it so an eventual user resize
+        # to a familiar tab size is not misclassified as automatic.
+        after_idle = getattr(root, "after_idle", None)
+        if callable(after_idle):
             try:
-                root.minsize(max(1, min_width), max(1, min_height))
-            except Exception:
-                pass
-            try:
-                self._last_auto_geometry_size = (int(width), int(height))
-                root.geometry(geometry)
-            except Exception:
-                pass
-            try:
-                root.update_idletasks()
+                after_idle(self._auto_geometry_sizes.clear)
             except Exception:
                 pass
         return
