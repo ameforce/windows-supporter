@@ -5,6 +5,8 @@ from math import isfinite
 from typing import Any
 import threading
 
+from src.apps.wrike_worktime import normalize_hhmm_input
+
 
 class WrikeSettingsView:
     _VACATION_PROVIDER_LABELS = {
@@ -245,7 +247,7 @@ class WrikeSettingsView:
         add_entry(self._workday_target_var)
         row += 1
 
-        add_label("출근 시각(HH:MM)")
+        add_label("출근 시각 (예: 9, 930, 9:30)")
         add_entry(self._workday_clock_in_var)
         row += 1
 
@@ -1090,18 +1092,6 @@ class WrikeSettingsView:
             )
         except Exception:
             clock_text = ""
-        clock_text = clock_text.strip()
-        if (
-            len(clock_text) != 5
-            or clock_text[2:3] != ":"
-            or not clock_text[:2].isdigit()
-            or not clock_text[3:].isdigit()
-        ):
-            self._set_status(
-                "계획 저장 실패: 출근 시각 형식은 HH:MM 입니다.",
-                level="error",
-            )
-            return
         clock_minutes, error = self._parse_hhmm(clock_text, "출근 시각")
         if error or clock_minutes is None:
             self._set_status(f"계획 저장 실패: {error}", level="error")
@@ -1957,17 +1947,12 @@ class WrikeSettingsView:
         return f"{total // 60:02d}:{total % 60:02d}"
 
     def _parse_hhmm(self, text: str, label: str) -> tuple[int | None, str | None]:
-        raw = str(text or "").strip()
-        parts = raw.split(":")
-        if len(parts) != 2:
-            return None, f"{label} 형식은 HH:MM 입니다."
-        try:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-        except Exception:
-            return None, f"{label} 값이 올바르지 않습니다."
-        if hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
-            return None, f"{label} 값이 올바르지 않습니다."
+        normalized = normalize_hhmm_input(text)
+        if normalized is None:
+            return None, (
+                f"{label}은 9, 930, 9:30 또는 HH:MM 형식으로 입력해 주세요."
+            )
+        hours, minutes = (int(part) for part in normalized.split(":", 1))
         return hours * 60 + minutes, None
 
     def _strict_positive_int(self, text: str, label: str) -> tuple[int, str | None]:

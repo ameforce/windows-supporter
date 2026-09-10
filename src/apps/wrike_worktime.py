@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import re
 
 
 COLOR_TEXT = "#111111"
@@ -18,6 +19,46 @@ COLOR_MUTED = "#6B7280"
 
 DEFAULT_LUNCH_START_MIN = 12 * 60
 DEFAULT_LUNCH_END_MIN = 13 * 60
+
+_COMPACT_CLOCK_INPUT_PATTERN = re.compile(r"\d{1,4}")
+_COLON_CLOCK_INPUT_PATTERN = re.compile(r"\d{1,2}")
+
+
+def normalize_hhmm_input(value) -> str | None:
+    """Normalize a user-entered local clock time to canonical ``HH:MM``.
+
+    Persisted workday plans still use the canonical form, while interactive
+    fields may use a short form: ``9``/``09`` means ``09:00``, ``930``/``0930``
+    means ``09:30``, and ``9:3`` means ``09:03``.
+    """
+
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+
+    if ":" in text:
+        parts = [part.strip() for part in text.split(":")]
+        if (
+            len(parts) != 2
+            or _COLON_CLOCK_INPUT_PATTERN.fullmatch(parts[0]) is None
+            or _COLON_CLOCK_INPUT_PATTERN.fullmatch(parts[1]) is None
+        ):
+            return None
+        hours = int(parts[0])
+        minutes = int(parts[1])
+    else:
+        if _COMPACT_CLOCK_INPUT_PATTERN.fullmatch(text) is None:
+            return None
+        if len(text) <= 2:
+            hours = int(text)
+            minutes = 0
+        else:
+            hours = int(text[:-2])
+            minutes = int(text[-2:])
+
+    if not 0 <= hours <= 23 or not 0 <= minutes <= 59:
+        return None
+    return f"{hours:02d}:{minutes:02d}"
 
 
 @dataclass(frozen=True)
