@@ -1414,10 +1414,31 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             wrike.get_workday_plan(target_day)["clock_in"],
             "08:00",
         )
-        self.assertTrue(wrike._Wrike__panel_edit_clock_in("08:15"))
+        self.assertTrue(wrike._Wrike__panel_edit_clock_in("815"))
         plan = wrike.get_workday_plan(target_day)
         self.assertEqual(plan["clock_in"], "08:15")
         self.assertEqual(plan["target_net_minutes"], 480)
+
+    def test_settings_workday_clock_accepts_compact_input_and_saves_canonical_value(self) -> None:
+        backend = Mock()
+        backend.update_workday_plan.return_value = (True, None)
+        backend.get_workday_plan.return_value = {
+            "date": "2026-04-06",
+            "target_net_minutes": 480,
+            "clock_in": "09:30",
+        }
+        view = WrikeSettingsView(None, backend)
+        view._workday_date_var = _FakeVar("2026-04-06")
+        view._workday_target_var = _FakeVar("8")
+        view._workday_clock_in_var = _FakeVar("930")
+        statuses = []
+        view._set_status = lambda text, level="info": statuses.append((text, level))
+
+        view._on_save_workday_plan()
+
+        backend.update_workday_plan.assert_called_once_with("2026-04-06", 480, "09:30")
+        self.assertEqual(view._workday_clock_in_var.get(), "09:30")
+        self.assertEqual(statuses[-1], ("근무 계획 저장 완료", "ok"))
 
     def test_clock_in_now_preserves_implicit_weekend_zero_target(self) -> None:
         wrike = self._new_wrike()

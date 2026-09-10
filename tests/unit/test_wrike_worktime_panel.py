@@ -983,7 +983,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertIn("23:59", panel._widgets["inline_error"].kwargs["text"])
         self.assertTrue(panel._inline_editor_active)
         shared_entry.delete(0, "end")
-        shared_entry.insert(0, "08:15")
+        shared_entry.insert(0, "815")
         fake_tk.button("저장").invoke()
         callbacks["edit_clock_in"].assert_called_once_with("08:15")
         self.assertFalse(panel._inline_editor_active)

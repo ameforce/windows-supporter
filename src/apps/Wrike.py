@@ -58,6 +58,7 @@ from src.apps.wrike_worktime import (
     build_workday_overview,
     clock_in_candidate,
     composed_vacation_credit_minutes,
+    normalize_hhmm_input,
 )
 from src.apps.wrike_worktime_state import WorktimeStateStore
 from src.apps.flex_worktime import (
@@ -2768,14 +2769,15 @@ class Wrike:
         report_error: bool = True,
     ) -> bool:
         now = self.__lib.datetime.now()
+        normalized_clock = normalize_hhmm_input(clock_value)
         try:
-            parsed = datetime.strptime(str(clock_value), "%H:%M")
-            if parsed.strftime("%H:%M") != str(clock_value):
+            parsed = datetime.strptime(str(normalized_clock), "%H:%M")
+            if normalized_clock is None or parsed.strftime("%H:%M") != normalized_clock:
                 raise ValueError("invalid clock")
         except Exception:
             if report_error:
                 self.__show_panel_action_error(
-                    "출근 시간은 HH:MM 형식이어야 합니다"
+                    "출근 시간은 9, 930, 9:30 또는 HH:MM 형식으로 입력해 주세요"
                 )
             return False
         try:
@@ -2784,7 +2786,7 @@ class Wrike:
             ok, _error = self.update_workday_plan(
                 now.date(),
                 target,
-                str(clock_value),
+                normalized_clock,
             )
         except Exception:
             ok = False

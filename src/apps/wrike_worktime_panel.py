@@ -10,6 +10,7 @@ import time
 from typing import Any, Callable
 
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
+from src.apps.wrike_worktime import normalize_hhmm_input
 
 
 _REFRESH_INTERVAL_MS = 1_000
@@ -2111,10 +2112,10 @@ class WorktimeQuickPanel:
 
     @staticmethod
     def _parse_clock_time(value: object) -> tuple[str | None, str | None]:
-        text = str(value or "").strip()
-        if _HHMM_PATTERN.fullmatch(text) is None:
-            return None, "HH:MM (00:00–23:59) 형식으로 입력해 주세요."
-        return text, None
+        normalized = normalize_hhmm_input(value)
+        if normalized is None:
+            return None, "9, 930, 9:30 또는 HH:MM 형식으로 입력해 주세요. (00:00–23:59)"
+        return normalized, None
 
     @staticmethod
     def _parse_manual_break_times(
@@ -2173,9 +2174,9 @@ class WorktimeQuickPanel:
         if kind == _INLINE_EDITOR_TARGET:
             return f"{context or '선택 날짜'} 목표 순근무 시간", "HH:MM (00:00–24:00)"
         if kind == _INLINE_EDITOR_CLOCK_IN:
-            return "오늘 출근 시간", "HH:MM (00:00–23:59)"
+            return "오늘 출근 시간", "예: 9 · 930 · 9:30"
         if kind == _INLINE_EDITOR_PROMPT:
-            return "감지된 출근 시간", "HH:MM (00:00–23:59)"
+            return "감지된 출근 시간", "예: 9 · 930 · 9:30"
         if kind == _INLINE_EDITOR_MANUAL_BREAK:
             return "완료한 수동 휴게", "HH:MM - HH:MM"
         raise ValueError(f"unsupported inline editor kind: {kind}")

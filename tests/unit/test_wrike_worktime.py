@@ -13,6 +13,7 @@ from src.apps.wrike_worktime import (
     compute_net_elapsed_minutes,
     earliest_clock_in_from_items,
     format_minutes,
+    normalize_hhmm_input,
     overlap_minutes,
     parse_iso_datetime,
     project_quit_at,
@@ -87,6 +88,25 @@ class WorktimeComputationUnitTest(unittest.TestCase):
         parsed = parse_iso_datetime("2026-08-27T01:15:00Z")
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.tzinfo, None)
+
+    def test_normalize_hhmm_input_accepts_compact_clock_forms(self):
+        cases = {
+            "9": "09:00",
+            "09": "09:00",
+            "930": "09:30",
+            "0930": "09:30",
+            "9:30": "09:30",
+            "09:3": "09:03",
+            " 9 : 5 ": "09:05",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_hhmm_input(raw), expected)
+
+    def test_normalize_hhmm_input_rejects_ambiguous_or_out_of_range_values(self):
+        for raw in ("", "24", "2400", "24:00", "9300", "12:345", "nine"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(normalize_hhmm_input(raw))
 
     def test_clock_in_candidate_prefers_non_midnight_tracked_date(self):
         item = {"trackedDate": "2026-08-27T09:04:00", "createdDate": "2026-08-27T11:40:00"}
