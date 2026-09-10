@@ -349,7 +349,7 @@ def _selected_taskbar_profiles(profiles: list[Any]) -> list[dict[str, Any]]:
         if not bool(raw.get("taskbar_selected", True)):
             continue
         selected.append(raw)
-        if len(selected) >= 2:
+        if len(selected) >= 4:
             break
     return selected
 
@@ -7496,5 +7496,158 @@ def _get_window_handle(window: Any) -> int:
     return int(hwnd)
 
 
-AiUsageTaskbarOverlay = CodexUsageTaskbarOverlay
+class AiUsageTaskbarOverlay:
+    """Render the selected taskbar profiles as two independently placed panes.
+
+    ``CodexUsageTaskbarOverlay`` deliberately remains the single-pane renderer:
+    its two-row shared-grid layout is also exercised directly by the native
+    drawing tests.  The product surface uses this coordinator instead.  It
+    gives profiles one and two the left-half pane and profiles three and four
+    the right-half pane, so increasing the selection limit never turns the
+    taskbar into a four-row strip or lets both panes race for the same slot.
+    """
+
+    _PANE_SIZE = 2
+
+    def __init__(
+        self,
+        root: Any,
+        runtime_getter: Callable[[], dict[str, Any]],
+        *,
+        window_factory: Callable[[Any], Any] | None = None,
+        work_area_getter: Callable[[], tuple[int, int, int, int] | None] | None = None,
+        occupied_span_getter: Callable[
+            [int, int, tuple[int, int, int, int] | dict[str, int] | None, dict[str, int | str]],
+            list[tuple[int, int]] | None,
+        ]
+        | None = None,
+        fullscreen_detector: Callable[[Any | None], bool] | None = None,
+        taskbar_target_getter: Callable[[], tuple[TaskbarOverlayTarget, ...]] | None = None,
+    ) -> None:
+        self._runtime_getter = runtime_getter
+        base_occupied_span_getter = (
+            occupied_span_getter or _detect_horizontal_taskbar_occupied_spans
+        )
+        self._left_pane = CodexUsageTaskbarOverlay(
+            root,
+            self._pane_runtime_getter(0),
+            window_factory=window_factory,
+            work_area_getter=work_area_getter,
+            occupied_span_getter=self._pane_occupied_span_getter(
+                base_occupied_span_getter,
+                _SLOT_SIDE_LEFT,
+            ),
+            fullscreen_detector=fullscreen_detector,
+            taskbar_target_getter=taskbar_target_getter,
+        )
+        self._right_pane = CodexUsageTaskbarOverlay(
+            root,
+            self._pane_runtime_getter(self._PANE_SIZE),
+            window_factory=window_factory,
+            work_area_getter=work_area_getter,
+            occupied_span_getter=self._pane_occupied_span_getter(
+                base_occupied_span_getter,
+                _SLOT_SIDE_RIGHT,
+            ),
+            fullscreen_detector=fullscreen_detector,
+            taskbar_target_getter=taskbar_target_getter,
+        )
+
+    def _pane_runtime_getter(self, offset: int) -> Callable[[], dict[str, Any]]:
+        def getter() -> dict[str, Any]:
+            try:
+                runtime = self._runtime_getter()
+            except Exception:
+                runtime = {}
+            if not isinstance(runtime, dict):
+                runtime = {}
+            selected = _selected_taskbar_profiles(_taskbar_profile_source(runtime))
+            pane_runtime = dict(runtime)
+            # Always publish a ``profiles`` list, even when the legacy source
+            # was ``accounts``.  The single-pane renderer then cannot reach a
+            # profile owned by its peer pane.
+            pane_runtime["profiles"] = list(
+                selected[int(offset) : int(offset) + self._PANE_SIZE]
+            )
+            pane_runtime.pop("accounts", None)
+            return pane_runtime
+
+        return getter
+
+    @staticmethod
+    def _pane_occupied_span_getter(
+        base_getter: Callable[
+            [int, int, tuple[int, int, int, int] | dict[str, int] | None, dict[str, int | str]],
+            list[tuple[int, int]] | None,
+        ],
+        side: str,
+    ) -> Callable[
+        [int, int, tuple[int, int, int, int] | dict[str, int] | None, dict[str, int | str]],
+        list[tuple[int, int]],
+    ]:
+        def getter(
+            width: int,
+            height: int,
+            work_area: tuple[int, int, int, int] | dict[str, int] | None,
+            geometry: dict[str, int | str],
+        ) -> list[tuple[int, int]]:
+            try:
+                detected = base_getter(width, height, work_area, geometry)
+            except Exception:
+                detected = None
+            spans = list(detected or [])
+            midpoint = max(1, int(width) // 2)
+            # Reserve the peer half before the core renderer chooses a free
+            # slot.  That makes the pane side a placement contract rather
+            # than a preference: a narrow left slot never jumps to the right
+            # pane (and vice versa).
+            if side == _SLOT_SIDE_LEFT:
+                spans.append((midpoint, int(width)))
+            else:
+                spans.append((0, midpoint))
+            return spans
+
+        return getter
+
+    def refresh(self) -> bool:
+        left_ok = bool(self._left_pane.refresh())
+        right_ok = bool(self._right_pane.refresh())
+        right_model = self._right_pane._last_model
+        right_geometry = _model_geometry(right_model)
+        if not isinstance(right_geometry, dict):
+            right_geometry = {}
+        # A vertical taskbar has no left/right horizontal slots.  Avoid
+        # stacking the two panes on that unsupported orientation; the first
+        # pane remains available and the second returns when the taskbar is
+        # horizontal again.
+        if str(right_geometry.get("orientation") or "") not in {"bottom", "top"}:
+            self._right_pane.hide()
+        return left_ok and right_ok
+
+    def hide(self) -> None:
+        self._left_pane.hide()
+        self._right_pane.hide()
+
+    def invalidate_geometry(self) -> None:
+        self._left_pane.invalidate_geometry()
+        self._right_pane.invalidate_geometry()
+
+    def prepare_for_display_topology_change(self) -> None:
+        self._left_pane.prepare_for_display_topology_change()
+        self._right_pane.prepare_for_display_topology_change()
+
+    def invalidate_native_owner(self) -> None:
+        self._left_pane.invalidate_native_owner()
+        self._right_pane.invalidate_native_owner()
+
+    def rebind_native_owner(self) -> None:
+        self.invalidate_native_owner()
+
+    def __getattr__(self, name: str) -> Any:
+        # Compatibility for integrations that read renderer diagnostics from
+        # the historical one-pane object.  Production mutation methods are
+        # defined above and are always fanned out to both panes.
+        return getattr(self._left_pane, name)
+
+
 build_ai_usage_taskbar_overlay_model = build_codex_usage_taskbar_overlay_model

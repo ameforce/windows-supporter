@@ -1,0 +1,35 @@
+# v0.23.0 작업표시줄 프로필 4개 표시 계약
+
+## 변경 분류
+
+- 의도한 계약: 작업표시줄 오버레이는 선택된 사용량 프로필을 빠르게 비교한다.
+- 현재 동작: 선택·저장·렌더링이 모두 최대 2개로 제한되어 있었다.
+- 차이: 프로필 3~4를 작업표시줄에 선택하거나 동시에 비교할 수 없었다.
+- 판정: 기존 버그의 복구가 아니라 표시 가능 프로필 수를 늘리는 사용자 기능이므로
+  `release/v0.23.0`에서 제공한다.
+
+## 표시 계약
+
+- 작업표시줄 선택은 최대 4개이며, 5번째 선택과 저장은 원자적으로 거부한다.
+- 수평 작업표시줄에서는 첫 번째·두 번째 프로필을 왼쪽 pane의 2행으로, 세 번째·네 번째
+  프로필을 오른쪽 pane의 2행으로 렌더링한다.
+- 각 pane은 반대쪽 화면 절반을 occupied span으로 예약한다. 빈 공간이 작아도 반대쪽 pane으로
+  이동하거나 서로 겹치지 않으며, 자기 쪽에 최소 compact slot이 없으면 그 pane만 숨긴다.
+- 수직 작업표시줄은 좌·우 분할의 의미가 없으므로 첫 pane만 표시한다. 수평 위치로 돌아오면
+  두 번째 pane은 다시 계산해 표시한다.
+
+## 검증 범위
+
+- 모델은 선택된 4개까지 순서를 유지한다.
+- 저장/재시작은 4개를 유지하고, 5개는 파일을 훼손하거나 조용히 자르지 않고 read-only로
+  보존한다.
+- pane 렌더링은 1~2와 3~4의 row ownership, 좌·우 geometry 및 2개 선택 시 두 번째 창의
+  미생성을 단위 테스트로 검증한다.
+
+## 릴리스 정리
+
+- task worktree에서 생성된 virtual environment, Python bytecode, PyInstaller `build`/`dist`/spec,
+  egg-info는 source가 아니므로 inventory를 남긴 뒤 정리한다.
+- runtime deploy의 probe, promotion marker, backup/staged candidate는 source가 아니므로
+  `.gitignore`에 명시한다. 실제 transaction marker나 backup은 실패 복구 증거일 수 있으므로
+  ownership과 완료 상태를 증명하기 전에는 삭제하지 않는다.
