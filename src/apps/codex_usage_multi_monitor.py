@@ -27,7 +27,7 @@ from src.apps.codex_usage_taskbar_overlay import AiUsageTaskbarOverlay
 LEGACY_ACCOUNT_IDS = ("account_1", "account_2")
 SUPPORTED_PROVIDERS = ("codex", "cursor")
 AI_USAGE_SETTINGS_VERSION = 4
-TASKBAR_PROFILE_LIMIT = 2
+TASKBAR_PROFILE_LIMIT = 4
 SHUTDOWN_QUIESCENCE_TIMEOUT_SEC = 60.0
 PROFILE_ID_PATTERN = re.compile(r"^(?:account_[12]|profile_[0-9a-f]{32})$")
 DEFAULT_LABELS = {
