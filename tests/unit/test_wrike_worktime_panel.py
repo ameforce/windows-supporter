@@ -1861,6 +1861,120 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 panel.destroy()
             root.destroy()
 
+    def test_real_tk_high_dpi_does_not_squash_action_buttons(self) -> None:
+        """High-DPI detail content must yield space before the action footer."""
+
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+        except Exception as exc:
+            self.skipTest(f"Tk display is unavailable: {exc}")
+        original_scaling = root.tk.call("tk", "scaling")
+        root.withdraw()
+        root.tk.call("tk", "scaling", 1.6)
+        panel = None
+        try:
+            base = _model(
+                actual_text="Wrike 기록 4시간 30분 · 현재 기대 8시간",
+                sync_text="2026-09-10 19:18:36 · 방금 · fresh · Flex unconfigured",
+                row_suffix=" · 목표 8시간 · 부족 3시간 30분",
+            )
+            date_key = base.rows[0].date_key
+            detail_rows = tuple(
+                TimelogDetailRow(
+                    date_key,
+                    f"L{index}",
+                    "T1" if index < 5 else "T2",
+                    15,
+                    f"작업 {index}",
+                    "공수처 KICS HP-UX pdfio 정규식 미지원 빌드로 CPO-00004 발생 원인 분석",
+                    "ready",
+                )
+                for index in range(6)
+            )
+            details = tuple(
+                TimelogDayDetails(
+                    row.date_key,
+                    "available",
+                    sum(item.minutes for item in detail_rows if item.date_key == row.date_key),
+                    tuple(item for item in detail_rows if item.date_key == row.date_key),
+                )
+                for row in base.rows
+            )
+            model = replace(base, day_details=details)
+            holder = {"model": model}
+            panel = WorktimeQuickPanel(
+                root,
+                lambda: holder["model"],
+                refresh=lambda: None,
+                clock_in_now=lambda: None,
+                edit_clock_in=lambda _value: True,
+                edit_plan=lambda _date_key, _minutes: True,
+                toggle_break=lambda: None,
+                open_settings=lambda: None,
+                prompt_accept=lambda _value: None,
+                prompt_edit=lambda _detected, _value: True,
+                prompt_snooze=lambda: None,
+                prompt_skip=lambda: None,
+                tk_module=tk,
+            )
+            with (
+                patch(
+                    "src.apps.wrike_worktime_panel._show_window_without_activation",
+                    side_effect=lambda window: (window.deiconify(), True)[1],
+                ),
+                patch(
+                    "src.apps.wrike_worktime_panel._work_area_for_point",
+                    return_value=(0, 0, 612, 538),
+                ),
+            ):
+                self.assertTrue(panel.show(activate=False))
+            root.update_idletasks()
+
+            window = panel._window
+            self.assertIsNotNone(window)
+            window.update()
+            window_bottom = window.winfo_rooty() + window.winfo_height()
+            footer = panel._widgets["footer"]
+            self.assertGreaterEqual(footer.winfo_height(), footer.winfo_reqheight())
+            self.assertLess(
+                int(panel._widgets["detail_text"].cget("height")),
+                8,
+            )
+            holder["model"] = replace(
+                model,
+                sync_text=f"{model.sync_text} · 갱신",
+            )
+            self.assertTrue(panel.refresh_now())
+            root.update_idletasks()
+            window.update()
+            self.assertGreaterEqual(footer.winfo_height(), footer.winfo_reqheight())
+            for button_name in (
+                "refresh_button",
+                "clock_button",
+                "break_button",
+                "plan_button",
+                "settings_button",
+            ):
+                with self.subTest(button=button_name):
+                    button = panel._widgets[button_name]
+                    self.assertTrue(button.winfo_ismapped())
+                    self.assertGreaterEqual(button.winfo_height(), 20)
+                    self.assertLessEqual(
+                        button.winfo_rooty() + button.winfo_height(),
+                        window_bottom,
+                    )
+
+            heading = panel._selected_detail_text(model).splitlines()[1]
+            self.assertIn("...", heading)
+            self.assertNotIn("\n", heading)
+        finally:
+            if panel is not None:
+                panel.destroy()
+            root.tk.call("tk", "scaling", original_scaling)
+            root.destroy()
+
     def test_manual_break_edit_control_is_visible_only_in_breaks_view(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
