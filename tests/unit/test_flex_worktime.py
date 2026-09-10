@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import unittest
 
 from src.apps.flex_worktime import (
@@ -16,6 +16,21 @@ from src.apps.flex_worktime import (
 
 
 class FlexScheduleParserTests(unittest.TestCase):
+    @staticmethod
+    def _flex_timestamp(hour: int, minute: int = 0) -> dict[str, object]:
+        value = datetime(
+            2026,
+            9,
+            10,
+            hour,
+            minute,
+            tzinfo=timezone(timedelta(hours=9)),
+        )
+        return {
+            "zoneId": "Asia/Seoul",
+            "timestamp": int(value.timestamp() * 1000),
+        }
+
     def test_normalizes_planned_break_overtime_and_actual_clock_blocks(self) -> None:
         payload = {
             "userWorkSchedules": [
@@ -173,6 +188,79 @@ class FlexScheduleParserTests(unittest.TestCase):
 
         self.assertIn(date(2026, 9, 10), schedules)
         self.assertEqual(employee_number, "E-42")
+
+    def test_parses_current_flex_daily_schedule_envelope_and_work_forms(self) -> None:
+        payloads = [
+            {
+                "userIdHash": "opaque-user-id",
+                "dailySchedules": [
+                    {
+                        "date": "2026-09-10",
+                        "timeBlocks": [
+                            {
+                                "type": "WORK",
+                                "value": {
+                                    "startTimestamp": self._flex_timestamp(9),
+                                    "endTimestampExclusive": self._flex_timestamp(18),
+                                    "workFormId": "basic-work-form",
+                                },
+                            },
+                            {
+                                "type": "REST",
+                                "value": {
+                                    "startTimestamp": self._flex_timestamp(12),
+                                    "endTimestampExclusive": self._flex_timestamp(13),
+                                    "workFormId": "rest-form",
+                                },
+                            },
+                            {
+                                "type": "WORK",
+                                "value": {
+                                    "startTimestamp": self._flex_timestamp(18),
+                                    "endTimestampExclusive": self._flex_timestamp(20),
+                                    "workFormId": "overtime-form",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+            {
+                "workForms": [
+                    {
+                        "customerWorkFormId": "basic-work-form",
+                        "type": "WORK",
+                        "display": {"name": "기본 근무"},
+                    },
+                    {
+                        "customerWorkFormId": "rest-form",
+                        "type": "REST",
+                        "display": {"name": "점심 휴게"},
+                    },
+                    {
+                        "customerWorkFormId": "overtime-form",
+                        "type": "WORK",
+                        "display": {"name": "연장 근무"},
+                    },
+                ]
+            },
+            {"employeeNumber": "E-42"},
+        ]
+
+        schedules, employee_number = _parse_browser_response_payloads(
+            payloads,
+            employee_number="",
+            now=datetime(2026, 9, 10, 19, 0),
+        )
+        schedule = schedules[date(2026, 9, 10)]
+
+        self.assertEqual(employee_number, "E-42")
+        self.assertEqual(schedule.target_minutes, 600)
+        self.assertEqual(schedule.overtime_assigned_minutes, 120)
+        self.assertEqual(schedule.scheduled_start.strftime("%H:%M"), "09:00")
+        self.assertEqual(schedule.regular_quit.strftime("%H:%M"), "18:00")
+        self.assertEqual(schedule.scheduled_quit.strftime("%H:%M"), "20:00")
+        self.assertEqual(schedule.overtime_scheduled_quit.strftime("%H:%M"), "20:00")
 
     def test_extracts_labelled_employee_number_from_visible_text(self) -> None:
         self.assertEqual(
