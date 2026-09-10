@@ -621,6 +621,8 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 return 0
 
         progress_instances = []
+        target_launches = []
+        readiness_waits = []
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -656,17 +658,35 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 log_switch = next(item for item in command if str(item).startswith("/LOG="))
                 return FakeInstallerProcess(Path(str(log_switch).removeprefix("/LOG=")), runtime)
 
+            def target_launcher(command, **kwargs):
+                target_launches.append((list(command), dict(kwargs)))
+                return types.SimpleNamespace(pid=731)
+
+            def runtime_readiness_waiter(_target, **kwargs):
+                readiness_waits.append(dict(kwargs))
+                observer = kwargs["observer"]
+                observer(None, "probe was not created")
+                observer({"state": "starting"}, "runtime is not ready: starting")
+                observer({"state": "ready"}, "ready")
+                return {
+                    "pid": 732,
+                    "launcher_pid": kwargs["launcher_pid"],
+                    "heartbeat_samples": 3,
+                    "mainloop_ticks": [1, 2, 3],
+                }
+
             with patch.object(update_monitor_module, "get_update_state_dir", return_value=root / "state"):
                 rc = run_release_update_handoff(
                     state_path,
                     release_client=FakeReleaseClient(),
                     installer_launcher=launcher,
-                    target_launcher=lambda *_args, **_kwargs: object(),
+                    target_launcher=target_launcher,
                     artifact_metadata_reader=lambda _path: {
                         "file_version": "0.23.1.0",
                         "product_version": "0.23.1.0",
                         "comments": "v0.23.1 (test)",
                     },
+                    runtime_readiness_waiter=runtime_readiness_waiter,
                     progress_ui_factory=lambda **kwargs: progress_instances.append(
                         FakeProgressUi(**kwargs)
                     )
@@ -682,6 +702,19 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(percents[0], 0)
         self.assertEqual(percents, sorted(percents))
         self.assertEqual(percents[-1], 100)
+        self.assertEqual(len(target_launches), 1)
+        self.assertEqual(target_launches[0][0], [str(runtime)])
+        self.assertIn(
+            "WINDOWS_SUPPORTER_RUNTIME_PROBE_PATH",
+            target_launches[0][1]["env"],
+        )
+        self.assertIn(
+            "WINDOWS_SUPPORTER_RUNTIME_PROBE_TOKEN",
+            target_launches[0][1]["env"],
+        )
+        self.assertEqual(len(readiness_waits), 1)
+        self.assertEqual(readiness_waits[0]["launcher_pid"], 731)
+        self.assertEqual(readiness_waits[0]["expected_version"], "0.23.1.0")
         log_snapshots = [
             snapshot
             for snapshot in snapshots
@@ -704,6 +737,35 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 "installer-shortcuts",
                 "installer-complete-log",
             ],
+        )
+        runtime_activity_ids = [
+            str(snapshot.get("activity", {}).get("id") or "")
+            for snapshot in snapshots
+            if str(snapshot.get("step_key") or "") == "release_relaunch"
+        ]
+        self.assertEqual(
+            runtime_activity_ids,
+            [
+                "runtime-launch",
+                "runtime-process-started",
+                "runtime-probe-wait",
+                "runtime-starting",
+                "runtime-heartbeat",
+                "runtime-ready",
+            ],
+        )
+        waiting_snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if str(snapshot.get("activity", {}).get("id") or "")
+            in {"runtime-probe-wait", "runtime-starting", "runtime-heartbeat"}
+        ]
+        self.assertTrue(
+            all(snapshot["progressbar"]["mode"] == "indeterminate" for snapshot in waiting_snapshots)
+        )
+        self.assertLess(
+            next(index for index, snapshot in enumerate(snapshots) if snapshot.get("activity", {}).get("id") == "runtime-ready"),
+            next(index for index, snapshot in enumerate(snapshots) if snapshot.get("step_key") == "complete"),
         )
         self.assertGreater(progress_instances[0].pump_calls, 0)
 
@@ -1012,7 +1074,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         finally:
             progress.close()
 
-    def test_update_handoff_progress_ui_keeps_indeterminate_installer_bar_moving(self) -> None:
+    def test_update_handoff_progress_ui_keeps_runtime_readiness_wait_bar_moving(self) -> None:
         try:
             import tkinter as tk
         except ImportError as exc:
@@ -1030,9 +1092,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             progress.show(
                 build_release_installer_progress_snapshot(
                     build_update_progress_snapshot(
-                        "release_install",
+                        "release_relaunch",
                         state="running",
+                        phase_fraction=0.35,
                         progress_mode="indeterminate",
+                        detail="새 Windows Supporter 프로세스를 실행했습니다. 준비 신호를 기다립니다.",
                     )
                 )
             )
@@ -1042,6 +1106,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             self.assertEqual(
                 str(progress._title_label.cget("text")),
                 "Windows Supporter 업데이트 · 2/2 설치",
+            )
+            self.assertEqual(str(progress._stage_label.cget("text")), "새 버전 재실행 중")
+            self.assertEqual(
+                str(progress._detail_label.cget("text")),
+                "새 Windows Supporter 프로세스를 실행했습니다. 준비 신호를 기다립니다.",
             )
             initial_offset = progress._progress_pulse_offset
             deadline = time.monotonic() + 0.7
