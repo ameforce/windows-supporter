@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, timedelta
 import re
 from types import SimpleNamespace
@@ -9,9 +9,12 @@ from unittest.mock import Mock, patch
 
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
 from src.apps.wrike_worktime_panel import (
+    _COMPACT_PANEL_MAX_HEIGHT,
+    _COMPACT_PANEL_MAX_WIDTH,
     WorktimeActivityPrompt,
     WorktimePanelDayRow,
     WorktimePanelLine,
+    WorktimePanelManualBreak,
     WorktimePanelModel,
     WorktimeQuickPanel,
 )
@@ -787,7 +790,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
 
         self.assertEqual(len(fake_tk.toplevels), 1)
         self.assertIs(fake_tk.toplevels[0], window)
-        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
+        self.assertEqual(window.geometry_calls, ["660x500+116+116"])
         self.assertEqual(len(window.geometry_calls), geometry_count)
         self.assertEqual(fake_tk.live_buttons(), first_buttons)
         self.assertEqual(provider.call_count, 2)
@@ -1108,10 +1111,30 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             holder["model"] = _model(today_lines=one_line)
             panel.refresh_now()
 
-        reconcile.assert_called_once_with()
+        reconcile.assert_called_once_with(resize_to_request=True)
         self.assertTrue(original_button.destroyed)
         self.assertIsNot(fake_tk.button("새로고침"), original_button)
         self.assertIn("한 줄만", fake_tk.live_label_texts())
+
+    def test_today_summary_collapses_surplus_statuses_without_rebuilding(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model()}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+        original_button = fake_tk.button("새로고침")
+
+        holder["model"] = _model(
+            today_lines=holder["model"].today_lines
+            + (WorktimePanelLine("세 번째 상태", "#111827"),)
+        )
+        self.assertTrue(panel.refresh_now())
+
+        self.assertIs(fake_tk.button("새로고침"), original_button)
+        today_labels = panel._widgets["today_lines"]
+        self.assertEqual(len(today_labels), 2)
+        self.assertEqual(today_labels[0].kwargs["text"], "Wrike 기록 1:30 · 현재 기대 2:00")
+        self.assertEqual(today_labels[1].kwargs["text"], "추가 상태 2건")
 
     def test_provider_failure_and_invalid_model_preserve_last_good_render(self) -> None:
         root = _FakeRoot()
@@ -1156,7 +1179,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(window.focus_force_calls, 0)
         self.assertEqual(window.grab_set_calls, 0)
         self.assertEqual(window.wait_window_calls, 0)
-        self.assertEqual(window.geometry_calls[-1], "700x500+116+116")
+        self.assertEqual(window.geometry_calls[-1], "660x500+116+116")
 
     def test_failed_noactivate_or_unmapped_show_withdraws_and_can_retry(self) -> None:
         root = _FakeRoot()
@@ -1217,12 +1240,12 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         window.geometry_failures = 1
 
         self.assertTrue(panel.show(activate=False))
-        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
+        self.assertEqual(window.geometry_calls, ["660x500+116+116"])
         self.assertEqual((window.width, window.height), (1, 1))
         rendered_model = panel._model
 
         self.assertTrue(panel.refresh_now())
-        self.assertEqual(window.geometry_calls, ["700x500+116+116"])
+        self.assertEqual(window.geometry_calls, ["660x500+116+116"])
         self.assertIs(panel._model, rendered_model)
 
         with (
@@ -1236,15 +1259,15 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(provider.call_count, 3)
         self.assertEqual(
             window.geometry_calls,
-            ["700x500+116+116", "700x500+116+116"],
+            ["660x500+116+116", "660x500+116+116"],
         )
         self.assertEqual(
             (window.x, window.y, window.width, window.height),
-            (116, 116, 700, 500),
+            (116, 116, 660, 500),
         )
         self.assertEqual(root.active_delays(), [200, 1_000, 6_000])
 
-    def test_user_geometry_is_untouched_in_place_and_reconciled_on_structure(self) -> None:
+    def test_same_structure_preserves_position_and_structure_reflows_compactly(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
         holder = {"model": _model()}
@@ -1269,13 +1292,13 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 prompt=WorktimeActivityPrompt("08:35"),
             )
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "740x620-1000+50")
+            self.assertEqual(window.geometry_calls[-1], "660x540-1000+50")
             self.assertEqual(work_area.call_count, 1)
 
             work_area.return_value = (-800, -100, 0, 500)
             holder["model"] = _model(actual_text="텍스트만 변경", prompt=None)
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "740x600-800-100")
+            self.assertEqual(window.geometry_calls[-1], "660x540-800-40")
             self.assertEqual(work_area.call_count, 2)
 
     def test_first_show_uses_compact_density_for_a_640_pixel_work_area(self) -> None:
@@ -1293,8 +1316,8 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         ):
             self.assertTrue(panel.show(activate=False))
 
-        self.assertEqual(panel._content.pack_kwargs["padx"], 6)
-        self.assertEqual(panel._content.pack_kwargs["pady"], 3)
+        self.assertEqual(panel._content.pack_kwargs["padx"], 5)
+        self.assertEqual(panel._content.pack_kwargs["pady"], 2)
         self.assertEqual(panel._widgets["rows"][0][0].pack_kwargs["pady"], 0)
         self.assertTrue(panel._widgets["actions"].packed)
         self.assertTrue(panel._widgets["countdown"].packed)
@@ -1544,7 +1567,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             return_value=(0, 0, 1920, 1080),
         ):
             self.assertTrue(panel.show(activate=False))
-        self.assertEqual(window.geometry_calls[-1], "700x500+784+284")
+        self.assertEqual(window.geometry_calls[-1], "660x500+824+284")
 
     def test_first_show_uses_compact_density_on_a_normal_work_area(self) -> None:
         root = _FakeRoot()
@@ -1561,8 +1584,8 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         ):
             self.assertTrue(panel.show(activate=False))
 
-        self.assertEqual(panel._content.pack_kwargs["padx"], 6)
-        self.assertEqual(panel._content.pack_kwargs["pady"], 3)
+        self.assertEqual(panel._content.pack_kwargs["padx"], 5)
+        self.assertEqual(panel._content.pack_kwargs["pady"], 2)
         self.assertEqual(panel._widgets["rows"][0][0].pack_kwargs["pady"], 0)
 
     def test_geometry_uses_compact_safety_minimum_when_content_is_small(self) -> None:
@@ -1588,8 +1611,112 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(window.width, 560)
-        self.assertEqual(window.height, 360)
+        self.assertEqual(window.width, 520)
+        self.assertEqual(window.height, 330)
+
+    def test_real_tk_worst_case_layout_has_bounded_natural_size(self) -> None:
+        """Catch Tk's natural-size override of a non-resizable panel."""
+
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+        except Exception as exc:
+            self.skipTest(f"Tk display is unavailable: {exc}")
+        root.withdraw()
+        panel = None
+        try:
+            base = _model(
+                prompt=WorktimeActivityPrompt("08:35"),
+                today_lines=tuple(
+                    WorktimePanelLine(f"상태 {index}", "#111827")
+                    for index in range(5)
+                ),
+            )
+            detail_rows = tuple(
+                TimelogDetailRow(
+                    base.rows[0].date_key,
+                    f"L{index}",
+                    "T1",
+                    15,
+                    f"작업 {index}",
+                    "긴 타임로그 티켓 제목",
+                    "ready",
+                )
+                for index in range(30)
+            )
+            model = replace(
+                base,
+                day_details=tuple(
+                    TimelogDayDetails(
+                        row.date_key,
+                        "available",
+                        sum(
+                            detail.minutes
+                            for detail in detail_rows
+                            if detail.date_key == row.date_key
+                        ),
+                        tuple(
+                            detail
+                            for detail in detail_rows
+                            if detail.date_key == row.date_key
+                        ),
+                    )
+                    for row in base.rows
+                ),
+            )
+            panel = WorktimeQuickPanel(
+                root,
+                lambda: model,
+                refresh=lambda: None,
+                clock_in_now=lambda: None,
+                edit_clock_in=lambda _value: True,
+                edit_plan=lambda _date_key, _minutes: True,
+                toggle_break=lambda: None,
+                open_settings=lambda: None,
+                prompt_accept=lambda _value: None,
+                prompt_edit=lambda _detected, _value: True,
+                prompt_snooze=lambda: None,
+                prompt_skip=lambda: None,
+                tk_module=tk,
+            )
+            window = panel._ensure_window()
+            self.assertIsNotNone(window)
+            panel._reconcile_selection_for_model(model)
+            panel._render_structure(model)
+            window.update_idletasks()
+
+            self.assertEqual(len(panel._widgets["today_lines"]), 2)
+            self.assertEqual(int(panel._widgets["detail_text"].cget("height")), 5)
+            self.assertLessEqual(window.winfo_reqwidth(), _COMPACT_PANEL_MAX_WIDTH)
+            self.assertLessEqual(window.winfo_reqheight(), _COMPACT_PANEL_MAX_HEIGHT)
+        finally:
+            if panel is not None:
+                panel.destroy()
+            root.destroy()
+
+    def test_manual_break_edit_control_is_visible_only_in_breaks_view(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        editable_break = WorktimePanelManualBreak(
+            "2026-04-06",
+            "수동 휴게",
+            "12:00",
+            "12:30",
+            True,
+            index=0,
+            fingerprint="manual-break-0",
+        )
+        holder = {"model": replace(_model(), manual_breaks=(editable_break,))}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+
+        self.assertTrue(panel.show(activate=False))
+        button = panel._widgets["manual_break_menu_button"]
+        self.assertFalse(button.packed)
+
+        panel._set_detail_view("breaks")
+        self.assertTrue(button.packed)
+        self.assertEqual(button.kwargs["state"], "normal")
 
     def test_countdown_and_common_inline_target_validation_are_view_local(self) -> None:
         root = _FakeRoot()

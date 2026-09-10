@@ -16,6 +16,7 @@ class UpdateSettingsView:
         self._enabled_var = None
         self._interval_var = None
         self._status_label = None
+        self._body = None
         self._loading = False
         return
 
@@ -54,9 +55,12 @@ class UpdateSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
-        card.pack(fill="both", expand=True, padx=12, pady=12)
+        # Update는 작은 상태/행동 화면이다. 빈 부모 영역을 흰 카드로
+        # 채우지 않아야 탭 전환 직후에도 과도한 공백이 생기지 않는다.
+        card.pack(fill="x", padx=8, pady=8, anchor="n")
         body = tk.Frame(card, bg=card_bg)
-        body.pack(fill="x", padx=14, pady=12, anchor="n")
+        body.pack(fill="x", padx=10, pady=8, anchor="n")
+        self._body = body
         body.columnconfigure(1, weight=1)
 
         tk.Label(
@@ -64,7 +68,7 @@ class UpdateSettingsView:
             text="Update",
             bg=card_bg,
             fg=text,
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 12, "bold"),
         ).grid(row=0, column=0, columnspan=3, sticky="w")
         tk.Label(
             body,
@@ -72,9 +76,9 @@ class UpdateSettingsView:
             bg=card_bg,
             fg=muted,
             font=("Segoe UI", 9),
-            wraplength=680,
+            wraplength=560,
             justify="left",
-        ).grid(row=1, column=0, columnspan=3, sticky="we", pady=(3, 12))
+        ).grid(row=1, column=0, columnspan=3, sticky="we", pady=(2, 8))
 
         self._enabled_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -82,7 +86,7 @@ class UpdateSettingsView:
             text="자동 업데이트 확인",
             variable=self._enabled_var,
             command=self._save_settings,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
         tk.Label(
             body,
@@ -90,7 +94,7 @@ class UpdateSettingsView:
             bg=card_bg,
             fg=text,
             font=("Segoe UI", 9),
-        ).grid(row=3, column=0, sticky="w", pady=(0, 8))
+        ).grid(row=3, column=0, sticky="w", pady=(0, 6))
         self._interval_var = tk.StringVar(value="10")
         interval = ttk.Spinbox(
             body,
@@ -101,7 +105,7 @@ class UpdateSettingsView:
             width=8,
             command=self._save_settings,
         )
-        interval.grid(row=3, column=1, sticky="w", pady=(0, 8))
+        interval.grid(row=3, column=1, sticky="w", pady=(0, 6))
         try:
             interval.bind("<FocusOut>", lambda _event: self._save_settings())
             interval.bind("<Return>", lambda _event: self._save_settings())
@@ -128,12 +132,29 @@ class UpdateSettingsView:
             fg=muted,
             font=("Segoe UI", 9),
             justify="left",
-            wraplength=720,
+            wraplength=580,
             anchor="w",
         )
         self._status_label.grid(row=5, column=0, columnspan=3, sticky="we", pady=(12, 0))
         self._load_settings()
         return
+
+    def preferred_size(self) -> tuple[int, int]:
+        """Expose the compact content requirement to the main shell."""
+
+        body = self._body
+        if body is None:
+            return (0, 0)
+        try:
+            body.update_idletasks()
+            width = int(body.winfo_reqwidth()) + 20
+            height = int(body.winfo_reqheight()) + 16
+        except Exception:
+            return (0, 0)
+        return (
+            min(640, max(560, width)),
+            min(420, max(280, height)),
+        )
 
     def refresh(self) -> None:
         self._refresh_status()

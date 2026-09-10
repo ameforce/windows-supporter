@@ -1,4 +1,5 @@
 import ctypes
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -115,8 +116,8 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         min_width, min_height = ui._tab_minsizes.get(ui._TAB_AI_USAGE)
         # 콘텐츠가 mount되면 실제 요청 크기가 우선하고, mount 전 fallback은
         # Windows 배율을 중복 적용하지 않는 compact 기준을 사용한다.
-        self.assertEqual((width, height), (1000, 560))
-        self.assertEqual((min_width, min_height), (820, 480))
+        self.assertEqual((width, height), (900, 520))
+        self.assertEqual((min_width, min_height), (720, 420))
 
     def test_ui_scale_clamps_tk_scaling_ratio(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
@@ -206,11 +207,104 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._apply_tab_geometry(ui._TAB_AI_USAGE)
 
         self.assertEqual(root.geometry_calls[-1], "768x452")
-        self.assertEqual(root.minsize_calls[-1], (768, 452))
+        self.assertEqual(root.minsize_calls[-1], (720, 420))
         self.assertEqual(
             root.resize_events,
-            [("minsize", (768, 452)), ("geometry", "768x452")],
+            [("minsize", (720, 420)), ("geometry", "768x452")],
         )
+
+    def test_user_resize_is_kept_separate_from_automatic_tab_fallback(self) -> None:
+        ui, root, _ = self._build_ui()
+        ui._current_tab = ui._TAB_AI_USAGE
+        fallback = ui._tab_sizes[ui._TAB_AI_USAGE]
+        ui._auto_geometry_sizes.add((900, 520))
+
+        ui._on_root_configure(SimpleNamespace(widget=root, width=900, height=520))
+        self.assertNotIn(ui._TAB_AI_USAGE, ui._tab_user_sizes)
+        self.assertNotIn((900, 520), ui._auto_geometry_sizes)
+
+        # An actual later resize to a familiar automatic size is still user
+        # intent; the deferred auto event above must not poison that state.
+        ui._on_root_configure(SimpleNamespace(widget=root, width=900, height=520))
+        self.assertEqual(ui._tab_user_sizes[ui._TAB_AI_USAGE], (900, 520))
+
+        ui._on_root_configure(SimpleNamespace(widget=root, width=760, height=460))
+        self.assertEqual(ui._tab_user_sizes[ui._TAB_AI_USAGE], (760, 460))
+        self.assertEqual(ui._tab_sizes[ui._TAB_AI_USAGE], fallback)
+        self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (760, 460))
+
+    def test_synchronous_minsize_configure_is_not_saved_as_a_user_resize(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+
+            def winfo_width(self):
+                return 900
+
+            def winfo_height(self):
+                return 520
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._current_tab = ui._TAB_AI_USAGE
+        original_minsize = root.minsize
+
+        def minsize_with_configure(width, height):
+            original_minsize(width, height)
+            ui._on_root_configure(
+                SimpleNamespace(widget=root, width=width, height=height)
+            )
+
+        root.minsize = minsize_with_configure
+        ui._apply_tab_geometry(ui._TAB_AI_USAGE)
+
+        self.assertEqual(ui._tab_user_sizes, {})
+        self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (900, 520))
+
+    def test_narrow_notebook_uses_short_tab_labels(self) -> None:
+        class _TabNotebook:
+            def __init__(self):
+                self.calls = []
+
+            def tab(self, widget, **kwargs):
+                self.calls.append((widget, kwargs))
+
+        ui, _, _ = self._build_ui()
+        notebook = _TabNotebook()
+        ui._notebook = notebook
+        ui._tab_dashboard = "dashboard"
+        ui._tab_startup = "startup"
+        ui._tab_kakao = "kakao"
+        ui._tab_wrike = "wrike"
+        ui._tab_ai_usage = "ai"
+        ui._tab_update = "update"
+
+        ui._current_tab = ui._TAB_AI_USAGE
+        ui._on_root_configure(
+            SimpleNamespace(widget=ui._root, width=760, height=460)
+        )
+
+        labels = {str(widget): options["text"] for widget, options in notebook.calls}
+        self.assertEqual(labels["startup"], "Startup")
+        self.assertEqual(labels["kakao"], "Kakao")
+        self.assertEqual(labels["ai"], "AI")
+
+        notebook.calls.clear()
+        ui._on_root_configure(
+            SimpleNamespace(widget=ui._root, width=900, height=520)
+        )
+        labels = {str(widget): options["text"] for widget, options in notebook.calls}
+        self.assertEqual(labels["startup"], "Startup Apps")
+        self.assertEqual(labels["kakao"], "KakaoTalk")
+        self.assertEqual(labels["ai"], "AI 사용량")
 
     def test_work_area_winapi_uses_pointer_sized_monitor_handles(self) -> None:
         class _Callable:
