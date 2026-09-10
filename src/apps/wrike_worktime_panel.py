@@ -29,6 +29,7 @@ _MAX_COMPACT_TODAY_LINES = 2
 # the first few ticket/detail rows while keeping long days scrollable.
 _DETAIL_EMPTY_TEXT_HEIGHT = 5
 _DETAIL_TEXT_HEIGHT_WITH_ROWS = 8
+_DETAIL_TEXT_MIN_HEIGHT = 3
 _DETAIL_TEXT_PAD_X = 6
 _DETAIL_GROUP_LEFT_MARGIN = 12
 _POINTER_OFFSET_PX = 16
@@ -376,6 +377,7 @@ class WorktimeQuickPanel:
         self._rendered_detail_date_key: str | None = None
         self._pending_detail_scroll: _DetailScrollAnchor | None = None
         self._detail_text_width: int | None = None
+        self._detail_text_layout_height: int | None = None
         self._structure_signature: tuple[Any, ...] | None = None
         self._widgets: dict[str, Any] = {}
         self._refresh_after_id = None
@@ -548,6 +550,7 @@ class WorktimeQuickPanel:
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = None
         self._detail_text_width = None
+        self._detail_text_layout_height = None
         self._structure_signature = None
         self._widgets = {}
         self._geometry_retry_pending = False
@@ -692,6 +695,65 @@ class WorktimeQuickPanel:
         # initial slice visible; Text scrolling handles unusually long days
         # instead of making this panel grow without bound.
         return _DETAIL_TEXT_HEIGHT_WITH_ROWS
+
+    def _fit_detail_viewport(self, max_window_height: int) -> None:
+        """Protect the footer by shrinking only the scrollable detail viewport."""
+
+        detail_text = self._widgets.get("detail_text")
+        footer = self._widgets.get("footer")
+        window = self._window
+        if (
+            detail_text is None
+            or footer is None
+            or window is None
+            or not callable(getattr(detail_text, "configure", None))
+            or not callable(getattr(detail_text, "cget", None))
+        ):
+            return
+
+        desired_height = (
+            self._detail_text_height(self._model)
+            if self._model is not None
+            else _DETAIL_TEXT_HEIGHT_WITH_ROWS
+        )
+        desired_height = max(_DETAIL_TEXT_MIN_HEIGHT, desired_height)
+        max_window_height = max(1, int(max_window_height))
+
+        # Restore the model's preferred viewport before measuring. This lets a
+        # refresh or monitor move give rows back when enough space is available.
+        self._detail_text_layout_height = desired_height
+        _safe_call(detail_text, "configure", height=desired_height)
+        _safe_call(window, "update_idletasks")
+        footer_reqheight = _positive_int_call(footer, "winfo_reqheight", 0)
+        if footer_reqheight <= 0:
+            return
+
+        def layout_fits() -> bool:
+            return bool(
+                _positive_int_call(window, "winfo_reqheight", 0)
+                <= max_window_height
+                and _int_call(footer, "winfo_height", 0) >= footer_reqheight
+            )
+
+        if layout_fits():
+            return
+
+        for detail_height in range(
+            desired_height - 1,
+            _DETAIL_TEXT_MIN_HEIGHT - 1,
+            -1,
+        ):
+            _safe_call(detail_text, "configure", height=detail_height)
+            _safe_call(window, "update_idletasks")
+            if layout_fits():
+                self._detail_text_layout_height = detail_height
+                return
+
+        # Keep the smallest readable viewport as the final fallback on an
+        # exceptionally small or heavily scaled work area.
+        self._detail_text_layout_height = _DETAIL_TEXT_MIN_HEIGHT
+        _safe_call(detail_text, "configure", height=_DETAIL_TEXT_MIN_HEIGHT)
+        _safe_call(window, "update_idletasks")
 
     @staticmethod
     def _group_timelog_rows(
@@ -909,10 +971,16 @@ class WorktimeQuickPanel:
             "configure",
             relief="sunken" if breaks_view else "solid",
         )
+        detail_height = self._detail_text_height(model)
+        if self._detail_text_layout_height is not None:
+            detail_height = min(
+                detail_height,
+                max(_DETAIL_TEXT_MIN_HEIGHT, self._detail_text_layout_height),
+            )
         _safe_call(
             widgets.get("detail_text"),
             "configure",
-            height=self._detail_text_height(model),
+            height=detail_height,
         )
         rows = self._selected_manual_breaks(model)
         menu = widgets.get("manual_break_menu")
@@ -974,6 +1042,7 @@ class WorktimeQuickPanel:
             self._rendered_detail_date_key = None
             self._pending_detail_scroll = None
             self._detail_text_width = None
+            self._detail_text_layout_height = None
             self._structure_signature = None
             self._widgets = {}
             self._placed = False
@@ -1337,6 +1406,7 @@ class WorktimeQuickPanel:
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = preserved_detail_scroll
         self._detail_text_width = None
+        self._detail_text_layout_height = None
 
         compact = (
             model.prompt is not None
@@ -1860,6 +1930,7 @@ class WorktimeQuickPanel:
 
     def _update_rendered_model(self, model: WorktimePanelModel) -> None:
         widgets = self._widgets
+        row_font_size = 8 if self._uses_compact_density() else 9
         widgets["week_range"].configure(text=model.week_range)
         widgets["sync"].configure(
             text=f"동기화 · {model.sync_text}",
@@ -1881,14 +1952,14 @@ class WorktimeQuickPanel:
             weekday_label.configure(
                 text=row.weekday,
                 bg=row_bg,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             date_label.configure(text=row.date, bg=row_bg)
             summary_label.configure(
                 text=row.summary,
                 bg=row_bg,
                 fg=row.color,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             today_label.configure(text="오늘" if row.today else "", bg=row_bg)
 
@@ -1929,6 +2000,7 @@ class WorktimeQuickPanel:
                 )
 
     def _update_row_selection(self, model: WorktimePanelModel) -> None:
+        row_font_size = 8 if self._uses_compact_density() else 9
         for row_widgets, row in zip(self._widgets.get("rows", ()), model.rows):
             row_frame, weekday_label, date_label, summary_label, today_label = (
                 row_widgets
@@ -1941,14 +2013,14 @@ class WorktimeQuickPanel:
                 weekday_label,
                 "configure",
                 bg=row_bg,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             _safe_call(date_label, "configure", bg=row_bg)
             _safe_call(
                 summary_label,
                 "configure",
                 bg=row_bg,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             _safe_call(today_label, "configure", bg=row_bg)
         self._update_detail_presentation(model, reset_scroll=True)
@@ -2621,14 +2693,6 @@ class WorktimeQuickPanel:
             return False
         _safe_call(window, "update_idletasks")
 
-        requested_width = min(
-            _COMPACT_PANEL_MAX_WIDTH,
-            _positive_int_call(window, "winfo_reqwidth", 680),
-        )
-        requested_height = min(
-            _COMPACT_PANEL_MAX_HEIGHT,
-            _positive_int_call(window, "winfo_reqheight", 480),
-        )
         current = self._window_rect(window)
         pointer_x, pointer_y = _pointer_position(window, self._root)
         use_pointer = bool(anchor_to_pointer or not self._placed or current is None)
@@ -2644,6 +2708,19 @@ class WorktimeQuickPanel:
         work_left, work_top, work_right, work_bottom = work_area
         work_width = max(1, work_right - work_left)
         work_height = max(1, work_bottom - work_top)
+
+        self._fit_detail_viewport(
+            min(_COMPACT_PANEL_MAX_HEIGHT, work_height)
+        )
+        _safe_call(window, "update_idletasks")
+        requested_width = min(
+            _COMPACT_PANEL_MAX_WIDTH,
+            _positive_int_call(window, "winfo_reqwidth", 680),
+        )
+        requested_height = min(
+            _COMPACT_PANEL_MAX_HEIGHT,
+            _positive_int_call(window, "winfo_reqheight", 480),
+        )
 
         current_width = current[2] if current is not None else 1
         current_height = current[3] if current is not None else 1
