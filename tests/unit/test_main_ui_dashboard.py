@@ -338,8 +338,8 @@ class MainUiDashboardUnitTest(unittest.TestCase):
 
             # 6개 기능 섹션이 2열 카드로 배치되며, mount 전 fallback도
             # 작업 영역을 과도하게 점유하지 않는 compact 기준을 따른다.
-            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (1000, 480))
-            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (760, 400))
+            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (900, 460))
+            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (700, 380))
 
     def test_show_restores_persisted_valid_tab(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -843,8 +843,8 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
             }
         )
 
-        attached_text = next(text for text, _style in parts if text.startswith("연결된 기능:"))
-        self.assertEqual(attached_text, "연결된 기능: AI 사용량")
+        summary_text = next(text for text, _style in parts if text.startswith("전경 "))
+        self.assertEqual(summary_text, "전경 없음 · 연결 AI 사용량")
 
     def test_minutes_are_displayed_as_hours_and_minutes(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})

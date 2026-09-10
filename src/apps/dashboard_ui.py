@@ -9,7 +9,7 @@ class DashboardView:
     # Two cards must retain enough width for their action buttons and status
     # copy. Below this threshold a single column is narrower overall and lets
     # the outer vertical scroll handle the additional height.
-    _TWO_COLUMN_MIN_WIDTH = 800
+    _TWO_COLUMN_MIN_WIDTH = 760
     _CALLBACK_ALIASES = {
         "ai_usage.settings": "codex.settings",
         "ai_usage.toggle": "codex.toggle",
@@ -105,24 +105,24 @@ class DashboardView:
             highlightthickness=1,
             highlightbackground=border,
         )
-        header_card.pack(fill="x", padx=12, pady=(12, 8))
+        header_card.pack(fill="x", padx=10, pady=(10, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
-        header_inner.pack(fill="x", padx=14, pady=10)
+        header_inner.pack(fill="x", padx=10, pady=7)
 
         tk.Label(
             header_inner,
             text="Dashboard",
             bg=card_bg,
             fg=text,
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 13, "bold"),
         ).pack(side="left")
         ttk.Button(header_inner, text="새로고침", command=self.refresh).pack(side="right")
 
         # 기능 섹션은 2열 카드 그리드로 배치한다. 세로 나열은 요약 화면을
         # 스크롤 없이 한눈에 보려는 대시보드 목적과 맞지 않았다.
         grid = tk.Frame(container, bg=bg)
-        grid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        grid.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         section_cards: list[Any] = []
         self._dashboard_grid = grid
         self._dashboard_section_cards = section_cards
@@ -260,12 +260,12 @@ class DashboardView:
                     row=index // columns,
                     column=index % columns,
                     sticky="nwe",
-                    padx=(0, 6)
+                    padx=(0, 5)
                     if columns > 1 and index % columns == 0
-                    else (6, 0)
+                    else (5, 0)
                     if columns > 1
                     else 0,
-                    pady=(0, 8),
+                    pady=(0, 6),
                 )
             except Exception:
                 pass
@@ -842,11 +842,8 @@ class DashboardView:
         attached_text = ", ".join(attached) if attached else "없음"
         return is_enabled, [
             self._enabled_part(is_enabled),
-            ("범위: 핫키/자동화", "normal"),
-            (f"핫키: {hotkeys}", "normal"),
-            (f"기능 준비: {warmup}", "normal"),
-            (f"전경 프로필: {profile}", "normal"),
-            (f"연결된 기능: {attached_text}", "normal"),
+            (f"핫키 {hotkeys} · 준비 {warmup}", "normal"),
+            (f"전경 {profile} · 연결 {attached_text}", "normal"),
         ]
 
     def _format_update(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:

@@ -77,26 +77,32 @@ class WindowsSupporterMainUI:
         self._power_view = None
         self._power_built = False
         self._current_tab = None
+        # 기본 fallback과 사용자가 명시적으로 조정한 창 크기는 서로 다른
+        # 책임이다. 탭 전환 때 현재 창 크기를 fallback에 덮어쓰면, 긴 화면을
+        # 본 뒤 작은 화면까지 같은 여백을 물려받는다.
+        self._tab_user_sizes: dict[str, tuple[int, int]] = {}
+        self._auto_geometry_sizes: set[tuple[int, int]] = set()
+        self._applying_tab_geometry = False
         # 탭 크기는 실제 콘텐츠 요구 크기를 우선한다. 이 값들은 콘텐츠가
         # 아직 mount되지 않았거나 요청 크기를 측정할 수 없는 탭의 compact
         # fallback이며, _apply_tab_geometry가 작업 영역 상한을 적용한다.
         self._tab_sizes = {
-            self._TAB_DASHBOARD: (1000, 480),
-            self._TAB_STARTUP: (1000, 560),
-            self._TAB_KAKAO: (700, 340),
-            self._TAB_WRIKE: (840, 580),
-            self._TAB_AI_USAGE: (1000, 560),
-            self._TAB_UPDATE: (760, 420),
-            self._TAB_POWER: (800, 420),
+            self._TAB_DASHBOARD: (900, 460),
+            self._TAB_STARTUP: (900, 520),
+            self._TAB_KAKAO: (640, 320),
+            self._TAB_WRIKE: (760, 520),
+            self._TAB_AI_USAGE: (900, 520),
+            self._TAB_UPDATE: (620, 320),
+            self._TAB_POWER: (700, 360),
         }
         self._tab_minsizes = {
-            self._TAB_DASHBOARD: (760, 400),
-            self._TAB_STARTUP: (820, 440),
-            self._TAB_KAKAO: (600, 300),
-            self._TAB_WRIKE: (720, 440),
-            self._TAB_AI_USAGE: (820, 480),
-            self._TAB_UPDATE: (640, 340),
-            self._TAB_POWER: (680, 340),
+            self._TAB_DASHBOARD: (700, 380),
+            self._TAB_STARTUP: (700, 400),
+            self._TAB_KAKAO: (560, 280),
+            self._TAB_WRIKE: (640, 400),
+            self._TAB_AI_USAGE: (720, 420),
+            self._TAB_UPDATE: (520, 280),
+            self._TAB_POWER: (600, 300),
         }
 
         self._lazy_import_tk()
@@ -281,6 +287,8 @@ class WindowsSupporterMainUI:
             root.bind("<Escape>", lambda _e: self.hide())
         except Exception:
             pass
+        self._bind_root_resize_tracking()
+        self._configure_compact_ttk_styles()
 
         shell = ttk.Frame(root)
         self._shell_frame = shell
@@ -338,6 +346,7 @@ class WindowsSupporterMainUI:
         notebook.add(tab_update, text="Update")
         if tab_power is not None:
             notebook.add(tab_power, text="전원")
+        self._apply_notebook_labels_for_width()
 
         try:
             notebook.bind("<<NotebookTabChanged>>", lambda _e: self._ensure_selected_tab_built())
@@ -358,6 +367,105 @@ class WindowsSupporterMainUI:
                 )
         except Exception:
             pass
+        return
+
+    def _configure_compact_ttk_styles(self) -> None:
+        """Keep the shared ttk controls proportional without changing behavior."""
+
+        style_factory = getattr(self._ttk, "Style", None)
+        if not callable(style_factory):
+            return
+        try:
+            style = style_factory(self._root)
+            style.configure("TNotebook.Tab", padding=(8, 4), font=("Segoe UI", 9))
+            style.configure("TButton", padding=(6, 2))
+            style.configure("TCheckbutton", padding=(2, 1))
+            style.configure("TCombobox", padding=(3, 1))
+            style.configure("TSpinbox", padding=(3, 1))
+        except Exception:
+            pass
+        return
+
+    def _bind_root_resize_tracking(self) -> None:
+        root = self._root
+        binder = getattr(root, "bind", None)
+        if not callable(binder):
+            return
+        try:
+            binder("<Configure>", self._on_root_configure, add="+")
+        except TypeError:
+            try:
+                binder("<Configure>", self._on_root_configure)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return
+
+    def _on_root_configure(self, event: Any) -> None:
+        """Remember only a user resize; shell-applied geometry remains transient."""
+
+        if getattr(event, "widget", self._root) is not self._root:
+            return
+        tab_key = self._current_tab
+        if not tab_key:
+            return
+        try:
+            width = getattr(event, "width", None)
+            height = getattr(event, "height", None)
+            if width is None:
+                width = self._root.winfo_width()
+            if height is None:
+                height = self._root.winfo_height()
+            width = int(width)
+            height = int(height)
+        except Exception:
+            return
+        if width <= 1 or height <= 1:
+            return
+        if self._applying_tab_geometry:
+            return
+        if (width, height) in self._auto_geometry_sizes:
+            # An automatic geometry request can produce a Configure event just
+            # after the scoped transaction ends. Consume that one event rather
+            # than retaining this size forever: a later real user resize to the
+            # same dimensions must still be honoured.
+            self._auto_geometry_sizes.discard((width, height))
+            return
+        self._tab_user_sizes[str(tab_key)] = (width, height)
+        self._apply_notebook_labels_for_width(width)
+        return
+
+    def _apply_notebook_labels_for_width(self, width: int | None = None) -> None:
+        """Avoid clipped tab titles on a narrow main window."""
+
+        notebook = self._notebook
+        tab = getattr(notebook, "tab", None)
+        if not callable(tab):
+            return
+        if width is None:
+            try:
+                width = int(self._root.winfo_width())
+            except Exception:
+                width = 0
+        compact = int(width or 0) > 1 and int(width or 0) < 800
+        labels = {
+            self._TAB_DASHBOARD: "Dashboard",
+            self._TAB_STARTUP: "Startup" if compact else "Startup Apps",
+            self._TAB_KAKAO: "Kakao" if compact else "KakaoTalk",
+            self._TAB_WRIKE: "Wrike",
+            self._TAB_AI_USAGE: "AI" if compact else "AI 사용량",
+            self._TAB_UPDATE: "Update",
+            self._TAB_POWER: "전원",
+        }
+        for tab_key, label in labels.items():
+            widget = self._tab_widget(tab_key)
+            if widget is None:
+                continue
+            try:
+                tab(widget, text=label)
+            except Exception:
+                continue
         return
 
     def _select_tab(self, tab: str) -> None:
@@ -444,26 +552,6 @@ class WindowsSupporterMainUI:
         )
         return
 
-    def _remember_tab_size(self, tab_key: str | None) -> None:
-        if not tab_key:
-            return
-        try:
-            w = int(self._root.winfo_width())
-            h = int(self._root.winfo_height())
-        except Exception:
-            return
-        if w <= 1 or h <= 1:
-            return
-        # winfo_width/height는 이미 scaling이 적용된 physical pixel이다.
-        # fallback은 logical pixel로 관리하므로 저장 시 다시 logical 단위로
-        # 환산해야 다음 탭 전환에서 배율을 중복 적용하지 않는다.
-        scale = self._ui_scale()
-        self._tab_sizes[tab_key] = (
-            max(1, int(round(w / scale))),
-            max(1, int(round(h / scale))),
-        )
-        return
-
     def _ui_scale(self) -> float:
         """Tk scaling(포인트→픽셀) 비율을 96dpi 기준 상대 배율로 바꾼다.
 
@@ -505,41 +593,57 @@ class WindowsSupporterMainUI:
         # A narrow window changes wrapping and therefore the requested height of
         # the content. Two passes settle that feedback loop without resizing on
         # every status refresh.
-        for _ in range(2):
-            preferred_width, preferred_height = self._preferred_window_size(tab_key)
-            work_width, work_height = self._work_area_size()
-            max_width = max(320, int(work_width) - 32)
-            max_height = max(280, int(work_height) - 48)
-            width = min(max(1, int(preferred_width)), max_width)
-            height = min(max(1, int(preferred_height)), max_height)
+        self._applying_tab_geometry = True
+        try:
+            for _ in range(2):
+                preferred_width, preferred_height = self._preferred_window_size(tab_key)
+                work_width, work_height = self._work_area_size()
+                max_width = max(320, int(work_width) - 32)
+                max_height = max(280, int(work_height) - 48)
+                width = min(max(1, int(preferred_width)), max_width)
+                height = min(max(1, int(preferred_height)), max_height)
 
-            # A measured dashboard can be smaller than the historical fallback
-            # minimum. Do not reintroduce the old blank area by forcing that
-            # minimum back above the content-fit size.
-            min_width = min(int(fallback_min_width), max_width, width)
-            min_height = min(int(fallback_min_height), max_height, height)
-            width = max(width, min_width)
-            height = max(height, min_height)
-            geometry = self._centered_geometry(
-                width,
-                height,
-                work_width=work_width,
-                work_height=work_height,
-            )
+                # A measured dashboard can be smaller than the historical fallback
+                # minimum. Do not reintroduce the old blank area by forcing that
+                # minimum back above the content-fit size.
+                min_width = min(int(fallback_min_width), max_width, width)
+                min_height = min(int(fallback_min_height), max_height, height)
+                width = max(width, min_width)
+                height = max(height, min_height)
+                geometry = self._centered_geometry(
+                    width,
+                    height,
+                    work_width=work_width,
+                    work_height=work_height,
+                )
 
-            if geometry == last_geometry:
-                break
-            last_geometry = geometry
+                if geometry == last_geometry:
+                    break
+                last_geometry = geometry
+                self._auto_geometry_sizes.add((int(min_width), int(min_height)))
+                try:
+                    root.minsize(max(1, min_width), max(1, min_height))
+                except Exception:
+                    pass
+                self._auto_geometry_sizes.add((int(width), int(height)))
+                try:
+                    root.geometry(geometry)
+                except Exception:
+                    pass
+                self._apply_notebook_labels_for_width(width)
+                try:
+                    root.update_idletasks()
+                except Exception:
+                    pass
+        finally:
+            self._applying_tab_geometry = False
+        # Tk delivers geometry Configure events before its next idle turn. Keep
+        # a brief deferred-event guard, then clear it so an eventual user resize
+        # to a familiar tab size is not misclassified as automatic.
+        after_idle = getattr(root, "after_idle", None)
+        if callable(after_idle):
             try:
-                root.minsize(max(1, min_width), max(1, min_height))
-            except Exception:
-                pass
-            try:
-                root.geometry(geometry)
-            except Exception:
-                pass
-            try:
-                root.update_idletasks()
+                after_idle(self._auto_geometry_sizes.clear)
             except Exception:
                 pass
         return
@@ -591,6 +695,9 @@ class WindowsSupporterMainUI:
         return chrome_width, chrome_height
 
     def _preferred_window_size(self, tab_key: str) -> tuple[int, int]:
+        user_size = self._tab_user_sizes.get(str(tab_key))
+        if user_size is not None and user_size[0] > 1 and user_size[1] > 1:
+            return user_size
         try:
             fallback = self._scaled_size(
                 self._tab_sizes.get(tab_key) or (1000, 560)
@@ -737,8 +844,6 @@ class WindowsSupporterMainUI:
 
             old_tab = self._current_tab
             if new_tab != old_tab:
-                self._remember_tab_size(old_tab)
-
                 if old_tab == self._TAB_KAKAO and new_tab != self._TAB_KAKAO:
                     try:
                         kakao = self._monitor.get_kakao_manager()
@@ -766,8 +871,15 @@ class WindowsSupporterMainUI:
                 self._ensure_power_built()
                 self._refresh_power_view()
 
-            self._apply_tab_geometry(new_tab)
+            # Configure notifications may be delivered while geometry is being
+            # applied. Select the target first so a user resize cannot be
+            # attributed to the tab being left.
             self._current_tab = new_tab
+            self._apply_tab_geometry(new_tab)
+            try:
+                self._apply_notebook_labels_for_width(self._root.winfo_width())
+            except Exception:
+                self._apply_notebook_labels_for_width()
             self._save_last_tab(new_tab)
             return
         except Exception:
