@@ -16,6 +16,10 @@ _REFRESH_INTERVAL_MS = 1_000
 _COUNTDOWN_INTERVAL_MS = 200
 _DEFAULT_IDLE_TIMEOUT_MS = 6_000
 _MIN_IDLE_TIMEOUT_MS = 1_200
+# The quick panel is intentionally a compact, non-modal summary. These are
+# safety fallbacks; normal content still determines the requested size.
+_MIN_PANEL_WIDTH = 560
+_MIN_PANEL_HEIGHT = 360
 _POINTER_OFFSET_PX = 16
 _DATE_KEY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -531,23 +535,16 @@ class WorktimeQuickPanel:
         return model.prompt is not None, len(model.today_lines)
 
     def _uses_compact_density(self) -> bool:
-        """Fit all controls in the work area used for the first placement."""
+        """Keep the reusable quick panel compact on every monitor size.
 
-        window = self._window
-        if window is None:
-            return False
-        current = self._window_rect(window)
-        pointer_x, pointer_y = _pointer_position(window, self._root)
-        use_pointer = not self._placed or current is None
-        if use_pointer:
-            work_area = _work_area_for_point(pointer_x, pointer_y, window, self._root)
-        else:
-            work_area = _work_area_for_window(window, self._root)
-        try:
-            work_height = int(work_area[3]) - int(work_area[1])
-        except (IndexError, TypeError, ValueError):
-            return False
-        return 480 <= work_height <= 720
+        The previous work-area-height heuristic made the same panel switch to
+        a spacious layout on a normal monitor. That made Ctrl+Alt+W appear
+        disproportionately large and caused geometry to jump between
+        monitors. The panel has a scrollable detail viewport, so compact
+        density is the stable default.
+        """
+
+        return True
 
     @staticmethod
     def _detail_for_selected_date(
@@ -619,11 +616,17 @@ class WorktimeQuickPanel:
                 ("\n", "detail_group"),
             ))
             for row in group:
+                comment = " ".join(str(row.comment or "").split())
                 parts.extend((
                     ("  ◦ ", "detail_child"),
                     (self._format_actual_minutes(row.minutes), "detail_child_duration"),
-                    ("\n", "detail_child"),
                 ))
+                if comment:
+                    parts.extend((
+                        (" · ", "detail_child"),
+                        (comment, "detail_comment"),
+                    ))
+                parts.append(("\n", "detail_child"))
         return tuple(parts)
 
     def _selected_detail_text(self, model: WorktimePanelModel) -> str:
@@ -1723,6 +1726,11 @@ class WorktimeQuickPanel:
                         foreground=_DETAIL_TIME_TEXT,
                         font=("Segoe UI", 9, "bold"),
                     )
+                    tag_configure(
+                        "detail_comment",
+                        foreground=_MUTED,
+                        font=("Segoe UI", 9),
+                    )
                     for text, tag in tagged_parts:
                         widget.insert("end", text, tag)
                 except Exception:
@@ -1882,11 +1890,11 @@ class WorktimeQuickPanel:
             activeforeground=_TEXT,
             relief="solid",
             borderwidth=1,
-            padx=8,
-            pady=4,
-            font=("Segoe UI", 9),
+            padx=6,
+            pady=2,
+            font=("Segoe UI", 8),
         )
-        button.pack(side="left", padx=(0, 6), pady=2)
+        button.pack(side="left", padx=(0, 4), pady=1)
         return button
 
     @staticmethod
@@ -2314,11 +2322,17 @@ class WorktimeQuickPanel:
         current_width = current[2] if current is not None else 1
         current_height = current[3] if current is not None else 1
         if resize_to_request:
-            width = min(max(requested_width, 680), work_width)
-            height = min(max(requested_height, 480), work_height)
+            width = min(max(requested_width, _MIN_PANEL_WIDTH), work_width)
+            height = min(max(requested_height, _MIN_PANEL_HEIGHT), work_height)
         else:
-            width = min(max(current_width, requested_width, 680), work_width)
-            height = min(max(current_height, requested_height, 480), work_height)
+            width = min(
+                max(current_width, requested_width, _MIN_PANEL_WIDTH),
+                work_width,
+            )
+            height = min(
+                max(current_height, requested_height, _MIN_PANEL_HEIGHT),
+                work_height,
+            )
 
         if use_pointer:
             x = pointer_x + _POINTER_OFFSET_PX

@@ -106,19 +106,17 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._tab_kakao = object()
         return ui, root, kakao
 
-    def test_ai_usage_tab_default_size_is_wider_and_content_fit(self) -> None:
+    def test_ai_usage_tab_default_size_is_compact_and_content_fit(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
                 ui = WindowsSupporterMainUI(root=object(), startup_manager=object(), monitor=object())
 
         width, height = ui._tab_sizes.get(ui._TAB_AI_USAGE)
         min_width, min_height = ui._tab_minsizes.get(ui._TAB_AI_USAGE)
-        # 프로필 2개(2열 카드) 콘텐츠 요구 높이가 ~740px이므로 기본 창은
-        # 스크롤 없이 주요 항목이 보이는 크기여야 한다.
-        self.assertGreaterEqual(width, 1100)
-        self.assertGreaterEqual(height, 740)
-        self.assertGreaterEqual(min_width, 940)
-        self.assertLessEqual(min_height, 600)
+        # 콘텐츠가 mount되면 실제 요청 크기가 우선하고, mount 전 fallback은
+        # Windows 배율을 중복 적용하지 않는 compact 기준을 사용한다.
+        self.assertEqual((width, height), (1000, 560))
+        self.assertEqual((min_width, min_height), (820, 480))
 
     def test_ui_scale_clamps_tk_scaling_ratio(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
@@ -132,14 +130,14 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
                 return 2.0
 
         ui._root = type("Root", (), {"tk": _TkBridge()})()
-        self.assertAlmostEqual(ui._ui_scale(), 1.5)
+        self.assertEqual(ui._ui_scale(), 1.0)
 
         class _HugeBridge:
             def call(self, *_args):
                 return 99.0
 
         ui._root = type("Root", (), {"tk": _HugeBridge()})()
-        self.assertEqual(ui._ui_scale(), 3.0)
+        self.assertEqual(ui._ui_scale(), 1.0)
 
     def test_base_ui_scaling_raises_default_font_scale_before_widgets(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
@@ -159,10 +157,9 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._apply_base_ui_scaling()
 
         base = 96.0 / 72.0
-        expected = base * ui._UI_BASE_SCALE
-        self.assertEqual(calls, [("tk:scaling", expected)])
+        self.assertEqual(calls, [])
 
-        # 시스템 scaling이 이미 더 높으면 그 값을 유지한다.
+        # 시스템 scaling이 더 높아도 앱의 compact 상한으로 낮춘다.
         calls.clear()
 
         class _HighDpiBridge:
@@ -174,7 +171,7 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
 
         ui._root = type("Root", (), {"tk": _HighDpiBridge()})()
         ui._apply_base_ui_scaling()
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, [("set", base)])
 
         # tk에 접근할 수 없는 테스트 더블은 조용히 무시한다.
         ui._root = object()
