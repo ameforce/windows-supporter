@@ -33,6 +33,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
                 "mixed-ready-standard",
                 "one-profile-125",
                 "dynamic-three-profiles",
+                "four-taskbar-profiles",
                 "ten-mixed-profiles-150",
                 "long-label-narrow",
                 "cursor-long-amount-150",
@@ -48,7 +49,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 9)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 10)
         by_name = {fixture["name"]: fixture for fixture in fixtures}
         self.assertEqual(by_name["zero-profiles"]["settings"]["profiles"], [])
         self.assertEqual(by_name["zero-profiles"]["runtime"]["profiles"], [])
@@ -57,6 +58,12 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         dynamic = by_name["dynamic-three-profiles"]
         self.assertEqual(len(dynamic["settings"]["profiles"]), 3)
         self.assertFalse(dynamic["settings"]["profiles"][2]["taskbar_selected"])
+        four_taskbar_profiles = by_name["four-taskbar-profiles"]
+        self.assertEqual(len(four_taskbar_profiles["settings"]["profiles"]), 4)
+        self.assertEqual(
+            four_taskbar_profiles["settings"]["selected_profile_ids"],
+            [profile["id"] for profile in four_taskbar_profiles["settings"]["profiles"]],
+        )
         ten_profiles = by_name["ten-mixed-profiles-150"]
         self.assertEqual(len(ten_profiles["settings"]["profiles"]), 10)
         self.assertEqual(ten_profiles["ui_scale_percent"], 150)
