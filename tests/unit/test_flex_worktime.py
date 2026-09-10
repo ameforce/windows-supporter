@@ -6,7 +6,10 @@ import unittest
 from src.apps.flex_worktime import (
     FlexBrowserClient,
     FlexBrowserError,
+    FlexBrowserSyncResult,
     FlexScheduleError,
+    _parse_browser_response_payloads,
+    extract_flex_employee_number,
     parse_flex_schedule_response,
     parse_flex_work_record_text,
 )
@@ -134,6 +137,50 @@ class FlexScheduleParserTests(unittest.TestCase):
             parse_flex_schedule_response([])  # type: ignore[arg-type]
         self.assertEqual(ctx.exception.code, "invalid_response")
 
+    def test_detects_employee_number_from_identity_and_schedule_payloads(self) -> None:
+        payloads = [
+            {"data": {"user": {"employeeNumber": "E-42"}}},
+            {
+                "userWorkSchedules": [
+                    {
+                        "employeeNumber": "OTHER",
+                        "days": [],
+                    },
+                    {
+                        "employeeNumber": "E-42",
+                        "days": [
+                            {
+                                "date": "2026-09-10",
+                                "workBlocks": [
+                                    {
+                                        "type": "WORK_RECORD",
+                                        "blockFrom": "2026-09-10T09:00:00",
+                                        "blockTo": "2026-09-10T18:00:00",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            },
+        ]
+
+        schedules, employee_number = _parse_browser_response_payloads(
+            payloads,
+            employee_number="",
+            now=datetime(2026, 9, 10, 12, 0),
+        )
+
+        self.assertIn(date(2026, 9, 10), schedules)
+        self.assertEqual(employee_number, "E-42")
+
+    def test_extracts_labelled_employee_number_from_visible_text(self) -> None:
+        self.assertEqual(
+            extract_flex_employee_number("내 계정 · 사번: 12345"),
+            "12345",
+        )
+        self.assertEqual(extract_flex_employee_number("사용자 id: abc"), "")
+
 
 class FlexBrowserClientTests(unittest.TestCase):
     def test_invalid_period_fails_before_opening_browser(self) -> None:
@@ -145,3 +192,9 @@ class FlexBrowserClientTests(unittest.TestCase):
                 employee_number="E-42",
             )
         self.assertEqual(ctx.exception.code, "invalid_period")
+
+    def test_sync_result_keeps_schedule_compatible_metadata_separate(self) -> None:
+        result = FlexBrowserSyncResult(schedules={}, employee_number="E-42")
+
+        self.assertEqual(result.schedules, {})
+        self.assertEqual(result.employee_number, "E-42")

@@ -139,14 +139,15 @@ class FlexBrowserFlowE2ETests(unittest.TestCase):
             result = client.fetch_schedule_period(
                 date(2026, 9, 7),
                 date(2026, 9, 13),
-                employee_number="E-42",
                 now=datetime(2026, 9, 10, 19, 0),
+                return_metadata=True,
             )
             page.screenshot(path=str(artifact_dir / "flex-desktop-loaded.png"), full_page=True)
             page.set_viewport_size({"width": 390, "height": 844})
             page.screenshot(path=str(artifact_dir / "flex-mobile-final.png"), full_page=True)
 
-            schedule = result[date(2026, 9, 10)]
+            self.assertEqual(result.employee_number, "E-42")
+            schedule = result.schedules[date(2026, 9, 10)]
             self.assertEqual(schedule.regular_quit.strftime("%H:%M"), "18:00")
             self.assertEqual(schedule.overtime_scheduled_quit.strftime("%H:%M"), "20:00")
             self.assertIn("근무 정보 확인됨", page.locator("body").inner_text())
