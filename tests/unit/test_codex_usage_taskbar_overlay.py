@@ -1429,8 +1429,61 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "5h"
         ][0]
 
-        self.assertGreaterEqual(status_dot[1][0] - profile_label[1][0], 64)
+        expected_label_span = (
+            taskbar_overlay._profile_label_text_width("Kim Jong")
+            + taskbar_overlay._PROFILE_LABEL_TEXT_END_GAP_PX
+            + 1
+        )
+        self.assertEqual(status_dot[1][0] - profile_label[1][0], expected_label_span)
         self.assertGreaterEqual(metric_label[1][0] - status_dot[1][2], 10)
+
+    def test_profile_label_column_uses_only_the_longest_measured_name_in_normal_slots(self):
+        labels = ("A", "Kim Jong")
+        expected = (
+            max(taskbar_overlay._profile_label_text_width(label) for label in labels)
+            + taskbar_overlay._PROFILE_LABEL_TEXT_END_GAP_PX
+        )
+
+        self.assertEqual(
+            taskbar_overlay._label_width_for_overlay_width(300, labels),
+            expected,
+        )
+        self.assertEqual(
+            taskbar_overlay._label_width_for_overlay_width(620, labels),
+            expected,
+        )
+        self.assertEqual(
+            taskbar_overlay._label_width_for_overlay_width(620, ("A",)),
+            taskbar_overlay._profile_label_text_width("A")
+            + taskbar_overlay._PROFILE_LABEL_TEXT_END_GAP_PX,
+        )
+        self.assertLess(expected, taskbar_overlay._PROFILE_LABEL_COLUMN_MIN_WIDTH_PX)
+
+    def test_short_profile_names_shrink_the_preferred_overlay_width(self):
+        short_runtime = self._runtime()
+        for profile, label in zip(short_runtime["accounts"], ("A", "B"), strict=True):
+            profile["label"] = label
+        short_model = build_codex_usage_taskbar_overlay_model(short_runtime)
+
+        long_runtime = self._runtime()
+        for profile, label in zip(
+            long_runtime["accounts"],
+            ("A long profile name", "B long profile name"),
+            strict=True,
+        ):
+            profile["label"] = label
+        long_model = build_codex_usage_taskbar_overlay_model(long_runtime)
+
+        short_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+            short_model
+        )
+        long_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+            long_model
+        )
+
+        self.assertIsNotNone(short_width)
+        self.assertIsNotNone(long_width)
+        self.assertLess(short_width, long_width)
 
     def test_draw_renders_full_profile_names_and_reserves_their_pixel_width(self):
         runtime = self._runtime()
@@ -4970,7 +5023,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
 
     def test_draw_compacts_all_row_badges_when_full_mode_does_not_fit(self):
-        texts = self._draw_row_badge_texts(500)
+        texts = self._draw_row_badge_texts(476)
 
         # Display contract: countdown text outranks the reset badge in compact
         # mode, so each row shows the freshest time it can fit.
@@ -5875,8 +5928,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
-        self.assertIn("458x", window.geometry_calls[-1])
-        self.assertIn("+1034+", window.geometry_calls[-1])
+        self.assertIn("430x", window.geometry_calls[-1])
+        self.assertIn("+1062+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_hard_resamples_changed_slot_after_scheduled_delay(self):
         root = _FakeRoot()
@@ -5920,8 +5973,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(overlay._last_geometry_hard_resample_at, 101.0)
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("458x", window.geometry_calls[-1])
-        self.assertIn("+1034+", window.geometry_calls[-1])
+        self.assertIn("430x", window.geometry_calls[-1])
+        self.assertIn("+1062+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_reuses_runtime_snapshot_and_now_for_width_change(self):
         root = _FakeRoot()
@@ -6268,9 +6321,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 1)
-        self.assertIn("458x", window.geometry_calls[-1])
+        self.assertIn("430x", window.geometry_calls[-1])
         # After the empty-slot gap recovers, content-fit width remains preferred.
-        self.assertRegex(window.geometry_calls[-1], r"458x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"430x38\+\d+\+")
 
     def test_geometry_monitor_defers_transient_width_shrink_without_jitter(self):
         root = _FakeRoot()
@@ -6409,7 +6462,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
-        self.assertIn("+1314+", window.geometry_calls[-1])
+        self.assertIn("+1342+", window.geometry_calls[-1])
 
     def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
@@ -6802,9 +6855,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         geometry_tick()
 
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("458x", window.geometry_calls[-1])
-        # Content-fit preferred width stays 300; confirmed slot-edge move updates x only.
-        self.assertRegex(window.geometry_calls[-1], r"458x38\+\d+\+")
+        self.assertIn("430x", window.geometry_calls[-1])
+        # Content-fit preferred width reflects the compact profile-label column;
+        # confirmed slot-edge move updates x only.
+        self.assertRegex(window.geometry_calls[-1], r"430x38\+\d+\+")
 
     def test_geometry_monitor_accepts_no_slot_when_work_area_context_changes(self):
         root = _FakeRoot()
