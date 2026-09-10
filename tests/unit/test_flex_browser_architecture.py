@@ -122,6 +122,56 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
         self.assertTrue(created[0].headless)
         self.assertTrue(created[0].closed)
 
+    def test_interactive_sync_failure_keeps_headed_session_for_retry(self) -> None:
+        created = []
+
+        class _Client:
+            def __init__(self, *_args, **kwargs):
+                self.headless = bool(kwargs.get("headless"))
+                self.closed = False
+                created.append(self)
+
+            def fetch_schedule_period(self, *_args, **_kwargs):
+                raise RuntimeError("navigation failed")
+
+            def close(self):
+                self.closed = True
+
+        app = Wrike.__new__(Wrike)
+        app._Wrike__flex_browser_queue = queue.Queue()
+        app._Wrike__flex_browser_profile_dir = "C:/temp/flex-profile-test"
+        app._Wrike__time_log_login_timeout_sec = 10.0
+        app._Wrike__flex_browser_stop_event = threading.Event()
+        app._Wrike__ensure_playwright_ready = lambda: True
+        app._Wrike__log_exception = lambda *_args: None
+
+        sync_response = queue.Queue(maxsize=1)
+        close_response = queue.Queue(maxsize=1)
+        app._Wrike__flex_browser_queue.put(
+            (
+                "sync",
+                (date(2026, 9, 10), date(2026, 9, 10), "", datetime(2026, 9, 10, 12), True),
+                sync_response,
+            )
+        )
+
+        with patch("src.apps.Wrike.FlexBrowserClient", _Client):
+            worker = threading.Thread(target=app._Wrike__flex_browser_worker_loop)
+            worker.start()
+            self.assertEqual(
+                sync_response.get(timeout=3.0),
+                (False, ("Flex 브라우저 동기화에 실패했습니다.", "unexpected_error")),
+            )
+            self.assertEqual(len(created), 1)
+            self.assertFalse(created[0].headless)
+            self.assertFalse(created[0].closed)
+            app._Wrike__flex_browser_queue.put(("close", None, close_response))
+            worker.join(timeout=3.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(close_response.get_nowait(), (True, None))
+        self.assertTrue(created[0].closed)
+
 
 class FlexEmployeeNumberUiTests(unittest.TestCase):
     class _Var:
