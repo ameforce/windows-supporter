@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -26,11 +27,15 @@ from src.utils.github_release_update import (
 )
 from src.utils.progress_subprocess import run_no_window_with_progress
 from src.utils.runtime_deploy import (
+    DEFAULT_HEARTBEAT_SAMPLES,
+    DEFAULT_READY_TIMEOUT_SECONDS,
     RuntimeDeployError,
     deploy_runtime,
     read_windows_artifact_metadata,
     restart_runtime,
+    wait_for_runtime_readiness,
 )
+from src.utils.runtime_lifecycle import PROBE_PATH_ENV, PROBE_TOKEN_ENV
 from src.utils.subprocess_utils import popen_no_window, run_no_window
 from src.utils.update_handoff_recovery import UpdateHandoffError, build_relaunch_environment
 from src.utils.update_settings import (
@@ -65,6 +70,8 @@ UPDATE_HANDOFF_COMMAND_TIMEOUT_SECONDS = 1800
 UPDATE_RELEASE_MODE = "github_release_installer"
 UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS = 900
 UPDATE_RELEASE_SOURCE_EXIT_TIMEOUT_SECONDS = 25.0
+UPDATE_RELEASE_RUNTIME_READY_TIMEOUT_SECONDS = DEFAULT_READY_TIMEOUT_SECONDS
+UPDATE_RELEASE_RUNTIME_HEARTBEAT_SAMPLES = DEFAULT_HEARTBEAT_SAMPLES
 RELEASE_DOWNLOAD_RATE_WINDOW_SECONDS = 5.0
 RELEASE_DOWNLOAD_RATE_MIN_SAMPLE_SECONDS = 0.4
 UPDATE_PROGRESS_TITLE = "Windows Supporter 업데이트"
@@ -2662,6 +2669,7 @@ def run_release_update_handoff(
     installer_launcher=popen_no_window,
     target_launcher=popen_no_window,
     artifact_metadata_reader: Callable[[Path], Mapping[str, Any]] = read_windows_artifact_metadata,
+    runtime_readiness_waiter=wait_for_runtime_readiness,
     progress_ui_factory=UpdateHandoffProgressUi,
     process_exists: Callable[[int], bool] = _process_exists,
     sleep: Callable[[float], None] = time.sleep,
@@ -2689,6 +2697,7 @@ def run_release_update_handoff(
     restored = False
     installed_artifact: dict[str, Any] | None = None
     installer_log_path: Path | None = None
+    runtime_readiness: dict[str, Any] | None = None
 
     def publish(snapshot: dict[str, Any], *, first: bool = False) -> None:
         nonlocal progress_floor
@@ -2953,26 +2962,127 @@ def run_release_update_handoff(
             "release_relaunch",
             state="running",
             phase_fraction=0.0,
-            detail="설치된 새 Windows Supporter를 재실행합니다.",
+            detail="설치된 새 Windows Supporter 프로세스를 시작합니다.",
             log_path=log_path,
         )
+        relaunch_progress["activity"] = {
+            "id": "runtime-launch",
+            "line": "새 Windows Supporter 프로세스를 시작합니다.",
+        }
         publish(relaunch_progress)
+        relaunch_probe_path = get_update_state_dir() / f"release-runtime-{uuid.uuid4().hex}.json"
+        relaunch_token = uuid.uuid4().hex
+        try:
+            relaunch_probe_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise UpdateHandoffError(
+                f"새 Windows Supporter 준비 신호 파일을 초기화하지 못했습니다: {exc}"
+            ) from exc
+        relaunch_environment = build_relaunch_environment(os.environ)
+        relaunch_environment[PROBE_PATH_ENV] = str(relaunch_probe_path)
+        relaunch_environment[PROBE_TOKEN_ENV] = relaunch_token
         target_process = target_launcher(
             [str(root_executable)],
             cwd=str(install_dir),
-            env=build_relaunch_environment(os.environ),
+            env=relaunch_environment,
         )
         if target_process is None:
             raise UpdateHandoffError("installer 적용 후 Windows Supporter 재실행을 시작하지 못했습니다.")
-        publish(
-            build_update_progress_snapshot(
+        launcher_pid = _coerce_positive_pid(getattr(target_process, "pid", 0))
+        if launcher_pid <= 0:
+            raise UpdateHandoffError("새 Windows Supporter 프로세스 PID를 확인하지 못했습니다.")
+
+        launched_progress = build_update_progress_snapshot(
+            "release_relaunch",
+            state="running",
+            phase_fraction=0.35,
+            progress_mode="indeterminate",
+            detail="새 Windows Supporter 프로세스를 실행했습니다. 준비 신호를 기다립니다.",
+            log_path=log_path,
+        )
+        launched_progress["activity"] = {
+            "id": "runtime-process-started",
+            "line": "새 Windows Supporter 프로세스 실행을 확인했습니다.",
+        }
+        publish(launched_progress)
+
+        last_runtime_observation = ""
+
+        def observe_runtime_readiness(
+            payload: Mapping[str, Any] | None,
+            _status: str,
+        ) -> None:
+            nonlocal last_runtime_observation
+            pump = getattr(progress_ui, "pump", None)
+            if callable(pump):
+                try:
+                    pump()
+                except Exception:
+                    pass
+
+            runtime_state = str((payload or {}).get("state") or "").strip().lower()
+            if runtime_state == "ready":
+                observation = "runtime-heartbeat"
+                detail = "새 Windows Supporter 준비 신호를 확인했습니다. 응답을 확인 중입니다."
+                activity = "새 프로세스의 트레이와 응답을 확인합니다."
+                phase_fraction = 0.7
+            elif runtime_state:
+                observation = "runtime-starting"
+                detail = "새 Windows Supporter 프로세스가 시작 중입니다. 준비 신호를 기다립니다."
+                activity = "새 프로세스 시작 상태를 확인합니다."
+                phase_fraction = 0.5
+            else:
+                observation = "runtime-probe-wait"
+                detail = "새 Windows Supporter 프로세스 실행 중입니다. 준비 신호를 기다립니다."
+                activity = "새 프로세스의 준비 신호를 기다립니다."
+                phase_fraction = 0.35
+
+            if observation == last_runtime_observation:
+                return
+            last_runtime_observation = observation
+            waiting_progress = build_update_progress_snapshot(
                 "release_relaunch",
                 state="running",
-                phase_fraction=1.0,
-                detail="새 Windows Supporter 재실행을 요청했습니다.",
+                phase_fraction=phase_fraction,
+                progress_mode="indeterminate",
+                detail=detail,
                 log_path=log_path,
             )
+            waiting_progress["activity"] = {"id": observation, "line": activity}
+            publish(waiting_progress)
+
+        try:
+            runtime_readiness = runtime_readiness_waiter(
+                root_executable,
+                probe_path=relaunch_probe_path,
+                token=relaunch_token,
+                launcher_pid=launcher_pid,
+                expected_version=str(installed_artifact.get("file_version") or ""),
+                timeout_seconds=UPDATE_RELEASE_RUNTIME_READY_TIMEOUT_SECONDS,
+                heartbeat_samples=UPDATE_RELEASE_RUNTIME_HEARTBEAT_SAMPLES,
+                observer=observe_runtime_readiness,
+            )
+        except Exception as exc:
+            raise UpdateHandoffError(
+                f"새 Windows Supporter 준비 신호를 확인하지 못했습니다: {exc}"
+            ) from exc
+        append_update_log(
+            log_path,
+            "verified relaunched runtime: "
+            + json.dumps(runtime_readiness, ensure_ascii=False, sort_keys=True),
         )
+        ready_progress = build_update_progress_snapshot(
+            "release_relaunch",
+            state="running",
+            phase_fraction=1.0,
+            detail="새 Windows Supporter가 정상 실행과 응답 준비를 완료했습니다.",
+            log_path=log_path,
+        )
+        ready_progress["activity"] = {
+            "id": "runtime-ready",
+            "line": "새 Windows Supporter의 준비 상태를 확인했습니다.",
+        }
+        publish(ready_progress)
 
         complete_progress = build_update_progress_snapshot(
             "complete",
@@ -2990,6 +3100,7 @@ def run_release_update_handoff(
             installer_path=str(downloaded_path),
             installer_log_path=str(installer_log_path) if installer_log_path else "",
             installed_artifact=installed_artifact,
+            runtime_readiness=runtime_readiness,
             progress=complete_progress,
         )
         append_update_log(log_path, "GitHub Release installer handoff completed")
