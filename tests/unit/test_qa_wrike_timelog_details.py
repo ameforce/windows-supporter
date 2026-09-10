@@ -167,25 +167,30 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertIn("메모: 첫 번째 작업 설명", text)
         self.assertIn("메모: 두 번째 작업 설명", text)
         self.assertNotIn("티켓  ", text)
-        self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 6)
+        self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 5)
 
-    def test_detail_viewport_grows_when_loaded_rows_replace_empty_snapshot(self):
+    def test_detail_viewport_uses_a_bounded_readable_height_for_loaded_rows(self):
         self.make(_details())
         text = self.panel._widgets["detail_text"]
-        self.assertEqual(text.kwargs["height"], 5)
+        self.assertEqual(text.kwargs["height"], 4)
         window = self.tk.toplevels[0]
         window.requested_height = 420
         before_geometry_count = len(window.geometry_calls)
 
-        row = TimelogDetailRow(
-            "2026-04-06", "L1", "T1", 45, "loaded action", "Loaded ticket", "ready",
+        rows = (
+            TimelogDetailRow(
+                "2026-04-06", "L1", "T1", 45, "loaded action", "Loaded ticket", "ready",
+            ),
+            TimelogDetailRow(
+                "2026-04-06", "L2", "T1", 30, "second action", "Loaded ticket", "ready",
+            ),
         )
         self.holder["model"] = replace(
             self.holder["model"],
-            day_details=_details(rows=(row,)),
+            day_details=_details(rows=rows),
         )
         self.assertTrue(self.panel.refresh_now())
-        self.assertEqual(text.kwargs["height"], 6)
+        self.assertEqual(text.kwargs["height"], 5)
         self.assertEqual(len(window.geometry_calls), before_geometry_count + 1)
         self.assertIn("x420", window.geometry_calls[-1])
 
@@ -196,9 +201,25 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             day_details=_details(),
         )
         self.assertTrue(self.panel.refresh_now())
-        self.assertEqual(text.kwargs["height"], 5)
+        self.assertEqual(text.kwargs["height"], 4)
         self.assertEqual(len(window.geometry_calls), before_geometry_count + 1)
         self.assertIn("x360", window.geometry_calls[-1])
+
+    def test_single_loaded_row_does_not_expand_the_compact_viewport(self):
+        self.make(_details())
+        text = self.panel._widgets["detail_text"]
+        window = self.tk.toplevels[0]
+        before_geometry_count = len(window.geometry_calls)
+        row = TimelogDetailRow(
+            "2026-04-06", "L1", "T1", 45, "loaded action", "Loaded ticket", "ready",
+        )
+        self.holder["model"] = replace(
+            self.holder["model"],
+            day_details=_details(rows=(row,)),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertEqual(text.kwargs["height"], 4)
+        self.assertEqual(len(window.geometry_calls), before_geometry_count)
 
     def test_loading_and_unavailable_never_claim_empty(self):
         self.make(_details(state="loading"))
@@ -361,7 +382,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         entry = self.panel._widgets["inline_entry"]
         entry.delete(0, "end")
         entry.insert(0, "07:37")
-        for transition in ("prompt_appears", "prompt_disappears", "today_lines_change"):
+        for transition in ("prompt_appears", "prompt_disappears"):
             with self.subTest(transition=transition):
                 before_text = self.panel._widgets["detail_text"]
                 before_text.yview_moveto(0.8)
@@ -370,8 +391,6 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
                     model = replace(model, prompt=WorktimeActivityPrompt("08:35"))
                 elif transition == "prompt_disappears":
                     model = replace(model, prompt=None)
-                else:
-                    model = replace(model, today_lines=model.today_lines + (WorktimePanelLine("Additional summary", "#111827"),))
                 self.holder["model"] = model
                 self.assertTrue(self.panel.refresh_now())
                 after_text = self.panel._widgets["detail_text"]
@@ -381,6 +400,20 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
                 self.assertEqual(self.panel._widgets["inline_entry"].get(), "07:37")
                 self.assertTrue(self.panel._inline_editor_active)
                 self.active.assert_not_called()
+
+        before_text = self.panel._widgets["detail_text"]
+        before_text.yview_moveto(0.8)
+        self.holder["model"] = replace(
+            self.holder["model"],
+            today_lines=self.holder["model"].today_lines
+            + (WorktimePanelLine("Additional summary", "#111827"),),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertIs(self.panel._widgets["detail_text"], before_text)
+        self.assertEqual(before_text.yview()[0], 0.8)
+        self.assertEqual(self.panel._widgets["today_lines"][1].kwargs["text"], "추가 상태 2건")
+        self.assertEqual(self.panel._widgets["inline_entry"].get(), "07:37")
+        self.assertTrue(self.panel._inline_editor_active)
         self.holder["model"] = replace(
             _model(week_start=date(2026, 4, 13)),
             day_details=_details(start=date(2026, 4, 13), state="loading"),
