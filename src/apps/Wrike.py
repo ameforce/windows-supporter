@@ -62,11 +62,11 @@ from src.apps.wrike_worktime import (
 )
 from src.apps.wrike_worktime_state import WorktimeStateStore
 from src.apps.flex_worktime import (
+    FLEX_BROWSER_PROFILE_DIR_NAME,
     FLEX_WEB_URL,
-    FlexApiError,
-    FlexCredentials,
+    FlexBrowserClient,
+    FlexBrowserError,
     FlexDaySchedule,
-    FlexOpenApiClient,
 )
 from src.apps.overtime_state import OvertimeStateStore
 from src.apps.wrike_timelog_snapshot import (
@@ -212,10 +212,9 @@ class Wrike:
         self.__activity_prompt_save_detected_at = None
         self.__activity_prompt_save_retry_not_before = None
         self.__activity_prompt_save_last_failure_key = None
-        # The additional Flex keys are optional and backward-compatible with
-        # the existing v9 settings envelope; keep the published version so
-        # older migration contracts remain stable.
-        self.__settings_version = 9
+        # v10 replaces the unusable administrator-only Open API credential
+        # flow with an interactive employee browser session.
+        self.__settings_version = 10
         self.__playwright_checked = False
         self.__playwright_ready = False
         self.__time_log_weekday_labels = ['월', '화', '수', '목', '금', '토', '일']
@@ -254,7 +253,6 @@ class Wrike:
         self.__google_calendar_oauth_secret_store = SecretStore(
             "windows-supporter:google-calendar-oauth"
         )
-        self.__flex_secret_store = SecretStore("windows-supporter:flex-open-api")
         self.__wrike_api_token_secret_scope = "windows-supporter:wrike-api-token"
         self.__lunch_break_enabled = True
         self.__lunch_start_min = int(DEFAULT_LUNCH_START_MIN)
@@ -301,10 +299,14 @@ class Wrike:
         self.__flex_employee_number = ""
         self.__flex_poll_interval_sec = 300.0
         self.__overtime_notice_interval_min = 10
-        self.__flex_credentials_protected = ""
-        self.__flex_refresh_token_session = ""
-        self.__flex_client_id_session = ""
-        self.__flex_client_secret_session = ""
+        self.__flex_browser_profile_dir = self.__lib.os.path.join(
+            self.__time_log_config_dir,
+            FLEX_BROWSER_PROFILE_DIR_NAME,
+        )
+        self.__flex_browser_queue = queue.Queue()
+        self.__flex_browser_worker_thread = None
+        self.__flex_browser_worker_lock = threading.Lock()
+        self.__flex_browser_stop_event = threading.Event()
         self.__flex_after_id = None
         self.__flex_sync_generation = 0
         self.__flex_sync_running = False
@@ -730,22 +732,133 @@ class Wrike:
         return
 
     # ------------------------------------------------------------------
-    # Flex Open API (read-only schedule synchronization)
+    # Flex browser session (read-only schedule synchronization)
     # ------------------------------------------------------------------
-
-    def __flex_credentials(self) -> FlexCredentials:
-        return FlexCredentials(
-            refresh_token=str(self.__flex_refresh_token_session or "").strip(),
-            client_id=str(self.__flex_client_id_session or "").strip(),
-            client_secret=str(self.__flex_client_secret_session or "").strip(),
-        ).normalized()
 
     def __flex_configured(self) -> bool:
         return bool(
             self.__flex_enabled
             and str(self.__flex_employee_number or "").strip()
-            and self.__flex_credentials().configured
         )
+
+    def __ensure_flex_browser_worker_started(self) -> bool:
+        with self.__flex_browser_worker_lock:
+            thread = self.__flex_browser_worker_thread
+            if thread is not None and thread.is_alive():
+                return True
+            self.__flex_browser_stop_event.clear()
+            self.__flex_browser_queue = queue.Queue()
+            try:
+                thread = threading.Thread(
+                    target=self.__flex_browser_worker_loop,
+                    daemon=True,
+                )
+                self.__flex_browser_worker_thread = thread
+                thread.start()
+                return True
+            except Exception as exc:
+                self.__flex_browser_worker_thread = None
+                self.__log_exception("flex browser worker start failed", exc)
+                return False
+
+    def __flex_browser_worker_loop(self) -> None:
+        client = None
+        while True:
+            try:
+                kind, payload, response_queue = self.__flex_browser_queue.get()
+            except Exception:
+                return
+            if kind == "close":
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                try:
+                    response_queue.put((True, None))
+                except Exception:
+                    pass
+                return
+            try:
+                if client is None:
+                    if not self.__ensure_playwright_ready():
+                        raise FlexBrowserError(
+                            "Flex 로그인 브라우저 구성요소를 사용할 수 없습니다.",
+                            code="playwright_unavailable",
+                        )
+                    client = FlexBrowserClient(
+                        self.__flex_browser_profile_dir,
+                        login_timeout_sec=self.__time_log_login_timeout_sec,
+                        stop_event=self.__flex_browser_stop_event,
+                    )
+                if kind == "open":
+                    client.open_work_record_page()
+                    result = None
+                elif kind == "sync":
+                    begin_date, end_date, employee_number, now = payload
+                    result = client.fetch_schedule_period(
+                        begin_date,
+                        end_date,
+                        employee_number=employee_number,
+                        now=now,
+                    )
+                else:
+                    raise FlexBrowserError("알 수 없는 Flex 브라우저 작업입니다.", code="invalid_command")
+                response_queue.put((True, result))
+            except FlexBrowserError as exc:
+                try:
+                    response_queue.put((False, (str(exc), str(exc.code or "browser_error"))))
+                except Exception:
+                    pass
+            except Exception as exc:
+                self.__log_exception("flex browser worker failed", exc)
+                try:
+                    response_queue.put((False, ("Flex 브라우저 동기화에 실패했습니다.", "unexpected_error")))
+                except Exception:
+                    pass
+        return
+
+    def __submit_flex_browser_job(
+        self,
+        kind: str,
+        payload=None,
+        *,
+        wait: bool,
+        timeout_sec: float,
+    ):
+        if not self.__ensure_flex_browser_worker_started():
+            return False, ("Flex 로그인 브라우저를 시작하지 못했습니다.", "worker_start_failed")
+        response_queue = queue.Queue(maxsize=1)
+        try:
+            self.__flex_browser_queue.put((kind, payload, response_queue))
+        except Exception as exc:
+            self.__log_exception("flex browser job enqueue failed", exc)
+            return False, ("Flex 브라우저 작업을 시작하지 못했습니다.", "enqueue_failed")
+        if not wait:
+            return True, None
+        try:
+            return response_queue.get(timeout=max(1.0, float(timeout_sec)))
+        except queue.Empty:
+            return False, ("Flex 브라우저 응답 시간이 초과되었습니다.", "browser_timeout")
+
+    def __close_flex_browser_worker(self) -> None:
+        thread = self.__flex_browser_worker_thread
+        if thread is None or not thread.is_alive():
+            self.__flex_browser_worker_thread = None
+            return
+        self.__flex_browser_stop_event.set()
+        response_queue = queue.Queue(maxsize=1)
+        try:
+            self.__flex_browser_queue.put(("close", None, response_queue))
+            response_queue.get(timeout=8.0)
+        except Exception:
+            pass
+        try:
+            thread.join(timeout=8.0)
+        except Exception:
+            pass
+        if not thread.is_alive():
+            self.__flex_browser_worker_thread = None
 
     def __cancel_flex_after(self) -> None:
         root = self.__root
@@ -768,7 +881,7 @@ class Wrike:
             return
         if not self.__flex_configured():
             self.__flex_state = "unconfigured"
-            self.__flex_last_error = "Flex 사번과 Open API 인증정보가 필요합니다."
+            self.__flex_last_error = "Flex 사번을 입력하고 본인 계정으로 로그인해 주세요."
             return
         self.__request_flex_sync(force=True)
         self.__schedule_flex_poll(root)
@@ -830,25 +943,21 @@ class Wrike:
 
     def __run_flex_sync(self, generation: int, root) -> None:
         schedules = None
-        credentials = None
         error = None
         try:
             now = self.__lib.datetime.now()
             week_start = now.date() - timedelta(days=now.weekday())
             week_end = week_start + timedelta(days=6)
-            client = FlexOpenApiClient(
-                self.__flex_credentials(),
-                timeout_sec=15.0,
+            ok, result = self.__submit_flex_browser_job(
+                "sync",
+                (week_start, week_end, self.__flex_employee_number, now),
+                wait=True,
+                timeout_sec=self.__time_log_login_timeout_sec + 30.0,
             )
-            schedules = client.fetch_schedule_period(
-                week_start,
-                week_end,
-                employee_number=self.__flex_employee_number,
-                now=now,
-            )
-            credentials = client.credentials
-        except FlexApiError as exc:
-            error = (str(exc), str(exc.code or "api_error"))
+            if ok:
+                schedules = result
+            else:
+                error = result
         except Exception as exc:
             self.__log_exception("flex sync failed", exc)
             error = ("Flex 동기화에 실패했습니다.", "unexpected_error")
@@ -857,7 +966,6 @@ class Wrike:
             self.__apply_flex_sync_result(
                 generation,
                 schedules,
-                credentials,
                 error,
             )
 
@@ -877,7 +985,6 @@ class Wrike:
         self,
         generation: int,
         schedules: dict | None,
-        credentials: FlexCredentials | None,
         error: tuple[str, str] | None,
     ) -> None:
         with self.__flex_schedule_lock:
@@ -892,13 +999,6 @@ class Wrike:
             self.__flex_last_success_ts = self.__lib.datetime.now()
             self.__flex_last_error = ""
             self.__flex_state = "fresh"
-        if credentials is not None:
-            normalized = credentials.normalized()
-            if normalized != self.__flex_credentials():
-                self.__flex_refresh_token_session = normalized.refresh_token
-                self.__flex_client_id_session = normalized.client_id
-                self.__flex_client_secret_session = normalized.client_secret
-                self.__save_settings()
         panel = self.__worktime_panel
         if panel is not None:
             try:
@@ -931,6 +1031,13 @@ class Wrike:
             }
 
     def __open_flex_worktime_page(self) -> bool:
+        ok, _result = self.__submit_flex_browser_job(
+            "open",
+            wait=True,
+            timeout_sec=15.0,
+        )
+        if ok:
+            return True
         try:
             return bool(webbrowser.open(FLEX_WEB_URL, new=2))
         except Exception as exc:
@@ -944,8 +1051,6 @@ class Wrike:
             return False, "Flex 일정 자동 반영을 먼저 켜 주세요."
         if not str(self.__flex_employee_number or "").strip():
             return False, "Flex 사번을 입력해 주세요."
-        if not self.__flex_credentials().configured:
-            return False, "Flex Open API 인증정보를 입력해 주세요."
         if not self.__background_active or self.__root is None:
             return False, "근무시간 백그라운드가 아직 시작되지 않았습니다."
         if not self.__request_flex_sync(force=True):
@@ -954,9 +1059,6 @@ class Wrike:
 
     def open_flex_worktime_page(self) -> bool:
         return self.__open_flex_worktime_page()
-
-    def clear_flex_credentials(self) -> tuple[bool, str | None]:
-        return self.update_settings({"clear_flex_credentials": True})
 
     # ------------------------------------------------------------------
     # Local overtime prompt, timer, and Flex handoff
@@ -1274,6 +1376,7 @@ class Wrike:
 
     def shutdown(self) -> None:
         self.stop_background()
+        self.__close_flex_browser_worker()
         root = self.__root
         after_id = self.__ui_after_id
         self.__ui_after_id = None
@@ -6102,13 +6205,8 @@ class Wrike:
             "flex_enabled": bool(self.__flex_enabled),
             "flex_employee_number": str(self.__flex_employee_number or ""),
             "flex_poll_interval_sec": float(self.__flex_poll_interval_sec),
-            "flex_api_configured": bool(self.__flex_credentials().configured),
-            "flex_refresh_token_configured": bool(
-                self.__flex_credentials().refresh_token
-            ),
-            "flex_client_configured": bool(
-                self.__flex_credentials().client_id
-                and self.__flex_credentials().client_secret
+            "flex_browser_configured": bool(
+                str(self.__flex_employee_number or "").strip()
             ),
             "flex_status": self.__flex_status_snapshot(),
             "overtime_notice_interval_min": int(
@@ -6181,10 +6279,6 @@ class Wrike:
             "flex_employee_number",
             "flex_poll_interval_sec",
             "overtime_notice_interval_min",
-            "flex_credentials_protected",
-            "flex_refresh_token_session",
-            "flex_client_id_session",
-            "flex_client_secret_session",
         )
         with self.__timelog_snapshot_lock, self.__vacation_ical_lock:
             return {
@@ -6239,33 +6333,6 @@ class Wrike:
             "overtime_notice_interval_min",
             self.__overtime_notice_interval_min,
         )
-        clear_flex_credentials = bool(data.get("clear_flex_credentials", False))
-        flex_refresh_supplied = "flex_refresh_token" in data
-        flex_client_id_supplied = "flex_client_id" in data
-        flex_client_secret_supplied = "flex_client_secret" in data
-        next_flex_refresh_token = str(
-            data.get("flex_refresh_token", "") or ""
-        ).strip()
-        next_flex_client_id = str(data.get("flex_client_id", "") or "").strip()
-        next_flex_client_secret = str(
-            data.get("flex_client_secret", "") or ""
-        ).strip()
-        if not clear_flex_credentials:
-            if not flex_refresh_supplied or not next_flex_refresh_token:
-                next_flex_refresh_token = str(
-                    self.__flex_refresh_token_session or ""
-                ).strip()
-            if not flex_client_id_supplied or not next_flex_client_id:
-                next_flex_client_id = str(self.__flex_client_id_session or "").strip()
-            if not flex_client_secret_supplied or not next_flex_client_secret:
-                next_flex_client_secret = str(
-                    self.__flex_client_secret_session or ""
-                ).strip()
-        else:
-            next_flex_refresh_token = ""
-            next_flex_client_id = ""
-            next_flex_client_secret = ""
-
         clear_ical_url = bool(data.get("clear_ical_url", False))
         ical_url_supplied = "ical_url" in data
         ical_url_value = str(data.get("ical_url", "") or "").strip()
@@ -6389,9 +6456,6 @@ class Wrike:
             bool(self.__flex_enabled),
             str(self.__flex_employee_number or "").strip(),
             float(self.__flex_poll_interval_sec),
-            str(self.__flex_refresh_token_session or "").strip(),
-            str(self.__flex_client_id_session or "").strip(),
-            str(self.__flex_client_secret_session or "").strip(),
         )
 
         if clear_token:
@@ -6406,9 +6470,6 @@ class Wrike:
         self.__flex_employee_number = flex_employee_number
         self.__flex_poll_interval_sec = float(flex_poll_interval)
         self.__overtime_notice_interval_min = int(overtime_notice_interval)
-        self.__flex_refresh_token_session = next_flex_refresh_token
-        self.__flex_client_id_session = next_flex_client_id
-        self.__flex_client_secret_session = next_flex_client_secret
         self.__lunch_break_enabled = bool(lunch_enabled)
         self.__lunch_start_min = int(lunch_start_val)
         self.__lunch_end_min = int(lunch_end_val)
@@ -6483,9 +6544,6 @@ class Wrike:
             bool(self.__flex_enabled),
             str(self.__flex_employee_number or "").strip(),
             float(self.__flex_poll_interval_sec),
-            str(self.__flex_refresh_token_session or "").strip(),
-            str(self.__flex_client_id_session or "").strip(),
-            str(self.__flex_client_secret_session or "").strip(),
         )
         if current_flex_configuration != previous_flex_configuration:
             self.__cancel_flex_after()
@@ -6741,7 +6799,6 @@ class Wrike:
             "flex_employee_number": "",
             "flex_poll_interval_sec": 300.0,
             "overtime_notice_interval_min": 10,
-            "flex_credentials_protected": "",
         }
         needs_save = False
         if data is None:
@@ -6867,47 +6924,17 @@ class Wrike:
             self.__set_wrike_api_token_session(token)
         elif not protected_token:
             self.__set_wrike_api_token_session("")
-        protected_flex = str(
-            data.get("flex_credentials_protected", "") or ""
-        ).strip()
-        loaded_flex_refresh = ""
-        loaded_flex_client_id = ""
-        loaded_flex_client_secret = ""
-        if protected_flex:
-            try:
-                decoded_flex = self.__flex_secret_store.unprotect(protected_flex)
-                flex_document = json.loads(decoded_flex or "")
-                if isinstance(flex_document, dict):
-                    loaded_flex_refresh = str(
-                        flex_document.get("refresh_token", "") or ""
-                    ).strip()
-                    loaded_flex_client_id = str(
-                        flex_document.get("client_id", "") or ""
-                    ).strip()
-                    loaded_flex_client_secret = str(
-                        flex_document.get("client_secret", "") or ""
-                    ).strip()
-            except Exception:
-                loaded_flex_refresh = ""
-                loaded_flex_client_id = ""
-                loaded_flex_client_secret = ""
-        else:
-            # Tolerate an early development build that wrote direct values, but
-            # immediately migrate them into the protected envelope on save.
-            loaded_flex_refresh = str(data.get("flex_refresh_token", "") or "").strip()
-            loaded_flex_client_id = str(data.get("flex_client_id", "") or "").strip()
-            loaded_flex_client_secret = str(
-                data.get("flex_client_secret", "") or ""
-            ).strip()
-            if any(
-                key in data
-                for key in ("flex_refresh_token", "flex_client_id", "flex_client_secret")
-            ):
-                needs_save = True
-        self.__flex_credentials_protected = protected_flex
-        self.__flex_refresh_token_session = loaded_flex_refresh
-        self.__flex_client_id_session = loaded_flex_client_id
-        self.__flex_client_secret_session = loaded_flex_client_secret
+        # v0.25.1 stored administrator-only Open API credentials.  They are no
+        # longer read or used; remove the legacy keys on the next settings save
+        # so a migrated installation does not retain obsolete secrets.
+        legacy_flex_keys = (
+            "flex_credentials_protected",
+            "flex_refresh_token",
+            "flex_client_id",
+            "flex_client_secret",
+        )
+        if any(key in data for key in legacy_flex_keys):
+            needs_save = True
         try:
             self.__flex_enabled = bool(data.get("flex_enabled", False))
         except Exception:
@@ -7224,30 +7251,6 @@ class Wrike:
                 self.__log("settings save skipped: oauth protection failed")
                 return False
         payload["google_calendar_oauth_protected"] = protected_oauth
-        flex_credentials = self.__flex_credentials()
-        protected_flex = str(self.__flex_credentials_protected or "").strip()
-        if flex_credentials.configured:
-            try:
-                protected_flex = self.__flex_secret_store.protect(
-                    json.dumps(
-                        {
-                            "refresh_token": flex_credentials.refresh_token,
-                            "client_id": flex_credentials.client_id,
-                            "client_secret": flex_credentials.client_secret,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                )
-            except Exception:
-                protected_flex = ""
-            if not protected_flex:
-                self.__log("settings save skipped: flex credentials protection failed")
-                return False
-        else:
-            protected_flex = ""
-        payload["flex_credentials_protected"] = protected_flex
         if token:
             protected_token = self.__secret_store.protect(token)
             if not protected_token:
@@ -7284,7 +7287,6 @@ class Wrike:
             temp_path = None
             self.__vacation_ical_url_protected = protected_vacation
             self.__google_calendar_oauth_protected = protected_oauth
-            self.__flex_credentials_protected = protected_flex
             return True
         except Exception as exc:
             self.__log_exception("settings save failed", exc)
