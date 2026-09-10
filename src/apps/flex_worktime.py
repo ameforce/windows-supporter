@@ -16,9 +16,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
-# The work-record route preserves the destination through Flex login when the
-# browser session is not authenticated.
-FLEX_WEB_URL = "https://flex.team/time-tracking/work-record/my"
+# Flex's current "My Work" route preserves the destination through login when
+# the browser session is not authenticated.  The older
+# ``/time-tracking/work-record/my`` route now redirects in the UI and can make
+# Playwright navigation time out before the schedule API/content is observed.
+FLEX_WEB_URL = "https://flex.team/time-tracking/my-work-record"
 FLEX_BROWSER_PROFILE_DIR_NAME = "flex-profile"
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
