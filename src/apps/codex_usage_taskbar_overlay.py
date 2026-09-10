@@ -642,6 +642,26 @@ def _label_width_for_overlay_width(
     profile_labels: tuple[str, ...] | list[str] | None = None,
 ) -> int:
     overlay_width = max(0, int(width))
+    measured_label_width = max(
+        (
+            _profile_label_text_width(label) + _PROFILE_LABEL_TEXT_END_GAP_PX
+            for label in tuple(profile_labels or ())
+        ),
+        default=0,
+    )
+
+    # The renderer passes the labels that are actually visible. In a normal
+    # slot the label column is content-sized: reserving the historical 64px
+    # floor for a short name wastes the horizontal space needed by metrics and
+    # makes the overlay look padded on the left. Keep the measured width
+    # stable across normal overlay widths so geometry and drawing use the same
+    # compact contract.
+    has_profile_labels = profile_labels is not None and any(
+        bool(str(label or "")) for label in tuple(profile_labels or ())
+    )
+    if overlay_width >= _MIN_EMPTY_SLOT_WIDTH_PX and has_profile_labels:
+        return measured_label_width
+
     if overlay_width < _MIN_EMPTY_SLOT_WIDTH_PX:
         base_width = min(
             _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX,
@@ -662,17 +682,9 @@ def _label_width_for_overlay_width(
     # The compact fallback intentionally keeps the established metric region
     # intact. At that size the label renderer uses a pixel-aware ellipsis; the
     # full label is reserved by the preferred-width path as soon as the slot
-    # can support a normal overlay.
-    required_label_width = 0
-    if overlay_width >= _MIN_EMPTY_SLOT_WIDTH_PX:
-        required_label_width = max(
-            (
-                _profile_label_text_width(label) + _PROFILE_LABEL_TEXT_END_GAP_PX
-                for label in tuple(profile_labels or ())
-            ),
-            default=0,
-        )
-    return max(base_width, required_label_width)
+    # can support a normal overlay. `profile_labels is None` is retained for
+    # headless/internal callers that do not provide the row labels.
+    return base_width
 
 
 def _fit_profile_label_text(label: Any, available_width: int) -> str:
