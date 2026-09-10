@@ -25,3 +25,11 @@
   보존한다.
 - pane 렌더링은 1~2와 3~4의 row ownership, 좌·우 geometry 및 2개 선택 시 두 번째 창의
   미생성을 단위 테스트로 검증한다.
+
+## 릴리스 정리
+
+- task worktree에서 생성된 virtual environment, Python bytecode, PyInstaller `build`/`dist`/spec,
+  egg-info는 source가 아니므로 inventory를 남긴 뒤 정리한다.
+- runtime deploy의 probe, promotion marker, backup/staged candidate는 source가 아니므로
+  `.gitignore`에 명시한다. 실제 transaction marker나 backup은 실패 복구 증거일 수 있으므로
+  ownership과 완료 상태를 증명하기 전에는 삭제하지 않는다.
