@@ -7,6 +7,7 @@ from datetime import date as date_type
 import math
 import re
 import time
+import unicodedata
 from typing import Any, Callable
 
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
@@ -28,6 +29,8 @@ _MAX_COMPACT_TODAY_LINES = 2
 # the first few ticket/detail rows while keeping long days scrollable.
 _DETAIL_EMPTY_TEXT_HEIGHT = 5
 _DETAIL_TEXT_HEIGHT_WITH_ROWS = 8
+_DETAIL_TEXT_PAD_X = 6
+_DETAIL_GROUP_LEFT_MARGIN = 12
 _POINTER_OFFSET_PX = 16
 _DATE_KEY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -372,6 +375,7 @@ class WorktimeQuickPanel:
         self._selected_date_key: str | None = None
         self._rendered_detail_date_key: str | None = None
         self._pending_detail_scroll: _DetailScrollAnchor | None = None
+        self._detail_text_width: int | None = None
         self._structure_signature: tuple[Any, ...] | None = None
         self._widgets: dict[str, Any] = {}
         self._refresh_after_id = None
@@ -543,6 +547,7 @@ class WorktimeQuickPanel:
         self._selected_date_key = None
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = None
+        self._detail_text_width = None
         self._structure_signature = None
         self._widgets = {}
         self._geometry_retry_pending = False
@@ -706,6 +711,102 @@ class WorktimeQuickPanel:
             grouped.setdefault(key, []).append(row)
         return tuple(tuple(group) for group in grouped.values())
 
+    def _detail_text_line_width(self) -> int:
+        """Return a conservative single-line width for ticket headings."""
+
+        widget = self._widgets.get("detail_text")
+        width = _int_call(widget, "winfo_width", 0)
+        if width <= 1:
+            # During the first render Tk has not assigned a child width yet.
+            # Fit to the panel's safety minimum until the Configure callback
+            # can re-fit the heading against the actual viewport.
+            return max(1, _MIN_PANEL_WIDTH - 28)
+        return width
+
+    @staticmethod
+    def _estimated_text_width(value: str) -> int:
+        """Estimate Segoe UI detail text width without requiring a Tk display."""
+
+        width = 0
+        for character in str(value):
+            if character == "\t":
+                width += 28
+            elif character.isspace():
+                width += 4
+            elif unicodedata.east_asian_width(character) in {"W", "F"}:
+                width += 12
+            else:
+                width += 7
+        return width
+
+    @classmethod
+    def _truncate_to_width(cls, value: str, width: int) -> str:
+        """Keep a ticket heading on one line and add an ASCII ellipsis."""
+
+        text = " ".join(str(value or "").split()) or "제목 없음"
+        budget = max(0, int(width))
+        if cls._estimated_text_width(text) <= budget:
+            return text
+        ellipsis = "..."
+        ellipsis_width = cls._estimated_text_width(ellipsis)
+        if budget <= ellipsis_width:
+            return ellipsis[: max(1, min(len(ellipsis), budget // 7))]
+        fitted: list[str] = []
+        fitted_width = 0
+        for character in text:
+            character_width = cls._estimated_text_width(character)
+            if fitted_width + character_width + ellipsis_width > budget:
+                break
+            fitted.append(character)
+            fitted_width += character_width
+        return "".join(fitted).rstrip() + ellipsis
+
+    def _ticket_heading_text(
+        self,
+        ticket_text: str,
+        *,
+        group_size: int,
+        group_duration: str,
+    ) -> str:
+        """Fit the ticket name while retaining the duration/count suffix."""
+
+        suffix = (
+            f" · {'티켓 합계 ' if group_size > 1 else ''}"
+            f"{group_duration} · {group_size}건"
+        )
+        line_budget = max(
+            96,
+            self._detail_text_line_width()
+            - (2 * _DETAIL_TEXT_PAD_X)
+            - _DETAIL_GROUP_LEFT_MARGIN
+            - 4,
+        )
+        title_budget = line_budget - self._estimated_text_width(f"• {suffix}")
+        return self._truncate_to_width(ticket_text, title_budget)
+
+    def _on_detail_text_configure(self, event: Any = None) -> None:
+        """Re-fit ticket headings after Tk assigns the real viewport width."""
+
+        widget = self._widgets.get("detail_text")
+        if widget is None:
+            return
+        event_widget = getattr(event, "widget", widget)
+        if event_widget is not widget and str(event_widget) != str(widget):
+            return
+        width = _int_call(widget, "winfo_width", 0)
+        if width <= 1 or width == self._detail_text_width:
+            return
+        self._detail_text_width = width
+        model = self._model
+        if model is None or self._detail_view != "timelog":
+            return
+        self._set_detail_text(
+            widget,
+            self._selected_detail_view_text(model),
+            date_key=self._selected_date_key,
+            tagged_parts=self._selected_detail_parts(model),
+        )
+
     def _selected_detail_parts(
         self, model: WorktimePanelModel,
     ) -> tuple[tuple[str, str], ...]:
@@ -724,14 +825,19 @@ class WorktimeQuickPanel:
         for group in self._group_timelog_rows(detail.rows):
             ticket = group[0]
             group_total = sum(row.minutes for row in group)
+            group_duration = self._format_actual_minutes(group_total)
             parts.extend((
                 ("• ", "detail_group"),
                 (
-                    f"{ticket.ticket_text} · "
-                    + ("티켓 합계 " if len(group) > 1 else ""),
+                    self._ticket_heading_text(
+                        ticket.ticket_text,
+                        group_size=len(group),
+                        group_duration=group_duration,
+                    ),
                     "detail_group",
                 ),
-                (self._format_actual_minutes(group_total), "detail_group_duration"),
+                (f" · {'티켓 합계 ' if len(group) > 1 else ''}", "detail_group"),
+                (group_duration, "detail_group_duration"),
                 (f" · {len(group)}건", "detail_group"),
                 ("\n", "detail_group"),
             ))
@@ -867,6 +973,7 @@ class WorktimeQuickPanel:
             self._selected_date_key = None
             self._rendered_detail_date_key = None
             self._pending_detail_scroll = None
+            self._detail_text_width = None
             self._structure_signature = None
             self._widgets = {}
             self._placed = False
@@ -1229,6 +1336,7 @@ class WorktimeQuickPanel:
         self._widgets = {}
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = preserved_detail_scroll
+        self._detail_text_width = None
 
         compact = (
             model.prompt is not None
@@ -1420,6 +1528,7 @@ class WorktimeQuickPanel:
             borderwidth=1,
             padx=4 if compact else 5,
             pady=1 if compact else 2,
+            height=1,
             font=("Segoe UI", 8),
         )
         detail_timelog_button.pack(side="right", padx=(3, 0))
@@ -1434,6 +1543,7 @@ class WorktimeQuickPanel:
             borderwidth=1,
             padx=4 if compact else 5,
             pady=1 if compact else 2,
+            height=1,
             font=("Segoe UI", 8),
         )
         detail_breaks_button.pack(side="right", padx=(3, 0))
@@ -1453,6 +1563,7 @@ class WorktimeQuickPanel:
                 borderwidth=1,
                 padx=4 if compact else 5,
                 pady=1 if compact else 2,
+                height=1,
                 font=("Segoe UI", 8),
             )
         else:
@@ -1503,6 +1614,11 @@ class WorktimeQuickPanel:
                 activebackground=_MUTED,
             )
             detail_text.configure(yscrollcommand=detail_scroll.set, state="disabled")
+            self._bind_additive(
+                detail_text,
+                "<Configure>",
+                self._on_detail_text_configure,
+            )
             detail_text.pack(side="left", fill="both", expand=True)
             detail_scroll.pack(side="right", fill="y")
         else:
@@ -1567,8 +1683,10 @@ class WorktimeQuickPanel:
         self._bind_additive(inline_entry, "<Return>", self._save_inline_editor_event)
         self._bind_additive(inline_entry, "<Escape>", self._cancel_inline_editor_event)
 
-        actions = tk.Frame(content, bg=_BG)
-        actions.pack(fill="x", pady=(0, 1))
+        footer = tk.Frame(content, bg=_BG)
+        footer.pack(side="bottom", fill="x", pady=(0, 1))
+        actions = tk.Frame(footer, bg=_BG)
+        actions.pack(fill="x")
         refresh_button = self._button(actions, "새로고침", self._refresh_command)
         clock_button = self._button(
             actions,
@@ -1590,7 +1708,7 @@ class WorktimeQuickPanel:
         plan_button = self._button(actions, "목표 수정", self._edit_plan_command)
         settings_button = self._button(actions, "설정", self._settings_command)
         countdown_label = tk.Label(
-            content,
+            footer,
             text=self._countdown_text(),
             bg=_BG,
             fg=_MUTED,
@@ -1609,7 +1727,7 @@ class WorktimeQuickPanel:
                 highlightthickness=1,
                 highlightbackground=_PROMPT_BORDER,
             )
-            prompt_card.pack(fill="x")
+            prompt_card.pack(fill="x", before=footer)
             prompt_label = tk.Label(
                 prompt_card,
                 text=f"{prompt.detected_time} 활동을 출근으로 반영할까요?",
@@ -1658,7 +1776,7 @@ class WorktimeQuickPanel:
                 highlightthickness=1,
                 highlightbackground="#86EFAC",
             )
-            overtime_card.pack(fill="x", pady=(section_gap, 0))
+            overtime_card.pack(fill="x", pady=(section_gap, 0), before=footer)
             assigned_text = (
                 f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
                 if overtime_prompt.assigned_minutes > 0
@@ -1705,6 +1823,7 @@ class WorktimeQuickPanel:
             "detail_breaks_button": detail_breaks_button,
             "manual_break_menu": manual_break_menu,
             "manual_break_menu_button": manual_break_menu_button,
+            "footer": footer,
             "refresh_button": refresh_button,
             "clock_button": clock_button,
             "break_button": break_button,
@@ -2078,6 +2197,7 @@ class WorktimeQuickPanel:
             borderwidth=1,
             padx=6,
             pady=2,
+            height=1,
             font=("Segoe UI", 8),
         )
         button.pack(side="left", padx=(0, 4), pady=1)
@@ -2190,7 +2310,6 @@ class WorktimeQuickPanel:
     ) -> None:
         editor = self._widgets.get("inline_editor")
         entry = self._widgets.get("inline_entry")
-        actions = self._widgets.get("actions")
         if editor is None or entry is None:
             return
         title, hint = self._inline_editor_copy(kind, context)
@@ -2207,7 +2326,7 @@ class WorktimeQuickPanel:
             "pack",
             fill="x",
             pady=(0, 6),
-            before=actions,
+            before=self._widgets.get("footer"),
         )
         _safe_call(entry, "focus_set")
         _safe_call(entry, "selection_range", 0, "end")

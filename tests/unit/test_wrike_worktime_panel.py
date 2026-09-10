@@ -1633,6 +1633,32 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(panel._content.pack_kwargs["pady"], 2)
         self.assertEqual(panel._widgets["rows"][0][0].pack_kwargs["pady"], 0)
 
+    def test_footer_reserves_a_full_action_button_row(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+
+        self.assertTrue(panel.show(activate=False))
+        footer = panel._widgets["footer"]
+        actions = panel._widgets["actions"]
+        self.assertIs(actions.parent, footer)
+        self.assertEqual(footer.pack_kwargs["side"], "bottom")
+        self.assertEqual(footer.pack_kwargs["fill"], "x")
+        self.assertEqual(actions.pack_kwargs["fill"], "x")
+        for button_name in (
+            "refresh_button",
+            "clock_button",
+            "break_button",
+            "plan_button",
+            "settings_button",
+        ):
+            with self.subTest(button=button_name):
+                self.assertEqual(panel._widgets[button_name].kwargs["height"], 1)
+
     def test_geometry_uses_compact_safety_minimum_when_content_is_small(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
@@ -1735,6 +1761,101 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             self.assertEqual(int(panel._widgets["detail_text"].cget("height")), 8)
             self.assertLessEqual(window.winfo_reqwidth(), _COMPACT_PANEL_MAX_WIDTH)
             self.assertLessEqual(window.winfo_reqheight(), _COMPACT_PANEL_MAX_HEIGHT)
+        finally:
+            if panel is not None:
+                panel.destroy()
+            root.destroy()
+
+    def test_real_tk_small_viewport_keeps_action_footer_visible(self) -> None:
+        """The detail viewport must not push the primary actions off-screen."""
+
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+        except Exception as exc:
+            self.skipTest(f"Tk display is unavailable: {exc}")
+        root.geometry("800x640+0+0")
+        root.update()
+        panel = None
+        try:
+            base = _model()
+            date_key = base.rows[0].date_key
+            detail_rows = tuple(
+                TimelogDetailRow(
+                    date_key,
+                    f"L{index}",
+                    "T1",
+                    15,
+                    f"작업 {index}",
+                    "공수처 KICS HP-UX pdfio 정규식 미지원 빌드로 CPO-00004 발생 원인 분석",
+                    "ready",
+                )
+                for index in range(5)
+            )
+            details = tuple(
+                TimelogDayDetails(
+                    row.date_key,
+                    "available",
+                    sum(item.minutes for item in detail_rows if item.date_key == row.date_key),
+                    tuple(item for item in detail_rows if item.date_key == row.date_key),
+                )
+                for row in base.rows
+            )
+            model = replace(base, day_details=details)
+            panel = WorktimeQuickPanel(
+                root,
+                lambda: model,
+                refresh=lambda: None,
+                clock_in_now=lambda: None,
+                edit_clock_in=lambda _value: True,
+                edit_plan=lambda _date_key, _minutes: True,
+                toggle_break=lambda: None,
+                open_settings=lambda: None,
+                prompt_accept=lambda _value: None,
+                prompt_edit=lambda _detected, _value: True,
+                prompt_snooze=lambda: None,
+                prompt_skip=lambda: None,
+                tk_module=tk,
+            )
+            with (
+                patch(
+                    "src.apps.wrike_worktime_panel._show_window_without_activation",
+                    side_effect=lambda window: (window.deiconify(), True)[1],
+                ),
+                patch(
+                    "src.apps.wrike_worktime_panel._work_area_for_point",
+                    return_value=(0, 0, 608, 535),
+                ),
+            ):
+                self.assertTrue(panel.show(activate=False))
+            root.update_idletasks()
+
+            window = panel._window
+            self.assertIsNotNone(window)
+            window.deiconify()
+            window.update()
+            root.update()
+            window_bottom = window.winfo_rooty() + window.winfo_height()
+            for button_name in (
+                "refresh_button",
+                "clock_button",
+                "break_button",
+                "plan_button",
+                "settings_button",
+            ):
+                with self.subTest(button=button_name):
+                    button = panel._widgets[button_name]
+                    self.assertTrue(button.winfo_ismapped())
+                    self.assertGreaterEqual(button.winfo_height(), 20)
+                    self.assertLessEqual(
+                        button.winfo_rooty() + button.winfo_height(),
+                        window_bottom,
+                    )
+
+            heading = panel._selected_detail_text(model).splitlines()[1]
+            self.assertIn("...", heading)
+            self.assertNotIn("\n", heading)
         finally:
             if panel is not None:
                 panel.destroy()
