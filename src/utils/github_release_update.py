@@ -5,6 +5,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,9 +33,13 @@ GITHUB_RELEASE_HOSTS = frozenset(
     }
 )
 SHA256_RE = re.compile(r"(?i)(?:sha256:)?(?P<digest>[0-9a-f]{64})")
-# Keep download reads small enough that the updater can refresh the visible
-# progress state several times per second on a normal installer download.
-DOWNLOAD_CHUNK_SIZE = 64 * 1024
+# Installer bytes are written and hashed synchronously.  A 64 KiB read used to
+# invoke the full UI/state write path for every chunk, which can turn a fast
+# download into thousands of Tk redraws and JSON rewrites per second.  Read a
+# suitably sized block, then publish progress independently at a human-visible
+# cadence below.
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS = 0.2
 MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 20
 
@@ -334,6 +339,7 @@ class GitHubReleaseClient:
         destination_dir: str | os.PathLike[str],
         *,
         progress_callback: Callable[[int, int | None], None] | None = None,
+        progress_monotonic: Callable[[], float] = time.monotonic,
     ) -> Path:
         _validate_download_url(candidate.installer_url)
         destination = Path(destination_dir).resolve()
@@ -353,6 +359,8 @@ class GitHubReleaseClient:
                 total_bytes = _response_content_length(response)
                 if progress_callback is not None:
                     progress_callback(0, total_bytes)
+                last_progress_emit_at = float(progress_monotonic())
+                last_progress_emit_bytes = 0
                 with os.fdopen(fd, "wb") as output:
                     fd = -1
                     while True:
@@ -364,11 +372,26 @@ class GitHubReleaseClient:
                             raise GitHubReleaseUpdateError("installer 크기가 허용 한도를 초과했습니다.")
                         digest.update(chunk)
                         output.write(chunk)
-                        if progress_callback is not None:
+                        now = float(progress_monotonic())
+                        if (
+                            progress_callback is not None
+                            and now - last_progress_emit_at
+                            >= DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS
+                        ):
                             progress_callback(
                                 total,
                                 total_bytes if total_bytes is not None else total,
                             )
+                            last_progress_emit_at = now
+                            last_progress_emit_bytes = total
+                if progress_callback is not None and last_progress_emit_bytes != total:
+                    # A download must always finish with an exact terminal
+                    # byte count even when it completed inside one throttle
+                    # window (as it does in unit tests and on local caches).
+                    progress_callback(
+                        total,
+                        total_bytes if total_bytes is not None else total,
+                    )
             finally:
                 close = getattr(response, "close", None)
                 if callable(close):

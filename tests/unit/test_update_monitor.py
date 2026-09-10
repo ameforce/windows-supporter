@@ -23,6 +23,7 @@ from src.utils.update_monitor import (
     UPDATE_PROGRESS_MANUAL_ACTION_TEXT,
     UPDATE_PROGRESS_RETRY_BUTTON_TEXT,
     UPDATE_SOURCE_CHANGE_NOTICE,
+    ReleaseDownloadTelemetry,
     UpdateCandidate,
     UpdateHandoffProgressUi,
     UpdatePromptSession,
@@ -479,6 +480,17 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(failed["labels"]["retry"], UPDATE_PROGRESS_RETRY_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["manual_action"], UPDATE_PROGRESS_MANUAL_ACTION_TEXT)
 
+    def test_release_install_uses_indeterminate_activity_without_faking_percent(self) -> None:
+        snapshot = build_update_progress_snapshot(
+            "release_install",
+            state="running",
+            progress_mode="indeterminate",
+        )
+
+        self.assertEqual(snapshot["percent"], 72)
+        self.assertEqual(snapshot["progressbar"]["value"], 72)
+        self.assertEqual(snapshot["progressbar"]["mode"], "indeterminate")
+
     def test_release_download_progress_maps_bytes_to_download_stage(self) -> None:
         snapshots = [
             build_release_download_progress_snapshot("v0.22.3", 0, 100),
@@ -486,12 +498,42 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             build_release_download_progress_snapshot("v0.22.3", 100, 100),
         ]
 
-        self.assertEqual([snapshot["percent"] for snapshot in snapshots], [22, 46, 70])
+        self.assertEqual([snapshot["percent"] for snapshot in snapshots], [24, 46, 68])
         self.assertTrue(all(snapshot["progressbar"]["visible"] for snapshot in snapshots))
         self.assertIn("50%", snapshots[1]["detail"])
         unknown_length = build_release_download_progress_snapshot("v0.22.3", 4096, None)
-        self.assertEqual(unknown_length["percent"], 22)
+        self.assertEqual(unknown_length["percent"], 24)
         self.assertIn("4.0 KiB", unknown_length["detail"])
+
+    def test_release_download_progress_shows_measured_speed_and_eta_only_when_known(self) -> None:
+        known = build_release_download_progress_snapshot(
+            "v0.22.3",
+            50_000_000,
+            100_000_000,
+            bytes_per_second=5_000_000,
+        )
+        unknown = build_release_download_progress_snapshot(
+            "v0.22.3",
+            50_000,
+            None,
+            bytes_per_second=500_000,
+        )
+
+        self.assertIn("5.0 MB/s", known["detail"])
+        self.assertIn("약 00:10 남음", known["detail"])
+        self.assertIn("500 KB/s", unknown["detail"])
+        self.assertNotIn("남음", unknown["detail"])
+
+    def test_release_download_telemetry_uses_a_real_sample_window(self) -> None:
+        telemetry = ReleaseDownloadTelemetry()
+
+        self.assertIsNone(telemetry.observe(0, now=10.0))
+        self.assertIsNone(telemetry.observe(1_000_000, now=10.2))
+        self.assertAlmostEqual(
+            telemetry.observe(2_000_000, now=10.8),
+            2_500_000.0,
+        )
+        self.assertIsNone(telemetry.observe(0, now=11.0))
 
     def test_update_handoff_progress_ui_uses_borderless_shell_and_collapses_empty_activity(self) -> None:
         try:
