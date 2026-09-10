@@ -789,6 +789,7 @@ class Wrike:
                 except Exception:
                     interactive_sync = True
             desired_headless = not interactive_sync if sync_job else False
+            sync_succeeded = False
             try:
                 if client is not None and client_headless != desired_headless:
                     try:
@@ -822,6 +823,7 @@ class Wrike:
                         now=now,
                         return_metadata=True,
                     )
+                    sync_succeeded = True
                 else:
                     raise FlexBrowserError("알 수 없는 Flex 브라우저 작업입니다.", code="invalid_command")
                 response_queue.put((True, result))
@@ -837,11 +839,14 @@ class Wrike:
                 except Exception:
                     pass
             finally:
-                # A sync is a bounded operation.  Closing its persistent context
-                # prevents a login window from remaining open after the result
-                # has already been applied.  The explicit "Flex 웹 열기" command
-                # intentionally keeps its headed browser open for registration.
-                if sync_job and client is not None:
+                # A successful sync is bounded and can close its context after
+                # the result has been applied.  Keep an interactive headed
+                # session open after a failure so the user can inspect the
+                # actual Flex page and retry without losing the login window.
+                should_close_sync = sync_job and (
+                    not interactive_sync or sync_succeeded
+                )
+                if should_close_sync and client is not None:
                     try:
                         client.close()
                     except Exception:
