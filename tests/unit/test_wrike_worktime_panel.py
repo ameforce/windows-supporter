@@ -1276,7 +1276,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             holder["model"] = _model(actual_text="텍스트만 변경", prompt=None)
             panel.refresh_now()
             self.assertEqual(window.geometry_calls[-1], "740x600-800-100")
-            self.assertEqual(work_area.call_count, 3)
+            self.assertEqual(work_area.call_count, 2)
 
     def test_first_show_uses_compact_density_for_a_640_pixel_work_area(self) -> None:
         root = _FakeRoot()
@@ -1545,6 +1545,51 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         ):
             self.assertTrue(panel.show(activate=False))
         self.assertEqual(window.geometry_calls[-1], "700x500+784+284")
+
+    def test_first_show_uses_compact_density_on_a_normal_work_area(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+
+        with patch(
+            "src.apps.wrike_worktime_panel._work_area_for_point",
+            return_value=(0, 0, 1920, 1080),
+        ):
+            self.assertTrue(panel.show(activate=False))
+
+        self.assertEqual(panel._content.pack_kwargs["padx"], 6)
+        self.assertEqual(panel._content.pack_kwargs["pady"], 3)
+        self.assertEqual(panel._widgets["rows"][0][0].pack_kwargs["pady"], 0)
+
+    def test_geometry_uses_compact_safety_minimum_when_content_is_small(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        panel, _provider, _callbacks = _make_panel(
+            root,
+            fake_tk,
+            {"model": _model()},
+        )
+        window = panel._ensure_window()
+        window.requested_width = 320
+        window.requested_height = 220
+
+        with patch(
+            "src.apps.wrike_worktime_panel._work_area_for_point",
+            return_value=(0, 0, 1920, 1080),
+        ):
+            self.assertTrue(
+                panel._reconcile_geometry(
+                    anchor_to_pointer=True,
+                    resize_to_request=True,
+                )
+            )
+
+        self.assertEqual(window.width, 560)
+        self.assertEqual(window.height, 360)
 
     def test_countdown_and_common_inline_target_validation_are_view_local(self) -> None:
         root = _FakeRoot()
