@@ -1687,7 +1687,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             window.update_idletasks()
 
             self.assertEqual(len(panel._widgets["today_lines"]), 2)
-            self.assertEqual(int(panel._widgets["detail_text"].cget("height")), 5)
+            self.assertEqual(int(panel._widgets["detail_text"].cget("height")), 8)
             self.assertLessEqual(window.winfo_reqwidth(), _COMPACT_PANEL_MAX_WIDTH)
             self.assertLessEqual(window.winfo_reqheight(), _COMPACT_PANEL_MAX_HEIGHT)
         finally:
