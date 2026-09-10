@@ -762,6 +762,7 @@ class Wrike:
 
     def __flex_browser_worker_loop(self) -> None:
         client = None
+        client_headless = None
         while True:
             try:
                 kind, payload, response_queue = self.__flex_browser_queue.get()
@@ -773,12 +774,29 @@ class Wrike:
                         client.close()
                     except Exception:
                         pass
+                client = None
+                client_headless = None
                 try:
                     response_queue.put((True, None))
                 except Exception:
                     pass
                 return
+            sync_job = kind == "sync"
+            interactive_sync = True
+            if sync_job:
+                try:
+                    interactive_sync = bool(payload[4])
+                except Exception:
+                    interactive_sync = True
+            desired_headless = not interactive_sync if sync_job else False
             try:
+                if client is not None and client_headless != desired_headless:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = None
+                    client_headless = None
                 if client is None:
                     if not self.__ensure_playwright_ready():
                         raise FlexBrowserError(
@@ -788,13 +806,15 @@ class Wrike:
                     client = FlexBrowserClient(
                         self.__flex_browser_profile_dir,
                         login_timeout_sec=self.__time_log_login_timeout_sec,
+                        headless=desired_headless,
                         stop_event=self.__flex_browser_stop_event,
                     )
+                    client_headless = desired_headless
                 if kind == "open":
                     client.open_work_record_page()
                     result = None
                 elif kind == "sync":
-                    begin_date, end_date, employee_number, now = payload
+                    begin_date, end_date, employee_number, now, _interactive = payload
                     result = client.fetch_schedule_period(
                         begin_date,
                         end_date,
@@ -816,6 +836,18 @@ class Wrike:
                     response_queue.put((False, ("Flex 브라우저 동기화에 실패했습니다.", "unexpected_error")))
                 except Exception:
                     pass
+            finally:
+                # A sync is a bounded operation.  Closing its persistent context
+                # prevents a login window from remaining open after the result
+                # has already been applied.  The explicit "Flex 웹 열기" command
+                # intentionally keeps its headed browser open for registration.
+                if sync_job and client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = None
+                    client_headless = None
         return
 
     def __submit_flex_browser_job(
@@ -881,8 +913,11 @@ class Wrike:
             return
         if not str(self.__flex_employee_number or "").strip():
             self.__flex_state = "unconfigured"
-            self.__flex_last_error = "본인 계정으로 로그인하면 Flex 사번을 자동 감지합니다."
-        self.__request_flex_sync(force=True)
+            self.__flex_last_error = (
+                "Flex 로그인 · 지금 동기화를 눌러 사번과 근무정보를 감지하세요."
+            )
+            return
+        self.__request_flex_sync(force=True, interactive=False)
         self.__schedule_flex_poll(root)
 
     def __schedule_flex_poll(self, root=None) -> None:
@@ -891,6 +926,7 @@ class Wrike:
             target_root is None
             or not self.__background_active
             or not self.__flex_configured()
+            or not str(self.__flex_employee_number or "").strip()
         ):
             return
         try:
@@ -911,10 +947,18 @@ class Wrike:
         self.__flex_after_id = None
         if not self.__background_active or not self.__flex_configured():
             return
-        self.__request_flex_sync(force=True)
+        if not str(self.__flex_employee_number or "").strip():
+            return
+        self.__request_flex_sync(force=True, interactive=False)
         self.__schedule_flex_poll()
 
-    def __request_flex_sync(self, *, force: bool = False) -> bool:
+    def __request_flex_sync(
+        self,
+        *,
+        force: bool = False,
+        interactive: bool = False,
+        announce: bool = False,
+    ) -> bool:
         _ = force
         root = self.__root
         if root is None or not self.__background_active or not self.__flex_configured():
@@ -929,7 +973,7 @@ class Wrike:
         try:
             threading.Thread(
                 target=self.__run_flex_sync,
-                args=(generation, root),
+                args=(generation, root, bool(interactive), bool(announce)),
                 daemon=True,
             ).start()
         except Exception:
@@ -940,7 +984,13 @@ class Wrike:
             return False
         return True
 
-    def __run_flex_sync(self, generation: int, root) -> None:
+    def __run_flex_sync(
+        self,
+        generation: int,
+        root,
+        interactive: bool = False,
+        announce: bool = False,
+    ) -> None:
         schedules = None
         detected_employee_number = ""
         error = None
@@ -950,7 +1000,13 @@ class Wrike:
             week_end = week_start + timedelta(days=6)
             ok, result = self.__submit_flex_browser_job(
                 "sync",
-                (week_start, week_end, self.__flex_employee_number, now),
+                (
+                    week_start,
+                    week_end,
+                    self.__flex_employee_number,
+                    now,
+                    bool(interactive),
+                ),
                 wait=True,
                 timeout_sec=self.__time_log_login_timeout_sec + 30.0,
             )
@@ -974,6 +1030,7 @@ class Wrike:
                 schedules,
                 detected_employee_number,
                 error,
+                announce=bool(announce),
             )
 
         with self.__flex_schedule_lock:
@@ -994,35 +1051,67 @@ class Wrike:
         schedules: dict | None,
         detected_employee_number: str,
         error: tuple[str, str] | None,
+        *,
+        announce: bool = False,
     ) -> None:
+        error_message = ""
         with self.__flex_schedule_lock:
             if generation != int(self.__flex_sync_generation):
                 return
             self.__flex_sync_running = False
             if error is not None:
                 self.__flex_state = "error"
-                self.__flex_last_error = str(error[0] or "Flex 동기화 실패")
-                return
-            detected_employee_number = str(
-                detected_employee_number or ""
-            ).strip()[:120]
-            if detected_employee_number:
-                if detected_employee_number == str(
-                    self.__flex_employee_number or ""
-                ).strip():
-                    self.__flex_detected_employee_number = ""
-                else:
-                    self.__flex_detected_employee_number = detected_employee_number
-            self.__flex_schedule_by_date = dict(schedules or {})
-            self.__flex_last_success_ts = self.__lib.datetime.now()
-            self.__flex_last_error = ""
-            self.__flex_state = "fresh"
+                error_message = str(error[0] or "Flex 동기화 실패")
+                self.__flex_last_error = error_message
+            else:
+                detected_employee_number = str(
+                    detected_employee_number or ""
+                ).strip()[:120]
+                if detected_employee_number:
+                    if detected_employee_number == str(
+                        self.__flex_employee_number or ""
+                    ).strip():
+                        self.__flex_detected_employee_number = ""
+                    else:
+                        self.__flex_detected_employee_number = detected_employee_number
+                self.__flex_schedule_by_date = dict(schedules or {})
+                self.__flex_last_success_ts = self.__lib.datetime.now()
+                self.__flex_last_error = ""
+                self.__flex_state = "fresh"
         panel = self.__worktime_panel
         if panel is not None:
             try:
                 panel.refresh_now()
             except Exception:
                 pass
+        if announce:
+            if error_message:
+                self.__show_tooltip(
+                    self.__root,
+                    "Flex 동기화 실패",
+                    lines=[(error_message, "#B91C1C")],
+                )
+            else:
+                lines = [
+                    (
+                        f"근무 일정 {len(dict(schedules or {}))}일 반영",
+                        "#166534",
+                    ),
+                    ("로그인 브라우저를 닫았습니다.", "#6B7280"),
+                ]
+                if detected_employee_number:
+                    lines.insert(
+                        1,
+                        (
+                            f"사번 {detected_employee_number} 감지 · 확인 후 저장",
+                            "#2563EB",
+                        ),
+                    )
+                self.__show_tooltip(
+                    self.__root,
+                    "Flex 동기화 완료",
+                    lines=lines,
+                )
 
     def __flex_schedule_for_day(self, target_day) -> FlexDaySchedule | None:
         try:
@@ -1073,7 +1162,11 @@ class Wrike:
             return False, "Flex 일정 자동 반영을 먼저 켜 주세요."
         if not self.__background_active or self.__root is None:
             return False, "근무시간 백그라운드가 아직 시작되지 않았습니다."
-        if not self.__request_flex_sync(force=True):
+        if not self.__request_flex_sync(
+            force=True,
+            interactive=True,
+            announce=True,
+        ):
             return False, "Flex 동기화가 이미 진행 중입니다."
         return True, None
 

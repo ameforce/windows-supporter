@@ -88,6 +88,7 @@ class WrikeSettingsView:
         self._autosave_after_id = None
         self._flex_status_poll_after_id = None
         self._flex_status_poll_started_at = 0.0
+        self._flex_sync_feedback_active = False
         self._flex_prompted_employee_numbers: set[str] = set()
         self._loading_settings = False
         self._status_colors = {
@@ -1782,11 +1783,45 @@ class WrikeSettingsView:
                 pass
         if prompt and detected_employee_number:
             self._prompt_for_flex_employee_number(detected_employee_number)
+        try:
+            schedule_days = max(0, int(flex_status.get("schedule_days", 0) or 0))
+        except Exception:
+            schedule_days = 0
         return {
             "state": state,
+            "error": error,
+            "schedule_days": schedule_days,
             "employee_number": employee_number,
             "detected_employee_number": detected_employee_number,
         }
+
+    def _update_flex_sync_feedback(self, snapshot: dict[str, Any]) -> None:
+        if not self._flex_sync_feedback_active:
+            return
+        state = str(snapshot.get("state") or "").strip().lower()
+        if state == "loading":
+            self._set_status(
+                "Flex 동기화 중 · 로그인 완료 후 근무정보를 자동으로 반영합니다.",
+                level="info",
+            )
+            return
+        if state == "fresh":
+            try:
+                schedule_days = max(0, int(snapshot.get("schedule_days", 0) or 0))
+            except Exception:
+                schedule_days = 0
+            self._set_status(
+                f"Flex 동기화 완료 · 근무 일정 {schedule_days}일 반영",
+                level="ok",
+            )
+            self._flex_sync_feedback_active = False
+            return
+        if state == "error":
+            error = str(snapshot.get("error") or "Flex 동기화에 실패했습니다.").strip()
+            self._set_status(f"Flex 동기화 실패 · {error}", level="error")
+            self._flex_sync_feedback_active = False
+            return
+        return
 
     def _prompt_for_flex_employee_number(self, employee_number: str) -> None:
         candidate = str(employee_number or "").strip()
@@ -1991,12 +2026,14 @@ class WrikeSettingsView:
             return
         ok, error = sync()
         if ok:
+            self._flex_sync_feedback_active = True
             self._set_status(
-                "Flex 로그인 브라우저를 여는 중입니다. 로그인 후 사번을 자동 감지합니다.",
+                "Flex 로그인 브라우저를 여는 중입니다. 로그인 후 동기화 결과를 표시합니다.",
                 level="info",
             )
             self._start_flex_status_poll()
         else:
+            self._flex_sync_feedback_active = False
             self._set_status(str(error or "Flex 동기화 실패"), level="error")
         return
 
@@ -2016,16 +2053,23 @@ class WrikeSettingsView:
     def _poll_flex_status(self) -> None:
         self._flex_status_poll_after_id = None
         snapshot = self._refresh_flex_status_from_backend()
-        if (
-            str(snapshot.get("state") or "") == "loading"
-            and time.monotonic() - self._flex_status_poll_started_at < 300.0
-        ):
-            after = getattr(self._win, "after", None)
-            if callable(after):
-                try:
-                    self._flex_status_poll_after_id = after(700, self._poll_flex_status)
-                except Exception:
-                    self._flex_status_poll_after_id = None
+        self._update_flex_sync_feedback(snapshot)
+        if str(snapshot.get("state") or "") != "loading":
+            return
+        if time.monotonic() - self._flex_status_poll_started_at >= 300.0:
+            if self._flex_sync_feedback_active:
+                self._set_status(
+                    "Flex 동기화 응답을 기다리지 못했습니다. 다시 시도해 주세요.",
+                    level="error",
+                )
+                self._flex_sync_feedback_active = False
+            return
+        after = getattr(self._win, "after", None)
+        if callable(after):
+            try:
+                self._flex_status_poll_after_id = after(700, self._poll_flex_status)
+            except Exception:
+                self._flex_status_poll_after_id = None
         return
 
     def _on_open_flex(self) -> None:
