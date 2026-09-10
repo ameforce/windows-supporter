@@ -169,6 +169,30 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertNotIn("티켓  ", text)
         self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 8)
 
+    def test_ticket_heading_is_single_line_and_uses_ellipsis_when_needed(self):
+        long_title = (
+            "공수처 KICS HP-UX pdfio 정규식 미지원 빌드로 CPO-00004 발생 원인 분석\n"
+            "추가 설명까지 포함된 긴 티켓 제목"
+        )
+        row = TimelogDetailRow(
+            "2026-04-06",
+            "L1",
+            "T1",
+            45,
+            "작업 메모",
+            long_title,
+            "ready",
+        )
+        self.make(_details(rows=(row,)))
+
+        heading = next(
+            line for line in self.detail_text().splitlines() if line.startswith("• ")
+        )
+        self.assertIn("...", heading)
+        self.assertNotIn("\n", heading)
+        self.assertTrue(heading.endswith(" · 00:45 · 1건"))
+        self.assertIn("  ◦ 00:45 · 메모: 작업 메모", self.detail_text())
+
     def test_detail_viewport_uses_a_bounded_readable_height_for_loaded_rows(self):
         self.make(_details())
         text = self.panel._widgets["detail_text"]
