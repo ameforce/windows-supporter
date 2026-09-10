@@ -3982,7 +3982,7 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
                 "clock-inline",
                 required_labels=(
                     "오늘 출근 시간",
-                    "HH:MM (00:00–23:59)",
+                    "예: 9 · 930 · 9:30",
                     "편집 중 · 자동 닫힘 일시정지",
                 ),
                 required_buttons=("저장", "취소"),
@@ -3999,7 +3999,7 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
             and "23:59" in clock_validation
         )
         shared_entry.delete(0, "end")
-        shared_entry.insert(0, "08:15")
+        shared_entry.insert(0, "815")
         _click_button(window, "저장")
         clock_saved = bool(
             calls.count("clock:08:15") == 1
@@ -4086,14 +4086,14 @@ def _run_inline_edit_hover_deadline(output_dir: Path) -> dict[str, Any]:
                 "prompt-inline",
                 required_labels=(
                     "감지된 출근 시간",
-                    "HH:MM (00:00–23:59)",
+                    "예: 9 · 930 · 9:30",
                     "편집 중 · 자동 닫힘 일시정지",
                 ),
                 required_buttons=("저장", "취소"),
             )
         )
         shared_entry.delete(0, "end")
-        shared_entry.insert(0, "08:40")
+        shared_entry.insert(0, "840")
         _click_button(window, "저장")
         prompt_saved = bool(
             calls.count("prompt:08:35->08:40") == 1
