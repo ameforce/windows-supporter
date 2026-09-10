@@ -46,9 +46,9 @@ class _FlexFixtureHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         if path.endswith("/api/work-schedule"):
-            # Keep the first screenshot in the loading state so the test also
-            # checks the visible transition before the schedule is available.
-            time.sleep(0.25)
+            # Deliberately exceed the old fixed 1.2-second wait.  The client
+            # must wait for parseable schedule content, not for elapsed time.
+            time.sleep(1.8)
             body = json.dumps(self.schedule).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

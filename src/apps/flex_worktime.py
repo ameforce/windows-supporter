@@ -844,6 +844,7 @@ class FlexBrowserClient:
         *,
         timeout_ms: int = 20_000,
         login_timeout_sec: float = 180.0,
+        content_timeout_sec: float | None = None,
         work_url: str = FLEX_WEB_URL,
         headless: bool = False,
         stop_event: Any = None,
@@ -851,6 +852,18 @@ class FlexBrowserClient:
         self._profile_dir = os.path.abspath(str(profile_dir or "").strip())
         self._timeout_ms = max(5_000, int(timeout_ms))
         self._login_timeout_sec = max(10.0, float(login_timeout_sec))
+        default_content_timeout = max(
+            15.0,
+            min(self._login_timeout_sec, 90.0),
+        )
+        self._content_timeout_sec = max(
+            5.0,
+            float(
+                default_content_timeout
+                if content_timeout_sec is None
+                else content_timeout_sec
+            ),
+        )
         self._work_url = str(work_url or FLEX_WEB_URL).strip() or FLEX_WEB_URL
         self._headless = bool(headless)
         self._stop_event = stop_event
@@ -920,9 +933,92 @@ class FlexBrowserClient:
 
     def _body_text(self, page) -> str:
         try:
-            return str(page.locator("body").inner_text(timeout=3000) or "")
+            return str(page.locator("body").inner_text(timeout=1000) or "")
         except Exception:
             return ""
+
+    def _ready_schedule_content(
+        self,
+        page,
+        payloads: list[Any],
+        *,
+        begin_date: date,
+        end_date: date,
+        employee_number: str,
+        now: datetime,
+    ) -> tuple[dict[date, FlexDaySchedule], str] | None:
+        parsed, detected_employee_number = _parse_browser_response_payloads(
+            payloads,
+            employee_number=employee_number,
+            now=now,
+        )
+        parsed = {
+            target_day: schedule
+            for target_day, schedule in parsed.items()
+            if begin_date <= target_day <= end_date
+        }
+        visible_text = self._body_text(page)
+        detected_employee_number = (
+            detected_employee_number
+            or extract_flex_employee_number(visible_text)
+            or str(employee_number or "").strip()
+        )
+        if parsed:
+            return parsed, detected_employee_number
+
+        visible = parse_flex_work_record_text(
+            visible_text,
+            target_day=now.date(),
+            employee_number=employee_number,
+            now=now,
+        )
+        if visible:
+            return visible, detected_employee_number
+        return None
+
+    def _wait_for_schedule_content(
+        self,
+        page,
+        payloads: list[Any],
+        *,
+        begin_date: date,
+        end_date: date,
+        employee_number: str,
+        now: datetime,
+    ) -> tuple[dict[date, FlexDaySchedule], str] | None:
+        """Wait until Flex's actual schedule content is parseable.
+
+        DOMContentLoaded only means that the SPA shell exists.  Flex loads the
+        work record asynchronously, so readiness is determined by a parsed
+        schedule response or parsed visible work-record text.  The deadline is
+        only a fail-safe; a successful content check returns immediately.
+        """
+
+        deadline = time.monotonic() + self._content_timeout_sec
+        while True:
+            if self._is_stop_requested():
+                raise FlexBrowserError(
+                    "Flex 브라우저 작업이 종료되었습니다.",
+                    code="cancelled",
+                )
+            ready = self._ready_schedule_content(
+                page,
+                payloads,
+                begin_date=begin_date,
+                end_date=end_date,
+                employee_number=employee_number,
+                now=now,
+            )
+            if ready is not None:
+                return ready
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            wait_ms = max(50, min(250, int(remaining * 1000)))
+            try:
+                page.wait_for_timeout(wait_ms)
+            except Exception:
+                time.sleep(wait_ms / 1000.0)
 
     def _requires_login(self, page) -> bool:
         url = str(getattr(page, "url", "") or "").casefold()
@@ -1050,27 +1146,26 @@ class FlexBrowserClient:
         try:
             page.on("response", collect_response)
             self._goto_work_page(page, wait_for_login=True)
-            try:
-                page.wait_for_timeout(1200)
-            except Exception:
-                time.sleep(1.2)
+            ready = self._wait_for_schedule_content(
+                page,
+                payloads,
+                begin_date=begin_date,
+                end_date=end_date,
+                employee_number=employee_number,
+                now=current,
+            )
         finally:
             try:
                 page.remove_listener("response", collect_response)
             except Exception:
                 pass
 
-        parsed, detected_employee_number = _parse_browser_response_payloads(
-            payloads,
-            employee_number=employee_number,
-            now=current,
-        )
-        visible_text = self._body_text(page)
-        detected_employee_number = (
-            detected_employee_number
-            or extract_flex_employee_number(visible_text)
-            or str(employee_number or "").strip()
-        )
+        if ready is None:
+            raise FlexBrowserError(
+                "Flex 근무 기록 화면에서 근무 정보 콘텐츠를 확인하지 못했습니다. Flex의 본인 근무 기록 페이지가 완전히 로드된 뒤 다시 시도해 주세요.",
+                code="schedule_not_found",
+            )
+        parsed, detected_employee_number = ready
 
         def make_result(schedules: dict[date, FlexDaySchedule]):
             if return_metadata:
@@ -1080,20 +1175,7 @@ class FlexBrowserClient:
                 )
             return schedules
 
-        if parsed:
-            return make_result(parsed)
-        visible = parse_flex_work_record_text(
-            visible_text,
-            target_day=current.date(),
-            employee_number=employee_number,
-            now=current,
-        )
-        if visible:
-            return make_result(visible)
-        raise FlexBrowserError(
-            "Flex 근무 기록 화면에서 근무 정보를 읽지 못했습니다. Flex의 본인 근무 기록 페이지를 열어 둔 뒤 다시 시도해 주세요.",
-            code="schedule_not_found",
-        )
+        return make_result(parsed)
 
     def close(self) -> None:
         context = self._context
