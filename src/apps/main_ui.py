@@ -18,11 +18,11 @@ class WindowsSupporterMainUI:
     _TAB_UPDATE = "update"
     _TAB_POWER = "power"
     _KAKAO_RETRY_DELAY_MS = 500
-    # 96dpi 기준 기본 UI 배율. 고해상도 디스플레이를 100% 배율로 쓰는
-    # 환경(예: 2560x1440)에서 Tk 기본 scaling(1.333)은 본문을 10~12px로
-    # 렌더링해 사실상 읽을 수 없다. 폰트·위젯을 이 배율만큼 키우고
-    # 창 크기는 _ui_scale이 같은 비율로 따라간다.
-    _UI_BASE_SCALE = 1.25
+    # Tk가 Windows 배율을 이미 반영한 상태에서 앱 배율을 다시 올리면
+    # 모든 탭과 보조 창이 함께 커져 작업 영역을 쉽게 넘는다. 96dpi 기준
+    # 1.0을 앱 내부 상한으로 두고, 사용자가 지정한 시스템 배율보다 크게
+    # 만들지 않는다.
+    _UI_BASE_SCALE = 1.0
 
     def __init__(
         self,
@@ -78,25 +78,25 @@ class WindowsSupporterMainUI:
         self._power_built = False
         self._current_tab = None
         # 탭 크기는 실제 콘텐츠 요구 크기를 우선한다. 이 값들은 콘텐츠가
-        # 아직 mount되지 않았거나 요청 크기를 측정할 수 없는 탭의 fallback
-        # 이며, _apply_tab_geometry가 작업 영역과 Tk scaling을 함께 반영한다.
+        # 아직 mount되지 않았거나 요청 크기를 측정할 수 없는 탭의 compact
+        # fallback이며, _apply_tab_geometry가 작업 영역 상한을 적용한다.
         self._tab_sizes = {
-            self._TAB_DASHBOARD: (1080, 660),
-            self._TAB_STARTUP: (1160, 660),
-            self._TAB_KAKAO: (800, 460),
-            self._TAB_WRIKE: (920, 640),
-            self._TAB_AI_USAGE: (1180, 780),
-            self._TAB_UPDATE: (880, 520),
-            self._TAB_POWER: (880, 540),
+            self._TAB_DASHBOARD: (1000, 480),
+            self._TAB_STARTUP: (1000, 560),
+            self._TAB_KAKAO: (700, 340),
+            self._TAB_WRIKE: (840, 580),
+            self._TAB_AI_USAGE: (1000, 560),
+            self._TAB_UPDATE: (760, 420),
+            self._TAB_POWER: (800, 420),
         }
         self._tab_minsizes = {
-            self._TAB_DASHBOARD: (940, 500),
-            self._TAB_STARTUP: (960, 540),
-            self._TAB_KAKAO: (700, 360),
-            self._TAB_WRIKE: (800, 540),
-            self._TAB_AI_USAGE: (960, 560),
-            self._TAB_UPDATE: (760, 420),
-            self._TAB_POWER: (760, 440),
+            self._TAB_DASHBOARD: (760, 400),
+            self._TAB_STARTUP: (820, 440),
+            self._TAB_KAKAO: (600, 300),
+            self._TAB_WRIKE: (720, 440),
+            self._TAB_AI_USAGE: (820, 480),
+            self._TAB_UPDATE: (640, 340),
+            self._TAB_POWER: (680, 340),
         }
 
         self._lazy_import_tk()
@@ -217,11 +217,11 @@ class WindowsSupporterMainUI:
         return
 
     def _apply_base_ui_scaling(self) -> None:
-        """Tk 기본 scaling에 최소 UI 배율을 보장한다.
+        """Tk 기본 scaling이 앱의 compact 상한을 넘지 않게 한다.
 
         폰트는 위젯 생성 시점의 scaling으로 픽셀 크기가 정해지므로 어떤
-        위젯도 만들기 전에 호출해야 한다. 시스템이 이미 더 높은 scaling을
-        보고하면(고배율 디스플레이) 그 값을 유지한다.
+        위젯도 만들기 전에 호출해야 한다. Windows의 배율을 그대로 한 번
+        더 적용해 전체 UI가 확대되는 것을 막는다.
         """
         root = self._root
         try:
@@ -231,8 +231,8 @@ class WindowsSupporterMainUI:
         base = 96.0 / 72.0
         if base <= 0:
             return
-        target = max(current, base * self._UI_BASE_SCALE)
-        if target <= current + 1e-9:
+        target = min(current, base * self._UI_BASE_SCALE)
+        if target >= current - 1e-9:
             return
         try:
             root.tk.call("tk", "scaling", target)
@@ -254,7 +254,7 @@ class WindowsSupporterMainUI:
             pass
         try:
             w, h = self._scaled_size(
-                self._tab_sizes.get(self._TAB_DASHBOARD, (1080, 660))
+                self._tab_sizes.get(self._TAB_DASHBOARD, (1000, 480))
             )
             work_width, work_height = self._work_area_size()
             w = min(int(w), max(320, int(work_width) - 32))
@@ -264,8 +264,11 @@ class WindowsSupporterMainUI:
             pass
         try:
             mw, mh = self._scaled_size(
-                self._tab_minsizes.get(self._TAB_DASHBOARD, (940, 500))
+                self._tab_minsizes.get(self._TAB_DASHBOARD, (760, 400))
             )
+            work_width, work_height = self._work_area_size()
+            mw = min(int(mw), max(320, int(work_width) - 32))
+            mh = min(int(mh), max(280, int(work_height) - 48))
             root.minsize(int(mw), int(mh))
         except Exception:
             pass
@@ -451,15 +454,21 @@ class WindowsSupporterMainUI:
             return
         if w <= 1 or h <= 1:
             return
-        self._tab_sizes[tab_key] = (w, h)
+        # winfo_width/height는 이미 scaling이 적용된 physical pixel이다.
+        # fallback은 logical pixel로 관리하므로 저장 시 다시 logical 단위로
+        # 환산해야 다음 탭 전환에서 배율을 중복 적용하지 않는다.
+        scale = self._ui_scale()
+        self._tab_sizes[tab_key] = (
+            max(1, int(round(w / scale))),
+            max(1, int(round(h / scale))),
+        )
         return
 
     def _ui_scale(self) -> float:
         """Tk scaling(포인트→픽셀) 비율을 96dpi 기준 상대 배율로 바꾼다.
 
-        고배율 디스플레이에서 고정 픽셀 창이 실제보다 작게 보이는 문제를
-        막기 위해 기본/최소 창 크기에 이 배율을 곱한다. Tk를 읽을 수 없는
-        테스트 더블에서는 1.0으로 둔다.
+        앱은 Windows scaling을 별도로 다시 확대하지 않으므로 compact 상한을
+        적용한다. Tk를 읽을 수 없는 테스트 더블에서는 1.0으로 둔다.
         """
         root = self._root
         try:
@@ -469,7 +478,7 @@ class WindowsSupporterMainUI:
         base = 96.0 / 72.0
         if scaling <= 0 or base <= 0:
             return 1.0
-        return max(1.0, min(3.0, scaling / base))
+        return max(1.0, min(self._UI_BASE_SCALE, scaling / base))
 
     def _scaled_size(self, size: tuple[int, int] | list[int]) -> tuple[int, int]:
         scale = self._ui_scale()
@@ -584,10 +593,10 @@ class WindowsSupporterMainUI:
     def _preferred_window_size(self, tab_key: str) -> tuple[int, int]:
         try:
             fallback = self._scaled_size(
-                self._tab_sizes.get(tab_key) or (960, 600)
+                self._tab_sizes.get(tab_key) or (1000, 560)
             )
         except Exception:
-            fallback = (960, 600)
+            fallback = (1000, 560)
 
         tab = self._tab_widget(tab_key)
         if tab is None:
