@@ -58,6 +58,14 @@ class FlexBrowserError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class FlexBrowserSyncResult:
+    """A browser sync result plus the employee number found in Flex."""
+
+    schedules: dict[date, "FlexDaySchedule"]
+    employee_number: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class FlexWorkBlock:
     """One planned or actual work/rest block returned by Flex."""
 
@@ -163,18 +171,79 @@ def _as_list(value: Any) -> list:
     return []
 
 
-def _employee_value(value: dict) -> str:
-    return str(
-        _first_value(
-            value,
-            "employeeNumber",
-            "employeeNo",
-            "employeeId",
-            "memberNumber",
-            "userNumber",
-        )
-        or ""
-    ).strip()
+_EMPLOYEE_NUMBER_KEYS = (
+    "employeeNumber",
+    "employeeNo",
+    "employeeCode",
+    "personnelNumber",
+    "personnelNo",
+    "staffNumber",
+    "staffNo",
+    "memberNumber",
+    "userNumber",
+    "employee_number",
+    "employee_no",
+    "employee_code",
+    "personnel_number",
+    "personnel_no",
+    "staff_number",
+    "staff_no",
+    "member_number",
+    "user_number",
+    "사번",
+    "사원번호",
+    "직원번호",
+)
+_EMPLOYEE_ID_KEYS = ("employeeId", "employee_id")
+
+
+def _normalize_employee_number(value: Any) -> str:
+    raw = str(value or "").strip().strip(".,;:)]}")
+    if not raw or len(raw) > 120:
+        return ""
+    if "@" in raw or raw.casefold().startswith(("http://", "https://")):
+        return ""
+    return raw
+
+
+def _employee_value(value: dict, *, include_id: bool = True) -> str:
+    if not isinstance(value, dict):
+        return ""
+    candidate = _first_value(value, *_EMPLOYEE_NUMBER_KEYS)
+    if candidate is None:
+        for nested_name in (
+            "employee",
+            "employeeInfo",
+            "staff",
+            "person",
+            "user",
+            "member",
+            "profile",
+        ):
+            nested = value.get(nested_name)
+            if isinstance(nested, dict):
+                nested_value = _employee_value(nested, include_id=include_id)
+                if nested_value:
+                    return nested_value
+    if candidate is None and include_id:
+        candidate = _first_value(value, *_EMPLOYEE_ID_KEYS)
+    return _normalize_employee_number(candidate)
+
+
+def _employee_number_from_mapping(value: dict) -> str:
+    """Extract an employee-number field without treating a generic user id as one."""
+
+    direct = _employee_value(value, include_id=False)
+    if direct:
+        return direct
+    candidate = _normalize_employee_number(
+        _first_value(value, *_EMPLOYEE_ID_KEYS)
+    )
+    if not candidate or re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f-]{27,}", candidate, re.IGNORECASE
+    ):
+        return ""
+    return candidate
 
 
 def _day_entries(user_schedule: dict) -> list[tuple[date | None, dict]]:
@@ -476,6 +545,35 @@ _BROWSER_RESPONSE_WORDS = (
     "출퇴근",
     "근태",
 )
+_BROWSER_IDENTITY_WORDS = (
+    "/account",
+    "/auth",
+    "/employee",
+    "/employees",
+    "/member",
+    "/members",
+    "/profile",
+    "/staff",
+    "/user",
+    "/users",
+    "identity",
+    "profile",
+    "employee",
+    "member",
+    "staff",
+    "account",
+    "사용자",
+    "계정",
+    "프로필",
+    "사번",
+)
+_BROWSER_EMPLOYEE_RE = re.compile(
+    r"(?:사번|사원번호|직원번호|"
+    r"employee\s*(?:number|no|id|code)|"
+    r"personnel\s*(?:number|no)|staff\s*(?:number|no))"
+    r"\s*(?:[:#：]\s*|\s+)([A-Za-z0-9][A-Za-z0-9._/-]{0,119})",
+    re.IGNORECASE,
+)
 
 
 def _browser_line_has(line: str, words: tuple[str, ...]) -> bool:
@@ -532,6 +630,16 @@ def _browser_date_from_text(text: str, fallback: date) -> date:
         return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
     except (TypeError, ValueError):
         return fallback
+
+
+def extract_flex_employee_number(text: str) -> str:
+    """Read an explicitly labelled employee number from visible Flex text."""
+
+    for match in _BROWSER_EMPLOYEE_RE.finditer(str(text or "")):
+        value = _normalize_employee_number(match.group(1))
+        if value:
+            return value
+    return ""
 
 
 def _browser_block_payload(
@@ -676,12 +784,27 @@ def _iter_browser_json_dicts(value: Any, *, depth: int = 0):
             yield from _iter_browser_json_dicts(child, depth=depth + 1)
 
 
+def _extract_employee_number_from_payloads(payloads: list[Any]) -> str:
+    for payload in payloads:
+        if not isinstance(payload, (dict, list)):
+            continue
+        for candidate in _iter_browser_json_dicts(payload):
+            employee_number = _employee_number_from_mapping(candidate)
+            if employee_number:
+                return employee_number
+    return ""
+
+
 def _parse_browser_response_payloads(
     payloads: list[Any],
     *,
     employee_number: str,
     now: datetime,
-) -> dict[date, FlexDaySchedule]:
+) -> tuple[dict[date, FlexDaySchedule], str]:
+    detected_employee_number = _extract_employee_number_from_payloads(payloads)
+    wanted_employee_number = (
+        str(employee_number or "").strip() or detected_employee_number
+    )
     for payload in payloads:
         if not isinstance(payload, (dict, list)):
             continue
@@ -692,14 +815,18 @@ def _parse_browser_response_payloads(
             try:
                 parsed = parse_flex_schedule_response(
                     candidate,
-                    employee_number=employee_number,
+                    employee_number=wanted_employee_number,
                     now=now,
                 )
             except FlexScheduleError:
                 continue
             if parsed:
-                return parsed
-    return {}
+                return (
+                    parsed,
+                    _employee_number_from_mapping(candidate)
+                    or detected_employee_number,
+                )
+    return {}, detected_employee_number
 
 
 class FlexBrowserClient:
@@ -884,7 +1011,8 @@ class FlexBrowserClient:
         *,
         employee_number: str = "",
         now: datetime | None = None,
-    ) -> dict[date, FlexDaySchedule]:
+        return_metadata: bool = False,
+    ) -> dict[date, FlexDaySchedule] | FlexBrowserSyncResult:
         if self._is_stop_requested():
             raise FlexBrowserError("Flex 브라우저 작업이 종료되었습니다.", code="cancelled")
         if not isinstance(begin_date, date) or not isinstance(end_date, date):
@@ -903,7 +1031,10 @@ class FlexBrowserClient:
                 url = str(response.url or "").casefold()
                 if resource_type not in {"xhr", "fetch"}:
                     return
-                if not any(word in url for word in _BROWSER_RESPONSE_WORDS):
+                if not (
+                    any(word in url for word in _BROWSER_RESPONSE_WORDS)
+                    or any(word in url for word in _BROWSER_IDENTITY_WORDS)
+                ):
                     return
                 payload = response.json()
                 if isinstance(payload, (dict, list)):
@@ -924,21 +1055,36 @@ class FlexBrowserClient:
             except Exception:
                 pass
 
-        parsed = _parse_browser_response_payloads(
+        parsed, detected_employee_number = _parse_browser_response_payloads(
             payloads,
             employee_number=employee_number,
             now=current,
         )
+        visible_text = self._body_text(page)
+        detected_employee_number = (
+            detected_employee_number
+            or extract_flex_employee_number(visible_text)
+            or str(employee_number or "").strip()
+        )
+
+        def make_result(schedules: dict[date, FlexDaySchedule]):
+            if return_metadata:
+                return FlexBrowserSyncResult(
+                    schedules=schedules,
+                    employee_number=detected_employee_number,
+                )
+            return schedules
+
         if parsed:
-            return parsed
+            return make_result(parsed)
         visible = parse_flex_work_record_text(
-            self._body_text(page),
+            visible_text,
             target_day=current.date(),
             employee_number=employee_number,
             now=current,
         )
         if visible:
-            return visible
+            return make_result(visible)
         raise FlexBrowserError(
             "Flex 근무 기록 화면에서 근무 정보를 읽지 못했습니다. Flex의 본인 근무 기록 페이지를 열어 둔 뒤 다시 시도해 주세요.",
             code="schedule_not_found",
