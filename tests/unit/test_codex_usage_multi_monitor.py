@@ -541,7 +541,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             manager_again, _ = self._build_manager(tmp)
             self.assertEqual(manager_again.get_settings_snapshot()["profiles"][0]["provider"], "cursor")
 
-    def test_profiles_allow_all_provider_combinations_and_more_than_two_saved_profiles(self):
+    def test_profiles_allow_all_provider_combinations_and_up_to_four_taskbar_profiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             for providers in (
                 ("codex", "codex"),
@@ -585,19 +585,27 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertTrue(ok, error)
             ok, error, created = manager.add_profile("cursor")
             self.assertTrue(ok, error)
-            dynamic_profile_id = created["id"]
-            self.assertEqual(len(manager.get_settings_snapshot()["profiles"]), 3)
-
-            before = manager.get_settings_snapshot()
+            selected_profile_ids = ["account_1", "account_2", created["id"]]
+            for provider in ("codex", "cursor"):
+                ok, error, created = manager.add_profile(provider)
+                self.assertTrue(ok, error)
+                selected_profile_ids.append(created["id"])
+            self.assertEqual(len(manager.get_settings_snapshot()["profiles"]), 5)
 
             ok, error = manager.update_settings(
                 {
-                    "selected_profile_ids": [
-                        "account_1",
-                        "account_2",
-                        dynamic_profile_id,
-                    ]
+                    "selected_profile_ids": selected_profile_ids[:4]
                 }
+            )
+            self.assertTrue(ok, error)
+            self.assertEqual(
+                manager.get_settings_snapshot()["selected_profile_ids"],
+                selected_profile_ids[:4],
+            )
+            before = manager.get_settings_snapshot()
+
+            ok, error = manager.update_settings(
+                {"selected_profile_ids": selected_profile_ids}
             )
             self.assertFalse(ok)
             self.assertEqual(error, "taskbar_profile_limit")
@@ -1540,6 +1548,54 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 self.assertTrue(snapshot["settings_read_only"])
                 self.assertTrue(snapshot["settings_error"])
 
+    def test_v4_settings_with_five_taskbar_profiles_is_not_silently_truncated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            profile_ids = [
+                "account_1",
+                "account_2",
+                *[f"profile_{index:032x}" for index in range(3)],
+            ]
+            payload = {
+                "settings_version": 4,
+                "profiles": [
+                    {
+                        "id": profile_id,
+                        "provider": "codex",
+                        "enabled": True,
+                        "taskbar_selected": True,
+                    }
+                    for profile_id in profile_ids
+                ],
+                "profile_order": profile_ids,
+                "selected_profile_ids": profile_ids,
+                "default_account_id": "account_1",
+            }
+            settings_path = os.path.join(config_dir, "ai_usage_settings.json")
+            original = json.dumps(payload, ensure_ascii=False, indent=2)
+            with open(settings_path, "w", encoding="utf-8") as fp:
+                fp.write(original)
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=config_dir,
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=lambda config_dir, profile_dir: _FakeChildMonitor(
+                    config_dir,
+                    profile_dir,
+                ),
+            )
+
+            snapshot = manager.get_settings_snapshot()
+            self.assertTrue(snapshot["settings_read_only"])
+            self.assertEqual(snapshot["settings_error"], "invalid_v4_taskbar_selection")
+            self.assertEqual(
+                manager.update_settings({"interval_sec": 123}),
+                (False, "settings_read_only"),
+            )
+            with open(settings_path, "r", encoding="utf-8") as fp:
+                self.assertEqual(fp.read(), original)
+
     def test_existing_unreadable_settings_never_fall_back_or_overwrite_original_bytes(self):
         cases = {
             "malformed_json": b"{",
@@ -1577,9 +1633,9 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 with open(settings_path, "rb") as fp:
                     self.assertEqual(fp.read(), original)
 
-    def test_profiles_support_zero_one_three_and_twenty_entries(self):
+    def test_profiles_support_zero_one_three_four_and_twenty_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for count in (0, 1, 3, 20):
+            for count in (0, 1, 3, 4, 20):
                 case_dir = os.path.join(tmp, str(count))
                 config_dir = os.path.join(case_dir, "config")
                 os.makedirs(config_dir, exist_ok=True)
@@ -1596,7 +1652,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                             "provider": "cursor" if index % 2 else "codex",
                             "label": f"Profile {index + 1}",
                             "enabled": True,
-                            "taskbar_selected": index < 2,
+                            "taskbar_selected": index < 4,
                         }
                     )
                 with open(os.path.join(config_dir, "ai_usage_settings.json"), "w", encoding="utf-8") as fp:
@@ -1605,7 +1661,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                             "settings_version": 4,
                             "profiles": profiles,
                             "profile_order": [item["id"] for item in profiles],
-                            "selected_profile_ids": [item["id"] for item in profiles[:2]],
+                            "selected_profile_ids": [item["id"] for item in profiles[:4]],
                             "default_account_id": profiles[0]["id"] if profiles else "",
                         },
                         fp,
@@ -1614,7 +1670,10 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 snapshot = manager.get_settings_snapshot()
                 self.assertEqual(len(snapshot["profiles"]), count)
                 self.assertEqual(snapshot["profile_order"], [item["id"] for item in profiles])
-                self.assertLessEqual(len(snapshot["selected_profile_ids"]), 2)
+                self.assertEqual(
+                    snapshot["selected_profile_ids"],
+                    [item["id"] for item in profiles[:4]],
+                )
                 if count == 0:
                     self.assertEqual(snapshot["default_account_id"], "")
                 if count >= 1:

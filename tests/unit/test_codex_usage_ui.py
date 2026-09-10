@@ -659,7 +659,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         ]
         self.assertIn("모니터링 사용", checkbox_texts)
         self.assertIn("작업표시줄 오버레이", checkbox_texts)
-        self.assertIn("사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 2개)", texts)
+        self.assertIn("사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 4개)", texts)
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
 
@@ -1525,7 +1525,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(view._profile_deletions_inflight, set())
         self.assertEqual(scheduled, [True])
 
-    def test_third_taskbar_selection_is_reverted_before_autosave(self) -> None:
+    def test_fifth_taskbar_selection_is_reverted_before_autosave(self) -> None:
         class _FakeMonitor:
             def __init__(self):
                 self.payloads = []
@@ -1536,6 +1536,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                         {"id": "account_1", "provider": "codex"},
                         {"id": "account_2", "provider": "cursor"},
                         {"id": "profile_0", "provider": "codex"},
+                        {"id": "profile_1", "provider": "cursor"},
+                        {"id": "profile_2", "provider": "codex"},
                     ]
                 }
 
@@ -1550,7 +1552,13 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
         view._usage_url_var = _FakeVar(value="https://example.test")
-        view._account_order = ["account_1", "account_2", "profile_0"]
+        view._account_order = [
+            "account_1",
+            "account_2",
+            "profile_0",
+            "profile_1",
+            "profile_2",
+        ]
         view._account_enabled_vars = {
             profile_id: _FakeVar(value=True)
             for profile_id in view._account_order
@@ -1559,30 +1567,37 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "account_1": _FakeVar(value="codex"),
             "account_2": _FakeVar(value="cursor"),
             "profile_0": _FakeVar(value="codex"),
+            "profile_1": _FakeVar(value="cursor"),
+            "profile_2": _FakeVar(value="codex"),
         }
         view._account_taskbar_selected_vars = {
             "account_1": _FakeVar(value=True),
             "account_2": _FakeVar(value=True),
             "profile_0": _FakeVar(value=True),
+            "profile_1": _FakeVar(value=True),
+            "profile_2": _FakeVar(value=True),
         }
         view._win = _FakeWidget()
         statuses = []
         view._set_status = lambda text, level="info": statuses.append((text, level))
         view._autosave_after_id = "after-existing"
 
-        view._on_taskbar_selection_changed("profile_0")
+        view._on_taskbar_selection_changed("profile_2")
 
-        self.assertFalse(view._account_taskbar_selected_vars["profile_0"].get())
+        self.assertFalse(view._account_taskbar_selected_vars["profile_2"].get())
         self.assertEqual(view._win.after_cancel_calls, ["after-existing"])
         self.assertIsNotNone(view._autosave_after_id)
-        self.assertIn("최대 2개", statuses[-1][0])
+        self.assertIn("최대 4개", statuses[-1][0])
         self.assertEqual(statuses[-1][1], "error")
 
         _delay, autosave = view._win.after_calls[-1]
         autosave()
 
-        self.assertEqual(monitor.payloads[-1]["selected_profile_ids"], ["account_1", "account_2"])
-        self.assertIn("최대 2개", statuses[-1][0])
+        self.assertEqual(
+            monitor.payloads[-1]["selected_profile_ids"],
+            ["account_1", "account_2", "profile_0", "profile_1"],
+        )
+        self.assertIn("최대 4개", statuses[-1][0])
         self.assertEqual(statuses[-1][1], "error")
 
     def test_add_flushes_pending_autosave_inside_worker_before_profile_creation(self) -> None:

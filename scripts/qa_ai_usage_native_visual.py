@@ -30,6 +30,7 @@ SCENARIO_NAMES = (
     "mixed-ready-standard",
     "one-profile-125",
     "dynamic-three-profiles",
+    "four-taskbar-profiles",
     "ten-mixed-profiles-150",
     "long-label-narrow",
     "cursor-long-amount-150",
@@ -148,7 +149,11 @@ def build_scenario_fixture(
             [900, 620]
             if scenario == "one-profile-125"
             else [1040, 760]
-            if scenario in {"dynamic-three-profiles", "ten-mixed-profiles-150"}
+            if scenario in {
+                "dynamic-three-profiles",
+                "four-taskbar-profiles",
+                "ten-mixed-profiles-150",
+            }
             else [1040, 660]
         )
         phase = (
@@ -234,6 +239,17 @@ def build_scenario_fixture(
             _runtime_profile(third_profile, _ready_runtime(), _codex_snapshot(recent))
         )
         interaction = {"action": "mousewheel_scroll", "profile_id": ""}
+    elif scenario == "four-taskbar-profiles":
+        for index, provider in ((3, "codex"), (4, "cursor")):
+            profile = _profile_settings(
+                f"profile_{index:032x}",
+                f"{provider.title()} 작업표시줄 프로필 {index}",
+                provider,
+                selected=True,
+            )
+            settings_profiles.append(profile)
+            snapshot = _codex_snapshot(recent) if provider == "codex" else _cursor_snapshot(recent)
+            runtime_profiles.append(_runtime_profile(profile, _ready_runtime(), snapshot))
     elif scenario == "ten-mixed-profiles-150":
         ui_scale_percent = 150
         for index in range(3, 11):

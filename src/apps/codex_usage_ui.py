@@ -5,6 +5,8 @@ import re
 import threading
 from typing import Any
 
+from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
+
 
 class CodexUsageSettingsView:
     def __init__(
@@ -393,7 +395,10 @@ class CodexUsageSettingsView:
         row += 1
         tk.Label(
             body,
-            text="사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 2개)",
+            text=(
+                "사용량 프로필 "
+                f"(저장 제한 없음 · 작업표시줄 표시 최대 {TASKBAR_PROFILE_LIMIT}개)"
+            ),
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 10, "bold"),
@@ -1532,8 +1537,11 @@ class CodexUsageSettingsView:
             for item in accounts
             if bool(item.get("taskbar_selected"))
         ]
-        if len(selected_profile_ids) > 2:
-            self._set_status("저장 실패: 작업표시줄 표시 프로필은 최대 2개입니다.", level="error")
+        if len(selected_profile_ids) > TASKBAR_PROFILE_LIMIT:
+            self._set_status(
+                f"저장 실패: 작업표시줄 표시 프로필은 최대 {TASKBAR_PROFILE_LIMIT}개입니다.",
+                level="error",
+            )
             return None
         payload = {
             "enabled": enabled,
@@ -1957,7 +1965,7 @@ class CodexUsageSettingsView:
             for profile_id, var in self._account_taskbar_selected_vars.items()
             if bool(var.get())
         ]
-        if len(selected) > 2:
+        if len(selected) > TASKBAR_PROFILE_LIMIT:
             current = self._account_taskbar_selected_vars.get(normalized)
             if current is not None:
                 self._loading_settings = True
@@ -1967,8 +1975,8 @@ class CodexUsageSettingsView:
                     self._loading_settings = False
             self._cancel_pending_autosave()
             rejection = (
-                "작업표시줄 표시 프로필은 최대 2개입니다. "
-                "세 번째 선택은 저장하지 않았습니다."
+                f"작업표시줄 표시 프로필은 최대 {TASKBAR_PROFILE_LIMIT}개입니다. "
+                "다섯 번째 선택은 저장하지 않았습니다."
             )
             self._preserve_status_after_next_autosave = True
             self._schedule_autosave()

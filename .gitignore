@@ -23,7 +23,20 @@ windows-supporter.exe
 
 # Runtime and installer artifacts
 .windows-supporter.runtime-probe.json
+windows-supporter.previous.exe
+windows-supporter.promotion-pending.json
+.windows-supporter.exe.backup-*
+.windows-supporter.exe.candidate-*
+.windows-supporter.exe.restore-*
 unins000.*
+
+# Test and static-analysis artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
 # Logs
 *.log

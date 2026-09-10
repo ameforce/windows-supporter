@@ -87,6 +87,82 @@ class _FakeCanvas:
         return len(self.ops)
 
 
+class AiUsageTaskbarOverlayPaneTest(unittest.TestCase):
+    @staticmethod
+    def _runtime(profile_count=4):
+        return {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": f"profile-{index}",
+                    "label": f"Profile {index}",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "runtime": {"session_state": "logged_in"},
+                    "last_snapshot": {
+                        "five_hour_limit": f"{20 + index}%",
+                        "weekly_limit": f"{30 + index}%",
+                    },
+                }
+                for index in range(1, profile_count + 1)
+            ],
+        }
+
+    def test_four_selected_profiles_render_as_fixed_left_and_right_two_row_panes(self):
+        windows = []
+
+        def make_window(_root):
+            window = _FakeWindow()
+            windows.append(window)
+            return window
+
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: self._runtime(4),
+            window_factory=make_window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+
+        self.assertTrue(overlay.refresh())
+        self.assertEqual(len(windows), 2)
+        left_model, right_model = (window.draw_calls[-1] for window in windows)
+        self.assertEqual(
+            [bar["label"] for bar in left_model["bars"]],
+            ["Profile 1", "Profile 2"],
+        )
+        self.assertEqual(
+            [bar["label"] for bar in right_model["bars"]],
+            ["Profile 3", "Profile 4"],
+        )
+        left_geometry = left_model["geometry"]
+        right_geometry = right_model["geometry"]
+        self.assertLessEqual(
+            int(left_geometry["x"]) + int(left_geometry["width"]),
+            960,
+        )
+        self.assertGreaterEqual(int(right_geometry["x"]), 960)
+        self.assertEqual(left_geometry["_slot_side"], "left")
+        self.assertEqual(right_geometry["_slot_side"], "right")
+
+    def test_second_pane_is_not_created_when_only_two_profiles_are_selected(self):
+        windows = []
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: self._runtime(2),
+            window_factory=lambda _root: windows.append(_FakeWindow()) or windows[-1],
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+
+        self.assertTrue(overlay.refresh())
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(
+            [bar["label"] for bar in windows[0].draw_calls[-1]["bars"]],
+            ["Profile 1", "Profile 2"],
+        )
+
+
 class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
     def _runtime(self):
         return {
@@ -128,7 +204,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(model["bars"][0]["color"], "#f59e0b")
         self.assertEqual(model["bars"][1]["color"], "#22c55e")
 
-    def test_model_prefers_selected_provider_profiles_before_applying_total_limit(self):
+    def test_model_prefers_selected_provider_profiles_before_applying_four_profile_limit(self):
         runtime = {
             "enabled": True,
             "profiles": [
@@ -205,9 +281,12 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(
             [bar["id"] for bar in model["bars"]],
-            ["cursor-selected", "codex-selected"],
+            ["cursor-selected", "codex-selected", "cursor-over-limit"],
         )
-        self.assertEqual([bar["provider"] for bar in model["bars"]], ["cursor", "codex"])
+        self.assertEqual(
+            [bar["provider"] for bar in model["bars"]],
+            ["cursor", "codex", "cursor"],
+        )
         self.assertEqual(model["bars"][0]["profile_id"], "cursor-selected")
         self.assertEqual(model["bars"][0]["freshness"], "fresh")
         self.assertEqual(model["bars"][0]["provider_status"], "ready")
