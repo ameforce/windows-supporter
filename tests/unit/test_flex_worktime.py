@@ -193,6 +193,29 @@ class FlexBrowserClientTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.code, "invalid_period")
 
+    def test_headless_session_requires_explicit_login_instead_of_waiting(self) -> None:
+        client = FlexBrowserClient("C:/temp/flex-profile-test", headless=True)
+
+        class _LoginPage:
+            url = "https://flex.team/auth/login"
+
+            def is_closed(self):
+                return False
+
+            def locator(self, *_args):
+                return self
+
+            def count(self):
+                return 0
+
+            def inner_text(self, **_kwargs):
+                return ""
+
+        with self.assertRaises(FlexBrowserError) as ctx:
+            client._wait_for_login(_LoginPage())
+
+        self.assertEqual(ctx.exception.code, "login_required")
+
     def test_sync_result_keeps_schedule_compatible_metadata_separate(self) -> None:
         result = FlexBrowserSyncResult(schedules={}, employee_number="E-42")
 

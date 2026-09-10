@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 from pathlib import Path
+import queue
+import threading
+import time
 import unittest
+from unittest.mock import Mock, patch
 
+from src.apps.Wrike import Wrike
 from src.apps.wrike_ui import WrikeSettingsView
 
 
@@ -52,6 +58,70 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
         self.assertNotIn('"flex_client_id"', save_source)
         self.assertNotIn('"flex_client_secret"', save_source)
 
+    def test_startup_does_not_open_flex_without_saved_employee_number(self) -> None:
+        app = Wrike.__new__(Wrike)
+        app._Wrike__root = object()
+        app._Wrike__background_active = True
+        app._Wrike__flex_enabled = True
+        app._Wrike__flex_employee_number = ""
+        app._Wrike__flex_after_id = None
+        app._Wrike__flex_state = "unknown"
+        app._Wrike__flex_last_error = ""
+        request_sync = Mock()
+        app._Wrike__request_flex_sync = request_sync
+
+        app._Wrike__start_flex_polling()
+
+        request_sync.assert_not_called()
+        self.assertEqual(app._Wrike__flex_state, "unconfigured")
+        self.assertIn("지금 동기화", app._Wrike__flex_last_error)
+
+    def test_sync_browser_job_closes_context_and_uses_headless_session(self) -> None:
+        created = []
+
+        class _Client:
+            def __init__(self, *_args, **kwargs):
+                self.headless = bool(kwargs.get("headless"))
+                self.closed = False
+                created.append(self)
+
+            def fetch_schedule_period(self, *_args, **_kwargs):
+                return {}
+
+            def close(self):
+                self.closed = True
+
+        app = Wrike.__new__(Wrike)
+        app._Wrike__flex_browser_queue = queue.Queue()
+        app._Wrike__flex_browser_profile_dir = "C:/temp/flex-profile-test"
+        app._Wrike__time_log_login_timeout_sec = 10.0
+        app._Wrike__flex_browser_stop_event = threading.Event()
+        app._Wrike__ensure_playwright_ready = lambda: True
+        app._Wrike__log_exception = lambda *_args: None
+
+        sync_response = queue.Queue(maxsize=1)
+        close_response = queue.Queue(maxsize=1)
+        app._Wrike__flex_browser_queue.put(
+            (
+                "sync",
+                (date(2026, 9, 10), date(2026, 9, 10), "E-42", datetime(2026, 9, 10, 12), False),
+                sync_response,
+            )
+        )
+        app._Wrike__flex_browser_queue.put(("close", None, close_response))
+
+        with patch("src.apps.Wrike.FlexBrowserClient", _Client):
+            worker = threading.Thread(target=app._Wrike__flex_browser_worker_loop)
+            worker.start()
+            worker.join(timeout=3.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(sync_response.get_nowait(), (True, {}))
+        self.assertEqual(close_response.get_nowait(), (True, None))
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].headless)
+        self.assertTrue(created[0].closed)
+
 
 class FlexEmployeeNumberUiTests(unittest.TestCase):
     class _Var:
@@ -67,6 +137,13 @@ class FlexEmployeeNumberUiTests(unittest.TestCase):
     class _MessageBox:
         def askyesno(self, *_args, **_kwargs):
             return True
+
+    class _Label:
+        def __init__(self):
+            self.configure_calls = []
+
+        def configure(self, **kwargs):
+            self.configure_calls.append(dict(kwargs))
 
     class _Backend:
         def __init__(self):
@@ -98,6 +175,31 @@ class FlexEmployeeNumberUiTests(unittest.TestCase):
         self.assertEqual(backend.confirmed, "E-42")
         self.assertEqual(view._flex_employee_number_var.get(), "E-42")
         self.assertIn("감지된 사번 E-42", view._flex_status_var.get())
+
+    def test_completed_sync_is_reported_in_main_status(self):
+        class _Backend:
+            def get_settings_snapshot(self):
+                return {
+                    "flex_employee_number": "E-42",
+                    "flex_status": {
+                        "state": "fresh",
+                        "schedule_days": 5,
+                    },
+                }
+
+        status = self._Var()
+        view = WrikeSettingsView(None, _Backend())
+        view._status_var = status
+        view._status_label = self._Label()
+        view._flex_status_var = self._Var()
+        view._flex_sync_feedback_active = True
+        view._flex_status_poll_started_at = time.monotonic()
+
+        view._poll_flex_status()
+
+        self.assertEqual(status.get(), "Flex 동기화 완료 · 근무 일정 5일 반영")
+        self.assertFalse(view._flex_sync_feedback_active)
+        self.assertEqual(view._status_label.configure_calls[-1]["fg"], "#10B981")
 
 
 if __name__ == "__main__":

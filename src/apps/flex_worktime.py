@@ -943,6 +943,11 @@ class FlexBrowserClient:
     def _wait_for_login(self, page) -> None:
         if not self._requires_login(page):
             return
+        if self._headless:
+            raise FlexBrowserError(
+                "Flex 로그인이 필요합니다. 설정에서 'Flex 로그인 · 지금 동기화'를 눌러 로그인해 주세요.",
+                code="login_required",
+            )
         try:
             page.bring_to_front()
         except Exception:
