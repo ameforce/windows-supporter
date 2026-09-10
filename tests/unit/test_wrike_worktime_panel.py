@@ -16,6 +16,8 @@ from src.apps.wrike_worktime_panel import (
     WorktimePanelLine,
     WorktimePanelManualBreak,
     WorktimePanelModel,
+    WorktimeOvertimePrompt,
+    WorktimeOvertimeState,
     WorktimeQuickPanel,
 )
 
@@ -510,6 +512,8 @@ def _model(
     today_index: int = 0,
     row_suffix: str = "",
     day_details: tuple[TimelogDayDetails, ...] = (),
+    overtime_prompt: WorktimeOvertimePrompt | None = None,
+    overtime_state: WorktimeOvertimeState | None = None,
 ) -> WorktimePanelModel:
     week_days = tuple(week_start + timedelta(days=index) for index in range(7))
     targets = (
@@ -553,6 +557,8 @@ def _model(
         rows=rows,
         prompt=prompt,
         day_details=day_details,
+        overtime_prompt=overtime_prompt,
+        overtime_state=overtime_state,
     )
 
 
@@ -568,6 +574,9 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         "prompt_edit": Mock(return_value=True),
         "prompt_snooze": Mock(),
         "prompt_skip": Mock(),
+        "overtime_prompt_accept": Mock(),
+        "overtime_prompt_skip": Mock(),
+        "overtime_end": Mock(),
     }
     provider = Mock(side_effect=lambda: holder["model"])
     panel = WorktimeQuickPanel(
@@ -583,6 +592,9 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         prompt_edit=callbacks["prompt_edit"],
         prompt_snooze=callbacks["prompt_snooze"],
         prompt_skip=callbacks["prompt_skip"],
+        overtime_prompt_accept=callbacks["overtime_prompt_accept"],
+        overtime_prompt_skip=callbacks["overtime_prompt_skip"],
+        overtime_end=callbacks["overtime_end"],
         tk_module=fake_tk,
         idle_timeout_ms=idle_timeout_ms,
         monotonic=root.monotonic,
@@ -1093,6 +1105,39 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             {button.kwargs.get("text") for button in fake_tk.live_buttons()},
         )
         self.assertIsNot(fake_tk.button("새로고침"), all_buttons[0])
+
+    def test_overtime_prompt_and_active_end_controls_use_callbacks(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": _model(
+                overtime_prompt=WorktimeOvertimePrompt(
+                    "18:05",
+                    "18:00",
+                    assigned_minutes=60,
+                )
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        fake_tk.button("초과근무 시작").invoke()
+        callbacks["overtime_prompt_accept"].assert_called_once_with("18:05")
+        fake_tk.button("오늘은 안 함").invoke()
+        callbacks["overtime_prompt_skip"].assert_called_once_with()
+
+        holder["model"] = _model(
+            overtime_state=WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                assigned_minutes=60,
+            )
+        )
+        panel.refresh_now()
+        fake_tk.button("초과근무 종료").invoke()
+        callbacks["overtime_end"].assert_called_once_with()
 
     def test_today_line_cardinality_change_is_structural(self) -> None:
         root = _FakeRoot()

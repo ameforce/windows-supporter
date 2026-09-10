@@ -32,6 +32,14 @@ class WrikeSettingsView:
         self._tooltip_var = None
         self._monitor_enabled_var = None
         self._monitor_interval_var = None
+        self._flex_enabled_var = None
+        self._flex_employee_number_var = None
+        self._flex_refresh_token_var = None
+        self._flex_client_id_var = None
+        self._flex_client_secret_var = None
+        self._flex_interval_var = None
+        self._overtime_interval_var = None
+        self._flex_status_var = None
         self._status_var = None
         self._status_label = None
         self._show_token_var = None
@@ -302,6 +310,116 @@ class WrikeSettingsView:
 
         add_label("모니터링 주기(초)")
         add_entry(self._monitor_interval_var)
+        row += 1
+
+        self._flex_enabled_var = tk.BooleanVar(value=False)
+        self._flex_employee_number_var = tk.StringVar(value="")
+        self._flex_refresh_token_var = tk.StringVar(value="")
+        self._flex_client_id_var = tk.StringVar(value="")
+        self._flex_client_secret_var = tk.StringVar(value="")
+        self._flex_interval_var = tk.StringVar(value="5")
+        self._overtime_interval_var = tk.StringVar(value="10")
+        self._flex_status_var = tk.StringVar(value="미설정")
+
+        tk.Label(
+            content,
+            text="── Flex 근무 연동 · 초과근무 ──",
+            bg=card_bg,
+            fg="#2563EB",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        row += 1
+
+        add_label("Flex 일정 자동 반영")
+        tk.Checkbutton(
+            content,
+            variable=self._flex_enabled_var,
+            bg=card_bg,
+            activebackground=card_bg,
+            selectcolor=card_bg,
+            fg="#111827",
+            activeforeground="#111827",
+            font=("Segoe UI", 9),
+        ).grid(row=row, column=1, sticky="w", pady=6)
+        row += 1
+
+        add_label("Flex 사번")
+        add_entry(self._flex_employee_number_var)
+        row += 1
+
+        add_label("Flex Refresh Token")
+        add_entry(self._flex_refresh_token_var, show="*")
+        row += 1
+
+        add_label("Flex Client ID(선택)")
+        add_entry(self._flex_client_id_var)
+        row += 1
+
+        add_label("Flex Client Secret(선택)")
+        add_entry(self._flex_client_secret_var, show="*")
+        row += 1
+
+        add_label("Flex 동기화 주기(분)")
+        add_entry(self._flex_interval_var)
+        row += 1
+
+        add_label("초과근무 툴팁 주기(분)")
+        add_entry(self._overtime_interval_var)
+        row += 1
+
+        add_label("Flex 연동 상태")
+        flex_status_label = tk.Label(
+            content,
+            textvariable=self._flex_status_var,
+            bg=card_bg,
+            fg=text_muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+        )
+        try:
+            flex_status_label.configure(wraplength=420)
+        except Exception:
+            pass
+        flex_status_label.grid(row=row, column=1, columnspan=2, sticky="we", pady=6)
+        row += 1
+
+        flex_button_row = tk.Frame(content, bg=card_bg)
+        flex_button_row.grid(row=row, column=1, columnspan=2, sticky="w", pady=(2, 4))
+        ttk.Button(
+            flex_button_row,
+            text="지금 동기화",
+            command=self._on_sync_flex,
+        ).pack(side="left")
+        ttk.Button(
+            flex_button_row,
+            text="Flex 웹 열기",
+            command=self._on_open_flex,
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(
+            flex_button_row,
+            text="인증정보 지우기",
+            command=self._on_clear_flex_credentials,
+        ).pack(side="left", padx=(4, 0))
+        row += 1
+
+        flex_help_label = tk.Label(
+            content,
+            text=(
+                "Flex Open API 플랜·권한과 사번이 필요합니다. Flex Open API 설정에서 발급한 Refresh Token을 사용하며, 인증정보는 Windows 보호 저장소에 보관합니다. "
+                "초과근무 종료 후에는 Flex 웹에서 근무 기록을 직접 등록합니다."
+            ),
+            bg=card_bg,
+            fg=text_muted,
+            font=("Segoe UI", 8),
+            anchor="w",
+            justify="left",
+        )
+        try:
+            flex_help_label.configure(wraplength=420)
+        except Exception:
+            pass
+        flex_help_label.grid(row=row, column=1, columnspan=2, sticky="we", pady=(0, 8))
         row += 1
 
         self._lunch_enabled_var = tk.BooleanVar(value=True)
@@ -1669,6 +1787,49 @@ class WrikeSettingsView:
             except Exception:
                 pass
             try:
+                if self._flex_enabled_var is not None:
+                    self._flex_enabled_var.set(bool(settings.get("flex_enabled", False)))
+                if self._flex_employee_number_var is not None:
+                    self._flex_employee_number_var.set(
+                        str(settings.get("flex_employee_number", "") or "")
+                    )
+                if self._flex_refresh_token_var is not None:
+                    self._flex_refresh_token_var.set("")
+                if self._flex_client_id_var is not None:
+                    self._flex_client_id_var.set("")
+                if self._flex_client_secret_var is not None:
+                    self._flex_client_secret_var.set("")
+                flex_poll = int(
+                    round(float(settings.get("flex_poll_interval_sec", 300)) / 60.0)
+                )
+                if self._flex_interval_var is not None:
+                    self._flex_interval_var.set(str(max(1, min(360, flex_poll))))
+                if self._overtime_interval_var is not None:
+                    self._overtime_interval_var.set(
+                        str(
+                            max(
+                                1,
+                                min(
+                                    120,
+                                    int(settings.get("overtime_notice_interval_min", 10)),
+                                ),
+                            )
+                        )
+                    )
+                flex_status = settings.get("flex_status")
+                if not isinstance(flex_status, dict):
+                    flex_status = {}
+                state = str(flex_status.get("state") or "unconfigured")
+                error = str(flex_status.get("error") or "").strip()
+                configured = bool(settings.get("flex_api_configured", False))
+                status_text = f"{state} · 인증정보 {'설정됨' if configured else '미설정'}"
+                if error:
+                    status_text += f" · {error}"
+                if self._flex_status_var is not None:
+                    self._flex_status_var.set(status_text)
+            except Exception:
+                pass
+            try:
                 plan = settings.get("workday_plan")
                 if not isinstance(plan, dict):
                     plan = {
@@ -1738,6 +1899,53 @@ class WrikeSettingsView:
             self._set_status("토큰 삭제 완료", level="ok")
         else:
             self._set_status(f"토큰 삭제 실패: {err}", level="error")
+        return
+
+    def _on_sync_flex(self) -> None:
+        sync = getattr(self._wrike, "sync_flex_now", None)
+        if not callable(sync):
+            self._set_status("Flex 동기화 기능을 사용할 수 없습니다.", level="error")
+            return
+        ok, error = sync()
+        if ok:
+            self._set_status("Flex 동기화 요청됨", level="ok")
+        else:
+            self._set_status(str(error or "Flex 동기화 실패"), level="error")
+        return
+
+    def _on_open_flex(self) -> None:
+        opener = getattr(self._wrike, "open_flex_worktime_page", None)
+        if not callable(opener) or not opener():
+            self._set_status("Flex 웹을 열지 못했습니다.", level="error")
+            return
+        self._set_status("Flex 웹을 열었습니다.", level="ok")
+        return
+
+    def _on_clear_flex_credentials(self) -> None:
+        clearer = getattr(self._wrike, "clear_flex_credentials", None)
+        if not callable(clearer):
+            self._set_status("Flex 인증정보 삭제 기능을 사용할 수 없습니다.", level="error")
+            return
+        ok, error = clearer()
+        if ok:
+            for var in (
+                self._flex_refresh_token_var,
+                self._flex_client_id_var,
+                self._flex_client_secret_var,
+            ):
+                try:
+                    if var is not None:
+                        var.set("")
+                except Exception:
+                    pass
+            if self._flex_status_var is not None:
+                try:
+                    self._flex_status_var.set("인증정보 미설정")
+                except Exception:
+                    pass
+            self._set_status("Flex 인증정보 삭제 완료", level="ok")
+        else:
+            self._set_status(str(error or "Flex 인증정보 삭제 실패"), level="error")
         return
 
     def _format_minutes_as_hhmm(self, minutes: int) -> str:
@@ -2158,6 +2366,13 @@ class WrikeSettingsView:
             self._tooltip_var,
             self._monitor_enabled_var,
             self._monitor_interval_var,
+            self._flex_enabled_var,
+            self._flex_employee_number_var,
+            self._flex_refresh_token_var,
+            self._flex_client_id_var,
+            self._flex_client_secret_var,
+            self._flex_interval_var,
+            self._overtime_interval_var,
             self._lunch_enabled_var,
             self._lunch_start_var,
             self._lunch_end_var,
@@ -2220,6 +2435,41 @@ class WrikeSettingsView:
         tooltip_text = str(self._tooltip_var.get() or "").strip()
         monitor_enabled = bool(self._monitor_enabled_var.get())
         interval_text = str(self._monitor_interval_var.get() or "").strip()
+        flex_enabled = (
+            bool(self._flex_enabled_var.get())
+            if self._flex_enabled_var is not None
+            else False
+        )
+        flex_employee_number = (
+            str(self._flex_employee_number_var.get() or "").strip()
+            if self._flex_employee_number_var is not None
+            else ""
+        )
+        flex_refresh_token = (
+            str(self._flex_refresh_token_var.get() or "").strip()
+            if self._flex_refresh_token_var is not None
+            else ""
+        )
+        flex_client_id = (
+            str(self._flex_client_id_var.get() or "").strip()
+            if self._flex_client_id_var is not None
+            else ""
+        )
+        flex_client_secret = (
+            str(self._flex_client_secret_var.get() or "").strip()
+            if self._flex_client_secret_var is not None
+            else ""
+        )
+        flex_interval_text = (
+            str(self._flex_interval_var.get() or "").strip()
+            if self._flex_interval_var is not None
+            else "5"
+        )
+        overtime_interval_text = (
+            str(self._overtime_interval_var.get() or "").strip()
+            if self._overtime_interval_var is not None
+            else "10"
+        )
 
         lunch_enabled = (
             bool(self._lunch_enabled_var.get()) if self._lunch_enabled_var is not None else True
@@ -2286,6 +2536,20 @@ class WrikeSettingsView:
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
             return
+        flex_interval_minutes, error = self._strict_positive_int(
+            flex_interval_text,
+            "Flex 동기화 주기(분)",
+        )
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+        overtime_interval_minutes, error = self._strict_positive_int(
+            overtime_interval_text,
+            "초과근무 툴팁 주기(분)",
+        )
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
 
         daily_minutes = int(round(daily_hours * 60))
         tooltip_ms = int(round(tooltip_sec * 1000))
@@ -2296,12 +2560,22 @@ class WrikeSettingsView:
             "tooltip_duration_ms": tooltip_ms,
             "monitor_enabled": monitor_enabled,
             "monitor_interval_sec": interval_sec,
+            "flex_enabled": flex_enabled,
+            "flex_employee_number": flex_employee_number,
+            "flex_poll_interval_sec": int(flex_interval_minutes) * 60,
+            "overtime_notice_interval_min": int(overtime_interval_minutes),
             "lunch_break_enabled": lunch_enabled,
             "lunch_start_min": int(lunch_start_min),
             "lunch_end_min": int(lunch_end_min),
             "break_keywords": parsed_keywords,
             "ical_poll_interval_sec": int(poll_minutes) * 60,
         }
+        if flex_refresh_token:
+            save_payload["flex_refresh_token"] = flex_refresh_token
+        if flex_client_id:
+            save_payload["flex_client_id"] = flex_client_id
+        if flex_client_secret:
+            save_payload["flex_client_secret"] = flex_client_secret
         if ical_dirty:
             save_payload["ical_url"] = ical_url
         if vacation_dirty:
@@ -2310,6 +2584,32 @@ class WrikeSettingsView:
         ok, err = self._wrike.update_settings(save_payload)
         try:
             if ok:
+                for var in (
+                    self._flex_refresh_token_var,
+                    self._flex_client_id_var,
+                    self._flex_client_secret_var,
+                ):
+                    try:
+                        if var is not None:
+                            var.set("")
+                    except Exception:
+                        pass
+                try:
+                    settings = self._wrike.get_settings_snapshot()
+                    flex_status = settings.get("flex_status", {})
+                    if not isinstance(flex_status, dict):
+                        flex_status = {}
+                    configured = bool(settings.get("flex_api_configured", False))
+                    status_text = (
+                        f"{str(flex_status.get('state') or 'unconfigured')} · "
+                        f"인증정보 {'설정됨' if configured else '미설정'}"
+                    )
+                    if flex_status.get("error"):
+                        status_text += f" · {flex_status['error']}"
+                    if self._flex_status_var is not None:
+                        self._flex_status_var.set(status_text)
+                except Exception:
+                    pass
                 if ical_dirty:
                     self._ical_dirty = False
                 if vacation_dirty:
