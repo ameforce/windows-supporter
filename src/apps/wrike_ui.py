@@ -391,8 +391,9 @@ class WrikeSettingsView:
         flex_help_label = tk.Label(
             content,
             text=(
-                "관리자용 Flex API 인증정보를 요구하지 않습니다. 앱 전용 Flex 브라우저에서 본인 계정으로 로그인하면 로그인 세션을 유지하며 근무정보를 읽습니다. "
-                "사번은 로그인 후 자동 감지하며, 확인한 뒤 저장합니다. 감지되지 않으면 직접 입력할 수 있습니다. "
+                "관리자용 Flex API 인증정보를 요구하지 않습니다. 최초 로그인 또는 로그인 만료 시 'Flex 웹 열기'로 앱 전용 브라우저에서 본인 계정으로 로그인하세요. "
+                "동기화는 저장된 로그인 세션으로 창을 띄우지 않고 백그라운드에서 수행합니다. 사번은 로그인 후 자동 감지하며, 확인한 뒤 저장합니다. "
+                "감지되지 않으면 직접 입력할 수 있습니다. "
                 "비밀번호·토큰·클라이언트 시크릿은 저장하지 않으며, 초과근무 종료 후에는 Flex 근무 기록 페이지를 엽니다."
             ),
             bg=card_bg,
@@ -2028,7 +2029,7 @@ class WrikeSettingsView:
         if ok:
             self._flex_sync_feedback_active = True
             self._set_status(
-                "Flex 로그인 브라우저를 여는 중입니다. 로그인 후 동기화 결과를 표시합니다.",
+                "Flex 근무정보를 백그라운드에서 확인하는 중입니다.",
                 level="info",
             )
             self._start_flex_status_poll()
