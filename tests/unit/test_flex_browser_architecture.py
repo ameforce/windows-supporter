@@ -104,7 +104,7 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
         app._Wrike__flex_browser_queue.put(
             (
                 "sync",
-                (date(2026, 9, 10), date(2026, 9, 10), "E-42", datetime(2026, 9, 10, 12), False),
+                (date(2026, 9, 10), date(2026, 9, 10), "E-42", datetime(2026, 9, 10, 12)),
                 sync_response,
             )
         )
@@ -122,7 +122,49 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
         self.assertTrue(created[0].headless)
         self.assertTrue(created[0].closed)
 
-    def test_interactive_sync_failure_keeps_headed_session_for_retry(self) -> None:
+    def test_open_browser_job_is_the_explicit_headed_path(self) -> None:
+        created = []
+
+        class _Client:
+            def __init__(self, *_args, **kwargs):
+                self.headless = bool(kwargs.get("headless"))
+                self.opened = False
+                self.closed = False
+                created.append(self)
+
+            def open_work_record_page(self):
+                self.opened = True
+
+            def close(self):
+                self.closed = True
+
+        app = Wrike.__new__(Wrike)
+        app._Wrike__flex_browser_queue = queue.Queue()
+        app._Wrike__flex_browser_profile_dir = "C:/temp/flex-profile-test"
+        app._Wrike__time_log_login_timeout_sec = 10.0
+        app._Wrike__flex_browser_stop_event = threading.Event()
+        app._Wrike__ensure_playwright_ready = lambda: True
+        app._Wrike__log_exception = lambda *_args: None
+
+        open_response = queue.Queue(maxsize=1)
+        close_response = queue.Queue(maxsize=1)
+        app._Wrike__flex_browser_queue.put(("open", None, open_response))
+        app._Wrike__flex_browser_queue.put(("close", None, close_response))
+
+        with patch("src.apps.Wrike.FlexBrowserClient", _Client):
+            worker = threading.Thread(target=app._Wrike__flex_browser_worker_loop)
+            worker.start()
+            worker.join(timeout=3.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(open_response.get_nowait(), (True, None))
+        self.assertEqual(close_response.get_nowait(), (True, None))
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].headless)
+        self.assertTrue(created[0].opened)
+        self.assertTrue(created[0].closed)
+
+    def test_sync_failure_closes_headless_session(self) -> None:
         created = []
 
         class _Client:
@@ -150,7 +192,7 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
         app._Wrike__flex_browser_queue.put(
             (
                 "sync",
-                (date(2026, 9, 10), date(2026, 9, 10), "", datetime(2026, 9, 10, 12), True),
+                (date(2026, 9, 10), date(2026, 9, 10), "", datetime(2026, 9, 10, 12)),
                 sync_response,
             )
         )
@@ -163,14 +205,27 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
                 (False, ("Flex 브라우저 동기화에 실패했습니다.", "unexpected_error")),
             )
             self.assertEqual(len(created), 1)
-            self.assertFalse(created[0].headless)
-            self.assertFalse(created[0].closed)
+            self.assertTrue(created[0].headless)
+            self.assertTrue(created[0].closed)
             app._Wrike__flex_browser_queue.put(("close", None, close_response))
             worker.join(timeout=3.0)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(close_response.get_nowait(), (True, None))
         self.assertTrue(created[0].closed)
+
+    def test_manual_sync_requests_background_mode(self) -> None:
+        app = Wrike.__new__(Wrike)
+        app._Wrike__flex_enabled = True
+        app._Wrike__background_active = True
+        app._Wrike__root = object()
+        request_sync = Mock(return_value=True)
+        app._Wrike__request_flex_sync = request_sync
+
+        result = app.sync_flex_now()
+
+        self.assertEqual(result, (True, None))
+        request_sync.assert_called_once_with(force=True, announce=True)
 
 
 class FlexEmployeeNumberUiTests(unittest.TestCase):

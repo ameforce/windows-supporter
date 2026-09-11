@@ -303,6 +303,12 @@ class FlexBrowserClientTests(unittest.TestCase):
             client._wait_for_login(_LoginPage())
 
         self.assertEqual(ctx.exception.code, "login_required")
+        self.assertIn("Flex 웹 열기", str(ctx.exception))
+
+    def test_schedule_client_defaults_to_headless(self) -> None:
+        client = FlexBrowserClient("C:/temp/flex-profile-test")
+
+        self.assertTrue(client._headless)
 
     def test_sync_result_keeps_schedule_compatible_metadata_separate(self) -> None:
         result = FlexBrowserSyncResult(schedules={}, employee_number="E-42")

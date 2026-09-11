@@ -782,14 +782,9 @@ class Wrike:
                     pass
                 return
             sync_job = kind == "sync"
-            interactive_sync = True
-            if sync_job:
-                try:
-                    interactive_sync = bool(payload[4])
-                except Exception:
-                    interactive_sync = True
-            desired_headless = not interactive_sync if sync_job else False
-            sync_succeeded = False
+            # A sync is always a background read.  The only headed browser
+            # operation is the explicit ``open`` command used for login.
+            desired_headless = bool(sync_job)
             try:
                 if client is not None and client_headless != desired_headless:
                     try:
@@ -815,7 +810,7 @@ class Wrike:
                     client.open_work_record_page()
                     result = None
                 elif kind == "sync":
-                    begin_date, end_date, employee_number, now, _interactive = payload
+                    begin_date, end_date, employee_number, now = payload
                     result = client.fetch_schedule_period(
                         begin_date,
                         end_date,
@@ -823,7 +818,6 @@ class Wrike:
                         now=now,
                         return_metadata=True,
                     )
-                    sync_succeeded = True
                 else:
                     raise FlexBrowserError("알 수 없는 Flex 브라우저 작업입니다.", code="invalid_command")
                 response_queue.put((True, result))
@@ -839,14 +833,11 @@ class Wrike:
                 except Exception:
                     pass
             finally:
-                # A successful sync is bounded and can close its context after
-                # the result has been applied.  Keep an interactive headed
-                # session open after a failure so the user can inspect the
-                # actual Flex page and retry without losing the login window.
-                should_close_sync = sync_job and (
-                    not interactive_sync or sync_succeeded
-                )
-                if should_close_sync and client is not None:
+                # Sync contexts are bounded and never visible.  Close them on
+                # both success and failure so a retry always starts from a
+                # clean background context.  The explicit ``open`` command is
+                # the only operation that intentionally keeps a headed page.
+                if sync_job and client is not None:
                     try:
                         client.close()
                     except Exception:
@@ -922,7 +913,7 @@ class Wrike:
                 "Flex 로그인 · 지금 동기화를 눌러 사번과 근무정보를 감지하세요."
             )
             return
-        self.__request_flex_sync(force=True, interactive=False)
+        self.__request_flex_sync(force=True)
         self.__schedule_flex_poll(root)
 
     def __schedule_flex_poll(self, root=None) -> None:
@@ -954,14 +945,13 @@ class Wrike:
             return
         if not str(self.__flex_employee_number or "").strip():
             return
-        self.__request_flex_sync(force=True, interactive=False)
+        self.__request_flex_sync(force=True)
         self.__schedule_flex_poll()
 
     def __request_flex_sync(
         self,
         *,
         force: bool = False,
-        interactive: bool = False,
         announce: bool = False,
     ) -> bool:
         _ = force
@@ -978,7 +968,7 @@ class Wrike:
         try:
             threading.Thread(
                 target=self.__run_flex_sync,
-                args=(generation, root, bool(interactive), bool(announce)),
+                args=(generation, root, bool(announce)),
                 daemon=True,
             ).start()
         except Exception:
@@ -993,7 +983,6 @@ class Wrike:
         self,
         generation: int,
         root,
-        interactive: bool = False,
         announce: bool = False,
     ) -> None:
         schedules = None
@@ -1010,7 +999,6 @@ class Wrike:
                     week_end,
                     self.__flex_employee_number,
                     now,
-                    bool(interactive),
                 ),
                 wait=True,
                 timeout_sec=self.__time_log_login_timeout_sec + 30.0,
@@ -1102,7 +1090,7 @@ class Wrike:
                         f"근무 일정 {len(dict(schedules or {}))}일 반영",
                         "#166534",
                     ),
-                    ("로그인 브라우저를 닫았습니다.", "#6B7280"),
+                    ("백그라운드에서 반영했습니다.", "#6B7280"),
                 ]
                 if detected_employee_number:
                     lines.insert(
@@ -1169,7 +1157,6 @@ class Wrike:
             return False, "근무시간 백그라운드가 아직 시작되지 않았습니다."
         if not self.__request_flex_sync(
             force=True,
-            interactive=True,
             announce=True,
         ):
             return False, "Flex 동기화가 이미 진행 중입니다."
