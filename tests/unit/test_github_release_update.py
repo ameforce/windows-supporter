@@ -20,6 +20,7 @@ from src.utils.github_release_update import (
 )
 from src.utils.update_monitor import (
     UPDATE_RELEASE_MODE,
+    UPDATE_SKIP_AUTO_UPDATE_TAG_ENV,
     UpdateCandidate,
     read_update_handoff_state,
     run_release_update_handoff,
@@ -130,6 +131,10 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
         self.assertIn('"/FWindowsSupporter-v$Version-Core"', script)
         self.assertIn("[IO.FileMode]::CreateNew", script)
         self.assertIn('INSTALLER_FORMAT=legacy-compatible-bootstrap', script)
+        installer_definition = Path("installer/windows-supporter.iss").read_text(encoding="utf-8")
+        self.assertIn("CloseApplications=force", installer_definition)
+        self.assertIn("Flags: ignoreversion", installer_definition)
+        self.assertNotIn("restartreplace", installer_definition)
         bootstrap = Path("installer/installer_bootstrap.c").read_text(encoding="utf-8")
         self.assertIn("PAYLOAD_MAGIC", bootstrap)
         self.assertIn("CommandLineToArgvW", bootstrap)
@@ -414,6 +419,23 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
                 self.timeout = timeout
                 return 0
 
+        class FakeRuntimeProcessController:
+            def __init__(self) -> None:
+                self.find_calls = []
+                self.terminate_calls = []
+                self._remaining = [9001, 9002]
+
+            def find_exact(self, executable):
+                self.find_calls.append(Path(executable))
+                current = list(self._remaining)
+                if current:
+                    self._remaining = []
+                return current
+
+            def terminate_tree(self, pids, timeout_seconds):
+                self.terminate_calls.append((list(pids), timeout_seconds))
+                return list(pids)
+
         class FakeProgressUi:
             def __init__(self, **_kwargs) -> None:
                 self.snapshots = []
@@ -452,6 +474,7 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
             )
             state_path.write_text(json.dumps(payload), encoding="utf-8")
             client = FakeReleaseClient(Path(tmp))
+            runtime_controller = FakeRuntimeProcessController()
             installer_calls = []
             target_calls = []
             progress_instances = []
@@ -475,6 +498,11 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
                     release_client=client,
                     installer_launcher=installer_launcher,
                     target_launcher=target_launcher,
+                    runtime_process_controller=runtime_controller,
+                    runtime_readiness_waiter=lambda *_args, **_kwargs: {
+                        "pid": 4123,
+                        "heartbeat_samples": 3,
+                    },
                     artifact_metadata_reader=lambda _path: {
                         "file_version": "0.22.0.0",
                         "product_version": "0.22.0.0",
@@ -491,9 +519,13 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["runtime_shutdown"]["status"], "verified")
+        self.assertEqual(runtime_controller.terminate_calls[0][0], [9001, 9002])
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(installer_calls), 1)
         self.assertIn("/VERYSILENT", installer_calls[0][0])
+        self.assertIn("/FORCECLOSEAPPLICATIONS", installer_calls[0][0])
+        self.assertIn("/NORESTARTAPPLICATIONS", installer_calls[0][0])
         self.assertIn("/DIR=" + str(root), installer_calls[0][0])
         self.assertNotIn('/DIR="' + str(root) + '"', installer_calls[0][0])
         self.assertTrue(any(item.startswith("/LOG=") for item in installer_calls[0][0]))
@@ -503,7 +535,7 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         )
         self.assertEqual(target_calls[0][0], [str(executable)])
         self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
-        self.assertEqual(progress_instances[0].snapshots[0]["percent"], 18)
+        self.assertEqual(progress_instances[0].snapshots[0]["percent"], 0)
         all_percents = [int(snapshot["percent"]) for snapshot in progress_instances[0].snapshots]
         self.assertEqual(all_percents, sorted(all_percents))
         download_snapshots = [
@@ -513,8 +545,8 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(download_snapshots), 4)
         download_percents = [int(snapshot["percent"]) for snapshot in download_snapshots]
-        self.assertEqual(download_percents[0], 24)
-        self.assertEqual(download_percents[-1], 68)
+        self.assertEqual(download_percents[0], 18)
+        self.assertEqual(download_percents[-1], 62)
         self.assertEqual(download_percents, sorted(download_percents))
         self.assertTrue(any("50%" in str(snapshot["detail"]) for snapshot in download_snapshots))
         stage_keys = [str(snapshot["step_key"]) for snapshot in progress_instances[0].snapshots]
@@ -594,6 +626,67 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         self.assertEqual(state["status"], "failed")
         self.assertIn("교체하지 않았습니다", state["error"])
         self.assertEqual(restored_bytes, b"old executable")
+
+    def test_release_handoff_does_not_launch_installer_when_exact_runtime_survives(self) -> None:
+        class FakeReleaseClient:
+            def download_installer(self, *_args, **_kwargs):
+                raise AssertionError("installer download must not start")
+
+        class StuckRuntimeController:
+            def find_exact(self, _executable):
+                return [777]
+
+            def terminate_tree(self, _pids, _timeout_seconds):
+                return [777]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "installed"
+            root.mkdir()
+            executable = root / "windows-supporter.exe"
+            executable.write_bytes(b"old executable")
+            candidate = UpdateCandidate(
+                tag="v0.22.0",
+                version=(0, 22, 0),
+                installer_name="WindowsSupporter-v0.22.0-Setup.exe",
+                installer_url="https://github.com/ameforce/windows-supporter/releases/download/v0.22.0/WindowsSupporter-v0.22.0-Setup.exe",
+                installer_sha256="a" * 64,
+            )
+            state_path = Path(tmp) / "update_handoff.json"
+            state_path.write_text(
+                json.dumps(
+                    build_update_handoff_payload(
+                        repo_root=root,
+                        target_tag=candidate.tag,
+                        mode=UPDATE_RELEASE_MODE,
+                        candidate=candidate,
+                        source_pid=0,
+                        install_dir=root,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            installer_calls = []
+
+            with patch.object(
+                update_monitor_module,
+                "get_update_state_dir",
+                return_value=Path(tmp) / "state",
+            ):
+                rc = run_release_update_handoff(
+                    state_path,
+                    release_client=FakeReleaseClient(),
+                    runtime_process_controller=StuckRuntimeController(),
+                    installer_launcher=lambda *args, **kwargs: installer_calls.append(
+                        (args, kwargs)
+                    ),
+                    progress_ui_factory=lambda **_kwargs: None,
+                )
+            state = read_update_handoff_state(state_path)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("installer를 실행하지 않았습니다", state["error"])
+        self.assertEqual(installer_calls, [])
 
     def test_release_handoff_does_not_install_while_source_process_is_alive(self) -> None:
         class FakeReleaseClient:
@@ -713,6 +806,7 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
                 executable.write_bytes(b"wrong v0.21.1 executable")
                 return FakeProcess()
 
+            recovery_target_calls = []
             with patch.object(
                 update_monitor_module,
                 "get_update_state_dir",
@@ -722,7 +816,10 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
                     state_path,
                     release_client=FakeReleaseClient(),
                     installer_launcher=installer_launcher,
-                    target_launcher=lambda *_args, **_kwargs: FakeProcess(),
+                    target_launcher=lambda *args, **kwargs: recovery_target_calls.append(
+                        (args, kwargs)
+                    )
+                    or FakeProcess(),
                     artifact_metadata_reader=lambda _path: {
                         "file_version": "0.21.1.0",
                         "product_version": "0.21.1.0",
@@ -738,3 +835,7 @@ class ReleaseUpdateHandoffUnitTest(unittest.TestCase):
         self.assertEqual(state["status"], "failed")
         self.assertIn("버전이 요청한 Release와 다릅니다", state["error"])
         self.assertEqual(restored_bytes, b"old executable")
+        self.assertEqual(
+            recovery_target_calls[0][1]["env"][UPDATE_SKIP_AUTO_UPDATE_TAG_ENV],
+            candidate.tag,
+        )

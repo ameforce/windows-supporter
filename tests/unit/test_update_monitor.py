@@ -17,6 +17,7 @@ from src.utils.update_monitor import (
     UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS,
     UPDATE_HANDOFF_ARG,
     UPDATE_RELEASE_MODE,
+    UPDATE_SKIP_AUTO_UPDATE_TAG_ENV,
     UPDATE_CLEANUP_ONLY_NOTICE,
     UPDATE_FORCE_CLEAN_APPROVAL_TEXT,
     UPDATE_FORCE_CLEAN_REJECTED_NOTICE,
@@ -1272,6 +1273,61 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("$childPid -eq $PID", script)
         self.assertNotIn("function Add-Descendants([int]$pid)", script)
 
+    def test_exact_runtime_shutdown_terminates_all_matching_processes_and_rechecks(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.find_calls = []
+                self.terminate_calls = []
+                self._remaining = [101, 102]
+
+            def find_exact(self, executable):
+                self.find_calls.append(Path(executable))
+                current = list(self._remaining)
+                if current:
+                    self._remaining = []
+                return current
+
+            def terminate_tree(self, pids, timeout_seconds):
+                self.terminate_calls.append((list(pids), timeout_seconds))
+                return list(pids)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "windows-supporter.exe"
+            executable.write_bytes(b"runtime")
+            controller = FakeController()
+
+            result = update_monitor_module._stop_exact_installed_runtime(
+                executable,
+                process_controller=controller,
+                timeout_seconds=4,
+            )
+
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["matched_pids"], [101, 102])
+        self.assertEqual(result["terminated_pids"], [101, 102])
+        self.assertEqual(controller.terminate_calls, [([101, 102], 4.0)])
+        self.assertEqual(len(controller.find_calls), 2)
+
+    def test_exact_runtime_shutdown_blocks_when_a_matching_process_survives(self) -> None:
+        class StuckController:
+            def find_exact(self, _executable):
+                return [777]
+
+            def terminate_tree(self, _pids, _timeout_seconds):
+                return [777]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "windows-supporter.exe"
+            executable.write_bytes(b"runtime")
+
+            with self.assertRaises(update_monitor_module.UpdateHandoffError) as caught:
+                update_monitor_module._stop_exact_installed_runtime(
+                    executable,
+                    process_controller=StuckController(),
+                )
+
+        self.assertIn("installer를 실행하지 않았습니다", str(caught.exception))
+
     def test_update_korean_ux_copy_distinguishes_cleanup_source_and_force_clean(self) -> None:
         self.assertIn("강제정리", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
         self.assertIn("stash", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
@@ -1456,6 +1512,48 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("커밋되지 않은 변경", warnings[0][1])
         self.assertIn("stash", warnings[0][1])
+        self.assertEqual(launches, [True])
+
+    def test_failed_release_candidate_is_skipped_once_for_auto_check(self) -> None:
+        with patch.dict(
+            os.environ,
+            {UPDATE_SKIP_AUTO_UPDATE_TAG_ENV: "v0.5.7"},
+            clear=False,
+        ):
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=".",
+            )
+
+        candidate = UpdateCandidate(tag="v0.5.7", version=(0, 5, 7))
+        asks = []
+        launches = []
+        updater._ask_update = lambda item: asks.append(item.tag) or True
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState()
+        updater._prepare_repository_for_update = lambda _working_tree: True
+        updater.launch_update = lambda: launches.append(True) or True
+
+        updater._handle_check_result(
+            candidate,
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=False,
+        )
+
+        self.assertEqual(asks, [])
+        self.assertEqual(launches, [])
+        self.assertEqual(updater.get_status_snapshot()["state"], "update_available")
+        self.assertIn("직전 설치 실패", updater.get_status_snapshot()["last_error"])
+
+        updater._handle_check_result(
+            candidate,
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        self.assertEqual(asks, [candidate.tag])
         self.assertEqual(launches, [True])
 
     def test_cleanup_only_update_launch_does_not_show_uncommitted_warning(self) -> None:

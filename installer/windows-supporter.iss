@@ -26,11 +26,17 @@ UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-CloseApplications=yes
+; The app uses a hidden Tk root and frozen multiprocessing workers. A normal
+; Restart Manager close only sends a graceful close request, which leaves
+; worker processes holding the executable open. Force-close is limited to the
+; executable listed below and the updater also performs an exact-path preflight.
+CloseApplications=force
 RestartApplications=no
 
 [Files]
-Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+; Do not defer replacement to reboot. The updater verifies the installed hash
+; and version immediately; a locked file must fail the install instead.
+Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
