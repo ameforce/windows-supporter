@@ -53,7 +53,7 @@ class FlexScheduleError(RuntimeError):
 
 
 class FlexBrowserError(RuntimeError):
-    """A safe, user-facing failure from the interactive Flex browser session."""
+    """A safe, user-facing failure from the Flex browser session."""
 
     def __init__(self, message: str, *, code: str = "browser_error") -> None:
         super().__init__(str(message))
@@ -999,12 +999,14 @@ def _parse_browser_response_payloads(
 
 
 class FlexBrowserClient:
-    """Interactive, read-only Flex client backed by a persistent Playwright session.
+    """Read-only Flex client backed by a persistent Playwright session.
 
-    The browser is intentionally visible so a normal employee can complete
-    the organisation's normal Flex login/SSO flow.  The app never receives or
-    stores the password, refresh token, client secret, or browser cookies
-    outside the Chromium profile created for this purpose.
+    Schedule reads are headless by default so a sync cannot steal focus or
+    surface a browser window.  The explicit ``Flex 웹 열기`` action creates a
+    headed client when a normal employee must complete the organisation's
+    login/SSO flow.  The app never receives or stores the password, refresh
+    token, client secret, or browser cookies outside the Chromium profile
+    created for this purpose.
     """
 
     def __init__(
@@ -1015,7 +1017,7 @@ class FlexBrowserClient:
         login_timeout_sec: float = 180.0,
         content_timeout_sec: float | None = None,
         work_url: str = FLEX_WEB_URL,
-        headless: bool = False,
+        headless: bool = True,
         stop_event: Any = None,
     ) -> None:
         self._profile_dir = os.path.abspath(str(profile_dir or "").strip())
@@ -1210,7 +1212,7 @@ class FlexBrowserClient:
             return
         if self._headless:
             raise FlexBrowserError(
-                "Flex 로그인이 필요합니다. 설정에서 'Flex 로그인 · 지금 동기화'를 눌러 로그인해 주세요.",
+                "Flex 로그인이 필요합니다. 설정에서 'Flex 웹 열기'를 눌러 로그인한 뒤 백그라운드 동기화를 다시 실행해 주세요.",
                 code="login_required",
             )
         try:
