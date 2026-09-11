@@ -2990,6 +2990,7 @@ class CodexUsageTaskbarOverlay:
                 for item in fullscreen_decisions
             ),
             int(preferred_width or 0),
+            int(compact_preferred_width or 0),
             hidden_fallback_reason,
             hidden_rca_class,
         )
