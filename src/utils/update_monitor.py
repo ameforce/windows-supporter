@@ -29,7 +29,9 @@ from src.utils.progress_subprocess import run_no_window_with_progress
 from src.utils.runtime_deploy import (
     DEFAULT_HEARTBEAT_SAMPLES,
     DEFAULT_READY_TIMEOUT_SECONDS,
+    DEFAULT_STOP_TIMEOUT_SECONDS,
     RuntimeDeployError,
+    WindowsRuntimeProcessController,
     deploy_runtime,
     read_windows_artifact_metadata,
     restart_runtime,
@@ -72,6 +74,7 @@ UPDATE_RELEASE_INSTALLER_TIMEOUT_SECONDS = 900
 UPDATE_RELEASE_SOURCE_EXIT_TIMEOUT_SECONDS = 25.0
 UPDATE_RELEASE_RUNTIME_READY_TIMEOUT_SECONDS = DEFAULT_READY_TIMEOUT_SECONDS
 UPDATE_RELEASE_RUNTIME_HEARTBEAT_SAMPLES = DEFAULT_HEARTBEAT_SAMPLES
+UPDATE_SKIP_AUTO_UPDATE_TAG_ENV = "WINDOWS_SUPPORTER_SKIP_AUTO_UPDATE_TAG"
 RELEASE_DOWNLOAD_RATE_WINDOW_SECONDS = 5.0
 RELEASE_DOWNLOAD_RATE_MIN_SAMPLE_SECONDS = 0.4
 UPDATE_PROGRESS_TITLE = "Windows Supporter 업데이트"
@@ -2611,6 +2614,109 @@ def _wait_for_process_exit(
     return not process_exists(process_id)
 
 
+def _stop_exact_installed_runtime(
+    executable_path: Path,
+    *,
+    process_controller: Any | None = None,
+    timeout_seconds: float = DEFAULT_STOP_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Stop every process running the installed executable before Setup runs.
+
+    The release updater is a copy of the frozen executable, so it must not use
+    a process-name kill or the source PID alone. Frozen multiprocessing
+    workers share the installed executable path and are invisible to a simple
+    parent-PID wait. Matching the exact path keeps the updater itself alive
+    while removing every process that can keep the destination locked.
+    """
+
+    controller = process_controller
+    if controller is None:
+        if os.name != "nt":
+            return {
+                "status": "skipped",
+                "reason": "unsupported platform",
+                "target": str(executable_path),
+                "matched_pids": [],
+                "terminated_pids": [],
+                "remaining_pids": [],
+            }
+        controller = WindowsRuntimeProcessController()
+
+    target = Path(executable_path).resolve()
+    if not target.is_file():
+        return {
+            "status": "skipped",
+            "reason": "target missing",
+            "target": str(target),
+            "matched_pids": [],
+            "terminated_pids": [],
+            "remaining_pids": [],
+        }
+    find_exact = getattr(controller, "find_exact", None)
+    terminate_tree = getattr(controller, "terminate_tree", None)
+    if not callable(find_exact) or not callable(terminate_tree):
+        raise UpdateHandoffError(
+            "설치된 Windows Supporter 프로세스 종료 도구를 사용할 수 없습니다."
+        )
+
+    try:
+        matched_pids = sorted(
+            {
+                int(pid)
+                for pid in find_exact(target)
+                if int(pid) > 0
+            }
+        )
+    except Exception as exc:
+        raise UpdateHandoffError(
+            f"설치된 Windows Supporter 프로세스를 확인하지 못했습니다: {exc}"
+        ) from exc
+
+    terminated_pids: list[int] = []
+    if matched_pids:
+        try:
+            terminated_pids = sorted(
+                {
+                    int(pid)
+                    for pid in terminate_tree(
+                        matched_pids,
+                        max(0.1, float(timeout_seconds)),
+                    )
+                    if int(pid) > 0
+                }
+            )
+        except Exception as exc:
+            raise UpdateHandoffError(
+                "설치된 Windows Supporter 프로세스를 종료하지 못했습니다. "
+                f"pids={matched_pids}: {exc}"
+            ) from exc
+
+    try:
+        remaining_pids = sorted(
+            {
+                int(pid)
+                for pid in find_exact(target)
+                if int(pid) > 0
+            }
+        )
+    except Exception as exc:
+        raise UpdateHandoffError(
+            f"프로세스 종료 후 설치된 Windows Supporter 상태를 확인하지 못했습니다: {exc}"
+        ) from exc
+    if remaining_pids:
+        raise UpdateHandoffError(
+            "설치 대상 windows-supporter.exe를 사용하는 프로세스가 남아 있어 "
+            f"installer를 실행하지 않았습니다. pids={remaining_pids}"
+        )
+    return {
+        "status": "verified",
+        "target": str(target),
+        "matched_pids": matched_pids,
+        "terminated_pids": terminated_pids,
+        "remaining_pids": [],
+    }
+
+
 def _wait_for_installer_exit(
     process: Any,
     *,
@@ -2668,6 +2774,7 @@ def run_release_update_handoff(
     release_client: GitHubReleaseClient | None = None,
     installer_launcher=popen_no_window,
     target_launcher=popen_no_window,
+    runtime_process_controller: Any | None = None,
     artifact_metadata_reader: Callable[[Path], Mapping[str, Any]] = read_windows_artifact_metadata,
     runtime_readiness_waiter=wait_for_runtime_readiness,
     progress_ui_factory=UpdateHandoffProgressUi,
@@ -2698,6 +2805,7 @@ def run_release_update_handoff(
     installed_artifact: dict[str, Any] | None = None
     installer_log_path: Path | None = None
     runtime_readiness: dict[str, Any] | None = None
+    runtime_shutdown: dict[str, Any] | None = None
 
     def publish(snapshot: dict[str, Any], *, first: bool = False) -> None:
         nonlocal progress_floor
@@ -2765,6 +2873,32 @@ def run_release_update_handoff(
                 raise UpdateHandoffError(
                     "기존 Windows Supporter 프로세스가 종료되지 않아 installer를 실행하지 않았습니다."
                 )
+
+        shutdown_progress = build_update_progress_snapshot(
+            "release_source_exit",
+            state="running",
+            phase_fraction=0.75,
+            detail="설치 대상 경로를 사용하는 앱과 frozen 작업자를 정리합니다.",
+            log_path=log_path,
+        )
+        shutdown_progress["activity"] = {
+            "id": "release_runtime_shutdown",
+            "line": "설치 대상 Windows Supporter 프로세스 트리를 종료합니다.",
+        }
+        publish(shutdown_progress)
+        runtime_shutdown = _stop_exact_installed_runtime(
+            root_executable,
+            process_controller=runtime_process_controller,
+        )
+        append_update_log(
+            log_path,
+            "verified installed runtime shutdown: "
+            + json.dumps(runtime_shutdown, ensure_ascii=False, sort_keys=True),
+        )
+        update_handoff_state(
+            state_path,
+            runtime_shutdown=runtime_shutdown,
+        )
 
         publish(
             build_update_progress_snapshot(
@@ -2853,6 +2987,8 @@ def run_release_update_handoff(
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
+            "/FORCECLOSEAPPLICATIONS",
+            "/NORESTARTAPPLICATIONS",
             # Pass each switch as one argv item.  subprocess.Popen performs the
             # Windows quoting needed for paths with spaces; embedding literal
             # quotes here makes Inno Setup treat them as part of the folder name.
@@ -3113,18 +3249,34 @@ def run_release_update_handoff(
     except Exception as exc:
         recovery_error = ""
         try:
-            if backup_path.is_file():
+            runtime_shutdown = _stop_exact_installed_runtime(
+                root_executable,
+                process_controller=runtime_process_controller,
+            )
+            append_update_log(
+                log_path,
+                "stopped installed runtime before recovery: "
+                + json.dumps(runtime_shutdown, ensure_ascii=False, sort_keys=True),
+            )
+        except Exception as shutdown_exc:
+            recovery_error = f"runtime shutdown before recovery failed: {shutdown_exc}"
+        try:
+            if not recovery_error and backup_path.is_file():
                 shutil.copy2(backup_path, root_executable)
                 restored = True
                 backup_path.unlink(missing_ok=True)
         except Exception as recovery_exc:
             recovery_error = str(recovery_exc)
-        if restored and not process_exists(int(state.get("source_pid") or 0)):
+        if restored and not process_exists(int(state.get("source_pid") or 0)) and not recovery_error:
             try:
+                relaunch_environment = build_relaunch_environment(os.environ)
+                failed_candidate_tag = str(state.get("target_tag") or "").strip()
+                if failed_candidate_tag:
+                    relaunch_environment[UPDATE_SKIP_AUTO_UPDATE_TAG_ENV] = failed_candidate_tag
                 target_launcher(
                     [str(root_executable)],
                     cwd=repo_root,
-                    env=build_relaunch_environment(os.environ),
+                    env=relaunch_environment,
                 )
             except Exception as relaunch_exc:
                 recovery_error = str(relaunch_exc)
@@ -3150,6 +3302,7 @@ def run_release_update_handoff(
                 failed_step="installer 업데이트",
                 error=diagnostic,
                 recovery_status="restored" if restored else "failed",
+                runtime_shutdown=runtime_shutdown,
                 installer_log_path=str(installer_log_path) if installer_log_path else "",
                 progress=failed_progress,
             )
@@ -3619,6 +3772,9 @@ class WindowsSupporterUpdater:
         self._settings_path = Path(self._settings_path_provider())
         self._settings = load_update_settings(self._settings_path)
         self._session = UpdatePromptSession()
+        self._skip_auto_update_tag = str(
+            os.environ.get(UPDATE_SKIP_AUTO_UPDATE_TAG_ENV) or ""
+        ).strip()
         self._worker_active = False
         self._state = "idle"
         self._current_tag = ""
@@ -3932,7 +4088,27 @@ class WindowsSupporterUpdater:
             state="update_available",
             detail=f"새 버전 {candidate.tag}을 설치할 수 있습니다.",
         )
+        skip_auto_prompt = (
+            not manual
+            and candidate.tag == self._skip_auto_update_tag
+        )
+        if skip_auto_prompt:
+            self._skip_auto_update_tag = ""
+            self._last_error = (
+                f"{candidate.tag} 자동 업데이트는 직전 설치 실패로 이번 확인에서 건너뛰었습니다. "
+                "수동 업데이트로 다시 시도할 수 있습니다."
+            )
+            self._progress_snapshot = build_update_progress_snapshot(
+                "available",
+                state="update_available",
+                detail=(
+                    f"{candidate.tag} 자동 업데이트를 이번에는 건너뛰었습니다. "
+                    "수동 업데이트로 다시 시도할 수 있습니다."
+                ),
+            )
         self._notify_status_changed()
+        if skip_auto_prompt:
+            return
         if not manual and not self._session.should_prompt(candidate.tag):
             return
 
