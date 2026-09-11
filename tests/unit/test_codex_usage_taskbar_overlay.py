@@ -4610,6 +4610,78 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             )
         )
 
+    def test_compact_preferred_width_releases_unrenderable_guidance_space(self):
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 100,
+            "value_text": "100%",
+            "color": "#22c55e",
+            "reset_text": "00h 00m 00s",
+            "reset_short_text": "00h 00m 00s",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 60~64% / 00h 30m 00s",
+            "normal_guidance_short_text": "N 60~64% / 00h 30m 00s",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 53,
+            "value_text": "53%",
+            "color": "#f59e0b",
+            "reset_text": "05d 11h 27m 46s",
+            "reset_short_text": "05d 11h 27m 46s",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 64~66% / 4d 3h",
+            "normal_guidance_short_text": "N 64~66% / 4d 3h",
+        }
+        credit = {
+            "key": "CR",
+            "metric_key": "credit",
+            "percent": None,
+            "value_text": "1,000",
+        }
+        model = {
+            "visible": True,
+            "bars": [
+                {"enabled": True, "label": "김종수", "metrics": [five_hour, weekly, credit]},
+                {"enabled": True, "label": "지혜 유", "metrics": [five_hour, weekly]},
+            ],
+        }
+
+        full_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+        compact_width = taskbar_overlay._compact_taskbar_overlay_width_for_model(model)
+
+        self.assertIsNotNone(full_width)
+        self.assertIsNotNone(compact_width)
+        self.assertGreater(full_width, compact_width)
+
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            occupied_spans=[(0, 80), (704, 1920)],
+            preferred_width=full_width,
+            compact_preferred_width=compact_width,
+        )
+
+        # The free taskbar span is wide enough for the compact content but not
+        # for the optional guidance. The overlay should fit the compact width
+        # instead of reserving the clamped span for empty guidance columns.
+        self.assertEqual(geometry["width"], compact_width)
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            int(geometry["width"]),
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+        self.assertEqual(
+            layouts[0].segment_geometry(1)[0],
+            layouts[1].segment_geometry(1)[0],
+        )
+        self.assertLess(layouts[0].segment_geometry(2)[0], int(geometry["width"]))
+
     def test_preferred_taskbar_overlay_width_below_status_text_switch_uses_dot_only(self):
         model = {
             "visible": True,
@@ -5751,6 +5823,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         with patch.object(
             taskbar_overlay,
             "_preferred_taskbar_overlay_width_for_model",
+            return_value=760,
+            create=True,
+        ), patch.object(
+            taskbar_overlay,
+            "_compact_taskbar_overlay_width_for_model",
             return_value=760,
             create=True,
         ):

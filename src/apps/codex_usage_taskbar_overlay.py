@@ -483,6 +483,7 @@ def calculate_taskbar_overlay_geometry(
     *,
     occupied_spans: list[tuple[int, int]] | None = None,
     preferred_width: int | None = None,
+    compact_preferred_width: int | None = None,
     previous_geometry: dict[str, Any] | None = None,
     include_telemetry: bool = False,
 ) -> dict[str, Any]:
@@ -517,6 +518,7 @@ def calculate_taskbar_overlay_geometry(
             int(screen_width),
             occupied_spans,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=previous_geometry,
             work_area_telemetry=work_area_telemetry,
             include_telemetry=include_telemetry,
@@ -541,6 +543,7 @@ def calculate_taskbar_overlay_geometry(
             int(screen_width),
             occupied_spans,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=previous_geometry,
             work_area_telemetry=work_area_telemetry,
             include_telemetry=include_telemetry,
@@ -611,6 +614,7 @@ def calculate_taskbar_overlay_geometry(
         int(screen_width),
         occupied_spans,
         preferred_width=preferred_width,
+        compact_preferred_width=compact_preferred_width,
         previous_geometry=previous_geometry,
         work_area_telemetry=work_area_telemetry,
         include_telemetry=include_telemetry,
@@ -1689,6 +1693,61 @@ def _preferred_width_for_rows_cached(
     return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
 
 
+def _compact_metric_width_signature(signature: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Drop optional guidance from a metric width signature.
+
+    Guidance is useful when the taskbar has room, but it is the first text to
+    yield in a clamped slot.  Keeping it in the compact search would make the
+    geometry reserve a width for text that the renderer intentionally cannot
+    draw, which is the source of the large empty columns in narrow overlays.
+    """
+    values = tuple(signature)
+    if len(values) < 6:
+        return values
+    detail = str(values[1] or "").split(_METRIC_CONTEXT_SEPARATOR, 1)[0]
+    short = str(values[2] or "").split(_METRIC_CONTEXT_SEPARATOR, 1)[0]
+    return (values[0], detail, short, values[3], values[4], values[5])
+
+
+@lru_cache(maxsize=512)
+def _compact_preferred_width_for_rows_cached(
+    rows_signature: tuple[tuple[tuple[Any, ...], ...], ...],
+    profile_labels: tuple[str, ...] = (),
+) -> int:
+    compact_rows = tuple(
+        tuple(_compact_metric_width_signature(signature) for signature in row)
+        for row in rows_signature
+    )
+    return _preferred_width_for_rows_cached(compact_rows, profile_labels)
+
+
+def _taskbar_overlay_width_inputs(
+    model: dict[str, Any],
+) -> tuple[tuple[tuple[tuple[Any, ...], ...], ...], tuple[str, ...]] | None:
+    if not isinstance(model, dict) or not bool(model.get("visible")):
+        return None
+
+    rows: list[tuple[tuple[Any, ...], ...]] = []
+    profile_labels: list[str] = []
+    bars = model.get("bars")
+    if not isinstance(bars, list):
+        return None
+    for bar in bars[:2]:
+        if not isinstance(bar, dict) or not bool(bar.get("enabled", True)):
+            continue
+        rows.append(
+            tuple(
+                _metric_width_signature(metric)
+                for metric in _visible_metrics_for_taskbar_bar(bar)
+            )
+        )
+        profile_labels.append(str(bar.get("label") or ""))
+
+    if not rows:
+        return None
+    return tuple(rows), tuple(profile_labels)
+
+
 def _metric_from_width_signature(
     signature: tuple[Any, ...],
 ) -> dict[str, Any]:
@@ -1711,28 +1770,19 @@ def _metric_from_width_signature(
 
 
 def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | None:
-    if not isinstance(model, dict) or not bool(model.get("visible")):
+    inputs = _taskbar_overlay_width_inputs(model)
+    if inputs is None:
         return None
+    rows, profile_labels = inputs
+    return _preferred_width_for_rows_cached(rows, profile_labels)
 
-    rows: list[tuple[tuple[Any, ...], ...]] = []
-    profile_labels: list[str] = []
-    bars = model.get("bars")
-    if not isinstance(bars, list):
-        return None
-    for bar in bars[:2]:
-        if not isinstance(bar, dict) or not bool(bar.get("enabled", True)):
-            continue
-        rows.append(
-            tuple(
-                _metric_width_signature(metric)
-                for metric in _visible_metrics_for_taskbar_bar(bar)
-            )
-        )
-        profile_labels.append(str(bar.get("label") or ""))
 
-    if not rows:
+def _compact_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | None:
+    inputs = _taskbar_overlay_width_inputs(model)
+    if inputs is None:
         return None
-    return _preferred_width_for_rows_cached(tuple(rows), tuple(profile_labels))
+    rows, profile_labels = inputs
+    return _compact_preferred_width_for_rows_cached(rows, profile_labels)
 
 
 def _render_signature_value(value: Any) -> Any:
@@ -1904,6 +1954,10 @@ def _set_overlay_text_width_scale(scale: float) -> None:
         pass
     try:
         _preferred_width_for_rows_cached.cache_clear()
+    except Exception:
+        pass
+    try:
+        _compact_preferred_width_for_rows_cached.cache_clear()
     except Exception:
         pass
     try:
@@ -2148,12 +2202,14 @@ class CodexUsageTaskbarOverlay:
             now=now,
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
+        compact_preferred_width = _compact_taskbar_overlay_width_for_model(pre_model)
         previous_geometry_context = self._cached_geometry_context
         previous_geometry = _previous_geometry_for_tick(
             self._last_model, self._last_visible_geometry
         )
         geometry = self._calculate_geometry(
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=previous_geometry,
         )
         geometry = self._stabilize_transient_geometry_regression(
@@ -2625,6 +2681,7 @@ class CodexUsageTaskbarOverlay:
             now=model_now,
         )
         preferred_width = _preferred_taskbar_overlay_width_for_model(pre_model)
+        compact_preferred_width = _compact_taskbar_overlay_width_for_model(pre_model)
         previous_geometry_context = self._cached_geometry_context
         previous_geometry = _previous_geometry_for_tick(
             model, self._last_visible_geometry
@@ -2633,6 +2690,7 @@ class CodexUsageTaskbarOverlay:
             force_resample=True,
             withdraw_for_sampling=False,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=previous_geometry,
         )
         candidate_geometry_context = self._cached_geometry_context
@@ -2816,12 +2874,14 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool = False,
         withdraw_for_sampling: bool = True,
         preferred_width: int | None = None,
+        compact_preferred_width: int | None = None,
         previous_geometry: dict[str, Any] | None = None,
     ) -> dict[str, int | str]:
         target_geometry = self._calculate_monitor_target_geometry(
             force_resample=force_resample,
             withdraw_for_sampling=withdraw_for_sampling,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=previous_geometry,
         )
         if target_geometry is not None:
@@ -2830,6 +2890,7 @@ class CodexUsageTaskbarOverlay:
             force_resample=force_resample,
             withdraw_for_sampling=withdraw_for_sampling,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=previous_geometry,
         )
 
@@ -2839,6 +2900,7 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool,
         withdraw_for_sampling: bool,
         preferred_width: int | None,
+        compact_preferred_width: int | None,
         previous_geometry: dict[str, Any] | None,
     ) -> dict[str, int | str] | None:
         targets = self._collect_taskbar_targets_for_geometry()
@@ -2872,6 +2934,7 @@ class CodexUsageTaskbarOverlay:
                 force_resample=force_resample,
                 withdraw_for_sampling=withdraw_for_sampling,
                 preferred_width=preferred_width,
+                compact_preferred_width=compact_preferred_width,
                 previous_geometry=previous_geometry,
             )
             if bool(geometry.get("visible", True)):
@@ -2954,6 +3017,7 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool,
         withdraw_for_sampling: bool,
         preferred_width: int | None,
+        compact_preferred_width: int | None,
         previous_geometry: dict[str, Any] | None,
     ) -> dict[str, int | str]:
         width, height = monitor_size(target.monitor)
@@ -2967,6 +3031,7 @@ class CodexUsageTaskbarOverlay:
             height,
             work_area,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=local_previous_geometry,
         )
         occupied_spans: list[tuple[int, int]] | None = None
@@ -2987,6 +3052,7 @@ class CodexUsageTaskbarOverlay:
                     work_area,
                     occupied_spans=occupied_spans,
                     preferred_width=preferred_width,
+                    compact_preferred_width=compact_preferred_width,
                     previous_geometry=local_previous_geometry,
                 )
         context = self._target_geometry_context(
@@ -2996,6 +3062,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             geometry,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             occupied_spans=occupied_spans,
             coordinate_basis=_GEOMETRY_COORDINATE_BASIS,
         )
@@ -3024,6 +3091,7 @@ class CodexUsageTaskbarOverlay:
         geometry: dict[str, int | str],
         *,
         preferred_width: int | None = None,
+        compact_preferred_width: int | None = None,
         occupied_spans: list[tuple[int, int]] | None = None,
         coordinate_basis: str = _GEOMETRY_COORDINATE_BASIS,
     ) -> tuple[Any, ...]:
@@ -3036,6 +3104,7 @@ class CodexUsageTaskbarOverlay:
                 work_area,
                 geometry,
                 preferred_width=preferred_width,
+                compact_preferred_width=compact_preferred_width,
                 occupied_spans=occupied_spans,
                 coordinate_basis=coordinate_basis,
             ),
@@ -3058,6 +3127,7 @@ class CodexUsageTaskbarOverlay:
         force_resample: bool = False,
         withdraw_for_sampling: bool = True,
         preferred_width: int | None = None,
+        compact_preferred_width: int | None = None,
         previous_geometry: dict[str, Any] | None = None,
     ) -> dict[str, int | str]:
         width = _root_int(self._root, "winfo_screenwidth", 1920)
@@ -3072,6 +3142,7 @@ class CodexUsageTaskbarOverlay:
             height,
             work_area,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=root_previous_geometry,
         )
         if str(geometry.get("orientation") or "") not in {"bottom", "top"}:
@@ -3081,6 +3152,7 @@ class CodexUsageTaskbarOverlay:
                 work_area,
                 geometry,
                 preferred_width=preferred_width,
+                compact_preferred_width=compact_preferred_width,
             )
             return geometry
         context = self._geometry_context(
@@ -3089,6 +3161,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             geometry,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             occupied_spans=None,
             coordinate_basis=_GEOMETRY_COORDINATE_BASIS,
         )
@@ -3118,6 +3191,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             occupied_spans=occupied_spans,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             previous_geometry=root_previous_geometry,
         )
         context = self._geometry_context(
@@ -3126,6 +3200,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             fitted,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             occupied_spans=occupied_spans,
             coordinate_basis=_GEOMETRY_COORDINATE_BASIS,
         )
@@ -3149,6 +3224,7 @@ class CodexUsageTaskbarOverlay:
         geometry: dict[str, int | str],
         *,
         preferred_width: int | None = None,
+        compact_preferred_width: int | None = None,
         occupied_spans: list[tuple[int, int]] | None = None,
         coordinate_basis: str = _GEOMETRY_COORDINATE_BASIS,
     ) -> tuple[Any, ...]:
@@ -3166,6 +3242,7 @@ class CodexUsageTaskbarOverlay:
             _normalize_work_area(work_area, int(width), int(height)),
             str(geometry.get("orientation") or ""),
             ("preferred_width", int(preferred_width or 0)),
+            ("compact_preferred_width", int(compact_preferred_width or 0)),
             ("coordinate_basis", str(coordinate_basis or _GEOMETRY_COORDINATE_BASIS)),
             ("occupied_spans", tuple(normalized_spans)),
             ("free_spans", free_spans),
@@ -3179,6 +3256,7 @@ class CodexUsageTaskbarOverlay:
         geometry: dict[str, int | str],
         *,
         preferred_width: int | None = None,
+        compact_preferred_width: int | None = None,
         occupied_spans: list[tuple[int, int]] | None = None,
     ) -> None:
         self._cached_geometry_context = self._geometry_context(
@@ -3187,6 +3265,7 @@ class CodexUsageTaskbarOverlay:
             work_area,
             geometry,
             preferred_width=preferred_width,
+            compact_preferred_width=compact_preferred_width,
             occupied_spans=occupied_spans,
             coordinate_basis=str(geometry.get("coordinate_basis") or _GEOMETRY_COORDINATE_BASIS),
         )
@@ -4239,6 +4318,7 @@ def _fit_horizontal_geometry_to_empty_slot(
     occupied_spans: list[tuple[int, int]] | None,
     *,
     preferred_width: int | None = None,
+    compact_preferred_width: int | None = None,
     previous_geometry: dict[str, Any] | None = None,
     work_area_telemetry: dict[str, Any] | None = None,
     include_telemetry: bool = False,
@@ -4274,28 +4354,45 @@ def _fit_horizontal_geometry_to_empty_slot(
             max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(preferred_width)),
             desired_width,
         )
+    compact_target_width: int | None = None
+    if (
+        preferred_width is not None
+        and compact_preferred_width is not None
+    ):
+        compact_target_width = min(
+            max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, int(compact_preferred_width)),
+            desired_width,
+        )
     selected_slot = _selected_free_slot(
         free_spans,
         previous_geometry=previous_geometry,
         target_width=target_width,
     )
     if selected_slot is not None:
-        fallback_slot = _wider_left_fallback_slot(
-            free_spans,
-            selected_slot,
-            target_width=target_width,
+        selected_available = max(0, int(selected_slot[1]) - int(selected_slot[0]))
+        compact_fit_available = bool(
+            compact_target_width is not None
+            and compact_target_width < target_width
+            and selected_available < target_width
+            and selected_available >= compact_target_width
         )
-        if fallback_slot is not None:
-            selected_slot = fallback_slot
-        unbiased_slot = _wider_unbiased_slot_when_clamped(
-            list(normalized_spans),
-            selected_slot,
-            previous_geometry,
-            screen_width=int(screen_width),
-            target_width=target_width,
-        )
-        if unbiased_slot is not None:
-            selected_slot = unbiased_slot
+        if not compact_fit_available:
+            fallback_slot = _wider_left_fallback_slot(
+                free_spans,
+                selected_slot,
+                target_width=target_width,
+            )
+            if fallback_slot is not None:
+                selected_slot = fallback_slot
+            unbiased_slot = _wider_unbiased_slot_when_clamped(
+                list(normalized_spans),
+                selected_slot,
+                previous_geometry,
+                screen_width=int(screen_width),
+                target_width=target_width,
+            )
+            if unbiased_slot is not None:
+                selected_slot = unbiased_slot
     if not free_spans:
         fitted["visible"] = False
         fitted["width"] = 0
@@ -4336,7 +4433,17 @@ def _fit_horizontal_geometry_to_empty_slot(
             )
         return fitted
 
-    width = min(target_width, available)
+    compact_fit = bool(
+        compact_target_width is not None
+        and compact_target_width < target_width
+        and available < target_width
+    )
+    width_target = (
+        int(compact_target_width)
+        if compact_fit and compact_target_width is not None
+        else int(target_width)
+    )
+    width = min(width_target, available)
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
     fitted["_slot_side"] = _slot_side_for_geometry(
