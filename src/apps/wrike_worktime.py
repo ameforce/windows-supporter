@@ -431,6 +431,7 @@ class WorkdayOverview:
     recorded_minutes: int | None = None
     expected_now_minutes: int = 0
     realtime_delta_minutes: int | None = None
+    overtime_minutes: int = 0
     recorded_available: bool = False
     vacation_available: bool = True
     vacation_state: str = "unconfigured"
@@ -531,6 +532,7 @@ def build_workday_overview(
     vacation_available: bool = True,
     vacation_state: str = "unconfigured",
     recorded_minutes: int | None = None,
+    overtime_minutes: int = 0,
 ) -> WorkdayOverview:
     try:
         target = max(0, int(target_minutes))
@@ -583,7 +585,11 @@ def build_workday_overview(
         clock_in,
         now,
     )
-    expected_now = min(effective_target, net)
+    try:
+        overtime = max(0, min(1440, int(overtime_minutes or 0)))
+    except Exception:
+        overtime = 0
+    expected_now = min(effective_target, net) + overtime
     realtime_delta = None if actual is None else actual - expected_now
     # Compatibility reference retained for existing callers: unlike
     # expected_now, this value remains based on uncapped wall-clock net time.
@@ -610,6 +616,7 @@ def build_workday_overview(
         recorded_minutes=actual,
         expected_now_minutes=expected_now,
         realtime_delta_minutes=realtime_delta,
+        overtime_minutes=overtime,
         recorded_available=actual is not None,
         vacation_available=availability,
         vacation_state=state,

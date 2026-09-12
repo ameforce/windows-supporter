@@ -11,12 +11,81 @@ import threading
 from datetime import date, datetime, timedelta
 
 
-STATE_VERSION = 1
+STATE_VERSION = 3
+_SUPPORTED_VERSIONS = frozenset({1, 2, STATE_VERSION})
+_MAX_PAUSED_SECONDS = 3 * 24 * 3600
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ISO_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$"
 )
 _STATUSES = frozenset({"pending", "active", "skipped", "completed"})
+_V1_ENTRY_FIELDS = frozenset(
+    {
+        "status",
+        "detected_at",
+        "scheduled_quit",
+        "assigned_minutes",
+        "started_at",
+        "ended_at",
+    }
+)
+_V2_ENTRY_FIELDS = frozenset(
+    {
+        "status",
+        "detected_at",
+        "scheduled_quit",
+        "assigned_minutes",
+        "started_at",
+        "ended_at",
+        "paused_at",
+        "paused_seconds",
+    }
+)
+
+
+def _parse_iso_value(value) -> datetime | None:
+    if not isinstance(value, str) or not _ISO_RE.fullmatch(value):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return None
+
+
+def net_elapsed_seconds(entry, at) -> int:
+    """Return worked seconds excluding finished and open pause intervals."""
+
+    started = _parse_iso_value(entry.get("started_at") if isinstance(entry, dict) else None)
+    if started is None or not isinstance(at, datetime) or at.tzinfo is not None:
+        return 0
+    ended = _parse_iso_value(entry.get("ended_at"))
+    effective_end = ended if ended is not None else at
+    paused_seconds = 0
+    try:
+        paused_seconds = max(0, int(entry.get("paused_seconds") or 0))
+    except Exception:
+        paused_seconds = 0
+    paused_at = _parse_iso_value(entry.get("paused_at"))
+    open_pause = 0
+    if paused_at is not None and effective_end > paused_at:
+        open_pause = int((effective_end - paused_at).total_seconds())
+    return max(0, int((effective_end - started).total_seconds()) - paused_seconds - open_pause)
+
+
+def paused_total_seconds(entry, at) -> int:
+    """Return accumulated pause seconds including a still-open pause."""
+
+    paused_seconds = 0
+    try:
+        paused_seconds = max(0, int(entry.get("paused_seconds") or 0))
+    except Exception:
+        paused_seconds = 0
+    paused_at = _parse_iso_value(entry.get("paused_at") if isinstance(entry, dict) else None)
+    ended = _parse_iso_value(entry.get("ended_at") if isinstance(entry, dict) else None)
+    effective_end = ended if ended is not None else at
+    if paused_at is not None and isinstance(effective_end, datetime) and effective_end > paused_at:
+        paused_seconds += int((effective_end - paused_at).total_seconds())
+    return paused_seconds
 
 
 class OvertimeStateStore:
@@ -72,12 +141,7 @@ class OvertimeStateStore:
 
     @staticmethod
     def _parse_iso(value) -> datetime | None:
-        if not isinstance(value, str) or not _ISO_RE.fullmatch(value):
-            return None
-        try:
-            return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            return None
+        return _parse_iso_value(value)
 
     @staticmethod
     def _format_iso(value: datetime) -> str:
@@ -95,6 +159,18 @@ class OvertimeStateStore:
             raise ValueError("초과근무 배정 시간은 0분 이상 1440분 이하여야 합니다.")
         return parsed
 
+    @staticmethod
+    def _validate_paused_seconds(value) -> int:
+        if isinstance(value, bool):
+            raise ValueError("초과근무 일시정지 누적은 정수여야 합니다.")
+        try:
+            parsed = int(value)
+        except Exception as exc:
+            raise ValueError("초과근무 일시정지 누적이 올바르지 않습니다.") from exc
+        if parsed < 0 or parsed > _MAX_PAUSED_SECONDS:
+            raise ValueError("초과근무 일시정지 누적이 올바르지 않습니다.")
+        return parsed
+
     @classmethod
     def _day_entry(
         cls,
@@ -105,6 +181,9 @@ class OvertimeStateStore:
         assigned_minutes: int,
         started_at: datetime | None = None,
         ended_at: datetime | None = None,
+        paused_at: datetime | None = None,
+        paused_seconds: int = 0,
+        flex_pending: bool = False,
     ) -> dict:
         return {
             "status": status,
@@ -113,6 +192,9 @@ class OvertimeStateStore:
             "assigned_minutes": int(assigned_minutes),
             "started_at": cls._format_iso(started_at) if started_at else None,
             "ended_at": cls._format_iso(ended_at) if ended_at else None,
+            "paused_at": cls._format_iso(paused_at) if paused_at else None,
+            "paused_seconds": int(paused_seconds),
+            "flex_pending": bool(flex_pending),
         }
 
     @classmethod
@@ -126,6 +208,9 @@ class OvertimeStateStore:
             "assigned_minutes",
             "started_at",
             "ended_at",
+            "paused_at",
+            "paused_seconds",
+            "flex_pending",
         }
         if set(raw) != expected:
             raise ValueError("초과근무 날짜별 상태 필드가 올바르지 않습니다.")
@@ -136,6 +221,11 @@ class OvertimeStateStore:
         scheduled = cls._parse_iso(raw.get("scheduled_quit"))
         started = cls._parse_iso(raw.get("started_at")) if raw.get("started_at") else None
         ended = cls._parse_iso(raw.get("ended_at")) if raw.get("ended_at") else None
+        paused_at = cls._parse_iso(raw.get("paused_at")) if raw.get("paused_at") else None
+        paused_seconds = cls._validate_paused_seconds(raw.get("paused_seconds"))
+        flex_pending = raw.get("flex_pending")
+        if type(flex_pending) is not bool:
+            raise ValueError("초과근무 Flex 등록 대기 표시가 올바르지 않습니다.")
         if detected is None or scheduled is None:
             raise ValueError("초과근무 기준 시간이 올바르지 않습니다.")
         if detected.date().isoformat() != key:
@@ -150,10 +240,18 @@ class OvertimeStateStore:
             raise ValueError("완료된 초과근무에는 시작·종료 시간이 필요합니다.")
         if status in {"pending", "skipped"} and (started is not None or ended is not None):
             raise ValueError("대기·건너뛴 초과근무에는 시작·종료 시간이 없어야 합니다.")
+        if status in {"pending", "skipped"} and paused_seconds:
+            raise ValueError("대기·건너뛴 초과근무에는 일시정지 누적이 없어야 합니다.")
+        if status != "active" and paused_at is not None:
+            raise ValueError("진행 중이 아닌 초과근무에는 열린 일시정지가 없어야 합니다.")
         if started is not None and started.date().isoformat() != key:
             raise ValueError("초과근무 시작 날짜가 올바르지 않습니다.")
         if ended is not None and ended < started:
             raise ValueError("초과근무 종료 시간이 시작보다 빠릅니다.")
+        if paused_at is not None and started is not None and paused_at < started:
+            raise ValueError("초과근무 일시정지 시작이 시작보다 빠릅니다.")
+        if flex_pending and status != "completed":
+            raise ValueError("Flex 등록 대기는 완료된 초과근무에만 허용됩니다.")
         return cls._day_entry(
             status=status,
             detected_at=detected,
@@ -161,6 +259,9 @@ class OvertimeStateStore:
             assigned_minutes=assigned,
             started_at=started,
             ended_at=ended,
+            paused_at=paused_at,
+            paused_seconds=paused_seconds,
+            flex_pending=flex_pending,
         )
 
     @staticmethod
@@ -179,16 +280,42 @@ class OvertimeStateStore:
     def _decode_state(self, raw) -> dict:
         if not isinstance(raw, dict) or set(raw) != {"state_version", "days"}:
             raise ValueError("초과근무 상태 최상위 필드가 올바르지 않습니다.")
-        if raw.get("state_version") != STATE_VERSION:
+        version = raw.get("state_version")
+        if version not in _SUPPORTED_VERSIONS:
             raise ValueError("지원하지 않는 초과근무 상태 버전입니다.")
         days = raw.get("days")
         if not isinstance(days, dict):
             raise ValueError("초과근무 상태 days 값이 객체가 아닙니다.")
         decoded = self._empty_state()
+        normalized_raw = {"state_version": STATE_VERSION, "days": {}}
         for raw_key, raw_value in days.items():
             key = self._parse_day(raw_key)
-            decoded["days"][key] = self._decode_entry(key, raw_value)
-        if decoded != raw:
+            upgraded = raw_value
+            if version == 1:
+                if not isinstance(upgraded, dict):
+                    raise ValueError("초과근무 날짜별 상태가 객체가 아닙니다.")
+                if set(upgraded) != _V1_ENTRY_FIELDS:
+                    raise ValueError("초과근무 날짜별 상태 필드가 올바르지 않습니다.")
+                # v1 files predate pause support; decode them with v2 defaults.
+                upgraded = {
+                    **raw_value,
+                    "paused_at": None,
+                    "paused_seconds": 0,
+                }
+            if version in {1, 2}:
+                if not isinstance(upgraded, dict):
+                    raise ValueError("초과근무 날짜별 상태가 객체가 아닙니다.")
+                if set(upgraded) != _V2_ENTRY_FIELDS:
+                    raise ValueError("초과근무 날짜별 상태 필드가 올바르지 않습니다.")
+                # Older files predate the local Flex-registration queue; every
+                # completed record still needs registration, the rest does not.
+                upgraded = {
+                    **upgraded,
+                    "flex_pending": upgraded.get("status") == "completed",
+                }
+            normalized_raw["days"][key] = upgraded
+            decoded["days"][key] = self._decode_entry(key, upgraded)
+        if decoded != normalized_raw:
             raise ValueError("초과근무 상태 파일이 정규 구조가 아닙니다.")
         return decoded
 
@@ -302,6 +429,79 @@ class OvertimeStateStore:
         )
         return self._set(key, value)
 
+    def pause(self, day=None, paused_at=None):
+        key = self._parse_day(day if day is not None else self._now())
+        at = self._now(paused_at)
+        with self._lock:
+            current = copy.deepcopy(self._state["days"].get(key))
+        if not current or current.get("status") != "active":
+            return False, "진행 중인 초과근무가 없습니다."
+        if current.get("paused_at"):
+            return False, "이미 일시정지 중입니다."
+        started = self._parse_iso(current.get("started_at"))
+        if started is None or at < started:
+            return False, "초과근무 일시정지 시간이 올바르지 않습니다."
+        value = self._day_entry(
+            status="active",
+            detected_at=self._parse_iso(current["detected_at"]),
+            scheduled_quit=self._parse_iso(current["scheduled_quit"]),
+            assigned_minutes=int(current["assigned_minutes"]),
+            started_at=started,
+            paused_at=at,
+            paused_seconds=int(current.get("paused_seconds") or 0),
+        )
+        return self._set(key, value)
+
+    def resume(self, day=None, resumed_at=None):
+        key = self._parse_day(day if day is not None else self._now())
+        at = self._now(resumed_at)
+        with self._lock:
+            current = copy.deepcopy(self._state["days"].get(key))
+        if not current or current.get("status") != "active":
+            return False, "진행 중인 초과근무가 없습니다."
+        paused_at = self._parse_iso(current.get("paused_at"))
+        if paused_at is None:
+            return False, "일시정지 중인 초과근무가 없습니다."
+        if at < paused_at:
+            return False, "초과근무 재개 시간이 올바르지 않습니다."
+        paused_seconds = int(current.get("paused_seconds") or 0) + int(
+            (at - paused_at).total_seconds()
+        )
+        value = self._day_entry(
+            status="active",
+            detected_at=self._parse_iso(current["detected_at"]),
+            scheduled_quit=self._parse_iso(current["scheduled_quit"]),
+            assigned_minutes=int(current["assigned_minutes"]),
+            started_at=self._parse_iso(current["started_at"]),
+            paused_seconds=paused_seconds,
+        )
+        return self._set(key, value)
+
+    def update_started(self, day=None, started_at=None):
+        key = self._parse_day(day if day is not None else self._now())
+        started = self._now(started_at)
+        now = self._now()
+        with self._lock:
+            current = copy.deepcopy(self._state["days"].get(key))
+        if not current or current.get("status") != "active":
+            return False, "진행 중인 초과근무가 없습니다."
+        if started.date().isoformat() != key:
+            return False, "초과근무 시작 날짜가 올바르지 않습니다."
+        paused_at = self._parse_iso(current.get("paused_at"))
+        upper_bound = paused_at if paused_at is not None and paused_at < now else now
+        if started > upper_bound:
+            return False, "초과근무 시작 시간이 올바르지 않습니다."
+        value = self._day_entry(
+            status="active",
+            detected_at=self._parse_iso(current["detected_at"]),
+            scheduled_quit=self._parse_iso(current["scheduled_quit"]),
+            assigned_minutes=int(current["assigned_minutes"]),
+            started_at=started,
+            paused_at=paused_at,
+            paused_seconds=int(current.get("paused_seconds") or 0),
+        )
+        return self._set(key, value)
+
     def skip(self, day=None):
         key = self._parse_day(day if day is not None else self._now())
         with self._lock:
@@ -326,6 +526,10 @@ class OvertimeStateStore:
         started = self._parse_iso(current["started_at"])
         if started is None or ended < started:
             return False, "초과근무 종료 시간이 올바르지 않습니다."
+        paused_seconds = int(current.get("paused_seconds") or 0)
+        paused_at = self._parse_iso(current.get("paused_at"))
+        if paused_at is not None and ended > paused_at:
+            paused_seconds += int((ended - paused_at).total_seconds())
         value = self._day_entry(
             status="completed",
             detected_at=self._parse_iso(current["detected_at"]),
@@ -333,5 +537,66 @@ class OvertimeStateStore:
             assigned_minutes=int(current["assigned_minutes"]),
             started_at=started,
             ended_at=ended,
+            paused_seconds=min(paused_seconds, _MAX_PAUSED_SECONDS),
+            # The finished interval stays queued locally until the user
+            # confirms the Flex registration; nothing is written to Flex.
+            flex_pending=True,
         )
         return self._set(key, value)
+
+    def update_completed(self, day, started_at, ended_at):
+        key = self._parse_day(day)
+        started = self._now(started_at)
+        ended = self._now(ended_at)
+        with self._lock:
+            current = copy.deepcopy(self._state["days"].get(key))
+        if not current or current.get("status") != "completed":
+            return False, "완료된 초과근무가 없습니다."
+        if started.date().isoformat() != key:
+            return False, "초과근무 시작 날짜가 올바르지 않습니다."
+        if ended <= started:
+            return False, "초과근무 종료 시간이 시작보다 늦어야 합니다."
+        if ended.date() > started.date() + timedelta(days=1):
+            return False, "초과근무 종료 날짜가 올바르지 않습니다."
+        value = self._day_entry(
+            status="completed",
+            detected_at=self._parse_iso(current["detected_at"]),
+            scheduled_quit=self._parse_iso(current["scheduled_quit"]),
+            assigned_minutes=int(current["assigned_minutes"]),
+            started_at=started,
+            ended_at=ended,
+            paused_seconds=int(current.get("paused_seconds") or 0),
+            flex_pending=bool(current.get("flex_pending")),
+        )
+        return self._set(key, value)
+
+    def mark_flex_registered(self, day=None):
+        key = self._parse_day(day if day is not None else self._now())
+        with self._lock:
+            current = copy.deepcopy(self._state["days"].get(key))
+        if not current or current.get("status") != "completed":
+            return False, "완료된 초과근무가 없습니다."
+        if not current.get("flex_pending"):
+            return False, "이미 Flex 등록 처리된 초과근무입니다."
+        value = self._day_entry(
+            status="completed",
+            detected_at=self._parse_iso(current["detected_at"]),
+            scheduled_quit=self._parse_iso(current["scheduled_quit"]),
+            assigned_minutes=int(current["assigned_minutes"]),
+            started_at=self._parse_iso(current["started_at"]),
+            ended_at=self._parse_iso(current["ended_at"]),
+            paused_seconds=int(current.get("paused_seconds") or 0),
+            flex_pending=False,
+        )
+        return self._set(key, value)
+
+    def flex_pending_days(self) -> list[str]:
+        with self._lock:
+            days = [
+                key
+                for key, value in self._state["days"].items()
+                if isinstance(value, dict)
+                and value.get("status") == "completed"
+                and value.get("flex_pending") is True
+            ]
+        return sorted(days, reverse=True)

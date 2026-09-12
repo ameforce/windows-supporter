@@ -12,6 +12,7 @@ from src.apps.wrike_worktime_panel import (
     _COMPACT_PANEL_MAX_HEIGHT,
     _COMPACT_PANEL_MAX_WIDTH,
     WorktimeActivityPrompt,
+    WorktimeFlexPendingRecord,
     WorktimePanelDayRow,
     WorktimePanelLine,
     WorktimePanelManualBreak,
@@ -514,6 +515,7 @@ def _model(
     day_details: tuple[TimelogDayDetails, ...] = (),
     overtime_prompt: WorktimeOvertimePrompt | None = None,
     overtime_state: WorktimeOvertimeState | None = None,
+    flex_pending: tuple[WorktimeFlexPendingRecord, ...] = (),
 ) -> WorktimePanelModel:
     week_days = tuple(week_start + timedelta(days=index) for index in range(7))
     targets = (
@@ -559,6 +561,7 @@ def _model(
         day_details=day_details,
         overtime_prompt=overtime_prompt,
         overtime_state=overtime_state,
+        flex_pending=flex_pending,
     )
 
 
@@ -577,6 +580,12 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         "overtime_prompt_accept": Mock(),
         "overtime_prompt_skip": Mock(),
         "overtime_end": Mock(),
+        "overtime_toggle_pause": Mock(),
+        "overtime_edit_start": Mock(return_value=True),
+        "overtime_prompt_edit": Mock(return_value=True),
+        "flex_open": Mock(),
+        "flex_pending_edit": Mock(return_value=True),
+        "flex_pending_done": Mock(),
     }
     provider = Mock(side_effect=lambda: holder["model"])
     panel = WorktimeQuickPanel(
@@ -595,6 +604,12 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         overtime_prompt_accept=callbacks["overtime_prompt_accept"],
         overtime_prompt_skip=callbacks["overtime_prompt_skip"],
         overtime_end=callbacks["overtime_end"],
+        overtime_toggle_pause=callbacks["overtime_toggle_pause"],
+        overtime_edit_start=callbacks["overtime_edit_start"],
+        overtime_prompt_edit=callbacks["overtime_prompt_edit"],
+        flex_open=callbacks["flex_open"],
+        flex_pending_edit=callbacks["flex_pending_edit"],
+        flex_pending_done=callbacks["flex_pending_done"],
         tk_module=fake_tk,
         idle_timeout_ms=idle_timeout_ms,
         monotonic=root.monotonic,
@@ -1138,6 +1153,196 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         panel.refresh_now()
         fake_tk.button("초과근무 종료").invoke()
         callbacks["overtime_end"].assert_called_once_with()
+
+    def test_overtime_pause_resume_and_start_edit_use_callbacks(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": _model(
+                overtime_state=WorktimeOvertimeState(
+                    status="active",
+                    start_time="18:05",
+                    elapsed_minutes=12,
+                    scheduled_quit_time="18:00",
+                    assigned_minutes=60,
+                )
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        fake_tk.button("일시정지").invoke()
+        callbacks["overtime_toggle_pause"].assert_called_once_with()
+
+        holder["model"] = _model(
+            overtime_state=WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                assigned_minutes=60,
+                paused=True,
+                paused_minutes=7,
+            )
+        )
+        panel.refresh_now()
+        fake_tk.button("다시 시작").invoke()
+        self.assertEqual(callbacks["overtime_toggle_pause"].call_count, 2)
+
+        fake_tk.button("시작 수정").invoke()
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "18:30")
+        fake_tk.button("저장").invoke()
+        callbacks["overtime_edit_start"].assert_called_once_with("18:30")
+
+    def test_overtime_prompt_start_edit_uses_edit_callback(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": _model(
+                overtime_prompt=WorktimeOvertimePrompt(
+                    "18:05",
+                    "18:00",
+                    assigned_minutes=60,
+                )
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        fake_tk.button("시작 수정").invoke()
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "17:55")
+        fake_tk.button("저장").invoke()
+        callbacks["overtime_prompt_edit"].assert_called_once_with("18:05", "17:55")
+
+    def test_flex_pending_card_lists_records_and_routes_callbacks(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        records = (
+            WorktimeFlexPendingRecord(
+                date_key="2026-04-06",
+                label="04/06 월",
+                start_time="18:10",
+                end_time="20:40",
+                net_minutes=150,
+            ),
+            WorktimeFlexPendingRecord(
+                date_key="2026-04-07",
+                label="04/07 화",
+                start_time="18:05",
+                end_time="19:05",
+                net_minutes=60,
+            ),
+        )
+        holder = {"model": _model(flex_pending=records)}
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        self.assertIsNotNone(fake_tk.button("Flex 열기"))
+        done_buttons = [
+            button for button in fake_tk.live_buttons() if button.kwargs.get("text") == "등록 완료"
+        ]
+        edit_buttons = [
+            button for button in fake_tk.live_buttons() if button.kwargs.get("text") == "시간 수정"
+        ]
+        self.assertEqual(len(done_buttons), 2)
+        self.assertEqual(len(edit_buttons), 2)
+
+        done_buttons[0].invoke()
+        callbacks["flex_pending_done"].assert_called_once_with("2026-04-06")
+
+        fake_tk.button("Flex 열기").invoke()
+        callbacks["flex_open"].assert_called_once_with()
+
+    def test_flex_pending_edit_uses_range_editor_with_record_context(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        record = WorktimeFlexPendingRecord(
+            date_key="2026-04-06",
+            label="04/06 월",
+            start_time="18:10",
+            end_time="20:40",
+            net_minutes=150,
+        )
+        holder = {"model": _model(flex_pending=(record,))}
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        edit_button = next(
+            button
+            for button in fake_tk.live_buttons()
+            if button.kwargs.get("text") == "시간 수정"
+        )
+        edit_button.invoke()
+        entry = panel._widgets["inline_entry"]
+        self.assertEqual(entry.get(), "18:10 - 20:40")
+        entry.delete(0, "end")
+        entry.insert(0, "18:30 - 21:00")
+        fake_tk.button("저장").invoke()
+        callbacks["flex_pending_edit"].assert_called_once_with(
+            "2026-04-06", "18:30", "21:00"
+        )
+
+    def test_flex_pending_editor_closes_when_record_is_marked_done(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        record = WorktimeFlexPendingRecord(
+            date_key="2026-04-06",
+            label="04/06 월",
+            start_time="18:10",
+            end_time="20:40",
+            net_minutes=150,
+        )
+        holder = {"model": _model(flex_pending=(record,))}
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        next(
+            button
+            for button in fake_tk.live_buttons()
+            if button.kwargs.get("text") == "시간 수정"
+        ).invoke()
+        self.assertTrue(panel._inline_editor_active)
+
+        callbacks["flex_pending_edit"].return_value = False
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "not a range")
+        fake_tk.button("저장").invoke()
+        callbacks["flex_pending_edit"].assert_not_called()
+        self.assertTrue(panel._inline_editor_active)
+
+        holder["model"] = _model(flex_pending=())
+        panel.refresh_now()
+        self.assertFalse(panel._inline_editor_active)
+
+    def test_flex_pending_card_caps_rows_and_reports_remaining(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        records = tuple(
+            WorktimeFlexPendingRecord(
+                date_key=f"2026-04-{day:02d}",
+                label=f"04/{day:02d}",
+                start_time="18:00",
+                end_time="19:00",
+                net_minutes=60,
+            )
+            for day in range(6, 12)
+        )
+        holder = {"model": _model(flex_pending=records)}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        rows = panel._widgets["flex_pending_rows"]
+        self.assertEqual(len(rows), 4)
+        label = panel._widgets["flex_pending_label"]
+        self.assertIn("6건", label.kwargs.get("text"))
+        self.assertTrue(
+            any("추가 2건" in text for text in fake_tk.live_label_texts())
+        )
 
     def test_today_line_cardinality_change_is_structural(self) -> None:
         root = _FakeRoot()

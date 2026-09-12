@@ -69,7 +69,11 @@ from src.apps.flex_worktime import (
     FlexBrowserSyncResult,
     FlexDaySchedule,
 )
-from src.apps.overtime_state import OvertimeStateStore
+from src.apps.overtime_state import (
+    OvertimeStateStore,
+    net_elapsed_seconds,
+    paused_total_seconds,
+)
 from src.apps.wrike_timelog_snapshot import (
     TimelogDay,
     TimelogSnapshotState,
@@ -85,6 +89,7 @@ from src.apps.wrike_timelog_snapshot import (
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
 from src.apps.wrike_worktime_panel import (
     WorktimeActivityPrompt,
+    WorktimeFlexPendingRecord,
     WorktimePanelDayRow,
     WorktimePanelLine,
     WorktimePanelManualBreak,
@@ -1260,7 +1265,8 @@ class Wrike:
         if status in {"skipped", "completed"}:
             return
         if status == "active":
-            self.__start_overtime_notice_timer(show_now=False)
+            if not state.get("paused_at"):
+                self.__start_overtime_notice_timer(show_now=False)
             self.__surface_overtime_panel(detected_at.date())
             return
         if status == "pending":
@@ -1324,8 +1330,10 @@ class Wrike:
             return None
         if started.tzinfo is not None or scheduled.tzinfo is not None:
             return None
-        elapsed = max(0, int((now - started).total_seconds() // 60))
-        if self.__root is not None:
+        paused = bool(state.get("paused_at"))
+        elapsed = net_elapsed_seconds(state, now) // 60
+        paused_minutes = paused_total_seconds(state, now) // 60
+        if self.__root is not None and not paused:
             self.__start_overtime_notice_timer(show_now=False)
         return WorktimeOvertimeState(
             status="active",
@@ -1333,6 +1341,8 @@ class Wrike:
             elapsed_minutes=elapsed,
             scheduled_quit_time=scheduled.strftime("%H:%M"),
             assigned_minutes=int(state.get("assigned_minutes", 0)),
+            paused=paused,
+            paused_minutes=paused_minutes,
         )
 
     def __overtime_tooltip_lines(self) -> list[tuple[str, str | None]]:
@@ -1344,10 +1354,16 @@ class Wrike:
             started = datetime.fromisoformat(str(state.get("started_at") or ""))
         except Exception:
             return []
-        elapsed = max(0, int((now - started).total_seconds() // 60))
+        paused = bool(state.get("paused_at"))
+        elapsed = net_elapsed_seconds(state, now) // 60
         assigned = int(state.get("assigned_minutes", 0))
+        heading = (
+            f"초과근무 일시정지 · 경과 {elapsed}분 · 시작 {started.strftime('%H:%M')}"
+            if paused
+            else f"초과근무 {elapsed}분 · 시작 {started.strftime('%H:%M')}"
+        )
         lines = [
-            (f"초과근무 {elapsed}분 · 시작 {started.strftime('%H:%M')}", "#166534"),
+            (heading, "#166534"),
             (
                 f"퇴근 예정 {str(state.get('scheduled_quit') or '')[11:16]}",
                 "#6B7280",
@@ -1355,7 +1371,14 @@ class Wrike:
         ]
         if assigned > 0:
             lines.append((f"Flex 연장 배정 {assigned}분", "#2563EB"))
-        lines.append(("근무시간 패널에서 초과근무 종료를 누르세요.", "#6B7280"))
+        lines.append(
+            (
+                "근무시간 패널에서 다시 시작을 누르세요."
+                if paused
+                else "근무시간 패널에서 초과근무 종료를 누르세요.",
+                "#6B7280",
+            )
+        )
         return lines
 
     def __start_overtime_notice_timer(self, *, show_now: bool) -> None:
@@ -1380,6 +1403,8 @@ class Wrike:
                 return
             active_state = self.__overtime_active_state()
             if not isinstance(active_state, dict) or active_state.get("status") != "active":
+                return
+            if active_state.get("paused_at"):
                 return
             lines = self.__overtime_tooltip_lines()
             if lines:
@@ -1409,6 +1434,39 @@ class Wrike:
             return
         self.__start_overtime_notice_timer(show_now=True)
 
+    def __panel_overtime_prompt_edit(self, detected_time: str, start_time: str) -> bool:
+        now = self.__lib.datetime.now()
+        state = self.__overtime_active_state(now.date())
+        if not isinstance(state, dict) or state.get("status") != "pending":
+            self.__show_panel_action_error("초과근무 알림이 만료되었습니다.")
+            return False
+        detected = str(state.get("detected_at") or "")
+        try:
+            detected_dt = datetime.fromisoformat(detected)
+        except Exception:
+            self.__show_panel_action_error("초과근무 알림이 만료되었습니다.")
+            return False
+        if detected_dt.strftime("%H:%M") != str(detected_time).strip():
+            self.__show_panel_action_error("초과근무 알림이 만료되었습니다.")
+            return False
+        try:
+            started = datetime.strptime(
+                f"{now.date().isoformat()} {str(start_time).strip()}",
+                "%Y-%m-%d %H:%M",
+            )
+        except Exception:
+            self.__show_panel_action_error("초과근무 시작 시간이 올바르지 않습니다.")
+            return False
+        if started > now:
+            self.__show_panel_action_error("초과근무 시작 시간이 올바르지 않습니다.")
+            return False
+        ok, error = self.__overtime_state_store.start(now.date(), started)
+        if not ok:
+            self.__show_panel_action_error(str(error or "초과근무를 시작하지 못했습니다."))
+            return False
+        self.__start_overtime_notice_timer(show_now=True)
+        return True
+
     def __panel_overtime_prompt_skip(self) -> None:
         ok, error = self.__overtime_state_store.skip()
         if not ok:
@@ -1431,9 +1489,165 @@ class Wrike:
             self.__show_panel_action_error(str(error or "초과근무를 종료하지 못했습니다."))
             return
         self.__cancel_overtime_notice_timer()
-        if lines:
-            self.__show_tooltip(self.__root, "초과근무 종료", lines=lines)
+        if lines and self.__root is not None:
+            self.__show_tooltip(
+                self.__root,
+                "초과근무 종료",
+                lines=lines
+                + [
+                    (
+                        "Flex에 등록할 때까지 패널에 보관됩니다.",
+                        "#92400E",
+                    )
+                ],
+            )
         self.__open_flex_worktime_page()
+
+    def __panel_overtime_toggle_pause(self) -> None:
+        now = self.__lib.datetime.now()
+        state = self.__overtime_active_state()
+        if not isinstance(state, dict) or state.get("status") != "active":
+            self.__show_panel_action_error("진행 중인 초과근무가 없습니다.")
+            return
+        try:
+            started_at = datetime.fromisoformat(str(state.get("started_at") or ""))
+        except Exception:
+            self.__show_panel_action_error("초과근무 시작 시간이 올바르지 않습니다.")
+            return
+        day = started_at.date()
+        if state.get("paused_at"):
+            ok, error = self.__overtime_state_store.resume(day, now)
+            if not ok:
+                self.__show_panel_action_error(
+                    str(error or "초과근무를 다시 시작하지 못했습니다.")
+                )
+                return
+            self.__start_overtime_notice_timer(show_now=True)
+            return
+        ok, error = self.__overtime_state_store.pause(day, now)
+        if not ok:
+            self.__show_panel_action_error(
+                str(error or "초과근무를 일시정지하지 못했습니다.")
+            )
+            return
+        self.__cancel_overtime_notice_timer()
+        lines = self.__overtime_tooltip_lines()
+        if self.__root is not None and lines:
+            self.__show_tooltip(self.__root, "초과근무 일시정지", lines=lines)
+
+    def __panel_overtime_edit_start(self, start_time: str) -> bool:
+        state = self.__overtime_active_state()
+        if not isinstance(state, dict) or state.get("status") != "active":
+            self.__show_panel_action_error("진행 중인 초과근무가 없습니다.")
+            return False
+        try:
+            started_at = datetime.fromisoformat(str(state.get("started_at") or ""))
+        except Exception:
+            self.__show_panel_action_error("초과근무 시작 시간이 올바르지 않습니다.")
+            return False
+        try:
+            edited = datetime.strptime(
+                f"{started_at.date().isoformat()} {str(start_time).strip()}",
+                "%Y-%m-%d %H:%M",
+            )
+        except Exception:
+            self.__show_panel_action_error("초과근무 시작 시간이 올바르지 않습니다.")
+            return False
+        ok, error = self.__overtime_state_store.update_started(
+            started_at.date(), edited
+        )
+        if not ok:
+            self.__show_panel_action_error(
+                str(error or "초과근무 시작 시간을 수정하지 못했습니다.")
+            )
+            return False
+        return True
+
+    def __flex_pending_records(self) -> tuple:
+        try:
+            days = self.__overtime_state_store.flex_pending_days()
+        except Exception:
+            return ()
+        records: list[WorktimeFlexPendingRecord] = []
+        for key in days:
+            entry = self.__overtime_state_store.get(key)
+            if not isinstance(entry, dict):
+                continue
+            try:
+                day = datetime.strptime(key, "%Y-%m-%d").date()
+                started = datetime.fromisoformat(str(entry.get("started_at") or ""))
+                ended = datetime.fromisoformat(str(entry.get("ended_at") or ""))
+            except Exception:
+                continue
+            net_minutes = max(0, net_elapsed_seconds(entry, ended) // 60)
+            weekday = self.__time_log_weekday_labels[day.weekday()]
+            end_time = (
+                "24:00"
+                if ended.date() == day + timedelta(days=1)
+                and (ended.hour, ended.minute, ended.second) == (0, 0, 0)
+                else ended.strftime("%H:%M")
+            )
+            records.append(
+                WorktimeFlexPendingRecord(
+                    date_key=key,
+                    label=f"{day.strftime('%m/%d')} {weekday}",
+                    start_time=started.strftime("%H:%M"),
+                    end_time=end_time,
+                    net_minutes=net_minutes,
+                )
+            )
+        return tuple(records)
+
+    def __panel_flex_open(self) -> None:
+        self.__open_flex_worktime_page()
+
+    def __panel_flex_pending_done(self, date_key: str) -> None:
+        try:
+            ok, error = self.__overtime_state_store.mark_flex_registered(date_key)
+        except Exception:
+            ok, error = False, "state_write_exception"
+        if not ok:
+            self.__show_panel_action_error(
+                str(error or "Flex 등록 완료 처리를 하지 못했습니다.")
+            )
+
+    def __panel_flex_pending_edit(
+        self,
+        date_key: str,
+        start_time: str,
+        end_time: str,
+    ) -> bool:
+        try:
+            day = datetime.strptime(str(date_key).strip(), "%Y-%m-%d").date()
+            started = datetime.strptime(
+                f"{day.isoformat()} {str(start_time).strip()}",
+                "%Y-%m-%d %H:%M",
+            )
+            end_text = str(end_time).strip()
+            if end_text == "24:00":
+                ended = datetime.combine(
+                    day + timedelta(days=1), datetime.min.time()
+                )
+            else:
+                ended = datetime.strptime(
+                    f"{day.isoformat()} {end_text}",
+                    "%Y-%m-%d %H:%M",
+                )
+        except Exception:
+            self.__show_panel_action_error("초과근무 기록 시간이 올바르지 않습니다.")
+            return False
+        try:
+            ok, error = self.__overtime_state_store.update_completed(
+                day, started, ended
+            )
+        except Exception:
+            ok, error = False, "state_write_exception"
+        if not ok:
+            self.__show_panel_action_error(
+                str(error or "초과근무 기록을 수정하지 못했습니다.")
+            )
+            return False
+        return True
 
     def __cancel_monitor_after(self) -> None:
         root = self.__root
@@ -2368,6 +2582,12 @@ class Wrike:
                 overtime_prompt_accept=self.__panel_overtime_prompt_accept,
                 overtime_prompt_skip=self.__panel_overtime_prompt_skip,
                 overtime_end=self.__panel_overtime_end,
+                overtime_toggle_pause=self.__panel_overtime_toggle_pause,
+                overtime_edit_start=self.__panel_overtime_edit_start,
+                overtime_prompt_edit=self.__panel_overtime_prompt_edit,
+                flex_open=self.__panel_flex_open,
+                flex_pending_edit=self.__panel_flex_pending_edit,
+                flex_pending_done=self.__panel_flex_pending_done,
                 idle_timeout_ms=self.__worktime_panel_idle_timeout_ms(),
             )
         except Exception:
@@ -2557,6 +2777,26 @@ class Wrike:
                 continue
         return intervals
 
+    def __overtime_net_minutes_for_day(self, target_day, now=None) -> int:
+        try:
+            entry = self.__overtime_state_store.get(target_day)
+        except Exception:
+            return 0
+        if not isinstance(entry, dict) or entry.get("status") not in {
+            "active",
+            "completed",
+        }:
+            return 0
+        at = now if isinstance(now, datetime) else None
+        if at is None:
+            try:
+                at = datetime.fromisoformat(str(entry.get("ended_at") or ""))
+            except Exception:
+                at = None
+        if at is None:
+            at = self.__lib.datetime.now()
+        return max(0, min(1440, net_elapsed_seconds(entry, at) // 60))
+
     def __today_overview(self, now, snapshot=None):
         current_snapshot = snapshot or self.__get_timelog_snapshot()
         plan = self.__plan_for_date(now.date())
@@ -2581,6 +2821,9 @@ class Wrike:
             vacation_available=vacation_available,
             vacation_state=str(vacation.get("availability_state") or "error"),
             recorded_minutes=recorded_minutes,
+            overtime_minutes=self.__overtime_net_minutes_for_day(
+                now.date(), now
+            ),
         )
 
     def __delta_text(self, delta) -> tuple[str, str]:
@@ -2799,9 +3042,16 @@ class Wrike:
                 else:
                     vacation_minutes = 0
             effective_target = max(0, target - vacation_minutes)
+            overtime_minutes = self.__overtime_net_minutes_for_day(target_day)
+            effective_target += overtime_minutes
             recorded = snapshot.recorded_minutes_for(target_day)
             vacation_state = str(
                 vacation.get("availability_state") or "error"
+            )
+            overtime_note = (
+                f" · 초과근무 {self.__format_minutes(overtime_minutes)}"
+                if overtime_minutes > 0
+                else ""
             )
             if target_day > now.date():
                 if not vacation_available:
@@ -2865,12 +3115,13 @@ class Wrike:
                         )
                     color = "#6B7280"
                 else:
-                    delta = int(recorded) - int(target)
+                    delta = int(recorded) - int(target) - overtime_minutes
                     status, color = self.__delta_text(delta)
                     summary = (
                         f"Wrike {self.__format_minutes(recorded)} · "
                         "휴가 미반영 임시 목표 "
-                        f"{self.__format_minutes(target)} · {status} · "
+                        f"{self.__format_minutes(target + overtime_minutes)} · "
+                        f"{status} · "
                         f"휴가 미확정 ({vacation_state}) (임시)"
                     )
             elif recorded is None:
@@ -2880,6 +3131,7 @@ class Wrike:
                     summary = (
                         f"Wrike 조회 불가 · 목표 "
                         f"{self.__format_minutes(effective_target)}"
+                        f"{overtime_note}"
                     )
                 color = "#6B7280"
             else:
@@ -2888,6 +3140,7 @@ class Wrike:
                 summary = (
                     f"Wrike {self.__format_minutes(recorded)} · 목표 "
                     f"{self.__format_minutes(effective_target)} · {status}"
+                    f"{overtime_note}"
                 )
             rows.append(
                 WorktimePanelDayRow(
@@ -2918,6 +3171,7 @@ class Wrike:
             manual_breaks=manual_break_rows,
             overtime_prompt=overtime_prompt,
             overtime_state=overtime_state,
+            flex_pending=self.__flex_pending_records(),
         )
 
     def __panel_manual_break_rows(
