@@ -42,6 +42,8 @@ _INLINE_EDITOR_TARGET = "target_minutes"
 _INLINE_EDITOR_CLOCK_IN = "clock_in"
 _INLINE_EDITOR_PROMPT = "prompt_clock_in"
 _INLINE_EDITOR_MANUAL_BREAK = "manual_break"
+_INLINE_EDITOR_OVERTIME_START = "overtime_start"
+_INLINE_EDITOR_OVERTIME_PROMPT_START = "overtime_prompt_start"
 
 _BG = "#F3F4F6"
 _CARD_BG = "#FFFFFF"
@@ -152,6 +154,8 @@ class WorktimeOvertimeState:
     elapsed_minutes: int
     scheduled_quit_time: str
     assigned_minutes: int = 0
+    paused: bool = False
+    paused_minutes: int = 0
 
     def __post_init__(self) -> None:
         if self.status != "active":
@@ -166,6 +170,10 @@ class WorktimeOvertimeState:
             raise TypeError("assigned_minutes must be an int")
         if not 0 <= self.assigned_minutes <= 1440:
             raise ValueError("assigned_minutes must be between 0 and 1440")
+        if type(self.paused) is not bool:
+            raise TypeError("paused must be a bool")
+        if type(self.paused_minutes) is not int or self.paused_minutes < 0:
+            raise ValueError("paused_minutes must be a non-negative int")
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +331,9 @@ class WorktimeQuickPanel:
         overtime_prompt_accept: Callable[[str], None] | None = None,
         overtime_prompt_skip: Callable[[], None] | None = None,
         overtime_end: Callable[[], None] | None = None,
+        overtime_toggle_pause: Callable[[], None] | None = None,
+        overtime_edit_start: Callable[[str], bool] | None = None,
+        overtime_prompt_edit: Callable[[str, str], bool] | None = None,
     ) -> None:
         callbacks = {
             "model_provider": model_provider,
@@ -368,6 +379,13 @@ class WorktimeQuickPanel:
         self._on_overtime_end = (
             overtime_end if overtime_end is not None else lambda: None
         )
+        self._on_overtime_toggle_pause = (
+            overtime_toggle_pause
+            if overtime_toggle_pause is not None
+            else lambda: None
+        )
+        self._on_overtime_edit_start = overtime_edit_start
+        self._on_overtime_prompt_edit = overtime_prompt_edit
         self._monotonic = monotonic
         self._tk = tk_module
 
@@ -629,6 +647,13 @@ class WorktimeQuickPanel:
                 or self._manual_break_edit.date_key != self._selected_date_key
                 or self._row_for_date(model, self._manual_break_edit.date_key) is None
             )
+        elif self._inline_editor_kind == _INLINE_EDITOR_OVERTIME_PROMPT_START:
+            stale = (
+                model.overtime_prompt is None
+                or model.overtime_prompt.detected_time != self._inline_editor_context
+            )
+        elif self._inline_editor_kind == _INLINE_EDITOR_OVERTIME_START:
+            stale = model.overtime_state is None
         if stale:
             self._close_inline_editor(reconcile=self._visible)
 
@@ -1813,13 +1838,6 @@ class WorktimeQuickPanel:
             "휴게 종료" if model.break_active else "휴게 시작",
             self._toggle_break_command,
         )
-        overtime_end_button = None
-        if model.overtime_state is not None:
-            overtime_end_button = self._button(
-                actions,
-                "초과근무 종료",
-                self._overtime_end_command,
-            )
         plan_button = self._button(actions, "목표 수정", self._edit_plan_command)
         settings_button = self._button(actions, "설정", self._settings_command)
         countdown_label = tk.Label(
@@ -1917,6 +1935,11 @@ class WorktimeQuickPanel:
                 "초과근무 시작",
                 self._overtime_prompt_accept_current_command,
             )
+            overtime_edit_button = self._button(
+                overtime_prompt_actions,
+                "시작 수정",
+                self._overtime_prompt_edit_command,
+            )
             overtime_skip_button = self._button(
                 overtime_prompt_actions,
                 "오늘은 안 함",
@@ -1924,7 +1947,55 @@ class WorktimeQuickPanel:
             )
             overtime_prompt_buttons = (
                 overtime_start_button,
+                overtime_edit_button,
                 overtime_skip_button,
+            )
+
+        overtime_end_button = None
+        overtime_state_label = None
+        overtime_state_buttons: tuple[Any, ...] = ()
+        if model.overtime_state is not None:
+            overtime_state = model.overtime_state
+            overtime_state_card = tk.Frame(
+                content,
+                bg="#EFF6FF",
+                highlightthickness=1,
+                highlightbackground="#BFDBFE",
+            )
+            overtime_state_card.pack(
+                fill="x", pady=(section_gap, 0), before=footer
+            )
+            overtime_state_label = tk.Label(
+                overtime_state_card,
+                text=self._overtime_state_text(overtime_state),
+                bg="#EFF6FF",
+                fg="#1E3A8A",
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9, "bold"),
+            )
+            overtime_state_label.pack(fill="x", padx=10, pady=(4, 2))
+            overtime_state_actions = tk.Frame(overtime_state_card, bg="#EFF6FF")
+            overtime_state_actions.pack(fill="x", padx=8, pady=(0, 4))
+            overtime_pause_button = self._button(
+                overtime_state_actions,
+                "다시 시작" if overtime_state.paused else "일시정지",
+                self._overtime_toggle_pause_command,
+            )
+            overtime_start_edit_button = self._button(
+                overtime_state_actions,
+                "시작 수정",
+                self._overtime_edit_start_command,
+            )
+            overtime_end_button = self._button(
+                overtime_state_actions,
+                "초과근무 종료",
+                self._overtime_end_command,
+            )
+            overtime_state_buttons = (
+                overtime_pause_button,
+                overtime_start_edit_button,
+                overtime_end_button,
             )
 
         self._widgets = {
@@ -1956,6 +2027,8 @@ class WorktimeQuickPanel:
             "prompt_buttons": prompt_buttons,
             "overtime_prompt_label": overtime_prompt_label,
             "overtime_prompt_buttons": overtime_prompt_buttons,
+            "overtime_state_label": overtime_state_label,
+            "overtime_state_buttons": overtime_state_buttons,
         }
         self._update_detail_presentation(model)
         if self._inline_editor_active and self._inline_editor_kind is not None:
@@ -2016,9 +2089,21 @@ class WorktimeQuickPanel:
         widgets["break_button"].configure(
             text="휴게 종료" if model.break_active else "휴게 시작"
         )
-        overtime_end_button = widgets.get("overtime_end_button")
-        if overtime_end_button is not None:
-            overtime_end_button.configure(text="초과근무 종료")
+        overtime_state_label = widgets.get("overtime_state_label")
+        overtime_state_buttons = widgets.get("overtime_state_buttons") or ()
+        if model.overtime_state is not None:
+            if overtime_state_label is not None:
+                overtime_state_label.configure(
+                    text=self._overtime_state_text(model.overtime_state)
+                )
+            if overtime_state_buttons:
+                overtime_state_buttons[0].configure(
+                    text=(
+                        "다시 시작"
+                        if model.overtime_state.paused
+                        else "일시정지"
+                    )
+                )
         self._update_countdown_label()
 
         if model.prompt is not None:
@@ -2394,6 +2479,12 @@ class WorktimeQuickPanel:
                 f"{self._manual_break_edit.start_time} - "
                 f"{self._manual_break_edit.end_time}"
             )
+        if kind == _INLINE_EDITOR_OVERTIME_PROMPT_START:
+            return str(context or "")
+        if kind == _INLINE_EDITOR_OVERTIME_START:
+            if model.overtime_state is None:
+                return ""
+            return str(model.overtime_state.start_time)
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     @staticmethod
@@ -2409,6 +2500,10 @@ class WorktimeQuickPanel:
             return "감지된 출근 시간", "예: 9 · 930 · 9:30"
         if kind == _INLINE_EDITOR_MANUAL_BREAK:
             return "완료한 수동 휴게", "HH:MM - HH:MM"
+        if kind == _INLINE_EDITOR_OVERTIME_PROMPT_START:
+            return "초과근무 시작 시간", "예: 18 · 1830 · 18:30"
+        if kind == _INLINE_EDITOR_OVERTIME_START:
+            return "초과근무 시작 시간", "예: 18 · 1830 · 18:30"
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     def _show_inline_editor(
@@ -2516,6 +2611,36 @@ class WorktimeQuickPanel:
                         )
                         failure_message = (
                             "출근 시간을 저장하지 못했거나 요청이 만료되었습니다."
+                        )
+        elif kind in {
+            _INLINE_EDITOR_OVERTIME_START,
+            _INLINE_EDITOR_OVERTIME_PROMPT_START,
+        }:
+            clock_value, error = self._parse_clock_time(raw_value)
+            if error is None and clock_value is not None:
+                if kind == _INLINE_EDITOR_OVERTIME_START:
+                    if self._on_overtime_edit_start is None:
+                        error = "초과근무 수정 기능을 사용할 수 없습니다."
+                    else:
+                        callback = (
+                            lambda: self._on_overtime_edit_start(clock_value) is True
+                        )
+                        failure_message = "초과근무 시작 시간을 저장하지 못했습니다."
+                else:
+                    context = self._inline_editor_context
+                    if context is None:
+                        error = "수정할 초과근무 알림이 만료되었습니다."
+                    elif self._on_overtime_prompt_edit is None:
+                        error = "초과근무 수정 기능을 사용할 수 없습니다."
+                    else:
+                        callback = (
+                            lambda: self._on_overtime_prompt_edit(
+                                context, clock_value
+                            )
+                            is True
+                        )
+                        failure_message = (
+                            "초과근무 시작 시간을 저장하지 못했거나 요청이 만료되었습니다."
                         )
         elif kind == _INLINE_EDITOR_MANUAL_BREAK:
             start_time, end_time, error = self._parse_manual_break_times(raw_value)
@@ -2703,6 +2828,23 @@ class WorktimeQuickPanel:
     def _prompt_skip_command(self) -> None:
         self._run_command(self._on_prompt_skip)
 
+    @staticmethod
+    def _overtime_state_text(state: WorktimeOvertimeState) -> str:
+        if state.paused:
+            return (
+                f"초과근무 일시정지 중 · 시작 {state.start_time} · "
+                f"경과 {state.elapsed_minutes}분 · 정지 {state.paused_minutes}분"
+            )
+        assigned = (
+            f" · Flex 배정 {state.assigned_minutes}분"
+            if state.assigned_minutes > 0
+            else ""
+        )
+        return (
+            f"초과근무 측정 중 · 시작 {state.start_time} · "
+            f"경과 {state.elapsed_minutes}분{assigned}"
+        )
+
     def _overtime_prompt_accept_current_command(self) -> None:
         model = self._model
         if model is None or model.overtime_prompt is None:
@@ -2714,6 +2856,37 @@ class WorktimeQuickPanel:
 
     def _overtime_prompt_skip_command(self) -> None:
         self._run_command(self._on_overtime_prompt_skip)
+
+    def _overtime_prompt_edit_command(self) -> None:
+        model = self._model
+        if (
+            model is None
+            or model.overtime_prompt is None
+            or self._on_overtime_prompt_edit is None
+        ):
+            return
+        detected = model.overtime_prompt.detected_time
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_OVERTIME_PROMPT_START,
+            detected,
+            context=detected,
+        )
+
+    def _overtime_toggle_pause_command(self) -> None:
+        self._run_command(self._on_overtime_toggle_pause)
+
+    def _overtime_edit_start_command(self) -> None:
+        model = self._model
+        if (
+            model is None
+            or model.overtime_state is None
+            or self._on_overtime_edit_start is None
+        ):
+            return
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_OVERTIME_START,
+            model.overtime_state.start_time,
+        )
 
     def _overtime_end_command(self) -> None:
         self._run_command(self._on_overtime_end)
