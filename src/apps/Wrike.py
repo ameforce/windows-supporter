@@ -2777,6 +2777,26 @@ class Wrike:
                 continue
         return intervals
 
+    def __overtime_net_minutes_for_day(self, target_day, now=None) -> int:
+        try:
+            entry = self.__overtime_state_store.get(target_day)
+        except Exception:
+            return 0
+        if not isinstance(entry, dict) or entry.get("status") not in {
+            "active",
+            "completed",
+        }:
+            return 0
+        at = now if isinstance(now, datetime) else None
+        if at is None:
+            try:
+                at = datetime.fromisoformat(str(entry.get("ended_at") or ""))
+            except Exception:
+                at = None
+        if at is None:
+            at = self.__lib.datetime.now()
+        return max(0, min(1440, net_elapsed_seconds(entry, at) // 60))
+
     def __today_overview(self, now, snapshot=None):
         current_snapshot = snapshot or self.__get_timelog_snapshot()
         plan = self.__plan_for_date(now.date())
@@ -2801,6 +2821,9 @@ class Wrike:
             vacation_available=vacation_available,
             vacation_state=str(vacation.get("availability_state") or "error"),
             recorded_minutes=recorded_minutes,
+            overtime_minutes=self.__overtime_net_minutes_for_day(
+                now.date(), now
+            ),
         )
 
     def __delta_text(self, delta) -> tuple[str, str]:
@@ -3019,9 +3042,16 @@ class Wrike:
                 else:
                     vacation_minutes = 0
             effective_target = max(0, target - vacation_minutes)
+            overtime_minutes = self.__overtime_net_minutes_for_day(target_day)
+            effective_target += overtime_minutes
             recorded = snapshot.recorded_minutes_for(target_day)
             vacation_state = str(
                 vacation.get("availability_state") or "error"
+            )
+            overtime_note = (
+                f" · 초과근무 {self.__format_minutes(overtime_minutes)}"
+                if overtime_minutes > 0
+                else ""
             )
             if target_day > now.date():
                 if not vacation_available:
@@ -3085,12 +3115,13 @@ class Wrike:
                         )
                     color = "#6B7280"
                 else:
-                    delta = int(recorded) - int(target)
+                    delta = int(recorded) - int(target) - overtime_minutes
                     status, color = self.__delta_text(delta)
                     summary = (
                         f"Wrike {self.__format_minutes(recorded)} · "
                         "휴가 미반영 임시 목표 "
-                        f"{self.__format_minutes(target)} · {status} · "
+                        f"{self.__format_minutes(target + overtime_minutes)} · "
+                        f"{status} · "
                         f"휴가 미확정 ({vacation_state}) (임시)"
                     )
             elif recorded is None:
@@ -3100,6 +3131,7 @@ class Wrike:
                     summary = (
                         f"Wrike 조회 불가 · 목표 "
                         f"{self.__format_minutes(effective_target)}"
+                        f"{overtime_note}"
                     )
                 color = "#6B7280"
             else:
@@ -3108,6 +3140,7 @@ class Wrike:
                 summary = (
                     f"Wrike {self.__format_minutes(recorded)} · 목표 "
                     f"{self.__format_minutes(effective_target)} · {status}"
+                    f"{overtime_note}"
                 )
             rows.append(
                 WorktimePanelDayRow(
