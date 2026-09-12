@@ -1853,9 +1853,17 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                         window_bottom,
                     )
 
-            heading = panel._selected_detail_text(model).splitlines()[1]
+            heading = panel._selected_detail_text(model).splitlines()[0]
             self.assertIn("...", heading)
             self.assertNotIn("\n", heading)
+            detail_widget = panel._widgets["detail_text"]
+            self.assertEqual(
+                detail_widget.count(
+                    "1.0", "2.0", "update", "displaylines",
+                    return_ints=True,
+                ),
+                1,
+            )
         finally:
             if panel is not None:
                 panel.destroy()
@@ -1966,9 +1974,17 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                         window_bottom,
                     )
 
-            heading = panel._selected_detail_text(model).splitlines()[1]
+            heading = panel._selected_detail_text(model).splitlines()[0]
             self.assertIn("...", heading)
             self.assertNotIn("\n", heading)
+            detail_widget = panel._widgets["detail_text"]
+            self.assertEqual(
+                detail_widget.count(
+                    "1.0", "2.0", "update", "displaylines",
+                    return_ints=True,
+                ),
+                1,
+            )
         finally:
             if panel is not None:
                 panel.destroy()
