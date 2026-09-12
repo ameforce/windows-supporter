@@ -544,6 +544,72 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__panel_flex_pending_done("2026-04-06")
         self.assertFalse(store.get(day)["flex_pending"])
 
+    def test_completed_overtime_raises_past_day_target_and_delta(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 8, 10, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        monday = date(2026, 4, 6)
+        store.set_pending(
+            monday,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(monday, datetime(2026, 4, 6, 18, 6))
+        store.pause(monday, datetime(2026, 4, 6, 19, 6))
+        store.resume(monday, datetime(2026, 4, 6, 19, 36))
+        store.complete(monday, datetime(2026, 4, 6, 20, 6))
+        wrike.update_workday_plan(monday, 8 * 60, None)
+        wrike.update_workday_plan(date(2026, 4, 7), 8 * 60, None)
+        wrike.update_workday_plan(date(2026, 4, 8), 8 * 60, "08:00")
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (9 * 60, 8 * 60, 4 * 60, 0, 0, 0, 0),
+                generation=9,
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        monday_row = model.rows[0]
+        # 8h plan + 1h30m net overtime (30m pause excluded) vs 9h recorded.
+        self.assertIn("목표 9시간 30분", monday_row.summary)
+        self.assertIn("초과근무 1시간 30분", monday_row.summary)
+        self.assertIn("부족 30분", monday_row.summary)
+        tuesday_row = model.rows[1]
+        self.assertIn("딱 맞음", tuesday_row.summary)
+        self.assertNotIn("초과근무", tuesday_row.summary)
+
+    def test_active_overtime_extends_today_expected_minutes(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 8, 19, 30)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 8)
+        wrike.update_workday_plan(day, 8 * 60, "09:00")
+        store.set_pending(
+            day,
+            datetime(2026, 4, 8, 18, 5),
+            datetime(2026, 4, 8, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 8, 18, 6))
+        store.pause(day, datetime(2026, 4, 8, 19, 0))
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 8 * 60, 0, 0, 0, 0),
+                generation=10,
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        # Paused since 19:00 -> 54 net overtime minutes; expected = 8h + 54m.
+        self.assertIn("현재 기대 8시간 54분", model.rows[2].summary)
+        self.assertTrue(
+            any("초과근무 54분" in line.text for line in model.today_lines)
+        )
+        self.assertIn("부족 54분", model.rows[2].summary)
+
     def test_authoritative_pagination_token_is_strict_and_opaque(self) -> None:
         malformed_tokens = (
             None,
