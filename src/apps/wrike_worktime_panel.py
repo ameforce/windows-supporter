@@ -44,6 +44,8 @@ _INLINE_EDITOR_PROMPT = "prompt_clock_in"
 _INLINE_EDITOR_MANUAL_BREAK = "manual_break"
 _INLINE_EDITOR_OVERTIME_START = "overtime_start"
 _INLINE_EDITOR_OVERTIME_PROMPT_START = "overtime_prompt_start"
+_INLINE_EDITOR_FLEX_PENDING = "flex_pending"
+_MAX_FLEX_PENDING_ROWS = 4
 
 _BG = "#F3F4F6"
 _CARD_BG = "#FFFFFF"
@@ -177,6 +179,27 @@ class WorktimeOvertimeState:
 
 
 @dataclass(frozen=True, slots=True)
+class WorktimeFlexPendingRecord:
+    """One completed overtime interval still waiting for Flex registration."""
+
+    date_key: str
+    label: str
+    start_time: str
+    end_time: str
+    net_minutes: int
+
+    def __post_init__(self) -> None:
+        _require_iso_date_key(self.date_key)
+        _require_nonempty_string(self.label, name="label")
+        if _HHMM_PATTERN.fullmatch(self.start_time) is None:
+            raise ValueError("start_time must use HH:MM format")
+        if _TARGET_HHMM_PATTERN.fullmatch(self.end_time) is None:
+            raise ValueError("end_time must use HH:MM or 24:00 format")
+        if type(self.net_minutes) is not int or self.net_minutes < 0:
+            raise ValueError("net_minutes must be a non-negative int")
+
+
+@dataclass(frozen=True, slots=True)
 class WorktimePanelManualBreak:
     """One selected-week break row; only raw manual rows are editable."""
 
@@ -225,6 +248,7 @@ class WorktimePanelModel:
     manual_breaks: tuple[WorktimePanelManualBreak, ...] = ()
     overtime_prompt: WorktimeOvertimePrompt | None = None
     overtime_state: WorktimeOvertimeState | None = None
+    flex_pending: tuple[WorktimeFlexPendingRecord, ...] = ()
 
     def __post_init__(self) -> None:
         _require_string(self.week_range, name="week_range")
@@ -269,6 +293,17 @@ class WorktimePanelModel:
             raise TypeError(
                 "overtime_state must be a WorktimeOvertimeState or None"
             )
+        if not isinstance(self.flex_pending, tuple):
+            raise TypeError("flex_pending must be an immutable tuple")
+        if any(
+            not isinstance(item, WorktimeFlexPendingRecord)
+            for item in self.flex_pending
+        ):
+            raise TypeError("flex_pending must contain WorktimeFlexPendingRecord values")
+        if len({item.date_key for item in self.flex_pending}) != len(
+            self.flex_pending
+        ):
+            raise ValueError("flex_pending must contain unique date_key values")
         if not isinstance(self.day_details, tuple):
             raise TypeError("day_details must be an immutable tuple")
         if self.day_details and (
@@ -334,6 +369,9 @@ class WorktimeQuickPanel:
         overtime_toggle_pause: Callable[[], None] | None = None,
         overtime_edit_start: Callable[[str], bool] | None = None,
         overtime_prompt_edit: Callable[[str, str], bool] | None = None,
+        flex_open: Callable[[], None] | None = None,
+        flex_pending_edit: Callable[[str, str, str], bool] | None = None,
+        flex_pending_done: Callable[[str], None] | None = None,
     ) -> None:
         callbacks = {
             "model_provider": model_provider,
@@ -386,6 +424,15 @@ class WorktimeQuickPanel:
         )
         self._on_overtime_edit_start = overtime_edit_start
         self._on_overtime_prompt_edit = overtime_prompt_edit
+        self._on_flex_open = (
+            flex_open if flex_open is not None else lambda: None
+        )
+        self._on_flex_pending_edit = flex_pending_edit
+        self._on_flex_pending_done = (
+            flex_pending_done
+            if flex_pending_done is not None
+            else lambda _date_key: None
+        )
         self._monotonic = monotonic
         self._tk = tk_module
 
@@ -654,6 +701,11 @@ class WorktimeQuickPanel:
             )
         elif self._inline_editor_kind == _INLINE_EDITOR_OVERTIME_START:
             stale = model.overtime_state is None
+        elif self._inline_editor_kind == _INLINE_EDITOR_FLEX_PENDING:
+            stale = not any(
+                record.date_key == self._inline_editor_context
+                for record in model.flex_pending
+            )
         if stale:
             self._close_inline_editor(reconcile=self._visible)
 
@@ -663,6 +715,10 @@ class WorktimeQuickPanel:
             model.prompt is not None,
             model.overtime_prompt is not None,
             model.overtime_state is not None,
+            tuple(
+                (record.date_key, record.start_time, record.end_time)
+                for record in model.flex_pending
+            ),
             min(
                 _MAX_COMPACT_TODAY_LINES,
                 max(1, len(model.today_lines)),
@@ -1482,6 +1538,7 @@ class WorktimeQuickPanel:
             model.prompt is not None
             or model.overtime_prompt is not None
             or model.overtime_state is not None
+            or bool(model.flex_pending)
             or self._uses_compact_density()
         )
         section_gap = 2 if compact else 8
@@ -1998,6 +2055,87 @@ class WorktimeQuickPanel:
                 overtime_end_button,
             )
 
+        flex_pending_label = None
+        flex_pending_rows: tuple[Any, ...] = ()
+        flex_open_button = None
+        if model.flex_pending:
+            pending_card = tk.Frame(
+                content,
+                bg="#FFFBEB",
+                highlightthickness=1,
+                highlightbackground="#FDE68A",
+            )
+            pending_card.pack(fill="x", pady=(section_gap, 0), before=footer)
+            pending_heading = tk.Frame(pending_card, bg="#FFFBEB")
+            pending_heading.pack(fill="x", padx=8, pady=(4, 0))
+            flex_pending_label = tk.Label(
+                pending_heading,
+                text=f"Flex 등록 대기 {len(model.flex_pending)}건",
+                bg="#FFFBEB",
+                fg="#92400E",
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9, "bold"),
+            )
+            flex_pending_label.pack(side="left")
+            flex_open_button = self._button(
+                pending_heading,
+                "Flex 열기",
+                self._flex_open_command,
+            )
+            flex_open_button.pack(side="right")
+            pending_row_widgets = []
+            for record in model.flex_pending[:_MAX_FLEX_PENDING_ROWS]:
+                row = tk.Frame(pending_card, bg="#FFFBEB")
+                row.pack(fill="x", padx=8, pady=1)
+                record_label = tk.Label(
+                    row,
+                    text=(
+                        f"{record.label} · {record.start_time}–{record.end_time}"
+                        f" · {self._format_target_minutes(record.net_minutes)}"
+                    ),
+                    bg="#FFFBEB",
+                    fg="#78350F",
+                    anchor="w",
+                    justify="left",
+                    font=("Segoe UI", 9),
+                )
+                record_label.pack(side="left")
+                done_button = self._button(
+                    row,
+                    "등록 완료",
+                    lambda date_key=record.date_key: (
+                        self._flex_pending_done_command(date_key)
+                    ),
+                )
+                done_button.pack(side="right")
+                edit_button = self._button(
+                    row,
+                    "시간 수정",
+                    lambda item=record: self._flex_pending_edit_command(item),
+                )
+                edit_button.pack(side="right")
+                pending_row_widgets.append(
+                    {
+                        "date_key": record.date_key,
+                        "label": record_label,
+                        "edit_button": edit_button,
+                        "done_button": done_button,
+                    }
+                )
+            flex_pending_rows = tuple(pending_row_widgets)
+            if len(model.flex_pending) > _MAX_FLEX_PENDING_ROWS:
+                more_label = tk.Label(
+                    pending_card,
+                    text=f"· 추가 {len(model.flex_pending) - _MAX_FLEX_PENDING_ROWS}건",
+                    bg="#FFFBEB",
+                    fg="#92400E",
+                    anchor="w",
+                    justify="left",
+                    font=("Segoe UI", 9),
+                )
+                more_label.pack(fill="x", padx=10, pady=(0, 4))
+
         self._widgets = {
             "week_range": week_range_label,
             "sync": sync_label,
@@ -2027,6 +2165,9 @@ class WorktimeQuickPanel:
             "prompt_buttons": prompt_buttons,
             "overtime_prompt_label": overtime_prompt_label,
             "overtime_prompt_buttons": overtime_prompt_buttons,
+            "flex_pending_label": flex_pending_label,
+            "flex_pending_rows": flex_pending_rows,
+            "flex_open_button": flex_open_button,
             "overtime_state_label": overtime_state_label,
             "overtime_state_buttons": overtime_state_buttons,
         }
@@ -2485,6 +2626,18 @@ class WorktimeQuickPanel:
             if model.overtime_state is None:
                 return ""
             return str(model.overtime_state.start_time)
+        if kind == _INLINE_EDITOR_FLEX_PENDING:
+            record = next(
+                (
+                    item
+                    for item in model.flex_pending
+                    if item.date_key == context
+                ),
+                None,
+            )
+            if record is None:
+                return ""
+            return f"{record.start_time} - {record.end_time}"
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     @staticmethod
@@ -2504,6 +2657,8 @@ class WorktimeQuickPanel:
             return "초과근무 시작 시간", "예: 18 · 1830 · 18:30"
         if kind == _INLINE_EDITOR_OVERTIME_START:
             return "초과근무 시작 시간", "예: 18 · 1830 · 18:30"
+        if kind == _INLINE_EDITOR_FLEX_PENDING:
+            return f"{context or '초과근무'} 기록 수정", "HH:MM - HH:MM"
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     def _show_inline_editor(
@@ -2523,7 +2678,14 @@ class WorktimeQuickPanel:
         self._inline_editor_context = context
         _safe_call(self._widgets.get("inline_title"), "configure", text=title)
         _safe_call(self._widgets.get("inline_hint"), "configure", text=hint)
-        _safe_call(entry, "configure", width=17 if kind == _INLINE_EDITOR_MANUAL_BREAK else 8)
+        _safe_call(
+            entry,
+            "configure",
+            width=17
+            if kind
+            in {_INLINE_EDITOR_MANUAL_BREAK, _INLINE_EDITOR_FLEX_PENDING}
+            else 8,
+        )
         _set_entry_text(entry, str(initial_value))
         _safe_call(self._widgets.get("inline_error"), "configure", text="")
         _safe_call(
@@ -2642,6 +2804,21 @@ class WorktimeQuickPanel:
                         failure_message = (
                             "초과근무 시작 시간을 저장하지 못했거나 요청이 만료되었습니다."
                         )
+        elif kind == _INLINE_EDITOR_FLEX_PENDING:
+            start_time, end_time, error = self._parse_manual_break_times(raw_value)
+            context = self._inline_editor_context
+            if context is None:
+                error = "수정할 초과근무 기록이 만료되었습니다."
+            elif self._on_flex_pending_edit is None:
+                error = "초과근무 기록 수정 기능을 사용할 수 없습니다."
+            elif error is None and start_time is not None and end_time is not None:
+                callback = (
+                    lambda: self._on_flex_pending_edit(
+                        context, start_time, end_time
+                    )
+                    is True
+                )
+                failure_message = "초과근무 기록을 저장하지 못했습니다."
         elif kind == _INLINE_EDITOR_MANUAL_BREAK:
             start_time, end_time, error = self._parse_manual_break_times(raw_value)
             break_row = self._manual_break_edit
@@ -2890,6 +3067,24 @@ class WorktimeQuickPanel:
 
     def _overtime_end_command(self) -> None:
         self._run_command(self._on_overtime_end)
+
+    def _flex_open_command(self) -> None:
+        self._run_command(self._on_flex_open)
+
+    def _flex_pending_done_command(self, date_key: str) -> None:
+        self._run_command(self._on_flex_pending_done, date_key)
+
+    def _flex_pending_edit_command(
+        self,
+        record: WorktimeFlexPendingRecord,
+    ) -> None:
+        if self._on_flex_pending_edit is None:
+            return
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_FLEX_PENDING,
+            f"{record.start_time} - {record.end_time}",
+            context=record.date_key,
+        )
 
     def _reconcile_geometry(
         self,

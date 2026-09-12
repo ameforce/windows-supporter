@@ -457,6 +457,93 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(entry["status"], "active")
         self.assertEqual(entry["started_at"], "2026-04-06T18:00:00")
 
+    def test_overtime_end_keeps_record_pending_for_flex(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 20, 30)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+        with patch.object(
+            wrike, "_Wrike__open_flex_worktime_page", return_value=True
+        ) as opened:
+            wrike._Wrike__panel_overtime_end()
+        opened.assert_called_once_with()
+        entry = store.get(day)
+        self.assertEqual(entry["status"], "completed")
+        self.assertTrue(entry["flex_pending"])
+        self.assertEqual(store.flex_pending_days(), ["2026-04-06"])
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertEqual(len(model.flex_pending), 1)
+        record = model.flex_pending[0]
+        self.assertEqual(record.date_key, "2026-04-06")
+        self.assertEqual(record.start_time, "18:06")
+        self.assertEqual(record.end_time, "20:30")
+        self.assertEqual(record.net_minutes, 144)
+
+    def test_flex_pending_edit_and_done_handlers(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 21, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+        store.complete(day, datetime(2026, 4, 6, 20, 6))
+
+        self.assertTrue(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-06", "18:30", "20:45"
+            )
+        )
+        entry = store.get(day)
+        self.assertEqual(entry["started_at"], "2026-04-06T18:30:00")
+        self.assertEqual(entry["ended_at"], "2026-04-06T20:45:00")
+        self.assertTrue(entry["flex_pending"])
+
+        self.assertFalse(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-06", "20:00", "19:00"
+            )
+        )
+        self.assertFalse(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-07", "18:00", "19:00"
+            )
+        )
+        # A 24:00 end is accepted and lands at midnight on the next day.
+        self.assertTrue(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-06", "18:30", "24:00"
+            )
+        )
+        self.assertEqual(
+            store.get(day)["ended_at"], "2026-04-07T00:00:00"
+        )
+        self.assertEqual(
+            wrike._Wrike__build_worktime_panel_model().flex_pending[0].end_time,
+            "24:00",
+        )
+
+        wrike._Wrike__panel_flex_pending_done("2026-04-06")
+        self.assertFalse(store.get(day)["flex_pending"])
+        self.assertEqual(store.flex_pending_days(), [])
+        self.assertEqual(
+            wrike._Wrike__build_worktime_panel_model().flex_pending, ()
+        )
+
+        # Completing again without a record must not raise.
+        wrike._Wrike__panel_flex_pending_done("2026-04-06")
+        self.assertFalse(store.get(day)["flex_pending"])
+
     def test_authoritative_pagination_token_is_strict_and_opaque(self) -> None:
         malformed_tokens = (
             None,
