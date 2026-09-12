@@ -128,7 +128,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.select(1)
         self.assertIn("Other ticket", self.detail_text())
         self.assertIn("• Other ticket · 00:30 · 1건", self.detail_text())
-        self.assertIn("  ◦ 00:30 · 메모: Tuesday only", self.detail_text())
+        self.assertIn("  ◦ 00:30 · Tuesday only", self.detail_text())
         self.assertIn("Tuesday only", self.detail_text())
         self.assertNotIn("Shared ticket", self.detail_text())
         self.assertEqual(self.panel._selected_date_key, "2026-04-07")
@@ -157,15 +157,16 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.make(_details(rows=rows))
         text = self.detail_text()
 
-        self.assertIn("실제 기록 합계 03:30 · 2건", text)
+        self.assertNotIn("실제 기록 합계", text)
         self.assertIn("• 아주 긴 라이선스 검증 티켓 제목 · 티켓 합계 03:30 · 2건", text)
         self.assertIn("  ◦ 01:15", text)
         self.assertIn("  ◦ 02:15", text)
         self.assertEqual(text.count("아주 긴 라이선스 검증 티켓 제목"), 1)
         self.assertIn("첫 번째 작업 설명", text)
         self.assertIn("두 번째 작업 설명", text)
-        self.assertIn("메모: 첫 번째 작업 설명", text)
-        self.assertIn("메모: 두 번째 작업 설명", text)
+        self.assertIn("  ◦ 01:15 · 첫 번째 작업 설명", text)
+        self.assertIn("  ◦ 02:15 · 두 번째 작업 설명", text)
+        self.assertNotIn("메모:", text)
         self.assertNotIn("티켓  ", text)
         self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 8)
 
@@ -191,7 +192,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertIn("...", heading)
         self.assertNotIn("\n", heading)
         self.assertTrue(heading.endswith(" · 00:45 · 1건"))
-        self.assertIn("  ◦ 00:45 · 메모: 작업 메모", self.detail_text())
+        self.assertIn("  ◦ 00:45 · 작업 메모", self.detail_text())
 
     def test_detail_viewport_uses_a_bounded_readable_height_for_loaded_rows(self):
         self.make(_details())
@@ -305,12 +306,13 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         )
         self.make(_details(rows=rows))
         text = self.detail_text()
-        self.assertIn("실제 기록 합계 00:45 · 3건", text)
+        self.assertNotIn("실제 기록 합계", text)
         for row in rows:
             self.assertIn(row.comment, text)
             self.assertIn(row.ticket_text, text)
         self.assertEqual(text.count("· 1건"), 3)
-        self.assertIn("메모: comment-missing", text)
+        self.assertIn("comment-missing", text)
+        self.assertNotIn("메모:", text)
         self.assertNotIn("기록이 없습니다", text)
 
     def test_default_show_reopen_toggle_and_refresh_use_passive_path(self):
@@ -385,7 +387,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             TimelogDetailRow("2026-04-06", "L1", "T1", 1500, "Long recorded entry"),
             TimelogDetailRow("2026-04-06", "L2", "T2", 60, "Another entry"),
         )))
-        self.assertIn("실제 기록 합계 26:00", self.detail_text())
+        self.assertNotIn("실제 기록 합계", self.detail_text())
         self.assertIn("25:00", self.detail_text())
         self.assertNotIn("24:00", self.detail_text())
         self.assertEqual(self.panel._format_target_minutes(1500), "24:00")
