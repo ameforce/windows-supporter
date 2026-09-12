@@ -577,6 +577,9 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         "overtime_prompt_accept": Mock(),
         "overtime_prompt_skip": Mock(),
         "overtime_end": Mock(),
+        "overtime_toggle_pause": Mock(),
+        "overtime_edit_start": Mock(return_value=True),
+        "overtime_prompt_edit": Mock(return_value=True),
     }
     provider = Mock(side_effect=lambda: holder["model"])
     panel = WorktimeQuickPanel(
@@ -595,6 +598,9 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         overtime_prompt_accept=callbacks["overtime_prompt_accept"],
         overtime_prompt_skip=callbacks["overtime_prompt_skip"],
         overtime_end=callbacks["overtime_end"],
+        overtime_toggle_pause=callbacks["overtime_toggle_pause"],
+        overtime_edit_start=callbacks["overtime_edit_start"],
+        overtime_prompt_edit=callbacks["overtime_prompt_edit"],
         tk_module=fake_tk,
         idle_timeout_ms=idle_timeout_ms,
         monotonic=root.monotonic,
@@ -1138,6 +1144,70 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         panel.refresh_now()
         fake_tk.button("초과근무 종료").invoke()
         callbacks["overtime_end"].assert_called_once_with()
+
+    def test_overtime_pause_resume_and_start_edit_use_callbacks(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": _model(
+                overtime_state=WorktimeOvertimeState(
+                    status="active",
+                    start_time="18:05",
+                    elapsed_minutes=12,
+                    scheduled_quit_time="18:00",
+                    assigned_minutes=60,
+                )
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        fake_tk.button("일시정지").invoke()
+        callbacks["overtime_toggle_pause"].assert_called_once_with()
+
+        holder["model"] = _model(
+            overtime_state=WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                assigned_minutes=60,
+                paused=True,
+                paused_minutes=7,
+            )
+        )
+        panel.refresh_now()
+        fake_tk.button("다시 시작").invoke()
+        self.assertEqual(callbacks["overtime_toggle_pause"].call_count, 2)
+
+        fake_tk.button("시작 수정").invoke()
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "18:30")
+        fake_tk.button("저장").invoke()
+        callbacks["overtime_edit_start"].assert_called_once_with("18:30")
+
+    def test_overtime_prompt_start_edit_uses_edit_callback(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": _model(
+                overtime_prompt=WorktimeOvertimePrompt(
+                    "18:05",
+                    "18:00",
+                    assigned_minutes=60,
+                )
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        fake_tk.button("시작 수정").invoke()
+        entry = panel._widgets["inline_entry"]
+        entry.delete(0, "end")
+        entry.insert(0, "17:55")
+        fake_tk.button("저장").invoke()
+        callbacks["overtime_prompt_edit"].assert_called_once_with("18:05", "17:55")
 
     def test_today_line_cardinality_change_is_structural(self) -> None:
         root = _FakeRoot()

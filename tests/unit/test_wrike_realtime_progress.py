@@ -407,6 +407,56 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             )
         )
 
+    def test_overtime_pause_resume_and_start_edit_handlers(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        self.assertEqual(
+            store.set_pending(
+                day,
+                datetime(2026, 4, 6, 18, 5),
+                datetime(2026, 4, 6, 18, 0),
+            ),
+            (True, None),
+        )
+        wrike._Wrike__panel_overtime_prompt_accept("18:06")
+        self.assertEqual(store.get(day)["status"], "active")
+
+        wrike._Wrike__panel_overtime_toggle_pause()
+        self.assertEqual(store.get(day)["paused_at"], "2026-04-06T19:00:00")
+
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 30)
+        wrike._Wrike__panel_overtime_toggle_pause()
+        entry = store.get(day)
+        self.assertIsNone(entry["paused_at"])
+        self.assertEqual(entry["paused_seconds"], 1800)
+
+        self.assertTrue(wrike._Wrike__panel_overtime_edit_start("18:10"))
+        self.assertEqual(store.get(day)["started_at"], "2026-04-06T18:10:00")
+        self.assertFalse(wrike._Wrike__panel_overtime_edit_start("not-a-time"))
+
+    def test_overtime_prompt_edit_requires_current_context(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        self.assertFalse(
+            wrike._Wrike__panel_overtime_prompt_edit("17:59", "18:00")
+        )
+        self.assertEqual(store.get(day)["status"], "pending")
+        self.assertTrue(
+            wrike._Wrike__panel_overtime_prompt_edit("18:05", "18:00")
+        )
+        entry = store.get(day)
+        self.assertEqual(entry["status"], "active")
+        self.assertEqual(entry["started_at"], "2026-04-06T18:00:00")
+
     def test_authoritative_pagination_token_is_strict_and_opaque(self) -> None:
         malformed_tokens = (
             None,
