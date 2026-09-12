@@ -32,6 +32,8 @@ _DETAIL_TEXT_HEIGHT_WITH_ROWS = 8
 _DETAIL_TEXT_MIN_HEIGHT = 3
 _DETAIL_TEXT_PAD_X = 6
 _DETAIL_GROUP_LEFT_MARGIN = 12
+_DETAIL_GROUP_FONT = ("Segoe UI", 10, "bold")
+_DETAIL_GROUP_DURATION_FONT = ("Segoe UI", 9, "bold")
 _POINTER_OFFSET_PX = 16
 _DATE_KEY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -801,27 +803,63 @@ class WorktimeQuickPanel:
                 width += 7
         return width
 
-    @classmethod
-    def _truncate_to_width(cls, value: str, width: int) -> str:
-        """Keep a ticket heading on one line and add an ASCII ellipsis."""
+    def _detail_text_metric(self, name: str, default: int) -> int:
+        """Read one integer geometry field from the live detail widget."""
 
-        text = " ".join(str(value or "").split()) or "제목 없음"
-        budget = max(0, int(width))
-        if cls._estimated_text_width(text) <= budget:
-            return text
-        ellipsis = "..."
-        ellipsis_width = cls._estimated_text_width(ellipsis)
-        if budget <= ellipsis_width:
-            return ellipsis[: max(1, min(len(ellipsis), budget // 7))]
-        fitted: list[str] = []
-        fitted_width = 0
-        for character in text:
-            character_width = cls._estimated_text_width(character)
-            if fitted_width + character_width + ellipsis_width > budget:
-                break
-            fitted.append(character)
-            fitted_width += character_width
-        return "".join(fitted).rstrip() + ellipsis
+        widget = self._widgets.get("detail_text")
+        cget = getattr(widget, "cget", None)
+        if not callable(cget):
+            return default
+        try:
+            return int(cget(name))
+        except Exception:
+            return default
+
+    def _measure_detail_run(self, font: tuple, value: str) -> int | None:
+        """Measure one same-font run in pixels; None without a live Tk display."""
+
+        widget = self._widgets.get("detail_text")
+        tk_interp = getattr(widget, "tk", None)
+        call = getattr(tk_interp, "call", None)
+        if not callable(call):
+            return None
+        try:
+            return int(
+                call("font", "measure", font, "-displayof", widget, str(value))
+            )
+        except Exception:
+            return None
+
+    def _detail_heading_budget(self) -> int:
+        """Pixel width a single ticket heading line may occupy."""
+
+        return max(
+            96,
+            self._detail_text_line_width()
+            - 2 * self._detail_text_metric("padx", _DETAIL_TEXT_PAD_X)
+            - 2 * self._detail_text_metric("highlightthickness", 1)
+            - _DETAIL_GROUP_LEFT_MARGIN
+            - 2,
+        )
+
+    def _ticket_heading_width(
+        self,
+        title: str,
+        suffix_a: str,
+        duration: str,
+        suffix_b: str,
+    ) -> int:
+        """Width of the composed heading across its two rendered fonts."""
+
+        group = self._measure_detail_run(
+            _DETAIL_GROUP_FONT, "• " + title + suffix_a + suffix_b
+        )
+        span = self._measure_detail_run(_DETAIL_GROUP_DURATION_FONT, duration)
+        if group is not None and span is not None:
+            return group + span
+        return self._estimated_text_width(
+            "• " + title + suffix_a + duration + suffix_b
+        )
 
     def _ticket_heading_text(
         self,
@@ -832,19 +870,30 @@ class WorktimeQuickPanel:
     ) -> str:
         """Fit the ticket name while retaining the duration/count suffix."""
 
-        suffix = (
-            f" · {'티켓 합계 ' if group_size > 1 else ''}"
-            f"{group_duration} · {group_size}건"
-        )
-        line_budget = max(
-            96,
-            self._detail_text_line_width()
-            - (2 * _DETAIL_TEXT_PAD_X)
-            - _DETAIL_GROUP_LEFT_MARGIN
-            - 4,
-        )
-        title_budget = line_budget - self._estimated_text_width(f"• {suffix}")
-        return self._truncate_to_width(ticket_text, title_budget)
+        suffix_a = f" · {'티켓 합계 ' if group_size > 1 else ''}"
+        suffix_b = f" · {group_size}건"
+        title = " ".join(str(ticket_text or "").split()) or "제목 없음"
+        budget = self._detail_heading_budget()
+        if (
+            self._ticket_heading_width(title, suffix_a, group_duration, suffix_b)
+            <= budget
+        ):
+            return title
+        ellipsis = "..."
+        low, high = 0, len(title)
+        while low < high:
+            mid = (low + high + 1) // 2
+            candidate = title[:mid] + ellipsis
+            if (
+                self._ticket_heading_width(
+                    candidate, suffix_a, group_duration, suffix_b
+                )
+                <= budget
+            ):
+                low = mid
+            else:
+                high = mid - 1
+        return title[:low].rstrip() + ellipsis
 
     def _on_detail_text_configure(self, event: Any = None) -> None:
         """Re-fit ticket headings after Tk assigns the real viewport width."""
@@ -879,11 +928,7 @@ class WorktimeQuickPanel:
             return (("상세 기록을 확인할 수 없습니다.", "detail_status"),)
         if not detail.rows:
             return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_status"),)
-        parts: list[tuple[str, str]] = [(
-            f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}"
-            f" · {len(detail.rows)}건\n",
-            "detail_summary",
-        )]
+        parts: list[tuple[str, str]] = []
         for group in self._group_timelog_rows(detail.rows):
             ticket = group[0]
             group_total = sum(row.minutes for row in group)
@@ -911,7 +956,7 @@ class WorktimeQuickPanel:
                 ))
                 if comment:
                     parts.extend((
-                        (" · 메모: ", "detail_child"),
+                        (" · ", "detail_child"),
                         (comment, "detail_comment"),
                     ))
                 parts.append(("\n", "detail_child"))
@@ -2061,13 +2106,6 @@ class WorktimeQuickPanel:
             if callable(tag_configure) and tagged_parts is not None:
                 try:
                     tag_configure(
-                        "detail_summary",
-                        foreground=_TEXT,
-                        font=("Segoe UI", 11, "bold"),
-                        spacing1=2,
-                        spacing3=6,
-                    )
-                    tag_configure(
                         "detail_status",
                         foreground=_MUTED,
                         font=("Segoe UI", 9),
@@ -2078,7 +2116,7 @@ class WorktimeQuickPanel:
                     tag_configure(
                         "detail_group",
                         foreground=_TEXT,
-                        font=("Segoe UI", 10, "bold"),
+                        font=_DETAIL_GROUP_FONT,
                         lmargin1=12,
                         lmargin2=12,
                         spacing1=3,
@@ -2088,7 +2126,7 @@ class WorktimeQuickPanel:
                         "detail_group_duration",
                         foreground=_DETAIL_TIME_TEXT,
                         background=_DETAIL_TIME_BG,
-                        font=("Segoe UI", 9, "bold"),
+                        font=_DETAIL_GROUP_DURATION_FONT,
                     )
                     tag_configure(
                         "detail_child",

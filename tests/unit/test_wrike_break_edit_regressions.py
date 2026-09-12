@@ -385,7 +385,8 @@ class BreakPanelReadabilityRegressions(unittest.TestCase):
         rendered = text.get("1.0", "end-1c")
         self.assertIn("• Ticket title · 티켓 합계 07:30 · 30건", rendered)
         self.assertEqual(rendered.count("  ◦ 00:15"), 30)
-        self.assertIn("메모: 긴 상세 내용 29", rendered)
+        self.assertIn("· 긴 상세 내용 29", rendered)
+        self.assertNotIn("메모:", rendered)
         self.assertEqual(tk.toplevels[0].focus_force_calls, 0)
 
 
@@ -477,10 +478,10 @@ class ReviewFindingRegressions(unittest.TestCase):
         })
         rendered = widget.get("1.0", "end-1c")
         self.assertIn("• First heading · 티켓 합계 00:45 · 2건", rendered)
-        self.assertIn("  ◦ 00:15 · 메모: comment first comment second", rendered)
-        self.assertIn("  ◦ 00:30 · 메모: another comment", rendered)
+        self.assertIn("  ◦ 00:15 · comment first comment second", rendered)
+        self.assertIn("  ◦ 00:30 · another comment", rendered)
         self.assertIn("• Second heading · 01:00 · 1건", rendered)
-        self.assertIn("  ◦ 01:00 · 메모: last comment", rendered)
+        self.assertIn("  ◦ 01:00 · last comment", rendered)
 
     def test_3946451105_other_date_cannot_silently_save_hidden_day(self):
         fixture = self.wiring()
