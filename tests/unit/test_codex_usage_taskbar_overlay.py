@@ -7187,6 +7187,308 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(keepalive_callbacks), 2)
 
+    def test_uia_taskbar_occupied_span_records_maps_elements_to_local_spans(self):
+        elements = [
+            _FakeUiaElement((0, 1392, 2560, 1440), control_type=50033),
+            _FakeUiaElement((774, 1392, 818, 1440), automation_id="StartButton"),
+            _FakeUiaElement((819, 1392, 863, 1440), automation_id="SearchButton"),
+            _FakeUiaElement((900, 1392, 944, 1440), offscreen=True),
+            _FakeUiaElement((2000, 1200, 2040, 1300)),
+        ]
+        automation = _FakeUiaAutomation(elements)
+
+        records = taskbar_overlay._uia_taskbar_occupied_span_records(
+            2560,
+            1392,
+            1440,
+            taskbar_hwnd=1234,
+            automation=automation,
+        )
+
+        spans = [tuple(record["span"]) for record in records]
+        self.assertEqual(spans, [(774, 818), (819, 863)])
+        self.assertEqual(records[0]["automation_id"], "StartButton")
+        self.assertEqual(records[0]["raw_basis"], "global_physical_px")
+        self.assertEqual(records[0]["source"], "uia")
+        self.assertEqual(automation.element_from_handle_calls, [1234])
+
+    def test_uia_taskbar_occupied_span_records_converts_origin_and_skips_full_band(self):
+        elements = [
+            _FakeUiaElement((2000, 1392, 2044, 1440)),
+            _FakeUiaElement((1920, 1392, 4480, 1440), control_type=50025),
+        ]
+        automation = _FakeUiaAutomation(elements)
+
+        records = taskbar_overlay._uia_taskbar_occupied_span_records(
+            2560,
+            1392,
+            1440,
+            taskbar_hwnd=77,
+            origin_x=1920,
+            automation=automation,
+        )
+
+        self.assertEqual([tuple(record["span"]) for record in records], [(80, 124)])
+        self.assertEqual(records[0]["conversion"]["origin_x"], 1920)
+
+    def test_uia_taskbar_occupied_span_records_degrades_when_uia_unavailable(self):
+        class _RaisingAutomation:
+            def ElementFromHandle(self, _hwnd):
+                raise RuntimeError("uia unavailable")
+
+        with patch.object(taskbar_overlay, "_uia_client", None), patch.object(
+            taskbar_overlay, "_uia_client_unavailable", True
+        ):
+            self.assertEqual(
+                taskbar_overlay._uia_taskbar_occupied_span_records(
+                    2560,
+                    1392,
+                    1440,
+                    taskbar_hwnd=1,
+                ),
+                [],
+            )
+        self.assertEqual(
+            taskbar_overlay._uia_taskbar_occupied_span_records(
+                2560,
+                1392,
+                1440,
+                taskbar_hwnd=1,
+                automation=_RaisingAutomation(),
+            ),
+            [],
+        )
+
+    def test_detect_horizontal_taskbar_occupied_spans_keeps_uia_icons_under_overlay_exclusion(self):
+        class _FakeWin32Gui:
+            windows = {
+                10: ("TrayNotifyWnd", (1820, 560, 1920, 600), True),
+            }
+
+            def FindWindow(self, class_name, _title):
+                return 1 if class_name == "Shell_TrayWnd" else 0
+
+            def EnumChildWindows(self, _hwnd, callback, extra):
+                for hwnd in self.windows:
+                    callback(hwnd, extra)
+
+            def GetClassName(self, hwnd):
+                return self.windows[int(hwnd)][0]
+
+            def IsWindowVisible(self, hwnd):
+                return self.windows[int(hwnd)][2]
+
+            def GetWindowRect(self, hwnd):
+                return self.windows[int(hwnd)][1]
+
+        uia_records = [
+            {
+                "automation_id": "StartButton",
+                "control_type": 50000,
+                "raw_rect": (774, 560, 818, 600),
+                "raw_basis": "global_physical_px",
+                "span": (774, 818),
+                "coordinate_basis": "physical_px",
+                "conversion": {"origin_x": 0, "band_top": 560, "band_bottom": 600},
+                "source": "uia",
+            },
+            {
+                "automation_id": "Appid: sample",
+                "control_type": 50000,
+                "raw_rect": (818, 560, 1300, 600),
+                "raw_basis": "global_physical_px",
+                "span": (818, 1300),
+                "coordinate_basis": "physical_px",
+                "conversion": {"origin_x": 0, "band_top": 560, "band_bottom": 600},
+                "source": "uia",
+            },
+        ]
+        background = [(118, 84, 154)] * 5
+        columns = [(x, background) for x in range(0, 1920, 40)]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "win32gui",
+            _FakeWin32Gui(),
+        ), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=columns,
+        ), patch.object(
+            taskbar_overlay,
+            "_uia_taskbar_occupied_span_records",
+            return_value=uia_records,
+        ):
+            spans, telemetry = taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                1920,
+                600,
+                (0, 0, 1920, 560),
+                {"orientation": "bottom", "_exclude_spans": [(700, 1300)]},
+            )
+
+        self.assertIsNotNone(spans)
+        self.assertTrue(any(start <= 774 and end >= 1300 for start, end in spans))
+        self.assertEqual(telemetry["uia_spans"], uia_records)
+        self.assertIn("50000", telemetry["uia_spans_by_control_type"])
+
+    def test_detect_horizontal_taskbar_occupied_spans_survives_pixel_capture_failure_with_uia(self):
+        class _FakeWin32Gui:
+            def FindWindow(self, class_name, _title):
+                return 1 if class_name == "Shell_TrayWnd" else 0
+
+            def EnumChildWindows(self, _hwnd, _callback, _extra):
+                return None
+
+        uia_records = [
+            {
+                "automation_id": "StartButton",
+                "control_type": 50000,
+                "raw_rect": (774, 560, 818, 600),
+                "raw_basis": "global_physical_px",
+                "span": (774, 818),
+                "coordinate_basis": "physical_px",
+                "conversion": {"origin_x": 0, "band_top": 560, "band_bottom": 600},
+                "source": "uia",
+            },
+        ]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "win32gui",
+            _FakeWin32Gui(),
+        ), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=[],
+        ), patch.object(
+            taskbar_overlay,
+            "_uia_taskbar_occupied_span_records",
+            return_value=uia_records,
+        ):
+            spans = taskbar_overlay._detect_horizontal_taskbar_occupied_spans(
+                1920,
+                600,
+                (0, 0, 1920, 560),
+                {"orientation": "bottom"},
+            )
+
+        self.assertIsNotNone(spans)
+        self.assertTrue(any(start <= 774 and end >= 818 for start, end in spans))
+
+    def test_overlay_relocates_off_icons_marked_occupied_under_previous_geometry(self):
+        previous = {
+            "x": 700,
+            "y": 562,
+            "width": 600,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+        }
+
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            600,
+            (0, 0, 1920, 560),
+            occupied_spans=[(0, 102), (774, 1300), (1825, 1920)],
+            preferred_width=500,
+            previous_geometry=previous,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertLessEqual(geometry["x"] + geometry["width"], 774)
+
+    def test_pane_occupied_span_getter_reserves_peer_window_rect(self):
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: {},
+            window_factory=lambda _root: _FakeWindow(),
+            occupied_span_getter=lambda _w, _h, _work, _geometry: [(0, 100)],
+        )
+        overlay._right_pane._window = _FakeWindow()
+        overlay._right_pane._window_visible = True
+
+        with patch.object(
+            taskbar_overlay,
+            "_current_horizontal_window_span",
+            return_value=(1700, 2100),
+        ):
+            spans = overlay._left_pane._occupied_span_getter(
+                2560,
+                1440,
+                (0, 0, 2560, 1392),
+                {"orientation": "bottom"},
+            )
+
+        self.assertIn((0, 100), spans)
+        self.assertIn((1700, 2100), spans)
+        self.assertIn((1280, 2560), spans)
+
+    def test_pane_occupied_span_getter_ignores_hidden_peer_window(self):
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: {},
+            window_factory=lambda _root: _FakeWindow(),
+            occupied_span_getter=lambda _w, _h, _work, _geometry: [],
+        )
+        overlay._right_pane._window = _FakeWindow()
+        overlay._right_pane._window_visible = False
+
+        with patch.object(
+            taskbar_overlay,
+            "_current_horizontal_window_span",
+            return_value=(1700, 2100),
+        ):
+            spans = overlay._left_pane._occupied_span_getter(
+                2560,
+                1440,
+                (0, 0, 2560, 1392),
+                {"orientation": "bottom"},
+            )
+
+        self.assertNotIn((1700, 2100), spans)
+        self.assertIn((1280, 2560), spans)
+
+
+class _FakeUiaRect:
+    def __init__(self, left, top, right, bottom):
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+
+
+class _FakeUiaElement:
+    def __init__(self, rect, control_type=50000, offscreen=False, automation_id=""):
+        self.CurrentBoundingRectangle = _FakeUiaRect(*rect)
+        self.CurrentControlType = control_type
+        self.CurrentIsOffscreen = offscreen
+        self.CurrentAutomationId = automation_id
+
+
+class _FakeUiaElementArray:
+    def __init__(self, elements):
+        self._elements = list(elements)
+        self.Length = len(self._elements)
+
+    def GetElement(self, index):
+        return self._elements[index]
+
+
+class _FakeUiaAutomation:
+    def __init__(self, elements):
+        self._elements = list(elements)
+        self.element_from_handle_calls = []
+
+    def ElementFromHandle(self, hwnd):
+        self.element_from_handle_calls.append(int(hwnd))
+        return self
+
+    def CreateTrueCondition(self):
+        return object()
+
+    def FindAll(self, _scope, _condition):
+        return _FakeUiaElementArray(self._elements)
+
 
 class _TkFakeRoot(_FakeRoot):
     def __init__(self, scaling=96.0 / 72.0):
