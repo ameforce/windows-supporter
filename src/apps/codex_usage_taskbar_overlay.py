@@ -102,6 +102,30 @@ _TASKBAR_STRUCTURAL_CHILD_CLASSES = {
     "MSTaskSwWClass",
     "ReBarWindow32",
 }
+# UI Automation control types that only group other elements. Their bounding
+# rectangles cover whole taskbar regions (TaskbarFrame, the running-apps pane,
+# the tray pane), so unioning them would mark every slot occupied; the actual
+# occupancy is carried by their leaf descendants instead.
+_TASKBAR_UIA_CONTAINER_CONTROL_TYPES = frozenset(
+    {
+        50008,  # UIA_ListControlTypeId
+        50009,  # UIA_MenuControlTypeId
+        50010,  # UIA_MenuBarControlTypeId
+        50018,  # UIA_TabControlTypeId
+        50021,  # UIA_ToolBarControlTypeId
+        50026,  # UIA_GroupControlTypeId
+        50028,  # UIA_TreeControlTypeId
+        50032,  # UIA_WindowControlTypeId
+        50033,  # UIA_PaneControlTypeId
+        50034,  # UIA_StatusBarControlTypeId
+        50036,  # UIA_TableControlTypeId
+        50039,  # UIA_SemanticZoomControlTypeId
+    }
+)
+_TASKBAR_UIA_TREE_SCOPE_DESCENDANTS = 4
+# A single non-container element covering almost the whole band cannot be an
+# icon; skipping it keeps one misreported element from hiding the overlay.
+_TASKBAR_UIA_MAX_ELEMENT_BAND_FRACTION = 0.9
 _FULLSCREEN_EXCLUDED_WINDOW_CLASSES = {
     "Dwm",
     "Progman",
@@ -5113,6 +5137,8 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
         "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
         "child_spans_by_class": {},
         "child_spans": [],
+        "uia_spans_by_control_type": {},
+        "uia_spans": [],
         "pixel_spans": [],
         "edge_guards": [],
         "merged_occupied_spans": [],
@@ -5188,6 +5214,31 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
     if excluded_spans:
         occupied = _subtract_spans(occupied, excluded_spans)
     telemetry["excluded_spans"] = excluded_spans
+    # UIA reports the real taskbar elements (XAML icons, Start/Search, tray)
+    # with exact bounds and, crucially, keeps reporting them while the overlay
+    # covers them. Their spans therefore bypass ``excluded_spans``: subtracting
+    # the overlay's own rect here is what let a transient misplacement hide the
+    # icons underneath it forever.
+    uia_records = _uia_taskbar_occupied_span_records(
+        int(screen_width),
+        int(band_top) + origin_y,
+        int(band_bottom) + origin_y,
+        taskbar_hwnd=taskbar_hwnd,
+        origin_x=origin_x,
+    )
+    telemetry["uia_spans"] = uia_records
+    uia_spans_by_control_type: dict[str, list[dict[str, Any]]] = {}
+    for record in uia_records:
+        control_type = str(record.get("control_type") or "unknown")
+        uia_spans_by_control_type.setdefault(control_type, []).append(record)
+    telemetry["uia_spans_by_control_type"] = uia_spans_by_control_type
+    telemetry["conversions"]["uia_element_rects"] = {
+        "raw_basis": "global_physical_px",
+        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+        "origin_x": int(origin_x),
+        "origin_y": int(origin_y),
+    }
+    occupied.extend(tuple(record["span"]) for record in uia_records)
     sample_rows = _taskbar_sample_rows(band_top, band_bottom)
     telemetry["sample_rows"] = sample_rows
     columns = _sample_taskbar_columns(
@@ -5371,6 +5422,165 @@ def _taskbar_child_occupied_spans(
     return [
         tuple(record["span"])
         for record in _taskbar_child_occupied_span_records(
+            screen_width,
+            band_top,
+            band_bottom,
+            taskbar_hwnd=taskbar_hwnd,
+            origin_x=origin_x,
+        )
+    ]
+
+
+_uia_client: Any | None = None
+_uia_client_unavailable = False
+
+
+def _uia_automation() -> Any | None:
+    """Return a process-wide IUIAutomation client, or None when unavailable.
+
+    The client is created lazily on the calling (UI) thread. Every failure
+    degrades to ``None`` so occupancy detection falls back to the Win32 child
+    and pixel-sampling sources instead of losing a tick.
+    """
+    global _uia_client, _uia_client_unavailable
+    if _uia_client_unavailable:
+        return None
+    if _uia_client is not None:
+        return _uia_client
+    try:
+        import comtypes
+        import comtypes.client
+    except Exception:
+        _uia_client_unavailable = True
+        return None
+    try:
+        comtypes.CoInitialize()
+    except Exception:
+        pass
+    try:
+        uia_module = comtypes.client.GetModule("UIAutomationCore.dll")
+        _uia_client = comtypes.client.CreateObject(
+            uia_module.CUIAutomation,
+            interface=uia_module.IUIAutomation,
+        )
+    except Exception:
+        _uia_client_unavailable = True
+        return None
+    return _uia_client
+
+
+def _uia_taskbar_occupied_span_records(
+    screen_width: int,
+    band_top: int,
+    band_bottom: int,
+    *,
+    taskbar_hwnd: int = 0,
+    origin_x: int = 0,
+    automation: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Occupied spans from the taskbar's UI Automation element tree.
+
+    Windows 11 renders taskbar icons inside a XAML island, so Win32 child
+    enumeration and pixel sampling are the only legacy witnesses - and both
+    can miss icons. UIA reports every interactive taskbar element with an
+    exact bounding rect and keeps reporting it while the overlay covers it,
+    which is what breaks the self-hiding misplacement loop. Returns ``[]`` on
+    any failure so callers keep their remaining sources.
+    """
+    client = automation if automation is not None else _uia_automation()
+    if client is None or win32gui is None:
+        return []
+    if int(taskbar_hwnd) <= 0:
+        try:
+            taskbar_hwnd = int(win32gui.FindWindow("Shell_TrayWnd", None) or 0)
+        except Exception:
+            return []
+    if taskbar_hwnd <= 0:
+        return []
+    try:
+        taskbar_element = client.ElementFromHandle(int(taskbar_hwnd))
+        condition = client.CreateTrueCondition()
+        elements = taskbar_element.FindAll(
+            _TASKBAR_UIA_TREE_SCOPE_DESCENDANTS,
+            condition,
+        )
+        count = int(elements.Length)
+    except Exception:
+        return []
+    if count <= 0:
+        return []
+    band_width = max(1, int(screen_width))
+    max_element_width = max(8, int(band_width * _TASKBAR_UIA_MAX_ELEMENT_BAND_FRACTION))
+    records: list[dict[str, Any]] = []
+    for index in range(count):
+        try:
+            element = elements.GetElement(index)
+        except Exception:
+            continue
+        try:
+            if bool(element.CurrentIsOffscreen):
+                continue
+        except Exception:
+            continue
+        try:
+            control_type = int(element.CurrentControlType)
+        except Exception:
+            control_type = 0
+        if control_type in _TASKBAR_UIA_CONTAINER_CONTROL_TYPES:
+            continue
+        try:
+            rect = element.CurrentBoundingRectangle
+            left = int(rect.left)
+            top = int(rect.top)
+            right = int(rect.right)
+            bottom = int(rect.bottom)
+        except Exception:
+            continue
+        if right <= left or bottom <= top:
+            continue
+        if right - left >= max_element_width:
+            continue
+        vertical_overlap = min(bottom, int(band_bottom)) - max(top, int(band_top))
+        if vertical_overlap < 8:
+            continue
+        start = max(0, min(int(screen_width), int(left) - int(origin_x)))
+        end = max(0, min(int(screen_width), int(right) - int(origin_x)))
+        if end - start < 8:
+            continue
+        try:
+            automation_id = str(element.CurrentAutomationId or "")
+        except Exception:
+            automation_id = ""
+        records.append(
+            {
+                "automation_id": automation_id,
+                "control_type": int(control_type),
+                "raw_rect": (int(left), int(top), int(right), int(bottom)),
+                "raw_basis": "global_physical_px",
+                "span": (int(start), int(end)),
+                "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+                "conversion": {
+                    "origin_x": int(origin_x),
+                    "band_top": int(band_top),
+                    "band_bottom": int(band_bottom),
+                },
+                "source": "uia",
+            }
+        )
+    return records
+
+
+def _uia_taskbar_occupied_spans(
+    screen_width: int,
+    band_top: int,
+    band_bottom: int,
+    *,
+    taskbar_hwnd: int = 0,
+    origin_x: int = 0,
+) -> list[tuple[int, int]]:
+    return [
+        tuple(record["span"])
+        for record in _uia_taskbar_occupied_span_records(
             screen_width,
             band_top,
             band_bottom,
@@ -7694,8 +7904,8 @@ class AiUsageTaskbarOverlay:
 
         return getter
 
-    @staticmethod
     def _pane_occupied_span_getter(
+        self,
         base_getter: Callable[
             [int, int, tuple[int, int, int, int] | dict[str, int] | None, dict[str, int | str]],
             list[tuple[int, int]] | None,
@@ -7716,6 +7926,29 @@ class AiUsageTaskbarOverlay:
             except Exception:
                 detected = None
             spans = list(detected or [])
+            # The peer pane's live window is taskbar content the sampler must
+            # never treat as free space. Pixel detection normally sees it, but
+            # injecting the rect keeps the exclusion exact even when screen
+            # capture fails or the peer just moved.
+            peer = self._right_pane if side == _SLOT_SIDE_LEFT else self._left_pane
+            peer_window = getattr(peer, "_window", None)
+            if peer_window is not None and bool(
+                getattr(peer, "_window_visible", False)
+            ):
+                peer_span = _current_horizontal_window_span(peer_window)
+                if peer_span is not None:
+                    try:
+                        peer_origin_x = int(
+                            geometry.get("_screen_origin_x", 0) or 0
+                        )
+                    except Exception:
+                        peer_origin_x = 0
+                    spans.append(
+                        (
+                            int(peer_span[0]) - peer_origin_x,
+                            int(peer_span[1]) - peer_origin_x,
+                        )
+                    )
             midpoint = max(1, int(width) // 2)
             # Reserve the peer half before the core renderer chooses a free
             # slot.  That makes the pane side a placement contract rather
