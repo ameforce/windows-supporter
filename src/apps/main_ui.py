@@ -436,6 +436,18 @@ class WindowsSupporterMainUI:
         self._apply_notebook_labels_for_width(width)
         return
 
+    def _notebook_labels_for_width(self, width: int | None) -> dict[str, str]:
+        compact = int(width or 0) > 1 and int(width or 0) < 800
+        return {
+            self._TAB_DASHBOARD: "Dashboard",
+            self._TAB_STARTUP: "Startup" if compact else "Startup Apps",
+            self._TAB_KAKAO: "Kakao" if compact else "KakaoTalk",
+            self._TAB_WRIKE: "Wrike",
+            self._TAB_AI_USAGE: "AI" if compact else "AI 사용량",
+            self._TAB_UPDATE: "Update",
+            self._TAB_POWER: "전원",
+        }
+
     def _apply_notebook_labels_for_width(self, width: int | None = None) -> None:
         """Avoid clipped tab titles on a narrow main window."""
 
@@ -448,16 +460,7 @@ class WindowsSupporterMainUI:
                 width = int(self._root.winfo_width())
             except Exception:
                 width = 0
-        compact = int(width or 0) > 1 and int(width or 0) < 800
-        labels = {
-            self._TAB_DASHBOARD: "Dashboard",
-            self._TAB_STARTUP: "Startup" if compact else "Startup Apps",
-            self._TAB_KAKAO: "Kakao" if compact else "KakaoTalk",
-            self._TAB_WRIKE: "Wrike",
-            self._TAB_AI_USAGE: "AI" if compact else "AI 사용량",
-            self._TAB_UPDATE: "Update",
-            self._TAB_POWER: "전원",
-        }
+        labels = self._notebook_labels_for_width(width)
         for tab_key, label in labels.items():
             widget = self._tab_widget(tab_key)
             if widget is None:
@@ -467,6 +470,44 @@ class WindowsSupporterMainUI:
             except Exception:
                 continue
         return
+
+    def _measure_tab_text(self, text: str) -> int:
+        """Measure a notebook tab title in pixels for the tab font."""
+
+        text = str(text or "")
+        if not text:
+            return 0
+        try:
+            return int(
+                self._root.tk.call(
+                    "font",
+                    "measure",
+                    ("Segoe UI", 9),
+                    "-displayof",
+                    self._root,
+                    text,
+                )
+            )
+        except Exception:
+            # Segoe UI 9pt ≈ 12px: latin glyphs ~7px, CJK glyphs ~13px.
+            return sum(13 if ord(char) > 0x2E7F else 7 for char in text)
+
+    def _notebook_tab_row_min_width(self, width: int | None) -> int:
+        """Pixel width the tab row needs so every title stays readable.
+
+        The window may shrink to fit narrow tab content, but the tab bar
+        itself must never compress titles into clipped text; the geometry
+        policy treats this as a hard floor for the window width.
+        """
+
+        total = 0
+        for tab_key, label in self._notebook_labels_for_width(width).items():
+            if self._tab_widget(tab_key) is None:
+                continue
+            # Tab chrome: TNotebook.Tab padding (8+8) plus the tab control's
+            # own border/margin (~12px) keeps the estimate on the safe side.
+            total += self._measure_tab_text(label) + 28
+        return total
 
     def _select_tab(self, tab: str) -> None:
         nb = self._notebook
@@ -608,6 +649,9 @@ class WindowsSupporterMainUI:
                 # minimum back above the content-fit size.
                 min_width = min(int(fallback_min_width), max_width, width)
                 min_height = min(int(fallback_min_height), max_height, height)
+                tab_row_min = self._notebook_tab_row_min_width(width)
+                if tab_row_min > 0:
+                    min_width = max(min_width, min(int(tab_row_min), max_width))
                 width = max(width, min_width)
                 height = max(height, min_height)
                 geometry = self._centered_geometry(

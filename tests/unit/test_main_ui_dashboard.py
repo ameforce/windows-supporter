@@ -1326,6 +1326,124 @@ class DashboardViewLayoutUnitTest(unittest.TestCase):
         )
         self.assertEqual(version_label.kwargs.get("wraplength"), 100)
 
+    def test_dashboard_grid_rows_share_extra_viewport_height_evenly(self):
+        class _Grid:
+            def __init__(self):
+                self.columns = {}
+                self.rows = {}
+
+            def winfo_width(self):
+                return 0
+
+            def columnconfigure(self, index, **kwargs):
+                self.columns[int(index)] = dict(kwargs)
+
+            def rowconfigure(self, index, **kwargs):
+                self.rows[int(index)] = dict(kwargs)
+
+        class _Card:
+            def grid(self, **_kwargs):
+                return None
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        grid = _Grid()
+        cards = [_Card() for _ in range(6)]
+
+        view._layout_dashboard_cards(grid, cards, available_width=900)
+        self.assertEqual(
+            [grid.rows[row].get("weight") for row in range(3)],
+            [1, 1, 1],
+        )
+        self.assertTrue(
+            all(
+                grid.rows[row].get("uniform") == "dashboard_section_row"
+                for row in range(3)
+            )
+        )
+
+        # Collapsing to one column reweights the new row set, and switching
+        # back clears the stale rows so they cannot keep stale weight.
+        view._layout_dashboard_cards(grid, cards, available_width=640)
+        self.assertEqual(
+            [grid.rows[row].get("weight") for row in range(6)],
+            [1, 1, 1, 1, 1, 1],
+        )
+        view._layout_dashboard_cards(grid, cards, available_width=900)
+        self.assertEqual(
+            [grid.rows[row].get("weight") for row in range(3, 6)],
+            [0, 0, 0],
+        )
+
+    def test_dashboard_scroll_geometry_stretches_content_to_viewport(self):
+        class _Canvas:
+            def __init__(self):
+                self.item_kwargs = {}
+                self.scrollregion = None
+
+            def winfo_width(self):
+                return 330
+
+            def winfo_height(self):
+                return 914
+
+            def itemconfigure(self, _window_id, **kwargs):
+                self.item_kwargs = dict(kwargs)
+
+            def bbox(self, _tag):
+                return (0, 0, 330, 914)
+
+            def configure(self, **kwargs):
+                self.scrollregion = kwargs.get("scrollregion")
+
+        class _Container:
+            def winfo_reqheight(self):
+                return 600
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        canvas = _Canvas()
+        view._dashboard_scroll_canvas = canvas
+        view._dashboard_scroll_container = _Container()
+        view._dashboard_scroll_window_id = 7
+
+        view._sync_dashboard_scroll_geometry()
+
+        self.assertEqual(canvas.item_kwargs.get("width"), 330)
+        self.assertEqual(canvas.item_kwargs.get("height"), 914)
+
+    def test_dashboard_scroll_geometry_keeps_content_height_when_taller(self):
+        class _Canvas:
+            def __init__(self):
+                self.item_kwargs = {}
+
+            def winfo_width(self):
+                return 700
+
+            def winfo_height(self):
+                return 500
+
+            def itemconfigure(self, _window_id, **kwargs):
+                self.item_kwargs = dict(kwargs)
+
+            def bbox(self, _tag):
+                return (0, 0, 700, 1200)
+
+            def configure(self, **_kwargs):
+                return None
+
+        class _Container:
+            def winfo_reqheight(self):
+                return 1200
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        canvas = _Canvas()
+        view._dashboard_scroll_canvas = canvas
+        view._dashboard_scroll_container = _Container()
+        view._dashboard_scroll_window_id = 3
+
+        view._sync_dashboard_scroll_geometry()
+
+        self.assertEqual(canvas.item_kwargs.get("height"), 1200)
+
 
 if __name__ == "__main__":
     unittest.main()
