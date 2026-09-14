@@ -105,10 +105,27 @@ if errorlevel 1 (
 )
 echo [ Success !! ]
 
+REM Stage Tcl/Tk script libraries as real directories. CPython 3.14 embeds them
+REM as ZipFS archives inside tcl90.dll/tcl9tk90.dll, and Tcl's runtime self-mount
+REM of that archive can fail when the _MEI temp parent is not enumerable, leaving
+REM the frozen app without init.tcl. Shipping extracted _tcl_data/_tk_data lets
+REM the stock run-time hook set TCL_LIBRARY/TK_LIBRARY so init.tcl is read
+REM through a plain file open instead.
+echo | set /p="Staging Tcl/Tk runtime libraries..."
+call :clear_log
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\stage_tcltk_runtime.py" --dest "%BUILD_GENERATED_DIR%\tcltk" > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo Tcl/Tk runtime staging failed.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+
 REM Build the executable
 echo | set /p="Building %MAIN_SOURCE% to %EXE_NAME%..."
 call :clear_log
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tcl_data;_tcl_data" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tk_data;_tk_data" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller build failed.
@@ -127,7 +144,7 @@ if not exist "dist\%EXE_NAME%" (
   call :print_log
   exit /b 1
 )
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\verify_pyinstaller_archive.py" "dist\%EXE_NAME%" --entry "playwright\driver\node.exe" --entry "src\apps\resources\google_desktop_oauth.json" --match-file ".venv\Lib\site-packages\playwright\driver\node.exe" --match-file "src\apps\resources\google_desktop_oauth.json" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\verify_pyinstaller_archive.py" "dist\%EXE_NAME%" --entry "playwright\driver\node.exe" --entry "src\apps\resources\google_desktop_oauth.json" --entry "_tcl_data\init.tcl" --entry "_tk_data\tk.tcl" --match-file ".venv\Lib\site-packages\playwright\driver\node.exe" --match-file "src\apps\resources\google_desktop_oauth.json" --match-file "%BUILD_GENERATED_DIR%\tcltk\_tcl_data\init.tcl" --match-file "%BUILD_GENERATED_DIR%\tcltk\_tk_data\tk.tcl" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller archive validation failed.
@@ -143,6 +160,20 @@ call :clear_log
 if errorlevel 1 (
   echo Failure
   echo Frozen Google Calendar resource loader validation failed.
+  call :print_log
+  exit /b 1
+)
+echo [ Success !! ]
+
+REM Exercise the bundled Tcl/Tk runtime inside the frozen process. This must run
+REM a real Tcl/Tk init, not just an archive listing, so a missing or unmountable
+REM script library fails the build instead of reaching users.
+echo | set /p="Validating frozen Tcl/Tk runtime..."
+call :clear_log
+"dist\%EXE_NAME%" --tcl-runtime-smoke > "%STEP_LOG%" 2>&1
+if errorlevel 1 (
+  echo Failure
+  echo Frozen Tcl/Tk runtime validation failed.
   call :print_log
   exit /b 1
 )
