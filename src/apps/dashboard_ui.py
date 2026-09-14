@@ -101,7 +101,7 @@ class DashboardView:
             highlightthickness=1,
             highlightbackground=border,
         )
-        header_card.pack(fill="x", padx=10, pady=(10, 6))
+        header_card.pack(fill="x", padx=10, pady=(2, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
         header_inner.pack(fill="x", padx=12, pady=7)
@@ -118,7 +118,7 @@ class DashboardView:
         # 기능 섹션은 2열 카드 그리드로 배치한다. 세로 나열은 요약 화면을
         # 스크롤 없이 한눈에 보려는 대시보드 목적과 맞지 않았다.
         grid = tk.Frame(container, bg=bg)
-        grid.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        grid.pack(fill="both", expand=True, padx=10, pady=(0, 2))
         section_cards: list[Any] = []
         self._dashboard_grid = grid
         self._dashboard_section_cards = section_cards
@@ -280,10 +280,14 @@ class DashboardView:
         )
         for row in range(max(row_count, previous_rows)):
             try:
+                # Weight still stretches rows into a genuinely taller viewport,
+                # but a uniform row group would also inflate the requested
+                # content height to the tallest card and bake blank space into
+                # every card in a content-fit window.
                 grid.rowconfigure(
                     row,
                     weight=1 if row < row_count else 0,
-                    uniform="dashboard_section_row" if row < row_count else "",
+                    uniform="",
                 )
             except Exception:
                 pass

@@ -654,6 +654,15 @@ class WindowsSupporterMainUI:
                     min_width = max(min_width, min(int(tab_row_min), max_width))
                 width = max(width, min_width)
                 height = max(height, min_height)
+                # The dashboard is content-fit: a remembered or dragged height
+                # above the measured content only reappears as blank space
+                # inside the equal-weight card rows, so cap the applied height
+                # at the content requirement.
+                content_height = 0
+                if tab_key == self._TAB_DASHBOARD:
+                    content_height = self._dashboard_content_height()
+                    if content_height > 1:
+                        height = min(height, max(content_height, int(min_height)))
                 geometry = self._centered_geometry(
                     width,
                     height,
@@ -667,6 +676,19 @@ class WindowsSupporterMainUI:
                 self._auto_geometry_sizes.add((int(min_width), int(min_height)))
                 try:
                     root.minsize(max(1, min_width), max(1, min_height))
+                except Exception:
+                    pass
+                try:
+                    if tab_key == self._TAB_DASHBOARD and content_height > 1:
+                        # Live resize follows the same content-fit contract:
+                        # extra height would only reappear as blank card space.
+                        # The ceiling is the content height, not the applied
+                        # height, so a shrunken window can still grow back.
+                        root.maxsize(10000, max(1, int(content_height)))
+                    else:
+                        screen_w = int(root.winfo_screenwidth())
+                        screen_h = int(root.winfo_screenheight())
+                        root.maxsize(screen_w, screen_h)
                 except Exception:
                     pass
                 self._auto_geometry_sizes.add((int(width), int(height)))
@@ -742,6 +764,9 @@ class WindowsSupporterMainUI:
         user_size = self._tab_user_sizes.get(str(tab_key))
         if user_size is not None and user_size[0] > 1 and user_size[1] > 1:
             return user_size
+        return self._content_window_size(tab_key)
+
+    def _content_window_size(self, tab_key: str) -> tuple[int, int]:
         try:
             fallback = self._scaled_size(
                 self._tab_sizes.get(tab_key) or (1000, 560)
@@ -773,6 +798,27 @@ class WindowsSupporterMainUI:
             max(1, int(measured[0]) + chrome_width),
             max(1, int(measured[1]) + chrome_height),
         )
+
+    def _dashboard_content_height(self) -> int:
+        """Return the window height that fits the dashboard content, or 0."""
+        view = self._dashboard_view
+        getter = getattr(view, "preferred_size", None)
+        if not callable(getter):
+            return 0
+        try:
+            value = getter()
+        except Exception:
+            return 0
+        if not isinstance(value, (tuple, list)) or len(value) < 2:
+            return 0
+        content_height = int(value[1])
+        if content_height <= 1:
+            return 0
+        tab = self._tab_widget(self._TAB_DASHBOARD)
+        _, chrome_height = (
+            self._window_chrome_size(tab) if tab is not None else (0, 0)
+        )
+        return max(1, content_height + int(chrome_height))
 
     def _centered_geometry(
         self,
