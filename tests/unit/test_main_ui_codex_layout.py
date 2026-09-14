@@ -213,6 +213,143 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
             [("minsize", (720, 420)), ("geometry", "768x452")],
         )
 
+    def _build_dashboard_geometry_ui(self, *, user_size):
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+                self.maxsize_calls = []
+
+            def winfo_width(self):
+                return 1200
+
+            def winfo_height(self):
+                return 900
+
+            def winfo_screenwidth(self):
+                return 1920
+
+            def winfo_screenheight(self):
+                return 1080
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+            def maxsize(self, width, height):
+                self.maxsize_calls.append((int(width), int(height)))
+
+        class _Tab:
+            def winfo_reqwidth(self):
+                return 330
+
+            def winfo_reqheight(self):
+                return 700
+
+        class _Notebook:
+            def winfo_reqwidth(self):
+                return 350
+
+            def winfo_reqheight(self):
+                return 730
+
+        class _Footer:
+            def winfo_reqwidth(self):
+                return 330
+
+            def winfo_reqheight(self):
+                return 25
+
+        class _View:
+            def preferred_size(self):
+                return (340, 700)
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1600, 1000)
+        ui._current_tab = ui._TAB_DASHBOARD
+        ui._tab_dashboard = _Tab()
+        ui._notebook = _Notebook()
+        ui._footer_frame = _Footer()
+        ui._dashboard_view = _View()
+        if user_size is not None:
+            ui._tab_user_sizes[ui._TAB_DASHBOARD] = user_size
+        return ui, root
+
+    def test_dashboard_remembered_height_is_capped_to_content(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=(330, 914))
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # 콘텐츠 요구 700 + chrome(footer 25 + notebook-tab 30) = 755.
+        # 기억된 914를 그대로 적용하면 균등 행이 늘어나 카드 내부에
+        # 빈 공간이 생기므로 콘텐츠 높이로 클램프한다.
+        self.assertEqual(root.geometry_calls[-1], "330x755")
+        self.assertEqual(root.maxsize_calls[-1], (10000, 755))
+
+    def test_dashboard_resize_ceiling_uses_content_not_applied_height(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=(330, 500))
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # 콘텐츠보다 낮게 줄인 사용자 높이는 유지하되, 리사이즈 상한은
+        # 콘텐츠 높이(755)로 둬야 다시 키울 수 있다.
+        self.assertEqual(root.geometry_calls[-1], "330x500")
+        self.assertEqual(root.maxsize_calls[-1], (10000, 755))
+
+    def test_dashboard_geometry_without_view_still_uses_fallback(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=None)
+        ui._dashboard_view = None
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # view가 없으면 콘텐츠 높이를 알 수 없으므로 상한도 적용하지 않고
+        # 기본 화면 크기 상한을 유지한다. 높이는 탭 요구 크기 측정 경로를
+        # 그대로 따른다(700 + chrome 55 = 755).
+        self.assertEqual(root.maxsize_calls[-1], (1920, 1080))
+        self.assertEqual(root.geometry_calls[-1], "350x755")
+
+    def test_non_dashboard_tab_restores_screen_maxsize(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+                self.maxsize_calls = []
+
+            def winfo_width(self):
+                return 1200
+
+            def winfo_height(self):
+                return 900
+
+            def winfo_screenwidth(self):
+                return 1920
+
+            def winfo_screenheight(self):
+                return 1080
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+            def maxsize(self, width, height):
+                self.maxsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1600, 1000)
+
+        ui._apply_tab_geometry(ui._TAB_AI_USAGE)
+
+        # 다른 탭은 기존처럼 화면 크기 상한으로 복원한다.
+        self.assertEqual(root.maxsize_calls[-1], (1920, 1080))
+
     def test_user_resize_is_kept_separate_from_automatic_tab_fallback(self) -> None:
         ui, root, _ = self._build_ui()
         ui._current_tab = ui._TAB_AI_USAGE
