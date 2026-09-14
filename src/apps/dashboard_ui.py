@@ -34,6 +34,7 @@ class DashboardView:
         self._dashboard_scroll_canvas = None
         self._dashboard_scroll_container = None
         self._dashboard_scrollbar = None
+        self._dashboard_scroll_window_id = None
         self._dashboard_grid = None
         self._dashboard_section_cards: list[Any] = []
         self._status_fonts: dict[str, Any] = {}
@@ -82,23 +83,16 @@ class DashboardView:
         self._dashboard_scroll_canvas = canvas
         self._dashboard_scroll_container = container
         self._dashboard_scrollbar = scrollbar
+        self._dashboard_scroll_window_id = window_id
 
-        def sync_scroll_region(_event: Any = None) -> None:
-            try:
-                canvas.configure(scrollregion=canvas.bbox("all"))
-            except Exception:
-                pass
-            return
-
-        def sync_content_width(event: Any) -> None:
-            try:
-                canvas.itemconfigure(window_id, width=max(1, int(event.width)))
-            except Exception:
-                pass
-            return
-
-        container.bind("<Configure>", sync_scroll_region)
-        canvas.bind("<Configure>", sync_content_width)
+        container.bind(
+            "<Configure>",
+            lambda _event: self._sync_dashboard_scroll_geometry(),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda _event: self._sync_dashboard_scroll_geometry(),
+        )
         canvas.bind("<Enter>", lambda _event: canvas.focus_set())
 
         header_card = tk.Frame(
@@ -150,26 +144,21 @@ class DashboardView:
             grid, section_cards, text=text, bg=card_bg, border=border
         )
         self._layout_dashboard_cards(grid, section_cards)
-        try:
-            grid.bind(
-                "<Configure>",
-                lambda event: self._layout_dashboard_cards(
-                    grid,
-                    section_cards,
-                    available_width=int(getattr(event, "width", 0) or 0),
-                ),
-                add="+",
+
+        def relayout_for_width(event: Any) -> None:
+            self._layout_dashboard_cards(
+                grid,
+                section_cards,
+                available_width=int(getattr(event, "width", 0) or 0),
             )
+            self._sync_dashboard_scroll_geometry()
+            return
+
+        try:
+            grid.bind("<Configure>", relayout_for_width, add="+")
         except TypeError:
             try:
-                grid.bind(
-                    "<Configure>",
-                    lambda event: self._layout_dashboard_cards(
-                        grid,
-                        section_cards,
-                        available_width=int(getattr(event, "width", 0) or 0),
-                    ),
-                )
+                grid.bind("<Configure>", relayout_for_width)
             except Exception:
                 pass
         except Exception:
@@ -177,7 +166,7 @@ class DashboardView:
 
         self.refresh()
         self._bind_dashboard_scroll_targets()
-        sync_scroll_region()
+        self._sync_dashboard_scroll_geometry()
         return
 
     def preferred_size(self) -> tuple[int, int]:
@@ -227,6 +216,35 @@ class DashboardView:
                 pass
         return max(1, width), max(1, height)
 
+    def _sync_dashboard_scroll_geometry(self) -> None:
+        """Keep the embedded dashboard content matching the viewport.
+
+        The canvas window tracks the viewport width and stretches to the
+        viewport height whenever the content is shorter, so the card grid
+        fills the window instead of leaving a gray band below it. When the
+        content is taller the natural height wins and the scrollbar takes
+        over as before.
+        """
+
+        canvas = self._dashboard_scroll_canvas
+        container = self._dashboard_scroll_container
+        window_id = self._dashboard_scroll_window_id
+        if canvas is None or container is None or window_id is None:
+            return
+        try:
+            view_width = int(canvas.winfo_width())
+            view_height = int(canvas.winfo_height())
+            required_height = int(container.winfo_reqheight())
+            canvas.itemconfigure(
+                window_id,
+                width=max(1, view_width),
+                height=max(required_height, view_height),
+            )
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+        return
+
     def _layout_dashboard_cards(
         self,
         grid: Any,
@@ -256,6 +274,23 @@ class DashboardView:
                 )
             except Exception:
                 pass
+        row_count = (len(cards) + columns - 1) // columns
+        previous_rows = int(
+            getattr(grid, "_windows_supporter_dashboard_rows", 0) or 0
+        )
+        for row in range(max(row_count, previous_rows)):
+            try:
+                grid.rowconfigure(
+                    row,
+                    weight=1 if row < row_count else 0,
+                    uniform="dashboard_section_row" if row < row_count else "",
+                )
+            except Exception:
+                pass
+        try:
+            grid._windows_supporter_dashboard_rows = row_count
+        except Exception:
+            pass
         for index, card in enumerate(cards):
             try:
                 card.grid(
@@ -353,6 +388,7 @@ class DashboardView:
         self._set_feature_status("background", self._format_background(snapshot.get("background")))
         self._set_feature_status("update", self._format_update(snapshot.get("update")))
         self._bind_dashboard_scroll_targets()
+        self._sync_dashboard_scroll_geometry()
         return
 
     def _lazy_import_tk(self) -> bool:
