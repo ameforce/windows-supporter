@@ -3,6 +3,7 @@ import os
 import queue
 import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import patch
 
@@ -1145,6 +1146,185 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(parts[0], ("지원 안 됨", "disabled"))
         self.assertIn(("Git checkout 필요", "normal"), parts)
+
+
+class DashboardViewLayoutUnitTest(unittest.TestCase):
+    def _recording_widget_factories(self):
+        created = {"frames": [], "labels": [], "buttons": []}
+
+        class _Widget:
+            def __init__(self, parent=None, *_args, **kwargs):
+                self.parent = parent
+                self.kwargs = dict(kwargs)
+                self.children = []
+                self.bindings = {}
+                self.pack_kwargs = {}
+                self.grid_kwargs = {}
+                self.destroyed = False
+                self._width = 0
+                if parent is not None:
+                    parent.children.append(self)
+
+            def pack(self, **kwargs):
+                self.pack_kwargs = dict(kwargs)
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+            def configure(self, **kwargs):
+                self.kwargs.update(kwargs)
+
+            def bind(self, sequence, callback):
+                self.bindings[sequence] = callback
+
+            def after_idle(self, callback):
+                callback()
+
+            def destroy(self):
+                self.destroyed = True
+                if self.parent is not None and self in self.parent.children:
+                    self.parent.children.remove(self)
+
+            def winfo_children(self):
+                return list(self.children)
+
+            def winfo_width(self):
+                return self._width
+
+        def _frame(parent=None, **kwargs):
+            widget = _Widget(parent, **kwargs)
+            created["frames"].append(widget)
+            return widget
+
+        def _label(parent=None, **kwargs):
+            widget = _Widget(parent, **kwargs)
+            created["labels"].append(widget)
+            return widget
+
+        def _button(parent=None, **kwargs):
+            widget = _Widget(parent, **kwargs)
+            created["buttons"].append(widget)
+            return widget
+
+        return created, _frame, _label, _button
+
+    def test_dashboard_cards_stretch_to_share_row_height(self):
+        class _Grid:
+            def winfo_width(self):
+                return 0
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+        class _Card:
+            def __init__(self):
+                self.grid_kwargs = {}
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        cards = [_Card() for _ in range(6)]
+
+        view._layout_dashboard_cards(_Grid(), cards, available_width=900)
+
+        self.assertTrue(all(card.grid_kwargs["sticky"] == "nsew" for card in cards))
+
+    def test_update_card_actions_share_the_title_row_like_other_sections(self):
+        created, _frame, _label, _button = self._recording_widget_factories()
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._tk = types.SimpleNamespace(Frame=_frame, Label=_label)
+        view._ttk = types.SimpleNamespace(Button=_button)
+
+        view._add_update_section(
+            _frame(),
+            [],
+            text="#111827",
+            bg="#FFFFFF",
+            border="#E5E7EB",
+        )
+
+        title_label = next(
+            widget for widget in created["labels"] if widget.kwargs.get("text") == "Update"
+        )
+        self.assertEqual(len(created["buttons"]), 2)
+        for button in created["buttons"]:
+            self.assertIs(button.parent.parent, title_label.parent)
+        status_frame = view._status_frames["update"]
+        status_row = status_frame.parent
+        self.assertIsNot(status_row, title_label.parent)
+        self.assertEqual(status_row.children, [status_frame])
+        self.assertEqual(status_frame.grid_kwargs["sticky"], "ew")
+
+    def test_status_lines_split_parts_that_exceed_the_frame_width(self):
+        groups = [[("업데이트 가능", "enabled"), ("v0.26.0 -> v0.26.1", "normal")]]
+        widths = {"업데이트 가능": 80, "v0.26.0 -> v0.26.1": 120, " | ": 14}
+        measure = lambda text, _kind: widths[text]
+
+        wide = DashboardView._status_lines_for_width(groups, 220, measure)
+        self.assertEqual(
+            [[item[0] for item in line] for line in wide],
+            [["업데이트 가능", "v0.26.0 -> v0.26.1"]],
+        )
+
+        narrow = DashboardView._status_lines_for_width(groups, 200, measure)
+        self.assertEqual(
+            [[item[0] for item in line] for line in narrow],
+            [["업데이트 가능"], ["v0.26.0 -> v0.26.1"]],
+        )
+        self.assertFalse(any(item[2] for line in narrow for item in line))
+
+        unknown = DashboardView._status_lines_for_width(groups, 0, measure)
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(len(unknown[0]), 2)
+
+    def test_status_line_marks_oversized_part_to_wrap_in_place(self):
+        groups = [[("매우 긴 업데이트 오류 상세 메시지", "normal")]]
+        measure = lambda text, _kind: 30 if text == " | " else 240
+
+        lines = DashboardView._status_lines_for_width(groups, 100, measure)
+
+        self.assertEqual(lines, [[("매우 긴 업데이트 오류 상세 메시지", "normal", True)]])
+
+    def test_status_reflow_rebuilds_lines_when_the_frame_width_changes(self):
+        created, _frame, _label, _button = self._recording_widget_factories()
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._tk = types.SimpleNamespace(Frame=_frame, Label=_label)
+        frame = _frame()
+        frame._width = 400
+        view._status_frames["update"] = frame
+        view._measure_status_part_width = lambda text, _kind: {
+            "업데이트 가능": 80,
+            "v0.26.0 -> v0.26.1": 120,
+            " | ": 14,
+        }[text]
+
+        view._set_status_parts(
+            "update",
+            [("업데이트 가능", "enabled"), ("v0.26.0 -> v0.26.1", "normal")],
+        )
+        self.assertEqual(len(frame.children), 1)
+
+        frame._width = 200
+        frame.bindings["<Configure>"]()
+        self.assertEqual(len(frame.children), 2)
+        self.assertEqual(
+            [child.kwargs.get("text") for child in frame.children[1].children],
+            ["v0.26.0 -> v0.26.1"],
+        )
+
+        frame._width = 100
+        frame.bindings["<Configure>"]()
+        version_label = next(
+            child
+            for row in frame.children
+            for child in row.children
+            if child.kwargs.get("text") == "v0.26.0 -> v0.26.1"
+        )
+        self.assertEqual(version_label.kwargs.get("wraplength"), 100)
 
 
 if __name__ == "__main__":
