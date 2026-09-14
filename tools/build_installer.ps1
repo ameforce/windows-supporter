@@ -4,6 +4,7 @@ param(
     [string]$OutputDirectory = "",
     [string]$CompilerPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
     [string]$BootstrapCompilerPath = "gcc.exe",
+    [string]$ManifestToolPath = "mt.exe",
     [switch]$SkipBuild,
     [switch]$KeepBuildArtifacts
 )
@@ -15,6 +16,34 @@ $compiler = (Resolve-Path -LiteralPath $CompilerPath -ErrorAction Stop).Path
 $bootstrapCompilerCommand = Get-Command $BootstrapCompilerPath -CommandType Application -ErrorAction Stop
 $bootstrapCompiler = $bootstrapCompilerCommand.Source
 $bootstrapSource = Join-Path $repoRoot "installer\installer_bootstrap.c"
+$bootstrapManifest = Join-Path $repoRoot "installer\installer_bootstrap.manifest"
+if (-not (Test-Path -LiteralPath $bootstrapManifest -PathType Leaf)) {
+    throw "Installer bootstrap manifest was not found: $bootstrapManifest"
+}
+$manifestToolCommand = Get-Command $ManifestToolPath -CommandType Application -ErrorAction SilentlyContinue
+$manifestTool = if ($manifestToolCommand) { $manifestToolCommand.Source } else { "" }
+if (-not $manifestTool) {
+    $sdkBinRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+    $sdkSearchDirs = @(
+        Get-ChildItem -LiteralPath $sdkBinRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+\.' } |
+            Sort-Object -Property Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "x64" }
+    ) + @(
+        (Join-Path $sdkBinRoot "x64"),
+        (Join-Path $sdkBinRoot "x86")
+    )
+    foreach ($sdkBinDir in $sdkSearchDirs) {
+        $candidate = Join-Path $sdkBinDir "mt.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $manifestTool = $candidate
+            break
+        }
+    }
+}
+if (-not $manifestTool) {
+    throw "Windows SDK manifest tool (mt.exe) was not found. Install the Windows 10/11 SDK or pass -ManifestToolPath."
+}
 
 function Invoke-GitText {
     param([string[]]$Arguments)
@@ -131,6 +160,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 if (-not (Test-Path -LiteralPath $bootstrapStubPath -PathType Leaf)) {
     throw "Expected installer bootstrap artifact was not found: $bootstrapStubPath"
+}
+
+& $manifestTool -nologo -manifest $bootstrapManifest "-outputresource:$bootstrapStubPath;#1"
+if ($LASTEXITCODE -ne 0) {
+    throw "Installer bootstrap manifest embedding failed with exit code $LASTEXITCODE."
+}
+$stubBytes = [IO.File]::ReadAllBytes($bootstrapStubPath)
+$stubText = [Text.Encoding]::ASCII.GetString($stubBytes)
+if (-not $stubText.Contains("requestedExecutionLevel") -or -not $stubText.Contains("asInvoker")) {
+    throw "Installer bootstrap stub does not contain the embedded asInvoker manifest."
 }
 
 $bootstrapStream = [IO.File]::OpenRead($bootstrapStubPath)

@@ -140,6 +140,16 @@ class GitHubReleaseUpdateUnitTest(unittest.TestCase):
         self.assertIn("CommandLineToArgvW", bootstrap)
         self.assertIn("normalize_legacy_value", bootstrap)
 
+    def test_installer_builder_embeds_as_invoker_manifest_in_bootstrap_stub(self) -> None:
+        script = Path("tools/build_installer.ps1").read_text(encoding="utf-8")
+        self.assertIn("ManifestToolPath", script)
+        self.assertIn("installer_bootstrap.manifest", script)
+        self.assertIn("-outputresource:$bootstrapStubPath;#1", script)
+        self.assertIn("requestedExecutionLevel", script)
+        self.assertIn("asInvoker", script)
+        manifest = Path("installer/installer_bootstrap.manifest").read_text(encoding="utf-8")
+        self.assertIn('requestedExecutionLevel level="asInvoker" uiAccess="false"', manifest)
+
     def test_github_release_asset_redirect_host_is_allowed(self) -> None:
         final_url = "https://release-assets.githubusercontent.com/github-production-release-asset/test"
 
