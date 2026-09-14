@@ -259,11 +259,30 @@ def _run_google_calendar_resource_smoke() -> int:
     return 0 if isinstance(result, GoogleCalendarSuccess) else 1
 
 
+def _run_tcl_runtime_smoke() -> int:
+    # Exercise the exact frozen-runtime contract that produced the startup
+    # crash: Tcl_Init must locate init.tcl and Tk_Init must locate tk.tcl
+    # inside the PyInstaller bundle. Returns nonzero when either fails.
+    import tkinter
+
+    interp = tkinter.Tcl()
+    interp.eval("info library")
+    root = tkinter.Tk()
+    try:
+        root.withdraw()
+        root.update_idletasks()
+    finally:
+        root.destroy()
+    return 0
+
+
 def main() -> None:
     if "--google-calendar-resource-smoke" in sys.argv:
         raise SystemExit(_run_google_calendar_resource_smoke())
     if "--codex-usage-worker-smoke" in sys.argv:
         raise SystemExit(run_process_boundary_smoke())
+    if "--tcl-runtime-smoke" in sys.argv:
+        raise SystemExit(_run_tcl_runtime_smoke())
     if run_update_handoff_from_argv(sys.argv):
         return
     single_instance_lock = _acquire_single_instance_lock()

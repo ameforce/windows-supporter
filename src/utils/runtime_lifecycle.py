@@ -24,6 +24,7 @@ _SPECIAL_MODE_ARGS = frozenset(
     {
         "--google-calendar-resource-smoke",
         "--codex-usage-worker-smoke",
+        "--tcl-runtime-smoke",
         "--windows-supporter-update-handoff",
         "--lid-power-watchdog",
         "--lid-power-runtime-canary",
