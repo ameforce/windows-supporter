@@ -306,6 +306,81 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         self.assertEqual(labels["kakao"], "KakaoTalk")
         self.assertEqual(labels["ai"], "AI 사용량")
 
+    def test_tab_row_min_width_floors_a_narrow_user_size(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+
+            def winfo_width(self):
+                return 330
+
+            def winfo_height(self):
+                return 914
+
+            def geometry(self, value):
+                self.geometry_calls.append(str(value))
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1920, 1080)
+        ui._tab_dashboard = "dashboard"
+        ui._tab_startup = "startup"
+        ui._tab_kakao = "kakao"
+        ui._tab_wrike = "wrike"
+        ui._tab_ai_usage = "ai"
+        ui._tab_update = "update"
+        ui._measure_tab_text = lambda text: len(str(text)) * 10
+
+        # A remembered narrow user size must not compress the tab row into
+        # clipped titles; the tab row floor wins over the stored width.
+        ui._tab_user_sizes[ui._TAB_DASHBOARD] = (330, 914)
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        compact_floor = sum(len(label) * 10 + 28 for label in (
+            "Dashboard", "Startup", "Kakao", "Wrike", "AI", "Update",
+        ))
+        self.assertEqual(compact_floor, 508)
+        self.assertEqual(root.minsize_calls[-1][0], compact_floor)
+        self.assertTrue(root.geometry_calls[-1].startswith(f"{compact_floor}x"))
+
+    def test_tab_row_min_width_does_not_raise_wide_geometry(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+
+            def geometry(self, value):
+                self.geometry_calls.append(str(value))
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1920, 1080)
+        ui._tab_dashboard = "dashboard"
+        ui._tab_startup = "startup"
+        ui._tab_kakao = "kakao"
+        ui._tab_wrike = "wrike"
+        ui._tab_ai_usage = "ai"
+        ui._tab_update = "update"
+        ui._measure_tab_text = lambda text: len(str(text)) * 10
+        ui._tab_user_sizes[ui._TAB_DASHBOARD] = (900, 500)
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # Full labels still fit inside a 900px window; the floor must not
+        # push the content-fit minimum back up.
+        self.assertLessEqual(root.minsize_calls[-1][0], 700)
+        self.assertTrue(root.geometry_calls[-1].startswith("900x"))
+
     def test_work_area_winapi_uses_pointer_sized_monitor_handles(self) -> None:
         class _Callable:
             def __init__(self, result):
