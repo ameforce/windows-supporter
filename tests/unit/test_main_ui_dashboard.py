@@ -1354,9 +1354,11 @@ class DashboardViewLayoutUnitTest(unittest.TestCase):
             [grid.rows[row].get("weight") for row in range(3)],
             [1, 1, 1],
         )
+        # Uniform rows would inflate the requested content height to the
+        # tallest card and bake blank space into a content-fit window.
         self.assertTrue(
             all(
-                grid.rows[row].get("uniform") == "dashboard_section_row"
+                grid.rows[row].get("uniform") in (None, "")
                 for row in range(3)
             )
         )
