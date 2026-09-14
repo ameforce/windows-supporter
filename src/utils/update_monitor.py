@@ -2768,6 +2768,32 @@ def _wait_for_installer_exit(
         sleep(0.1)
 
 
+_INSTALLER_DETECTION_NAME_TOKENS = ("setup", "install", "update", "patch")
+
+
+def _neutral_installer_launch_path(downloaded_path: Path) -> Path:
+    """Return a launch path that avoids Windows installer-detection naming.
+
+    Unmanifested executables whose file name contains setup/install/update/
+    patch are forced through the UAC elevation path, so CreateProcess fails
+    with ERROR_ELEVATION_REQUIRED whenever the runtime itself is not elevated.
+    The installer is already hash-verified before this point, so launching a
+    same-directory copy under a neutral name keeps the handoff working at any
+    runtime integrity level.  The bootstrap stub also carries an asInvoker
+    manifest; this copy is a defense-in-depth fallback for payloads that do
+    not carry one.
+    """
+    name = downloaded_path.name.lower()
+    if not any(token in name for token in _INSTALLER_DETECTION_NAME_TOKENS):
+        return downloaded_path
+    neutral_path = downloaded_path.with_name(f"wsu-apply{downloaded_path.suffix}")
+    try:
+        shutil.copyfile(downloaded_path, neutral_path)
+    except OSError:
+        return downloaded_path
+    return neutral_path
+
+
 def run_release_update_handoff(
     state_path: str | os.PathLike[str],
     *,
@@ -2801,6 +2827,7 @@ def run_release_update_handoff(
         / f"windows-supporter-pre-release-update-{os.getpid()}-{int(time.time())}.exe"
     )
     downloaded_path: Path | None = None
+    installer_launch_path: Path | None = None
     restored = False
     installed_artifact: dict[str, Any] | None = None
     installer_log_path: Path | None = None
@@ -2981,8 +3008,14 @@ def run_release_update_handoff(
             / f"release-installer-{candidate.version[0]}.{candidate.version[1]}.{candidate.version[2]}.log"
         )
         installer_log_path.parent.mkdir(parents=True, exist_ok=True)
+        installer_launch_path = _neutral_installer_launch_path(downloaded_path)
+        if installer_launch_path != downloaded_path:
+            append_update_log(
+                log_path,
+                f"installer launch path neutralized: {installer_launch_path}",
+            )
         installer_command = [
-            str(downloaded_path),
+            str(installer_launch_path),
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
@@ -3243,6 +3276,8 @@ def run_release_update_handoff(
         backup_path.unlink(missing_ok=True)
         if downloaded_path is not None:
             downloaded_path.unlink(missing_ok=True)
+        if installer_launch_path is not None and installer_launch_path != downloaded_path:
+            installer_launch_path.unlink(missing_ok=True)
         if progress_ui is not None:
             progress_ui.close()
         return 0

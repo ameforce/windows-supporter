@@ -622,6 +622,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 return 0
 
         progress_instances = []
+        installer_commands = []
         target_launches = []
         readiness_waits = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -656,6 +657,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             )
 
             def launcher(command, **_kwargs):
+                installer_commands.append(list(command))
                 log_switch = next(item for item in command if str(item).startswith("/LOG="))
                 return FakeInstallerProcess(Path(str(log_switch).removeprefix("/LOG=")), runtime)
 
@@ -703,6 +705,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(percents[0], 0)
         self.assertEqual(percents, sorted(percents))
         self.assertEqual(percents[-1], 100)
+        self.assertEqual(len(installer_commands), 1)
+        self.assertEqual(
+            Path(str(installer_commands[0][0])).name,
+            "wsu-apply.exe",
+        )
         self.assertEqual(len(target_launches), 1)
         self.assertEqual(target_launches[0][0], [str(runtime)])
         self.assertIn(
@@ -769,6 +776,27 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
             next(index for index, snapshot in enumerate(snapshots) if snapshot.get("step_key") == "complete"),
         )
         self.assertGreater(progress_instances[0].pump_calls, 0)
+
+    def test_neutral_installer_launch_path_copies_setup_named_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "WindowsSupporter-v0.26.4-Setup.exe"
+            source.write_bytes(b"installer")
+
+            launch_path = update_monitor_module._neutral_installer_launch_path(source)
+
+            self.assertEqual(launch_path.name, "wsu-apply.exe")
+            self.assertEqual(launch_path.read_bytes(), b"installer")
+            self.assertTrue(source.exists())
+
+    def test_neutral_installer_launch_path_keeps_neutral_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "wsu-apply.exe"
+            source.write_bytes(b"installer")
+
+            self.assertEqual(
+                update_monitor_module._neutral_installer_launch_path(source),
+                source,
+            )
 
     def test_release_download_progress_maps_bytes_to_download_stage(self) -> None:
         snapshots = [
