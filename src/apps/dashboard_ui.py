@@ -10,6 +10,7 @@ class DashboardView:
     # copy. Below this threshold a single column is narrower overall and lets
     # the outer vertical scroll handle the additional height.
     _TWO_COLUMN_MIN_WIDTH = 760
+    _STATUS_PART_CHROME = 8
     _CALLBACK_ALIASES = {
         "ai_usage.settings": "codex.settings",
         "ai_usage.toggle": "codex.toggle",
@@ -35,6 +36,7 @@ class DashboardView:
         self._dashboard_scrollbar = None
         self._dashboard_grid = None
         self._dashboard_section_cards: list[Any] = []
+        self._status_fonts: dict[str, Any] = {}
         self._tk = None
         self._ttk = None
         return
@@ -108,7 +110,7 @@ class DashboardView:
         header_card.pack(fill="x", padx=10, pady=(10, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
-        header_inner.pack(fill="x", padx=10, pady=7)
+        header_inner.pack(fill="x", padx=12, pady=7)
 
         tk.Label(
             header_inner,
@@ -259,7 +261,7 @@ class DashboardView:
                 card.grid(
                     row=index // columns,
                     column=index % columns,
-                    sticky="nwe",
+                    sticky="nsew",
                     padx=(0, 5)
                     if columns > 1 and index % columns == 0
                     else (5, 0)
@@ -519,21 +521,8 @@ class DashboardView:
             fg=text,
             font=("Segoe UI", 10, "bold"),
         ).pack(side="left")
-        row = tk.Frame(inner, bg=bg)
-        row.pack(fill="x", pady=(4, 0))
-        try:
-            row.columnconfigure(0, weight=1)
-        except Exception:
-            pass
-        status_frame = tk.Frame(row, bg=bg)
-        status_frame.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        buttons = tk.Frame(row, bg=bg)
-        buttons.grid(row=0, column=1, sticky="e")
-        try:
-            status_frame.configure(cursor="hand2")
-            self._bind_click(status_frame, "update.settings")
-        except Exception:
-            pass
+        buttons = tk.Frame(title_row, bg=bg)
+        buttons.pack(side="right")
         ttk.Button(
             buttons,
             text="업데이트 확인",
@@ -546,6 +535,19 @@ class DashboardView:
             width=12,
             command=lambda: self._invoke("update.settings"),
         ).pack(side="left")
+        row = tk.Frame(inner, bg=bg)
+        row.pack(fill="x", pady=(4, 0))
+        try:
+            row.columnconfigure(0, weight=1)
+        except Exception:
+            pass
+        status_frame = tk.Frame(row, bg=bg)
+        status_frame.grid(row=0, column=0, sticky="ew")
+        try:
+            status_frame.configure(cursor="hand2")
+            self._bind_click(status_frame, "update.settings")
+        except Exception:
+            pass
         self._status_frames["update"] = status_frame
         return
 
@@ -640,70 +642,152 @@ class DashboardView:
         frame = self._status_frames.get(str(key))
         if frame is None or tk is None:
             return
-        try:
-            for child in list(frame.winfo_children()):
-                try:
-                    child.destroy()
-                except Exception:
-                    continue
-        except Exception:
-            return
-        status_labels: list[Any] = []
-        for row_parts in self._status_part_rows(key, parts):
-            row = tk.Frame(frame, bg="#FFFFFF")
-            row.pack(anchor="w", fill="x")
-            for idx, (raw_text, kind) in enumerate(row_parts):
-                if idx > 0:
-                    tk.Label(
-                        row,
-                        text=" | ",
-                        bg="#FFFFFF",
-                        fg="#6B7280",
-                        font=("Segoe UI", 9),
-                    ).pack(side="left")
-                fg = "#111827"
-                if kind == "enabled":
-                    fg = "#059669"
-                elif kind == "disabled":
-                    fg = "#DC2626"
-                label = tk.Label(
-                    row,
-                    text=str(raw_text),
-                    bg="#FFFFFF",
-                    fg=fg,
-                    font=("Segoe UI", 9, "bold") if kind in {"enabled", "disabled"} else ("Segoe UI", 9),
-                    anchor="w",
-                    justify="left",
-                )
-                label.pack(side="left")
-                status_labels.append(label)
-                callback_name = f"{key}.settings"
-                if callable(self._get_callback(callback_name)):
-                    try:
-                        label.configure(cursor="hand2")
-                    except Exception:
-                        pass
-                    self._bind_click(label, callback_name)
-        def sync_wraplength(event: Any = None) -> None:
+        logical_rows = self._status_part_rows(key, parts)
+        applied = {"signature": None}
+
+        def measure(text_value: str, kind: str) -> int:
+            return self._measure_status_part_width(str(text_value), str(kind))
+
+        def rebuild(event: Any = None) -> None:
             try:
                 width = int(getattr(event, "width", 0) or frame.winfo_width())
             except Exception:
+                width = 0
+            signature = (width, id(logical_rows))
+            if signature == applied["signature"]:
                 return
-            if width <= 1:
+            applied["signature"] = signature
+            try:
+                for child in list(frame.winfo_children()):
+                    try:
+                        child.destroy()
+                    except Exception:
+                        continue
+            except Exception:
                 return
-            for label in status_labels:
-                try:
-                    label.configure(wraplength=width)
-                except Exception:
-                    continue
+            for line in self._status_lines_for_width(logical_rows, width, measure):
+                row = tk.Frame(frame, bg="#FFFFFF")
+                row.pack(anchor="w", fill="x")
+                for idx, (raw_text, kind, wrap) in enumerate(line):
+                    if idx > 0:
+                        self._make_status_label(row, " | ", "separator").pack(
+                            side="left", anchor="n"
+                        )
+                    label = self._make_status_label(row, raw_text, kind)
+                    label.pack(side="left", anchor="n")
+                    if wrap and width > 1:
+                        try:
+                            label.configure(wraplength=width)
+                        except Exception:
+                            pass
+                    callback_name = f"{key}.settings"
+                    if callable(self._get_callback(callback_name)):
+                        try:
+                            label.configure(cursor="hand2")
+                        except Exception:
+                            pass
+                        self._bind_click(label, callback_name)
             return
 
+        rebuild()
         try:
-            frame.bind("<Configure>", sync_wraplength)
-            frame.after_idle(sync_wraplength)
+            frame.bind("<Configure>", rebuild)
+            frame.after_idle(rebuild)
         except Exception:
             pass
         return
+
+    def _make_status_label(self, row: Any, raw_text: str, kind: str) -> Any:
+        tk = self._tk
+        fg = "#111827"
+        font = ("Segoe UI", 9)
+        if kind == "enabled":
+            fg = "#059669"
+            font = ("Segoe UI", 9, "bold")
+        elif kind == "disabled":
+            fg = "#DC2626"
+            font = ("Segoe UI", 9, "bold")
+        elif kind == "separator":
+            fg = "#6B7280"
+        return tk.Label(
+            row,
+            text=str(raw_text),
+            bg="#FFFFFF",
+            fg=fg,
+            font=font,
+            anchor="w",
+            justify="left",
+        )
+
+    @staticmethod
+    def _status_lines_for_width(
+        row_groups: list[list[tuple[str, str]]],
+        width: int,
+        measure: Callable[[str, str], int],
+    ) -> list[list[tuple[str, str, bool]]]:
+        """Group status parts into rendered lines that fit `width` pixels.
+
+        `measure(text, kind)` returns the rendered pixel width of one part
+        including label chrome. Parts that overflow the current line move to
+        a new line; a part wider than a whole line is flagged to wrap in
+        place. A non-positive or unknown width keeps every logical row on a
+        single line.
+        """
+        lines: list[list[tuple[str, str, bool]]] = []
+        try:
+            separator_width = int(measure(" | ", "separator"))
+        except Exception:
+            separator_width = 0
+        for group in row_groups or []:
+            current: list[tuple[str, str, bool]] = []
+            current_width = 0
+            for raw_text, kind in group or []:
+                try:
+                    part_width = int(measure(str(raw_text), str(kind)))
+                except Exception:
+                    part_width = 0
+                extra = part_width + (separator_width if current else 0)
+                if current and width > 1 and current_width + extra > width:
+                    lines.append(current)
+                    current = []
+                    current_width = 0
+                    extra = part_width
+                current.append((raw_text, kind, bool(width > 1 and part_width > width)))
+                current_width += extra
+            if current:
+                lines.append(current)
+        return lines
+
+    def _status_measure_fonts(self) -> dict[str, Any]:
+        if self._status_fonts:
+            return self._status_fonts
+        fonts: dict[str, Any] = {}
+        try:
+            from tkinter import font as tkfont
+        except Exception:
+            tkfont = None
+        if tkfont is not None:
+            for name, weight in (("normal", "normal"), ("bold", "bold")):
+                try:
+                    fonts[name] = tkfont.Font(
+                        family="Segoe UI", size=9, weight=weight
+                    )
+                except Exception:
+                    continue
+        self._status_fonts = fonts
+        return fonts
+
+    def _measure_status_part_width(self, text: str, kind: str) -> int:
+        font = self._status_measure_fonts().get(
+            "bold" if kind in {"enabled", "disabled"} else "normal"
+        )
+        try:
+            width = int(font.measure(str(text))) if font is not None else 0
+        except Exception:
+            width = 0
+        if width <= 0:
+            width = max(1, len(str(text))) * 10
+        return width + self._STATUS_PART_CHROME
 
     @staticmethod
     def _status_part_rows(key: str, parts: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
