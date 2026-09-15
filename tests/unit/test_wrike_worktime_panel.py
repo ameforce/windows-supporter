@@ -1196,6 +1196,42 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         fake_tk.button("저장").invoke()
         callbacks["overtime_edit_start"].assert_called_once_with("18:30")
 
+    def test_overtime_state_auto_pause_label_and_validation(self) -> None:
+        text = WorktimeQuickPanel._overtime_state_text(
+            WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                paused=True,
+                paused_minutes=7,
+                auto_paused=True,
+            )
+        )
+        self.assertIn("자동 일시정지", text)
+
+        manual_text = WorktimeQuickPanel._overtime_state_text(
+            WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                paused=True,
+                paused_minutes=7,
+            )
+        )
+        self.assertIn("일시정지", manual_text)
+        self.assertNotIn("자동", manual_text)
+
+        with self.assertRaises(ValueError):
+            WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                auto_paused=True,
+            )
+
     def test_overtime_prompt_start_edit_uses_edit_callback(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
