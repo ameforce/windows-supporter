@@ -61,7 +61,7 @@ reflog, fsck, unreachable object, 장식 없는 commit은 live ref가 아니다.
 `docs/runbooks/runtime-registration.md`에 따라 다음을 기록한다.
 
 - current branch `main`
-- `main...origin/main` clean/synced status
+- `main...origin/main` clean/synced status. GUI guard로 동기화를 미룬 경우 `clean/behind` + `deferred`로 기록하고 `origin/main` read-back이 production head 증거를 대신한다.
 - main physical executable path와 version/hash
 - startup registry exact path
 - temporary worktree executable이 persistent runtime으로 등록되지 않았음

@@ -27,9 +27,11 @@ main 물리 checkout에서 `git pull`, `git reset`, `git switch`, `git merge`처
 
 실행 중이면 정상 종료하고 process 부재를 확인한다. 사용자가 앱을 열어 두어야 하면 main checkout을 직접 바꾸지 않는 alternate worktree 절차를 사용한다. Fork/libgit2가 감시 중인 main HEAD를 외부 Git 명령으로 바꾸면 `[bug] head ... != ...` popup이 발생할 수 있다.
 
+GUI guard로 main checkout을 바꿀 수 없는 동안에는 lane close를 remote merge로 수행할 수 있다. 이때 authoritative production head는 `refs/remotes/<remote>/main`이고, commit lifecycle validator plan에는 `lifecycle.production_head_source: "remote"`를 기록한다. local `main` ref는 remote head의 ancestor로 뒤처진 채 유지되어야 하며(diverge 금지), 동기화는 guard가 해제된 뒤 fast-forward로 미룬다. 이 deferred 상태는 완료가 아니라 evidence에 명시하는 보류다.
+
 ## build와 process
 
-- final release build는 main physical worktree의 tagged source에서 실행한다.
+- final release build는 main physical worktree의 tagged source에서 실행한다. GUI guard로 그 checkout을 바꿀 수 없으면 같은 tag SHA의 clean alternate worktree에서 빌드하고 사용한 경로를 evidence에 기록한다.
 - `build.bat`의 build phase는 running root executable을 중단하거나 root artifact를 교체하지 않는다.
 - final candidate build에는 child environment로 `WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY=1`을 전달한다.
 - runtime·packaging release의 승격은 `tools/deploy_runtime.py`만 수행한다. helper는 candidate 검증 후 exact-path process tree 종료, backup, atomic replacement, launch, tray/Tk readiness와 heartbeat 검증을 하나의 transaction으로 수행한다.
@@ -55,7 +57,7 @@ linked worktree를 제거하기 전에:
 ## final state
 
 - current branch가 main인지 확인한다.
-- main이 origin/main과 clean/synced인지 확인한다.
+- main이 origin/main과 clean/synced인지 확인한다. GUI guard로 동기화를 미뤘다면 `main`이 `origin/main`의 ancestor로 clean/behind인 것과 deferred 사실을 기록하고, synced 확인은 guard 해제 후 follow-up으로 남긴다.
 - permanent executable metadata/hash를 read-back한다.
 - startup registry가 exact permanent path인지 확인한다.
 - temporary task worktree와 그 executable이 없거나 persistent runtime과 무관한지 확인한다.
