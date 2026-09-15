@@ -263,13 +263,42 @@ _PROFILE_LABEL_COLUMN_WIDTH_RATIO = 0.17
 _PROFILE_LABEL_FONT_PT = 8
 _PROFILE_LABEL_TEXT_END_GAP_PX = 6
 # Brand glyph box drawn at the row's left inset, before the profile label.
-# All three providers share the "C" initial, so the marks differ by shape:
-# Codex is a `>_` prompt, Cursor a pointer arrow, Claude a radial burst.
+# Codex draws its official knot-silhouette mark (sampled from the published
+# 24px SVG) with the `>_` knocked out in panel background; Cursor a pointer
+# arrow, Claude a radial burst.
 _PROVIDER_ICON_SIZE_PX = 10
 _PROVIDER_ICON_TO_LABEL_GAP_PX = 3
 _PROVIDER_ICON_COLUMN_WIDTH_PX = (
     _PROVIDER_ICON_SIZE_PX + _PROVIDER_ICON_TO_LABEL_GAP_PX
 )
+# Codex mark: blob silhouette sampled from the official SVG outline (scaled
+# to the 10px icon box), then the chevron and bar subpaths re-drawn in the
+# panel background color to reproduce the logo's knocked-out `>_`.
+_CODEX_BLOB_OUTLINE = (
+    3.37, 0.19, 4.42, 0.0, 5.43, 0.24, 6.13, 0.73, 6.17, 0.74, 7.24, 0.7,
+    7.95, 0.93, 8.82, 1.66, 9.24, 2.48, 9.34, 3.04, 9.31, 3.61, 9.27, 3.87,
+    9.58, 4.25, 9.99, 5.39, 9.75, 6.75, 9.02, 7.67, 8.14, 8.11, 8.1, 8.15,
+    7.88, 8.68, 7.28, 9.42, 5.94, 9.98, 4.7, 9.82, 3.87, 9.27, 3.82, 9.26,
+    3.41, 9.34, 2.78, 9.31, 1.9, 8.99, 1.17, 8.34, 1.02, 8.13, 0.87, 7.82,
+    0.69, 7.25, 0.73, 6.19, 0.74, 6.16, 0.73, 6.14, 0.38, 5.7, 0.08, 4.99,
+    0.0, 4.4, 0.08, 3.66, 0.64, 2.66, 1.25, 2.15, 1.45, 2.04, 1.67, 1.95,
+    1.86, 1.89, 1.89, 1.86, 2.25, 1.1, 2.82, 0.5, 3.37, 0.19,
+)
+_CODEX_CHEVRON_OUTLINE = (
+    3.03, 3.46, 2.9, 3.33, 2.73, 3.28, 2.55, 3.33, 2.42, 3.46, 2.37, 3.63,
+    2.42, 3.81, 3.13, 5.05, 2.42, 6.23, 2.38, 6.41, 2.43, 6.58, 2.55, 6.71,
+    2.73, 6.75, 2.9, 6.71, 3.03, 6.59, 3.84, 5.23, 3.87, 5.17, 3.88, 5.11,
+    3.89, 5.05, 3.88, 4.99, 3.87, 4.93, 3.84, 4.87, 3.03, 3.46, 3.03, 3.46,
+)
+_CODEX_BAR_OUTLINE = (
+    5.3, 6.06, 5.14, 6.11, 5.01, 6.24, 4.97, 6.41, 5.01, 6.58, 5.14, 6.71,
+    5.3, 6.77, 7.32, 6.77, 7.49, 6.71, 7.62, 6.59, 7.66, 6.41, 7.62, 6.24,
+    7.49, 6.11, 7.32, 6.06, 5.3, 6.06, 5.3, 6.06,
+)
+# Mid stop of the mark's blue->lavender brand gradient (#B1A7FF/#7A9DFF/
+# #3941FF); a single tone keeps the 10px silhouette readable on the panel.
+_CODEX_BRAND_COLOR = "#7a9dff"
+_CODEX_KNOCKOUT_COLOR = "#16181d"
 _STATUS_DOT_ONLY_WIDTH_PX = 14
 _STATUS_WITH_TEXT_WIDTH_PX = 24
 _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX = 420
@@ -756,37 +785,29 @@ def _draw_taskbar_provider_icon(
 ) -> None:
     """Draw the provider's small brand glyph in the row's left icon box.
 
-    All three provider names share the "C" initial, so the marks differ by
-    shape: Codex is a `>_` terminal prompt (OpenAI green), Cursor a pointer
-    arrow (monochrome brand), Claude a radial burst (coral). Unknown
-    providers get a neutral ring so the column never renders blank.
+    Codex renders its real mark: the knot-derived silhouette filled in the
+    brand violet with the `>_` knocked out in the panel background. Cursor
+    is a pointer arrow (monochrome brand), Claude a radial burst (coral).
+    Unknown providers get a neutral ring so the column never renders blank.
     """
     left = float(x)
     size = float(_PROVIDER_ICON_SIZE_PX)
     top = float(center_y) - size / 2.0
     key = str(provider or "").strip().lower()
     if key == "codex":
-        canvas.create_line(
-            left + 1.0,
-            top + 1.0,
-            left + 4.2,
-            top + size / 2.0,
-            left + 1.0,
-            top + size - 1.0,
-            fill="#10a37f",
-            width=1.6,
-            capstyle="round",
-            joinstyle="round",
-        )
-        canvas.create_line(
-            left + 5.4,
-            top + size - 1.4,
-            left + size - 0.8,
-            top + size - 1.4,
-            fill="#10a37f",
-            width=1.6,
-            capstyle="round",
-        )
+        blob = [
+            left + coord if index % 2 == 0 else top + coord
+            for index, coord in enumerate(_CODEX_BLOB_OUTLINE)
+        ]
+        canvas.create_polygon(*blob, fill=_CODEX_BRAND_COLOR, outline="")
+        for outline in (_CODEX_CHEVRON_OUTLINE, _CODEX_BAR_OUTLINE):
+            knockout = [
+                left + coord if index % 2 == 0 else top + coord
+                for index, coord in enumerate(outline)
+            ]
+            canvas.create_polygon(
+                *knockout, fill=_CODEX_KNOCKOUT_COLOR, outline=""
+            )
         return
     if key == "cursor":
         canvas.create_polygon(
