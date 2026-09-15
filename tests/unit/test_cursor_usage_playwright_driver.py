@@ -107,6 +107,38 @@ class CursorUsagePlaywrightDriverUnitTest(unittest.TestCase):
         self.assertTrue(chromium.calls[0]["chromium_sandbox"])
         self.assertNotIn("user_agent", chromium.calls[0])
 
+    def test_launch_suppresses_automation_fingerprints_for_oauth(self) -> None:
+        probe = {
+            "url": "https://cursor.com/dashboard/usage",
+            "mainText": "Included usage: 5 / 20",
+            "metricBlocks": [
+                {"metric_key": "cursor_account_summary", "block_text": "Included usage: 5 / 20"}
+            ],
+        }
+        chromium = _Chromium(_Context(_Page([probe])))
+        driver = CursorUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(chromium),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        call = chromium.calls[0]
+        self.assertIn("--enable-automation", call["ignore_default_args"])
+        self.assertNotIn("--enable-automation", call["args"])
+        self.assertIn(
+            "--disable-blink-features=AutomationControlled",
+            call["args"],
+            "navigator.webdriver must stay false for oauth sign-in",
+        )
+        self.assertIn(
+            "--test-type",
+            call["args"],
+            "chrome bad-flags prompt must be suppressed while the flag is in use",
+        )
+
     def test_login_page_is_reported_without_bypass(self) -> None:
         probe = {
             "url": "https://cursor.com/login",
