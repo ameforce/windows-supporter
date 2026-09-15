@@ -40,6 +40,8 @@ class WrikeSettingsView:
         self._flex_employee_number_var = None
         self._flex_interval_var = None
         self._overtime_interval_var = None
+        self._overtime_idle_enabled_var = None
+        self._overtime_idle_minutes_var = None
         self._flex_status_var = None
         self._status_var = None
         self._status_label = None
@@ -321,6 +323,8 @@ class WrikeSettingsView:
         self._flex_employee_number_var = tk.StringVar(value="")
         self._flex_interval_var = tk.StringVar(value="5")
         self._overtime_interval_var = tk.StringVar(value="10")
+        self._overtime_idle_enabled_var = tk.BooleanVar(value=True)
+        self._overtime_idle_minutes_var = tk.StringVar(value="5")
         self._flex_status_var = tk.StringVar(value="미설정")
 
         tk.Label(
@@ -355,6 +359,23 @@ class WrikeSettingsView:
 
         add_label("초과근무 툴팁 주기(분)")
         add_entry(self._overtime_interval_var)
+        row += 1
+
+        add_label("무입력 시 초과근무 자동 일시정지")
+        tk.Checkbutton(
+            content,
+            variable=self._overtime_idle_enabled_var,
+            bg=card_bg,
+            activebackground=card_bg,
+            selectcolor=card_bg,
+            fg="#111827",
+            activeforeground="#111827",
+            font=("Segoe UI", 9),
+        ).grid(row=row, column=1, sticky="w", pady=6)
+        row += 1
+
+        add_label("자동 일시정지까지 무입력(분)")
+        add_entry(self._overtime_idle_minutes_var)
         row += 1
 
         add_label("Flex 연동 상태")
@@ -1945,6 +1966,22 @@ class WrikeSettingsView:
                             )
                         )
                     )
+                if self._overtime_idle_enabled_var is not None:
+                    self._overtime_idle_enabled_var.set(
+                        bool(settings.get("overtime_idle_pause_enabled", True))
+                    )
+                if self._overtime_idle_minutes_var is not None:
+                    self._overtime_idle_minutes_var.set(
+                        str(
+                            max(
+                                1,
+                                min(
+                                    120,
+                                    int(settings.get("overtime_idle_pause_min", 5)),
+                                ),
+                            )
+                        )
+                    )
                 self._refresh_flex_status_from_backend(prompt=False, settings=settings)
             except Exception:
                 pass
@@ -2498,6 +2535,8 @@ class WrikeSettingsView:
             self._flex_employee_number_var,
             self._flex_interval_var,
             self._overtime_interval_var,
+            self._overtime_idle_enabled_var,
+            self._overtime_idle_minutes_var,
             self._lunch_enabled_var,
             self._lunch_start_var,
             self._lunch_end_var,
@@ -2580,6 +2619,16 @@ class WrikeSettingsView:
             if self._overtime_interval_var is not None
             else "10"
         )
+        overtime_idle_enabled = (
+            bool(self._overtime_idle_enabled_var.get())
+            if self._overtime_idle_enabled_var is not None
+            else True
+        )
+        overtime_idle_minutes_text = (
+            str(self._overtime_idle_minutes_var.get() or "").strip()
+            if self._overtime_idle_minutes_var is not None
+            else "5"
+        )
 
         lunch_enabled = (
             bool(self._lunch_enabled_var.get()) if self._lunch_enabled_var is not None else True
@@ -2660,6 +2709,13 @@ class WrikeSettingsView:
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
             return
+        overtime_idle_minutes, error = self._strict_positive_int(
+            overtime_idle_minutes_text,
+            "자동 일시정지까지 무입력(분)",
+        )
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
 
         daily_minutes = int(round(daily_hours * 60))
         tooltip_ms = int(round(tooltip_sec * 1000))
@@ -2674,6 +2730,8 @@ class WrikeSettingsView:
             "flex_employee_number": flex_employee_number,
             "flex_poll_interval_sec": int(flex_interval_minutes) * 60,
             "overtime_notice_interval_min": int(overtime_interval_minutes),
+            "overtime_idle_pause_enabled": bool(overtime_idle_enabled),
+            "overtime_idle_pause_min": int(overtime_idle_minutes),
             "lunch_break_enabled": lunch_enabled,
             "lunch_start_min": int(lunch_start_min),
             "lunch_end_min": int(lunch_end_min),
