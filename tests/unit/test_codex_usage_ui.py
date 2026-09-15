@@ -523,6 +523,98 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "활성화 · US$8.20\u00a0사용",
         )
 
+    def test_claude_metric_rows_use_five_hour_weekly_and_scoped_contract(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        fake_tk = _FakeTk()
+        view._tk = fake_tk
+
+        metric_vars, display_vars = view._build_account_metric_rows(
+            parent=object(),
+            bg="#FFFFFF",
+            provider="claude",
+        )
+
+        self.assertEqual(
+            set(metric_vars),
+            {
+                "captured_at",
+                "five_hour_limit",
+                "five_hour_limit_reset_at",
+                "weekly_limit",
+                "weekly_limit_reset_at",
+                "weekly_scoped_limit",
+                "weekly_scoped_limit_reset_at",
+                "on_demand_status",
+            },
+        )
+        self.assertEqual(display_vars["five_hour_limit"].get(), "-")
+        self.assertEqual(display_vars["weekly_limit"].get(), "-")
+        self.assertEqual(display_vars["weekly_scoped_limit"].get(), "-")
+        self.assertEqual(display_vars["on_demand_status"].get(), "-")
+
+        metric_vars["weekly_scoped_limit"].set("Opus 40%")
+        self.assertEqual(display_vars["weekly_scoped_limit"].get(), "Opus 40%")
+
+    def test_claude_metric_visibility_hides_unreported_rows(self) -> None:
+        fake_tk = _FakeTk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        five_hour = _GridTrackingLabel(fake_tk)
+        five_hour_reset = _GridTrackingLabel(fake_tk)
+        weekly = _GridTrackingLabel(fake_tk)
+        weekly_reset = _GridTrackingLabel(fake_tk)
+        scoped = _GridTrackingLabel(fake_tk)
+        scoped_reset = _GridTrackingLabel(fake_tk)
+        extra = _GridTrackingLabel(fake_tk)
+        view._account_metric_cells = {
+            "claude-1": {
+                "five_hour_limit": five_hour,
+                "five_hour_limit_reset_at": five_hour_reset,
+                "weekly_limit": weekly,
+                "weekly_limit_reset_at": weekly_reset,
+                "weekly_scoped_limit": scoped,
+                "weekly_scoped_limit_reset_at": scoped_reset,
+                "on_demand_status": extra,
+            },
+        }
+
+        view._update_account_metric_visibility(
+            "claude-1",
+            provider="claude",
+            descriptor_keys={"five_hour_limit"},
+            payload={
+                "five_hour_limit": "65%",
+                "on_demand_enabled": True,
+                "on_demand_status": "ON · $1.9 / $50",
+            },
+        )
+
+        self.assertEqual(five_hour.grid_calls, 1)
+        self.assertEqual(five_hour_reset.grid_calls, 1)
+        self.assertEqual(weekly.grid_remove_calls, 1)
+        self.assertEqual(weekly_reset.grid_remove_calls, 1)
+        self.assertEqual(scoped.grid_remove_calls, 1)
+        self.assertEqual(scoped_reset.grid_remove_calls, 1)
+        self.assertEqual(extra.grid_calls, 1)
+
+        # When a later snapshot reports the weekly + scoped model windows.
+        view._update_account_metric_visibility(
+            "claude-1",
+            provider="claude",
+            descriptor_keys=set(),
+            payload={
+                "five_hour_limit": "65%",
+                "weekly_limit": "86%",
+                "weekly_scoped_limit": "Opus 40%",
+                "on_demand_enabled": True,
+                "on_demand_status": "ON · $1.9 / $50",
+            },
+        )
+
+        self.assertEqual(weekly.grid_calls, 1)
+        self.assertEqual(weekly_reset.grid_calls, 1)
+        self.assertEqual(scoped.grid_calls, 1)
+        self.assertEqual(scoped_reset.grid_calls, 1)
+
     def test_usage_metric_values_are_localized_without_changing_amounts(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
 

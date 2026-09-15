@@ -86,6 +86,14 @@ class _FakeCanvas:
         self.ops.append(("oval", args, dict(kwargs)))
         return len(self.ops)
 
+    def create_line(self, *args, **kwargs):
+        self.ops.append(("line", args, dict(kwargs)))
+        return len(self.ops)
+
+    def create_polygon(self, *args, **kwargs):
+        self.ops.append(("polygon", args, dict(kwargs)))
+        return len(self.ops)
+
 
 class AiUsageTaskbarOverlayPaneTest(unittest.TestCase):
     @staticmethod
@@ -336,6 +344,64 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(metric["detail_value_text"], "US$0 / US$20")
         self.assertEqual(metric["reset_text"], "25d 00h 00m 00s")
         self.assertEqual(metric["reset_short_text"], "25d 00h 00m 00s")
+
+    def test_claude_profile_renders_five_hour_and_weekly_metric_descriptors(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "claude-1",
+                    "provider": "claude",
+                    "label": "Claude 1",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "fresh",
+                    "provider_status": "ready",
+                    "runtime": {"session_state": "logged_in"},
+                    "last_snapshot": {
+                        "captured_at": "2026-09-14T10:00:00+00:00",
+                    },
+                    "metrics": [
+                        {
+                            "key": "five_hour_limit",
+                            "short_label": "5H",
+                            "percent": 65.0,
+                            "value_text": "65%",
+                            "short_value_text": "65%",
+                            "reset_at": "2026-09-15T05:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        },
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 86.0,
+                            "value_text": "86%",
+                            "short_value_text": "86%",
+                            "reset_at": "2026-09-19T09:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        self.assertTrue(model["visible"])
+        bar = model["bars"][0]
+        self.assertEqual(bar["provider"], "claude")
+        self.assertEqual(bar["label"], "Claude 1")
+        self.assertEqual(bar["percent"], 65)
+        self.assertEqual(len(bar["metrics"]), 2)
+        first, second = bar["metrics"]
+        self.assertEqual(first["metric_key"], "five_hour_limit")
+        self.assertEqual(first["short_label"], "5H")
+        self.assertEqual(first["percent"], 65.0)
+        self.assertEqual(second["metric_key"], "weekly_limit")
+        self.assertEqual(second["short_label"], "7D")
+        self.assertEqual(second["percent"], 86.0)
 
     def test_taskbar_renderer_keeps_unreported_metrics_empty(self):
         runtime = {
@@ -1548,6 +1614,191 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             taskbar_overlay._profile_label_text_width(fitted),
             64,
         )
+
+    def test_provider_icon_column_reserves_width_before_the_label(self):
+        labels = ("Codex 1",)
+        label_width = taskbar_overlay._label_width_for_overlay_width(620, labels)
+        status_width = taskbar_overlay._status_width_for_overlay_width(620)
+
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            620,
+            [()],
+            profile_labels=labels,
+        )
+
+        self.assertEqual(
+            layouts[0].metrics_x,
+            6
+            + taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+            + label_width
+            + status_width
+            + taskbar_overlay._STATUS_TO_METRICS_GAP_PX,
+        )
+
+        # A metric-bearing row that fits keeps the icon column funded too.
+        model = build_codex_usage_taskbar_overlay_model(self._runtime())
+        funded = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            620,
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+        self.assertTrue(
+            all(
+                layout.icon_width
+                == taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+                for layout in funded
+            )
+        )
+
+    def test_draw_renders_provider_icons_left_of_profile_labels(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["provider"] = "codex"
+        runtime["accounts"][1]["provider"] = "cursor"
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        preferred_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+            model
+        )
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(
+            dict(
+                model,
+                geometry={
+                    "x": 1400,
+                    "y": 1000,
+                    "width": preferred_width,
+                    "height": 38,
+                    "orientation": "bottom",
+                    "visible": True,
+                },
+            )
+        )
+
+        icon_left = 6
+        label_x = icon_left + taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+        line_ops = [op for op in canvas.ops if op[0] == "line"]
+        polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
+        # Codex row: `>_` prompt (chevron + underscore) in OpenAI green.
+        self.assertEqual(len(line_ops), 2)
+        self.assertTrue(
+            all(op[2].get("fill") == "#10a37f" for op in line_ops)
+        )
+        self.assertTrue(
+            all(
+                icon_left <= coord <= icon_left + 10
+                for op in line_ops
+                for coord in op[1][::2]
+            )
+        )
+        # Cursor row: pointer arrow in the brand's monochrome white.
+        self.assertEqual(len(polygon_ops), 1)
+        self.assertEqual(polygon_ops[0][2].get("fill"), "#f8fafc")
+        self.assertTrue(
+            all(
+                icon_left <= coord <= icon_left + 10
+                for coord in polygon_ops[0][1][::2]
+            )
+        )
+        # Both icon marks stay inside the reserved icon box.
+        row_height = (38 - 8) // 2
+        self.assertTrue(all(op[1][1] < 4 + row_height for op in line_ops))
+        self.assertGreater(polygon_ops[0][1][1], 4 + row_height)
+        # Labels shift right by the icon column.
+        label_ops = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("font") == ("Segoe UI", 8, "bold")
+        ]
+        self.assertEqual(len(label_ops), 2)
+        self.assertEqual(label_ops[0][1][0], label_x)
+        self.assertEqual(label_ops[1][1][0], label_x)
+
+    def test_draw_renders_claude_burst_and_neutral_ring_for_unknown_provider(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["provider"] = "claude"
+        runtime["accounts"][1]["provider"] = "future-provider"
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(
+            dict(
+                model,
+                geometry={
+                    "x": 1400,
+                    "y": 1000,
+                    "width": 620,
+                    "height": 38,
+                    "orientation": "bottom",
+                    "visible": True,
+                },
+            )
+        )
+
+        polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
+        self.assertEqual(len(polygon_ops), 1)
+        self.assertEqual(polygon_ops[0][2].get("fill"), "#d97757")
+        # 16 vertices (8-spoke burst) => 32 coordinate values.
+        self.assertEqual(len(polygon_ops[0][1]), 32)
+        # Unknown providers draw the neutral ring; the status dot is the only
+        # other oval, so the ring is the one in the icon column's x range.
+        ring_ops = [
+            op
+            for op in canvas.ops
+            if op[0] == "oval" and op[1][0] < 6 + 10
+        ]
+        self.assertEqual(len(ring_ops), 1)
+        self.assertEqual(ring_ops[0][2].get("outline"), "#94a3b8")
+
+    def test_draw_omits_provider_icon_when_slot_drops_the_icon_column(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["provider"] = "codex"
+        runtime["accounts"][1]["provider"] = "cursor"
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        # 440px cannot fund the icon column beside this runtime's required
+        # metric widths, so the glyph must stay undrawn and labels keep the
+        # original left inset.
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            440,
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+        self.assertTrue(all(layout.icon_width == 0 for layout in row_layouts))
+
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        overlay._draw(
+            dict(
+                model,
+                geometry={
+                    "x": 1400,
+                    "y": 1000,
+                    "width": 440,
+                    "height": 38,
+                    "orientation": "bottom",
+                    "visible": True,
+                },
+            )
+        )
+
+        self.assertFalse(
+            [
+                op
+                for op in canvas.ops
+                if op[0] in {"line", "polygon"}
+            ]
+        )
+        label_ops = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("font") == ("Segoe UI", 8, "bold")
+        ]
+        self.assertTrue(label_ops)
+        self.assertTrue(all(op[1][0] == 6 for op in label_ops))
 
     def test_draw_keeps_metric_columns_clear_when_preferred_cap_shows_status_text(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -4861,7 +5112,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 514)
+        self.assertEqual(width, 527)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
@@ -4880,7 +5131,18 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         _narrower_offset, narrower_wide_width, _narrower_progress = (
             narrower_row_layout.segment_geometry(wide_index)
         )
-        self.assertLess(narrower_wide_width, required_wide_segment)
+        # The provider icon is chrome: 8px below the funded width it yields
+        # first, so the widest segment still keeps its required width.
+        self.assertEqual(narrower_row_layout.icon_width, 0)
+        self.assertGreaterEqual(narrower_wide_width, required_wide_segment)
+        below_text_fit = taskbar_overlay._metric_row_layout_for_overlay_width(
+            width - taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX - 8 - 1,
+            (narrow_metric, wide_metric),
+        )
+        _below_offset, below_wide_width, _below_progress = (
+            below_text_fit.segment_geometry(wide_index)
+        )
+        self.assertLess(below_wide_width, required_wide_segment)
         layout = taskbar_overlay._fit_metric_segment_layout(
             wide_segment_width,
             wide_metric["reset_text"],
@@ -6005,8 +6267,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
-        self.assertIn("430x", window.geometry_calls[-1])
-        self.assertIn("+1062+", window.geometry_calls[-1])
+        self.assertIn("443x", window.geometry_calls[-1])
+        self.assertIn("+1049+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_hard_resamples_changed_slot_after_scheduled_delay(self):
         root = _FakeRoot()
@@ -6050,8 +6312,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(overlay._last_geometry_hard_resample_at, 101.0)
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("430x", window.geometry_calls[-1])
-        self.assertIn("+1062+", window.geometry_calls[-1])
+        self.assertIn("443x", window.geometry_calls[-1])
+        self.assertIn("+1049+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_reuses_runtime_snapshot_and_now_for_width_change(self):
         root = _FakeRoot()
@@ -6398,9 +6660,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 1)
-        self.assertIn("430x", window.geometry_calls[-1])
+        self.assertIn("443x", window.geometry_calls[-1])
         # After the empty-slot gap recovers, content-fit width remains preferred.
-        self.assertRegex(window.geometry_calls[-1], r"430x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"443x38\+\d+\+")
 
     def test_geometry_monitor_defers_transient_width_shrink_without_jitter(self):
         root = _FakeRoot()
@@ -6539,7 +6801,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
-        self.assertIn("+1342+", window.geometry_calls[-1])
+        self.assertIn("+1329+", window.geometry_calls[-1])
 
     def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
@@ -6932,10 +7194,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         geometry_tick()
 
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("430x", window.geometry_calls[-1])
-        # Content-fit preferred width reflects the compact profile-label column;
-        # confirmed slot-edge move updates x only.
-        self.assertRegex(window.geometry_calls[-1], r"430x38\+\d+\+")
+        self.assertIn("443x", window.geometry_calls[-1])
+        # Content-fit preferred width reflects the provider icon column and
+        # the compact profile-label column; confirmed slot-edge move updates
+        # x only.
+        self.assertRegex(window.geometry_calls[-1], r"443x38\+\d+\+")
 
     def test_geometry_monitor_accepts_no_slot_when_work_area_context_changes(self):
         root = _FakeRoot()
@@ -8250,6 +8513,16 @@ class _MeasuringCanvas:
     def create_oval(self, *args, **kwargs):
         item = len(self.ops) + 1
         self.ops.append(("oval", args, dict(kwargs)))
+        return item
+
+    def create_line(self, *args, **kwargs):
+        item = len(self.ops) + 1
+        self.ops.append(("line", args, dict(kwargs)))
+        return item
+
+    def create_polygon(self, *args, **kwargs):
+        item = len(self.ops) + 1
+        self.ops.append(("polygon", args, dict(kwargs)))
         return item
 
     def bbox(self, item):
