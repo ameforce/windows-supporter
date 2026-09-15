@@ -1578,9 +1578,11 @@ def _metric_rows_layout_for_overlay_width(
                     or metric.get("reset_badge_short_label")
                     or ""
                 ),
-                metric_key=key,
+                metric_key=str(metric.get("metric_key") or ""),
             )
-            if reserved_reset > reserved_reset_by_slot.get(key, 0):
+            # Store even a 0 reservation (credit) so slot lookups never fall
+            # back to the legacy flat weekly column.
+            if reserved_reset > reserved_reset_by_slot.get(key, -1):
                 reserved_reset_by_slot[key] = reserved_reset
 
     base_need = sum(required_by_slot.values()) + segment_gap * max(0, counts - 1)
