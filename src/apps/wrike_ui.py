@@ -1910,6 +1910,38 @@ class WrikeSettingsView:
         self._schedule_autosave()
         return
 
+    def refresh_overtime_idle_settings(self) -> None:
+        try:
+            settings = self._wrike.get_settings_snapshot()
+        except Exception:
+            return
+        if not isinstance(settings, dict):
+            return
+        previous_loading = self._loading_settings
+        self._loading_settings = True
+        try:
+            if self._overtime_idle_enabled_var is not None:
+                self._overtime_idle_enabled_var.set(
+                    bool(settings.get("overtime_idle_pause_enabled", True))
+                )
+            if self._overtime_idle_minutes_var is not None:
+                self._overtime_idle_minutes_var.set(
+                    str(
+                        max(
+                            1,
+                            min(
+                                120,
+                                int(settings.get("overtime_idle_pause_min", 5)),
+                            ),
+                        )
+                    )
+                )
+        except Exception:
+            pass
+        finally:
+            self._loading_settings = previous_loading
+        return
+
     def _load_settings(self) -> None:
         self._loading_settings = True
         try:
