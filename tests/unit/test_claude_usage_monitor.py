@@ -370,6 +370,165 @@ class ClaudeUsageMonitorUnitTest(unittest.TestCase):
         self.assertFalse(reading.is_usable)
         self.assertIn("로그인", reading.message)
 
+    def test_cloudflare_challenge_is_not_reported_as_logged_out(self) -> None:
+        session = self._Session(
+            [BrowserOperationResult(error="cloudflare_challenge")]
+        )
+        monitor = ClaudeUsageMonitor(
+            profile_id="claude-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        reading = monitor.collect()
+
+        self.assertNotEqual(reading.state, UsageState.LOGGED_OUT)
+        runtime = monitor.get_runtime_status()
+        self.assertNotEqual(runtime["provider_status"], "login")
+        self.assertEqual(runtime["provider_status"], "retrying")
+        self.assertNotEqual(runtime["session_state"], "logged_out")
+        self.assertNotEqual(runtime["monitor_state"], "paused_auth_required")
+
+    def test_cloudflare_challenge_keeps_usable_cache_as_stale(self) -> None:
+        now = [datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc)]
+        session = self._Session(
+            [
+                BrowserOperationResult(probe=self._probe()),
+                BrowserOperationResult(error="cloudflare_challenge"),
+            ]
+        )
+        monitor = ClaudeUsageMonitor(
+            profile_id="claude-personal",
+            browser_session_factory=lambda _config: session,
+            clock=lambda: now[0],
+        )
+        first = monitor.collect()
+        now[0] += timedelta(minutes=20)
+
+        stale = monitor.collect(force=True)
+
+        self.assertEqual(first.state, UsageState.READY)
+        self.assertEqual(stale.state, UsageState.STALE)
+        self.assertTrue(stale.is_usable)
+        runtime = monitor.get_runtime_status()
+        self.assertEqual(runtime["provider_status"], "stale")
+        self.assertEqual(runtime["session_state"], "logged_in")
+        self.assertEqual(runtime["monitor_state"], "idle")
+
+    def test_profile_name_from_probe_is_reported_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            profile_dir = Path(tmp) / "profile"
+            session = self._Session(
+                [
+                    BrowserOperationResult(
+                        probe=self._probe(
+                            profileName="테스트 사용자",
+                            profileNameSource="account",
+                        )
+                    )
+                ]
+            )
+            monitor = ClaudeUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                browser_session_factory=lambda _config: session,
+            )
+
+            monitor.collect()
+
+            self.assertEqual(
+                monitor.get_runtime_status()["profile_name"], "테스트 사용자"
+            )
+            state_payload = json.loads(
+                (config_dir / "claude_usage_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(state_payload["profile_name"], "테스트 사용자")
+            self.assertTrue(state_payload["profile_name_verified"])
+
+            restored = ClaudeUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                browser_session_factory=lambda _config: self._Session([]),
+            )
+            self.assertEqual(
+                restored.get_runtime_status()["profile_name"], "테스트 사용자"
+            )
+
+    def test_verified_profile_name_keeps_plan_suffix(self) -> None:
+        session = self._Session(
+            [
+                BrowserOperationResult(
+                    probe=self._probe(
+                        profileName="Devin Team",
+                        profileNameSource="organization",
+                    )
+                )
+            ]
+        )
+        monitor = ClaudeUsageMonitor(
+            profile_id="claude-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        monitor.collect()
+
+        self.assertEqual(
+            monitor.get_runtime_status()["profile_name"], "Devin Team"
+        )
+
+    def test_verified_profile_name_survives_state_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            profile_dir = Path(tmp) / "profile"
+            session = self._Session(
+                [
+                    BrowserOperationResult(
+                        probe=self._probe(
+                            profileName="Devin Team",
+                            profileNameSource="organization",
+                        )
+                    )
+                ]
+            )
+            monitor = ClaudeUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                browser_session_factory=lambda _config: session,
+            )
+            monitor.collect()
+
+            restored = ClaudeUsageMonitor(
+                config_dir=str(config_dir),
+                profile_dir=str(profile_dir),
+                browser_session_factory=lambda _config: self._Session([]),
+            )
+
+            self.assertEqual(
+                restored.get_runtime_status()["profile_name"], "Devin Team"
+            )
+
+    def test_dom_sourced_profile_name_is_still_label_filtered(self) -> None:
+        session = self._Session(
+            [
+                BrowserOperationResult(
+                    probe=self._probe(
+                        profileName="Account menu",
+                        profileNameSource="dom",
+                    )
+                )
+            ]
+        )
+        monitor = ClaudeUsageMonitor(
+            profile_id="claude-personal",
+            browser_session_factory=lambda _config: session,
+        )
+
+        monitor.collect()
+
+        self.assertEqual(monitor.get_runtime_status()["profile_name"], "")
+
     def test_failure_preserves_last_success_as_stale_with_weekly_extras(self) -> None:
         now = [datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc)]
         session = self._Session(
@@ -705,6 +864,9 @@ class ClaudeUsageMonitorUnitTest(unittest.TestCase):
         self.assertIn("claude_usage_summary", lowered)
         self.assertIn("claude_auth_required", lowered)
         self.assertIn("claude_rate_limited", lowered)
+        self.assertIn("claude_cf_challenge", lowered)
+        self.assertIn("cf-mitigated", lowered)
+        self.assertIn("/api/account", lowered)
         self.assertIn("lastactiveorg", lowered)
         self.assertIn("collectprofilename", lowered)
         self.assertNotIn("localstorage", lowered)

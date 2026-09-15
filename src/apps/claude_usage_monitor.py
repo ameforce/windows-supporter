@@ -101,6 +101,25 @@ async () => {
         credentials: 'include',
         headers: {Accept: 'application/json'},
       });
+      const contentType = String(
+        response.headers.get('content-type') || ''
+      ).toLowerCase();
+      const cfMitigated = String(
+        response.headers.get('cf-mitigated') || ''
+      ).toLowerCase();
+      // Cloudflare challenge/interstitial responses are not API answers: they
+      // carry cf-mitigated headers or HTML bodies. A real Claude auth failure
+      // is a JSON 401/403 from the API itself.
+      if (cfMitigated.indexOf('challenge') !== -1) {
+        return {challenge: true, status: response.status};
+      }
+      if (contentType.indexOf('json') === -1) {
+        const redirectedUrl = String(response.url || '').toLowerCase();
+        if (response.redirected && /\/(login|signin|logout)/.test(redirectedUrl)) {
+          return {authRequired: true};
+        }
+        return {challenge: true, status: response.status};
+      }
       if (response.status === 401 || response.status === 403) {
         return {authRequired: true};
       }
@@ -170,12 +189,17 @@ async () => {
   const blocks = [];
   let authRequired = false;
   let rateLimited = false;
+  let challenge = false;
   let apiPayload = null;
   let organizationName = '';
   let organizationId = '';
+  let accountName = '';
+  let accountEmailLocal = '';
 
   const orgsResult = await fetchJson('/api/organizations');
-  if (orgsResult.authRequired) {
+  if (orgsResult.challenge) {
+    challenge = true;
+  } else if (orgsResult.authRequired) {
     authRequired = true;
   } else if (orgsResult.rateLimited) {
     rateLimited = true;
@@ -195,10 +219,27 @@ async () => {
     if (org) {
       organizationId = clean(org.uuid);
       organizationName = clean(org.name);
+      // Identity enrichment only: the organizations response already proved
+      // the session is authenticated, so an account failure must never feed
+      // auth/challenge classification.
+      const accountResult = await fetchJson('/api/account');
+      if (accountResult.data && typeof accountResult.data === 'object') {
+        const account = accountResult.data;
+        accountName = clean(
+          account.full_name || account.display_name || account.name ||
+          account.given_name || account.preferred_name
+        );
+        const accountEmail = clean(account.email_address || account.email);
+        if (accountEmail.indexOf('@') > 0) {
+          accountEmailLocal = clean(accountEmail.split('@')[0]);
+        }
+      }
       const usageResult = await fetchJson(
         '/api/organizations/' + encodeURIComponent(organizationId) + '/usage'
       );
-      if (usageResult.authRequired) {
+      if (usageResult.challenge) {
+        challenge = true;
+      } else if (usageResult.authRequired) {
         authRequired = true;
       } else if (usageResult.rateLimited) {
         rateLimited = true;
@@ -221,24 +262,57 @@ async () => {
       block_text: JSON.stringify(apiPayload).slice(0, 8000),
     });
   }
+  const pageChallenge =
+    /cf_chl/i.test(String(location.href || '')) ||
+    /just a moment|잠시만\s*기다리|보안\s*확인/i.test(clean(document.title)) ||
+    Boolean(document.querySelector(
+      'script[src*="challenge-platform"], #challenge-stage, #cf-chl-widget, ' +
+      '.cf-browser-verification, #challenge-error-text'
+    ));
+
   if (summaryText && /usage|사용량|session|세션|weekly|주간/i.test(summaryText)) {
     blocks.push({
       metric_key: 'claude_usage_summary',
       block_text: summaryText,
     });
   }
-  if (authRequired) {
+  // A real API payload is decisive: residual edge markers or a challenged
+  // sub-request must not veto collected data.
+  if ((challenge || pageChallenge) && !apiPayload) {
+    blocks.push({metric_key: 'claude_cf_challenge', block_text: 'cf_challenge'});
+  }
+  if (authRequired && !apiPayload) {
     blocks.push({metric_key: 'claude_auth_required', block_text: 'auth_required'});
   }
-  if (rateLimited) {
+  if (rateLimited && !apiPayload) {
     blocks.push({metric_key: 'claude_rate_limited', block_text: 'rate_limited'});
+  }
+
+  let profileName = '';
+  let profileNameSource = '';
+  if (accountName) {
+    profileName = accountName;
+    profileNameSource = 'account';
+  } else if (organizationName) {
+    profileName = organizationName;
+    profileNameSource = 'organization';
+  } else {
+    const domName = collectProfileName();
+    if (domName) {
+      profileName = domName;
+      profileNameSource = 'dom';
+    } else if (accountEmailLocal) {
+      profileName = accountEmailLocal;
+      profileNameSource = 'email';
+    }
   }
 
   return {
     url: String(location.href || ''),
     title: clean(document.title),
     mainText: summaryText || loginText || cleanLines(document.body ? document.body.innerText : '').slice(0, 800),
-    profileName: collectProfileName() || organizationName,
+    profileName: profileName,
+    profileNameSource: profileNameSource,
     accountId: organizationId,
     metricBlocks: blocks,
   };
@@ -975,9 +1049,10 @@ def _browser_error_state(error: object) -> UsageState:
     if key in {
         BrowserErrorCode.LOGIN_REQUIRED.value,
         BrowserErrorCode.LOGIN_WINDOW_CLOSED.value,
-        BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
     }:
         return UsageState.LOGGED_OUT
+    if key == BrowserErrorCode.CLOUDFLARE_CHALLENGE.value:
+        return UsageState.UNKNOWN
     if key in {
         BrowserErrorCode.COMMAND_TIMEOUT.value,
         "navigation_timeout",
@@ -1148,6 +1223,7 @@ class ClaudeUsageMonitor:
             state=UsageState.UNKNOWN,
         )
         self._profile_name = ""
+        self._profile_name_verified = False
         self._session_used_percent: float | None = None
         self._session_reset_at = ""
         self._weekly_used_percent: float | None = None
@@ -1402,6 +1478,7 @@ class ClaudeUsageMonitor:
                 pass
             captured_at = _iso_now(self._clock)
             self._profile_name = ""
+            self._profile_name_verified = False
             self._session_used_percent = None
             self._session_reset_at = ""
             self._weekly_used_percent = None
@@ -1502,7 +1579,12 @@ class ClaudeUsageMonitor:
             )
         from src.apps.codex_usage_monitor import sanitize_profile_name
 
-        profile_name = sanitize_profile_name(probe.get("profileName", ""))
+        name_source = str(probe.get("profileNameSource", "") or "").strip().lower()
+        verified = name_source in {"account", "organization", "email"}
+        profile_name = sanitize_profile_name(
+            probe.get("profileName", ""),
+            verified=verified,
+        )
         api_text = ""
         summary_text = ""
         for block in probe.get("metricBlocks", []):
@@ -1529,6 +1611,7 @@ class ClaudeUsageMonitor:
             )
         # Successful usage scrape owns identity: empty profileName clears stale names.
         self._profile_name = profile_name
+        self._profile_name_verified = bool(verified and profile_name)
         self._session_used_percent = parsed.session_used_percent
         self._session_reset_at = parsed.session_reset_at
         self._weekly_used_percent = parsed.weekly_used_percent
@@ -1591,6 +1674,11 @@ class ClaudeUsageMonitor:
         reading: AiUsageReading,
     ) -> UsageErrorType:
         if result.error:
+            error_key = str(result.error).strip().lower()
+            if error_key == BrowserErrorCode.CLOUDFLARE_CHALLENGE.value:
+                # An edge challenge is environmental and retryable; it must
+                # not pin the provider to the auth-required "OUT" projection.
+                return UsageErrorType.TRANSIENT
             return normalize_usage_error_type(result.error)
         if reading.last_error_state is not None:
             return normalize_usage_error_type(reading.last_error_state.value)
@@ -1810,9 +1898,14 @@ class ClaudeUsageMonitor:
         self._extra_usage_text = str(data.get("extra_usage_text") or "").strip()
         from src.apps.codex_usage_monitor import sanitize_profile_name
 
-        profile_name = sanitize_profile_name(data.get("profile_name", ""))
+        profile_name_verified = data.get("profile_name_verified") is True
+        profile_name = sanitize_profile_name(
+            data.get("profile_name", ""),
+            verified=profile_name_verified,
+        )
         if profile_name:
             self._profile_name = profile_name
+            self._profile_name_verified = profile_name_verified
 
     def _save_last_success(self, reading: AiUsageReading) -> None:
         if (
@@ -1836,6 +1929,7 @@ class ClaudeUsageMonitor:
                     "reset_precision": reading.reset_precision,
                     "on_demand_enabled": reading.on_demand_enabled,
                     "profile_name": str(self._profile_name or ""),
+                    "profile_name_verified": bool(self._profile_name_verified),
                     "session_used_percent": self._session_used_percent,
                     "session_reset_at": self._session_reset_at,
                     "weekly_used_percent": self._weekly_used_percent,

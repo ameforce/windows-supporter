@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import os
 import time
+from urllib.parse import urlsplit
 
 from src.apps.codex_usage_browser_types import (
     BrowserErrorCode,
@@ -78,6 +79,7 @@ class ClaudeUsagePlaywrightDriver:
         self._page_success_count = 0
         self._page_crashed = False
         self._shutdown = False
+        self._cached_user_agent: str | None = None
         self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
 
     def start(self) -> BrowserOperationResult:
@@ -102,6 +104,12 @@ class ClaudeUsagePlaywrightDriver:
                 raise RuntimeError("Page crashed")
             if probe is None:
                 raise RuntimeError("usage probe did not return an object")
+            # A real API payload is decisive: residual challenge/login signals
+            # must not discard collected usage data.
+            if self._has_api_data(probe):
+                self._page_success_count += 1
+                self._set_status(BrowserState.HEADLESS_READY)
+                return BrowserOperationResult(probe=probe)
             if self._is_cloudflare(probe):
                 return self._fail(BrowserErrorCode.CLOUDFLARE_CHALLENGE.value)
             if self._is_login_required(probe):
@@ -131,8 +139,14 @@ class ClaudeUsagePlaywrightDriver:
                 wait_until="domcontentloaded",
             )
             probe = self._evaluate_probe_until_terminal(page)
-            # Auth/challenge markers take precedence over summary presence: a
-            # login wall can still contain usage-like text in its footer.
+            # A real API payload proves the session is authenticated and wins
+            # over any residual markers; other auth/challenge markers take
+            # precedence over summary presence because a login wall can still
+            # contain usage-like text in its footer.
+            if probe is not None and self._has_api_data(probe):
+                self._close_context()
+                self._set_status(BrowserState.STOPPED)
+                return BrowserOperationResult(probe=probe)
             if probe is not None and self._is_cloudflare(probe):
                 return self._fail(
                     BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
@@ -170,6 +184,10 @@ class ClaudeUsagePlaywrightDriver:
             return self._fail(BrowserErrorCode.LOGIN_WINDOW_CLOSED.value)
         try:
             probe = self._evaluate_probe_until_terminal(page)
+            if probe is not None and self._has_api_data(probe):
+                self._close_context()
+                self._set_status(BrowserState.STOPPED)
+                return BrowserOperationResult(probe=probe)
             if probe is not None and self._is_cloudflare(probe):
                 return self._fail(
                     BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
@@ -256,6 +274,23 @@ class ClaudeUsagePlaywrightDriver:
                 return self._replace_page()
             return self._page
         self._close_context()
+        page = self._launch_context(headless=headless)
+        if headless and self._cached_user_agent is None:
+            try:
+                user_agent = page.evaluate("() => navigator.userAgent")
+            except Exception:
+                self._close_context()
+                raise
+            if isinstance(user_agent, str) and user_agent:
+                self._cached_user_agent = user_agent.replace(
+                    "HeadlessChrome", "Chrome"
+                )
+                if user_agent != self._cached_user_agent:
+                    self._close_context()
+                    page = self._launch_context(headless=True)
+        return page
+
+    def _launch_context(self, *, headless: bool) -> PageLike:
         if self._playwright is None:
             raise RuntimeError("playwright unavailable")
         os.makedirs(self._config.profile_dir, exist_ok=True)
@@ -272,6 +307,7 @@ class ClaudeUsagePlaywrightDriver:
                 "--test-type",
             ],
             ignore_default_args=["--enable-automation"],
+            user_agent=self._cached_user_agent if headless else None,
             timeout=float(self._config.navigation_timeout_ms),
         )
         self._headless = headless
@@ -320,21 +356,33 @@ class ClaudeUsagePlaywrightDriver:
 
     def _evaluate_probe_until_terminal(self, page: PageLike) -> UsageProbePayload | None:
         last_probe: UsageProbePayload | None = None
+        # Bounded by both attempts and wall-clock: each probe issues several
+        # sequential fetches, so a persistent challenge must not run the
+        # command-timeout budget to zero.
+        deadline = time.monotonic() + 8.0
         for attempt in range(21):
             probe = parse_usage_probe(page.evaluate(self._config.probe_script))
             if probe is None:
                 return None
             last_probe = probe
-            if (
-                self._has_summary(probe)
-                or self._is_login_required(probe)
-                or self._is_cloudflare(probe)
-                or self._is_rate_limited(probe)
-            ):
+            if self._has_summary(probe) or self._is_rate_limited(probe):
                 return probe
-            if attempt < 20:
+            # Cloudflare challenges clear on their own while the page settles;
+            # keep polling instead of reporting a terminal state.
+            if self._is_login_required(probe) and not self._is_cloudflare(probe):
+                return probe
+            if attempt < 20 and time.monotonic() < deadline:
                 self._sleep(0.25)
+                continue
+            break
         return last_probe
+
+    @staticmethod
+    def _has_api_data(probe: UsageProbePayload) -> bool:
+        return any(
+            str(block.get("metric_key", "")) == "claude_usage_api"
+            for block in probe.get("metricBlocks", [])
+        )
 
     @staticmethod
     def _has_summary(probe: UsageProbePayload) -> bool:
@@ -352,10 +400,14 @@ class ClaudeUsagePlaywrightDriver:
         ):
             return True
         url = str(probe.get("url", "")).lower()
+        path = urlsplit(url).path
         combined = " ".join(
             str(probe.get(key, "")) for key in ("title", "mainText")
         ).lower()
-        return any(token in url for token in ("/login", "/signin", "/auth")) or any(
+        return any(
+            path == token or path.startswith(token + "/")
+            for token in ("/login", "/signin", "/auth", "/logout")
+        ) or any(
             marker in combined
             for marker in (
                 "sign in",
@@ -369,6 +421,13 @@ class ClaudeUsagePlaywrightDriver:
 
     @staticmethod
     def _is_cloudflare(probe: UsageProbePayload) -> bool:
+        if any(
+            str(block.get("metric_key", "")) == "claude_cf_challenge"
+            for block in probe.get("metricBlocks", [])
+        ):
+            return True
+        if "cf_chl" in str(probe.get("url", "")).lower():
+            return True
         combined = " ".join(
             str(probe.get(key, "")) for key in ("title", "mainText")
         ).lower()
@@ -379,6 +438,11 @@ class ClaudeUsagePlaywrightDriver:
                 "verify you are human",
                 "checking your browser",
                 "challenge-platform",
+                "challenge-error-text",
+                "just a moment",
+                "cdn-cgi",
+                "잠시만 기다리",
+                "보안 확인",
             )
         )
 

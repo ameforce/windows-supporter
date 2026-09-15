@@ -9,6 +9,13 @@ from src.apps.claude_usage_playwright_driver import (
 )
 
 
+HEADLESS_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) HeadlessChrome/152.0.0.0 Safari/537.36"
+)
+NORMAL_USER_AGENT = HEADLESS_USER_AGENT.replace("HeadlessChrome", "Chrome")
+
+
 class _Page:
     def __init__(self, probes: list[dict[str, object]]) -> None:
         self.url = "about:blank"
@@ -16,6 +23,7 @@ class _Page:
         self.calls: list[str] = []
         self.closed = False
         self.handlers: dict[str, object] = {}
+        self.user_agent = HEADLESS_USER_AGENT
 
     def goto(self, url: str, *, timeout: int, wait_until: str) -> None:
         _ = timeout, wait_until
@@ -26,8 +34,10 @@ class _Page:
         _ = timeout, wait_until
         self.calls.append("reload")
 
-    def evaluate(self, _script: str) -> dict[str, object]:
+    def evaluate(self, script: str) -> object:
         self.calls.append("evaluate")
+        if "navigator.userAgent" in str(script):
+            return self.user_agent
         return self.probes.pop(0)
 
     def is_closed(self) -> bool:
@@ -108,7 +118,7 @@ class ClaudeUsagePlaywrightDriverUnitTest(unittest.TestCase):
         self.assertEqual(chromium.calls[0]["user_data_dir"], "C:/app-owned/claude-profile")
         self.assertEqual(chromium.calls[0]["channel"], "chrome")
         self.assertTrue(chromium.calls[0]["chromium_sandbox"])
-        self.assertNotIn("user_agent", chromium.calls[0])
+        self.assertIsNone(chromium.calls[0]["user_agent"])
 
     def test_launch_suppresses_automation_fingerprints_for_oauth(self) -> None:
         probe = {
@@ -328,6 +338,246 @@ class ClaudeUsagePlaywrightDriverUnitTest(unittest.TestCase):
         self.assertEqual(result.error, "login_required")
         self.assertIsNone(result.probe)
         self.assertTrue(driver.get_runtime_status().login_window_open)
+
+    def test_headless_collect_relaunches_with_non_headless_user_agent(self) -> None:
+        probe = {
+            "url": "https://claude.ai/settings/usage",
+            "mainText": "Current session 12% used",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_usage_api",
+                    "block_text": '{"usage": {"five_hour": {"utilization": 12.0}}}',
+                }
+            ],
+        }
+        page = _Page([probe])
+        chromium = _Chromium(_Context(page))
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(chromium),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        self.assertEqual(len(chromium.calls), 2)
+        self.assertIsNone(chromium.calls[0]["user_agent"])
+        self.assertEqual(chromium.calls[1]["user_agent"], NORMAL_USER_AGENT)
+        self.assertNotIn("Headless", chromium.calls[1]["user_agent"])
+
+    def test_headless_collect_reuses_cached_user_agent_without_relaunch(self) -> None:
+        probe = {
+            "url": "https://claude.ai/settings/usage",
+            "mainText": "Current session 12% used",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_usage_api",
+                    "block_text": '{"usage": {"five_hour": {"utilization": 12.0}}}',
+                }
+            ],
+        }
+        page = _Page([dict(probe), dict(probe)])
+        chromium = _Chromium(_Context(page))
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(chromium),
+            sleep=lambda _delay: None,
+        )
+        driver.collect()
+        driver.close_session()
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        self.assertEqual(len(chromium.calls), 3)
+        self.assertEqual(chromium.calls[2]["user_agent"], NORMAL_USER_AGENT)
+
+    def test_headed_login_launch_uses_browser_default_user_agent(self) -> None:
+        page = _Page(
+            [
+                {
+                    "url": "https://claude.ai/login",
+                    "mainText": "Log in",
+                    "metricBlocks": [],
+                }
+            ]
+        )
+        chromium = _Chromium(_Context(page))
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(chromium),
+            sleep=lambda _delay: None,
+        )
+
+        driver.open_login()
+
+        self.assertEqual(len(chromium.calls), 1)
+        self.assertFalse(chromium.calls[0]["headless"])
+        self.assertIsNone(chromium.calls[0]["user_agent"])
+
+    def test_korean_cloudflare_challenge_is_not_reported_as_login(self) -> None:
+        challenge_probe = {
+            "url": "https://claude.ai/settings/usage?__cf_chl_rt_tk=token",
+            "title": "잠시만 기다리십시오…",
+            "mainText": (
+                "claude.ai\n보안 확인 수행 중\n"
+                "claude.ai에서 이 요청이 봇이 아닌 실제 사용자의 요청인지 "
+                "확인해야 합니다."
+            ),
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_cf_challenge",
+                    "block_text": "cf_challenge",
+                }
+            ],
+        }
+        page = _Page([challenge_probe] * 21)
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(_Chromium(_Context(page))),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, "cloudflare_challenge")
+        self.assertNotEqual(result.error, "login_required")
+
+    def test_cloudflare_challenge_is_retried_until_summary_arrives(self) -> None:
+        challenge_probe = {
+            "url": "https://claude.ai/settings/usage?__cf_chl_rt_tk=token",
+            "title": "Just a moment...",
+            "mainText": "Verify you are human",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_cf_challenge",
+                    "block_text": "cf_challenge",
+                }
+            ],
+        }
+        ready_probe = {
+            "url": "https://claude.ai/settings/usage",
+            "mainText": "Current session 12% used",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_usage_api",
+                    "block_text": '{"usage": {"five_hour": {"utilization": 12.0}}}',
+                }
+            ],
+        }
+        page = _Page([challenge_probe, challenge_probe, ready_probe])
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(_Chromium(_Context(page))),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.probe, ready_probe)
+
+    def test_cloudflare_then_login_transition_reports_login(self) -> None:
+        challenge_probe = {
+            "url": "https://claude.ai/settings/usage?__cf_chl_rt_tk=token",
+            "title": "Just a moment...",
+            "mainText": "Verify you are human",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_cf_challenge",
+                    "block_text": "cf_challenge",
+                }
+            ],
+        }
+        login_probe = {
+            "url": "https://claude.ai/login",
+            "mainText": "Log in to Claude",
+            "metricBlocks": [],
+        }
+        page = _Page([challenge_probe, login_probe])
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(_Chromium(_Context(page))),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, "login_required")
+
+    def test_api_payload_wins_over_auth_marker(self) -> None:
+        probe = {
+            "url": "https://claude.ai/settings/usage",
+            "mainText": "Current session 12% used",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_usage_api",
+                    "block_text": '{"usage": {"five_hour": {"utilization": 12.0}}}',
+                },
+                {"metric_key": "claude_auth_required", "block_text": "auth_required"},
+            ],
+        }
+        page = _Page([probe])
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(_Chromium(_Context(page))),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.probe, probe)
+
+    def test_api_payload_wins_over_residual_challenge_markers(self) -> None:
+        probe = {
+            "url": "https://claude.ai/settings/usage?__cf_chl_rt_tk=stale",
+            "title": "Usage - Claude",
+            "mainText": "Current session 12% used",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_usage_api",
+                    "block_text": '{"usage": {"five_hour": {"utilization": 12.0}}}',
+                },
+                {
+                    "metric_key": "claude_cf_challenge",
+                    "block_text": "cf_challenge",
+                },
+            ],
+        }
+        page = _Page([probe])
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(_Chromium(_Context(page))),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.probe, probe)
+
+    def test_involuntary_logout_url_is_reported_as_login_required(self) -> None:
+        probe = {
+            "url": (
+                "https://claude.ai/logout?involuntary=1"
+                "&returnTo=%2Flogin%3Ffrom%3Dlogout"
+            ),
+            "title": "Claude",
+            "mainText": "Claude",
+            "metricBlocks": [],
+        }
+        page = _Page([probe])
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(_Chromium(_Context(page))),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, "login_required")
 
     def test_transient_poll_error_keeps_headed_login_window_state(self) -> None:
         page = _Page(
