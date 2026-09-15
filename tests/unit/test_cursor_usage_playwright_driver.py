@@ -139,6 +139,34 @@ class CursorUsagePlaywrightDriverUnitTest(unittest.TestCase):
             "chrome bad-flags prompt must be suppressed while the flag is in use",
         )
 
+    def test_headed_login_launch_hides_automation_signals(self) -> None:
+        page = _Page(
+            [
+                {
+                    "url": "https://cursor.com/login",
+                    "mainText": "Sign in",
+                    "metricBlocks": [],
+                }
+            ]
+        )
+        chromium = _Chromium(_Context(page))
+        driver = CursorUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(chromium),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.open_login()
+
+        self.assertEqual(result.error, "login_required")
+        self.assertTrue(driver.get_runtime_status().login_window_open)
+        call = chromium.calls[-1]
+        self.assertFalse(call["headless"])
+        self.assertIn("--enable-automation", call["ignore_default_args"])
+        self.assertNotIn("--enable-automation", call["args"])
+        self.assertIn("--disable-blink-features=AutomationControlled", call["args"])
+        self.assertIn("--test-type", call["args"])
+
     def test_login_page_is_reported_without_bypass(self) -> None:
         probe = {
             "url": "https://cursor.com/login",
