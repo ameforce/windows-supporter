@@ -443,7 +443,7 @@ class CodexUsageSettingsView:
             label_var = tk.StringVar(value=label)
             self._account_label_vars[account_id] = label_var
             enabled_var = tk.BooleanVar(value=bool(raw.get("enabled", True)))
-            provider_var = tk.StringVar(value=provider if provider in {"codex", "cursor"} else "codex")
+            provider_var = tk.StringVar(value=provider if provider in {"codex", "cursor", "claude"} else "codex")
             selected_var = tk.BooleanVar(value=bool(raw.get("taskbar_selected", True)))
             self._account_enabled_vars[account_id] = enabled_var
             self._account_provider_vars[account_id] = provider_var
@@ -494,7 +494,7 @@ class CodexUsageSettingsView:
                 provider_box = provider_box_factory(
                     header,
                     textvariable=provider_var,
-                    values=("codex", "cursor"),
+                    values=("codex", "cursor", "claude"),
                     state="readonly",
                     width=8,
                 )
@@ -895,6 +895,13 @@ class CodexUsageSettingsView:
             rows = (
                 (("captured_at", "최근 확인 시각"), ("included_usage", "포함 사용량")),
                 (("billing_reset_at", "결제 주기 초기화"), ("on_demand_status", "온디맨드")),
+            )
+        elif str(provider or "").lower() == "claude":
+            rows = (
+                (("captured_at", "최근 확인 시각"), ("five_hour_limit", "5시간 사용 한도")),
+                (("five_hour_limit_reset_at", "5시간 한도 초기화"), ("weekly_limit", "주간 사용 한도")),
+                (("weekly_limit_reset_at", "주간 한도 초기화"), ("weekly_scoped_limit", "모델별 주간 한도")),
+                (("weekly_scoped_limit_reset_at", "모델별 주간 초기화"), ("on_demand_status", "추가 사용량")),
             )
         else:
             rows = (
@@ -1667,7 +1674,7 @@ class CodexUsageSettingsView:
             if provider_var is not None:
                 try:
                     provider = str(provider_var.get() or "codex").strip().lower()
-                    item["provider"] = provider if provider in {"codex", "cursor"} else "codex"
+                    item["provider"] = provider if provider in {"codex", "cursor", "claude"} else "codex"
                 except Exception:
                     pass
             selected_var = self._account_taskbar_selected_vars.get(account_id)
@@ -2729,6 +2736,28 @@ class CodexUsageSettingsView:
                 and bool(str(payload.get("on_demand_status") or "").strip())
             )
             visibility["on_demand_status"] = bool(on_demand_visible)
+        elif str(provider or "").lower() == "claude":
+            five_hour_visible = (
+                "five_hour_limit" in descriptor_keys
+                or bool(str(payload.get("five_hour_limit") or "").strip())
+            )
+            visibility["five_hour_limit"] = bool(five_hour_visible)
+            visibility["five_hour_limit_reset_at"] = bool(five_hour_visible)
+            weekly_visible = (
+                "weekly_limit" in descriptor_keys
+                or bool(str(payload.get("weekly_limit") or "").strip())
+            )
+            visibility["weekly_limit"] = bool(weekly_visible)
+            visibility["weekly_limit_reset_at"] = bool(weekly_visible)
+            scoped_weekly_visible = bool(
+                str(payload.get("weekly_scoped_limit") or "").strip()
+            )
+            visibility["weekly_scoped_limit"] = bool(scoped_weekly_visible)
+            visibility["weekly_scoped_limit_reset_at"] = bool(scoped_weekly_visible)
+            visibility["on_demand_status"] = bool(
+                payload.get("on_demand_enabled") is not None
+                and str(payload.get("on_demand_status") or "").strip()
+            )
         else:
             five_hour_visible = (
                 "five_hour_limit" in descriptor_keys

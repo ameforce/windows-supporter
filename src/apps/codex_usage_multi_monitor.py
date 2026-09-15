@@ -25,7 +25,7 @@ from src.apps.codex_usage_taskbar_overlay import AiUsageTaskbarOverlay
 
 
 LEGACY_ACCOUNT_IDS = ("account_1", "account_2")
-SUPPORTED_PROVIDERS = ("codex", "cursor")
+SUPPORTED_PROVIDERS = ("codex", "cursor", "claude")
 AI_USAGE_SETTINGS_VERSION = 4
 TASKBAR_PROFILE_LIMIT = 4
 SHUTDOWN_QUIESCENCE_TIMEOUT_SEC = 60.0
@@ -43,12 +43,12 @@ class _AccountPaths:
 
     @property
     def settings_path(self) -> str:
-        filename = "codex_usage_settings.json" if self.provider == "codex" else "cursor_usage_settings.json"
+        filename = f"{self.provider}_usage_settings.json"
         return os.path.join(self.config_dir, filename)
 
     @property
     def state_path(self) -> str:
-        filename = "codex_usage_state.json" if self.provider == "codex" else "cursor_usage_state.json"
+        filename = f"{self.provider}_usage_state.json"
         return os.path.join(self.config_dir, filename)
 
 
@@ -2253,7 +2253,7 @@ class CodexUsageMultiMonitor:
         normalized_id = str(profile_id or "")
         if normalized_id in LEGACY_ACCOUNT_IDS:
             return max(1, _safe_int(normalized_id.rsplit("_", 1)[-1], 1))
-        provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
+        provider_name = _provider_display_name(provider)
         match = re.fullmatch(rf"{re.escape(provider_name)} ([1-9]\d*)", str(label or ""))
         if match is not None:
             return max(1, _safe_int(match.group(1), 1))
@@ -2276,10 +2276,12 @@ class CodexUsageMultiMonitor:
                     f"chatgpt-profile-account-{slot_number}",
                 )
             else:
-                config_dir = os.path.join(self.__config_dir, f"cursor-account-{slot_number}")
+                config_dir = os.path.join(
+                    self.__config_dir, f"{normalized_provider}-account-{slot_number}"
+                )
                 profile_dir = os.path.join(
                     local_app_base,
-                    f"cursor-profile-account-{slot_number}",
+                    f"{normalized_provider}-profile-account-{slot_number}",
                 )
         else:
             config_dir = os.path.join(
@@ -3342,6 +3344,17 @@ class CodexUsageMultiMonitor:
                 unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
                 profile_id=profile_id,
             )
+        elif provider_id == "claude":
+            from src.apps.claude_usage_monitor import ClaudeUsageMonitor
+
+            child = ClaudeUsageMonitor(
+                config_dir=config_dir,
+                profile_dir=profile_dir,
+                notification_sink=notification_sink,
+                suppress_normal_tooltips=True,
+                unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
+                profile_id=profile_id,
+            )
         else:
             child = CodexUsageMonitor(
                 config_dir=config_dir,
@@ -3440,18 +3453,31 @@ def _is_valid_profile_id(value: str) -> bool:
     return PROFILE_ID_PATTERN.fullmatch(str(value or "")) is not None
 
 
+_PROVIDER_DISPLAY_NAMES = {
+    "codex": "Codex",
+    "cursor": "Cursor",
+    "claude": "Claude",
+}
+
+
+def _provider_display_name(provider: str) -> str:
+    return _PROVIDER_DISPLAY_NAMES.get(str(provider or "").lower(), "Codex")
+
+
 def _default_profile_label(provider: str, index: int) -> str:
-    provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
-    return f"{provider_name} {max(1, int(index))}"
+    return f"{_provider_display_name(provider)} {max(1, int(index))}"
 
 
 def _is_cross_provider_default_label(label: str, provider: str) -> bool:
     text = str(label or "").strip()
     if not text:
         return False
-    if str(provider or "").lower() == "cursor":
-        return bool(re.fullmatch(r"Codex [1-9]\d*", text))
-    return bool(re.fullmatch(r"Cursor [1-9]\d*", text))
+    current = str(provider or "").lower()
+    return any(
+        other != current
+        and re.fullmatch(rf"{re.escape(name)} [1-9]\d*", text) is not None
+        for other, name in _PROVIDER_DISPLAY_NAMES.items()
+    )
 
 
 def _optional_percent(value: Any) -> float | None:

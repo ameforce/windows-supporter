@@ -345,6 +345,64 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(metric["reset_text"], "25d 00h 00m 00s")
         self.assertEqual(metric["reset_short_text"], "25d 00h 00m 00s")
 
+    def test_claude_profile_renders_five_hour_and_weekly_metric_descriptors(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "claude-1",
+                    "provider": "claude",
+                    "label": "Claude 1",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "fresh",
+                    "provider_status": "ready",
+                    "runtime": {"session_state": "logged_in"},
+                    "last_snapshot": {
+                        "captured_at": "2026-09-14T10:00:00+00:00",
+                    },
+                    "metrics": [
+                        {
+                            "key": "five_hour_limit",
+                            "short_label": "5H",
+                            "percent": 65.0,
+                            "value_text": "65%",
+                            "short_value_text": "65%",
+                            "reset_at": "2026-09-15T05:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        },
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 86.0,
+                            "value_text": "86%",
+                            "short_value_text": "86%",
+                            "reset_at": "2026-09-19T09:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        self.assertTrue(model["visible"])
+        bar = model["bars"][0]
+        self.assertEqual(bar["provider"], "claude")
+        self.assertEqual(bar["label"], "Claude 1")
+        self.assertEqual(bar["percent"], 65)
+        self.assertEqual(len(bar["metrics"]), 2)
+        first, second = bar["metrics"]
+        self.assertEqual(first["metric_key"], "five_hour_limit")
+        self.assertEqual(first["short_label"], "5H")
+        self.assertEqual(first["percent"], 65.0)
+        self.assertEqual(second["metric_key"], "weekly_limit")
+        self.assertEqual(second["short_label"], "7D")
+        self.assertEqual(second["percent"], 86.0)
+
     def test_taskbar_renderer_keeps_unreported_metrics_empty(self):
         runtime = {
             "enabled": True,
