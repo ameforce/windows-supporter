@@ -110,6 +110,69 @@ class ClaudeUsagePlaywrightDriverUnitTest(unittest.TestCase):
         self.assertTrue(chromium.calls[0]["chromium_sandbox"])
         self.assertNotIn("user_agent", chromium.calls[0])
 
+    def test_launch_suppresses_automation_fingerprints_for_oauth(self) -> None:
+        probe = {
+            "url": "https://claude.ai/settings/usage",
+            "mainText": "Current session 12% used",
+            "metricBlocks": [
+                {
+                    "metric_key": "claude_usage_api",
+                    "block_text": '{"usage": {"five_hour": {"utilization": 12.0}}}',
+                }
+            ],
+        }
+        chromium = _Chromium(_Context(_Page([probe])))
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(chromium),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        call = chromium.calls[0]
+        self.assertIn("--enable-automation", call["ignore_default_args"])
+        self.assertNotIn("--enable-automation", call["args"])
+        self.assertIn(
+            "--disable-blink-features=AutomationControlled",
+            call["args"],
+            "navigator.webdriver must stay false for google oauth sign-in",
+        )
+        self.assertIn(
+            "--test-type",
+            call["args"],
+            "chrome bad-flags prompt must be suppressed while the flag is in use",
+        )
+
+    def test_headed_login_launch_hides_automation_signals(self) -> None:
+        page = _Page(
+            [
+                {
+                    "url": "https://claude.ai/login",
+                    "mainText": "Log in",
+                    "metricBlocks": [],
+                }
+            ]
+        )
+        chromium = _Chromium(_Context(page))
+        driver = ClaudeUsagePlaywrightDriver(
+            self._config(),
+            playwright_starter=lambda: _Playwright(chromium),
+            sleep=lambda _delay: None,
+        )
+
+        result = driver.open_login()
+
+        self.assertEqual(result.error, "login_required")
+        self.assertTrue(driver.get_runtime_status().login_window_open)
+        call = chromium.calls[-1]
+        self.assertFalse(call["headless"])
+        self.assertIn("--enable-automation", call["ignore_default_args"])
+        self.assertNotIn("--enable-automation", call["args"])
+        self.assertIn("--disable-blink-features=AutomationControlled", call["args"])
+        self.assertIn("--test-type", call["args"])
+
     def test_summary_block_alone_counts_as_summary(self) -> None:
         probe = {
             "url": "https://claude.ai/settings/usage",

@@ -265,7 +265,13 @@ class ClaudeUsagePlaywrightDriver:
             channel="chrome",
             headless=headless,
             chromium_sandbox=True,
-            args=["--disable-extensions", "--disable-notifications"],
+            args=[
+                "--disable-extensions",
+                "--disable-notifications",
+                "--disable-blink-features=AutomationControlled",
+                "--test-type",
+            ],
+            ignore_default_args=["--enable-automation"],
             timeout=float(self._config.navigation_timeout_ms),
         )
         self._headless = headless
