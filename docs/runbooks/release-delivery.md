@@ -9,7 +9,7 @@
    - `git status --short --branch`
    - `git log --graph --decorate --oneline --branches --remotes --tags --max-count=12`
    - 예정 version의 local/remote branch와 tag
-3. main 물리 worktree의 HEAD를 바꿀 예정이면 `docs/runbooks/runtime-registration.md`의 Git GUI guard를 먼저 통과한다.
+3. main 물리 worktree의 HEAD를 바꿀 예정이면 `docs/runbooks/runtime-registration.md`의 Git GUI guard를 먼저 통과한다. guard가 변경을 막으면 remote merge로 close하고 `lifecycle.production_head_source: "remote"` plan을 사용한다.
 4. hotfix는 확인된 clean `main`, release는 확인된 clean `develop`을 기준으로 한다. 별도 release plan이 다른 base를 명시하면 그 증거를 기록한다.
 5. `hotfix/vX.Y.Z` 또는 `release/vX.Y.Z`를 만들고 remote exact ref를 read-back한다.
 
