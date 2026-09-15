@@ -1777,6 +1777,81 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             child = manager._CodexUsageMultiMonitor__children[profile_id]
             self.assertEqual(child.profile_id, profile_id)
 
+    def test_dynamic_claude_child_receives_opaque_profile_id_and_paths(self):
+        from src.apps.claude_usage_monitor import ClaudeUsageMonitor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_id = f"profile_{'2' * 32}"
+            config_dir = os.path.join(tmp, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            with open(
+                os.path.join(config_dir, "ai_usage_settings.json"),
+                "w",
+                encoding="utf-8",
+            ) as fp:
+                json.dump(
+                    {
+                        "settings_version": 4,
+                        "profiles": [
+                            {
+                                "id": profile_id,
+                                "provider": "claude",
+                                "enabled": True,
+                            }
+                        ],
+                        "profile_order": [profile_id],
+                        "default_account_id": profile_id,
+                    },
+                    fp,
+                )
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=config_dir,
+                local_base_dir=os.path.join(tmp, "local"),
+            )
+
+            child = manager._CodexUsageMultiMonitor__children[profile_id]
+            self.assertIsInstance(child, ClaudeUsageMonitor)
+            self.assertEqual(child.profile_id, profile_id)
+            self.assertTrue(child.profile_dir.endswith(
+                os.path.join("ai-profiles", profile_id, "claude")
+            ))
+            settings = child.get_settings_snapshot()
+            self.assertEqual(settings["provider"], "claude")
+            self.assertTrue(settings["settings_path"].endswith(
+                "claude_usage_settings.json"
+            ))
+            self.assertTrue(settings["state_path"].endswith(
+                "claude_usage_state.json"
+            ))
+
+    def test_legacy_account_switched_to_claude_uses_claude_owned_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            payload = manager.get_settings_snapshot()["profiles"]
+            for item in payload:
+                if item["id"] == "account_1":
+                    item["provider"] = "claude"
+            ok, error = manager.update_settings({"profiles": payload})
+            self.assertTrue(ok, error)
+
+            profile = next(
+                item
+                for item in manager.get_settings_snapshot()["profiles"]
+                if item["id"] == "account_1"
+            )
+            self.assertEqual(profile["provider"], "claude")
+            self.assertTrue(profile["config_dir"].endswith("claude-account-1"))
+            self.assertTrue(profile["profile_dir"].endswith("claude-profile-account-1"))
+            paths = manager._CodexUsageMultiMonitor__account_paths["account_1"]
+            self.assertTrue(paths.settings_path.endswith(
+                "claude_usage_settings.json"
+            ))
+            self.assertTrue(paths.state_path.endswith(
+                "claude_usage_state.json"
+            ))
+            self.assertTrue(profile["label"].startswith("Claude"))
+
     def test_first_provider_switch_preserves_explicit_label_and_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, _ = self._build_manager(tmp)

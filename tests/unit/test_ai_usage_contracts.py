@@ -19,7 +19,7 @@ class AiUsageContractsUnitTest(unittest.TestCase):
     def test_provider_contract_contains_only_supported_provider_ids(self) -> None:
         self.assertEqual(
             {provider.value for provider in AiUsageProvider},
-            {"codex", "cursor"},
+            {"codex", "cursor", "claude"},
         )
 
     def test_runtime_failure_aliases_normalize_to_stable_states(self) -> None:

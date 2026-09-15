@@ -262,6 +262,14 @@ _PROFILE_LABEL_COLUMN_MAX_WIDTH_PX = 76
 _PROFILE_LABEL_COLUMN_WIDTH_RATIO = 0.17
 _PROFILE_LABEL_FONT_PT = 8
 _PROFILE_LABEL_TEXT_END_GAP_PX = 6
+# Brand glyph box drawn at the row's left inset, before the profile label.
+# All three providers share the "C" initial, so the marks differ by shape:
+# Codex is a `>_` prompt, Cursor a pointer arrow, Claude a radial burst.
+_PROVIDER_ICON_SIZE_PX = 10
+_PROVIDER_ICON_TO_LABEL_GAP_PX = 3
+_PROVIDER_ICON_COLUMN_WIDTH_PX = (
+    _PROVIDER_ICON_SIZE_PX + _PROVIDER_ICON_TO_LABEL_GAP_PX
+)
 _STATUS_DOT_ONLY_WIDTH_PX = 14
 _STATUS_WITH_TEXT_WIDTH_PX = 24
 _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX = 420
@@ -342,6 +350,10 @@ class _MetricRowLayout:
     segment_offsets: tuple[int, ...] = ()
     segment_widths: tuple[int, ...] = ()
     progress_widths: tuple[int, ...] = ()
+    # Reserved provider-glyph column between the left inset and the label.
+    # Funded in the text-first regime; drops to 0 when a clamped slot needs
+    # the pixels for metric countdown/percent text.
+    icon_width: int = 0
 
     def segment_geometry(self, index: int) -> tuple[int, int, int]:
         """Return (offset, width, progress_width) for one segment."""
@@ -734,6 +746,86 @@ def _fit_profile_label_text(label: Any, available_width: int) -> str:
             break
         fitted += character
     return f"{fitted}{ellipsis}"
+
+
+def _draw_taskbar_provider_icon(
+    canvas: Any,
+    provider: Any,
+    x: int,
+    center_y: float,
+) -> None:
+    """Draw the provider's small brand glyph in the row's left icon box.
+
+    All three provider names share the "C" initial, so the marks differ by
+    shape: Codex is a `>_` terminal prompt (OpenAI green), Cursor a pointer
+    arrow (monochrome brand), Claude a radial burst (coral). Unknown
+    providers get a neutral ring so the column never renders blank.
+    """
+    left = float(x)
+    size = float(_PROVIDER_ICON_SIZE_PX)
+    top = float(center_y) - size / 2.0
+    key = str(provider or "").strip().lower()
+    if key == "codex":
+        canvas.create_line(
+            left + 1.0,
+            top + 1.0,
+            left + 4.2,
+            top + size / 2.0,
+            left + 1.0,
+            top + size - 1.0,
+            fill="#10a37f",
+            width=1.6,
+            capstyle="round",
+            joinstyle="round",
+        )
+        canvas.create_line(
+            left + 5.4,
+            top + size - 1.4,
+            left + size - 0.8,
+            top + size - 1.4,
+            fill="#10a37f",
+            width=1.6,
+            capstyle="round",
+        )
+        return
+    if key == "cursor":
+        canvas.create_polygon(
+            left + 1.5,
+            top + 0.4,
+            left + 1.5,
+            top + 7.8,
+            left + 3.6,
+            top + 6.1,
+            left + 5.0,
+            top + 9.2,
+            left + 6.4,
+            top + 8.4,
+            left + 5.0,
+            top + 5.4,
+            left + 8.1,
+            top + 5.4,
+            fill="#f8fafc",
+            outline="#0f172a",
+        )
+        return
+    if key == "claude":
+        center_x = left + size / 2.0
+        points: list[float] = []
+        for index in range(16):
+            angle = -math.pi / 2.0 + index * (math.pi / 8.0)
+            radius = size / 2.0 - 0.4 if index % 2 == 0 else size * 0.19
+            points.append(center_x + radius * math.cos(angle))
+            points.append(center_y + radius * math.sin(angle))
+        canvas.create_polygon(*points, fill="#d97757", outline="")
+        return
+    canvas.create_oval(
+        left + 1.6,
+        top + 1.6,
+        left + size - 1.6,
+        top + size - 1.6,
+        outline="#94a3b8",
+        width=1.2,
+    )
 
 
 def _status_width_for_overlay_width(width: int) -> int:
@@ -1426,7 +1518,14 @@ def _metric_rows_layout_for_overlay_width(
     ]
     label_width = _label_width_for_overlay_width(overlay_width, profile_labels)
     status_width = _status_width_for_overlay_width(overlay_width)
-    metrics_x = 6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
+    icon_width = _PROVIDER_ICON_COLUMN_WIDTH_PX
+    metrics_x = (
+        6
+        + icon_width
+        + label_width
+        + status_width
+        + _STATUS_TO_METRICS_GAP_PX
+    )
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
 
     slot_keys = _metric_slot_keys(rows_metrics)
@@ -1452,10 +1551,27 @@ def _metric_rows_layout_for_overlay_width(
     metrics_width = max(
         0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - right_air
     )
+    total_required = base_need
+    if counts and total_required > metrics_width:
+        # The provider glyph is chrome, not data: in the cramped regime it
+        # yields before the fixed countdown/percent texts so a clamped slot
+        # keeps every metric's text instead of trading text for the icon.
+        icon_width = 0
+        metrics_x = (
+            6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
+        )
+        right_air = (
+            _OVERLAY_RIGHT_AIR_RESERVE_PX
+            if overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - base_need
+            >= _OVERLAY_RIGHT_AIR_RESERVE_PX
+            else 0
+        )
+        metrics_width = max(
+            0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - right_air
+        )
 
     column_widths: dict[str, int] = {}
     column_progresses: dict[str, int] = {}
-    total_required = base_need
     if counts and total_required <= metrics_width:
         # Text-first allocation on the shared grid: reserve each column's
         # widest requirement across rows and hand the leftover to the bars,
@@ -1549,6 +1665,7 @@ def _metric_rows_layout_for_overlay_width(
                 label_width=label_width,
                 status_width=status_width,
                 metrics_x=metrics_x,
+                icon_width=icon_width,
                 metrics_width=metrics_width,
                 segment_gap=segment_gap,
                 segment_width=max(row_widths) if row_widths else metrics_width,
@@ -1679,16 +1796,24 @@ def _preferred_width_for_rows_cached(
         # One shared-column layout for all rows: the search accepts a width
         # only when every row fits every one of its metrics at the shared
         # column geometry — never a per-row width that would break alignment.
-        return _rows_fit_badge_mode_for_overlay_width(
+        # Accept a candidate width only when the bar keeps its preferred
+        # width too and the provider icon column stays funded — otherwise
+        # the min-fit search would stop at a width that squeezes the bar to
+        # the cramped floor or drops the icon even though a wider overlay
+        # fits everything.
+        row_layouts = _metric_rows_layout_for_overlay_width(
             candidate_width,
             list(rows),
-            badge_mode,
-            # Accept a candidate width only when the bar keeps its
-            # preferred width too — otherwise the min-fit search would
-            # stop at a uniform split that squeezes the bar to the
-            # cramped floor even though a wider overlay fits everything.
-            min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
             profile_labels=profile_labels,
+        )
+        return all(
+            int(row_layout.icon_width) > 0
+            and _row_fits_badge_mode_for_layout(
+                row_layout,
+                badge_mode,
+                min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
+            )
+            for row_layout in row_layouts
         )
 
     # The 300..900 sweep is too wide for a per-second layout budget when a
@@ -3741,15 +3866,21 @@ class CodexUsageTaskbarOverlay:
             label = str(bar.get("label") or "")
             status_text = str(bar.get("status_text") or "")
             status_color = str(bar.get("status_color") or "#6b7280")
+            icon_column = int(getattr(row_layout, "icon_width", 0) or 0)
+            if icon_column > 0:
+                _draw_taskbar_provider_icon(
+                    canvas, bar.get("provider"), 6, center_y
+                )
+            label_x = 6 + icon_column
             canvas.create_text(
-                6,
+                label_x,
                 center_y,
                 anchor="w",
                 fill="#e5e7eb",
                 font=("Segoe UI", 8, "bold"),
                 text=_fit_profile_label_text(label, row_layout.label_width),
             )
-            dot_x = 6 + row_layout.label_width + 1
+            dot_x = label_x + row_layout.label_width + 1
             canvas.create_oval(
                 dot_x,
                 center_y - 4,

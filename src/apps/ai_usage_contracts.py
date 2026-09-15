@@ -11,6 +11,7 @@ from typing import Any
 class AiUsageProvider(StrEnum):
     CODEX = "codex"
     CURSOR = "cursor"
+    CLAUDE = "claude"
 
 
 @unique
