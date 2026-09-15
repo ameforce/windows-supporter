@@ -1680,31 +1680,68 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         label_x = icon_left + taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
         line_ops = [op for op in canvas.ops if op[0] == "line"]
         polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
-        # Codex row: `>_` prompt (chevron + underscore) in OpenAI green.
-        self.assertEqual(len(line_ops), 2)
+        # Codex row: real brand mark — silhouette polygon in brand violet,
+        # then the chevron and bar subpaths knocked out in panel background.
+        self.assertEqual(len(line_ops), 0)
+        row_height = (38 - 8) // 2
+        codex_polygons = [
+            op for op in polygon_ops if op[1][1] < 4 + row_height
+        ]
+        self.assertEqual(len(codex_polygons), 3)
+        self.assertEqual(
+            codex_polygons[0][2].get("fill"),
+            taskbar_overlay._CODEX_BRAND_COLOR,
+        )
         self.assertTrue(
-            all(op[2].get("fill") == "#10a37f" for op in line_ops)
+            all(
+                op[2].get("fill") == taskbar_overlay._CODEX_KNOCKOUT_COLOR
+                for op in codex_polygons[1:]
+            )
+        )
+        # The knockout only reads as a hole if it repaints the exact panel
+        # surface, so pin the constant to the recorded panel rect fill.
+        panel_rects = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[1][:2] == (0, 0)
+        ]
+        self.assertEqual(len(panel_rects), 1)
+        self.assertEqual(
+            taskbar_overlay._CODEX_KNOCKOUT_COLOR,
+            panel_rects[0][2].get("fill"),
         )
         self.assertTrue(
             all(
                 icon_left <= coord <= icon_left + 10
-                for op in line_ops
+                for op in codex_polygons
                 for coord in op[1][::2]
             )
         )
+        icon_top = (
+            4 + row_height // 2 - taskbar_overlay._PROVIDER_ICON_SIZE_PX / 2
+        )
+        self.assertTrue(
+            all(
+                icon_top
+                <= coord
+                <= icon_top + taskbar_overlay._PROVIDER_ICON_SIZE_PX
+                for op in codex_polygons
+                for coord in op[1][1::2]
+            )
+        )
         # Cursor row: pointer arrow in the brand's monochrome white.
-        self.assertEqual(len(polygon_ops), 1)
-        self.assertEqual(polygon_ops[0][2].get("fill"), "#f8fafc")
+        cursor_polygons = [
+            op for op in polygon_ops if op[2].get("fill") == "#f8fafc"
+        ]
+        self.assertEqual(len(cursor_polygons), 1)
         self.assertTrue(
             all(
                 icon_left <= coord <= icon_left + 10
-                for coord in polygon_ops[0][1][::2]
+                for coord in cursor_polygons[0][1][::2]
             )
         )
-        # Both icon marks stay inside the reserved icon box.
-        row_height = (38 - 8) // 2
-        self.assertTrue(all(op[1][1] < 4 + row_height for op in line_ops))
-        self.assertGreater(polygon_ops[0][1][1], 4 + row_height)
+        # Cursor mark stays in its own row (below the codex row).
+        self.assertGreater(cursor_polygons[0][1][1], 4 + row_height)
         # Labels shift right by the icon column.
         label_ops = [
             op
