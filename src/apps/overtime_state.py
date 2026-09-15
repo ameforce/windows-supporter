@@ -11,8 +11,8 @@ import threading
 from datetime import date, datetime, timedelta
 
 
-STATE_VERSION = 3
-_SUPPORTED_VERSIONS = frozenset({1, 2, STATE_VERSION})
+STATE_VERSION = 4
+_SUPPORTED_VERSIONS = frozenset({1, 2, 3, STATE_VERSION})
 _MAX_PAUSED_SECONDS = 3 * 24 * 3600
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ISO_RE = re.compile(
@@ -41,6 +41,7 @@ _V2_ENTRY_FIELDS = frozenset(
         "paused_seconds",
     }
 )
+_V3_ENTRY_FIELDS = _V2_ENTRY_FIELDS | {"flex_pending"}
 
 
 def _parse_iso_value(value) -> datetime | None:
@@ -183,6 +184,7 @@ class OvertimeStateStore:
         ended_at: datetime | None = None,
         paused_at: datetime | None = None,
         paused_seconds: int = 0,
+        pause_auto: bool = False,
         flex_pending: bool = False,
     ) -> dict:
         return {
@@ -194,6 +196,7 @@ class OvertimeStateStore:
             "ended_at": cls._format_iso(ended_at) if ended_at else None,
             "paused_at": cls._format_iso(paused_at) if paused_at else None,
             "paused_seconds": int(paused_seconds),
+            "pause_auto": bool(pause_auto),
             "flex_pending": bool(flex_pending),
         }
 
@@ -210,6 +213,7 @@ class OvertimeStateStore:
             "ended_at",
             "paused_at",
             "paused_seconds",
+            "pause_auto",
             "flex_pending",
         }
         if set(raw) != expected:
@@ -223,6 +227,11 @@ class OvertimeStateStore:
         ended = cls._parse_iso(raw.get("ended_at")) if raw.get("ended_at") else None
         paused_at = cls._parse_iso(raw.get("paused_at")) if raw.get("paused_at") else None
         paused_seconds = cls._validate_paused_seconds(raw.get("paused_seconds"))
+        pause_auto = raw.get("pause_auto")
+        if type(pause_auto) is not bool:
+            raise ValueError("초과근무 자동 일시정지 표시가 올바르지 않습니다.")
+        if pause_auto and paused_at is None:
+            raise ValueError("자동 일시정지 표시에는 열린 일시정지가 필요합니다.")
         flex_pending = raw.get("flex_pending")
         if type(flex_pending) is not bool:
             raise ValueError("초과근무 Flex 등록 대기 표시가 올바르지 않습니다.")
@@ -261,6 +270,7 @@ class OvertimeStateStore:
             ended_at=ended,
             paused_at=paused_at,
             paused_seconds=paused_seconds,
+            pause_auto=pause_auto,
             flex_pending=flex_pending,
         )
 
@@ -313,6 +323,14 @@ class OvertimeStateStore:
                     **upgraded,
                     "flex_pending": upgraded.get("status") == "completed",
                 }
+            if version in {1, 2, 3}:
+                if not isinstance(upgraded, dict):
+                    raise ValueError("초과근무 날짜별 상태가 객체가 아닙니다.")
+                if set(upgraded) != _V3_ENTRY_FIELDS:
+                    raise ValueError("초과근무 날짜별 상태 필드가 올바르지 않습니다.")
+                # Older files predate idle auto-pause; any recorded pause was
+                # initiated by the user and must not auto-resume on input.
+                upgraded = {**upgraded, "pause_auto": False}
             normalized_raw["days"][key] = upgraded
             decoded["days"][key] = self._decode_entry(key, upgraded)
         if decoded != normalized_raw:
@@ -429,7 +447,7 @@ class OvertimeStateStore:
         )
         return self._set(key, value)
 
-    def pause(self, day=None, paused_at=None):
+    def pause(self, day=None, paused_at=None, *, automatic=False):
         key = self._parse_day(day if day is not None else self._now())
         at = self._now(paused_at)
         with self._lock:
@@ -449,6 +467,7 @@ class OvertimeStateStore:
             started_at=started,
             paused_at=at,
             paused_seconds=int(current.get("paused_seconds") or 0),
+            pause_auto=bool(automatic),
         )
         return self._set(key, value)
 
@@ -464,8 +483,10 @@ class OvertimeStateStore:
             return False, "일시정지 중인 초과근무가 없습니다."
         if at < paused_at:
             return False, "초과근무 재개 시간이 올바르지 않습니다."
-        paused_seconds = int(current.get("paused_seconds") or 0) + int(
-            (at - paused_at).total_seconds()
+        paused_seconds = min(
+            int(current.get("paused_seconds") or 0)
+            + int((at - paused_at).total_seconds()),
+            _MAX_PAUSED_SECONDS,
         )
         value = self._day_entry(
             status="active",
@@ -499,6 +520,7 @@ class OvertimeStateStore:
             started_at=started,
             paused_at=paused_at,
             paused_seconds=int(current.get("paused_seconds") or 0),
+            pause_auto=bool(current.get("pause_auto")),
         )
         return self._set(key, value)
 

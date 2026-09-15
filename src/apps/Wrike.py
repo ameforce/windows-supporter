@@ -306,6 +306,8 @@ class Wrike:
         self.__flex_detected_employee_number = ""
         self.__flex_poll_interval_sec = 300.0
         self.__overtime_notice_interval_min = 10
+        self.__overtime_idle_pause_enabled = True
+        self.__overtime_idle_pause_min = 5
         self.__flex_browser_profile_dir = self.__lib.os.path.join(
             self.__time_log_config_dir,
             FLEX_BROWSER_PROFILE_DIR_NAME,
@@ -726,6 +728,8 @@ class Wrike:
                     root,
                     self.__on_worktime_activity,
                     now_provider=self.__lib.datetime.now,
+                    idle_callback=self.__on_overtime_idle_input,
+                    idle_threshold_seconds=self.__overtime_idle_threshold_seconds,
                 )
             except (LastInputUnavailableError, OSError, ValueError):
                 return
@@ -1343,6 +1347,7 @@ class Wrike:
             assigned_minutes=int(state.get("assigned_minutes", 0)),
             paused=paused,
             paused_minutes=paused_minutes,
+            auto_paused=paused and bool(state.get("pause_auto")),
         )
 
     def __overtime_tooltip_lines(self) -> list[tuple[str, str | None]]:
@@ -1355,13 +1360,23 @@ class Wrike:
         except Exception:
             return []
         paused = bool(state.get("paused_at"))
+        auto_paused = paused and bool(state.get("pause_auto"))
         elapsed = net_elapsed_seconds(state, now) // 60
         assigned = int(state.get("assigned_minutes", 0))
-        heading = (
-            f"초과근무 일시정지 · 경과 {elapsed}분 · 시작 {started.strftime('%H:%M')}"
-            if paused
-            else f"초과근무 {elapsed}분 · 시작 {started.strftime('%H:%M')}"
-        )
+        if auto_paused:
+            heading = (
+                f"초과근무 자동 일시정지 · 경과 {elapsed}분 · "
+                f"시작 {started.strftime('%H:%M')}"
+            )
+        elif paused:
+            heading = (
+                f"초과근무 일시정지 · 경과 {elapsed}분 · "
+                f"시작 {started.strftime('%H:%M')}"
+            )
+        else:
+            heading = (
+                f"초과근무 {elapsed}분 · 시작 {started.strftime('%H:%M')}"
+            )
         lines = [
             (heading, "#166534"),
             (
@@ -1371,14 +1386,13 @@ class Wrike:
         ]
         if assigned > 0:
             lines.append((f"Flex 연장 배정 {assigned}분", "#2563EB"))
-        lines.append(
-            (
-                "근무시간 패널에서 다시 시작을 누르세요."
-                if paused
-                else "근무시간 패널에서 초과근무 종료를 누르세요.",
-                "#6B7280",
-            )
-        )
+        if auto_paused:
+            hint = "입력이 감지되면 자동으로 다시 시작합니다."
+        elif paused:
+            hint = "근무시간 패널에서 다시 시작을 누르세요."
+        else:
+            hint = "근무시간 패널에서 초과근무 종료를 누르세요."
+        lines.append((hint, "#6B7280"))
         return lines
 
     def __start_overtime_notice_timer(self, *, show_now: bool) -> None:
@@ -3472,9 +3486,70 @@ class Wrike:
         self.__activity_prompt_save_retry_not_before = None
         self.__activity_prompt_save_last_failure_key = None
 
+    def __overtime_idle_threshold_seconds(self):
+        if not self.__overtime_idle_pause_enabled:
+            return None
+        try:
+            minutes = int(self.__overtime_idle_pause_min)
+        except Exception:
+            return None
+        return max(1, min(120, minutes)) * 60
+
+    def __on_overtime_idle_input(self, detected_at) -> None:
+        if not isinstance(detected_at, datetime) or detected_at.tzinfo is not None:
+            return
+        if not self.__overtime_idle_pause_enabled:
+            return
+        state = self.__overtime_active_state()
+        if not isinstance(state, dict) or state.get("status") != "active":
+            return
+        if state.get("paused_at"):
+            return
+        try:
+            started_at = datetime.fromisoformat(str(state.get("started_at") or ""))
+        except Exception:
+            return
+        ok, error = self.__overtime_state_store.pause(
+            started_at.date(), detected_at, automatic=True
+        )
+        if not ok:
+            self.__log(
+                "overtime idle auto-pause skipped: "
+                + str(error or "unknown")
+            )
+            return
+        self.__cancel_overtime_notice_timer()
+        lines = self.__overtime_tooltip_lines()
+        if self.__root is not None and lines:
+            self.__show_tooltip(
+                self.__root, "초과근무 자동 일시정지", lines=lines
+            )
+
+    def __maybe_resume_overtime_for_activity(self, detected_at) -> None:
+        state = self.__overtime_active_state()
+        if not isinstance(state, dict) or state.get("status") != "active":
+            return
+        if not state.get("paused_at") or not state.get("pause_auto"):
+            return
+        try:
+            started_at = datetime.fromisoformat(str(state.get("started_at") or ""))
+        except Exception:
+            return
+        ok, error = self.__overtime_state_store.resume(
+            started_at.date(), detected_at
+        )
+        if not ok:
+            self.__log(
+                "overtime idle auto-resume skipped: "
+                + str(error or "unknown")
+            )
+            return
+        self.__start_overtime_notice_timer(show_now=True)
+
     def __on_worktime_activity(self, detected_at) -> None:
         if not isinstance(detected_at, datetime) or detected_at.tzinfo is not None:
             return
+        self.__maybe_resume_overtime_for_activity(detected_at)
         first_detected_at = self.__activity_prompt_save_detected_at
         if (
             isinstance(first_detected_at, datetime)
@@ -6599,6 +6674,10 @@ class Wrike:
             "overtime_notice_interval_min": int(
                 self.__overtime_notice_interval_min
             ),
+            "overtime_idle_pause_enabled": bool(
+                self.__overtime_idle_pause_enabled
+            ),
+            "overtime_idle_pause_min": int(self.__overtime_idle_pause_min),
         }
         return snapshot
 
@@ -6667,6 +6746,8 @@ class Wrike:
             "flex_detected_employee_number",
             "flex_poll_interval_sec",
             "overtime_notice_interval_min",
+            "overtime_idle_pause_enabled",
+            "overtime_idle_pause_min",
         )
         with self.__timelog_snapshot_lock, self.__vacation_ical_lock:
             return {
@@ -6720,6 +6801,16 @@ class Wrike:
         overtime_notice_raw = data.get(
             "overtime_notice_interval_min",
             self.__overtime_notice_interval_min,
+        )
+        overtime_idle_pause_enabled = bool(
+            data.get(
+                "overtime_idle_pause_enabled",
+                self.__overtime_idle_pause_enabled,
+            )
+        )
+        overtime_idle_pause_raw = data.get(
+            "overtime_idle_pause_min",
+            self.__overtime_idle_pause_min,
         )
         clear_ical_url = bool(data.get("clear_ical_url", False))
         ical_url_supplied = "ical_url" in data
@@ -6839,6 +6930,11 @@ class Wrike:
         except Exception:
             return False, "overtime interval"
         overtime_notice_interval = max(1, min(120, overtime_notice_interval))
+        try:
+            overtime_idle_pause_min = int(round(float(overtime_idle_pause_raw)))
+        except Exception:
+            return False, "overtime idle pause minutes"
+        overtime_idle_pause_min = max(1, min(120, overtime_idle_pause_min))
 
         previous_flex_configuration = (
             bool(self.__flex_enabled),
@@ -6860,6 +6956,8 @@ class Wrike:
             self.__flex_detected_employee_number = ""
         self.__flex_poll_interval_sec = float(flex_poll_interval)
         self.__overtime_notice_interval_min = int(overtime_notice_interval)
+        self.__overtime_idle_pause_enabled = bool(overtime_idle_pause_enabled)
+        self.__overtime_idle_pause_min = int(overtime_idle_pause_min)
         self.__lunch_break_enabled = bool(lunch_enabled)
         self.__lunch_start_min = int(lunch_start_val)
         self.__lunch_end_min = int(lunch_end_val)
@@ -7189,6 +7287,8 @@ class Wrike:
             "flex_employee_number": "",
             "flex_poll_interval_sec": 300.0,
             "overtime_notice_interval_min": 10,
+            "overtime_idle_pause_enabled": True,
+            "overtime_idle_pause_min": 5,
         }
         needs_save = False
         if data is None:
@@ -7355,6 +7455,28 @@ class Wrike:
         clamped_overtime = max(1, min(120, self.__overtime_notice_interval_min))
         if clamped_overtime != self.__overtime_notice_interval_min:
             self.__overtime_notice_interval_min = clamped_overtime
+            needs_save = True
+        try:
+            self.__overtime_idle_pause_enabled = bool(
+                data.get(
+                    "overtime_idle_pause_enabled",
+                    self.__overtime_idle_pause_enabled,
+                )
+            )
+        except Exception:
+            self.__overtime_idle_pause_enabled = True
+        try:
+            self.__overtime_idle_pause_min = int(
+                data.get(
+                    "overtime_idle_pause_min",
+                    self.__overtime_idle_pause_min,
+                )
+            )
+        except Exception:
+            self.__overtime_idle_pause_min = 5
+        clamped_idle_pause = max(1, min(120, self.__overtime_idle_pause_min))
+        if clamped_idle_pause != self.__overtime_idle_pause_min:
+            self.__overtime_idle_pause_min = clamped_idle_pause
             needs_save = True
         try:
             self.__daily_target_minutes = int(data.get("daily_target_minutes", self.__daily_target_minutes))
@@ -7587,6 +7709,10 @@ class Wrike:
             "overtime_notice_interval_min": int(
                 self.__overtime_notice_interval_min
             ),
+            "overtime_idle_pause_enabled": bool(
+                self.__overtime_idle_pause_enabled
+            ),
+            "overtime_idle_pause_min": int(self.__overtime_idle_pause_min),
         }
         ical_url_now = str(self.__decode_ical_url() or "").strip()
         if ical_url_now:
