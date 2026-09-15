@@ -1683,8 +1683,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         # Codex row: real brand mark — silhouette polygon in brand violet,
         # then the chevron and bar subpaths knocked out in panel background.
         self.assertEqual(len(line_ops), 0)
+        row_height = (38 - 8) // 2
         codex_polygons = [
-            op for op in polygon_ops if op[1][1] < 4 + (38 - 8) // 2
+            op for op in polygon_ops if op[1][1] < 4 + row_height
         ]
         self.assertEqual(len(codex_polygons), 3)
         self.assertEqual(
@@ -1697,11 +1698,35 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for op in codex_polygons[1:]
             )
         )
+        # The knockout only reads as a hole if it repaints the exact panel
+        # surface, so pin the constant to the recorded panel rect fill.
+        panel_rects = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[1][:2] == (0, 0)
+        ]
+        self.assertEqual(len(panel_rects), 1)
+        self.assertEqual(
+            taskbar_overlay._CODEX_KNOCKOUT_COLOR,
+            panel_rects[0][2].get("fill"),
+        )
         self.assertTrue(
             all(
                 icon_left <= coord <= icon_left + 10
                 for op in codex_polygons
                 for coord in op[1][::2]
+            )
+        )
+        icon_top = (
+            4 + row_height // 2 - taskbar_overlay._PROVIDER_ICON_SIZE_PX / 2
+        )
+        self.assertTrue(
+            all(
+                icon_top
+                <= coord
+                <= icon_top + taskbar_overlay._PROVIDER_ICON_SIZE_PX
+                for op in codex_polygons
+                for coord in op[1][1::2]
             )
         )
         # Cursor row: pointer arrow in the brand's monochrome white.
@@ -1716,7 +1741,6 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             )
         )
         # Cursor mark stays in its own row (below the codex row).
-        row_height = (38 - 8) // 2
         self.assertGreater(cursor_polygons[0][1][1], 4 + row_height)
         # Labels shift right by the icon column.
         label_ops = [

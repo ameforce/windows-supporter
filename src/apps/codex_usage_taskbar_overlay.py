@@ -219,6 +219,9 @@ _METRIC_CONTEXT_SEPARATOR_COLOR = "#64748b"
 # agree; single spaces read attached at 6px canvas fonts.
 _METRIC_CONTEXT_SEPARATOR_GAP_PX = 10
 _NORMAL_GUIDANCE_COLOR = "#4ade80"
+# Panel surface behind every overlay row. The Codex mark's knocked-out
+# `>_` paints this color back over the silhouette, so the two must match.
+_PANEL_BG_COLOR = "#16181d"
 _VALUE_COLUMN_MIN_WIDTH_PX = 22
 _VALUE_COLUMN_MAX_WIDTH_PX = 28
 _SEGMENT_RIGHT_PADDING_PX = 2
@@ -298,7 +301,7 @@ _CODEX_BAR_OUTLINE = (
 # Mid stop of the mark's blue->lavender brand gradient (#B1A7FF/#7A9DFF/
 # #3941FF); a single tone keeps the 10px silhouette readable on the panel.
 _CODEX_BRAND_COLOR = "#7a9dff"
-_CODEX_KNOCKOUT_COLOR = "#16181d"
+_CODEX_KNOCKOUT_COLOR = _PANEL_BG_COLOR
 _STATUS_DOT_ONLY_WIDTH_PX = 14
 _STATUS_WITH_TEXT_WIDTH_PX = 24
 _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX = 420
@@ -3567,7 +3570,7 @@ class CodexUsageTaskbarOverlay:
             window,
             borderwidth=0,
             highlightthickness=0,
-            bg="#16181d",
+            bg=_PANEL_BG_COLOR,
         )
         canvas.pack(fill="both", expand=True)
         self._window = window
@@ -3830,7 +3833,7 @@ class CodexUsageTaskbarOverlay:
         # w/h, which are outside the drawable area and get clipped. Inset by
         # one pixel so all four borders render and the margins stay symmetric.
         canvas.create_rectangle(
-            0, 0, width - 1, height - 1, fill="#16181d", outline="#343946"
+            0, 0, width - 1, height - 1, fill=_PANEL_BG_COLOR, outline="#343946"
         )
         if not bars:
             return
@@ -4010,7 +4013,7 @@ class CodexUsageTaskbarOverlay:
                 y + 1,
                 x + width + 1,
                 y + row_height - 1,
-                fill="#16181d",
+                fill=_PANEL_BG_COLOR,
                 outline="#f59e0b",
             )
         canvas.create_text(
