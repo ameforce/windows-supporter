@@ -1555,15 +1555,33 @@ def _metric_rows_layout_for_overlay_width(
     slot_keys = _metric_slot_keys(rows_metrics)
     counts = len(slot_keys)
     required_by_slot: dict[str, int] = {}
+    reserved_reset_by_slot: dict[str, int] = {}
     for metrics in rows_metrics:
         for metric in metrics:
             key = _metric_slot_key(metric)
+            # Reserve the full badge up front: the shared grid's only honest
+            # "fits" currency is a column that already budgets the richest
+            # label. Degrading to the short badge stays a draw-time decision
+            # when the slot is genuinely cramped, not an allocation accident.
             required = min(
-                _required_metric_segment_width(metric, badge_mode="short"),
+                _required_metric_segment_width(metric, badge_mode="full"),
                 _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
             )
             if required > required_by_slot.get(key, 0):
                 required_by_slot[key] = required
+            detail_text, short_text = _metric_guidance_texts(metric)
+            reserved_reset = _metric_reset_reserved_px(
+                detail_text,
+                short_text,
+                badge_label=str(
+                    metric.get("reset_badge_label")
+                    or metric.get("reset_badge_short_label")
+                    or ""
+                ),
+                metric_key=key,
+            )
+            if reserved_reset > reserved_reset_by_slot.get(key, 0):
+                reserved_reset_by_slot[key] = reserved_reset
 
     base_need = sum(required_by_slot.values()) + segment_gap * max(0, counts - 1)
     right_air = (
@@ -1614,7 +1632,11 @@ def _metric_rows_layout_for_overlay_width(
                     _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
                     min(
                         _METRIC_PROGRESS_MAX_WIDTH_PX,
-                        _metric_progress_width_for_segment(column_width),
+                        _metric_progress_width_for_segment(
+                            column_width,
+                            reserved_reset_by_slot.get(key),
+                            cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
+                        ),
                     ),
                 )
             )
@@ -1642,7 +1664,11 @@ def _metric_rows_layout_for_overlay_width(
                 column_width = min_by_slot[key] + shares.get(key, 0)
                 column_widths[key] = column_width
                 column_progresses[key] = min(
-                    _metric_progress_width_for_segment(column_width),
+                    _metric_progress_width_for_segment(
+                        column_width,
+                        reserved_reset_by_slot.get(key),
+                        cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
+                    ),
                     _METRIC_PROGRESS_MAX_WIDTH_PX,
                 )
         else:
@@ -1666,7 +1692,11 @@ def _metric_rows_layout_for_overlay_width(
                 column_widths[key] = equal_width
             if fits or equal_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
                 for key in slot_keys:
-                    column_progresses[key] = _metric_progress_width_for_segment(equal_width)
+                    column_progresses[key] = _metric_progress_width_for_segment(
+                        equal_width,
+                        reserved_reset_by_slot.get(key),
+                        cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
+                    )
             else:
                 for key in slot_keys:
                     column_progresses[key] = _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
@@ -1760,6 +1790,14 @@ def _required_metric_segment_width_cached(
     has_reset_badge = bool(badge_label or badge_short_label)
     has_reset_time = bool(detail_text or short_text)
     mode = _normalized_badge_mode(badge_mode)
+    reserved_reset = _metric_reset_reserved_px(
+        detail_text,
+        short_text,
+        badge_label=_expected_badge_label_for_mode(
+            badge_label, badge_short_label, mode
+        ),
+        metric_key=metric_key,
+    )
 
     for candidate_width in range(48, _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX + 1):
         layout = _fit_metric_segment_layout(
@@ -1771,7 +1809,9 @@ def _required_metric_segment_width_cached(
             metric_key=metric_key,
             reset_marker="",
             has_reset_badge=has_reset_badge,
-            progress_width=_metric_progress_width_for_segment(candidate_width),
+            progress_width=_metric_progress_width_for_segment(
+                candidate_width, reserved_reset
+            ),
             badge_mode=mode,
             value_width=_value_column_width_for_text(value_text),
         )
@@ -7591,15 +7631,64 @@ def _reset_badge_width_for_label(label: str) -> int:
     )
 
 
-def _metric_progress_width_for_segment(width: int) -> int:
+def _metric_reset_reserved_px(
+    detail_text: str,
+    short_text: str,
+    *,
+    badge_label: str = "",
+    metric_key: str = "",
+) -> int:
+    """Reset-region width this metric's own content reserves for bar budgeting.
+
+    The segment fit arbitrates bar-versus-text itself; the reservation only
+    decides how much of a column the bar request should leave alone. Funding
+    every metric with the flat weekly countdown column inflated the request
+    for metrics whose reset region is a short countdown, a bare badge, or the
+    "--" placeholder, and the unneeded reservation surfaced as dead space
+    inside the column. Reserve the badge block plus the metric's own fixed
+    countdown shape (placeholder when nothing renders there at all).
+    """
+    if str(metric_key or "") == "credit":
+        return 0
+    badge_width = _reset_badge_width_for_label(str(badge_label or ""))
+    badge_block = (
+        badge_width + _RESET_BADGE_TIME_GAP_PX if badge_width else 0
+    )
+    reset_part = str(detail_text or "").split(_METRIC_CONTEXT_SEPARATOR)[0]
+    if not reset_part:
+        reset_part = str(short_text or "").split(_METRIC_CONTEXT_SEPARATOR)[0]
+    if not reset_part:
+        reset_part = "" if badge_block else _RESET_PLACEHOLDER_TEXT
+    return badge_block + _reset_column_width_for_text(
+        reset_part, metric_key=metric_key
+    )
+
+
+def _metric_progress_width_for_segment(
+    width: int,
+    reserved_reset_px: int | None = None,
+    *,
+    cap: int = _METRIC_PROGRESS_PREFERRED_WIDTH_PX,
+) -> int:
     width = max(0, int(width))
-    fixed_columns = 14 + 3 + 3 + _VALUE_COLUMN_MAX_WIDTH_PX + 4 + _RESET_WEEKLY_COLUMN_WIDTH_PX + _SEGMENT_RIGHT_PADDING_PX
+    # `None` keeps the historical worst-case reservation for callers that do
+    # not know the metric; callers that do pass its measured reservation so
+    # the request stops budgeting phantom countdown space.
+    reserve = (
+        _RESET_WEEKLY_COLUMN_WIDTH_PX
+        if reserved_reset_px is None
+        else max(0, int(reserved_reset_px))
+    )
+    fixed_columns = 14 + 3 + 3 + _VALUE_COLUMN_MAX_WIDTH_PX + 4 + reserve + _SEGMENT_RIGHT_PADDING_PX
     available = max(6, width - fixed_columns)
+    # `cap` separates the preferred-bar request (required-width search) from
+    # slack absorption (allocation paths pass the max so leftover width can
+    # widen the bar instead of idling as dead space inside the column).
     return max(
         _METRIC_PROGRESS_MIN_WIDTH_PX,
         min(
             _METRIC_PROGRESS_MAX_WIDTH_PX,
-            _METRIC_PROGRESS_PREFERRED_WIDTH_PX,
+            int(cap),
             int(available),
         ),
     )
