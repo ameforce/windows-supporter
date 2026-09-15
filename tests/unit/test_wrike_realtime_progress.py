@@ -494,6 +494,64 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__overtime_idle_pause_enabled = False
         self.assertIsNone(wrike._Wrike__overtime_idle_threshold_seconds())
 
+    def test_panel_idle_autopause_toggle_updates_and_persists_settings(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+
+        wrike._Wrike__panel_overtime_idle_autopause()
+        self.assertFalse(wrike._Wrike__overtime_idle_pause_enabled)
+        self.assertIsNone(wrike._Wrike__overtime_idle_threshold_seconds())
+
+        payload = json.loads(
+            Path(wrike._Wrike__settings_path).read_text(encoding="utf-8")
+        )
+        self.assertFalse(payload["overtime_idle_pause_enabled"])
+
+        wrike._Wrike__panel_overtime_idle_autopause()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+        payload = json.loads(
+            Path(wrike._Wrike__settings_path).read_text(encoding="utf-8")
+        )
+        self.assertTrue(payload["overtime_idle_pause_enabled"])
+
+    def test_panel_idle_autopause_toggle_failure_keeps_flag(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+
+        show_error = Mock()
+        with (
+            patch.object(wrike, "_Wrike__save_settings", return_value=False),
+            patch.object(
+                wrike, "_Wrike__show_panel_action_error", show_error
+            ),
+        ):
+            wrike._Wrike__panel_overtime_idle_autopause()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+        show_error.assert_called_once()
+
+    def test_update_settings_keeps_single_flex_poll_chain(self) -> None:
+        wrike = self._new_wrike()
+        root = _FakeRoot()
+        wrike._Wrike__root = root
+        wrike._Wrike__background_active = True
+        wrike._Wrike__flex_enabled = True
+        wrike._Wrike__flex_employee_number = "E12345"
+        wrike._Wrike__flex_poll_interval_sec = 300
+
+        ok, error = wrike.update_settings({"flex_poll_interval_sec": 300})
+        self.assertTrue(ok, error)
+        ok, error = wrike.update_settings({"flex_poll_interval_sec": 300})
+        self.assertTrue(ok, error)
+
+        flex_calls = [
+            item
+            for item in root.after_calls
+            if item[2] == wrike._Wrike__flex_poll_tick
+        ]
+        self.assertEqual(len(flex_calls), 1)
+
     def test_overtime_prompt_edit_requires_current_context(self) -> None:
         _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
         wrike = self._new_wrike()

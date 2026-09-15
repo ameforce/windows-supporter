@@ -159,6 +159,7 @@ class WorktimeOvertimeState:
     paused: bool = False
     paused_minutes: int = 0
     auto_paused: bool = False
+    idle_autopause_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.status != "active":
@@ -181,6 +182,8 @@ class WorktimeOvertimeState:
             raise TypeError("auto_paused must be a bool")
         if self.auto_paused and not self.paused:
             raise ValueError("auto_paused requires paused")
+        if type(self.idle_autopause_enabled) is not bool:
+            raise TypeError("idle_autopause_enabled must be a bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +377,7 @@ class WorktimeQuickPanel:
         overtime_toggle_pause: Callable[[], None] | None = None,
         overtime_edit_start: Callable[[str], bool] | None = None,
         overtime_prompt_edit: Callable[[str, str], bool] | None = None,
+        overtime_idle_autopause: Callable[[], None] | None = None,
         flex_open: Callable[[], None] | None = None,
         flex_pending_edit: Callable[[str, str, str], bool] | None = None,
         flex_pending_done: Callable[[str], None] | None = None,
@@ -429,6 +433,11 @@ class WorktimeQuickPanel:
         )
         self._on_overtime_edit_start = overtime_edit_start
         self._on_overtime_prompt_edit = overtime_prompt_edit
+        self._on_overtime_idle_autopause = (
+            overtime_idle_autopause
+            if overtime_idle_autopause is not None
+            else lambda: None
+        )
         self._on_flex_open = (
             flex_open if flex_open is not None else lambda: None
         )
@@ -2016,6 +2025,7 @@ class WorktimeQuickPanel:
         overtime_end_button = None
         overtime_state_label = None
         overtime_state_buttons: tuple[Any, ...] = ()
+        overtime_idle_button = None
         if model.overtime_state is not None:
             overtime_state = model.overtime_state
             overtime_state_card = tk.Frame(
@@ -2054,10 +2064,18 @@ class WorktimeQuickPanel:
                 "초과근무 종료",
                 self._overtime_end_command,
             )
+            overtime_idle_button = self._button(
+                overtime_state_actions,
+                "자동 일시정지 끄기"
+                if overtime_state.idle_autopause_enabled
+                else "자동 일시정지 켜기",
+                self._overtime_idle_autopause_command,
+            )
             overtime_state_buttons = (
                 overtime_pause_button,
                 overtime_start_edit_button,
                 overtime_end_button,
+                overtime_idle_button,
             )
 
         flex_pending_label = None
@@ -2175,6 +2193,7 @@ class WorktimeQuickPanel:
             "flex_open_button": flex_open_button,
             "overtime_state_label": overtime_state_label,
             "overtime_state_buttons": overtime_state_buttons,
+            "overtime_idle_button": overtime_idle_button,
         }
         self._update_detail_presentation(model)
         if self._inline_editor_active and self._inline_editor_kind is not None:
@@ -2248,6 +2267,15 @@ class WorktimeQuickPanel:
                         "다시 시작"
                         if model.overtime_state.paused
                         else "일시정지"
+                    )
+                )
+            overtime_idle_button = widgets.get("overtime_idle_button")
+            if overtime_idle_button is not None:
+                overtime_idle_button.configure(
+                    text=(
+                        "자동 일시정지 끄기"
+                        if model.overtime_state.idle_autopause_enabled
+                        else "자동 일시정지 켜기"
                     )
                 )
         self._update_countdown_label()
@@ -3077,6 +3105,9 @@ class WorktimeQuickPanel:
 
     def _overtime_end_command(self) -> None:
         self._run_command(self._on_overtime_end)
+
+    def _overtime_idle_autopause_command(self) -> None:
+        self._run_command(self._on_overtime_idle_autopause)
 
     def _flex_open_command(self) -> None:
         self._run_command(self._on_flex_open)
