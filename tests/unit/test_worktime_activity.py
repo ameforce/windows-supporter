@@ -196,6 +196,284 @@ class WorktimeActivityWatcherTests(unittest.TestCase):
         self.assertTrue(watcher.is_running)
         self.assertEqual(len(root.after_calls), 1)
 
+    def test_idle_callback_fires_once_at_threshold_and_rearms_on_input(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(100)
+        now_box = [datetime(2026, 4, 6, 19, 0)]
+        seen = []
+        idles = []
+        watcher = WorktimeActivityWatcher(
+            root,
+            seen.append,
+            provider=provider,
+            now=lambda: now_box[0],
+            poll_interval_ms=250,
+            idle_callback=idles.append,
+            idle_threshold_seconds=300,
+        )
+
+        watcher.start()
+        # First stable read seeds the last-input moment without firing.
+        root.run_next()
+        self.assertEqual(idles, [])
+
+        now_box[0] = datetime(2026, 4, 6, 19, 4)
+        root.run_next()
+        self.assertEqual(idles, [])
+
+        now_box[0] = datetime(2026, 4, 6, 19, 5)
+        root.run_next()
+        self.assertEqual(idles, [datetime(2026, 4, 6, 19, 5)])
+
+        # The same idle crossing is reported only once.
+        now_box[0] = datetime(2026, 4, 6, 19, 10)
+        root.run_next()
+        self.assertEqual(len(idles), 1)
+
+        # New input re-arms idle reporting.
+        provider.tick = 101
+        now_box[0] = datetime(2026, 4, 6, 19, 11)
+        root.run_next()
+        self.assertEqual(seen, [datetime(2026, 4, 6, 19, 11)])
+
+        now_box[0] = datetime(2026, 4, 6, 19, 15, 59)
+        root.run_next()
+        self.assertEqual(len(idles), 1)
+        now_box[0] = datetime(2026, 4, 6, 19, 16)
+        root.run_next()
+        self.assertEqual(idles, [datetime(2026, 4, 6, 19, 5), datetime(2026, 4, 6, 19, 16)])
+
+    def test_idle_threshold_callable_disables_and_reenables_reporting(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(50)
+        now_box = [datetime(2026, 4, 6, 19, 0)]
+        threshold_box = [None]
+        idles = []
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _now: None,
+            provider=provider,
+            now=lambda: now_box[0],
+            idle_callback=idles.append,
+            idle_threshold_seconds=lambda: threshold_box[0],
+        )
+        watcher.start()
+        root.run_next()
+
+        now_box[0] = datetime(2026, 4, 6, 20, 0)
+        root.run_next()
+        self.assertEqual(idles, [])
+
+        threshold_box[0] = 60
+        root.run_next()
+        self.assertEqual(idles, [datetime(2026, 4, 6, 20, 0)])
+
+    def test_idle_requires_callback_and_validates_threshold(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(50)
+        with self.assertRaises(ValueError):
+            WorktimeActivityWatcher(
+                root,
+                lambda _now: None,
+                provider=provider,
+                idle_callback="not-callable",
+                idle_threshold_seconds=60,
+            )
+        with self.assertRaises(ValueError):
+            WorktimeActivityWatcher(
+                root,
+                lambda _now: None,
+                provider=provider,
+                idle_callback=lambda _now: None,
+                idle_threshold_seconds=0,
+            )
+        with self.assertRaises(ValueError):
+            WorktimeActivityWatcher(
+                root,
+                lambda _now: None,
+                provider=provider,
+                idle_callback=lambda _now: None,
+                idle_threshold_seconds=True,
+            )
+
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _now: None,
+            provider=provider,
+            now=lambda: datetime(2026, 4, 6, 19, 0),
+            idle_threshold_seconds=60,
+        )
+        watcher.start()
+        root.run_next()
+        root.run_next()
+        self.assertTrue(watcher.is_running)
+        self.assertTrue(root.after_calls)
+        watcher.stop()
+
+    def test_idle_callback_failure_is_reported_once_and_polling_continues(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(70)
+        now_box = [datetime(2026, 4, 6, 19, 0)]
+        calls = []
+
+        def idle_callback(now_value) -> None:
+            calls.append(now_value)
+            raise RuntimeError("UI closed")
+
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _now: None,
+            provider=provider,
+            now=lambda: now_box[0],
+            idle_callback=idle_callback,
+            idle_threshold_seconds=60,
+        )
+        watcher.start()
+        root.run_next()
+        now_box[0] = datetime(2026, 4, 6, 19, 2)
+        root.run_next()
+        now_box[0] = datetime(2026, 4, 6, 19, 3)
+        root.run_next()
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(watcher.is_running)
+        self.assertEqual(len(root.after_calls), 1)
+
+    def test_stop_and_reset_baseline_clear_idle_state(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(80)
+        now_box = [datetime(2026, 4, 6, 19, 0)]
+        idles = []
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _now: None,
+            provider=provider,
+            now=lambda: now_box[0],
+            idle_callback=idles.append,
+            idle_threshold_seconds=60,
+        )
+        watcher.start()
+        root.run_next()
+        now_box[0] = datetime(2026, 4, 6, 19, 2)
+        root.run_next()
+        self.assertEqual(len(idles), 1)
+
+        watcher.reset_baseline()
+        now_box[0] = datetime(2026, 4, 6, 19, 3)
+        root.run_next()
+        self.assertEqual(len(idles), 1)
+
+        watcher.stop()
+        watcher.start()
+        now_box[0] = datetime(2026, 4, 6, 19, 4)
+        root.run_next()
+        self.assertEqual(len(idles), 1)
+        now_box[0] = datetime(2026, 4, 6, 19, 5)
+        root.run_next()
+        self.assertEqual(len(idles), 2)
+
+    def test_non_finite_threshold_literal_is_rejected(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(90)
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                WorktimeActivityWatcher(
+                    root,
+                    lambda _now: None,
+                    provider=provider,
+                    idle_callback=lambda _now: None,
+                    idle_threshold_seconds=bad,
+                )
+
+    def test_non_finite_callable_threshold_disables_idle_and_rearms(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(90)
+        now_box = [datetime(2026, 4, 6, 19, 0)]
+        threshold_box = [float("nan")]
+        idles = []
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _now: None,
+            provider=provider,
+            now=lambda: now_box[0],
+            idle_callback=idles.append,
+            idle_threshold_seconds=lambda: threshold_box[0],
+        )
+        watcher.start()
+        root.run_next()
+        now_box[0] = datetime(2026, 4, 6, 19, 2)
+        root.run_next()
+        self.assertEqual(idles, [])
+        self.assertTrue(watcher.is_running)
+        self.assertTrue(root.after_calls)
+
+        threshold_box[0] = 60.0
+        now_box[0] = datetime(2026, 4, 6, 19, 4)
+        root.run_next()
+        self.assertEqual(len(idles), 1)
+        self.assertTrue(watcher.is_running)
+        self.assertTrue(root.after_calls)
+        watcher.stop()
+
+    def test_unexpected_tracking_failure_still_reschedules_polling(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(95)
+        now_box = [datetime(2026, 4, 6, 19, 0)]
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _now: None,
+            provider=provider,
+            now=lambda: now_box[0],
+            idle_callback=lambda _now: None,
+            idle_threshold_seconds=60,
+        )
+        watcher.start()
+        root.run_next()
+
+        now_box[0] = datetime(2026, 4, 6, 19, 2, tzinfo=None)
+        root.run_next()
+        self.assertTrue(watcher.is_running)
+        self.assertTrue(root.after_calls)
+
+        aware = datetime(2026, 4, 6, 19, 4).astimezone()
+        now_box[0] = aware
+        root.run_next()
+        self.assertTrue(watcher.is_running)
+        self.assertTrue(root.after_calls)
+
+        now_box[0] = datetime(2026, 4, 6, 19, 6)
+        root.run_next()
+        self.assertTrue(watcher.is_running)
+        self.assertTrue(root.after_calls)
+        watcher.stop()
+
+    def test_non_datetime_now_result_does_not_stall_idle_tracking(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(96)
+        now_box = ["not-a-datetime"]
+        idles = []
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _now: None,
+            provider=provider,
+            now=lambda: now_box[0],
+            idle_callback=idles.append,
+            idle_threshold_seconds=60,
+        )
+        watcher.start()
+        root.run_next()
+        root.run_next()
+        self.assertEqual(idles, [])
+        self.assertTrue(watcher.is_running)
+        self.assertTrue(root.after_calls)
+
+        now_box[0] = datetime(2026, 4, 6, 19, 0)
+        root.run_next()
+        now_box[0] = datetime(2026, 4, 6, 19, 2)
+        root.run_next()
+        self.assertEqual(len(idles), 1)
+        watcher.stop()
+
 
 class WindowsLastInputProviderTests(unittest.TestCase):
     def test_non_windows_guard_runs_before_loading_user32(self) -> None:

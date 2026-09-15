@@ -6,7 +6,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.apps.overtime_state import OvertimeStateStore, STATE_VERSION
+from src.apps.overtime_state import (
+    OvertimeStateStore,
+    STATE_VERSION,
+    _MAX_PAUSED_SECONDS,
+)
 
 
 class OvertimeStateStoreTests(unittest.TestCase):
@@ -318,6 +322,182 @@ class OvertimeStateStoreTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("완료된", error or "")
 
+    def test_automatic_pause_marks_pause_auto_and_resume_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "overtime.json"
+            store = OvertimeStateStore(path)
+            day = datetime(2026, 9, 10)
+            self.assertEqual(
+                store.set_pending(
+                    day, day.replace(hour=18, minute=5), day.replace(hour=18)
+                ),
+                (True, None),
+            )
+            self.assertEqual(
+                store.start(day, day.replace(hour=18, minute=6)), (True, None)
+            )
+            self.assertEqual(
+                store.pause(day, day.replace(hour=19, minute=0), automatic=True),
+                (True, None),
+            )
+            entry = store.get(day)
+            self.assertEqual(entry["paused_at"], "2026-09-10T19:00:00")
+            self.assertTrue(entry["pause_auto"])
+
+            reloaded = OvertimeStateStore(path)
+            self.assertTrue(reloaded.get(day)["pause_auto"])
+
+            self.assertEqual(
+                reloaded.resume(day, day.replace(hour=19, minute=30)),
+                (True, None),
+            )
+            entry = reloaded.get(day)
+            self.assertIsNone(entry["paused_at"])
+            self.assertFalse(entry["pause_auto"])
+            self.assertEqual(entry["paused_seconds"], 1800)
+
+            self.assertEqual(
+                reloaded.pause(day, day.replace(hour=20, minute=0)), (True, None)
+            )
+            self.assertFalse(reloaded.get(day)["pause_auto"])
+
+    def test_resume_clamps_pause_span_within_decode_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "overtime.json"
+            store = OvertimeStateStore(path)
+            day = datetime(2026, 9, 10)
+            self.assertEqual(
+                store.set_pending(
+                    day, day.replace(hour=18, minute=5), day.replace(hour=18)
+                ),
+                (True, None),
+            )
+            self.assertEqual(
+                store.start(day, day.replace(hour=18, minute=6)), (True, None)
+            )
+            self.assertEqual(
+                store.pause(day, day.replace(hour=19, minute=0), automatic=True),
+                (True, None),
+            )
+
+            resumed = day + timedelta(days=4)
+            self.assertEqual(store.resume(day, resumed), (True, None))
+            entry = store.get(day)
+            self.assertEqual(entry["paused_seconds"], _MAX_PAUSED_SECONDS)
+
+            reloaded = OvertimeStateStore(path)
+            entry = reloaded.get(day)
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry["status"], "active")
+            self.assertEqual(entry["paused_seconds"], _MAX_PAUSED_SECONDS)
+            self.assertEqual(
+                reloaded.set_pending(
+                    day + timedelta(days=1),
+                    (day + timedelta(days=1)).replace(hour=18),
+                    (day + timedelta(days=1)).replace(hour=18),
+                ),
+                (True, None),
+            )
+
+    def test_pause_auto_field_is_strictly_decoded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "overtime.json"
+            base = {
+                "status": "active",
+                "detected_at": "2026-09-10T18:05:00",
+                "scheduled_quit": "2026-09-10T18:00:00",
+                "assigned_minutes": 0,
+                "started_at": "2026-09-10T18:06:00",
+                "ended_at": None,
+                "paused_at": "2026-09-10T19:00:00",
+                "paused_seconds": 0,
+                "pause_auto": True,
+                "flex_pending": False,
+            }
+            for mutated in (
+                {key: value for key, value in base.items() if key != "pause_auto"},
+                {**base, "pause_auto": "yes"},
+                {**base, "paused_at": None},
+            ):
+                path.write_text(
+                    json.dumps(
+                        {"state_version": STATE_VERSION, "days": {"2026-09-10": mutated}}
+                    ),
+                    encoding="utf-8",
+                )
+                store = OvertimeStateStore(path)
+                self.assertIsNone(store.get("2026-09-10"))
+
+            path.write_text(
+                json.dumps(
+                    {"state_version": STATE_VERSION, "days": {"2026-09-10": base}}
+                ),
+                encoding="utf-8",
+            )
+            store = OvertimeStateStore(path)
+            entry = store.get("2026-09-10")
+            self.assertIsNotNone(entry)
+            self.assertTrue(entry["pause_auto"])
+
+    def test_v3_state_file_is_upgraded_with_pause_auto(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "overtime.json"
+            paused_v3 = {
+                "status": "active",
+                "detected_at": "2026-09-10T18:05:00",
+                "scheduled_quit": "2026-09-10T18:00:00",
+                "assigned_minutes": 0,
+                "started_at": "2026-09-10T18:06:00",
+                "ended_at": None,
+                "paused_at": "2026-09-10T19:00:00",
+                "paused_seconds": 0,
+                "flex_pending": False,
+            }
+            path.write_text(
+                json.dumps(
+                    {"state_version": 3, "days": {"2026-09-10": paused_v3}}
+                ),
+                encoding="utf-8",
+            )
+            store = OvertimeStateStore(path)
+            entry = store.get("2026-09-10")
+            self.assertIsNotNone(entry)
+            # A pause recorded before auto-pause existed stays manual and
+            # must not auto-resume on input.
+            self.assertFalse(entry["pause_auto"])
+            self.assertEqual(entry["paused_at"], "2026-09-10T19:00:00")
+
+            self.assertEqual(
+                store.resume("2026-09-10", datetime(2026, 9, 10, 19, 30)),
+                (True, None),
+            )
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(raw["state_version"], STATE_VERSION)
+
+    def test_v3_file_with_v4_only_fields_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "overtime.json"
+            bad = {
+                "state_version": 3,
+                "days": {
+                    "2026-09-10": {
+                        "status": "active",
+                        "detected_at": "2026-09-10T18:05:00",
+                        "scheduled_quit": "2026-09-10T18:00:00",
+                        "assigned_minutes": 0,
+                        "started_at": "2026-09-10T18:06:00",
+                        "ended_at": None,
+                        "paused_at": "2026-09-10T19:00:00",
+                        "paused_seconds": 0,
+                        "pause_auto": True,
+                        "flex_pending": False,
+                    }
+                },
+            }
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            store = OvertimeStateStore(path)
+            self.assertIsNone(store.get("2026-09-10"))
+
     def test_flex_pending_field_is_strictly_decoded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "overtime.json"
@@ -330,6 +510,7 @@ class OvertimeStateStoreTests(unittest.TestCase):
                 "ended_at": "2026-09-10T19:06:00",
                 "paused_at": None,
                 "paused_seconds": 0,
+                "pause_auto": False,
                 "flex_pending": True,
             }
             for mutated in (

@@ -158,6 +158,7 @@ class WorktimeOvertimeState:
     assigned_minutes: int = 0
     paused: bool = False
     paused_minutes: int = 0
+    auto_paused: bool = False
 
     def __post_init__(self) -> None:
         if self.status != "active":
@@ -176,6 +177,10 @@ class WorktimeOvertimeState:
             raise TypeError("paused must be a bool")
         if type(self.paused_minutes) is not int or self.paused_minutes < 0:
             raise ValueError("paused_minutes must be a non-negative int")
+        if type(self.auto_paused) is not bool:
+            raise TypeError("auto_paused must be a bool")
+        if self.auto_paused and not self.paused:
+            raise ValueError("auto_paused requires paused")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3008,8 +3013,13 @@ class WorktimeQuickPanel:
     @staticmethod
     def _overtime_state_text(state: WorktimeOvertimeState) -> str:
         if state.paused:
+            heading = (
+                "초과근무 자동 일시정지 중"
+                if state.auto_paused
+                else "초과근무 일시정지 중"
+            )
             return (
-                f"초과근무 일시정지 중 · 시작 {state.start_time} · "
+                f"{heading} · 시작 {state.start_time} · "
                 f"경과 {state.elapsed_minutes}분 · 정지 {state.paused_minutes}분"
             )
         assigned = (

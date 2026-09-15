@@ -436,6 +436,64 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(store.get(day)["started_at"], "2026-04-06T18:10:00")
         self.assertFalse(wrike._Wrike__panel_overtime_edit_start("not-a-time"))
 
+    def test_overtime_idle_auto_pause_and_input_auto_resume(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+
+        # A manual pause must not auto-resume on input.
+        self.assertEqual(
+            store.pause(day, datetime(2026, 4, 6, 19, 0)), (True, None)
+        )
+        wrike._Wrike__on_worktime_activity(datetime(2026, 4, 6, 19, 10))
+        entry = store.get(day)
+        self.assertEqual(entry["paused_at"], "2026-04-06T19:00:00")
+        self.assertFalse(entry["pause_auto"])
+
+        self.assertEqual(
+            store.resume(day, datetime(2026, 4, 6, 19, 11)), (True, None)
+        )
+        wrike._Wrike__on_overtime_idle_input(datetime(2026, 4, 6, 19, 20))
+        entry = store.get(day)
+        self.assertEqual(entry["paused_at"], "2026-04-06T19:20:00")
+        self.assertTrue(entry["pause_auto"])
+
+        # The next input event resumes only an automatic pause.
+        wrike._Wrike__on_worktime_activity(datetime(2026, 4, 6, 19, 40))
+        entry = store.get(day)
+        self.assertIsNone(entry["paused_at"])
+        self.assertFalse(entry["pause_auto"])
+        self.assertEqual(entry["paused_seconds"], 660 + 1200)
+
+    def test_overtime_idle_pause_respects_disabled_setting(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+
+        wrike._Wrike__overtime_idle_pause_enabled = False
+        wrike._Wrike__on_overtime_idle_input(datetime(2026, 4, 6, 19, 30))
+        self.assertIsNone(store.get(day)["paused_at"])
+
+        wrike._Wrike__overtime_idle_pause_enabled = True
+        wrike._Wrike__overtime_idle_pause_min = 15
+        self.assertEqual(wrike._Wrike__overtime_idle_threshold_seconds(), 900)
+        wrike._Wrike__overtime_idle_pause_enabled = False
+        self.assertIsNone(wrike._Wrike__overtime_idle_threshold_seconds())
+
     def test_overtime_prompt_edit_requires_current_context(self) -> None:
         _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
         wrike = self._new_wrike()
