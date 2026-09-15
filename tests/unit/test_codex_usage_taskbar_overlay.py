@@ -1795,11 +1795,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         runtime["accounts"][0]["provider"] = "codex"
         runtime["accounts"][1]["provider"] = "cursor"
         model = build_codex_usage_taskbar_overlay_model(runtime)
-        # 440px cannot fund the icon column beside this runtime's required
+        # 298px cannot fund the icon column beside this runtime's required
         # metric widths, so the glyph must stay undrawn and labels keep the
         # original left inset.
         row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
-            440,
+            298,
             [tuple(bar["metrics"]) for bar in model["bars"]],
             profile_labels=tuple(bar["label"] for bar in model["bars"]),
         )
@@ -1814,7 +1814,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 geometry={
                     "x": 1400,
                     "y": 1000,
-                    "width": 440,
+                    "width": 298,
                     "height": 38,
                     "orientation": "bottom",
                     "visible": True,
@@ -5149,7 +5149,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 527)
+        self.assertEqual(width, 537)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
@@ -5381,7 +5381,10 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width, metrics)
-        narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 1, metrics)
+        # One pixel below preferred only costs the icon column and bar slack;
+        # the full badge must survive until the columns genuinely cannot fund
+        # it, so probe well past the icon-yield point.
+        narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 20, metrics)
 
         self.assertGreater(width, 414)
         self.assertEqual(
@@ -5461,6 +5464,84 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ),
             f"progress widths out of bounds: {widths_by_metric}",
         )
+
+    def test_empty_five_hour_reset_does_not_reserve_weekly_column_or_starve_badge(self):
+        # Live defect: a 5H metric whose reset region renders only the "--"
+        # placeholder was still funded with the weekly countdown column, so
+        # the surplus died inside its segment as dead space and the weekly
+        # badge dropped to the one-letter short label.
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 100,
+            "value_text": "100%",
+            "color": "#22c55e",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 94,
+            "value_text": "94%",
+            "color": "#22c55e",
+            "reset_text": "05d 14h 22m 33s",
+            "reset_short_text": "5d 14h",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 60~95% / 2d 3h",
+            "normal_guidance_short_text": "N 60~95%",
+        }
+        rows = [
+            (dict(five_hour), dict(weekly)),
+            (
+                dict(five_hour),
+                dict(
+                    weekly,
+                    reset_text="01d 12h 51m 33s",
+                    reset_short_text="1d 12h",
+                    normal_guidance_text="N 30~60% / 1d 2h",
+                    normal_guidance_short_text="N 30~60%",
+                ),
+            ),
+        ]
+        labels = ("Codex 1", "Codex 2")
+        signature = tuple(
+            tuple(taskbar_overlay._metric_width_signature(m) for m in row)
+            for row in rows
+        )
+        width = taskbar_overlay._preferred_width_for_rows_cached(
+            signature, labels
+        )
+
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            width, rows, profile_labels=labels
+        )
+
+        self.assertEqual(
+            taskbar_overlay._resolve_overlay_badge_mode(tuple(row_layouts)),
+            "full",
+        )
+        for layout in row_layouts:
+            five_hour_width = int(layout.segment_widths[0])
+            weekly_width = int(layout.segment_widths[1])
+            # The 5H column stays close to its own content instead of
+            # inheriting the weekly reset reservation (~175px before).
+            self.assertLessEqual(five_hour_width, 140)
+            self.assertLess(five_hour_width, weekly_width)
+
+        texts = []
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        model = self._two_row_badge_model(
+            width, first_metrics=rows[0], second_metrics=rows[1]
+        )
+        overlay._draw(model)
+        texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
+        self.assertIn("남음", texts)
+        self.assertNotIn("남", texts)
+        # The weekly countdown survives alongside the full badge (the fit
+        # picked the short countdown shape to fund the guidance text).
+        self.assertIn("5d 14h", texts)
 
     def test_fit_reset_badge_can_be_forced_to_short_or_full_mode(self):
         short_available = (
@@ -6304,8 +6385,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
-        self.assertIn("443x", window.geometry_calls[-1])
-        self.assertIn("+1049+", window.geometry_calls[-1])
+        self.assertIn("301x", window.geometry_calls[-1])
+        self.assertIn("+1191+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_hard_resamples_changed_slot_after_scheduled_delay(self):
         root = _FakeRoot()
@@ -6349,8 +6430,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(overlay._last_geometry_hard_resample_at, 101.0)
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("443x", window.geometry_calls[-1])
-        self.assertIn("+1049+", window.geometry_calls[-1])
+        self.assertIn("301x", window.geometry_calls[-1])
+        self.assertIn("+1191+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_reuses_runtime_snapshot_and_now_for_width_change(self):
         root = _FakeRoot()
@@ -6697,9 +6778,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 1)
-        self.assertIn("443x", window.geometry_calls[-1])
+        self.assertIn("301x", window.geometry_calls[-1])
         # After the empty-slot gap recovers, content-fit width remains preferred.
-        self.assertRegex(window.geometry_calls[-1], r"443x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"301x38\+\d+\+")
 
     def test_geometry_monitor_defers_transient_width_shrink_without_jitter(self):
         root = _FakeRoot()
@@ -6838,7 +6919,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
-        self.assertIn("+1329+", window.geometry_calls[-1])
+        self.assertIn("+1471+", window.geometry_calls[-1])
 
     def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
@@ -7231,11 +7312,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         geometry_tick()
 
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("443x", window.geometry_calls[-1])
+        self.assertIn("301x", window.geometry_calls[-1])
         # Content-fit preferred width reflects the provider icon column and
         # the compact profile-label column; confirmed slot-edge move updates
         # x only.
-        self.assertRegex(window.geometry_calls[-1], r"443x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"301x38\+\d+\+")
 
     def test_geometry_monitor_accepts_no_slot_when_work_area_context_changes(self):
         root = _FakeRoot()
@@ -7979,9 +8060,8 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
 
         # Need-based distribution satisfied both bars: the weekly slot no
         # longer degrades below the shared progress.
-        self.assertEqual(floors["weekly_limit"], 36)
-        self.assertEqual(floors["five_hour_limit"], 36)
-        self.assertEqual(floors["five_hour_limit"], 36)
+        self.assertEqual(floors["weekly_limit"], 42)
+        self.assertEqual(floors["five_hour_limit"], 42)
         self.assertNotIn("credit", floors)
 
     def test_drawn_same_slot_tracks_share_width_without_losing_text(self):
