@@ -583,6 +583,7 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         "overtime_toggle_pause": Mock(),
         "overtime_edit_start": Mock(return_value=True),
         "overtime_prompt_edit": Mock(return_value=True),
+        "overtime_idle_autopause": Mock(),
         "flex_open": Mock(),
         "flex_pending_edit": Mock(return_value=True),
         "flex_pending_done": Mock(),
@@ -607,6 +608,7 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         overtime_toggle_pause=callbacks["overtime_toggle_pause"],
         overtime_edit_start=callbacks["overtime_edit_start"],
         overtime_prompt_edit=callbacks["overtime_prompt_edit"],
+        overtime_idle_autopause=callbacks["overtime_idle_autopause"],
         flex_open=callbacks["flex_open"],
         flex_pending_edit=callbacks["flex_pending_edit"],
         flex_pending_done=callbacks["flex_pending_done"],
@@ -1230,6 +1232,48 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 elapsed_minutes=12,
                 scheduled_quit_time="18:00",
                 auto_paused=True,
+            )
+
+    def test_overtime_idle_autopause_toggle_button_uses_callback(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": _model(
+                overtime_state=WorktimeOvertimeState(
+                    status="active",
+                    start_time="18:05",
+                    elapsed_minutes=12,
+                    scheduled_quit_time="18:00",
+                    idle_autopause_enabled=True,
+                )
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        fake_tk.button("자동 일시정지 끄기").invoke()
+        callbacks["overtime_idle_autopause"].assert_called_once_with()
+
+        holder["model"] = _model(
+            overtime_state=WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                idle_autopause_enabled=False,
+            )
+        )
+        panel.refresh_now()
+        fake_tk.button("자동 일시정지 켜기").invoke()
+        self.assertEqual(callbacks["overtime_idle_autopause"].call_count, 2)
+
+        with self.assertRaises(TypeError):
+            WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=12,
+                scheduled_quit_time="18:00",
+                idle_autopause_enabled=1,
             )
 
     def test_overtime_prompt_start_edit_uses_edit_callback(self) -> None:

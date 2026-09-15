@@ -926,6 +926,7 @@ class Wrike:
         self.__schedule_flex_poll(root)
 
     def __schedule_flex_poll(self, root=None) -> None:
+        self.__cancel_flex_after()
         target_root = root if root is not None else self.__root
         if (
             target_root is None
@@ -1348,6 +1349,7 @@ class Wrike:
             paused=paused,
             paused_minutes=paused_minutes,
             auto_paused=paused and bool(state.get("pause_auto")),
+            idle_autopause_enabled=bool(self.__overtime_idle_pause_enabled),
         )
 
     def __overtime_tooltip_lines(self) -> list[tuple[str, str | None]]:
@@ -1548,6 +1550,34 @@ class Wrike:
         lines = self.__overtime_tooltip_lines()
         if self.__root is not None and lines:
             self.__show_tooltip(self.__root, "초과근무 일시정지", lines=lines)
+
+    def __panel_overtime_idle_autopause(self) -> None:
+        ok, _error = self.update_settings(
+            {
+                "overtime_idle_pause_enabled": not bool(
+                    self.__overtime_idle_pause_enabled
+                )
+            }
+        )
+        if not ok:
+            self.__show_panel_action_error(
+                "자동 일시정지 설정을 바꾸지 못했습니다."
+            )
+            return
+        self.__sync_settings_view()
+
+    def __sync_settings_view(self) -> None:
+        root = self.__root
+        if root is None:
+            return
+        try:
+            ui = getattr(root, "_ws_main_ui", None)
+            view = getattr(ui, "_wrike_view", None)
+            if view is None:
+                return
+            view.refresh_overtime_idle_settings()
+        except Exception:
+            pass
 
     def __panel_overtime_edit_start(self, start_time: str) -> bool:
         state = self.__overtime_active_state()
@@ -2599,6 +2629,7 @@ class Wrike:
                 overtime_toggle_pause=self.__panel_overtime_toggle_pause,
                 overtime_edit_start=self.__panel_overtime_edit_start,
                 overtime_prompt_edit=self.__panel_overtime_prompt_edit,
+                overtime_idle_autopause=self.__panel_overtime_idle_autopause,
                 flex_open=self.__panel_flex_open,
                 flex_pending_edit=self.__panel_flex_pending_edit,
                 flex_pending_done=self.__panel_flex_pending_done,
