@@ -2996,10 +2996,24 @@ class Wrike:
             if overview.clock_in is not None
             else "-"
         )
+        actual_quit = (
+            flex_schedule.actual_quit
+            if (
+                flex_schedule is not None
+                and isinstance(flex_schedule.actual_start, datetime)
+                and isinstance(flex_schedule.actual_quit, datetime)
+            )
+            else None
+        )
+        quit_label = "실제 퇴근" if actual_quit is not None else "예상 퇴근"
         quit_text = (
-            overview.projected_quit.strftime("%H:%M")
-            if overview.projected_quit is not None
-            else "-"
+            actual_quit.strftime("%H:%M")
+            if actual_quit is not None
+            else (
+                overview.projected_quit.strftime("%H:%M")
+                if overview.projected_quit is not None
+                else "-"
+            )
         )
         sync_text = self.__snapshot_sync_text(snapshot, now)
         if self.__flex_enabled:
@@ -3046,7 +3060,7 @@ class Wrike:
                 delta_color,
             ),
             WorktimePanelLine(
-                f"출근 {clock_text} · 예상 퇴근 {quit_text}"
+                f"출근 {clock_text} · {quit_label} {quit_text}"
                 + (" (임시)" if provisional else ""),
                 "#111827",
             ),
