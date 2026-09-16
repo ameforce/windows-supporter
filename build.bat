@@ -105,12 +105,12 @@ if errorlevel 1 (
 )
 echo [ Success !! ]
 
-REM Stage Tcl/Tk script libraries as real directories. CPython 3.14 embeds them
-REM as ZipFS archives inside tcl90.dll/tcl9tk90.dll, and Tcl's runtime self-mount
-REM of that archive can fail when the _MEI temp parent is not enumerable, leaving
-REM the frozen app without init.tcl. Shipping extracted _tcl_data/_tk_data lets
-REM the stock run-time hook set TCL_LIBRARY/TK_LIBRARY so init.tcl is read
-REM through a plain file open instead.
+REM Stage Tcl/Tk script libraries as real directories. Tcl's runtime self-mount
+REM of a frozen onefile bundle can fail when the OS _MEI temp parent is not
+REM enumerable (for example C:\Windows\Temp under an elevated launch), leaving
+REM the app without init.tcl. Shipping extracted _tcl_data/_tk_data avoids the
+REM ZipFS lookup, while --runtime-tmpdir keeps those files under the executable
+REM directory instead of the unreliable OS temp parent.
 echo | set /p="Staging Tcl/Tk runtime libraries..."
 call :clear_log
 "%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\stage_tcltk_runtime.py" --dest "%BUILD_GENERATED_DIR%\tcltk" > "%STEP_LOG%" 2>&1
@@ -125,7 +125,7 @@ echo [ Success !! ]
 REM Build the executable
 echo | set /p="Building %MAIN_SOURCE% to %EXE_NAME%..."
 call :clear_log
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tcl_data;_tcl_data" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tk_data;_tk_data" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --runtime-tmpdir "." --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tcl_data;_tcl_data" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tk_data;_tk_data" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller build failed.
@@ -170,8 +170,15 @@ REM a real Tcl/Tk init, not just an archive listing, so a missing or unmountable
 REM script library fails the build instead of reaching users.
 echo | set /p="Validating frozen Tcl/Tk runtime..."
 call :clear_log
+set "WINDOWS_SUPPORTER_SAVED_TEMP=%TEMP%"
+set "WINDOWS_SUPPORTER_SAVED_TMP=%TMP%"
+set "TEMP=%SystemRoot%\Temp"
+set "TMP=%SystemRoot%\Temp"
 "dist\%EXE_NAME%" --tcl-runtime-smoke > "%STEP_LOG%" 2>&1
-if errorlevel 1 (
+set "TCL_RUNTIME_SMOKE_EXIT=%ERRORLEVEL%"
+set "TEMP=%WINDOWS_SUPPORTER_SAVED_TEMP%"
+set "TMP=%WINDOWS_SUPPORTER_SAVED_TMP%"
+if not "%TCL_RUNTIME_SMOKE_EXIT%"=="0" (
   echo Failure
   echo Frozen Tcl/Tk runtime validation failed.
   call :print_log
