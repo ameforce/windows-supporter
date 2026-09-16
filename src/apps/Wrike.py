@@ -59,6 +59,7 @@ from src.apps.wrike_worktime import (
     clock_in_candidate,
     composed_vacation_credit_minutes,
     normalize_hhmm_input,
+    project_quit_at,
 )
 from src.apps.wrike_worktime_state import WorktimeStateStore
 from src.apps.flex_worktime import (
@@ -1236,19 +1237,28 @@ class Wrike:
             return None
         return None
 
-    def __overtime_scheduled_quit(self, target_day, overview=None):
+    def __overtime_scheduled_quit(self, target_day, overview=None, now=None):
         schedule = self.__flex_schedule_for_day(target_day)
-        if schedule is not None:
-            # Overtime measurement starts after the regular shift. Flex may
-            # already contain an approved extension; it is displayed as the
-            # assigned amount but must not hide the local overtime prompt.
-            if schedule.regular_quit is not None:
-                return schedule.regular_quit
-            if schedule.scheduled_quit is not None:
-                return schedule.scheduled_quit
-        if overview is not None:
-            return overview.projected_quit
-        return None
+        if schedule is not None and isinstance(schedule.actual_start, datetime):
+            at = now if isinstance(now, datetime) else self.__lib.datetime.now()
+            try:
+                intervals = self.__collect_break_intervals_for_day(target_day, at)
+                # Use the actual clock record and Flex's regular work duration,
+                # not its planned clock range.  Assigned Flex overtime remains
+                # a separate local overtime flow and must not move this point.
+                return project_quit_at(
+                    at,
+                    schedule.actual_start,
+                    schedule.regular_work_minutes,
+                    intervals,
+                )
+            except Exception:
+                return None
+        if overview is None:
+            return None
+        # If Flex has no actual clock record, retain the local plan's common
+        # projection.  Never fall back to a Flex planned quit time.
+        return getattr(overview, "projected_quit", None)
 
     def __maybe_record_overtime_activity(self, detected_at, plan) -> None:
         if not isinstance(detected_at, datetime) or not isinstance(plan, dict):
@@ -1262,6 +1272,7 @@ class Wrike:
         scheduled_quit = self.__overtime_scheduled_quit(
             detected_at.date(),
             overview,
+            now=detected_at,
         )
         if not isinstance(scheduled_quit, datetime) or detected_at < scheduled_quit:
             return
@@ -2996,15 +3007,16 @@ class Wrike:
             sync_text += f" · Flex {flex_status['state']}"
         flex_note = ""
         if flex_schedule is not None:
-            flex_quit = (
-                flex_schedule.scheduled_quit.strftime("%H:%M")
-                if flex_schedule.scheduled_quit is not None
-                else "-"
-            )
             flex_note = (
-                f"Flex 목표 {self.__format_minutes(flex_schedule.target_minutes)}"
-                f" · Flex 퇴근 {flex_quit}"
+                "Flex 근무 "
+                f"{self.__format_minutes(flex_schedule.regular_work_minutes)}"
             )
+            if isinstance(flex_schedule.actual_start, datetime):
+                flex_note += f" · 실제 출근 {flex_schedule.actual_start.strftime('%H:%M')} 기준"
+            elif flex_schedule.scheduled_quit is not None:
+                flex_note += (
+                    f" · Flex 예정 퇴근 {flex_schedule.scheduled_quit.strftime('%H:%M')}"
+                )
             if flex_schedule.overtime_assigned_minutes > 0:
                 flex_note += (
                     f" · 연장 배정 {self.__format_minutes(flex_schedule.overtime_assigned_minutes)}"
