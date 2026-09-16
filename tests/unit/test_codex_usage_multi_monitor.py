@@ -4120,6 +4120,44 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(len(_FakeTaskbarOverlay.instances), 2)
             self.assertEqual(_FakeTaskbarOverlay.instances[-1].refresh_calls, 1)
 
+    def test_taskbar_side_priority_round_trips_and_rejects_unknown_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_manager(tmp)
+
+            self.assertEqual(
+                manager.get_settings_snapshot()["taskbar_side_priority"],
+                "left",
+            )
+            self.assertEqual(
+                manager.get_runtime_status()["taskbar_side_priority"],
+                "left",
+            )
+
+            ok, error = manager.update_settings({"taskbar_side_priority": "right"})
+            self.assertTrue(ok, error)
+            self.assertEqual(
+                manager.get_settings_snapshot()["taskbar_side_priority"],
+                "right",
+            )
+            self.assertEqual(
+                manager.get_runtime_status()["taskbar_side_priority"],
+                "right",
+            )
+
+            ok, error = manager.update_settings({"taskbar_side_priority": "center"})
+            self.assertFalse(ok)
+            self.assertEqual(error, "taskbar_side_priority")
+            self.assertEqual(
+                manager.get_settings_snapshot()["taskbar_side_priority"],
+                "right",
+            )
+
+            restarted, _children = self._build_manager(tmp)
+            self.assertEqual(
+                restarted.get_settings_snapshot()["taskbar_side_priority"],
+                "right",
+            )
+
     def test_show_current_status_refreshes_enabled_accounts_in_fixed_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)

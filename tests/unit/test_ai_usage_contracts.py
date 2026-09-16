@@ -5,8 +5,11 @@ import unittest
 from src.apps.ai_usage_contracts import (
     AiUsageProvider,
     AiUsageReading,
+    TaskbarSidePriority,
     UsageErrorType,
     UsageState,
+    is_valid_taskbar_side_priority,
+    normalize_taskbar_side_priority,
     normalize_usage_error_type,
     normalize_usage_state,
     normalize_reset_boundary,
@@ -21,6 +24,18 @@ class AiUsageContractsUnitTest(unittest.TestCase):
             {provider.value for provider in AiUsageProvider},
             {"codex", "cursor", "claude"},
         )
+
+    def test_taskbar_side_priority_normalizes_supported_values_and_defaults_left(self) -> None:
+        self.assertEqual(
+            normalize_taskbar_side_priority("right-first"),
+            TaskbarSidePriority.RIGHT,
+        )
+        self.assertEqual(
+            normalize_taskbar_side_priority("unknown"),
+            TaskbarSidePriority.LEFT,
+        )
+        self.assertTrue(is_valid_taskbar_side_priority("left"))
+        self.assertFalse(is_valid_taskbar_side_priority("center"))
 
     def test_runtime_failure_aliases_normalize_to_stable_states(self) -> None:
         cases = {

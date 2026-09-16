@@ -15,6 +15,36 @@ class AiUsageProvider(StrEnum):
 
 
 @unique
+class TaskbarSidePriority(StrEnum):
+    LEFT = "left"
+    RIGHT = "right"
+
+
+DEFAULT_TASKBAR_SIDE_PRIORITY = TaskbarSidePriority.LEFT
+
+
+def normalize_taskbar_side_priority(value: object) -> TaskbarSidePriority:
+    if isinstance(value, TaskbarSidePriority):
+        return value
+    key = str(value or "").strip().lower().replace("-", "_")
+    key = "_".join(key.split())
+    return {
+        "left": TaskbarSidePriority.LEFT,
+        "left_first": TaskbarSidePriority.LEFT,
+        "right": TaskbarSidePriority.RIGHT,
+        "right_first": TaskbarSidePriority.RIGHT,
+    }.get(key, DEFAULT_TASKBAR_SIDE_PRIORITY)
+
+
+def is_valid_taskbar_side_priority(value: object) -> bool:
+    if isinstance(value, TaskbarSidePriority):
+        return True
+    key = str(value or "").strip().lower().replace("-", "_")
+    key = "_".join(key.split())
+    return key in {"left", "left_first", "right", "right_first"}
+
+
+@unique
 class UsageState(StrEnum):
     READY = "ready"
     UNKNOWN = "unknown"
