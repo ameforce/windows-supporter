@@ -76,6 +76,11 @@ _GEOMETRY_CHANGE_TOLERANCE_PX = 2
 _GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX = _OCCUPIED_DILATION_PX
 _RIGHT_TO_LEFT_SWITCH_DWELL_SEC = 2.0
 _LEFT_TO_RIGHT_SWITCH_DWELL_SEC = 1.0
+# A candidate that reverses an already accepted same-side move needs stronger
+# evidence than the first relocation.  This is the cycle breaker for a
+# detector whose two adjacent samples are influenced by the overlay itself.
+_SAME_SIDE_SLOT_RETURN_CONFIRMATION_COUNT = 4
+_STABLE_SLOT_MIN_OVERLAP_PX = 32
 _SLOT_SIDE_LEFT = "left"
 _SLOT_SIDE_RIGHT = "right"
 _FULLSCREEN_POLL_MS = 500
@@ -2411,6 +2416,7 @@ class CodexUsageTaskbarOverlay:
         | None = None,
         fullscreen_detector: Callable[[Any | None], bool] | None = None,
         taskbar_target_getter: Callable[[], tuple[TaskbarOverlayTarget, ...]] | None = None,
+        stable_slot_selection: bool = False,
     ) -> None:
         self._root = root
         self._runtime_getter = runtime_getter
@@ -2421,6 +2427,7 @@ class CodexUsageTaskbarOverlay:
         )
         self._fullscreen_detector = fullscreen_detector
         self._taskbar_target_getter = taskbar_target_getter
+        self._stable_slot_selection = bool(stable_slot_selection)
         self._window = None
         self._canvas = None
         self._last_metric_values: dict[str, str] = {}
@@ -2445,6 +2452,7 @@ class CodexUsageTaskbarOverlay:
         self._pending_side_transition: tuple[str, str] | None = None
         self._pending_side_transition_context = None
         self._pending_side_transition_started_at = 0.0
+        self._last_same_side_transition: tuple[tuple[Any, ...], tuple[Any, ...]] | None = None
         self._fullscreen_suppressed = False
         self._window_visible = False
         self._active_taskbar_hwnd = 0
@@ -2571,6 +2579,7 @@ class CodexUsageTaskbarOverlay:
         self._cancel_geometry_monitor_tick()
         self._clear_pending_regression_geometry()
         self._clear_pending_side_transition()
+        self._last_same_side_transition = None
         self._fullscreen_suppressed = False
         return
 
@@ -2596,6 +2605,7 @@ class CodexUsageTaskbarOverlay:
         self._cached_geometry = None
         self._clear_pending_regression_geometry()
         self._clear_pending_side_transition()
+        self._last_same_side_transition = None
         return
 
     def prepare_for_display_topology_change(self) -> None:
@@ -3033,6 +3043,40 @@ class CodexUsageTaskbarOverlay:
         self._pending_side_transition_started_at = 0.0
         return
 
+    def _remember_same_side_transition(
+        self,
+        previous_geometry: dict[str, Any],
+        candidate_geometry: dict[str, int | str],
+    ) -> None:
+        previous_side = _horizontal_geometry_slot_side(previous_geometry)
+        candidate_side = _horizontal_geometry_slot_side(candidate_geometry)
+        if previous_side != candidate_side or not previous_side:
+            return
+        if not _geometry_changed(previous_geometry, candidate_geometry):
+            return
+        previous_key = _geometry_slot_identity(previous_geometry)
+        candidate_key = _geometry_slot_identity(candidate_geometry)
+        if previous_key is None or candidate_key is None or previous_key == candidate_key:
+            return
+        self._last_same_side_transition = (previous_key, candidate_key)
+        return
+
+    def _same_side_confirmation_count(
+        self,
+        previous_geometry: dict[str, Any],
+        candidate_geometry: dict[str, int | str],
+    ) -> int:
+        previous_key = _geometry_slot_identity(previous_geometry)
+        candidate_key = _geometry_slot_identity(candidate_geometry)
+        transition = self._last_same_side_transition
+        if (
+            transition is not None
+            and _geometry_slot_identity_matches(candidate_key, transition[0])
+            and _geometry_slot_identity_matches(previous_key, transition[1])
+        ):
+            return int(_SAME_SIDE_SLOT_RETURN_CONFIRMATION_COUNT)
+        return 2
+
     def _stabilize_transient_geometry_regression(
         self,
         previous_geometry: dict[str, Any],
@@ -3052,6 +3096,7 @@ class CodexUsageTaskbarOverlay:
             ):
                 self._clear_pending_side_transition()
                 self._clear_pending_regression_geometry()
+                self._last_same_side_transition = None
                 return candidate_geometry
             transition = (previous_side, candidate_side)
             now = time.monotonic()
@@ -3076,16 +3121,24 @@ class CodexUsageTaskbarOverlay:
                 return dict(previous_geometry)
             self._clear_pending_side_transition()
             self._clear_pending_regression_geometry()
+            self._last_same_side_transition = None
             return candidate_geometry
         self._clear_pending_side_transition()
         if not _is_transient_geometry_regression(previous_geometry, candidate_geometry):
             self._clear_pending_regression_geometry()
+            self._remember_same_side_transition(previous_geometry, candidate_geometry)
             return candidate_geometry
         previous_stable_context = _transient_geometry_context_key(previous_context)
         candidate_stable_context = _transient_geometry_context_key(candidate_context)
         if previous_stable_context is None or previous_stable_context != candidate_stable_context:
             self._clear_pending_regression_geometry()
+            self._last_same_side_transition = None
+            self._remember_same_side_transition(previous_geometry, candidate_geometry)
             return candidate_geometry
+        required_count = self._same_side_confirmation_count(
+            previous_geometry,
+            candidate_geometry,
+        )
         x_shift_delta = _same_width_geometry_x_shift_delta(
             previous_geometry,
             candidate_geometry,
@@ -3100,10 +3153,18 @@ class CodexUsageTaskbarOverlay:
                 isinstance(self._pending_regression_geometry, dict)
                 and self._pending_regression_context == candidate_context
                 and self._pending_regression_geometry == dict(candidate_geometry)
-                and int(self._pending_regression_count) >= 1
             ):
-                self._clear_pending_regression_geometry()
-                return candidate_geometry
+                if int(self._pending_regression_count) >= required_count - 1:
+                    self._clear_pending_regression_geometry()
+                    self._remember_same_side_transition(
+                        previous_geometry,
+                        candidate_geometry,
+                    )
+                    return candidate_geometry
+                self._pending_regression_count = int(
+                    self._pending_regression_count
+                ) + 1
+                return dict(previous_geometry)
             self._pending_regression_geometry = dict(candidate_geometry)
             self._pending_regression_context = candidate_context
             self._pending_regression_count = 1
@@ -3112,9 +3173,10 @@ class CodexUsageTaskbarOverlay:
             isinstance(self._pending_regression_geometry, dict)
             and _transient_geometry_context_key(self._pending_regression_context)
             == candidate_stable_context
-            and int(self._pending_regression_count) >= 1
+            and int(self._pending_regression_count) >= required_count - 1
         ):
             self._clear_pending_regression_geometry()
+            self._remember_same_side_transition(previous_geometry, candidate_geometry)
             return candidate_geometry
         self._pending_regression_geometry = dict(candidate_geometry)
         self._pending_regression_context = candidate_context
@@ -3322,6 +3384,13 @@ class CodexUsageTaskbarOverlay:
                     compact_preferred_width=compact_preferred_width,
                     previous_geometry=local_previous_geometry,
                 )
+                if self._stable_slot_selection:
+                    geometry = _keep_geometry_in_previous_stable_slot(
+                        geometry,
+                        occupied_spans,
+                        local_previous_geometry,
+                        screen_width=width,
+                    )
         context = self._target_geometry_context(
             target,
             width,
@@ -3461,6 +3530,13 @@ class CodexUsageTaskbarOverlay:
             compact_preferred_width=compact_preferred_width,
             previous_geometry=root_previous_geometry,
         )
+        if self._stable_slot_selection:
+            fitted = _keep_geometry_in_previous_stable_slot(
+                fitted,
+                occupied_spans,
+                root_previous_geometry,
+                screen_width=width,
+            )
         context = self._geometry_context(
             width,
             height,
@@ -4958,6 +5034,140 @@ def _previous_geometry_overlap_slot(
     return best
 
 
+def _previous_geometry_stable_free_slot(
+    free_spans: list[tuple[int, int]],
+    previous_geometry: dict[str, Any] | None,
+) -> tuple[int, int] | None:
+    """Return the previous slot when it still has a compact-safe witness.
+
+    A slot edge can breathe by a few pixels while Explorer repaints.  The
+    normal rightmost selector is allowed to choose another span in that case,
+    which is correct for a cold start but creates a feedback loop for a live
+    overlay.  Keep the current slot when its center remains free, or when the
+    measured span still substantially overlaps the current rect.  A tiny edge
+    intersection is deliberately not enough: that is evidence of a collapsed
+    slot and should go through the normal relocation path.
+    """
+    if not isinstance(previous_geometry, dict) or not bool(
+        previous_geometry.get("visible", True)
+    ):
+        return None
+    if str(previous_geometry.get("orientation") or "") not in {"bottom", "top"}:
+        return None
+    try:
+        previous_x = int(previous_geometry.get("x", 0))
+        previous_width = int(previous_geometry.get("width", 0))
+    except (TypeError, ValueError):
+        return None
+    if previous_width <= 0:
+        return None
+    previous_center = previous_x + max(1, previous_width) // 2
+    usable = [
+        (int(start), int(end))
+        for start, end in free_spans
+        if int(end) - int(start) >= _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+    ]
+    for start, end in usable:
+        if start <= previous_center <= end:
+            return start, end
+    previous_end = previous_x + previous_width
+    minimum_overlap = max(
+        int(_STABLE_SLOT_MIN_OVERLAP_PX),
+        max(1, previous_width // 4),
+    )
+    best: tuple[int, int] | None = None
+    best_overlap = 0
+    for start, end in usable:
+        overlap = min(previous_end, end) - max(previous_x, start)
+        if overlap < minimum_overlap or overlap <= best_overlap:
+            continue
+        best_overlap = int(overlap)
+        best = (start, end)
+    return best
+
+
+def _keep_geometry_in_previous_stable_slot(
+    geometry: dict[str, Any],
+    occupied_spans: list[tuple[int, int]] | None,
+    previous_geometry: dict[str, Any] | None,
+    *,
+    screen_width: int,
+) -> dict[str, Any]:
+    """Keep a live overlay in its current slot while that slot is usable.
+
+    This is intentionally stateful and is called only by the live renderer;
+    the public pure geometry function retains its rightmost/capacity policy
+    for cold-start decisions and diagnostics.
+    """
+    if occupied_spans is None:
+        return geometry
+    if not isinstance(previous_geometry, dict) or not bool(
+        previous_geometry.get("visible", True)
+    ):
+        return geometry
+    if str(previous_geometry.get("orientation") or "") not in {"bottom", "top"}:
+        return geometry
+    if str(geometry.get("orientation") or "") != str(
+        previous_geometry.get("orientation") or ""
+    ):
+        return geometry
+    free_spans = _free_spans_from_occupied_spans(
+        int(screen_width),
+        list(_normalized_occupied_spans(int(screen_width), occupied_spans)),
+        padding_px=_EMPTY_SLOT_PADDING_PX,
+    )
+    stable_slot = _previous_geometry_stable_free_slot(
+        free_spans,
+        previous_geometry,
+    )
+    if stable_slot is None:
+        return geometry
+    start, end = stable_slot
+    available = max(0, int(end) - int(start))
+    if available < _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX:
+        return geometry
+    try:
+        previous_x = int(previous_geometry.get("x", 0))
+        previous_width = int(previous_geometry.get("width", 0))
+    except (TypeError, ValueError):
+        previous_x = 0
+        previous_width = 0
+    try:
+        candidate_width = int(geometry.get("width", 0))
+    except (TypeError, ValueError):
+        candidate_width = 0
+    desired_width = candidate_width if candidate_width > 0 else previous_width
+    width = min(max(_MIN_COMPACT_EMPTY_SLOT_WIDTH_PX, desired_width), available)
+    if width < _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX:
+        return geometry
+    previous_end = 0
+    if previous_width > 0:
+        previous_end = previous_x + previous_width
+    anchored = dict(geometry)
+    if (
+        previous_width >= _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX
+        and start <= previous_x
+        and previous_end <= end
+    ):
+        anchored["x"] = int(
+            min(
+                max(start, previous_x),
+                end - width,
+            )
+        )
+    else:
+        anchored["x"] = int(max(start, end - width))
+    anchored["width"] = int(width)
+    anchored["visible"] = True
+    anchored["_slot_side"] = _slot_side_for_geometry(
+        anchored,
+        int(screen_width),
+    )
+    anchored["fallback_reason"] = ""
+    anchored["rca_class"] = "displayable_horizontal_taskbar"
+    return anchored
+
+
 def _slot_classification(width: int) -> str:
     width = int(width)
     if width < _MIN_COMPACT_EMPTY_SLOT_WIDTH_PX:
@@ -5131,6 +5341,47 @@ def _horizontal_geometry_slot_side(geometry: dict[str, Any]) -> str:
     if side in {_SLOT_SIDE_LEFT, _SLOT_SIDE_RIGHT}:
         return side
     return ""
+
+
+def _geometry_slot_identity(geometry: dict[str, Any]) -> tuple[Any, ...] | None:
+    side = _horizontal_geometry_slot_side(geometry)
+    if not side:
+        return None
+    try:
+        return (
+            side,
+            str(geometry.get("orientation") or ""),
+            int(geometry.get("x", 0)),
+            int(geometry.get("width", 0)),
+            int(geometry.get("y", 0)),
+            int(geometry.get("height", 0)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _geometry_slot_identity_matches(
+    left: tuple[Any, ...] | None,
+    right: tuple[Any, ...] | None,
+) -> bool:
+    if left is None or right is None or len(left) < 6 or len(right) < 6:
+        return False
+    if left[0] != right[0] or left[1] != right[1]:
+        return False
+    try:
+        return (
+            abs(int(left[2]) - int(right[2]))
+            <= int(_GEOMETRY_TRANSIENT_X_SHIFT_TOLERANCE_PX) * 2
+            and abs(int(left[3]) - int(right[3])) <= int(
+                _GEOMETRY_CHANGE_TOLERANCE_PX
+            )
+            and abs(int(left[4]) - int(right[4]))
+            <= int(_GEOMETRY_CHANGE_TOLERANCE_PX)
+            and abs(int(left[5]) - int(right[5]))
+            <= int(_GEOMETRY_CHANGE_TOLERANCE_PX)
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _transient_geometry_context_key(context: Any) -> Any:
@@ -5512,22 +5763,28 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
         telemetry["pixel_background"] = background
         for x, colors in sampled_columns:
             if _column_looks_occupied(colors, background):
-                span = (
+                raw_span = (
                     max(0, x - _OCCUPIED_DILATION_PX),
                     min(int(screen_width), x + _TASKBAR_SAMPLE_STEP_PX + _OCCUPIED_DILATION_PX),
                 )
-                telemetry["pixel_spans"].append(
-                    {
-                        "sample_x": int(x),
-                        "span": span,
-                        "raw_basis": "monitor_local_physical_px",
-                        "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
-                        "colors": list(colors),
-                    }
-                )
-                occupied.append(
-                    span
-                )
+                # The sample column is outside the overlay exclusion, but the
+                # dilation band can still spill back through the overlay edge.
+                # Do not feed those self pixels into the next slot decision;
+                # UIA records above remain the trusted witness for real icons
+                # covered by the overlay.
+                pixel_fragments = _subtract_spans([raw_span], excluded_spans)
+                for span in pixel_fragments:
+                    telemetry["pixel_spans"].append(
+                        {
+                            "sample_x": int(x),
+                            "span": span,
+                            "raw_span": raw_span,
+                            "raw_basis": "monitor_local_physical_px",
+                            "coordinate_basis": _GEOMETRY_COORDINATE_BASIS,
+                            "colors": list(colors),
+                        }
+                    )
+                    occupied.append(span)
 
     # Keep the reserved taskbar edge controls out of the overlay even when the
     # sampled pixels happen to be close to the background color.
@@ -8156,6 +8413,13 @@ class AiUsageTaskbarOverlay:
         base_occupied_span_getter = (
             occupied_span_getter or _detect_horizontal_taskbar_occupied_spans
         )
+        # Both panes are views of one taskbar.  Keep one detector snapshot per
+        # left/right sampling cycle so the first pane's resize cannot change
+        # the evidence consumed by the second pane.
+        self._pane_occupancy_cache_key: tuple[Any, ...] | None = None
+        self._pane_occupancy_cache_spans: list[tuple[int, int]] | None = None
+        self._pane_occupancy_cache_ready = False
+        self._pane_occupancy_requested_sides: set[str] = set()
         self._left_pane = CodexUsageTaskbarOverlay(
             root,
             self._pane_runtime_getter(_SLOT_SIDE_LEFT),
@@ -8167,6 +8431,7 @@ class AiUsageTaskbarOverlay:
             ),
             fullscreen_detector=fullscreen_detector,
             taskbar_target_getter=taskbar_target_getter,
+            stable_slot_selection=True,
         )
         self._right_pane = CodexUsageTaskbarOverlay(
             root,
@@ -8179,6 +8444,7 @@ class AiUsageTaskbarOverlay:
             ),
             fullscreen_detector=fullscreen_detector,
             taskbar_target_getter=taskbar_target_getter,
+            stable_slot_selection=True,
         )
 
     def _pane_runtime_getter(self, side: str) -> Callable[[], dict[str, Any]]:
@@ -8206,6 +8472,75 @@ class AiUsageTaskbarOverlay:
 
         return getter
 
+    def _clear_pane_occupancy_cache(self) -> None:
+        self._pane_occupancy_cache_key = None
+        self._pane_occupancy_cache_spans = None
+        self._pane_occupancy_cache_ready = False
+        self._pane_occupancy_requested_sides.clear()
+        return
+
+    def _pane_occupancy_key(
+        self,
+        width: int,
+        height: int,
+        work_area: tuple[int, int, int, int] | dict[str, int] | None,
+        geometry: dict[str, int | str],
+    ) -> tuple[Any, ...]:
+        try:
+            origin_x = int(geometry.get("_screen_origin_x", 0) or 0)
+        except (TypeError, ValueError):
+            origin_x = 0
+        try:
+            origin_y = int(geometry.get("_screen_origin_y", 0) or 0)
+        except (TypeError, ValueError):
+            origin_y = 0
+        try:
+            taskbar_hwnd = int(geometry.get("_taskbar_hwnd", 0) or 0)
+        except (TypeError, ValueError):
+            taskbar_hwnd = 0
+        return (
+            int(width),
+            int(height),
+            _normalize_work_area(work_area, int(width), int(height)),
+            str(geometry.get("orientation") or ""),
+            int(origin_x),
+            int(origin_y),
+            int(taskbar_hwnd),
+        )
+
+    def _pane_sampling_exclude_spans(
+        self,
+        width: int,
+        geometry: dict[str, int | str],
+    ) -> list[tuple[int, int]]:
+        try:
+            origin_x = int(geometry.get("_screen_origin_x", 0) or 0)
+        except (TypeError, ValueError):
+            origin_x = 0
+        excludes: list[tuple[int, int]] = []
+        existing = geometry.get("_exclude_spans")
+        if isinstance(existing, (list, tuple)):
+            for span in existing:
+                try:
+                    start, end = span
+                    excludes.append((int(start), int(end)))
+                except (TypeError, ValueError):
+                    continue
+        for pane in (self._left_pane, self._right_pane):
+            window = getattr(pane, "_window", None)
+            if window is None or not bool(getattr(pane, "_window_visible", False)):
+                continue
+            span = _current_horizontal_window_span(window)
+            if span is None:
+                continue
+            excludes.append(
+                (
+                    int(span[0]) - int(origin_x),
+                    int(span[1]) - int(origin_x),
+                )
+            )
+        return list(_normalized_occupied_spans(int(width), excludes))
+
     def _pane_occupied_span_getter(
         self,
         base_getter: Callable[
@@ -8223,11 +8558,41 @@ class AiUsageTaskbarOverlay:
             work_area: tuple[int, int, int, int] | dict[str, int] | None,
             geometry: dict[str, int | str],
         ) -> list[tuple[int, int]]:
-            try:
-                detected = base_getter(width, height, work_area, geometry)
-            except Exception:
-                detected = None
-            spans = list(detected or [])
+            cache_key = self._pane_occupancy_key(
+                width,
+                height,
+                work_area,
+                geometry,
+            )
+            if (
+                cache_key != self._pane_occupancy_cache_key
+                or str(side) in self._pane_occupancy_requested_sides
+            ):
+                self._pane_occupancy_cache_key = cache_key
+                self._pane_occupancy_cache_spans = None
+                self._pane_occupancy_cache_ready = False
+                self._pane_occupancy_requested_sides.clear()
+            if not self._pane_occupancy_cache_ready:
+                sampling_geometry = dict(geometry)
+                exclude_spans = self._pane_sampling_exclude_spans(
+                    width,
+                    sampling_geometry,
+                )
+                if exclude_spans:
+                    sampling_geometry["_exclude_spans"] = exclude_spans
+                try:
+                    detected = base_getter(
+                        width,
+                        height,
+                        work_area,
+                        sampling_geometry,
+                    )
+                except Exception:
+                    detected = None
+                self._pane_occupancy_cache_spans = list(detected or [])
+                self._pane_occupancy_cache_ready = True
+            self._pane_occupancy_requested_sides.add(str(side))
+            spans = list(self._pane_occupancy_cache_spans or [])
             # The peer pane's live window is taskbar content the sampler must
             # never treat as free space. Pixel detection normally sees it, but
             # injecting the rect keeps the exclusion exact even when screen
@@ -8280,14 +8645,17 @@ class AiUsageTaskbarOverlay:
         return left_ok and right_ok
 
     def hide(self) -> None:
+        self._clear_pane_occupancy_cache()
         self._left_pane.hide()
         self._right_pane.hide()
 
     def invalidate_geometry(self) -> None:
+        self._clear_pane_occupancy_cache()
         self._left_pane.invalidate_geometry()
         self._right_pane.invalidate_geometry()
 
     def prepare_for_display_topology_change(self) -> None:
+        self._clear_pane_occupancy_cache()
         self._left_pane.prepare_for_display_topology_change()
         self._right_pane.prepare_for_display_topology_change()
 

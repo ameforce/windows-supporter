@@ -199,6 +199,36 @@ class AiUsageTaskbarOverlayPaneTest(unittest.TestCase):
             ["Profile 1", "Profile 2"],
         )
 
+    def test_left_and_right_panes_share_one_occupancy_snapshot_per_cycle(self):
+        base_calls = []
+
+        def base_getter(width, height, work_area, geometry):
+            base_calls.append((width, height, work_area, dict(geometry)))
+            return [(100, 200)]
+
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: {},
+            occupied_span_getter=base_getter,
+        )
+        left_getter = overlay._left_pane._occupied_span_getter
+        right_getter = overlay._right_pane._occupied_span_getter
+
+        left_spans = left_getter(1920, 1080, (0, 0, 1920, 1040), {"orientation": "bottom"})
+        right_spans = right_getter(1920, 1080, (0, 0, 1920, 1040), {"orientation": "bottom"})
+
+        self.assertEqual(len(base_calls), 1)
+        self.assertEqual(base_calls[0][3].get("_exclude_spans"), None)
+        self.assertIn((100, 200), left_spans)
+        self.assertIn((100, 200), right_spans)
+        self.assertIn((960, 1920), left_spans)
+        self.assertIn((0, 960), right_spans)
+
+        # A second left request starts a new cycle rather than reusing a stale
+        # snapshot forever.
+        left_getter(1920, 1080, (0, 0, 1920, 1040), {"orientation": "bottom"})
+        self.assertEqual(len(base_calls), 2)
+
 
 class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
     def _runtime(self):
@@ -3954,6 +3984,30 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertLessEqual(pixel_spans[0]["span"][0], 320)
         self.assertGreater(pixel_spans[0]["span"][1], 320)
 
+    def test_pixel_dilation_never_reintroduces_excluded_overlay_pixels(self):
+        background = [(24, 24, 24)] * 5
+        control = [(240, 240, 240)] * 5
+        # Keep the sampled column just outside the excluded span while its
+        # dilation band still crosses that span.
+        columns = [(0, background), (276, control), (400, background)]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=columns,
+        ):
+            _spans, telemetry = taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                800,
+                600,
+                (0, 0, 800, 560),
+                {"orientation": "bottom", "_exclude_spans": [(280, 300)]},
+            )
+
+        self.assertTrue(telemetry["pixel_spans"])
+        for record in telemetry["pixel_spans"]:
+            start, end = record["span"]
+            self.assertFalse(start < 300 and end > 280)
+
     def test_work_area_conversion_records_logical_to_physical_scale(self):
         geometry = calculate_taskbar_overlay_geometry(
             1920,
@@ -6956,6 +7010,105 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
         self.assertIn("+1471+", window.geometry_calls[-1])
+
+    def test_geometry_monitor_does_not_ping_pong_between_same_side_slots(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        # The two spans describe two candidate slots on the same side.  Each
+        # candidate is visible for two samples, which is enough for the old
+        # two-sample confirmation but is still a detector feedback cycle.
+        spans_a = [(0, 100), (400, 600), (960, 1920)]
+        spans_b = [(0, 100), (700, 900), (960, 1920)]
+        spans_by_call = [spans_a, spans_b, spans_b, spans_a, spans_a]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ), patch.object(
+            taskbar_overlay,
+            "_compact_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            initial_geometry = window.geometry_calls[-1]
+            for _index in range(4):
+                geometry_tick = [
+                    callback
+                    for _delay, callback in root.after_calls
+                    if callback.__name__ == "_geometry_monitor_tick"
+                ][-1]
+                geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 5)
+        # The first candidate may be a real sustained relocation.  Once that
+        # move is accepted, the immediate return to the prior same-side slot
+        # must not be accepted on the same short evidence window.
+        self.assertEqual(
+            window.geometry_calls,
+            [initial_geometry, "300x38+392+1041"],
+        )
+        self.assertIn("+652+", initial_geometry)
+
+    def test_live_geometry_holds_previous_slot_when_another_slot_becomes_rightmost(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 100), (400, 600), (960, 1920)],
+            [(0, 100), (400, 600), (960, 1000), (1300, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+            stable_slot_selection=True,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ), patch.object(
+            taskbar_overlay,
+            "_compact_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            initial_geometry = window.geometry_calls[-1]
+            for _index in range(2):
+                geometry_tick = [
+                    callback
+                    for _delay, callback in root.after_calls
+                    if callback.__name__ == "_geometry_monitor_tick"
+                ][-1]
+                geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 3)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertIn("+652+", initial_geometry)
 
     def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
