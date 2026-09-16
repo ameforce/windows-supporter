@@ -13,7 +13,12 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
-from src.apps.ai_usage_contracts import normalize_reset_boundary
+from src.apps.ai_usage_contracts import (
+    DEFAULT_TASKBAR_SIDE_PRIORITY,
+    is_valid_taskbar_side_priority,
+    normalize_reset_boundary,
+    normalize_taskbar_side_priority,
+)
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
 from src.apps.codex_usage_monitor import (
     CURRENT_CODEX_USAGE_URL,
@@ -145,6 +150,7 @@ class CodexUsageMultiMonitor:
         self.__account_order = list(LEGACY_ACCOUNT_IDS)
         self.__enabled = True
         self.__taskbar_overlay_enabled = True
+        self.__taskbar_side_priority = DEFAULT_TASKBAR_SIDE_PRIORITY.value
         self.__interval_sec = 90.0
         self.__tooltip_duration_ms = 7000
         self.__usage_url = CURRENT_CODEX_USAGE_URL
@@ -369,6 +375,7 @@ class CodexUsageMultiMonitor:
             "settings_error": str(self.__settings_write_block_reason or ""),
             "enabled": bool(self.__enabled),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
+            "taskbar_side_priority": str(self.__taskbar_side_priority),
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "usage_url": str(self.__usage_url),
@@ -685,6 +692,7 @@ class CodexUsageMultiMonitor:
 
         candidate_enabled = self.__enabled
         candidate_taskbar_overlay_enabled = self.__taskbar_overlay_enabled
+        candidate_taskbar_side_priority = self.__taskbar_side_priority
         candidate_interval_sec = self.__interval_sec
         candidate_tooltip_duration_ms = self.__tooltip_duration_ms
         candidate_usage_url = self.__usage_url
@@ -692,6 +700,12 @@ class CodexUsageMultiMonitor:
             candidate_enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
             candidate_taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
+        if "taskbar_side_priority" in data:
+            if not is_valid_taskbar_side_priority(data.get("taskbar_side_priority")):
+                return False, "taskbar_side_priority"
+            candidate_taskbar_side_priority = normalize_taskbar_side_priority(
+                data.get("taskbar_side_priority")
+            ).value
         if "interval_sec" in data:
             try:
                 interval_sec = float(data.get("interval_sec"))
@@ -785,6 +799,7 @@ class CodexUsageMultiMonitor:
                 default_account_id=candidate_default,
                 enabled=candidate_enabled,
                 taskbar_overlay_enabled=candidate_taskbar_overlay_enabled,
+                taskbar_side_priority=candidate_taskbar_side_priority,
                 interval_sec=candidate_interval_sec,
                 tooltip_duration_ms=candidate_tooltip_duration_ms,
                 usage_url=candidate_usage_url,
@@ -841,6 +856,7 @@ class CodexUsageMultiMonitor:
         }
         self.__enabled = candidate_enabled
         self.__taskbar_overlay_enabled = candidate_taskbar_overlay_enabled
+        self.__taskbar_side_priority = candidate_taskbar_side_priority
         self.__interval_sec = candidate_interval_sec
         self.__tooltip_duration_ms = candidate_tooltip_duration_ms
         self.__usage_url = candidate_usage_url
@@ -1226,6 +1242,7 @@ class CodexUsageMultiMonitor:
             "settings_read_only": bool(self.__settings_write_block_reason),
             "settings_error": str(self.__settings_write_block_reason or ""),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
+            "taskbar_side_priority": str(self.__taskbar_side_priority),
             "monitor_state": self.__aggregate_monitor_state(runtimes),
             "session_state": self.__aggregate_session_state(runtimes),
             "auto_monitoring_active": bool(self.__should_run_background_collection()),
@@ -2404,6 +2421,10 @@ class CodexUsageMultiMonitor:
             self.__enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
             self.__taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
+        if "taskbar_side_priority" in data:
+            self.__taskbar_side_priority = normalize_taskbar_side_priority(
+                data.get("taskbar_side_priority")
+            ).value
         try:
             self.__interval_sec = float(data.get("interval_sec", self.__interval_sec))
         except Exception:
@@ -2550,6 +2571,7 @@ class CodexUsageMultiMonitor:
         taskbar_overlay_enabled: bool | None = None,
         interval_sec: float | None = None,
         tooltip_duration_ms: int | None = None,
+        taskbar_side_priority: str | None = None,
         usage_url: str | None = None,
     ) -> None:
         if self.__settings_write_block_reason is not None:
@@ -2582,6 +2604,11 @@ class CodexUsageMultiMonitor:
                 self.__taskbar_overlay_enabled
                 if taskbar_overlay_enabled is None
                 else taskbar_overlay_enabled
+            ),
+            "taskbar_side_priority": str(
+                self.__taskbar_side_priority
+                if taskbar_side_priority is None
+                else normalize_taskbar_side_priority(taskbar_side_priority).value
             ),
             "interval_sec": float(self.__interval_sec if interval_sec is None else interval_sec),
             "tooltip_duration_ms": int(
@@ -2618,6 +2645,10 @@ class CodexUsageMultiMonitor:
             self.__enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
             self.__taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
+        if "taskbar_side_priority" in data:
+            self.__taskbar_side_priority = normalize_taskbar_side_priority(
+                data.get("taskbar_side_priority")
+            ).value
         if "interval_sec" in data:
             try:
                 interval_sec = float(data.get("interval_sec"))
