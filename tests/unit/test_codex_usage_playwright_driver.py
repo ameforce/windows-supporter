@@ -16,6 +16,7 @@ from src.apps.codex_usage_playwright_driver import CodexUsagePlaywrightDriver
 
 
 USAGE_URL = "https://chatgpt.com/codex/settings/usage"
+LOGIN_URL = "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage"
 PROBE: UsageProbePayload = {
     "url": USAGE_URL,
     "mainText": "usage limit",
@@ -193,7 +194,13 @@ def make_driver(
     chromium = FakeChromium(outcomes, event_log)
     starter = FakeStarter(chromium)
     driver = CodexUsagePlaywrightDriver(
-        config or PlaywrightSessionConfig("profile", USAGE_URL, "probe()"),
+        config
+        or PlaywrightSessionConfig(
+            "profile",
+            USAGE_URL,
+            "probe()",
+            login_url=LOGIN_URL,
+        ),
         playwright_starter=starter,
         sleep=sleep,
     )
@@ -290,6 +297,7 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         result = driver.open_login()
 
         self.assertEqual(result.error, BrowserErrorCode.LOGIN_REQUIRED.value)
+        self.assertEqual(login_page.calls, [("goto", LOGIN_URL)])
         call = chromium.calls[-1]
         self.assertFalse(call["headless"])
         self.assertIsNone(call["user_agent"])
@@ -322,12 +330,12 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         home_probe: UsageProbePayload = {
             "url": "https://chatgpt.com/",
             "title": "ChatGPT",
-            "mainText": "지금 무슨 생각을 하시나요?",
+            "mainText": "Usage and limits",
             "metricBlocks": [],
         }
         probes = (
             [{"url": USAGE_URL, "mainText": "Log in", "metricBlocks": []}]
-            + [dict(home_probe)] * 21
+            + [dict(home_probe)]
             + [PROBE]
         )
         login_page = FakePage(url=USAGE_URL, probes=probes)
@@ -343,7 +351,7 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         self.assertEqual(result.probe, PROBE)
         self.assertEqual(
             login_page.calls,
-            [("goto", USAGE_URL), ("goto", USAGE_URL)],
+            [("goto", LOGIN_URL), ("goto", USAGE_URL)],
             "poll must steer an authenticated non-usage landing page back to the usage url",
         )
         self.assertTrue(headed.closed)
@@ -368,7 +376,7 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         result = driver.poll_login()
 
         self.assertEqual(result.error, BrowserErrorCode.LOGIN_REQUIRED.value)
-        self.assertEqual(login_page.calls, [("goto", USAGE_URL)])
+        self.assertEqual(login_page.calls, [("goto", LOGIN_URL)])
         self.assertFalse(headed.closed)
         status = driver.get_runtime_status()
         self.assertEqual(status.state, BrowserState.HEADED_LOGIN)
@@ -485,7 +493,7 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
                 self.assertEqual(result.error, error)
                 self.assertEqual(driver.get_runtime_status().state, state)
 
-    def test_login_mode_switch_closes_old_context_before_launch_and_uses_usage_url(self) -> None:
+    def test_login_mode_switch_closes_old_context_before_launch_and_uses_login_url(self) -> None:
         events: list[str] = []
         headless = FakeContext([FakePage()], events)
         login_page = FakePage(url="about:blank", probe={"url": USAGE_URL, "mainText": "Log in", "metricBlocks": []})
@@ -497,7 +505,7 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
 
         self.assertEqual(result.error, "login_required")
         self.assertEqual(events[-2:], ["close", "launch:False"])
-        self.assertEqual(login_page.calls, [("goto", USAGE_URL)])
+        self.assertEqual(login_page.calls, [("goto", LOGIN_URL)])
         self.assertEqual(driver.get_runtime_status().state, BrowserState.HEADED_LOGIN)
 
     def test_poll_login_reports_closed_window_and_success_returns_to_headless(self) -> None:
