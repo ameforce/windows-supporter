@@ -214,6 +214,17 @@ class _FakeTtk:
 
 
 class CodexUsageUiUnitTest(unittest.TestCase):
+    def test_runtime_value_updates_skip_unchanged_tk_variable_writes(self) -> None:
+        variable = _FakeVar(value="ready")
+        writes = []
+        variable.trace_add("write", lambda *_args: writes.append(variable.get()))
+
+        self.assertFalse(CodexUsageSettingsView._set_var_if_changed(variable, "ready"))
+        self.assertEqual(writes, [])
+
+        self.assertTrue(CodexUsageSettingsView._set_var_if_changed(variable, "busy"))
+        self.assertEqual(writes, ["busy"])
+
     def test_post_ui_propagates_dispatch_rejection(self) -> None:
         view = CodexUsageSettingsView(
             root=None,
@@ -317,6 +328,23 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             payload={"on_demand_enabled": False, "on_demand_status": "OFF"},
         )
 
+        self.assertEqual(codex_value.grid_remove_calls, 1)
+        self.assertEqual(codex_reset.grid_remove_calls, 1)
+        self.assertEqual(cursor_od.grid_remove_calls, 1)
+
+        # A steady-state polling tick must not re-run Tk geometry operations.
+        view._update_account_metric_visibility(
+            "codex-1",
+            provider="codex",
+            descriptor_keys={"weekly_limit"},
+            payload={"weekly_limit": "80%"},
+        )
+        view._update_account_metric_visibility(
+            "cursor-1",
+            provider="cursor",
+            descriptor_keys={"included_usage"},
+            payload={"on_demand_enabled": False, "on_demand_status": "OFF"},
+        )
         self.assertEqual(codex_value.grid_remove_calls, 1)
         self.assertEqual(codex_reset.grid_remove_calls, 1)
         self.assertEqual(cursor_od.grid_remove_calls, 1)
@@ -786,6 +814,30 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             [(1, "units"), (1, "pages"), (2, "units")],
         )
         self.assertEqual(canvas.yview_moveto_calls, [0.0, 1.0])
+
+    def test_mousewheel_burst_is_coalesced_until_idle(self) -> None:
+        class _IdleCanvas(_FakeCanvas):
+            def __init__(self):
+                super().__init__()
+                self.idle_callbacks = []
+
+            def after_idle(self, callback):
+                self.idle_callbacks.append(callback)
+                return "idle-scroll"
+
+            def after_cancel(self, _after_id):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        canvas = _IdleCanvas()
+
+        view._queue_scroll_units(canvas, 1)
+        view._queue_scroll_units(canvas, 2)
+
+        self.assertEqual(canvas.yview_scroll_calls, [])
+        self.assertEqual(len(canvas.idle_callbacks), 1)
+        canvas.idle_callbacks[0]()
+        self.assertEqual(canvas.yview_scroll_calls, [(3, "units")])
 
     def test_scroll_navigation_reaches_focused_child_controls(self) -> None:
         class _FocusedEntry(_FakeWidget):
