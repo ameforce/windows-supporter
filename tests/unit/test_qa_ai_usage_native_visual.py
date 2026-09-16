@@ -36,6 +36,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
                 "four-taskbar-profiles",
                 "ten-mixed-profiles-150",
                 "long-label-narrow",
+                "compact-narrow",
                 "cursor-long-amount-150",
                 "cursor-logged-out",
                 "cursor-stale-rate-limited",
@@ -49,7 +50,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 10)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 11)
         by_name = {fixture["name"]: fixture for fixture in fixtures}
         self.assertEqual(by_name["zero-profiles"]["settings"]["profiles"], [])
         self.assertEqual(by_name["zero-profiles"]["runtime"]["profiles"], [])
@@ -90,6 +91,9 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         self.assertEqual(long_label["window_size"][0], 700)
         self.assertLess(long_label["window_size"][0], by_name["mixed-ready-standard"]["window_size"][0])
         self.assertGreater(len(long_label["settings"]["profiles"][0]["label"]), 40)
+        compact = by_name["compact-narrow"]
+        self.assertEqual(compact["window_size"], [520, 560])
+        self.assertEqual(compact["interaction"]["action"], "mousewheel_scroll")
         long_amount = by_name["cursor-long-amount-150"]
         self.assertEqual(long_amount["ui_scale_percent"], 150)
         self.assertEqual(long_amount["window_size"][0], 960)
