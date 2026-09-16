@@ -42,6 +42,18 @@
 - version/ref 충돌이나 live 상태 불일치가 있으면 공개 ref를 덮어쓰지 않고
   다음 유효한 version lane 또는 명시된 복구 절차로 전환한 뒤 배포를 계속한다.
 
+## GitHub Release 보존 정책
+
+- **[POLICY-LATEST-GITHUB-RELEASE]** GitHub Release는 현재 배포한 최신 version의
+  Release 하나만 유지한다. 새 Release와 자산을 먼저 생성·검증한 뒤 기존 Release
+  record와 그 자산을 삭제하고, 최종 `gh release list` read-back에서 정확히 하나의
+  최신 Release(`isLatest=true`)만 남았는지 확인한다.
+- Release 삭제는 tag 삭제 옵션을 사용하지 않는다. 사용자가 tag 삭제를 명시하지
+  않는 한 Git tag와 tag 이력은 보존한다.
+- 이 정책은 draft·prerelease를 포함한 이전 Release record에도 적용한다. 삭제가
+  실패하거나 immutable Release 등으로 보존된 항목이 있으면 성공으로 보고하지
+  않고 남은 tag/release와 원인을 기록한다.
+
 ## 검증 매트릭스
 
 - **[VAL-SCOPE-MINIMUM]** 구현 전에 변경 파일, 직접 호출 경로, 영향받는 test module과 native scenario를 정하고 변경 동작을 직접 증명하는 최소 집합만 실행한다.
