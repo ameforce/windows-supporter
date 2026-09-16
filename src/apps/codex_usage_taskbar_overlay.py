@@ -383,8 +383,8 @@ class _MetricRowLayout:
     segment_widths: tuple[int, ...] = ()
     progress_widths: tuple[int, ...] = ()
     # Reserved provider-glyph column between the left inset and the label.
-    # Funded in the text-first regime; drops to 0 when a clamped slot needs
-    # the pixels for metric countdown/percent text.
+    # Provider identity is the highest-priority row chrome, so this column is
+    # retained even when the metric columns must enter their cramped fallback.
     icon_width: int = 0
 
     def segment_geometry(self, index: int) -> tuple[int, int, int]:
@@ -1596,13 +1596,48 @@ def _metric_rows_layout_for_overlay_width(
         0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - right_air
     )
     total_required = base_need
-    if counts and total_required > metrics_width:
-        # The provider glyph is chrome, not data: in the cramped regime it
-        # yields before the fixed countdown/percent texts so a clamped slot
-        # keeps every metric's text instead of trading text for the icon.
-        icon_width = 0
+    if (
+        counts
+        and total_required > metrics_width
+        and status_width > _STATUS_DOT_ONLY_WIDTH_PX
+    ):
+        # Provider identity outranks the optional status text. Reclaim that
+        # text's column before the metric fallback runs so fixed countdowns
+        # and percentages keep their established compact contract while the
+        # icon column remains funded.
+        status_width = _STATUS_DOT_ONLY_WIDTH_PX
         metrics_x = (
-            6 + label_width + status_width + _STATUS_TO_METRICS_GAP_PX
+            6
+            + icon_width
+            + label_width
+            + status_width
+            + _STATUS_TO_METRICS_GAP_PX
+        )
+        right_air = (
+            _OVERLAY_RIGHT_AIR_RESERVE_PX
+            if overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - base_need
+            >= _OVERLAY_RIGHT_AIR_RESERVE_PX
+            else 0
+        )
+        metrics_width = max(
+            0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - right_air
+        )
+    if (
+        counts
+        and total_required > metrics_width
+        and profile_labels is None
+        and label_width > _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX
+    ):
+        # With no live labels to preserve, reclaim only the historical
+        # fallback's excess padding after optional status text has yielded.
+        # The provider icon column is never reclaimed.
+        label_width = _PROFILE_LABEL_COLUMN_MIN_WIDTH_PX
+        metrics_x = (
+            6
+            + icon_width
+            + label_width
+            + status_width
+            + _STATUS_TO_METRICS_GAP_PX
         )
         right_air = (
             _OVERLAY_RIGHT_AIR_RESERVE_PX
@@ -1852,6 +1887,8 @@ def _required_metric_segment_width_cached(
 def _preferred_width_for_rows_cached(
     rows_signature: tuple[tuple[tuple[Any, ...], ...], ...],
     profile_labels: tuple[str, ...] = (),
+    *,
+    require_status_text: bool = False,
 ) -> int:
     rows = tuple(
         tuple(_metric_from_width_signature(sig) for sig in row)
@@ -1874,6 +1911,11 @@ def _preferred_width_for_rows_cached(
         )
         return all(
             int(row_layout.icon_width) > 0
+            and (
+                not require_status_text
+                or candidate_width < _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX
+                or int(row_layout.status_width) >= _STATUS_WITH_TEXT_WIDTH_PX
+            )
             and _row_fits_badge_mode_for_layout(
                 row_layout,
                 badge_mode,
@@ -1933,7 +1975,11 @@ def _compact_preferred_width_for_rows_cached(
         tuple(_compact_metric_width_signature(signature) for signature in row)
         for row in rows_signature
     )
-    return _preferred_width_for_rows_cached(compact_rows, profile_labels)
+    return _preferred_width_for_rows_cached(
+        compact_rows,
+        profile_labels,
+        require_status_text=False,
+    )
 
 
 def _taskbar_overlay_width_inputs(
@@ -1989,7 +2035,11 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
     if inputs is None:
         return None
     rows, profile_labels = inputs
-    return _preferred_width_for_rows_cached(rows, profile_labels)
+    return _preferred_width_for_rows_cached(
+        rows,
+        profile_labels,
+        require_status_text=True,
+    )
 
 
 def _compact_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | None:
