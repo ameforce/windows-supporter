@@ -87,11 +87,19 @@ class StageTclTkRuntimeUnitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             prefix = _fake_prefix(Path(temp_dir))
             # PE-like blob with the library zip appended, matching the
-            # CPython 3.14 tcl90.dll layout.
-            (prefix / "DLLs" / "tcl90.dll").write_bytes(
+            # CPython's Tcl/Tk DLL layout for the active runtime.
+            tcl_major, tcl_minor = TCL_VERSION.split(".")
+            tk_major, tk_minor = TK_VERSION.split(".")
+            if int(tcl_major) >= 9:
+                tcl_dll_name = f"tcl{tcl_major}0.dll"
+                tk_dll_name = f"tcl{tcl_major}tk{tk_major}0.dll"
+            else:
+                tcl_dll_name = f"tcl{tcl_major}{tcl_minor}.dll"
+                tk_dll_name = f"tk{tk_major}{tk_minor}.dll"
+            (prefix / "DLLs" / tcl_dll_name).write_bytes(
                 b"MZ" + b"\x00" * 1024 + _zip_bytes(_tcl_entries())
             )
-            (prefix / "DLLs" / "tcl9tk90.dll").write_bytes(
+            (prefix / "DLLs" / tk_dll_name).write_bytes(
                 b"MZ" + b"\x00" * 1024 + _zip_bytes(_tk_entries())
             )
 
@@ -100,7 +108,7 @@ class StageTclTkRuntimeUnitTest(unittest.TestCase):
 
             self.assertTrue((dest / "_tcl_data" / "tclIndex").is_file())
             self.assertTrue((dest / "_tk_data" / "tk.tcl").is_file())
-            self.assertTrue(result["tcl_source"].endswith("tcl90.dll"))
+            self.assertTrue(result["tcl_source"].endswith(tcl_dll_name))
 
     def test_fails_when_no_library_source_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
