@@ -117,6 +117,18 @@ class FlexDaySchedule:
     def has_data(self) -> bool:
         return bool(self.blocks)
 
+    @property
+    def regular_work_minutes(self) -> int:
+        """Return the net regular-work duration without assigned overtime."""
+
+        return max(
+            0,
+            min(
+                1440,
+                int(self.target_minutes) - int(self.overtime_assigned_minutes),
+            ),
+        )
+
 
 def _parse_datetime(value: Any) -> datetime | None:
     has_explicit_zone = False
