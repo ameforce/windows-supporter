@@ -1950,6 +1950,7 @@ class CodexUsageMonitor:
             probe_script=USAGE_PAGE_PROBE_SCRIPT,
             navigation_timeout_ms=int(self.__navigation_timeout_ms),
             command_timeout_sec=max(45.0, float(self.__login_timeout_sec) + 15.0),
+            login_url=build_codex_login_entry_url(str(self.__usage_url)),
         )
         factory = self.__browser_session_factory
         if factory is not None:

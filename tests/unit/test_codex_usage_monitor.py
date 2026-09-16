@@ -720,6 +720,24 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
         )
 
+    def test_browser_session_receives_codex_login_entry_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            configs = []
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda config: configs.append(config) or session,
+            )
+
+            self.assertEqual(len(configs), 1)
+            self.assertEqual(
+                configs[0].login_url,
+                build_codex_login_entry_url(
+                    monitor.get_settings_snapshot()["usage_url"]
+                ),
+            )
+
     def test_are_equivalent_codex_usage_urls_treats_fragmentless_analytics_variant_as_same_target(self) -> None:
         self.assertTrue(
             are_equivalent_codex_usage_urls(
