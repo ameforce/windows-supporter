@@ -1790,20 +1790,25 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(len(ring_ops), 1)
         self.assertEqual(ring_ops[0][2].get("outline"), "#94a3b8")
 
-    def test_draw_omits_provider_icon_when_slot_drops_the_icon_column(self):
+    def test_draw_keeps_provider_icon_when_slot_enters_cramped_metric_fallback(self):
         runtime = self._runtime()
         runtime["accounts"][0]["provider"] = "codex"
         runtime["accounts"][1]["provider"] = "cursor"
         model = build_codex_usage_taskbar_overlay_model(runtime)
-        # 298px cannot fund the icon column beside this runtime's required
-        # metric widths, so the glyph must stay undrawn and labels keep the
-        # original left inset.
+        # 298px cannot fund the full metric text widths, but provider identity
+        # remains the highest-priority row chrome and must stay visible.
         row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
             298,
             [tuple(bar["metrics"]) for bar in model["bars"]],
             profile_labels=tuple(bar["label"] for bar in model["bars"]),
         )
-        self.assertTrue(all(layout.icon_width == 0 for layout in row_layouts))
+        self.assertTrue(
+            all(
+                layout.icon_width
+                == taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+                for layout in row_layouts
+            )
+        )
 
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
         canvas = _FakeCanvas()
@@ -1822,20 +1827,20 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             )
         )
 
-        self.assertFalse(
-            [
-                op
-                for op in canvas.ops
-                if op[0] in {"line", "polygon"}
-            ]
-        )
+        polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
+        self.assertEqual(len(polygon_ops), 4)
         label_ops = [
             op
             for op in canvas.ops
             if op[0] == "text" and op[2].get("font") == ("Segoe UI", 8, "bold")
         ]
         self.assertTrue(label_ops)
-        self.assertTrue(all(op[1][0] == 6 for op in label_ops))
+        self.assertTrue(
+            all(
+                op[1][0] == 6 + taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+                for op in label_ops
+            )
+        )
 
     def test_draw_keeps_metric_columns_clear_when_preferred_cap_shows_status_text(self):
         overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
@@ -5155,7 +5160,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             (narrow_metric, wide_metric),
         )
         narrower_row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
-            width - 8,
+            width - 40,
             (narrow_metric, wide_metric),
         )
         required_wide_segment = taskbar_overlay._required_metric_segment_width(wide_metric)
@@ -5168,18 +5173,21 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         _narrower_offset, narrower_wide_width, _narrower_progress = (
             narrower_row_layout.segment_geometry(wide_index)
         )
-        # The provider icon is chrome: 8px below the funded width it yields
-        # first, so the widest segment still keeps its required width.
-        self.assertEqual(narrower_row_layout.icon_width, 0)
-        self.assertGreaterEqual(narrower_wide_width, required_wide_segment)
+        # The provider icon is the highest-priority chrome and remains funded
+        # while the metric segment enters the cramped fallback.
+        self.assertEqual(
+            narrower_row_layout.icon_width,
+            taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX,
+        )
+        self.assertLess(narrower_wide_width, required_wide_segment)
         below_text_fit = taskbar_overlay._metric_row_layout_for_overlay_width(
-            width - taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX - 8 - 1,
+            width - 48,
             (narrow_metric, wide_metric),
         )
         _below_offset, below_wide_width, _below_progress = (
             below_text_fit.segment_geometry(wide_index)
         )
-        self.assertLess(below_wide_width, required_wide_segment)
+        self.assertLess(below_wide_width, narrower_wide_width)
         layout = taskbar_overlay._fit_metric_segment_layout(
             wide_segment_width,
             wide_metric["reset_text"],
@@ -5381,10 +5389,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width, metrics)
-        # One pixel below preferred only costs the icon column and bar slack;
-        # the full badge must survive until the columns genuinely cannot fund
-        # it, so probe well past the icon-yield point.
-        narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 20, metrics)
+        # The full badge must survive until the columns genuinely cannot fund
+        # it, so probe beyond the optional status/label compaction boundary.
+        narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 24, metrics)
 
         self.assertGreater(width, 414)
         self.assertEqual(
@@ -8000,9 +8007,12 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
             row_layouts, badge_mode=mode
         )
 
-        # P2: every track shares one width, including across slots.
+        # P2: every track shares one width, including across slots. The icon
+        # reservation and compact status fallback change the exact floor from
+        # the pre-icon layout, but the cross-slot equality remains the
+        # contract.
         self.assertEqual(floors["five_hour_limit"], floors["weekly_limit"])
-        self.assertEqual(floors["weekly_limit"], 11)
+        self.assertEqual(floors["weekly_limit"], 16)
 
     def _live_like_rows(self):
         seven_day_sparse = {
