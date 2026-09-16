@@ -5,6 +5,10 @@ import re
 import threading
 from typing import Any
 
+from src.apps.ai_usage_contracts import (
+    TaskbarSidePriority,
+    normalize_taskbar_side_priority,
+)
 from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
 
 
@@ -32,6 +36,7 @@ class CodexUsageSettingsView:
 
         self._enabled_var = None
         self._taskbar_overlay_var = None
+        self._taskbar_side_priority_var = None
         self._interval_var = None
         self._tooltip_var = None
         self._usage_url_var = None
@@ -66,6 +71,9 @@ class CodexUsageSettingsView:
         self._scroll_after_id = None
         self._scroll_root_bindings: list[tuple[str, Any]] = []
         self._scroll_window_id = None
+        self._header_card = None
+        self._content_card = None
+        self._scrollbar = None
         self._runtime_value_rows: list[tuple[Any, Any]] = []
         self._live_spark_visible = None
         self._button_enabled_states: dict[int, bool] = {}
@@ -163,6 +171,7 @@ class CodexUsageSettingsView:
         self._account_text_widgets = {}
         self._account_provider_vars = {}
         self._account_taskbar_selected_vars = {}
+        self._taskbar_side_priority_var = None
         self._runtime_value_rows = []
         self._live_spark_visible = None
         self._button_enabled_states = {}
@@ -184,6 +193,7 @@ class CodexUsageSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
+        self._header_card = header_card
         header_card.pack(fill="x", padx=8, pady=(8, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
@@ -239,6 +249,7 @@ class CodexUsageSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
+        self._content_card = content_card
         content_card.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         viewport = tk.Frame(content_card, bg=card_bg)
@@ -251,6 +262,7 @@ class CodexUsageSettingsView:
             takefocus=True,
         )
         scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+        self._scrollbar = scrollbar
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -277,6 +289,9 @@ class CodexUsageSettingsView:
 
         self._enabled_var = tk.BooleanVar(value=False)
         self._taskbar_overlay_var = tk.BooleanVar(value=True)
+        self._taskbar_side_priority_var = tk.StringVar(
+            value=TaskbarSidePriority.LEFT.value
+        )
         self._interval_var = tk.StringVar(value="")
         self._tooltip_var = tk.StringVar(value="")
         self._usage_url_var = tk.StringVar(value="")
@@ -325,6 +340,31 @@ class CodexUsageSettingsView:
                 )
             )
         self._bind_responsive_widget_row(options, option_widgets, columns=2)
+        row += 1
+
+        placement = tk.Frame(body, bg=card_bg)
+        placement.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 3))
+        tk.Label(
+            placement,
+            text="작업표시줄 배치 우선순위",
+            bg=card_bg,
+            fg="#374151",
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+        radio_factory = getattr(ttk, "Radiobutton", None)
+        if not callable(radio_factory):
+            radio_factory = getattr(tk, "Radiobutton", None)
+        if callable(radio_factory):
+            for label, value in (
+                ("왼쪽 우선", TaskbarSidePriority.LEFT.value),
+                ("오른쪽 우선", TaskbarSidePriority.RIGHT.value),
+            ):
+                radio_factory(
+                    placement,
+                    text=label,
+                    variable=self._taskbar_side_priority_var,
+                    value=value,
+                ).pack(side="left", padx=(12, 0))
         row += 1
 
         tk.Label(
@@ -397,6 +437,51 @@ class CodexUsageSettingsView:
         self._register_autosave_traces()
         self._start_runtime_refresh()
         return
+
+    def preferred_size(self) -> tuple[int, int]:
+        """Expose the mounted AI content requirement to the main shell.
+
+        A canvas reports only its small viewport request, while the embedded
+        scroll body owns the actual profile/status grid. Measuring the body
+        and adding the scrollbar plus the surrounding card insets keeps the
+        first AI-tab geometry wide enough before the user has to resize it.
+        """
+
+        body = self._scroll_body
+        if body is None:
+            return (0, 0)
+        try:
+            body.update_idletasks()
+        except Exception:
+            pass
+        try:
+            body_width = int(body.winfo_reqwidth())
+        except Exception:
+            return (0, 0)
+
+        scrollbar_width = 0
+        scrollbar = self._scrollbar
+        if scrollbar is not None:
+            try:
+                scrollbar_width = max(0, int(scrollbar.winfo_reqwidth()))
+            except Exception:
+                pass
+        try:
+            container_width = int(self._win.winfo_reqwidth())
+            container_height = int(self._win.winfo_reqheight())
+        except Exception:
+            container_width = 0
+            container_height = 0
+
+        # content_card has 8px outer padding and viewport has 3px inner
+        # padding on both sides. The embedded body's own padding is already
+        # included in winfo_reqwidth().
+        measured_width = body_width + scrollbar_width + 22
+        width = max(1, measured_width, container_width)
+        # The body is intentionally scrollable, so its full content height
+        # must not turn the first AI tab open into a very tall window.
+        height = max(1, container_height)
+        return width, height
 
     def _add_account_sections(
         self,
@@ -1454,6 +1539,14 @@ class CodexUsageSettingsView:
             except Exception:
                 pass
             try:
+                self._taskbar_side_priority_var.set(
+                    normalize_taskbar_side_priority(
+                        settings.get("taskbar_side_priority")
+                    ).value
+                )
+            except Exception:
+                pass
+            try:
                 interval = float(settings.get("interval_sec", 90.0))
                 self._interval_var.set(self._format_seconds(interval))
             except Exception:
@@ -1790,6 +1883,7 @@ class CodexUsageSettingsView:
         for var in (
             self._enabled_var,
             self._taskbar_overlay_var,
+            self._taskbar_side_priority_var,
             self._interval_var,
             self._usage_url_var,
             *self._account_enabled_vars.values(),
@@ -1892,6 +1986,11 @@ class CodexUsageSettingsView:
         payload = {
             "enabled": enabled,
             "taskbar_overlay_enabled": bool(self._taskbar_overlay_var.get()),
+            "taskbar_side_priority": normalize_taskbar_side_priority(
+                self._taskbar_side_priority_var.get()
+                if self._taskbar_side_priority_var is not None
+                else None
+            ).value,
             "interval_sec": interval_sec,
             "tooltip_duration_ms": int(round(tooltip_sec * 1000.0)),
             "usage_url": usage_url,

@@ -170,6 +170,35 @@ class AiUsageTaskbarOverlayPaneTest(unittest.TestCase):
             ["Profile 1", "Profile 2"],
         )
 
+    def test_right_priority_assigns_first_two_profiles_to_right_pane(self):
+        windows = []
+
+        def make_window(_root):
+            window = _FakeWindow()
+            windows.append(window)
+            return window
+
+        runtime = self._runtime(4)
+        runtime["taskbar_side_priority"] = "right"
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: runtime,
+            window_factory=make_window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+
+        self.assertTrue(overlay.refresh())
+        left_model, right_model = (window.draw_calls[-1] for window in windows)
+        self.assertEqual(
+            [bar["label"] for bar in left_model["bars"]],
+            ["Profile 3", "Profile 4"],
+        )
+        self.assertEqual(
+            [bar["label"] for bar in right_model["bars"]],
+            ["Profile 1", "Profile 2"],
+        )
+
 
 class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
     def _runtime(self):

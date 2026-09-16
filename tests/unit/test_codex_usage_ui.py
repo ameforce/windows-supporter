@@ -200,6 +200,7 @@ class _FakeTtk:
         self.buttons = []
         self.entries = []
         self.scrollbars = []
+        self.radiobuttons = []
 
     def Entry(self, *args, **kwargs):
         widget = _FakeWidget(self, *args, **kwargs)
@@ -211,6 +212,11 @@ class _FakeTtk:
 
     def Scrollbar(self, *args, **kwargs):
         return _FakeScrollbar(self, *args, **kwargs)
+
+    def Radiobutton(self, *args, **kwargs):
+        widget = _FakeWidget(self, *args, **kwargs)
+        self.radiobuttons.append(widget)
+        return widget
 
 
 class CodexUsageUiUnitTest(unittest.TestCase):
@@ -748,6 +754,51 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             {"<Up>", "<Down>", "<Prior>", "<Next>", "<Home>", "<End>", "<MouseWheel>"}
             <= sequences
         )
+
+    def test_mount_exposes_taskbar_side_priority_controls(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(_FakeWidget())
+
+        self.assertEqual(view._taskbar_side_priority_var.get(), "left")
+        self.assertEqual(
+            [radio.kwargs["value"] for radio in fake_ttk.radiobuttons],
+            ["left", "right"],
+        )
+
+    def test_preferred_size_measures_scroll_body_width_without_using_full_body_height(self) -> None:
+        class _RequestedWidget:
+            def __init__(self, width, height):
+                self.width = width
+                self.height = height
+
+            def update_idletasks(self):
+                return None
+
+            def winfo_reqwidth(self):
+                return self.width
+
+            def winfo_reqheight(self):
+                return self.height
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._scroll_body = _RequestedWidget(1100, 1400)
+        view._scrollbar = _RequestedWidget(17, 1400)
+        view._win = _RequestedWidget(800, 500)
+
+        self.assertEqual(view.preferred_size(), (1139, 500))
 
     def test_mount_keeps_two_account_settings_visible_inside_scroll_canvas(self) -> None:
         fake_tk = _FakeTk()
@@ -2000,6 +2051,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
         view._enabled_var = _FakeVar(value=True)
         view._taskbar_overlay_var = _FakeVar(value=False)
+        view._taskbar_side_priority_var = _FakeVar(value="right")
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
         view._usage_url_var = _FakeVar(value="https://example.test")
@@ -2010,6 +2062,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._on_save()
 
         self.assertEqual(monitor.update_payloads[-1]["taskbar_overlay_enabled"], False)
+        self.assertEqual(monitor.update_payloads[-1]["taskbar_side_priority"], "right")
         self.assertEqual(statuses[-1], ("저장됨", "ok"))
 
     def test_invalid_autosave_value_does_not_update_settings(self) -> None:
