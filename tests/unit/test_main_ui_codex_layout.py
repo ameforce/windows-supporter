@@ -119,6 +119,27 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         self.assertEqual((width, height), (900, 520))
         self.assertEqual((min_width, min_height), (720, 420))
 
+    def test_ai_usage_content_fit_uses_mounted_view_preferred_size(self) -> None:
+        with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
+            with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
+                ui = WindowsSupporterMainUI(
+                    root=object(),
+                    startup_manager=object(),
+                    monitor=object(),
+                )
+
+        class _View:
+            def preferred_size(self):
+                return (1139, 500)
+
+        ui._tab_ai_usage = object()
+        ui._ai_usage_view = _View()
+
+        self.assertEqual(
+            ui._content_window_size(ui._TAB_AI_USAGE),
+            (1139, 500),
+        )
+
     def test_ui_scale_clamps_tk_scaling_ratio(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):

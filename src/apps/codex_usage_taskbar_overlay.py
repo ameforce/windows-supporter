@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Callable
 
+from src.apps.ai_usage_contracts import normalize_taskbar_side_priority
 from src.apps.codex_usage_taskbar_targets import (
     TaskbarMonitorSnapshot,
     TaskbarOverlayTarget,
@@ -8127,10 +8128,11 @@ class AiUsageTaskbarOverlay:
 
     ``CodexUsageTaskbarOverlay`` deliberately remains the single-pane renderer:
     its two-row shared-grid layout is also exercised directly by the native
-    drawing tests.  The product surface uses this coordinator instead.  It
-    gives profiles one and two the left-half pane and profiles three and four
-    the right-half pane, so increasing the selection limit never turns the
-    taskbar into a four-row strip or lets both panes race for the same slot.
+    drawing tests.  The product surface uses this coordinator instead.  The
+    first two selected profiles go to the configured priority side and
+    profiles three and four go to the opposite pane, so increasing the
+    selection limit never turns the taskbar into a four-row strip or lets both
+    panes race for the same slot.
     """
 
     _PANE_SIZE = 2
@@ -8156,7 +8158,7 @@ class AiUsageTaskbarOverlay:
         )
         self._left_pane = CodexUsageTaskbarOverlay(
             root,
-            self._pane_runtime_getter(0),
+            self._pane_runtime_getter(_SLOT_SIDE_LEFT),
             window_factory=window_factory,
             work_area_getter=work_area_getter,
             occupied_span_getter=self._pane_occupied_span_getter(
@@ -8168,7 +8170,7 @@ class AiUsageTaskbarOverlay:
         )
         self._right_pane = CodexUsageTaskbarOverlay(
             root,
-            self._pane_runtime_getter(self._PANE_SIZE),
+            self._pane_runtime_getter(_SLOT_SIDE_RIGHT),
             window_factory=window_factory,
             work_area_getter=work_area_getter,
             occupied_span_getter=self._pane_occupied_span_getter(
@@ -8179,7 +8181,7 @@ class AiUsageTaskbarOverlay:
             taskbar_target_getter=taskbar_target_getter,
         )
 
-    def _pane_runtime_getter(self, offset: int) -> Callable[[], dict[str, Any]]:
+    def _pane_runtime_getter(self, side: str) -> Callable[[], dict[str, Any]]:
         def getter() -> dict[str, Any]:
             try:
                 runtime = self._runtime_getter()
@@ -8188,6 +8190,10 @@ class AiUsageTaskbarOverlay:
             if not isinstance(runtime, dict):
                 runtime = {}
             selected = _selected_taskbar_profiles(_taskbar_profile_source(runtime))
+            priority = normalize_taskbar_side_priority(
+                runtime.get("taskbar_side_priority")
+            ).value
+            offset = 0 if str(side) == priority else self._PANE_SIZE
             pane_runtime = dict(runtime)
             # Always publish a ``profiles`` list, even when the legacy source
             # was ``accounts``.  The single-pane renderer then cannot reach a
