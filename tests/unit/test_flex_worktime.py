@@ -80,6 +80,7 @@ class FlexScheduleParserTests(unittest.TestCase):
 
         self.assertEqual(schedule.target_minutes, 600)
         self.assertEqual(schedule.overtime_assigned_minutes, 120)
+        self.assertEqual(schedule.regular_work_minutes, 480)
         self.assertEqual(schedule.scheduled_start.strftime("%H:%M"), "09:00")
         self.assertEqual(schedule.regular_quit.strftime("%H:%M"), "18:00")
         self.assertEqual(schedule.scheduled_quit.strftime("%H:%M"), "20:00")
