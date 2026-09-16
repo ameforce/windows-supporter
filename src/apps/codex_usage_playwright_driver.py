@@ -209,20 +209,30 @@ class CodexUsagePlaywrightDriver:
             _ = self._run_stage(
                 "navigation",
                 lambda: page.goto(
-                    self._config.usage_url,
+                    self._login_entry_url,
                     timeout=self._config.navigation_timeout_ms,
                     wait_until="domcontentloaded",
                 ),
             )
             probe = self._run_stage(
                 "evaluate_probe",
-                lambda: self._evaluate_probe_until_ready(page),
+                lambda: self._evaluate_probe_until_ready(
+                    page,
+                    stop_on_non_usage_landing=True,
+                ),
             )
             if probe is not None and self._probe_is_authenticated(probe):
                 self._close_context()
                 _ = self._ensure_context(headless=True)
                 self._set_status(BrowserState.HEADLESS_READY)
                 return BrowserOperationResult(probe=probe)
+            if probe is not None and not self._probe_is_login_pending(page, probe):
+                probe = self._recover_post_login_landing(page, probe)
+                if probe is not None and self._probe_is_authenticated(probe):
+                    self._close_context()
+                    _ = self._ensure_context(headless=True)
+                    self._set_status(BrowserState.HEADLESS_READY)
+                    return BrowserOperationResult(probe=probe)
         except (OSError, RuntimeError) as exc:
             return self._fail(_classify_error(str(exc)), str(exc))
         except _playwright_error_type() as exc:
@@ -247,7 +257,10 @@ class CodexUsagePlaywrightDriver:
         try:
             probe = self._run_stage(
                 "evaluate_probe",
-                lambda: self._evaluate_probe_until_ready(page),
+                lambda: self._evaluate_probe_until_ready(
+                    page,
+                    stop_on_non_usage_landing=True,
+                ),
             )
             if probe is not None and self._probe_is_cloudflare(probe):
                 return self._fail(
@@ -256,9 +269,19 @@ class CodexUsagePlaywrightDriver:
                     login_window_open=True,
                 )
             if probe is None or not self._probe_is_authenticated(probe):
-                probe = self._recover_post_login_landing(page)
+                if probe is None or self._probe_is_login_pending(page, probe):
+                    return self._fail(
+                        BrowserErrorCode.LOGIN_REQUIRED.value,
+                        state=BrowserState.HEADED_LOGIN,
+                        login_window_open=True,
+                    )
+                probe = self._recover_post_login_landing(page, probe)
             if probe is None or not self._probe_is_authenticated(probe):
-                return self._fail(BrowserErrorCode.LOGIN_REQUIRED.value, state=BrowserState.HEADED_LOGIN, login_window_open=True)
+                return self._fail(
+                    BrowserErrorCode.LOGIN_REQUIRED.value,
+                    state=BrowserState.HEADED_LOGIN,
+                    login_window_open=True,
+                )
             self._close_context()
             _ = self._ensure_context(headless=True)
         except (OSError, RuntimeError) as exc:
@@ -405,13 +428,53 @@ class CodexUsagePlaywrightDriver:
                 ),
             )
 
-    def _probe_is_authenticated(self, probe: UsageProbePayload) -> bool:
-        main_text = str(probe.get("mainText", "")).lower()
-        if any(token in main_text for token in ("log in", "sign in", "로그인")):
-            return False
-        return bool(probe.get("metricBlocks")) or any(token in main_text for token in ("usage", "limit", "사용", "한도"))
+    @property
+    def _login_entry_url(self) -> str:
+        return str(self._config.login_url or self._config.usage_url)
 
-    def _recover_post_login_landing(self, page: PageLike) -> UsageProbePayload | None:
+    def _probe_is_authenticated(self, probe: UsageProbePayload) -> bool:
+        return self._probe_is_usage_ready(probe)
+
+    def _probe_is_usage_ready(self, probe: UsageProbePayload) -> bool:
+        if _canonical_usage_url(str(probe.get("url", ""))) != _canonical_usage_url(
+            self._config.usage_url
+        ):
+            return False
+        return any(
+            str(block.get("metric_key", "")) != "remaining_credit"
+            for block in probe.get("metricBlocks", [])
+        )
+
+    def _probe_is_login_pending(
+        self,
+        page: PageLike,
+        probe: UsageProbePayload,
+    ) -> bool:
+        urls: list[str] = [str(probe.get("url", ""))]
+        try:
+            urls.append(str(page.url))
+        except (OSError, RuntimeError, _playwright_error_type()):
+            pass
+        for url in urls:
+            lowered = url.lower()
+            if any(token in lowered for token in ("/login", "/auth", "signin", "sign-in")):
+                return True
+            host = urlsplit(url).netloc.lower()
+            if host.endswith(("accounts.google.com", "auth.openai.com")):
+                return True
+        combined = " ".join(
+            str(probe.get(key, "")) for key in ("title", "mainText")
+        ).lower()
+        return any(
+            marker in combined
+            for marker in ("log in", "sign in", "continue with google", "로그인")
+        )
+
+    def _recover_post_login_landing(
+        self,
+        page: PageLike,
+        probe: UsageProbePayload | None = None,
+    ) -> UsageProbePayload | None:
         try:
             current_url = str(page.url)
         except (OSError, RuntimeError, _playwright_error_type()):
@@ -421,6 +484,8 @@ class CodexUsagePlaywrightDriver:
             return None
         host = urlsplit(current_url).netloc.lower()
         if host.endswith(("accounts.google.com", "auth.openai.com")):
+            return None
+        if probe is not None and self._probe_is_login_pending(page, probe):
             return None
         if _canonical_usage_url(current_url) == _canonical_usage_url(self._config.usage_url):
             return None
@@ -441,20 +506,33 @@ class CodexUsagePlaywrightDriver:
             self._log("post-login landing recovery navigation failed")
             return None
 
-    def _evaluate_probe_until_ready(self, page: PageLike) -> UsageProbePayload | None:
+    def _evaluate_probe_until_ready(
+        self,
+        page: PageLike,
+        *,
+        stop_on_non_usage_landing: bool = False,
+    ) -> UsageProbePayload | None:
         last_probe: UsageProbePayload | None = None
         for attempt in range(21):
             probe = parse_usage_probe(page.evaluate(self._config.probe_script))
             if probe is None:
                 raise DriverOperationError("usage probe did not return an object")
             last_probe = probe
-            if self._probe_is_terminal(probe):
+            if self._probe_is_terminal(
+                probe,
+                stop_on_non_usage_landing=stop_on_non_usage_landing,
+            ):
                 return probe
             if attempt < 20:
                 self._sleep(0.25)
         return last_probe
 
-    def _probe_is_terminal(self, probe: UsageProbePayload) -> bool:
+    def _probe_is_terminal(
+        self,
+        probe: UsageProbePayload,
+        *,
+        stop_on_non_usage_landing: bool = False,
+    ) -> bool:
         if any(
             str(block.get("metric_key", "")) != "remaining_credit"
             for block in probe.get("metricBlocks", [])
@@ -463,6 +541,10 @@ class CodexUsagePlaywrightDriver:
         if self._probe_is_cloudflare(probe):
             return True
         url = str(probe.get("url", "")).lower()
+        if stop_on_non_usage_landing and url and not _canonical_usage_url(url) == _canonical_usage_url(
+            self._config.usage_url
+        ):
+            return True
         combined = " ".join(str(probe.get(key, "")) for key in ("title", "mainText")).lower()
         if any(token in url for token in ("/login", "/auth", "signin", "sign-in")):
             return True
