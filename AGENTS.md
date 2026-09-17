@@ -13,7 +13,7 @@
 - **[INV-PROTECTED-RULESET]** `.github/pr-protection/ruleset.json`은 `hotfix/*`와 `release/*`에 merge-only PR, non-fast-forward, deletion 보호를 적용하고 required status check를 두지 않는다.
 - **[INV-NO-ACTIONS]** GitHub Actions는 비활성화하고 `.github/workflows`를 두지 않는다. task evidence, clean tagged artifact, exact ref read-back이 release 검증을 소유한다.
 - **[INV-NO-PUBLIC-REF-REWRITE]** 공개된 `main`, `develop`, tag는 force rewrite하지 않는다. 잘못된 공개 이력은 revert 또는 다음 patch로 교정한다. merged disposable topic/version branch의 expected-OID compare-and-delete는 공개 release ref rewrite와 별개다.
-- **[INV-MAIN-RUNTIME]** 영구 runtime·시작프로그램·자동 업데이트 기준은 main 물리 worktree `C:\workspace\daeng\git\tools\windows-supporter\windows-supporter.exe`다. 임시/Codex worktree artifact를 영구 등록하지 않는다.
+- **[INV-MAIN-RUNTIME]** 영구 runtime·시작프로그램·자동 업데이트 기준은 사용자가 설치한 persistent executable `C:\Users\enmso\AppData\Local\Programs\Windows Supporter\windows-supporter.exe`다. 이 위치는 Windows 설치기(`installer/windows-supporter.iss`)의 `DefaultDirName`이 만드는 유일한 배포 설치 경로이며 사용자가 명시적으로 유지를 확정한 대상이다. 빌드·검증·배포는 저장소 소스 worktree에서 수행하지만, 소스 worktree 복제본을 영구 등록하거나 시작프로그램을 소스 경로로 되돌리지 않는다. 임시/Codex worktree artifact를 영구 등록하지 않는다.
 - **[INV-GIT-GUI-GUARD]** main 물리 checkout의 HEAD/worktree를 바꾸기 전에 Fork, GitHub Desktop, SourceTree, GitKraken, TortoiseGitProc가 감시 중인지 확인한다. 실행 중이면 정상 종료하거나 main을 바꾸지 않는 절차를 사용한다.
 - **[INV-FAIL-CLOSED-CLEANUP]** ref·worktree·artifact의 expected identity, ownership, clean state, runtime 비사용을 모두 증명하지 못하면 삭제하지 않는다. force fallback이나 광역 clean으로 우회하지 않는다.
 
@@ -93,7 +93,7 @@
 - **[SAFE-CANONICAL-RESTORE]** protected version branch cleanup은 canonical ruleset 원상복구를 freeze 제거보다 먼저 검증한다. 복구를 증명하지 못하면 emergency full freeze를 유지하고 중단한다.
 - `git worktree remove --force`, `git branch -D`, recursive force deletion, 광역 `git clean -fdx`를 cleanup 우회 수단으로 사용하지 않는다.
 - local/remote ref는 독립적으로 판단한다. expected SHA의 존재 ref만 compare-and-delete하고, 이미 없는 ref는 최종 read-back에서도 없어야 한다.
-- 임시 worktree에서는 build/test/smoke/단기 실행이 가능하지만 persistent runtime으로 등록하지 않는다. 시작프로그램이 임시 경로면 main artifact 기준으로 복구하고 검증한다.
+- 임시 worktree에서는 build/test/smoke/단기 실행이 가능하지만 persistent runtime으로 등록하지 않는다. 시작프로그램이 임시 경로면 설치된 persistent executable 기준으로 복구하고 검증한다.
 
 ## 완료 증거
 
@@ -102,7 +102,7 @@
 - `main`, tag, `develop` push/read-back, 최종 local/remote refs와 release graph를 포함한다.
 - 각 topic의 immutable cleanup receipt, 삭제한 refs/worktrees/artifacts, 보존한 대상과 이유를 포함한다.
 - protected version branch와 temporary freeze의 삭제, canonical ruleset 복원 read-back을 포함한다.
-- 최종 main physical runtime 경로와 시작프로그램 등록 경로를 포함한다.
+- 최종 installed runtime 경로와 시작프로그램 등록 경로를 포함한다.
 
 ## 필수 runbook
 
