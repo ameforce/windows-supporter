@@ -116,8 +116,9 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         min_width, min_height = ui._tab_minsizes.get(ui._TAB_AI_USAGE)
         # 콘텐츠가 mount되면 실제 요청 크기가 우선하고, mount 전 fallback은
         # Windows 배율을 중복 적용하지 않는 compact 기준을 사용한다.
-        self.assertEqual((width, height), (900, 520))
-        self.assertEqual((min_width, min_height), (720, 420))
+        # 좌우 상자 레이아웃에 맞춰 기본값을 키웠다.
+        self.assertEqual((width, height), (1040, 640))
+        self.assertEqual((min_width, min_height), (880, 480))
 
     def test_ai_usage_content_fit_uses_mounted_view_preferred_size(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
@@ -228,10 +229,10 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._apply_tab_geometry(ui._TAB_AI_USAGE)
 
         self.assertEqual(root.geometry_calls[-1], "768x452")
-        self.assertEqual(root.minsize_calls[-1], (720, 420))
+        self.assertEqual(root.minsize_calls[-1], (768, 452))
         self.assertEqual(
             root.resize_events,
-            [("minsize", (720, 420)), ("geometry", "768x452")],
+            [("minsize", (768, 452)), ("geometry", "768x452")],
         )
 
     def _build_dashboard_geometry_ui(self, *, user_size):
@@ -425,7 +426,7 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._apply_tab_geometry(ui._TAB_AI_USAGE)
 
         self.assertEqual(ui._tab_user_sizes, {})
-        self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (900, 520))
+        self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (1040, 640))
 
     def test_narrow_notebook_uses_short_tab_labels(self) -> None:
         class _TabNotebook:
