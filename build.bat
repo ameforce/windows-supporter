@@ -109,8 +109,9 @@ REM Stage Tcl/Tk script libraries as real directories. Tcl's runtime self-mount
 REM of a frozen onefile bundle can fail when the OS _MEI temp parent is not
 REM enumerable (for example C:\Windows\Temp under an elevated launch), leaving
 REM the app without init.tcl. Shipping extracted _tcl_data/_tk_data avoids the
-REM ZipFS lookup, while --runtime-tmpdir keeps those files under the executable
-REM directory instead of the unreliable OS temp parent.
+REM ZipFS lookup. Use a per-user root independent of CWD and TEMP/TMP.
+REM Double percent signs preserve the variable for bootloader-time expansion;
+REM a single percent pair would embed the build account's absolute path.
 echo | set /p="Staging Tcl/Tk runtime libraries..."
 call :clear_log
 "%WINDOWS_SUPPORTER_UV_EXE%" run --locked python "tools\stage_tcltk_runtime.py" --dest "%BUILD_GENERATED_DIR%\tcltk" > "%STEP_LOG%" 2>&1
@@ -125,7 +126,7 @@ echo [ Success !! ]
 REM Build the executable
 echo | set /p="Building %MAIN_SOURCE% to %EXE_NAME%..."
 call :clear_log
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --runtime-tmpdir "." --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tcl_data;_tcl_data" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tk_data;_tk_data" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --runtime-tmpdir "%%LOCALAPPDATA%%\windows-supporter\runtime" --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tcl_data;_tcl_data" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tk_data;_tk_data" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller build failed.
