@@ -1239,24 +1239,36 @@ class Wrike:
 
     def __overtime_scheduled_quit(self, target_day, overview=None, now=None):
         schedule = self.__flex_schedule_for_day(target_day)
-        if schedule is not None and isinstance(schedule.actual_start, datetime):
+        arrival = None
+        if overview is not None and overview.clock_in is not None:
+            arrival = overview.clock_in
+        elif schedule is not None and isinstance(schedule.actual_start, datetime):
+            arrival = schedule.actual_start
+        if arrival is not None:
             at = now if isinstance(now, datetime) else self.__lib.datetime.now()
             try:
                 intervals = self.__collect_break_intervals_for_day(target_day, at)
-                # Use the actual clock record and Flex's regular work duration,
+                # Use the actual arrival and Flex's regular work duration,
                 # not its planned clock range.  Assigned Flex overtime remains
                 # a separate local overtime flow and must not move this point.
+                regular_minutes = (
+                    schedule.regular_work_minutes
+                    if schedule is not None
+                    else None
+                )
+                if regular_minutes is None:
+                    return getattr(overview, "projected_quit", None)
                 return project_quit_at(
                     at,
-                    schedule.actual_start,
-                    schedule.regular_work_minutes,
+                    arrival,
+                    regular_minutes,
                     intervals,
                 )
             except Exception:
                 return None
         if overview is None:
             return None
-        # If Flex has no actual clock record, retain the local plan's common
+        # If no clock record exists, retain the local plan's common
         # projection.  Never fall back to a Flex planned quit time.
         return getattr(overview, "projected_quit", None)
 
@@ -2663,20 +2675,28 @@ class Wrike:
                 "explicit": False,
             }
         explicit = bool(plan.get("explicit", False))
+        flex_schedule = self.__flex_schedule_for_day(target_day)
         if explicit:
             try:
                 target = max(0, min(1440, int(plan.get("target_net_minutes", 0))))
             except Exception:
                 target = 0
+            if flex_schedule is not None:
+                target = max(
+                    0,
+                    min(
+                        1440,
+                        int(flex_schedule.regular_work_minutes),
+                    ),
+                )
             return {
                 "date": target_day.isoformat(),
                 "target_net_minutes": int(target),
                 "clock_in": plan.get("clock_in"),
                 "explicit": True,
                 "source": "local",
-                "flex_schedule": self.__flex_schedule_for_day(target_day),
+                "flex_schedule": flex_schedule,
             }
-        flex_schedule = self.__flex_schedule_for_day(target_day)
         if flex_schedule is not None:
             actual_start = flex_schedule.actual_start
             return {
@@ -3051,6 +3071,11 @@ class Wrike:
                 else "#6B7280",
             ),
             WorktimePanelLine(
+                f"출근 {clock_text} · {quit_label} {quit_text}"
+                + (" (임시)" if provisional else ""),
+                "#111827",
+            ),
+            WorktimePanelLine(
                 (
                     f"현재 기준 {delta_text} · 초과근무 {overtime_state.elapsed_minutes}분"
                     if overtime_state is not None
@@ -3058,11 +3083,6 @@ class Wrike:
                 )
                 + (" (임시)" if provisional else ""),
                 delta_color,
-            ),
-            WorktimePanelLine(
-                f"출근 {clock_text} · {quit_label} {quit_text}"
-                + (" (임시)" if provisional else ""),
-                "#111827",
             ),
             WorktimePanelLine(
                 f"병합 휴게 {self.__format_minutes(overview.break_total_minutes)}"
