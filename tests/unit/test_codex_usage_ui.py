@@ -962,19 +962,49 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             2,
         )
 
-    def test_reflow_profile_cards_uses_card_count(self) -> None:
+    def test_pane_boxes_record_side_by_side_columns_when_wide(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
-        cards = _FakeWidget()
-        cards.tk = type("TkBridge", (), {"call": lambda _self, *_args: 4.0 / 3.0})()
-        single_card = [_FakeWidget()]
+        panes = _FakeWidget()
+        side_row = _FakeWidget()
+        left_box = _FakeWidget()
+        right_box = _FakeWidget()
+        view._pane_boxes = {"left": left_box, "right": right_box}
 
-        view._reflow_profile_cards(cards, single_card, available_width=820)
-        self.assertEqual(single_card[0].grid_kwargs["column"], 0)
-        self.assertEqual(cards.grid_kwargs.get("column") if hasattr(cards, "grid_kwargs") else None, None)
+        view._reflow_pane_boxes(panes, side_row, available_width=820)
+        self.assertEqual(left_box.grid_kwargs["column"], 0)
+        self.assertEqual(right_box.grid_kwargs["column"], 1)
         try:
-            self.assertEqual(cards._windows_supporter_profile_columns, 1)
+            self.assertEqual(panes._windows_supporter_pane_columns, 2)
         except AttributeError:
-            self.fail("reflow should record the applied column count")
+            self.fail("reflow should record the applied pane column count")
+
+    def test_pane_boxes_stack_when_viewport_crosses_narrow_boundary(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        panes = _FakeWidget()
+        side_row = _FakeWidget()
+        left_box = _FakeWidget()
+        right_box = _FakeWidget()
+        view._pane_boxes = {"left": left_box, "right": right_box}
+
+        view._reflow_pane_boxes(panes, side_row, available_width=700)
+        self.assertEqual(
+            [(left_box.grid_kwargs["row"], left_box.grid_kwargs["column"]),
+             (right_box.grid_kwargs["row"], right_box.grid_kwargs["column"])],
+            [(0, 0), (1, 0)],
+        )
+
+        panes2 = _FakeWidget()
+        side_row2 = _FakeWidget()
+        left_box2 = _FakeWidget()
+        right_box2 = _FakeWidget()
+        view._pane_boxes = {"left": left_box2, "right": right_box2}
+
+        view._reflow_pane_boxes(panes2, side_row2, available_width=820)
+        self.assertEqual(
+            [(left_box2.grid_kwargs["row"], left_box2.grid_kwargs["column"]),
+             (right_box2.grid_kwargs["row"], right_box2.grid_kwargs["column"])],
+            [(0, 0), (0, 1)],
+        )
 
     def test_profile_cards_collapse_to_one_column_when_viewport_is_narrow(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
@@ -1002,22 +1032,19 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             2,
         )
 
-    def test_profile_cards_reflow_when_viewport_crosses_narrow_boundary(self) -> None:
+    def test_pane_boxes_reflow_when_viewport_crosses_narrow_boundary(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
-        cards = _FakeWidget()
-        cards.tk = type("TkBridge", (), {"call": lambda _self, *_args: 4.0 / 3.0})()
-        card_widgets = [_FakeWidget(), _FakeWidget(), _FakeWidget()]
+        panes = _FakeWidget()
+        side_row = _FakeWidget()
+        left_box = _FakeWidget()
+        right_box = _FakeWidget()
+        view._pane_boxes = {"left": left_box, "right": right_box}
 
-        view._reflow_profile_cards(cards, card_widgets, available_width=700)
+        view._reflow_pane_boxes(panes, side_row, available_width=700)
         self.assertEqual(
-            [(card.grid_kwargs["row"], card.grid_kwargs["column"]) for card in card_widgets],
-            [(0, 0), (1, 0), (2, 0)],
-        )
-
-        view._reflow_profile_cards(cards, card_widgets, available_width=820)
-        self.assertEqual(
-            [(card.grid_kwargs["row"], card.grid_kwargs["column"]) for card in card_widgets],
-            [(0, 0), (0, 1), (1, 0)],
+            [(left_box.grid_kwargs["row"], left_box.grid_kwargs["column"]),
+             (right_box.grid_kwargs["row"], right_box.grid_kwargs["column"])],
+            [(0, 0), (1, 0)],
         )
 
     def test_mount_lays_runtime_values_out_in_two_columns(self) -> None:
@@ -1110,6 +1137,111 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("Codex 2", texts)
         self.assertIn("프로필 경로: profile-1", texts)
         self.assertIn("프로필 경로: profile-2", texts)
+
+    def test_mount_renders_saved_right_priority_boxes_on_first_paint(self) -> None:
+        class _FakeMonitor:
+            def get_settings_snapshot(self):
+                return {
+                    "enabled": True,
+                    "taskbar_overlay_enabled": True,
+                    "taskbar_side_priority": "right",
+                    "interval_sec": 90,
+                    "tooltip_duration_ms": 7000,
+                    "usage_url": "https://example.test",
+                    "settings_path": "",
+                    "state_path": "",
+                    "profile_dir": "",
+                    "profiles": [
+                        {
+                            "id": f"account_{index}",
+                            "label": f"Profile {index}",
+                            "provider": "codex",
+                            "enabled": True,
+                            "taskbar_selected": True,
+                            "settings_path": "",
+                            "state_path": "",
+                            "profile_dir": "",
+                        }
+                        for index in range(1, 5)
+                    ],
+                }
+
+            def get_runtime_status(self):
+                return {"profiles": []}
+
+            def get_last_snapshot(self):
+                return None
+
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=_FakeMonitor())
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        self.assertEqual(view._rendered_side_priority, "right")
+        rendered = view._rendered_pane_assignment
+        self.assertEqual(rendered["right"], ["account_1", "account_2"])
+        self.assertEqual(rendered["left"], ["account_3", "account_4"])
+        self.assertIn("1·2번 슬롯", view._pane_hints["right"].kwargs.get("text", ""))
+        self.assertIn("3·4번 슬롯", view._pane_hints["left"].kwargs.get("text", ""))
+
+    def test_save_remounts_when_pane_assignment_goes_stale(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.update_calls = []
+
+            def get_settings_snapshot(self):
+                return {
+                    "enabled": True,
+                    "taskbar_overlay_enabled": True,
+                    "taskbar_side_priority": "left",
+                    "interval_sec": 90,
+                    "tooltip_duration_ms": 7000,
+                    "usage_url": "https://example.test",
+                    "profiles": [
+                        {"id": "account_1", "provider": "codex", "enabled": True},
+                        {"id": "account_2", "provider": "codex", "enabled": True},
+                    ],
+                }
+
+            def update_settings(self, payload):
+                self.update_calls.append(dict(payload))
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._taskbar_side_priority_var = _FakeVar(value="right")
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._usage_url_var = _FakeVar(value="https://example.test")
+        view._account_order = ["account_1", "account_2"]
+        view._account_enabled_vars = {}
+        view._account_provider_vars = {}
+        view._account_taskbar_selected_vars = {
+            "account_1": _FakeVar(value=True),
+            "account_2": _FakeVar(value=True),
+        }
+        view._pane_lists = {"left": object(), "right": object(), "pool": object()}
+        view._rendered_side_priority = "left"
+        view._rendered_pane_assignment = {
+            "left": ["account_1", "account_2"],
+            "right": [],
+            "pool": [],
+        }
+        remounts = []
+        view._remount = lambda: remounts.append(True)
+        view._set_status = lambda *_args, **_kwargs: None
+
+        self.assertTrue(view._save_settings())
+        self.assertEqual(monitor.update_calls[-1]["taskbar_side_priority"], "right")
+        self.assertEqual(remounts, [True])
 
     def test_mount_hides_codex_url_when_every_profile_is_cursor(self) -> None:
         fake_tk = _FakeTk()
