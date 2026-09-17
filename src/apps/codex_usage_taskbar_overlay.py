@@ -4466,69 +4466,50 @@ class CodexUsageTaskbarOverlay:
 
     def _is_native_z_order_visible(self, window: Any) -> bool:
         hwnd = _get_window_handle(window)
-        if hwnd <= 0 or not hasattr(ctypes, "windll") or wintypes is None:
+        if hwnd <= 0 or win32gui is None:
             return True
-
-        class RECT(ctypes.Structure):
-            _fields_ = [
-                ("left", ctypes.c_long),
-                ("top", ctypes.c_long),
-                ("right", ctypes.c_long),
-                ("bottom", ctypes.c_long),
-            ]
-
         try:
-            rect = RECT()
-            if not ctypes.windll.user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
-                return True
-            width = int(rect.right) - int(rect.left)
-            height = int(rect.bottom) - int(rect.top)
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return False
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width, height = right - left, bottom - top
             if width <= 0 or height <= 0:
-                return True
-            y = int(rect.top) + max(1, height // 2)
-            probe_xs = [
-                int(rect.left) + max(1, min(12, width - 1)),
-                int(rect.left) + max(1, width // 2),
-                int(rect.right) - max(1, min(12, width - 1)),
-            ]
+                return False
+            y = top + max(1, height // 2)
+            probe_xs = [left + max(1, min(12, width - 1)),
+                        left + max(1, width // 2),
+                        right - max(1, min(12, width - 1))]
             for x in probe_xs:
-                hit = ctypes.windll.user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
-                if int(hit) <= 0:
-                    continue
-                root = ctypes.windll.user32.GetAncestor(int(hit), 2)
-                if int(hit) == int(hwnd) or int(root) == int(hwnd):
+                hit = win32gui.WindowFromPoint((x, y))
+                if hit and (hit == hwnd or win32gui.GetAncestor(hit, 2) == hwnd):
                     return True
         except Exception:
-            return True
+            return False
         return False
 
     def _reassert_native_z_order(self, window: Any) -> None:
         hwnd = _get_window_handle(window)
-        if hwnd <= 0 or not hasattr(ctypes, "windll"):
+        if hwnd <= 0 or win32gui is None or win32con is None:
             return
         try:
             self._prepare_native_window(window)
-            hwnd_topmost = -1
-            swp_nosize = 0x0001
-            swp_nomove = 0x0002
-            swp_noactivate = 0x0010
-            swp_showwindow = 0x0040
-            swp_noownerzorder = 0x0200
-            ctypes.windll.user32.SetWindowPos(
-                int(hwnd),
-                hwnd_topmost,
-                0,
-                0,
-                0,
-                0,
-                swp_nomove
-                | swp_nosize
-                | swp_noactivate
-                | swp_showwindow
-                | swp_noownerzorder,
+            # HWND_TOPMOST is a pointer-sized pseudo handle. Untyped ctypes
+            # marshals -1 as c_int and can produce ERROR_INVALID_WINDOW_HANDLE
+            # on 64-bit Windows. Use the same typed binding as initial placement.
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE
+                | win32con.SWP_NOSIZE
+                | win32con.SWP_NOACTIVATE
+                | win32con.SWP_SHOWWINDOW
+                | win32con.SWP_NOOWNERZORDER,
             )
         except Exception:
-            pass
+            # Let keepalive recover the surface and retry; do not silently
+            # treat a failed native operation as successful recovery.
+            raise
         return
 
     def _force_native_repaint(self, window: Any) -> None:
