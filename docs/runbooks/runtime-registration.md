@@ -2,17 +2,18 @@
 
 ## persistent runtime boundary
 
-- main physical worktree는 `C:\workspace\daeng\git\tools\windows-supporter`다.
-- persistent executable은 `C:\workspace\daeng\git\tools\windows-supporter\windows-supporter.exe`다.
+- 빌드·검증·배포 소스 worktree(main physical checkout)는 `C:\workspace\daeng\git\tools\windows-supporter`다.
+- installed persistent executable은 `C:\Users\enmso\AppData\Local\Programs\Windows Supporter\windows-supporter.exe`다. 이는 설치기 `installer/windows-supporter.iss`의 `DefaultDirName`이 만드는 배포 설치 경로이며 영구 runtime·시작프로그램·자동 업데이트의 기준이다.
+- 소스 worktree의 `windows-supporter.exe`(있다면 task 빌드 산출물)를 영구 등록하거나 시작프로그램을 소스 경로로 되돌리지 않는다.
 - temporary/Codex worktree에서는 build, test, smoke, 단기 executable 실행이 가능하다.
 - temporary worktree executable을 Windows 시작프로그램, 자동 업데이트, 주기 실행 대상으로 등록하지 않는다.
 
 ## startup registration
 
 1. `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Windows Supporter`를 읽는다.
-2. exact main physical executable을 가리키는지 확인한다.
-3. `.codex\worktrees` 또는 다른 temporary path면 정상 상태가 아니다.
-4. main tagged artifact를 기준으로 재등록하고 registry value를 read-back한다.
+2. exact installed persistent executable을 가리키는지 확인한다.
+3. `.codex\worktrees`, 소스 worktree 또는 다른 temporary path면 정상 상태가 아니다.
+4. installed persistent executable 기준으로 재등록하고 registry value를 read-back한다.
 5. 실행 파일 metadata/hash와 startup path를 final evidence에 기록한다.
 
 ## Git GUI guard
@@ -32,12 +33,12 @@ GUI guard로 main checkout을 바꿀 수 없는 동안에는 lane close를 remot
 ## build와 process
 
 - final release build는 main physical worktree의 tagged source에서 실행한다. GUI guard로 그 checkout을 바꿀 수 없으면 같은 tag SHA의 clean alternate worktree에서 빌드하고 사용한 경로를 evidence에 기록한다.
-- `build.bat`의 build phase는 running root executable을 중단하거나 root artifact를 교체하지 않는다.
+- `build.bat`의 build phase는 installed persistent executable을 중단하거나 교체하지 않는다.
 - final candidate build에는 child environment로 `WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY=1`을 전달한다.
 - runtime·packaging release의 승격은 `tools/deploy_runtime.py`만 수행한다. helper는 candidate 검증 후 exact-path process tree 종료, backup, atomic replacement, launch, tray/Tk readiness와 heartbeat 검증을 하나의 transaction으로 수행한다.
 - helper는 marker를 exclusive-create해 동시 배포를 배제한다. backup과 staged candidate가 모두 검증되기 전에는 running runtime을 건드리지 않으며, preparation 실패는 target-unchanged receipt로 끝낸다.
-- candidate-only build 전후의 root executable identity가 같고, 배포 영수증의 명시적 `recovery_action=restart-unchanged-runtime`과 `rollback.status=target-unchanged`가 함께 있을 때만 이전 runtime을 재기동한다. build가 root executable을 바꿨다면 복원 후보의 검증·원자적 복원·재기동을 `restart_runtime(restore_source=...)`의 단일 transaction으로 수행한다. 재기동도 같은 marker를 exclusive-create하며, marker 선점 경쟁에서 진 호출자는 `transaction_conflict`와 `preserved_transaction`을 기록한다. 전환 후·rollback 실패는 재기동하지 않는다.
-- root executable이 없는 fresh checkout은 previous artifact 없는 transaction으로 설치하고, 실패하면 target 부재 상태로 되돌린다.
+- candidate-only build 전후의 installed persistent executable identity가 같고, 배포 영수증의 명시적 `recovery_action=restart-unchanged-runtime`과 `rollback.status=target-unchanged`가 함께 있을 때만 이전 runtime을 재기동한다. build가 installed executable을 바꿨다면 복원 후보의 검증·원자적 복원·재기동을 `restart_runtime(restore_source=...)`의 단일 transaction으로 수행한다. 재기동도 같은 marker를 exclusive-create하며, marker 선점 경쟁에서 진 호출자는 `transaction_conflict`와 `preserved_transaction`을 기록한다. 전환 후·rollback 실패는 재기동하지 않는다.
+- installed persistent executable이 없는 fresh 설치는 previous artifact 없는 transaction으로 설치하고, 실패하면 target 부재 상태로 되돌린다.
 - 새 runtime의 launch/readiness가 실패하면 helper는 이전 artifact를 복원하고 이전 runtime readiness까지 확인한 뒤 비영 종료 코드와 JSON rollback receipt를 반환한다.
 - marker 또는 backup이 이미 존재하면 ownership을 추정하지 않고 그대로 보존한 채 실패한다. 별도 조사 없이 덮어쓰거나 삭제하지 않는다.
 - normal `build.bat`은 helper stdout/stderr를 합치지 않고 JSON receipt를 별도 UTF-8 파일에 보존한다. updater는 배포 성공 뒤 build/dist/spec을 exact repo child로 정리한다.
@@ -50,7 +51,7 @@ linked worktree를 제거하기 전에:
 
 - 그 경로의 executable/tool을 쓰는 process가 없는지 확인한다.
 - startup, automatic update, scheduled execution이 그 경로를 가리키지 않는지 확인한다.
-- main tagged artifact가 존재하고 persistent registration이 정상인지 확인한다.
+- installed persistent executable이 존재하고 startup registration이 그 경로를 가리키는지 확인한다.
 
 불확실하면 worktree와 artifact를 보존한다.
 
@@ -58,6 +59,6 @@ linked worktree를 제거하기 전에:
 
 - current branch가 main인지 확인한다.
 - main이 origin/main과 clean/synced인지 확인한다. GUI guard로 동기화를 미뤘다면 `main`이 `origin/main`의 ancestor로 clean/behind인 것과 deferred 사실을 기록하고, synced 확인은 guard 해제 후 follow-up으로 남긴다.
-- permanent executable metadata/hash를 read-back한다.
-- startup registry가 exact permanent path인지 확인한다.
-- temporary task worktree와 그 executable이 없거나 persistent runtime과 무관한지 확인한다.
+- installed persistent executable metadata/hash를 read-back한다.
+- startup registry가 exact installed persistent executable 경로를 가리키는지 확인한다.
+- temporary task worktree와 그 executable이 없거나 installed persistent runtime과 무관한지 확인한다.

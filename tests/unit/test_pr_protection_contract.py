@@ -200,12 +200,22 @@ class PullRequestProtectionContractTest(unittest.TestCase):
         self.assertIn("freeze ID와 name이 live 목록에 없는지 확인", runbook)
         self.assertIn("remote ref 삭제가 실패했지만 canonical 복원은 성공", runbook)
 
-    def test_runtime_and_final_evidence_bind_main_path_and_actual_refs(self) -> None:
+    def test_runtime_and_final_evidence_bind_installed_path_and_actual_refs(self) -> None:
         runtime = self._read_runbook("runtime-registration.md")
         evidence = self._read_runbook("release-evidence.md")
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         self.assertIn(
-            "C:\\workspace\\daeng\\git\\tools\\windows-supporter\\windows-supporter.exe",
+            "C:\\Users\\enmso\\AppData\\Local\\Programs\\Windows Supporter\\windows-supporter.exe",
             runtime,
+        )
+        self.assertIn("installer/windows-supporter.iss", runtime)
+        self.assertIn(
+            "C:\\Users\\enmso\\AppData\\Local\\Programs\\Windows Supporter\\windows-supporter.exe",
+            agents,
+        )
+        self.assertNotIn(
+            "C:\\workspace\\daeng\\git\\tools\\windows-supporter\\windows-supporter.exe",
+            agents,
         )
         self.assertIn("Fork.exe", runtime)
         self.assertIn("main이 origin/main과 clean/synced", runtime)
@@ -213,7 +223,7 @@ class PullRequestProtectionContractTest(unittest.TestCase):
         self.assertIn("git ls-remote --heads --tags origin", evidence)
         self.assertIn("refs/codex/turn-diffs", evidence)
         self.assertIn("temporary freeze ID/name 부재", evidence)
-        self.assertIn("시작프로그램 등록 경로", (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8"))
+        self.assertIn("시작프로그램 등록 경로", agents)
 
 
 if __name__ == "__main__":
