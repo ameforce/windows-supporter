@@ -24,7 +24,7 @@ _MIN_PANEL_WIDTH = 520
 _MIN_PANEL_HEIGHT = 330
 _COMPACT_PANEL_MAX_WIDTH = 660
 _COMPACT_PANEL_MAX_HEIGHT = 540
-_MAX_COMPACT_TODAY_LINES = 2
+_MAX_COMPACT_TODAY_LINES = 3
 # Detail text is a bounded viewport: leave enough room for the summary and
 # the first few ticket/detail rows while keeping long days scrollable.
 _DETAIL_EMPTY_TEXT_HEIGHT = 5
@@ -751,8 +751,11 @@ class WorktimeQuickPanel:
         if len(lines) <= _MAX_COMPACT_TODAY_LINES:
             return lines
         return (
-            lines[0],
-            WorktimePanelLine(f"추가 상태 {len(lines) - 1}건", _MUTED),
+            *lines[:_MAX_COMPACT_TODAY_LINES],
+            WorktimePanelLine(
+                f"추가 상태 {len(lines) - _MAX_COMPACT_TODAY_LINES}건",
+                _MUTED,
+            ),
         )
 
     def _uses_compact_density(self) -> bool:
