@@ -1752,6 +1752,80 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(recovered["failure_count"], 0)
             self.assertEqual(recovered["last_error_type"], "")
 
+    def _monthly_usage_probe(self) -> dict:
+        return {
+            "url": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+            "mainText": "Codex 및 Work 분석 사용량 월간 사용 한도 0% 남음 2026. 10. 10. 오후 9:55 초기화 남은 크레딧 865",
+            "profileName": "김웅기",
+            "accountId": "96e460c4-c893-4884-bbd4-b68c81a96fad",
+            "metricBlocks": [
+                {
+                    "metric_key": "monthly_limit",
+                    "label_text": "월간 사용 한도",
+                    "value_candidates": ["0% 남음"],
+                    "block_text": "월간 사용 한도 0% 남음 2026. 10. 10. 오후 9:55 초기화",
+                    "reset_candidates": ["2026. 10. 10. 오후 9:55 초기화"],
+                },
+                {
+                    "metric_key": "remaining_credit",
+                    "label_text": "남은 크레딧",
+                    "value_candidates": ["865"],
+                    "block_text": "남은 크레딧 865",
+                },
+            ],
+        }
+
+    def test_monthly_only_probe_builds_snapshot_and_logs_in(self) -> None:
+        # Given: the provider reports only a monthly limit plus credits,
+        # with no 5-hour or weekly cards on the analytics page.
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._monthly_usage_probe()
+            )
+
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            self.assertEqual(snapshot.monthly_limit, "0%")
+            self.assertEqual(snapshot.remaining_credit, "865")
+            self.assertTrue(snapshot.monthly_limit_reset_at)
+
+            changes = monitor.handle_snapshot(snapshot)
+
+            self.assertEqual(changes, [])
+            self.assertEqual(
+                monitor.get_runtime_status().get("session_state"),
+                "logged_in",
+            )
+
+    def test_monthly_limit_survives_state_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(config_dir=tmp, profile_dir=os.path.join(tmp, "profile"))
+            snapshot = monitor._CodexUsageMonitor__build_snapshot_from_probe(
+                self._monthly_usage_probe()
+            )
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            monitor.handle_snapshot(snapshot)
+            monitor._CodexUsageMonitor__save_state()
+
+            profile_dir = os.path.join(tmp, "profile")
+            os.makedirs(profile_dir, exist_ok=True)
+            with open(os.path.join(profile_dir, "session"), "w", encoding="utf-8") as fp:
+                fp.write("profile-session-present")
+
+            reloaded = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=profile_dir,
+            )
+
+            self.assertEqual(reloaded.get_last_snapshot().monthly_limit, "0%")
+            self.assertEqual(
+                reloaded.get_runtime_status().get("session_state"),
+                "logged_in",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

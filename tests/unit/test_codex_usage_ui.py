@@ -2341,6 +2341,28 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("이전 값:", summary)
         self.assertIn("100%", summary)
 
+    def test_account_snapshot_summary_shows_monthly_limit(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        summary = view._format_account_snapshot_summary(
+            {
+                "runtime": {
+                    "monitor_state": "idle",
+                    "session_state": "logged_in",
+                    "collect_inflight": False,
+                },
+                "settings": {"interval_sec": 30},
+                "last_snapshot": {
+                    "captured_at": "2099-01-01T00:00:00",
+                    "monthly_limit": "0%",
+                    "monthly_limit_reset_at": "2099-02-01T00:00:00",
+                    "remaining_credit": "865",
+                },
+            }
+        )
+
+        self.assertIn("월간 0%", summary)
+
     def test_command_timeout_shows_recovery_progress_and_marks_snapshot_previous(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         runtime = {
