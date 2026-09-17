@@ -23,7 +23,9 @@ _MIN_IDLE_TIMEOUT_MS = 1_200
 _MIN_PANEL_WIDTH = 520
 _MIN_PANEL_HEIGHT = 330
 _COMPACT_PANEL_MAX_WIDTH = 660
-_COMPACT_PANEL_MAX_HEIGHT = 540
+# Compact summary shows three today rows (Flex note, arrival/quit, delta),
+# so the height budget covers one more summary row than before.
+_COMPACT_PANEL_MAX_HEIGHT = 570
 _MAX_COMPACT_TODAY_LINES = 3
 # Detail text is a bounded viewport: leave enough room for the summary and
 # the first few ticket/detail rows while keeping long days scrollable.
@@ -748,12 +750,15 @@ class WorktimeQuickPanel:
         lines = model.today_lines
         if not lines:
             return (WorktimePanelLine("표시할 오늘 상세가 없습니다.", _MUTED),)
-        if len(lines) <= _MAX_COMPACT_TODAY_LINES:
+        if len(lines) < _MAX_COMPACT_TODAY_LINES:
             return lines
+        # Collapsed summary keeps arrival/quit (lines[1]) visible alongside
+        # the Flex note (lines[0]) within the compact today budget.
         return (
-            *lines[:_MAX_COMPACT_TODAY_LINES],
+            lines[0],
+            lines[1],
             WorktimePanelLine(
-                f"추가 상태 {len(lines) - _MAX_COMPACT_TODAY_LINES}건",
+                f"추가 상태 {len(lines) - (_MAX_COMPACT_TODAY_LINES - 1)}건",
                 _MUTED,
             ),
         )
