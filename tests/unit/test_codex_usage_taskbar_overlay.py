@@ -6643,6 +6643,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             work_area_getter=lambda: (0, 0, 1920, 1040),
         )
         overlay._window = window
+        overlay._window_visible = True
         overlay._last_metric_values = {"account_1:five_hour_limit": "98%"}
         overlay._last_model = {
             "visible": True,
