@@ -33,8 +33,10 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
                 "mixed-ready-standard",
                 "one-profile-125",
                 "dynamic-three-profiles",
+                "four-taskbar-profiles",
                 "ten-mixed-profiles-150",
                 "long-label-narrow",
+                "compact-narrow",
                 "cursor-long-amount-150",
                 "cursor-logged-out",
                 "cursor-stale-rate-limited",
@@ -48,7 +50,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 9)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 11)
         by_name = {fixture["name"]: fixture for fixture in fixtures}
         self.assertEqual(by_name["zero-profiles"]["settings"]["profiles"], [])
         self.assertEqual(by_name["zero-profiles"]["runtime"]["profiles"], [])
@@ -57,6 +59,12 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         dynamic = by_name["dynamic-three-profiles"]
         self.assertEqual(len(dynamic["settings"]["profiles"]), 3)
         self.assertFalse(dynamic["settings"]["profiles"][2]["taskbar_selected"])
+        four_taskbar_profiles = by_name["four-taskbar-profiles"]
+        self.assertEqual(len(four_taskbar_profiles["settings"]["profiles"]), 4)
+        self.assertEqual(
+            four_taskbar_profiles["settings"]["selected_profile_ids"],
+            [profile["id"] for profile in four_taskbar_profiles["settings"]["profiles"]],
+        )
         ten_profiles = by_name["ten-mixed-profiles-150"]
         self.assertEqual(len(ten_profiles["settings"]["profiles"]), 10)
         self.assertEqual(ten_profiles["ui_scale_percent"], 150)
@@ -83,6 +91,9 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         self.assertEqual(long_label["window_size"][0], 700)
         self.assertLess(long_label["window_size"][0], by_name["mixed-ready-standard"]["window_size"][0])
         self.assertGreater(len(long_label["settings"]["profiles"][0]["label"]), 40)
+        compact = by_name["compact-narrow"]
+        self.assertEqual(compact["window_size"], [520, 560])
+        self.assertEqual(compact["interaction"]["action"], "mousewheel_scroll")
         long_amount = by_name["cursor-long-amount-150"]
         self.assertEqual(long_amount["ui_scale_percent"], 150)
         self.assertEqual(long_amount["window_size"][0], 960)

@@ -5,6 +5,12 @@ import re
 import threading
 from typing import Any
 
+from src.apps.ai_usage_contracts import (
+    TaskbarSidePriority,
+    normalize_taskbar_side_priority,
+)
+from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
+
 
 class CodexUsageSettingsView:
     def __init__(
@@ -30,6 +36,7 @@ class CodexUsageSettingsView:
 
         self._enabled_var = None
         self._taskbar_overlay_var = None
+        self._taskbar_side_priority_var = None
         self._interval_var = None
         self._tooltip_var = None
         self._usage_url_var = None
@@ -51,11 +58,25 @@ class CodexUsageSettingsView:
         self._account_metric_vars = {}
         self._account_metric_display_vars = {}
         self._account_metric_cells = {}
+        self._account_metric_layouts = {}
+        self._account_metric_visibility = {}
+        self._account_text_widgets = {}
         self._account_order: list[str] = []
         self._profile_deletions_inflight: set[str] = set()
         self._profile_actions_inflight: set[str] = set()
         self._scroll_canvas = None
         self._scroll_body = None
+        self._scroll_pending_canvas = None
+        self._scroll_pending_units = 0
+        self._scroll_after_id = None
+        self._scroll_root_bindings: list[tuple[str, Any]] = []
+        self._scroll_window_id = None
+        self._header_card = None
+        self._content_card = None
+        self._scrollbar = None
+        self._runtime_value_rows: list[tuple[Any, Any]] = []
+        self._live_spark_visible = None
+        self._button_enabled_states: dict[int, bool] = {}
         self._autosave_after_id = None
         self._preserve_status_after_next_autosave = False
         self._external_settings_result_lock = threading.Lock()
@@ -145,8 +166,17 @@ class CodexUsageSettingsView:
         self._account_metric_vars = {}
         self._account_metric_display_vars = {}
         self._account_metric_cells = {}
+        self._account_metric_layouts = {}
+        self._account_metric_visibility = {}
+        self._account_text_widgets = {}
         self._account_provider_vars = {}
         self._account_taskbar_selected_vars = {}
+        self._taskbar_side_priority_var = None
+        self._runtime_value_rows = []
+        self._live_spark_visible = None
+        self._button_enabled_states = {}
+        self._cancel_pending_scroll()
+        self._unbind_scroll_root_bindings()
 
         container = tk.Frame(parent, bg=bg)
         try:
@@ -163,6 +193,7 @@ class CodexUsageSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
+        self._header_card = header_card
         header_card.pack(fill="x", padx=8, pady=(8, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
@@ -218,6 +249,7 @@ class CodexUsageSettingsView:
             highlightthickness=1,
             highlightbackground=border,
         )
+        self._content_card = content_card
         content_card.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         viewport = tk.Frame(content_card, bg=card_bg)
@@ -230,6 +262,7 @@ class CodexUsageSettingsView:
             takefocus=True,
         )
         scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+        self._scrollbar = scrollbar
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -238,17 +271,15 @@ class CodexUsageSettingsView:
         body_window = canvas.create_window((0, 0), window=body, anchor="nw")
         self._scroll_canvas = canvas
         self._scroll_body = body
+        self._scroll_window_id = body_window
         try:
             body.bind(
                 "<Configure>",
-                lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+                self._on_scroll_body_configure,
             )
             canvas.bind(
                 "<Configure>",
-                lambda event: canvas.itemconfigure(
-                    body_window,
-                    width=max(1, int(getattr(event, "width", 1) or 1)),
-                ),
+                self._on_scroll_canvas_configure,
             )
         except Exception:
             pass
@@ -258,6 +289,9 @@ class CodexUsageSettingsView:
 
         self._enabled_var = tk.BooleanVar(value=False)
         self._taskbar_overlay_var = tk.BooleanVar(value=True)
+        self._taskbar_side_priority_var = tk.StringVar(
+            value=TaskbarSidePriority.LEFT.value
+        )
         self._interval_var = tk.StringVar(value="")
         self._tooltip_var = tk.StringVar(value="")
         self._usage_url_var = tk.StringVar(value="")
@@ -277,26 +311,60 @@ class CodexUsageSettingsView:
 
         row = 0
 
-        # 기본 설정: 체크박스가 라벨 텍스트를 직접 담아 컨트롤-라벨 연결이
-        # 한눈에 보이게 한다. 라벨만 따로 떨어뜨리는 이전 배치는 어떤
-        # 체크박스가 어떤 라벨인지 추적하게 만들었다.
-        for column, (checkbox_text, target_var) in enumerate(
-            (
-                ("모니터링 사용", self._enabled_var),
-                ("작업표시줄 오버레이", self._taskbar_overlay_var),
-            )
+        # 기본 설정은 별도 responsive row로 분리한다. 이전에는 두 체크박스가
+        # body의 4열 grid를 직접 점유해, 아래의 긴 섹션 제목이 첫 열의
+        # 최소 폭을 키우고 URL 입력칸을 화면 오른쪽으로 밀어냈다.
+        options = tk.Frame(body, bg=card_bg)
+        options.grid(row=row, column=0, columnspan=4, sticky="we", pady=3)
+        try:
+            options.columnconfigure(0, weight=1)
+            options.columnconfigure(1, weight=1)
+        except Exception:
+            pass
+        option_widgets = []
+        for checkbox_text, target_var in (
+            ("모니터링 사용", self._enabled_var),
+            ("작업표시줄 오버레이", self._taskbar_overlay_var),
         ):
-            tk.Checkbutton(
-                body,
-                text=checkbox_text,
-                variable=target_var,
-                bg=card_bg,
-                activebackground=card_bg,
-                selectcolor=card_bg,
-                fg="#111827",
-                activeforeground="#111827",
-                font=("Segoe UI", 9),
-            ).grid(row=row, column=column * 2, columnspan=2, sticky="w", pady=3)
+            option_widgets.append(
+                tk.Checkbutton(
+                    options,
+                    text=checkbox_text,
+                    variable=target_var,
+                    bg=card_bg,
+                    activebackground=card_bg,
+                    selectcolor=card_bg,
+                    fg="#111827",
+                    activeforeground="#111827",
+                    font=("Segoe UI", 9),
+                )
+            )
+        self._bind_responsive_widget_row(options, option_widgets, columns=2)
+        row += 1
+
+        placement = tk.Frame(body, bg=card_bg)
+        placement.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 3))
+        tk.Label(
+            placement,
+            text="작업표시줄 배치 우선순위",
+            bg=card_bg,
+            fg="#374151",
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+        radio_factory = getattr(ttk, "Radiobutton", None)
+        if not callable(radio_factory):
+            radio_factory = getattr(tk, "Radiobutton", None)
+        if callable(radio_factory):
+            for label, value in (
+                ("왼쪽 우선", TaskbarSidePriority.LEFT.value),
+                ("오른쪽 우선", TaskbarSidePriority.RIGHT.value),
+            ):
+                radio_factory(
+                    placement,
+                    text=label,
+                    variable=self._taskbar_side_priority_var,
+                    value=value,
+                ).pack(side="left", padx=(12, 0))
         row += 1
 
         tk.Label(
@@ -309,7 +377,7 @@ class CodexUsageSettingsView:
         ttk.Entry(body, textvariable=self._interval_var, width=10).grid(
             row=row,
             column=1,
-            sticky="w",
+            sticky="we",
             pady=2,
         )
         row += 1
@@ -370,6 +438,51 @@ class CodexUsageSettingsView:
         self._start_runtime_refresh()
         return
 
+    def preferred_size(self) -> tuple[int, int]:
+        """Expose the mounted AI content requirement to the main shell.
+
+        A canvas reports only its small viewport request, while the embedded
+        scroll body owns the actual profile/status grid. Measuring the body
+        and adding the scrollbar plus the surrounding card insets keeps the
+        first AI-tab geometry wide enough before the user has to resize it.
+        """
+
+        body = self._scroll_body
+        if body is None:
+            return (0, 0)
+        try:
+            body.update_idletasks()
+        except Exception:
+            pass
+        try:
+            body_width = int(body.winfo_reqwidth())
+        except Exception:
+            return (0, 0)
+
+        scrollbar_width = 0
+        scrollbar = self._scrollbar
+        if scrollbar is not None:
+            try:
+                scrollbar_width = max(0, int(scrollbar.winfo_reqwidth()))
+            except Exception:
+                pass
+        try:
+            container_width = int(self._win.winfo_reqwidth())
+            container_height = int(self._win.winfo_reqheight())
+        except Exception:
+            container_width = 0
+            container_height = 0
+
+        # content_card has 8px outer padding and viewport has 3px inner
+        # padding on both sides. The embedded body's own padding is already
+        # included in winfo_reqwidth().
+        measured_width = body_width + scrollbar_width + 22
+        width = max(1, measured_width, container_width)
+        # The body is intentionally scrollable, so its full content height
+        # must not turn the first AI tab open into a very tall window.
+        height = max(1, container_height)
+        return width, height
+
     def _add_account_sections(
         self,
         body: Any,
@@ -391,18 +504,48 @@ class CodexUsageSettingsView:
             pady=(5, 4),
         )
         row += 1
-        tk.Label(
-            body,
-            text="사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 2개)",
+        section_header = tk.Frame(body, bg=card_bg)
+        section_header.grid(
+            row=row,
+            column=0,
+            columnspan=4,
+            sticky="we",
+            pady=(0, 2),
+        )
+        try:
+            section_header.columnconfigure(0, weight=1)
+        except Exception:
+            pass
+        section_title = tk.Label(
+            section_header,
+            text=(
+                "사용량 프로필 "
+                f"(저장 제한 없음 · 작업표시줄 표시 최대 {TASKBAR_PROFILE_LIMIT}개)"
+            ),
             bg=card_bg,
             fg="#111827",
             font=("Segoe UI", 10, "bold"),
-        ).grid(row=row, column=0, sticky="w", pady=(0, 2))
-        ttk.Button(
-            body,
+            anchor="w",
+            justify="left",
+        )
+        section_title.grid(row=0, column=0, sticky="we")
+        add_profile_button = ttk.Button(
+            section_header,
             text="프로필 추가",
             command=self._on_add_profile,
-        ).grid(row=row, column=3, sticky="e", pady=(0, 2))
+        )
+        add_profile_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        try:
+            section_header.bind(
+                "<Configure>",
+                lambda event: self._fit_section_title(
+                    section_title,
+                    add_profile_button,
+                    int(getattr(event, "width", 0) or 0),
+                ),
+            )
+        except Exception:
+            pass
         row += 1
         cards = tk.Frame(body, bg=card_bg)
         cards.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 2))
@@ -438,7 +581,7 @@ class CodexUsageSettingsView:
             label_var = tk.StringVar(value=label)
             self._account_label_vars[account_id] = label_var
             enabled_var = tk.BooleanVar(value=bool(raw.get("enabled", True)))
-            provider_var = tk.StringVar(value=provider if provider in {"codex", "cursor"} else "codex")
+            provider_var = tk.StringVar(value=provider if provider in {"codex", "cursor", "claude"} else "codex")
             selected_var = tk.BooleanVar(value=bool(raw.get("taskbar_selected", True)))
             self._account_enabled_vars[account_id] = enabled_var
             self._account_provider_vars[account_id] = provider_var
@@ -478,9 +621,9 @@ class CodexUsageSettingsView:
                 font=("Segoe UI", 10, "bold"),
                 anchor="w",
                 justify="left",
-                wraplength=self._scaled_wrap_length(340),
+                wraplength=self._scaled_wrap_length(260),
             )
-            profile_label.grid(row=0, column=0, sticky="w")
+            profile_label.grid(row=0, column=0, sticky="we")
 
             # provider 선택은 프로필 제목과 같은 행 오른쪽에 둬서 카드의
             # 소유권을 먼저 읽고 조작 순서를 나중에 읽게 한다.
@@ -489,7 +632,7 @@ class CodexUsageSettingsView:
                 provider_box = provider_box_factory(
                     header,
                     textvariable=provider_var,
-                    values=("codex", "cursor"),
+                    values=("codex", "cursor", "claude"),
                     state="readonly",
                     width=8,
                 )
@@ -497,76 +640,94 @@ class CodexUsageSettingsView:
                 provider_box = ttk.Entry(header, textvariable=provider_var, width=8)
             provider_box.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
+            try:
+                header.bind(
+                    "<Configure>",
+                    lambda event, label_widget=profile_label, provider_widget=provider_box: self._fit_profile_header(
+                        label_widget,
+                        provider_widget,
+                        int(getattr(event, "width", 0) or 0),
+                    ),
+                )
+            except Exception:
+                pass
+
             controls = tk.Frame(header, bg=card_bg)
-            controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 2))
-            tk.Checkbutton(
-                controls,
-                text="수집",
-                variable=enabled_var,
-                bg=card_bg,
-                activebackground=card_bg,
-                selectcolor=card_bg,
-                fg="#111827",
-                activeforeground="#111827",
-                font=("Segoe UI", 9),
-            ).pack(side="left", padx=(0, 10))
-            tk.Checkbutton(
-                controls,
-                text="작업표시줄 표시",
-                variable=selected_var,
-                bg=card_bg,
-                activebackground=card_bg,
-                selectcolor=card_bg,
-                fg="#111827",
-                activeforeground="#111827",
-                font=("Segoe UI", 9),
-                command=lambda aid=account_id: self._on_taskbar_selection_changed(aid),
-            ).pack(side="left", padx=(0, 3))
+            controls.grid(row=1, column=0, columnspan=2, sticky="we", pady=(3, 2))
+            control_widgets = [
+                tk.Checkbutton(
+                    controls,
+                    text="수집",
+                    variable=enabled_var,
+                    bg=card_bg,
+                    activebackground=card_bg,
+                    selectcolor=card_bg,
+                    fg="#111827",
+                    activeforeground="#111827",
+                    font=("Segoe UI", 9),
+                ),
+                tk.Checkbutton(
+                    controls,
+                    text="작업표시줄 표시",
+                    variable=selected_var,
+                    bg=card_bg,
+                    activebackground=card_bg,
+                    selectcolor=card_bg,
+                    fg="#111827",
+                    activeforeground="#111827",
+                    font=("Segoe UI", 9),
+                    command=lambda aid=account_id: self._on_taskbar_selection_changed(aid),
+                ),
+            ]
+            self._bind_responsive_widget_row(controls, control_widgets, columns=2)
 
             actions = tk.Frame(card, bg=card_bg)
             actions.grid(row=1, column=0, sticky="we", padx=8, pady=(0, 2))
+            action_widgets = []
             if len(ordered_accounts) > 1:
                 if index > 0:
-                    ttk.Button(
+                    action_widgets.append(ttk.Button(
                         actions,
                         text="▲",
                         width=3,
                         command=lambda aid=account_id: self._on_move_account(aid, -1),
-                    ).pack(side="left", padx=(0, 3))
+                    ))
                 if index < len(ordered_accounts) - 1:
-                    ttk.Button(
+                    action_widgets.append(ttk.Button(
                         actions,
                         text="▼",
                         width=3,
                         command=lambda aid=account_id: self._on_move_account(aid, 1),
-                    ).pack(side="left", padx=(0, 3))
+                    ))
             query_button = ttk.Button(
                 actions,
                 text="새로고침",
                 width=8,
                 command=lambda aid=account_id: self._on_account_query(aid),
             )
-            query_button.pack(side="left", padx=(0, 3))
+            action_widgets.append(query_button)
             login_button = ttk.Button(
                 actions,
                 text="연결",
                 width=6,
                 command=lambda aid=account_id: self._on_account_login(aid),
             )
-            login_button.pack(side="left", padx=(0, 3))
+            action_widgets.append(login_button)
             logout_button = ttk.Button(
                 actions,
                 text="연결 해제",
                 width=8,
                 command=lambda aid=account_id: self._on_account_release_profile(aid),
             )
-            logout_button.pack(side="left", padx=(0, 3))
-            ttk.Button(
+            action_widgets.append(logout_button)
+            delete_button = ttk.Button(
                 actions,
                 text="삭제",
                 width=6,
                 command=lambda aid=account_id, name=label: self._on_delete_profile(aid, name),
-            ).pack(side="left")
+            )
+            action_widgets.append(delete_button)
+            self._bind_responsive_widget_row(actions, action_widgets, columns=5)
             self._account_query_buttons[account_id] = query_button
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
@@ -575,8 +736,9 @@ class CodexUsageSettingsView:
             snapshot_var = tk.StringVar(value="값 상태: -")
             self._account_status_vars[account_id] = status_var
             self._account_snapshot_vars[account_id] = snapshot_var
+            text_widgets = []
             for value_var in (status_var, snapshot_var):
-                tk.Label(
+                status_label = tk.Label(
                     card,
                     textvariable=value_var,
                     bg=card_bg,
@@ -584,14 +746,16 @@ class CodexUsageSettingsView:
                     font=("Segoe UI", 8),
                     anchor="w",
                     justify="left",
-                    wraplength=self._scaled_wrap_length(330),
-                ).grid(
+                    wraplength=self._scaled_wrap_length(260),
+                )
+                status_label.grid(
                     row=detail_row,
                     column=0,
                     sticky="we",
                     padx=8,
                     pady=(0, 1),
                 )
+                text_widgets.append(status_label)
                 detail_row += 1
             metric_grid = tk.Frame(card, bg=card_bg)
             metric_grid.grid(
@@ -618,6 +782,18 @@ class CodexUsageSettingsView:
             )
             self._account_metric_vars[account_id] = metric_vars
             self._account_metric_display_vars[account_id] = display_vars
+            self._account_text_widgets[account_id] = text_widgets
+            try:
+                metric_grid.bind(
+                    "<Configure>",
+                    lambda event, grid=metric_grid, aid=account_id: self._reflow_metric_grid(
+                        grid,
+                        aid,
+                        available_width=int(getattr(event, "width", 0) or 0),
+                    ),
+                )
+            except Exception:
+                pass
             detail_row += 1
             for prefix, key, clickable in (
                 ("설정 파일", "settings_path", True),
@@ -637,6 +813,7 @@ class CodexUsageSettingsView:
                     font=("Segoe UI", 8),
                     anchor="w",
                     justify="left",
+                    wraplength=self._scaled_wrap_length(300),
                 )
                 path_label.grid(
                     row=detail_row,
@@ -651,7 +828,19 @@ class CodexUsageSettingsView:
                         path_label.bind("<Button-1>", lambda _e, path=value: self._open_path(path))
                     except Exception:
                         pass
+                text_widgets.append(path_label)
                 detail_row += 1
+            try:
+                card.bind(
+                    "<Configure>",
+                    lambda event, card_widget=card, aid=account_id: self._fit_account_card_text(
+                        card_widget,
+                        aid,
+                        int(getattr(event, "width", 0) or 0),
+                    ),
+                )
+            except Exception:
+                pass
         self._reflow_profile_cards(cards, card_widgets)
         try:
             cards.bind(
@@ -703,92 +892,308 @@ class CodexUsageSettingsView:
         row += 1
 
         runtime_grid = tk.Frame(body, bg=card_bg)
-        runtime_grid.grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 0))
+        runtime_grid.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 0))
         runtime_grid.columnconfigure(1, weight=1)
         runtime_grid.columnconfigure(3, weight=1)
+        self._runtime_value_rows = []
 
-        runtime_row = 0
-        self._add_value_row(runtime_grid, runtime_row, "조회 상태", self._collect_state_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "다음 모니터링까지",
-            self._next_collect_var,
-            card_bg,
-            column=2,
+        runtime_pairs = (
+            (
+                ("조회 상태", self._collect_state_var),
+                ("다음 모니터링까지", self._next_collect_var),
+            ),
+            (
+                ("최근 확인 시각", self._live_time_var),
+                ("남은 크레딧", self._live_credit_var),
+            ),
+            (
+                ("5시간 사용 한도", self._live_five_hour_var),
+                ("5시간 한도 초기화", self._live_five_hour_reset_var),
+            ),
+            (
+                ("주간 사용 한도", self._live_weekly_var),
+                ("주간 한도 초기화", self._live_weekly_reset_var),
+            ),
+            (
+                ("Spark 5시간 한도", self._live_spark_five_hour_var),
+                ("Spark 5시간 초기화", self._live_spark_five_hour_reset_var),
+            ),
+            (
+                ("Spark 주간 한도", self._live_spark_weekly_var),
+                ("Spark 주간 초기화", self._live_spark_weekly_reset_var),
+            ),
         )
-        runtime_row += 1
-        self._add_value_row(runtime_grid, runtime_row, "최근 확인 시각", self._live_time_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "남은 크레딧",
-            self._live_credit_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
-        self._add_value_row(runtime_grid, runtime_row, "5시간 사용 한도", self._live_five_hour_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "5시간 한도 초기화",
-            self._live_five_hour_reset_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
-        self._add_value_row(runtime_grid, runtime_row, "주간 사용 한도", self._live_weekly_var, card_bg)
-        self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "주간 한도 초기화",
-            self._live_weekly_reset_var,
-            card_bg,
-            column=2,
-        )
-        runtime_row += 1
         self._live_spark_cells = []
-        spark_cells = self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 5시간 한도",
-            self._live_spark_five_hour_var,
-            card_bg,
-        )
-        if spark_cells is not None:
-            self._live_spark_cells.extend(spark_cells)
-        spark_cells = self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 5시간 초기화",
-            self._live_spark_five_hour_reset_var,
-            card_bg,
-            column=2,
-        )
-        if spark_cells is not None:
-            self._live_spark_cells.extend(spark_cells)
-        runtime_row += 1
-        spark_cells = self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 주간 한도",
-            self._live_spark_weekly_var,
-            card_bg,
-        )
-        if spark_cells is not None:
-            self._live_spark_cells.extend(spark_cells)
-        spark_cells = self._add_value_row(
-            runtime_grid,
-            runtime_row,
-            "Spark 주간 초기화",
-            self._live_spark_weekly_reset_var,
-            card_bg,
-            column=2,
-        )
-        if spark_cells is not None:
-            self._live_spark_cells.extend(spark_cells)
+        for runtime_row, pairs in enumerate(runtime_pairs):
+            for pair_index, (label, value_var) in enumerate(pairs):
+                cells = self._add_value_row(
+                    runtime_grid,
+                    runtime_row,
+                    label,
+                    value_var,
+                    card_bg,
+                    column=pair_index * 2,
+                )
+                self._runtime_value_rows.append(cells)
+                if runtime_row >= 4 and cells is not None:
+                    self._live_spark_cells.extend(cells)
+        try:
+            runtime_grid.bind(
+                "<Configure>",
+                lambda event, grid=runtime_grid: self._reflow_runtime_grid(
+                    grid,
+                    available_width=int(getattr(event, "width", 0) or 0),
+                ),
+            )
+        except Exception:
+            pass
+        self._reflow_runtime_grid(runtime_grid)
         return row + 1
+
+    def _fit_section_title(self, title: Any, action: Any, width: int) -> None:
+        if title is None:
+            return
+        available = int(width or 0)
+        if available <= 1:
+            available = 520
+        action_width = self._widget_requested_width(action)
+        try:
+            title.configure(wraplength=max(120, available - action_width - 16))
+        except Exception:
+            pass
+        return
+
+    def _fit_profile_header(self, label: Any, provider: Any, width: int) -> None:
+        available = int(width or 0)
+        if available <= 1:
+            available = 360
+        provider_width = self._widget_requested_width(provider)
+        try:
+            label.configure(wraplength=max(90, available - provider_width - 28))
+        except Exception:
+            pass
+        return
+
+    def _fit_account_card_text(self, card: Any, account_id: str, width: int) -> None:
+        available = int(width or 0)
+        if available <= 1:
+            try:
+                available = int(card.winfo_width())
+            except Exception:
+                available = 360
+        wraplength = max(100, available - 18)
+        for widget in self._account_text_widgets.get(str(account_id or ""), ()):
+            try:
+                widget.configure(wraplength=wraplength)
+            except Exception:
+                pass
+        return
+
+    @staticmethod
+    def _widget_requested_width(widget: Any) -> int:
+        if widget is None:
+            return 0
+        try:
+            return max(1, int(widget.winfo_reqwidth()))
+        except Exception:
+            pass
+        try:
+            configured = int(widget.cget("width"))
+            return max(1, configured * 8)
+        except Exception:
+            return 0
+
+    def _bind_responsive_widget_row(
+        self,
+        container: Any,
+        widgets: list[Any],
+        *,
+        columns: int,
+    ) -> None:
+        if container is None:
+            return
+        try:
+            container._windows_supporter_responsive_widgets = list(widgets)
+            container._windows_supporter_responsive_columns = int(max(1, columns))
+        except Exception:
+            pass
+        try:
+            container.bind(
+                "<Configure>",
+                lambda event, host=container, children=list(widgets), max_columns=columns: self._reflow_widget_row(
+                    host,
+                    children,
+                    max_columns=int(max_columns),
+                    available_width=int(getattr(event, "width", 0) or 0),
+                ),
+            )
+        except Exception:
+            pass
+        self._reflow_widget_row(container, widgets, max_columns=columns)
+        return
+
+    def _reflow_widget_row(
+        self,
+        container: Any,
+        widgets: list[Any],
+        *,
+        max_columns: int,
+        available_width: int | None = None,
+    ) -> None:
+        children = [widget for widget in widgets if widget is not None]
+        if not children:
+            return
+        width = int(available_width or 0)
+        if width <= 1:
+            try:
+                width = int(container.winfo_width())
+            except Exception:
+                width = 0
+        requested = sum(self._widget_requested_width(widget) for widget in children)
+        gap = max(4, (len(children) - 1) * 8)
+        columns = min(max(1, int(max_columns)), len(children))
+        if width > 1 and requested + gap > width:
+            columns = 1
+        for column in range(max(1, int(max_columns))):
+            try:
+                container.columnconfigure(column, weight=1 if column < columns else 0)
+            except Exception:
+                pass
+        for index, widget in enumerate(children):
+            try:
+                widget.grid(
+                    row=index // columns,
+                    column=index % columns,
+                    sticky="w",
+                    padx=(0, 8) if index % columns < columns - 1 else 0,
+                    pady=(0, 2),
+                )
+            except Exception:
+                pass
+        return
+
+    def _reflow_metric_grid(
+        self,
+        metric_grid: Any,
+        account_id: str,
+        *,
+        available_width: int | None = None,
+    ) -> None:
+        layout = self._account_metric_layouts.get(str(account_id or ""))
+        if not isinstance(layout, dict):
+            return
+        rows = layout.get("rows")
+        if not isinstance(rows, list) or not rows:
+            return
+        width = int(available_width or 0)
+        if width <= 1:
+            try:
+                width = int(metric_grid.winfo_width())
+            except Exception:
+                width = 0
+        pair_columns = 2 if width <= 1 or width >= 700 else 1
+        for column in range(4):
+            try:
+                metric_grid.columnconfigure(
+                    column,
+                    weight=1 if column % 2 == 1 and column // 2 < pair_columns else 0,
+                )
+            except Exception:
+                pass
+        visibility = self._account_metric_visibility.get(str(account_id or ""), {})
+        for index, (key, cells) in enumerate(rows):
+            pair_column = index % pair_columns
+            row = index // pair_columns
+            widgets = self._metric_cell_widgets(cells)
+            for widget_index, widget in enumerate(widgets):
+                try:
+                    if visibility.get(key, True):
+                        widget.grid(
+                            row=row,
+                            column=pair_column * 2 + widget_index,
+                            sticky="we" if widget_index else "e",
+                            padx=(6, 12) if widget_index == 1 and pair_column == 0 else (6, 0)
+                            if widget_index == 1
+                            else (0, 6)
+                            if pair_column == 0
+                            else (18, 6),
+                            pady=1,
+                        )
+                    else:
+                        widget.grid_remove()
+                except Exception:
+                    pass
+        return
+
+    def _reflow_runtime_grid(self, runtime_grid: Any, *, available_width: int | None = None) -> None:
+        rows = [row for row in self._runtime_value_rows if isinstance(row, (tuple, list))]
+        if not rows:
+            return
+        width = int(available_width or 0)
+        if width <= 1:
+            try:
+                width = int(runtime_grid.winfo_width())
+            except Exception:
+                width = 0
+        pair_columns = 2 if width <= 1 or width >= 700 else 1
+        for column in range(4):
+            try:
+                runtime_grid.columnconfigure(
+                    column,
+                    weight=1 if column % 2 == 1 and column // 2 < pair_columns else 0,
+                )
+            except Exception:
+                pass
+        hidden_spark = {
+            id(widget)
+            for widget in self._live_spark_cells
+        } if self._live_spark_visible is False else set()
+        for index, cells in enumerate(rows):
+            pair_column = index % pair_columns
+            row = index // pair_columns
+            for widget_index, widget in enumerate(cells):
+                if widget is None:
+                    continue
+                try:
+                    if id(widget) in hidden_spark:
+                        widget.grid_remove()
+                        continue
+                    widget.grid(
+                        row=row,
+                        column=pair_column * 2 + widget_index,
+                        sticky="we" if widget_index else "w",
+                        padx=(0, 6) if widget_index == 0 else (0, 8),
+                        pady=1,
+                    )
+                    if widget_index == 1:
+                        widget.configure(
+                            wraplength=max(120, (width // pair_columns) - 120)
+                        )
+                except Exception:
+                    pass
+        return
+
+    def _on_scroll_body_configure(self, _event: Any = None) -> None:
+        canvas = self._scroll_canvas
+        if canvas is None:
+            return
+        try:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+        return
+
+    def _on_scroll_canvas_configure(self, event: Any = None) -> None:
+        canvas = self._scroll_canvas
+        window_id = self._scroll_window_id
+        if canvas is None or window_id is None:
+            return
+        width = max(1, int(getattr(event, "width", 1) or 1))
+        try:
+            canvas.itemconfigure(window_id, width=width)
+        except Exception:
+            pass
+        return
 
     def _profile_card_column_count(
         self,
@@ -891,6 +1296,13 @@ class CodexUsageSettingsView:
                 (("captured_at", "최근 확인 시각"), ("included_usage", "포함 사용량")),
                 (("billing_reset_at", "결제 주기 초기화"), ("on_demand_status", "온디맨드")),
             )
+        elif str(provider or "").lower() == "claude":
+            rows = (
+                (("captured_at", "최근 확인 시각"), ("five_hour_limit", "5시간 사용 한도")),
+                (("five_hour_limit_reset_at", "5시간 한도 초기화"), ("weekly_limit", "주간 사용 한도")),
+                (("weekly_limit_reset_at", "주간 한도 초기화"), ("weekly_scoped_limit", "모델별 주간 한도")),
+                (("weekly_scoped_limit_reset_at", "모델별 주간 초기화"), ("on_demand_status", "추가 사용량")),
+            )
         else:
             rows = (
                 (("captured_at", "최근 확인 시각"), ("remaining_credit", "남은 크레딧")),
@@ -907,6 +1319,11 @@ class CodexUsageSettingsView:
             )
         metric_vars: dict[str, Any] = {}
         display_vars: dict[str, Any] = {}
+        if account_id:
+            self._account_metric_layouts[account_id] = {
+                "parent": parent,
+                "rows": [],
+            }
         for row_index, row in enumerate(rows):
             for pair_index, (key, label) in enumerate(row):
                 value_var = tk.StringVar(value="-")
@@ -930,6 +1347,9 @@ class CodexUsageSettingsView:
                 )
                 if account_id and cells is not None:
                     self._account_metric_cells.setdefault(account_id, {})[key] = cells
+                    self._account_metric_layouts[account_id]["rows"].append((key, cells))
+        if account_id:
+            self._reflow_metric_grid(parent, account_id)
         return metric_vars, display_vars
 
     def _bind_metric_display_value(
@@ -943,7 +1363,7 @@ class CodexUsageSettingsView:
             except Exception:
                 raw = ""
             try:
-                display_var.set(raw if raw else "-")
+                self._set_var_if_changed(display_var, raw if raw else "-")
             except Exception:
                 pass
 
@@ -953,6 +1373,21 @@ class CodexUsageSettingsView:
             pass
         sync()
         return
+
+    @staticmethod
+    def _set_var_if_changed(variable: Any, value: Any) -> bool:
+        if variable is None:
+            return False
+        try:
+            if variable.get() == value:
+                return False
+        except Exception:
+            pass
+        try:
+            variable.set(value)
+            return True
+        except Exception:
+            return False
 
     def _add_metric_cell(
         self,
@@ -978,6 +1413,7 @@ class CodexUsageSettingsView:
             font=("Segoe UI", 9),
             anchor="e",
             justify="right",
+            wraplength=max(90, int(wraplength // 2)),
         )
         label_cell.grid(
             row=row,
@@ -999,7 +1435,7 @@ class CodexUsageSettingsView:
         value_cell.grid(
             row=row,
             column=column * 2 + 1,
-            sticky="w",
+            sticky="we",
             padx=(6, 0) if column else (6, 12),
             pady=1,
         )
@@ -1013,7 +1449,7 @@ class CodexUsageSettingsView:
         value_var,
         bg: str,
         column: int = 0,
-    ) -> None:
+    ) -> tuple[Any, Any] | None:
         tk = self._tk
         if tk is None:
             return
@@ -1100,6 +1536,14 @@ class CodexUsageSettingsView:
                 pass
             try:
                 self._taskbar_overlay_var.set(bool(settings.get("taskbar_overlay_enabled", True)))
+            except Exception:
+                pass
+            try:
+                self._taskbar_side_priority_var.set(
+                    normalize_taskbar_side_priority(
+                        settings.get("taskbar_side_priority")
+                    ).value
+                )
             except Exception:
                 pass
             try:
@@ -1439,6 +1883,7 @@ class CodexUsageSettingsView:
         for var in (
             self._enabled_var,
             self._taskbar_overlay_var,
+            self._taskbar_side_priority_var,
             self._interval_var,
             self._usage_url_var,
             *self._account_enabled_vars.values(),
@@ -1532,12 +1977,20 @@ class CodexUsageSettingsView:
             for item in accounts
             if bool(item.get("taskbar_selected"))
         ]
-        if len(selected_profile_ids) > 2:
-            self._set_status("저장 실패: 작업표시줄 표시 프로필은 최대 2개입니다.", level="error")
+        if len(selected_profile_ids) > TASKBAR_PROFILE_LIMIT:
+            self._set_status(
+                f"저장 실패: 작업표시줄 표시 프로필은 최대 {TASKBAR_PROFILE_LIMIT}개입니다.",
+                level="error",
+            )
             return None
         payload = {
             "enabled": enabled,
             "taskbar_overlay_enabled": bool(self._taskbar_overlay_var.get()),
+            "taskbar_side_priority": normalize_taskbar_side_priority(
+                self._taskbar_side_priority_var.get()
+                if self._taskbar_side_priority_var is not None
+                else None
+            ).value,
             "interval_sec": interval_sec,
             "tooltip_duration_ms": int(round(tooltip_sec * 1000.0)),
             "usage_url": usage_url,
@@ -1659,7 +2112,7 @@ class CodexUsageSettingsView:
             if provider_var is not None:
                 try:
                     provider = str(provider_var.get() or "codex").strip().lower()
-                    item["provider"] = provider if provider in {"codex", "cursor"} else "codex"
+                    item["provider"] = provider if provider in {"codex", "cursor", "claude"} else "codex"
                 except Exception:
                     pass
             selected_var = self._account_taskbar_selected_vars.get(account_id)
@@ -1798,43 +2251,130 @@ class CodexUsageSettingsView:
 
     def _bind_mousewheel_tree(self, widget: Any, canvas: Any) -> None:
         def on_mousewheel(event):
+            if not self._event_is_inside_scroll_canvas(event, canvas):
+                return None
             delta = int(getattr(event, "delta", 0) or 0)
             if delta == 0:
                 return None
             units = max(1, abs(delta) // 120)
-            try:
-                canvas.yview_scroll(-units if delta > 0 else units, "units")
-            except Exception:
-                pass
+            self._queue_scroll_units(canvas, -units if delta > 0 else units)
             return "break"
 
         callbacks = {
             "<MouseWheel>": on_mousewheel,
-            "<Button-4>": lambda _event: self._scroll_canvas_units(canvas, -1),
-            "<Button-5>": lambda _event: self._scroll_canvas_units(canvas, 1),
+            "<Button-4>": lambda event: self._scroll_button_event(canvas, event, -1),
+            "<Button-5>": lambda event: self._scroll_button_event(canvas, event, 1),
         }
-        pending = [widget, canvas]
-        seen: set[int] = set()
-        while pending:
-            current = pending.pop()
-            identity = id(current)
-            if identity in seen:
-                continue
-            seen.add(identity)
+        # Bind the canvas itself for direct events (and synthetic QA events),
+        # then use the toplevel binding for child widgets. Binding every label,
+        # button and entry made each wheel event traverse a large binding tree.
+        for sequence, callback in callbacks.items():
+            try:
+                canvas.bind(sequence, callback, add="+")
+            except TypeError:
+                try:
+                    canvas.bind(sequence, callback)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        root = self._root
+        if root is not None and root is not canvas:
             for sequence, callback in callbacks.items():
                 try:
-                    current.bind(sequence, callback, add="+")
+                    binding_id = root.bind(sequence, callback, add="+")
+                    if binding_id:
+                        self._scroll_root_bindings.append((sequence, binding_id))
                 except TypeError:
                     try:
-                        current.bind(sequence, callback)
+                        root.bind(sequence, callback)
                     except Exception:
                         pass
                 except Exception:
                     pass
+        return
+
+    def _scroll_button_event(self, canvas: Any, event: Any, units: int) -> str | None:
+        if not self._event_is_inside_scroll_canvas(event, canvas):
+            return None
+        return self._queue_scroll_units(canvas, units)
+
+    def _unbind_scroll_root_bindings(self) -> None:
+        root = self._root
+        bindings = self._scroll_root_bindings
+        self._scroll_root_bindings = []
+        if root is None:
+            return
+        for sequence, binding_id in bindings:
             try:
-                pending.extend(list(current.winfo_children()))
+                root.unbind(sequence, binding_id)
             except Exception:
                 pass
+        return
+
+    def _event_is_inside_scroll_canvas(self, event: Any, canvas: Any) -> bool:
+        event_widget = getattr(event, "widget", None)
+        if event_widget is canvas:
+            return True
+        try:
+            x_root = int(getattr(event, "x_root"))
+            y_root = int(getattr(event, "y_root"))
+            left = int(canvas.winfo_rootx())
+            top = int(canvas.winfo_rooty())
+            right = left + int(canvas.winfo_width())
+            bottom = top + int(canvas.winfo_height())
+            return left <= x_root < right and top <= y_root < bottom
+        except Exception:
+            # Synthetic unit events do not carry screen coordinates. They are
+            # only delivered through the canvas binding, so treating them as
+            # inside keeps the test and Tk fallback paths deterministic.
+            return event_widget is None or event_widget is canvas
+
+    def _queue_scroll_units(self, canvas: Any, units: int) -> str:
+        amount = int(units)
+        if amount == 0:
+            return "break"
+        self._scroll_pending_canvas = canvas
+        self._scroll_pending_units += amount
+        if self._scroll_after_id is not None:
+            return "break"
+        host = self._win or canvas
+        after_idle = getattr(host, "after_idle", None)
+        if callable(after_idle):
+            try:
+                self._scroll_after_id = after_idle(self._flush_pending_scroll)
+                return "break"
+            except Exception:
+                self._scroll_after_id = None
+        self._flush_pending_scroll()
+        return "break"
+
+    def _flush_pending_scroll(self) -> None:
+        canvas = self._scroll_pending_canvas
+        units = int(self._scroll_pending_units)
+        self._scroll_pending_canvas = None
+        self._scroll_pending_units = 0
+        self._scroll_after_id = None
+        if canvas is None or units == 0:
+            return
+        try:
+            canvas.yview_scroll(units, "units")
+        except Exception:
+            pass
+        return
+
+    def _cancel_pending_scroll(self) -> None:
+        after_id = self._scroll_after_id
+        self._scroll_after_id = None
+        self._scroll_pending_canvas = None
+        self._scroll_pending_units = 0
+        if not after_id:
+            return
+        host = self._win or self._scroll_canvas
+        try:
+            host.after_cancel(after_id)
+        except Exception:
+            pass
         return
 
     def _scroll_canvas_units(self, canvas: Any, units: int):
@@ -1957,7 +2497,7 @@ class CodexUsageSettingsView:
             for profile_id, var in self._account_taskbar_selected_vars.items()
             if bool(var.get())
         ]
-        if len(selected) > 2:
+        if len(selected) > TASKBAR_PROFILE_LIMIT:
             current = self._account_taskbar_selected_vars.get(normalized)
             if current is not None:
                 self._loading_settings = True
@@ -1967,8 +2507,8 @@ class CodexUsageSettingsView:
                     self._loading_settings = False
             self._cancel_pending_autosave()
             rejection = (
-                "작업표시줄 표시 프로필은 최대 2개입니다. "
-                "세 번째 선택은 저장하지 않았습니다."
+                f"작업표시줄 표시 프로필은 최대 {TASKBAR_PROFILE_LIMIT}개입니다. "
+                "다섯 번째 선택은 저장하지 않았습니다."
             )
             self._preserve_status_after_next_autosave = True
             self._schedule_autosave()
@@ -2619,11 +3159,7 @@ class CodexUsageSettingsView:
             if label:
                 self._account_labels[account_id] = label
                 label_var = self._account_label_vars.get(account_id)
-                if label_var is not None:
-                    try:
-                        label_var.set(label)
-                    except Exception:
-                        pass
+                self._set_var_if_changed(label_var, label)
             child_runtime = raw.get("runtime", {})
             if not isinstance(child_runtime, dict):
                 child_runtime = {}
@@ -2632,17 +3168,9 @@ class CodexUsageSettingsView:
             else:
                 state = "비활성"
             status_var = self._account_status_vars.get(account_id)
-            if status_var is not None:
-                try:
-                    status_var.set(f"조회 상태: {state}")
-                except Exception:
-                    pass
+            self._set_var_if_changed(status_var, f"조회 상태: {state}")
             snapshot_var = self._account_snapshot_vars.get(account_id)
-            if snapshot_var is not None:
-                try:
-                    snapshot_var.set(self._account_snapshot_state_text(raw))
-                except Exception:
-                    pass
+            self._set_var_if_changed(snapshot_var, self._account_snapshot_state_text(raw))
             metric_vars = self._account_metric_vars.get(account_id)
             if isinstance(metric_vars, dict):
                 payload = self._snapshot_payload_from_any(raw.get("last_snapshot"))
@@ -2666,32 +3194,23 @@ class CodexUsageSettingsView:
                     payload=payload,
                 )
                 for key, value_var in metric_vars.items():
-                    try:
-                        value_var.set(self._format_account_metric_value(key, payload))
-                    except Exception:
-                        pass
+                    self._set_var_if_changed(
+                        value_var,
+                        self._format_account_metric_value(key, payload),
+                    )
         for account_id, status_var in self._account_status_vars.items():
             if account_id in seen:
                 continue
-            try:
-                status_var.set("조회 상태: -")
-            except Exception:
-                pass
+            self._set_var_if_changed(status_var, "조회 상태: -")
         for account_id, snapshot_var in self._account_snapshot_vars.items():
             if account_id in seen:
                 continue
-            try:
-                snapshot_var.set("값 상태: -")
-            except Exception:
-                pass
+            self._set_var_if_changed(snapshot_var, "값 상태: -")
         for account_id, metric_vars in self._account_metric_vars.items():
             if account_id in seen or not isinstance(metric_vars, dict):
                 continue
             for value_var in metric_vars.values():
-                try:
-                    value_var.set("-")
-                except Exception:
-                    pass
+                self._set_var_if_changed(value_var, "-")
         return
 
     @staticmethod
@@ -2721,6 +3240,28 @@ class CodexUsageSettingsView:
                 and bool(str(payload.get("on_demand_status") or "").strip())
             )
             visibility["on_demand_status"] = bool(on_demand_visible)
+        elif str(provider or "").lower() == "claude":
+            five_hour_visible = (
+                "five_hour_limit" in descriptor_keys
+                or bool(str(payload.get("five_hour_limit") or "").strip())
+            )
+            visibility["five_hour_limit"] = bool(five_hour_visible)
+            visibility["five_hour_limit_reset_at"] = bool(five_hour_visible)
+            weekly_visible = (
+                "weekly_limit" in descriptor_keys
+                or bool(str(payload.get("weekly_limit") or "").strip())
+            )
+            visibility["weekly_limit"] = bool(weekly_visible)
+            visibility["weekly_limit_reset_at"] = bool(weekly_visible)
+            scoped_weekly_visible = bool(
+                str(payload.get("weekly_scoped_limit") or "").strip()
+            )
+            visibility["weekly_scoped_limit"] = bool(scoped_weekly_visible)
+            visibility["weekly_scoped_limit_reset_at"] = bool(scoped_weekly_visible)
+            visibility["on_demand_status"] = bool(
+                payload.get("on_demand_enabled") is not None
+                and str(payload.get("on_demand_status") or "").strip()
+            )
         else:
             five_hour_visible = (
                 "five_hour_limit" in descriptor_keys
@@ -2752,10 +3293,15 @@ class CodexUsageSettingsView:
             visibility["gpt_5_3_codex_spark_weekly_limit_reset_at"] = bool(
                 spark_weekly_visible
             )
+        state_key = str(account_id or "")
+        previous = self._account_metric_visibility.setdefault(state_key, {})
         for key, visible in visibility.items():
             cell = cells.get(key)
             if cell is None:
                 continue
+            if previous.get(key) is visible:
+                continue
+            previous[key] = visible
             for widget in self._metric_cell_widgets(cell):
                 try:
                     if visible:
@@ -2774,6 +3320,9 @@ class CodexUsageSettingsView:
             str(payload.get("gpt_5_3_codex_spark_five_hour_limit") or "").strip()
             or str(payload.get("gpt_5_3_codex_spark_weekly_limit") or "").strip()
         )
+        if self._live_spark_visible is visible:
+            return
+        self._live_spark_visible = visible
         for widget in self._metric_cell_widgets(self._live_spark_cells):
             try:
                 if visible:
@@ -2894,30 +3443,40 @@ class CodexUsageSettingsView:
             return raw
 
         try:
-            self._collect_state_var.set(state)
-            self._next_collect_var.set(remain_text)
-            self._live_time_var.set(_fmt_time(_val("captured_at")))
-            self._live_five_hour_var.set(_val("five_hour_limit"))
+            self._set_var_if_changed(self._collect_state_var, state)
+            self._set_var_if_changed(self._next_collect_var, remain_text)
+            self._set_var_if_changed(self._live_time_var, _fmt_time(_val("captured_at")))
+            self._set_var_if_changed(self._live_five_hour_var, _val("five_hour_limit"))
             if self._live_five_hour_reset_var is not None:
-                self._live_five_hour_reset_var.set(_fmt_reset("five_hour_limit_reset_at"))
-            self._live_weekly_var.set(_val("weekly_limit"))
+                self._set_var_if_changed(
+                    self._live_five_hour_reset_var,
+                    _fmt_reset("five_hour_limit_reset_at"),
+                )
+            self._set_var_if_changed(self._live_weekly_var, _val("weekly_limit"))
             if self._live_weekly_reset_var is not None:
-                self._live_weekly_reset_var.set(_fmt_reset("weekly_limit_reset_at"))
-            self._live_spark_five_hour_var.set(
-                _val("gpt_5_3_codex_spark_five_hour_limit")
+                self._set_var_if_changed(
+                    self._live_weekly_reset_var,
+                    _fmt_reset("weekly_limit_reset_at"),
+                )
+            self._set_var_if_changed(
+                self._live_spark_five_hour_var,
+                _val("gpt_5_3_codex_spark_five_hour_limit"),
             )
             if self._live_spark_five_hour_reset_var is not None:
-                self._live_spark_five_hour_reset_var.set(
-                    _fmt_reset("gpt_5_3_codex_spark_five_hour_limit_reset_at")
+                self._set_var_if_changed(
+                    self._live_spark_five_hour_reset_var,
+                    _fmt_reset("gpt_5_3_codex_spark_five_hour_limit_reset_at"),
                 )
-            self._live_spark_weekly_var.set(
-                _val("gpt_5_3_codex_spark_weekly_limit")
+            self._set_var_if_changed(
+                self._live_spark_weekly_var,
+                _val("gpt_5_3_codex_spark_weekly_limit"),
             )
             if self._live_spark_weekly_reset_var is not None:
-                self._live_spark_weekly_reset_var.set(
-                    _fmt_reset("gpt_5_3_codex_spark_weekly_limit_reset_at")
+                self._set_var_if_changed(
+                    self._live_spark_weekly_reset_var,
+                    _fmt_reset("gpt_5_3_codex_spark_weekly_limit_reset_at"),
                 )
-            self._live_credit_var.set(_val("remaining_credit"))
+            self._set_var_if_changed(self._live_credit_var, _val("remaining_credit"))
             self._apply_live_spark_visibility(payload)
         except Exception:
             pass
@@ -2943,19 +3502,35 @@ class CodexUsageSettingsView:
             can_logout = False
         self._set_button_enabled(login_button, can_login)
         self._set_button_enabled(logout_button, can_logout)
+        runtime_entries = self._runtime_profile_map(runtime)
         for account_id, button in self._account_query_buttons.items():
-            entry = self._find_account_runtime_entry(runtime, account_id)
+            entry = runtime_entries.get(str(account_id or ""))
             account_can_query = self._account_query_permission(entry) and not actions_blocked
             self._set_button_enabled(button, account_can_query)
         for account_id, button in self._account_login_buttons.items():
-            entry = self._find_account_runtime_entry(runtime, account_id)
+            entry = runtime_entries.get(str(account_id or ""))
             account_can_login, _account_can_logout = self._account_action_permissions(entry)
             self._set_button_enabled(button, account_can_login and not actions_blocked)
         for account_id, button in self._account_logout_buttons.items():
-            entry = self._find_account_runtime_entry(runtime, account_id)
+            entry = runtime_entries.get(str(account_id or ""))
             _account_can_login, account_can_logout = self._account_action_permissions(entry)
             self._set_button_enabled(button, account_can_logout and not actions_blocked)
         return
+
+    def _runtime_profile_map(self, runtime: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        accounts = runtime.get("profiles") if isinstance(runtime, dict) else None
+        if not isinstance(accounts, list) and isinstance(runtime, dict):
+            accounts = runtime.get("accounts")
+        if not isinstance(accounts, list):
+            return {}
+        entries: dict[str, dict[str, Any]] = {}
+        for raw in accounts:
+            if not isinstance(raw, dict):
+                continue
+            account_id = str(raw.get("id") or "").strip()
+            if account_id:
+                entries[account_id] = raw
+        return entries
 
     def _find_account_runtime_entry(
         self,
@@ -3051,8 +3626,13 @@ class CodexUsageSettingsView:
     def _set_button_enabled(self, button: Any, enabled: bool) -> None:
         if button is None:
             return
+        normalized = bool(enabled)
+        identity = id(button)
+        if self._button_enabled_states.get(identity) is normalized:
+            return
+        self._button_enabled_states[identity] = normalized
         try:
-            if bool(enabled):
+            if normalized:
                 button.state(["!disabled"])
             else:
                 button.state(["disabled"])
@@ -3060,7 +3640,7 @@ class CodexUsageSettingsView:
         except Exception:
             pass
         try:
-            button.configure(state="normal" if bool(enabled) else "disabled")
+            button.configure(state="normal" if normalized else "disabled")
         except Exception:
             pass
         return

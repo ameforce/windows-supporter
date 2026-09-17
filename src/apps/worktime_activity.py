@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 from ctypes import wintypes
 from datetime import datetime
@@ -102,6 +103,15 @@ class WorktimeActivityWatcher:
     The first successful read establishes a baseline. Only later tick changes
     call ``callback(now())``. API/read/callback failures never install hooks and
     do not stop later polls.
+
+    When ``idle_callback`` is provided, each poll that observes an unchanged
+    tick measures wall-clock idle time since the last observed input. Once the
+    idle span reaches ``idle_threshold_seconds`` the watcher calls
+    ``idle_callback(now())`` exactly once per idle crossing; the next observed
+    input re-arms the report. ``idle_threshold_seconds`` may be a positive
+    finite number or a callable returning a positive finite number or ``None``
+    (``None`` and non-positive or non-finite values disable idle reporting for
+    that poll and re-arm it).
     """
 
     def __init__(
@@ -113,6 +123,8 @@ class WorktimeActivityWatcher:
         poll_interval_ms: int = 500,
         *,
         now_provider=None,
+        idle_callback=None,
+        idle_threshold_seconds=None,
     ) -> None:
         if not callable(getattr(root, "after", None)):
             raise ValueError("root.after must be callable.")
@@ -122,6 +134,24 @@ class WorktimeActivityWatcher:
             raise ValueError("poll_interval_ms must be a positive integer.")
         if poll_interval_ms <= 0:
             raise ValueError("poll_interval_ms must be a positive integer.")
+        if idle_callback is not None and not callable(idle_callback):
+            raise ValueError("idle_callback must be callable.")
+        if idle_threshold_seconds is not None and not callable(
+            idle_threshold_seconds
+        ):
+            try:
+                resolved_threshold = float(idle_threshold_seconds)
+            except (TypeError, ValueError, OverflowError):
+                resolved_threshold = float("nan")
+            if (
+                isinstance(idle_threshold_seconds, bool)
+                or not isinstance(idle_threshold_seconds, (int, float))
+                or not math.isfinite(resolved_threshold)
+                or resolved_threshold <= 0
+            ):
+                raise ValueError(
+                    "idle_threshold_seconds must be a positive number or callable."
+                )
         if now is not None and now_provider is not None:
             raise ValueError("Specify only one now provider.")
 
@@ -145,6 +175,10 @@ class WorktimeActivityWatcher:
         self._provider_getter = provider_getter
         self._now = resolved_now
         self._poll_interval_ms = poll_interval_ms
+        self._idle_callback = idle_callback
+        self._idle_threshold_seconds = idle_threshold_seconds
+        self._last_input_at = None
+        self._idle_reported = False
         self._running = False
         self._generation = 0
         self._after_id = None
@@ -183,6 +217,8 @@ class WorktimeActivityWatcher:
     def stop(self) -> None:
         """Stop polling and invalidate any callback already queued by Tk."""
 
+        self._last_input_at = None
+        self._idle_reported = False
         if not self._running and self._after_id is None:
             self._baseline = _UNSET
             return
@@ -204,6 +240,8 @@ class WorktimeActivityWatcher:
         """Replace the baseline with the current tick without emitting an event."""
 
         self._baseline = self._read_tick()
+        self._last_input_at = None
+        self._idle_reported = False
 
     def _schedule(self, generation: int) -> None:
         if not self._running or generation != self._generation:
@@ -238,9 +276,18 @@ class WorktimeActivityWatcher:
         if current_tick is not _UNSET:
             self._baseline = current_tick
             if baseline is not _UNSET and current_tick != baseline:
+                self._idle_reported = False
                 try:
                     now_value = self._now()
+                    self._last_input_at = (
+                        now_value if isinstance(now_value, datetime) else None
+                    )
                     self._callback(now_value)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._track_unchanged_tick()
                 except Exception:
                     pass
         elif baseline is _UNSET:
@@ -248,6 +295,66 @@ class WorktimeActivityWatcher:
 
         if self._running and generation == self._generation:
             self._schedule(generation)
+
+    def _resolve_idle_threshold_seconds(self) -> float | None:
+        source = self._idle_threshold_seconds
+        try:
+            value = source() if callable(source) else source
+        except Exception:
+            value = None
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+        ):
+            threshold = None
+        else:
+            try:
+                threshold = float(value)
+            except (TypeError, ValueError, OverflowError):
+                threshold = None
+        if threshold is None or not math.isfinite(threshold) or threshold <= 0:
+            # A disabled/invalid threshold re-arms idle reporting so enabling
+            # the feature again during the same idle span still reports once.
+            self._idle_reported = False
+            return None
+        return threshold
+
+    def _track_unchanged_tick(self) -> None:
+        if self._idle_callback is None:
+            return
+        if self._last_input_at is None:
+            # The first stable read cannot know earlier idle time; measure from
+            # the moment the watcher could first observe the input state.
+            try:
+                seeded_at = self._now()
+            except Exception:
+                seeded_at = None
+            self._last_input_at = (
+                seeded_at if isinstance(seeded_at, datetime) else None
+            )
+            return
+        threshold = self._resolve_idle_threshold_seconds()
+        if threshold is None:
+            return
+        try:
+            now_value = self._now()
+        except Exception:
+            return
+        last_input_at = self._last_input_at
+        if not isinstance(now_value, datetime) or not isinstance(
+            last_input_at, datetime
+        ):
+            return
+        if (now_value - last_input_at).total_seconds() < threshold:
+            return
+        if self._idle_reported:
+            return
+        self._idle_reported = True
+        try:
+            self._idle_callback(now_value)
+        except Exception:
+            pass
 
 
 LastInputActivityWatcher = WorktimeActivityWatcher

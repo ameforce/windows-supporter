@@ -3,6 +3,8 @@ param(
     [string]$Version = "",
     [string]$OutputDirectory = "",
     [string]$CompilerPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+    [string]$BootstrapCompilerPath = "gcc.exe",
+    [string]$ManifestToolPath = "mt.exe",
     [switch]$SkipBuild,
     [switch]$KeepBuildArtifacts
 )
@@ -11,6 +13,37 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $installerDefinition = Join-Path $repoRoot "installer\windows-supporter.iss"
 $compiler = (Resolve-Path -LiteralPath $CompilerPath -ErrorAction Stop).Path
+$bootstrapCompilerCommand = Get-Command $BootstrapCompilerPath -CommandType Application -ErrorAction Stop
+$bootstrapCompiler = $bootstrapCompilerCommand.Source
+$bootstrapSource = Join-Path $repoRoot "installer\installer_bootstrap.c"
+$bootstrapManifest = Join-Path $repoRoot "installer\installer_bootstrap.manifest"
+if (-not (Test-Path -LiteralPath $bootstrapManifest -PathType Leaf)) {
+    throw "Installer bootstrap manifest was not found: $bootstrapManifest"
+}
+$manifestToolCommand = Get-Command $ManifestToolPath -CommandType Application -ErrorAction SilentlyContinue
+$manifestTool = if ($manifestToolCommand) { $manifestToolCommand.Source } else { "" }
+if (-not $manifestTool) {
+    $sdkBinRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+    $sdkSearchDirs = @(
+        Get-ChildItem -LiteralPath $sdkBinRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+\.' } |
+            Sort-Object -Property Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "x64" }
+    ) + @(
+        (Join-Path $sdkBinRoot "x64"),
+        (Join-Path $sdkBinRoot "x86")
+    )
+    foreach ($sdkBinDir in $sdkSearchDirs) {
+        $candidate = Join-Path $sdkBinDir "mt.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $manifestTool = $candidate
+            break
+        }
+    }
+}
+if (-not $manifestTool) {
+    throw "Windows SDK manifest tool (mt.exe) was not found. Install the Windows 10/11 SDK or pass -ManifestToolPath."
+}
 
 function Invoke-GitText {
     param([string[]]$Arguments)
@@ -32,6 +65,15 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "Version must be an exact semantic version such as 0.22.0."
 }
 
+$headTag = Invoke-GitText @("describe", "--tags", "--exact-match", "HEAD")
+$headVersion = $headTag.Trim()
+if ($headVersion.StartsWith("v", [StringComparison]::OrdinalIgnoreCase)) {
+    $headVersion = $headVersion.Substring(1)
+}
+if ($headVersion -ne $Version) {
+    throw "Installer version $Version does not match the exact HEAD tag $headTag."
+}
+
 if (-not $SkipBuild) {
     $status = Invoke-GitText @("status", "--porcelain", "--untracked-files=all")
     if ($status) {
@@ -49,6 +91,8 @@ $sourceExe = Join-Path $repoRoot "dist\windows-supporter.exe"
 $installerName = "WindowsSupporter-v$Version-Setup.exe"
 $installerPath = Join-Path $outputDirectory $installerName
 $sidecarPath = "$installerPath.sha256"
+$coreInstallerPath = Join-Path $outputDirectory "WindowsSupporter-v$Version-Core.exe"
+$bootstrapStubPath = Join-Path $outputDirectory "WindowsSupporter-v$Version-Bootstrap.exe"
 
 if (-not $SkipBuild) {
     $previousArtifactOnly = $env:WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY
@@ -87,11 +131,65 @@ if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
     throw "Expected PyInstaller artifact was not found: $sourceExe"
 }
 
-Remove-Item -LiteralPath $installerPath, $sidecarPath -Force -ErrorAction SilentlyContinue
-& $compiler "/DAppVersion=$Version" "/DSourceExe=$sourceExe" "/O$outputDirectory" $installerDefinition
+$sourceVersionInfo = (Get-Item -LiteralPath $sourceExe).VersionInfo
+$escapedVersion = [regex]::Escape($Version)
+$versionPrefixPattern = "^(?:v)?$escapedVersion(?:\.\d+)?(?:\s|$)"
+foreach ($field in @("FileVersion", "ProductVersion")) {
+    $value = [string]$sourceVersionInfo.$field
+    if ($value -notmatch $versionPrefixPattern) {
+        throw "Source executable $field $value does not match release version $Version."
+    }
+}
+$comments = [string]$sourceVersionInfo.Comments
+if ($comments -notmatch "^(?:v)?$escapedVersion(?:\.\d+)?\s+\(") {
+    throw "Source executable Comments '$comments' does not identify release version $Version."
+}
+
+Remove-Item -LiteralPath $installerPath, $sidecarPath, $coreInstallerPath, $bootstrapStubPath -Force -ErrorAction SilentlyContinue
+& $compiler "/DAppVersion=$Version" "/DSourceExe=$sourceExe" "/O$outputDirectory" "/FWindowsSupporter-v$Version-Core" $installerDefinition
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE."
 }
+if (-not (Test-Path -LiteralPath $coreInstallerPath -PathType Leaf)) {
+    throw "Expected core installer artifact was not found: $coreInstallerPath"
+}
+
+& $bootstrapCompiler -O2 -s -static -mwindows -o $bootstrapStubPath $bootstrapSource -lshell32
+if ($LASTEXITCODE -ne 0) {
+    throw "Installer bootstrap compilation failed with exit code $LASTEXITCODE."
+}
+if (-not (Test-Path -LiteralPath $bootstrapStubPath -PathType Leaf)) {
+    throw "Expected installer bootstrap artifact was not found: $bootstrapStubPath"
+}
+
+& $manifestTool -nologo -manifest $bootstrapManifest "-outputresource:$bootstrapStubPath;#1"
+if ($LASTEXITCODE -ne 0) {
+    throw "Installer bootstrap manifest embedding failed with exit code $LASTEXITCODE."
+}
+$stubBytes = [IO.File]::ReadAllBytes($bootstrapStubPath)
+$stubText = [Text.Encoding]::ASCII.GetString($stubBytes)
+if (-not $stubText.Contains("requestedExecutionLevel") -or -not $stubText.Contains("asInvoker")) {
+    throw "Installer bootstrap stub does not contain the embedded asInvoker manifest."
+}
+
+$bootstrapStream = [IO.File]::OpenRead($bootstrapStubPath)
+$coreStream = [IO.File]::OpenRead($coreInstallerPath)
+$finalStream = [IO.File]::Open($installerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+try {
+    $bootstrapStream.CopyTo($finalStream)
+    $coreStream.CopyTo($finalStream)
+    $magic = [Text.Encoding]::ASCII.GetBytes("WSUSETUP")
+    $finalStream.Write($magic, 0, $magic.Length)
+    $payloadLength = [BitConverter]::GetBytes([UInt64]$coreStream.Length)
+    $finalStream.Write($payloadLength, 0, $payloadLength.Length)
+}
+finally {
+    $finalStream.Dispose()
+    $coreStream.Dispose()
+    $bootstrapStream.Dispose()
+}
+Remove-Item -LiteralPath $coreInstallerPath, $bootstrapStubPath -Force
+
 if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
     throw "Expected installer artifact was not found: $installerPath"
 }
@@ -112,3 +210,7 @@ if (-not $KeepBuildArtifacts) {
 Write-Output "INSTALLER_ARTIFACT=$installerPath"
 Write-Output "INSTALLER_SHA256=$hash"
 Write-Output "INSTALLER_SHA256_FILE=$sidecarPath"
+Write-Output "INSTALLER_FORMAT=legacy-compatible-bootstrap"
+Write-Output "SOURCE_EXE_FILE_VERSION=$($sourceVersionInfo.FileVersion)"
+Write-Output "SOURCE_EXE_PRODUCT_VERSION=$($sourceVersionInfo.ProductVersion)"
+Write-Output "SOURCE_EXE_COMMENTS=$comments"

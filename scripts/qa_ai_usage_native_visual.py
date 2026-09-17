@@ -30,8 +30,10 @@ SCENARIO_NAMES = (
     "mixed-ready-standard",
     "one-profile-125",
     "dynamic-three-profiles",
+    "four-taskbar-profiles",
     "ten-mixed-profiles-150",
     "long-label-narrow",
+    "compact-narrow",
     "cursor-long-amount-150",
     "cursor-logged-out",
     "cursor-stale-rate-limited",
@@ -130,14 +132,14 @@ def build_scenario_fixture(
     stale = _iso(current - timedelta(days=3))
 
     ui_scale_percent = 100
-    if scenario == "long-label-narrow":
+    if scenario in {"long-label-narrow", "compact-narrow"}:
         codex_label = "Codex 장기 프로젝트 품질 검증 및 릴리스 자동화 업무용 프로필 아주 긴 표시 이름"
         cursor_label = "Cursor 다중 모니터 고해상도 한국어 레이아웃 검증 전용 프로필 아주 긴 표시 이름"
-        window_size = [700, 680]
+        window_size = [520, 560] if scenario == "compact-narrow" else [700, 680]
         phase = "interaction"
         interaction = {
-            "action": "manual_query_and_toggle_taskbar_selection",
-            "profile_id": "cursor_long",
+            "action": "mousewheel_scroll" if scenario == "compact-narrow" else "manual_query_and_toggle_taskbar_selection",
+            "profile_id": "" if scenario == "compact-narrow" else "cursor_long",
         }
         codex_id = "codex_long"
         cursor_id = "cursor_long"
@@ -148,7 +150,11 @@ def build_scenario_fixture(
             [900, 620]
             if scenario == "one-profile-125"
             else [1040, 760]
-            if scenario in {"dynamic-three-profiles", "ten-mixed-profiles-150"}
+            if scenario in {
+                "dynamic-three-profiles",
+                "four-taskbar-profiles",
+                "ten-mixed-profiles-150",
+            }
             else [1040, 660]
         )
         phase = (
@@ -234,6 +240,17 @@ def build_scenario_fixture(
             _runtime_profile(third_profile, _ready_runtime(), _codex_snapshot(recent))
         )
         interaction = {"action": "mousewheel_scroll", "profile_id": ""}
+    elif scenario == "four-taskbar-profiles":
+        for index, provider in ((3, "codex"), (4, "cursor")):
+            profile = _profile_settings(
+                f"profile_{index:032x}",
+                f"{provider.title()} 작업표시줄 프로필 {index}",
+                provider,
+                selected=True,
+            )
+            settings_profiles.append(profile)
+            snapshot = _codex_snapshot(recent) if provider == "codex" else _cursor_snapshot(recent)
+            runtime_profiles.append(_runtime_profile(profile, _ready_runtime(), snapshot))
     elif scenario == "ten-mixed-profiles-150":
         ui_scale_percent = 150
         for index in range(3, 11):
@@ -759,7 +776,7 @@ def capture_scenario(
         root.tk.call("tk", "scaling", (96.0 * ui_scale_percent / 100.0) / 72.0)
         root.title(f"Windows Supporter · AI 사용량 · {name}")
         root.geometry(f"{width}x{height}+40+40")
-        root.minsize(700, 560)
+        root.minsize(max(320, width), max(360, height))
         root.configure(bg="#F3F4F6")
         root.attributes("-topmost", True)
         parent = tk.Frame(root, bg="#F3F4F6")

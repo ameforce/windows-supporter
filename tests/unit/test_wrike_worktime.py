@@ -13,6 +13,7 @@ from src.apps.wrike_worktime import (
     compute_net_elapsed_minutes,
     earliest_clock_in_from_items,
     format_minutes,
+    normalize_hhmm_input,
     overlap_minutes,
     parse_iso_datetime,
     project_quit_at,
@@ -87,6 +88,25 @@ class WorktimeComputationUnitTest(unittest.TestCase):
         parsed = parse_iso_datetime("2026-08-27T01:15:00Z")
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.tzinfo, None)
+
+    def test_normalize_hhmm_input_accepts_compact_clock_forms(self):
+        cases = {
+            "9": "09:00",
+            "09": "09:00",
+            "930": "09:30",
+            "0930": "09:30",
+            "9:30": "09:30",
+            "09:3": "09:03",
+            " 9 : 5 ": "09:05",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_hhmm_input(raw), expected)
+
+    def test_normalize_hhmm_input_rejects_ambiguous_or_out_of_range_values(self):
+        for raw in ("", "24", "2400", "24:00", "9300", "12:345", "nine"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(normalize_hhmm_input(raw))
 
     def test_clock_in_candidate_prefers_non_midnight_tracked_date(self):
         item = {"trackedDate": "2026-08-27T09:04:00", "createdDate": "2026-08-27T11:40:00"}
@@ -220,6 +240,33 @@ class WorktimeComputationUnitTest(unittest.TestCase):
         self.assertEqual(after_quit.realtime_delta_minutes, 0)
         self.assertEqual(at_quit.projected_quit, after_quit.projected_quit)
         self.assertEqual((after_quit.projected_quit.hour, after_quit.projected_quit.minute), (18, 0))
+
+    def test_overtime_extends_expected_now_beyond_target(self):
+        lunch = build_lunch_interval(self.day, True, 720, 780)
+        common = {
+            "clock_in": self._dt(8),
+            "recorded_minutes": 9 * 60,
+            "target_minutes": 9 * 60,
+            "intervals": [lunch],
+        }
+        without = build_workday_overview(now=self._dt(20), **common)
+        with_ot = build_workday_overview(
+            now=self._dt(20), overtime_minutes=120, **common
+        )
+
+        self.assertEqual(without.expected_now_minutes, 9 * 60)
+        self.assertEqual(with_ot.expected_now_minutes, 11 * 60)
+        self.assertEqual(with_ot.overtime_minutes, 120)
+        self.assertEqual(without.realtime_delta_minutes, 0)
+        self.assertEqual(with_ot.realtime_delta_minutes, -120)
+        self.assertIn("현재 기대 11시간", with_ot.as_lines(self._dt(20))[0][0])
+        self.assertIn("현재 기준 부족 2시간", with_ot.as_lines(self._dt(20))[-1][0])
+
+        ignored = build_workday_overview(
+            now=self._dt(20), overtime_minutes=-30, **common
+        )
+        self.assertEqual(ignored.expected_now_minutes, 9 * 60)
+        self.assertEqual(ignored.overtime_minutes, 0)
 
     def test_realtime_delta_reports_exact_ahead_and_behind(self):
         cases = [

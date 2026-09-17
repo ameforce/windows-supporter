@@ -13,7 +13,12 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
-from src.apps.ai_usage_contracts import normalize_reset_boundary
+from src.apps.ai_usage_contracts import (
+    DEFAULT_TASKBAR_SIDE_PRIORITY,
+    is_valid_taskbar_side_priority,
+    normalize_reset_boundary,
+    normalize_taskbar_side_priority,
+)
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
 from src.apps.codex_usage_monitor import (
     CURRENT_CODEX_USAGE_URL,
@@ -25,9 +30,9 @@ from src.apps.codex_usage_taskbar_overlay import AiUsageTaskbarOverlay
 
 
 LEGACY_ACCOUNT_IDS = ("account_1", "account_2")
-SUPPORTED_PROVIDERS = ("codex", "cursor")
+SUPPORTED_PROVIDERS = ("codex", "cursor", "claude")
 AI_USAGE_SETTINGS_VERSION = 4
-TASKBAR_PROFILE_LIMIT = 2
+TASKBAR_PROFILE_LIMIT = 4
 SHUTDOWN_QUIESCENCE_TIMEOUT_SEC = 60.0
 PROFILE_ID_PATTERN = re.compile(r"^(?:account_[12]|profile_[0-9a-f]{32})$")
 DEFAULT_LABELS = {
@@ -43,12 +48,12 @@ class _AccountPaths:
 
     @property
     def settings_path(self) -> str:
-        filename = "codex_usage_settings.json" if self.provider == "codex" else "cursor_usage_settings.json"
+        filename = f"{self.provider}_usage_settings.json"
         return os.path.join(self.config_dir, filename)
 
     @property
     def state_path(self) -> str:
-        filename = "codex_usage_state.json" if self.provider == "codex" else "cursor_usage_state.json"
+        filename = f"{self.provider}_usage_state.json"
         return os.path.join(self.config_dir, filename)
 
 
@@ -145,6 +150,7 @@ class CodexUsageMultiMonitor:
         self.__account_order = list(LEGACY_ACCOUNT_IDS)
         self.__enabled = True
         self.__taskbar_overlay_enabled = True
+        self.__taskbar_side_priority = DEFAULT_TASKBAR_SIDE_PRIORITY.value
         self.__interval_sec = 90.0
         self.__tooltip_duration_ms = 7000
         self.__usage_url = CURRENT_CODEX_USAGE_URL
@@ -369,6 +375,7 @@ class CodexUsageMultiMonitor:
             "settings_error": str(self.__settings_write_block_reason or ""),
             "enabled": bool(self.__enabled),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
+            "taskbar_side_priority": str(self.__taskbar_side_priority),
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "usage_url": str(self.__usage_url),
@@ -685,6 +692,7 @@ class CodexUsageMultiMonitor:
 
         candidate_enabled = self.__enabled
         candidate_taskbar_overlay_enabled = self.__taskbar_overlay_enabled
+        candidate_taskbar_side_priority = self.__taskbar_side_priority
         candidate_interval_sec = self.__interval_sec
         candidate_tooltip_duration_ms = self.__tooltip_duration_ms
         candidate_usage_url = self.__usage_url
@@ -692,6 +700,12 @@ class CodexUsageMultiMonitor:
             candidate_enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
             candidate_taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
+        if "taskbar_side_priority" in data:
+            if not is_valid_taskbar_side_priority(data.get("taskbar_side_priority")):
+                return False, "taskbar_side_priority"
+            candidate_taskbar_side_priority = normalize_taskbar_side_priority(
+                data.get("taskbar_side_priority")
+            ).value
         if "interval_sec" in data:
             try:
                 interval_sec = float(data.get("interval_sec"))
@@ -785,6 +799,7 @@ class CodexUsageMultiMonitor:
                 default_account_id=candidate_default,
                 enabled=candidate_enabled,
                 taskbar_overlay_enabled=candidate_taskbar_overlay_enabled,
+                taskbar_side_priority=candidate_taskbar_side_priority,
                 interval_sec=candidate_interval_sec,
                 tooltip_duration_ms=candidate_tooltip_duration_ms,
                 usage_url=candidate_usage_url,
@@ -841,6 +856,7 @@ class CodexUsageMultiMonitor:
         }
         self.__enabled = candidate_enabled
         self.__taskbar_overlay_enabled = candidate_taskbar_overlay_enabled
+        self.__taskbar_side_priority = candidate_taskbar_side_priority
         self.__interval_sec = candidate_interval_sec
         self.__tooltip_duration_ms = candidate_tooltip_duration_ms
         self.__usage_url = candidate_usage_url
@@ -1226,6 +1242,7 @@ class CodexUsageMultiMonitor:
             "settings_read_only": bool(self.__settings_write_block_reason),
             "settings_error": str(self.__settings_write_block_reason or ""),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
+            "taskbar_side_priority": str(self.__taskbar_side_priority),
             "monitor_state": self.__aggregate_monitor_state(runtimes),
             "session_state": self.__aggregate_session_state(runtimes),
             "auto_monitoring_active": bool(self.__should_run_background_collection()),
@@ -2253,7 +2270,7 @@ class CodexUsageMultiMonitor:
         normalized_id = str(profile_id or "")
         if normalized_id in LEGACY_ACCOUNT_IDS:
             return max(1, _safe_int(normalized_id.rsplit("_", 1)[-1], 1))
-        provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
+        provider_name = _provider_display_name(provider)
         match = re.fullmatch(rf"{re.escape(provider_name)} ([1-9]\d*)", str(label or ""))
         if match is not None:
             return max(1, _safe_int(match.group(1), 1))
@@ -2276,10 +2293,12 @@ class CodexUsageMultiMonitor:
                     f"chatgpt-profile-account-{slot_number}",
                 )
             else:
-                config_dir = os.path.join(self.__config_dir, f"cursor-account-{slot_number}")
+                config_dir = os.path.join(
+                    self.__config_dir, f"{normalized_provider}-account-{slot_number}"
+                )
                 profile_dir = os.path.join(
                     local_app_base,
-                    f"cursor-profile-account-{slot_number}",
+                    f"{normalized_provider}-profile-account-{slot_number}",
                 )
         else:
             config_dir = os.path.join(
@@ -2402,6 +2421,10 @@ class CodexUsageMultiMonitor:
             self.__enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
             self.__taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
+        if "taskbar_side_priority" in data:
+            self.__taskbar_side_priority = normalize_taskbar_side_priority(
+                data.get("taskbar_side_priority")
+            ).value
         try:
             self.__interval_sec = float(data.get("interval_sec", self.__interval_sec))
         except Exception:
@@ -2548,6 +2571,7 @@ class CodexUsageMultiMonitor:
         taskbar_overlay_enabled: bool | None = None,
         interval_sec: float | None = None,
         tooltip_duration_ms: int | None = None,
+        taskbar_side_priority: str | None = None,
         usage_url: str | None = None,
     ) -> None:
         if self.__settings_write_block_reason is not None:
@@ -2580,6 +2604,11 @@ class CodexUsageMultiMonitor:
                 self.__taskbar_overlay_enabled
                 if taskbar_overlay_enabled is None
                 else taskbar_overlay_enabled
+            ),
+            "taskbar_side_priority": str(
+                self.__taskbar_side_priority
+                if taskbar_side_priority is None
+                else normalize_taskbar_side_priority(taskbar_side_priority).value
             ),
             "interval_sec": float(self.__interval_sec if interval_sec is None else interval_sec),
             "tooltip_duration_ms": int(
@@ -2616,6 +2645,10 @@ class CodexUsageMultiMonitor:
             self.__enabled = bool(data.get("enabled"))
         if "taskbar_overlay_enabled" in data:
             self.__taskbar_overlay_enabled = bool(data.get("taskbar_overlay_enabled"))
+        if "taskbar_side_priority" in data:
+            self.__taskbar_side_priority = normalize_taskbar_side_priority(
+                data.get("taskbar_side_priority")
+            ).value
         if "interval_sec" in data:
             try:
                 interval_sec = float(data.get("interval_sec"))
@@ -3342,6 +3375,17 @@ class CodexUsageMultiMonitor:
                 unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
                 profile_id=profile_id,
             )
+        elif provider_id == "claude":
+            from src.apps.claude_usage_monitor import ClaudeUsageMonitor
+
+            child = ClaudeUsageMonitor(
+                config_dir=config_dir,
+                profile_dir=profile_dir,
+                notification_sink=notification_sink,
+                suppress_normal_tooltips=True,
+                unrecoverable_timeout_handler=self.__unrecoverable_timeout_handler,
+                profile_id=profile_id,
+            )
         else:
             child = CodexUsageMonitor(
                 config_dir=config_dir,
@@ -3440,18 +3484,31 @@ def _is_valid_profile_id(value: str) -> bool:
     return PROFILE_ID_PATTERN.fullmatch(str(value or "")) is not None
 
 
+_PROVIDER_DISPLAY_NAMES = {
+    "codex": "Codex",
+    "cursor": "Cursor",
+    "claude": "Claude",
+}
+
+
+def _provider_display_name(provider: str) -> str:
+    return _PROVIDER_DISPLAY_NAMES.get(str(provider or "").lower(), "Codex")
+
+
 def _default_profile_label(provider: str, index: int) -> str:
-    provider_name = "Cursor" if str(provider or "").lower() == "cursor" else "Codex"
-    return f"{provider_name} {max(1, int(index))}"
+    return f"{_provider_display_name(provider)} {max(1, int(index))}"
 
 
 def _is_cross_provider_default_label(label: str, provider: str) -> bool:
     text = str(label or "").strip()
     if not text:
         return False
-    if str(provider or "").lower() == "cursor":
-        return bool(re.fullmatch(r"Codex [1-9]\d*", text))
-    return bool(re.fullmatch(r"Cursor [1-9]\d*", text))
+    current = str(provider or "").lower()
+    return any(
+        other != current
+        and re.fullmatch(rf"{re.escape(name)} [1-9]\d*", text) is not None
+        for other, name in _PROVIDER_DISPLAY_NAMES.items()
+    )
 
 
 def _optional_percent(value: Any) -> float | None:

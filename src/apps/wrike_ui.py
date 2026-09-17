@@ -4,6 +4,9 @@ from datetime import date, datetime
 from math import isfinite
 from typing import Any
 import threading
+import time
+
+from src.apps.wrike_worktime import normalize_hhmm_input
 
 
 class WrikeSettingsView:
@@ -22,6 +25,7 @@ class WrikeSettingsView:
 
         self._tk = None
         self._ttk = None
+        self._messagebox = None
         self._win = None
         self._scroll_canvas = None
         self._scroll_body = None
@@ -32,6 +36,13 @@ class WrikeSettingsView:
         self._tooltip_var = None
         self._monitor_enabled_var = None
         self._monitor_interval_var = None
+        self._flex_enabled_var = None
+        self._flex_employee_number_var = None
+        self._flex_interval_var = None
+        self._overtime_interval_var = None
+        self._overtime_idle_enabled_var = None
+        self._overtime_idle_minutes_var = None
+        self._flex_status_var = None
         self._status_var = None
         self._status_label = None
         self._show_token_var = None
@@ -77,6 +88,10 @@ class WrikeSettingsView:
         self._folder_path_label = None
         self._folder_restoring = False
         self._autosave_after_id = None
+        self._flex_status_poll_after_id = None
+        self._flex_status_poll_started_at = 0.0
+        self._flex_sync_feedback_active = False
+        self._flex_prompted_employee_numbers: set[str] = set()
         self._loading_settings = False
         self._status_colors = {
             "info": "#6B7280",
@@ -237,7 +252,7 @@ class WrikeSettingsView:
         add_entry(self._workday_target_var)
         row += 1
 
-        add_label("출근 시각(HH:MM)")
+        add_label("출근 시각 (예: 9, 930, 9:30)")
         add_entry(self._workday_clock_in_var)
         row += 1
 
@@ -302,6 +317,117 @@ class WrikeSettingsView:
 
         add_label("모니터링 주기(초)")
         add_entry(self._monitor_interval_var)
+        row += 1
+
+        self._flex_enabled_var = tk.BooleanVar(value=False)
+        self._flex_employee_number_var = tk.StringVar(value="")
+        self._flex_interval_var = tk.StringVar(value="5")
+        self._overtime_interval_var = tk.StringVar(value="10")
+        self._overtime_idle_enabled_var = tk.BooleanVar(value=True)
+        self._overtime_idle_minutes_var = tk.StringVar(value="5")
+        self._flex_status_var = tk.StringVar(value="미설정")
+
+        tk.Label(
+            content,
+            text="── Flex 근무 연동 · 초과근무 ──",
+            bg=card_bg,
+            fg="#2563EB",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        row += 1
+
+        add_label("Flex 일정 자동 반영")
+        tk.Checkbutton(
+            content,
+            variable=self._flex_enabled_var,
+            bg=card_bg,
+            activebackground=card_bg,
+            selectcolor=card_bg,
+            fg="#111827",
+            activeforeground="#111827",
+            font=("Segoe UI", 9),
+        ).grid(row=row, column=1, sticky="w", pady=6)
+        row += 1
+
+        add_label("Flex 사번 (자동 감지)")
+        add_entry(self._flex_employee_number_var)
+        row += 1
+
+        add_label("Flex 동기화 주기(분)")
+        add_entry(self._flex_interval_var)
+        row += 1
+
+        add_label("초과근무 툴팁 주기(분)")
+        add_entry(self._overtime_interval_var)
+        row += 1
+
+        add_label("무입력 시 초과근무 자동 일시정지")
+        tk.Checkbutton(
+            content,
+            variable=self._overtime_idle_enabled_var,
+            bg=card_bg,
+            activebackground=card_bg,
+            selectcolor=card_bg,
+            fg="#111827",
+            activeforeground="#111827",
+            font=("Segoe UI", 9),
+        ).grid(row=row, column=1, sticky="w", pady=6)
+        row += 1
+
+        add_label("자동 일시정지까지 무입력(분)")
+        add_entry(self._overtime_idle_minutes_var)
+        row += 1
+
+        add_label("Flex 연동 상태")
+        flex_status_label = tk.Label(
+            content,
+            textvariable=self._flex_status_var,
+            bg=card_bg,
+            fg=text_muted,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+        )
+        try:
+            flex_status_label.configure(wraplength=420)
+        except Exception:
+            pass
+        flex_status_label.grid(row=row, column=1, columnspan=2, sticky="we", pady=6)
+        row += 1
+
+        flex_button_row = tk.Frame(content, bg=card_bg)
+        flex_button_row.grid(row=row, column=1, columnspan=2, sticky="w", pady=(2, 4))
+        ttk.Button(
+            flex_button_row,
+            text="Flex 로그인 · 지금 동기화",
+            command=self._on_sync_flex,
+        ).pack(side="left")
+        ttk.Button(
+            flex_button_row,
+            text="Flex 웹 열기",
+            command=self._on_open_flex,
+        ).pack(side="left", padx=(4, 0))
+        row += 1
+
+        flex_help_label = tk.Label(
+            content,
+            text=(
+                "관리자용 Flex API 인증정보를 요구하지 않습니다. 최초 로그인 또는 로그인 만료 시 'Flex 웹 열기'로 앱 전용 브라우저에서 본인 계정으로 로그인하세요. "
+                "동기화는 저장된 로그인 세션으로 창을 띄우지 않고 백그라운드에서 수행합니다. 사번은 로그인 후 자동 감지하며, 확인한 뒤 저장합니다. "
+                "감지되지 않으면 직접 입력할 수 있습니다. "
+                "비밀번호·토큰·클라이언트 시크릿은 저장하지 않으며, 초과근무 종료 후에는 Flex 근무 기록 페이지를 엽니다."
+            ),
+            bg=card_bg,
+            fg=text_muted,
+            font=("Segoe UI", 8),
+            anchor="w",
+            justify="left",
+        )
+        try:
+            flex_help_label.configure(wraplength=420)
+        except Exception:
+            pass
+        flex_help_label.grid(row=row, column=1, columnspan=2, sticky="we", pady=(0, 8))
         row += 1
 
         self._lunch_enabled_var = tk.BooleanVar(value=True)
@@ -657,13 +783,15 @@ class WrikeSettingsView:
             return
         try:
             import tkinter as tk
-            from tkinter import ttk
+            from tkinter import messagebox, ttk
         except Exception:
             self._tk = None
             self._ttk = None
+            self._messagebox = None
             return
         self._tk = tk
         self._ttk = ttk
+        self._messagebox = messagebox
         return
 
     def _create_scroll_body(self, parent: Any, bg: str) -> Any:
@@ -972,18 +1100,6 @@ class WrikeSettingsView:
             )
         except Exception:
             clock_text = ""
-        clock_text = clock_text.strip()
-        if (
-            len(clock_text) != 5
-            or clock_text[2:3] != ":"
-            or not clock_text[:2].isdigit()
-            or not clock_text[3:].isdigit()
-        ):
-            self._set_status(
-                "계획 저장 실패: 출근 시각 형식은 HH:MM 입니다.",
-                level="error",
-            )
-            return
         clock_minutes, error = self._parse_hhmm(clock_text, "출근 시각")
         if error or clock_minutes is None:
             self._set_status(f"계획 저장 실패: {error}", level="error")
@@ -1622,8 +1738,166 @@ class WrikeSettingsView:
                 break_state = None
             if isinstance(break_state, dict):
                 self._refresh_break_button_label(break_state)
+        self._refresh_flex_status_from_backend()
         self._refresh_google_status_from_backend()
         self._refresh_vacation_status_from_backend()
+        return
+
+    def _refresh_flex_status_from_backend(
+        self,
+        *,
+        prompt: bool = True,
+        settings: Any = None,
+    ) -> dict[str, Any]:
+        if not isinstance(settings, dict):
+            try:
+                settings = self._wrike.get_settings_snapshot()
+            except Exception:
+                settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        flex_status = settings.get("flex_status")
+        if not isinstance(flex_status, dict):
+            flex_status = {}
+        state = str(flex_status.get("state") or "unconfigured")
+        error = str(flex_status.get("error") or "").strip()
+        employee_number = str(
+            settings.get(
+                "flex_employee_number",
+                flex_status.get("employee_number", ""),
+            )
+            or ""
+        ).strip()
+        detected_employee_number = str(
+            settings.get(
+                "flex_detected_employee_number",
+                flex_status.get("detected_employee_number", ""),
+            )
+            or ""
+        ).strip()
+        configured = bool(employee_number)
+        status_text = (
+            f"{state} · 브라우저 세션 "
+            f"{'사번 설정됨' if configured else '로그인 후 사번 자동 감지'}"
+        )
+        if detected_employee_number:
+            status_text += f" · 감지된 사번 {detected_employee_number}"
+        if error:
+            status_text += f" · {error}"
+        if configured and self._flex_employee_number_var is not None:
+            try:
+                current = str(self._flex_employee_number_var.get() or "").strip()
+            except Exception:
+                current = ""
+            if current != employee_number:
+                previous_loading = self._loading_settings
+                self._loading_settings = True
+                try:
+                    self._flex_employee_number_var.set(employee_number)
+                except Exception:
+                    pass
+                finally:
+                    self._loading_settings = previous_loading
+        if self._flex_status_var is not None:
+            try:
+                self._flex_status_var.set(status_text)
+            except Exception:
+                pass
+        if prompt and detected_employee_number:
+            self._prompt_for_flex_employee_number(detected_employee_number)
+        try:
+            schedule_days = max(0, int(flex_status.get("schedule_days", 0) or 0))
+        except Exception:
+            schedule_days = 0
+        return {
+            "state": state,
+            "error": error,
+            "schedule_days": schedule_days,
+            "employee_number": employee_number,
+            "detected_employee_number": detected_employee_number,
+        }
+
+    def _update_flex_sync_feedback(self, snapshot: dict[str, Any]) -> None:
+        if not self._flex_sync_feedback_active:
+            return
+        state = str(snapshot.get("state") or "").strip().lower()
+        if state == "loading":
+            self._set_status(
+                "Flex 동기화 중 · 로그인 완료 후 근무정보를 자동으로 반영합니다.",
+                level="info",
+            )
+            return
+        if state == "fresh":
+            try:
+                schedule_days = max(0, int(snapshot.get("schedule_days", 0) or 0))
+            except Exception:
+                schedule_days = 0
+            self._set_status(
+                f"Flex 동기화 완료 · 근무 일정 {schedule_days}일 반영",
+                level="ok",
+            )
+            self._flex_sync_feedback_active = False
+            return
+        if state == "error":
+            error = str(snapshot.get("error") or "Flex 동기화에 실패했습니다.").strip()
+            self._set_status(f"Flex 동기화 실패 · {error}", level="error")
+            self._flex_sync_feedback_active = False
+            return
+        return
+
+    def _prompt_for_flex_employee_number(self, employee_number: str) -> None:
+        candidate = str(employee_number or "").strip()
+        if not candidate or candidate in self._flex_prompted_employee_numbers:
+            return
+        messagebox = self._messagebox
+        if messagebox is None:
+            return
+        self._flex_prompted_employee_numbers.add(candidate)
+        try:
+            accepted = bool(
+                messagebox.askyesno(
+                    "Flex 사번 확인",
+                    f"로그인한 Flex 계정에서 사번 {candidate}을(를) 확인했습니다.\n"
+                    "이 사번을 Windows Supporter에 저장할까요?",
+                    parent=self._win,
+                )
+            )
+        except Exception:
+            return
+        if not accepted:
+            self._set_status(
+                f"Flex 사번 {candidate}을(를) 저장하지 않았습니다. 필요하면 직접 입력해 주세요.",
+                level="info",
+            )
+            return
+        confirmer = getattr(self._wrike, "confirm_flex_employee_number", None)
+        try:
+            result = (
+                confirmer(candidate)
+                if callable(confirmer)
+                else (False, "Flex 사번 확인 기능을 사용할 수 없습니다.")
+            )
+        except Exception:
+            result = (False, "Flex 사번 저장에 실패했습니다.")
+        ok = bool(isinstance(result, tuple) and len(result) == 2 and result[0])
+        error = (
+            str(result[1] or "").strip()
+            if isinstance(result, tuple) and len(result) == 2
+            else ""
+        )
+        if ok:
+            if self._flex_employee_number_var is not None:
+                previous_loading = self._loading_settings
+                self._loading_settings = True
+                try:
+                    self._flex_employee_number_var.set(candidate)
+                except Exception:
+                    pass
+                finally:
+                    self._loading_settings = previous_loading
+            self._set_status(f"Flex 사번 {candidate} 저장 완료", level="ok")
+        else:
+            self._set_status(error or "Flex 사번 저장 실패", level="error")
         return
 
     def _mark_ical_dirty(self, _event: Any = None) -> None:
@@ -1634,6 +1908,38 @@ class WrikeSettingsView:
     def _mark_vacation_ical_dirty(self, _event: Any = None) -> None:
         self._vacation_ical_dirty = True
         self._schedule_autosave()
+        return
+
+    def refresh_overtime_idle_settings(self) -> None:
+        try:
+            settings = self._wrike.get_settings_snapshot()
+        except Exception:
+            return
+        if not isinstance(settings, dict):
+            return
+        previous_loading = self._loading_settings
+        self._loading_settings = True
+        try:
+            if self._overtime_idle_enabled_var is not None:
+                self._overtime_idle_enabled_var.set(
+                    bool(settings.get("overtime_idle_pause_enabled", True))
+                )
+            if self._overtime_idle_minutes_var is not None:
+                self._overtime_idle_minutes_var.set(
+                    str(
+                        max(
+                            1,
+                            min(
+                                120,
+                                int(settings.get("overtime_idle_pause_min", 5)),
+                            ),
+                        )
+                    )
+                )
+        except Exception:
+            pass
+        finally:
+            self._loading_settings = previous_loading
         return
 
     def _load_settings(self) -> None:
@@ -1666,6 +1972,49 @@ class WrikeSettingsView:
             try:
                 interval = float(settings.get("monitor_interval_sec", 5))
                 self._monitor_interval_var.set(str(int(interval)))
+            except Exception:
+                pass
+            try:
+                if self._flex_enabled_var is not None:
+                    self._flex_enabled_var.set(bool(settings.get("flex_enabled", False)))
+                if self._flex_employee_number_var is not None:
+                    self._flex_employee_number_var.set(
+                        str(settings.get("flex_employee_number", "") or "")
+                    )
+                flex_poll = int(
+                    round(float(settings.get("flex_poll_interval_sec", 300)) / 60.0)
+                )
+                if self._flex_interval_var is not None:
+                    self._flex_interval_var.set(str(max(1, min(360, flex_poll))))
+                if self._overtime_interval_var is not None:
+                    self._overtime_interval_var.set(
+                        str(
+                            max(
+                                1,
+                                min(
+                                    120,
+                                    int(settings.get("overtime_notice_interval_min", 10)),
+                                ),
+                            )
+                        )
+                    )
+                if self._overtime_idle_enabled_var is not None:
+                    self._overtime_idle_enabled_var.set(
+                        bool(settings.get("overtime_idle_pause_enabled", True))
+                    )
+                if self._overtime_idle_minutes_var is not None:
+                    self._overtime_idle_minutes_var.set(
+                        str(
+                            max(
+                                1,
+                                min(
+                                    120,
+                                    int(settings.get("overtime_idle_pause_min", 5)),
+                                ),
+                            )
+                        )
+                    )
+                self._refresh_flex_status_from_backend(prompt=False, settings=settings)
             except Exception:
                 pass
             try:
@@ -1740,6 +2089,67 @@ class WrikeSettingsView:
             self._set_status(f"토큰 삭제 실패: {err}", level="error")
         return
 
+    def _on_sync_flex(self) -> None:
+        sync = getattr(self._wrike, "sync_flex_now", None)
+        if not callable(sync):
+            self._set_status("Flex 동기화 기능을 사용할 수 없습니다.", level="error")
+            return
+        ok, error = sync()
+        if ok:
+            self._flex_sync_feedback_active = True
+            self._set_status(
+                "Flex 근무정보를 백그라운드에서 확인하는 중입니다.",
+                level="info",
+            )
+            self._start_flex_status_poll()
+        else:
+            self._flex_sync_feedback_active = False
+            self._set_status(str(error or "Flex 동기화 실패"), level="error")
+        return
+
+    def _start_flex_status_poll(self) -> None:
+        win = self._win
+        after_cancel = getattr(win, "after_cancel", None)
+        if self._flex_status_poll_after_id is not None and callable(after_cancel):
+            try:
+                after_cancel(self._flex_status_poll_after_id)
+            except Exception:
+                pass
+        self._flex_status_poll_after_id = None
+        self._flex_status_poll_started_at = time.monotonic()
+        self._poll_flex_status()
+        return
+
+    def _poll_flex_status(self) -> None:
+        self._flex_status_poll_after_id = None
+        snapshot = self._refresh_flex_status_from_backend()
+        self._update_flex_sync_feedback(snapshot)
+        if str(snapshot.get("state") or "") != "loading":
+            return
+        if time.monotonic() - self._flex_status_poll_started_at >= 300.0:
+            if self._flex_sync_feedback_active:
+                self._set_status(
+                    "Flex 동기화 응답을 기다리지 못했습니다. 다시 시도해 주세요.",
+                    level="error",
+                )
+                self._flex_sync_feedback_active = False
+            return
+        after = getattr(self._win, "after", None)
+        if callable(after):
+            try:
+                self._flex_status_poll_after_id = after(700, self._poll_flex_status)
+            except Exception:
+                self._flex_status_poll_after_id = None
+        return
+
+    def _on_open_flex(self) -> None:
+        opener = getattr(self._wrike, "open_flex_worktime_page", None)
+        if not callable(opener) or not opener():
+            self._set_status("Flex 웹을 열지 못했습니다.", level="error")
+            return
+        self._set_status("Flex 웹을 열었습니다.", level="ok")
+        return
+
     def _format_minutes_as_hhmm(self, minutes: int) -> str:
         try:
             total = int(minutes)
@@ -1749,17 +2159,12 @@ class WrikeSettingsView:
         return f"{total // 60:02d}:{total % 60:02d}"
 
     def _parse_hhmm(self, text: str, label: str) -> tuple[int | None, str | None]:
-        raw = str(text or "").strip()
-        parts = raw.split(":")
-        if len(parts) != 2:
-            return None, f"{label} 형식은 HH:MM 입니다."
-        try:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-        except Exception:
-            return None, f"{label} 값이 올바르지 않습니다."
-        if hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
-            return None, f"{label} 값이 올바르지 않습니다."
+        normalized = normalize_hhmm_input(text)
+        if normalized is None:
+            return None, (
+                f"{label}은 9, 930, 9:30 또는 HH:MM 형식으로 입력해 주세요."
+            )
+        hours, minutes = (int(part) for part in normalized.split(":", 1))
         return hours * 60 + minutes, None
 
     def _strict_positive_int(self, text: str, label: str) -> tuple[int, str | None]:
@@ -2158,6 +2563,12 @@ class WrikeSettingsView:
             self._tooltip_var,
             self._monitor_enabled_var,
             self._monitor_interval_var,
+            self._flex_enabled_var,
+            self._flex_employee_number_var,
+            self._flex_interval_var,
+            self._overtime_interval_var,
+            self._overtime_idle_enabled_var,
+            self._overtime_idle_minutes_var,
             self._lunch_enabled_var,
             self._lunch_start_var,
             self._lunch_end_var,
@@ -2220,6 +2631,36 @@ class WrikeSettingsView:
         tooltip_text = str(self._tooltip_var.get() or "").strip()
         monitor_enabled = bool(self._monitor_enabled_var.get())
         interval_text = str(self._monitor_interval_var.get() or "").strip()
+        flex_enabled = (
+            bool(self._flex_enabled_var.get())
+            if self._flex_enabled_var is not None
+            else False
+        )
+        flex_employee_number = (
+            str(self._flex_employee_number_var.get() or "").strip()
+            if self._flex_employee_number_var is not None
+            else ""
+        )
+        flex_interval_text = (
+            str(self._flex_interval_var.get() or "").strip()
+            if self._flex_interval_var is not None
+            else "5"
+        )
+        overtime_interval_text = (
+            str(self._overtime_interval_var.get() or "").strip()
+            if self._overtime_interval_var is not None
+            else "10"
+        )
+        overtime_idle_enabled = (
+            bool(self._overtime_idle_enabled_var.get())
+            if self._overtime_idle_enabled_var is not None
+            else True
+        )
+        overtime_idle_minutes_text = (
+            str(self._overtime_idle_minutes_var.get() or "").strip()
+            if self._overtime_idle_minutes_var is not None
+            else "5"
+        )
 
         lunch_enabled = (
             bool(self._lunch_enabled_var.get()) if self._lunch_enabled_var is not None else True
@@ -2286,6 +2727,27 @@ class WrikeSettingsView:
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
             return
+        flex_interval_minutes, error = self._strict_positive_int(
+            flex_interval_text,
+            "Flex 동기화 주기(분)",
+        )
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+        overtime_interval_minutes, error = self._strict_positive_int(
+            overtime_interval_text,
+            "초과근무 툴팁 주기(분)",
+        )
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
+        overtime_idle_minutes, error = self._strict_positive_int(
+            overtime_idle_minutes_text,
+            "자동 일시정지까지 무입력(분)",
+        )
+        if error:
+            self._set_status(f"저장 실패: {error}", level="error")
+            return
 
         daily_minutes = int(round(daily_hours * 60))
         tooltip_ms = int(round(tooltip_sec * 1000))
@@ -2296,6 +2758,12 @@ class WrikeSettingsView:
             "tooltip_duration_ms": tooltip_ms,
             "monitor_enabled": monitor_enabled,
             "monitor_interval_sec": interval_sec,
+            "flex_enabled": flex_enabled,
+            "flex_employee_number": flex_employee_number,
+            "flex_poll_interval_sec": int(flex_interval_minutes) * 60,
+            "overtime_notice_interval_min": int(overtime_interval_minutes),
+            "overtime_idle_pause_enabled": bool(overtime_idle_enabled),
+            "overtime_idle_pause_min": int(overtime_idle_minutes),
             "lunch_break_enabled": lunch_enabled,
             "lunch_start_min": int(lunch_start_min),
             "lunch_end_min": int(lunch_end_min),
@@ -2310,6 +2778,14 @@ class WrikeSettingsView:
         ok, err = self._wrike.update_settings(save_payload)
         try:
             if ok:
+                try:
+                    settings = self._wrike.get_settings_snapshot()
+                    self._refresh_flex_status_from_backend(
+                        prompt=False,
+                        settings=settings,
+                    )
+                except Exception:
+                    pass
                 if ical_dirty:
                     self._ical_dirty = False
                 if vacation_dirty:

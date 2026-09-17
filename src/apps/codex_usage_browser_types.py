@@ -173,6 +173,7 @@ class PlaywrightSessionConfig:
     headed_login_emergency_max_process_rss_bytes: int = 2_147_483_648
     worker_cleanup_timeout_sec: float = 5.0
     worker_bootstrap_timeout_sec: float = 15.0
+    login_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

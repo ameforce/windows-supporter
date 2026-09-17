@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 import io
 import json
@@ -16,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 from src.apps.Monitor import Monitor
 from src.apps.Wrike import Wrike
+from src.apps.flex_worktime import FlexDaySchedule, FlexWorkBlock
 from src.apps.wrike_ical import CalendarError, CalendarErrorCode, CalendarSuccess
 from src.apps.wrike_timelog_details import TimelogDayDetails
 from src.apps.wrike_ui import WrikeSettingsView
@@ -406,6 +408,449 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
                 "task-1", now + timedelta(minutes=5), force=False, cache=cache
             )
         )
+
+    def test_overtime_pause_resume_and_start_edit_handlers(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        self.assertEqual(
+            store.set_pending(
+                day,
+                datetime(2026, 4, 6, 18, 5),
+                datetime(2026, 4, 6, 18, 0),
+            ),
+            (True, None),
+        )
+        wrike._Wrike__panel_overtime_prompt_accept("18:06")
+        self.assertEqual(store.get(day)["status"], "active")
+
+        wrike._Wrike__panel_overtime_toggle_pause()
+        self.assertEqual(store.get(day)["paused_at"], "2026-04-06T19:00:00")
+
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 30)
+        wrike._Wrike__panel_overtime_toggle_pause()
+        entry = store.get(day)
+        self.assertIsNone(entry["paused_at"])
+        self.assertEqual(entry["paused_seconds"], 1800)
+
+        self.assertTrue(wrike._Wrike__panel_overtime_edit_start("18:10"))
+        self.assertEqual(store.get(day)["started_at"], "2026-04-06T18:10:00")
+        self.assertFalse(wrike._Wrike__panel_overtime_edit_start("not-a-time"))
+
+    def test_flex_actual_clock_in_and_work_duration_drive_overtime_boundary(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 17, 5)
+        wrike = self._new_wrike()
+        day = date(2026, 4, 6)
+        planned_start = datetime(2026, 4, 6, 8, 0)
+        planned_quit = datetime(2026, 4, 6, 17, 0)
+        actual_start = datetime(2026, 4, 6, 8, 45)
+        schedule = FlexDaySchedule(
+            date=day,
+            blocks=(
+                FlexWorkBlock("기본 근무", planned_start, planned_quit, "WORK_RECORD"),
+                FlexWorkBlock(
+                    "점심 휴게",
+                    datetime(2026, 4, 6, 12, 0),
+                    datetime(2026, 4, 6, 13, 0),
+                    "WORK_RECORD",
+                ),
+                FlexWorkBlock("출퇴근 기록", actual_start, None, "WORK_CLOCK"),
+            ),
+            break_intervals=(
+                (datetime(2026, 4, 6, 12, 0), datetime(2026, 4, 6, 13, 0)),
+            ),
+            scheduled_start=planned_start,
+            regular_quit=planned_quit,
+            scheduled_quit=planned_quit,
+            actual_start=actual_start,
+            actual_quit=None,
+            target_minutes=8 * 60,
+            overtime_assigned_minutes=0,
+            overtime_scheduled_quit=None,
+            fetched_at=datetime(2026, 4, 6, 17, 0),
+        )
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {day: schedule}
+
+        plan = wrike._Wrike__plan_for_date(day)
+        self.assertEqual(plan["clock_in"], "08:45")
+        overview = wrike._Wrike__today_overview(_FrozenDateTime.current)
+        self.assertEqual(overview.projected_quit, datetime(2026, 4, 6, 17, 45))
+        self.assertEqual(
+            wrike._Wrike__overtime_scheduled_quit(day, overview),
+            datetime(2026, 4, 6, 17, 45),
+        )
+
+        # An approved Flex extension increases the overall target but does not
+        # move the start of the local overtime measurement past regular work.
+        approved_schedule = replace(
+            schedule,
+            target_minutes=10 * 60,
+            overtime_assigned_minutes=2 * 60,
+            scheduled_quit=datetime(2026, 4, 6, 19, 0),
+        )
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {day: approved_schedule}
+        approved_overview = wrike._Wrike__today_overview(_FrozenDateTime.current)
+        self.assertEqual(
+            approved_overview.projected_quit,
+            datetime(2026, 4, 6, 19, 45),
+        )
+        self.assertEqual(
+            wrike._Wrike__overtime_scheduled_quit(
+                day,
+                approved_overview,
+                now=_FrozenDateTime.current,
+            ),
+            datetime(2026, 4, 6, 17, 45),
+        )
+
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {day: schedule}
+
+        # Flex's planned 08:00-17:00 range must not open the prompt at 17:05.
+        wrike._Wrike__maybe_record_overtime_activity(_FrozenDateTime.current, plan)
+        self.assertIsNone(wrike._Wrike__overtime_state_store.get(day))
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex 근무 8시간 · 실제 출근 08:45 기준", model.today_lines[0].text)
+        self.assertNotIn("Flex 퇴근 17:00", model.today_lines[0].text)
+        self.assertIn("출근 08:45 · 예상 퇴근 17:45", model.today_lines[2].text)
+
+        wrike._Wrike__maybe_record_overtime_activity(
+            datetime(2026, 4, 6, 17, 46),
+            plan,
+        )
+        pending = wrike._Wrike__overtime_state_store.get(day)
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["scheduled_quit"], "2026-04-06T17:45:00")
+
+    def test_flex_actual_clock_out_is_displayed_instead_of_projected_quit(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 18, 30)
+        wrike = self._new_wrike()
+        day = date(2026, 4, 6)
+        actual_start = datetime(2026, 4, 6, 8, 45)
+        actual_quit = datetime(2026, 4, 6, 18, 12)
+        schedule = FlexDaySchedule(
+            date=day,
+            blocks=(
+                FlexWorkBlock(
+                    "출퇴근 기록",
+                    actual_start,
+                    actual_quit,
+                    "WORK_CLOCK",
+                ),
+            ),
+            break_intervals=(),
+            scheduled_start=datetime(2026, 4, 6, 8, 0),
+            regular_quit=datetime(2026, 4, 6, 17, 0),
+            scheduled_quit=datetime(2026, 4, 6, 17, 0),
+            actual_start=actual_start,
+            actual_quit=actual_quit,
+            target_minutes=8 * 60,
+            overtime_assigned_minutes=0,
+            overtime_scheduled_quit=None,
+            fetched_at=datetime(2026, 4, 6, 18, 30),
+        )
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {day: schedule}
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        today_text = model.today_lines[2].text
+        self.assertIn("출근 08:45 · 실제 퇴근 18:12", today_text)
+        self.assertNotIn("예상 퇴근", today_text)
+
+    def test_overtime_idle_auto_pause_and_input_auto_resume(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+
+        # A manual pause must not auto-resume on input.
+        self.assertEqual(
+            store.pause(day, datetime(2026, 4, 6, 19, 0)), (True, None)
+        )
+        wrike._Wrike__on_worktime_activity(datetime(2026, 4, 6, 19, 10))
+        entry = store.get(day)
+        self.assertEqual(entry["paused_at"], "2026-04-06T19:00:00")
+        self.assertFalse(entry["pause_auto"])
+
+        self.assertEqual(
+            store.resume(day, datetime(2026, 4, 6, 19, 11)), (True, None)
+        )
+        wrike._Wrike__on_overtime_idle_input(datetime(2026, 4, 6, 19, 20))
+        entry = store.get(day)
+        self.assertEqual(entry["paused_at"], "2026-04-06T19:20:00")
+        self.assertTrue(entry["pause_auto"])
+
+        # The next input event resumes only an automatic pause.
+        wrike._Wrike__on_worktime_activity(datetime(2026, 4, 6, 19, 40))
+        entry = store.get(day)
+        self.assertIsNone(entry["paused_at"])
+        self.assertFalse(entry["pause_auto"])
+        self.assertEqual(entry["paused_seconds"], 660 + 1200)
+
+    def test_overtime_idle_pause_respects_disabled_setting(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+
+        wrike._Wrike__overtime_idle_pause_enabled = False
+        wrike._Wrike__on_overtime_idle_input(datetime(2026, 4, 6, 19, 30))
+        self.assertIsNone(store.get(day)["paused_at"])
+
+        wrike._Wrike__overtime_idle_pause_enabled = True
+        wrike._Wrike__overtime_idle_pause_min = 15
+        self.assertEqual(wrike._Wrike__overtime_idle_threshold_seconds(), 900)
+        wrike._Wrike__overtime_idle_pause_enabled = False
+        self.assertIsNone(wrike._Wrike__overtime_idle_threshold_seconds())
+
+    def test_panel_idle_autopause_toggle_updates_and_persists_settings(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+
+        wrike._Wrike__panel_overtime_idle_autopause()
+        self.assertFalse(wrike._Wrike__overtime_idle_pause_enabled)
+        self.assertIsNone(wrike._Wrike__overtime_idle_threshold_seconds())
+
+        payload = json.loads(
+            Path(wrike._Wrike__settings_path).read_text(encoding="utf-8")
+        )
+        self.assertFalse(payload["overtime_idle_pause_enabled"])
+
+        wrike._Wrike__panel_overtime_idle_autopause()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+        payload = json.loads(
+            Path(wrike._Wrike__settings_path).read_text(encoding="utf-8")
+        )
+        self.assertTrue(payload["overtime_idle_pause_enabled"])
+
+    def test_panel_idle_autopause_toggle_failure_keeps_flag(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+
+        show_error = Mock()
+        with (
+            patch.object(wrike, "_Wrike__save_settings", return_value=False),
+            patch.object(
+                wrike, "_Wrike__show_panel_action_error", show_error
+            ),
+        ):
+            wrike._Wrike__panel_overtime_idle_autopause()
+        self.assertTrue(wrike._Wrike__overtime_idle_pause_enabled)
+        show_error.assert_called_once()
+
+    def test_update_settings_keeps_single_flex_poll_chain(self) -> None:
+        wrike = self._new_wrike()
+        root = _FakeRoot()
+        wrike._Wrike__root = root
+        wrike._Wrike__background_active = True
+        wrike._Wrike__flex_enabled = True
+        wrike._Wrike__flex_employee_number = "E12345"
+        wrike._Wrike__flex_poll_interval_sec = 300
+
+        ok, error = wrike.update_settings({"flex_poll_interval_sec": 300})
+        self.assertTrue(ok, error)
+        ok, error = wrike.update_settings({"flex_poll_interval_sec": 300})
+        self.assertTrue(ok, error)
+
+        flex_calls = [
+            item
+            for item in root.after_calls
+            if item[2] == wrike._Wrike__flex_poll_tick
+        ]
+        self.assertEqual(len(flex_calls), 1)
+
+    def test_overtime_prompt_edit_requires_current_context(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        self.assertFalse(
+            wrike._Wrike__panel_overtime_prompt_edit("17:59", "18:00")
+        )
+        self.assertEqual(store.get(day)["status"], "pending")
+        self.assertTrue(
+            wrike._Wrike__panel_overtime_prompt_edit("18:05", "18:00")
+        )
+        entry = store.get(day)
+        self.assertEqual(entry["status"], "active")
+        self.assertEqual(entry["started_at"], "2026-04-06T18:00:00")
+
+    def test_overtime_end_keeps_record_pending_for_flex(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 20, 30)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+        with patch.object(
+            wrike, "_Wrike__open_flex_worktime_page", return_value=True
+        ) as opened:
+            wrike._Wrike__panel_overtime_end()
+        opened.assert_called_once_with()
+        entry = store.get(day)
+        self.assertEqual(entry["status"], "completed")
+        self.assertTrue(entry["flex_pending"])
+        self.assertEqual(store.flex_pending_days(), ["2026-04-06"])
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertEqual(len(model.flex_pending), 1)
+        record = model.flex_pending[0]
+        self.assertEqual(record.date_key, "2026-04-06")
+        self.assertEqual(record.start_time, "18:06")
+        self.assertEqual(record.end_time, "20:30")
+        self.assertEqual(record.net_minutes, 144)
+
+    def test_flex_pending_edit_and_done_handlers(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 21, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(
+            day,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+        store.complete(day, datetime(2026, 4, 6, 20, 6))
+
+        self.assertTrue(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-06", "18:30", "20:45"
+            )
+        )
+        entry = store.get(day)
+        self.assertEqual(entry["started_at"], "2026-04-06T18:30:00")
+        self.assertEqual(entry["ended_at"], "2026-04-06T20:45:00")
+        self.assertTrue(entry["flex_pending"])
+
+        self.assertFalse(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-06", "20:00", "19:00"
+            )
+        )
+        self.assertFalse(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-07", "18:00", "19:00"
+            )
+        )
+        # A 24:00 end is accepted and lands at midnight on the next day.
+        self.assertTrue(
+            wrike._Wrike__panel_flex_pending_edit(
+                "2026-04-06", "18:30", "24:00"
+            )
+        )
+        self.assertEqual(
+            store.get(day)["ended_at"], "2026-04-07T00:00:00"
+        )
+        self.assertEqual(
+            wrike._Wrike__build_worktime_panel_model().flex_pending[0].end_time,
+            "24:00",
+        )
+
+        wrike._Wrike__panel_flex_pending_done("2026-04-06")
+        self.assertFalse(store.get(day)["flex_pending"])
+        self.assertEqual(store.flex_pending_days(), [])
+        self.assertEqual(
+            wrike._Wrike__build_worktime_panel_model().flex_pending, ()
+        )
+
+        # Completing again without a record must not raise.
+        wrike._Wrike__panel_flex_pending_done("2026-04-06")
+        self.assertFalse(store.get(day)["flex_pending"])
+
+    def test_completed_overtime_raises_past_day_target_and_delta(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 8, 10, 0)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        monday = date(2026, 4, 6)
+        store.set_pending(
+            monday,
+            datetime(2026, 4, 6, 18, 5),
+            datetime(2026, 4, 6, 18, 0),
+        )
+        store.start(monday, datetime(2026, 4, 6, 18, 6))
+        store.pause(monday, datetime(2026, 4, 6, 19, 6))
+        store.resume(monday, datetime(2026, 4, 6, 19, 36))
+        store.complete(monday, datetime(2026, 4, 6, 20, 6))
+        wrike.update_workday_plan(monday, 8 * 60, None)
+        wrike.update_workday_plan(date(2026, 4, 7), 8 * 60, None)
+        wrike.update_workday_plan(date(2026, 4, 8), 8 * 60, "08:00")
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (9 * 60, 8 * 60, 4 * 60, 0, 0, 0, 0),
+                generation=9,
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        monday_row = model.rows[0]
+        # 8h plan + 1h30m net overtime (30m pause excluded) vs 9h recorded.
+        self.assertIn("목표 9시간 30분", monday_row.summary)
+        self.assertIn("초과근무 1시간 30분", monday_row.summary)
+        self.assertIn("부족 30분", monday_row.summary)
+        tuesday_row = model.rows[1]
+        self.assertIn("딱 맞음", tuesday_row.summary)
+        self.assertNotIn("초과근무", tuesday_row.summary)
+
+    def test_active_overtime_extends_today_expected_minutes(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 8, 19, 30)
+        wrike = self._new_wrike()
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 8)
+        wrike.update_workday_plan(day, 8 * 60, "09:00")
+        store.set_pending(
+            day,
+            datetime(2026, 4, 8, 18, 5),
+            datetime(2026, 4, 8, 18, 0),
+        )
+        store.start(day, datetime(2026, 4, 8, 18, 6))
+        store.pause(day, datetime(2026, 4, 8, 19, 0))
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 8 * 60, 0, 0, 0, 0),
+                generation=10,
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        # Paused since 19:00 -> 54 net overtime minutes; expected = 8h + 54m.
+        self.assertIn("현재 기대 8시간 54분", model.rows[2].summary)
+        self.assertTrue(
+            any("초과근무 54분" in line.text for line in model.today_lines)
+        )
+        self.assertIn("부족 54분", model.rows[2].summary)
 
     def test_authoritative_pagination_token_is_strict_and_opaque(self) -> None:
         malformed_tokens = (
@@ -1414,10 +1859,31 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             wrike.get_workday_plan(target_day)["clock_in"],
             "08:00",
         )
-        self.assertTrue(wrike._Wrike__panel_edit_clock_in("08:15"))
+        self.assertTrue(wrike._Wrike__panel_edit_clock_in("815"))
         plan = wrike.get_workday_plan(target_day)
         self.assertEqual(plan["clock_in"], "08:15")
         self.assertEqual(plan["target_net_minutes"], 480)
+
+    def test_settings_workday_clock_accepts_compact_input_and_saves_canonical_value(self) -> None:
+        backend = Mock()
+        backend.update_workday_plan.return_value = (True, None)
+        backend.get_workday_plan.return_value = {
+            "date": "2026-04-06",
+            "target_net_minutes": 480,
+            "clock_in": "09:30",
+        }
+        view = WrikeSettingsView(None, backend)
+        view._workday_date_var = _FakeVar("2026-04-06")
+        view._workday_target_var = _FakeVar("8")
+        view._workday_clock_in_var = _FakeVar("930")
+        statuses = []
+        view._set_status = lambda text, level="info": statuses.append((text, level))
+
+        view._on_save_workday_plan()
+
+        backend.update_workday_plan.assert_called_once_with("2026-04-06", 480, "09:30")
+        self.assertEqual(view._workday_clock_in_var.get(), "09:30")
+        self.assertEqual(statuses[-1], ("근무 계획 저장 완료", "ok"))
 
     def test_clock_in_now_preserves_implicit_weekend_zero_target(self) -> None:
         wrike = self._new_wrike()

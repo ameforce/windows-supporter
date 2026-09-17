@@ -29,6 +29,31 @@
 - 운영 계약 결함 복구는 hotfix이고, 의도적인 새 운영 정책은 release다. 진행 중인 lane에서 발견한 절차 보강은 [CLASS-INTENT-FIRST] 판정이 현재 lane과 호환될 때만 같은 lane의 별도 task PR로 통합한다. 호환되지 않으면 현재 lane에 섞지 않고 affected completion을 중단한 뒤 올바르게 분류된 lane의 순서와 base를 결정한다.
 - 사용자가 `로컬 빌드만`, `커밋/푸시 금지`, `핫픽스 금지`처럼 delivery 범위를 명시적으로 제한한 경우에만 해당 효과를 생략한다.
 
+## 배포 완료 기본 범위
+
+- 사용자가 구현·수정·핫픽스·릴리즈·배포를 요청하면 기본 완료 범위는 task
+  검증, 커밋, task PR merge, `main`/tag/`develop` publish, tagged artifact 및
+  permanent runtime 배포, 그리고 live read-back까지다. 커밋·PR merge·테스트
+  통과만으로 완료를 보고하거나 그 지점에서 임의로 멈추지 않는다.
+- 사용자가 delivery 범위를 명시적으로 제한했거나, 필수 gate·검증·rollback
+  증거가 실패한 경우에만 해당 단계에서 멈춘다. 이때 성공으로 표현하지 말고
+  blocker와 현재 ref·artifact·runtime 상태를 기록하며, 안전한 대체 경로가
+  있으면 같은 turn 안에서 계속 시도한다.
+- version/ref 충돌이나 live 상태 불일치가 있으면 공개 ref를 덮어쓰지 않고
+  다음 유효한 version lane 또는 명시된 복구 절차로 전환한 뒤 배포를 계속한다.
+
+## GitHub Release 보존 정책
+
+- **[POLICY-LATEST-GITHUB-RELEASE]** GitHub Release는 현재 배포한 최신 version의
+  Release 하나만 유지한다. 새 Release와 자산을 먼저 생성·검증한 뒤 기존 Release
+  record와 그 자산을 삭제하고, 최종 `gh release list` read-back에서 정확히 하나의
+  최신 Release(`isLatest=true`)만 남았는지 확인한다.
+- Release 삭제는 tag 삭제 옵션을 사용하지 않는다. 사용자가 tag 삭제를 명시하지
+  않는 한 Git tag와 tag 이력은 보존한다.
+- 이 정책은 draft·prerelease를 포함한 이전 Release record에도 적용한다. 삭제가
+  실패하거나 immutable Release 등으로 보존된 항목이 있으면 성공으로 보고하지
+  않고 남은 tag/release와 원인을 기록한다.
+
 ## 검증 매트릭스
 
 - **[VAL-SCOPE-MINIMUM]** 구현 전에 변경 파일, 직접 호출 경로, 영향받는 test module과 native scenario를 정하고 변경 동작을 직접 증명하는 최소 집합만 실행한다.

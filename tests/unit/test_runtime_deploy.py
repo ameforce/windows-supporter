@@ -17,6 +17,7 @@ from src.utils.runtime_deploy import (
     cli,
     deploy_runtime,
     restart_runtime,
+    wait_for_runtime_readiness,
 )
 
 
@@ -148,6 +149,40 @@ class RuntimeDeployTest(unittest.TestCase):
             self.assertEqual(controller.terminated, [101, 102])
             self.assertNotIn(controller.other_same_name_pid, controller.terminated)
             self.assertFalse(target.with_name("windows-supporter.previous.exe").exists())
+
+    def test_wait_for_already_launched_runtime_requires_live_heartbeats(self):
+        with tempfile.TemporaryDirectory() as root:
+            _candidate, target = self._paths(root)
+            controller = FakeController()
+            controller.target = target
+            controller.probe_path = Path(root) / "relaunch-probe.json"
+            controller.token = "relaunch-token"
+            controller.launcher_pid = 700
+            controller.probe_pid = 701
+            controller.tick = 1
+            controller._write_probe()
+            observations = []
+
+            readiness = wait_for_runtime_readiness(
+                target,
+                probe_path=controller.probe_path,
+                token=controller.token,
+                launcher_pid=controller.launcher_pid,
+                expected_version="0.18.18.0",
+                expected_commit="abc1234",
+                controller=controller,
+                timeout_seconds=1,
+                heartbeat_samples=2,
+                poll_interval=0.01,
+                sleep=controller.sleep,
+                observer=lambda payload, status: observations.append(
+                    (None if payload is None else payload.get("state"), status)
+                ),
+            )
+
+            self.assertEqual(readiness["heartbeat_samples"], 2)
+            self.assertEqual(readiness["mainloop_ticks"], [1, 2])
+            self.assertEqual(observations, [("ready", "ready"), ("ready", "ready")])
 
     def test_stale_probe_and_pid_reuse_are_rejected_then_old_runtime_is_restored(self):
         with tempfile.TemporaryDirectory() as root:

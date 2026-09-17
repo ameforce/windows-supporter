@@ -1,4 +1,5 @@
 import ctypes
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -106,19 +107,38 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._tab_kakao = object()
         return ui, root, kakao
 
-    def test_ai_usage_tab_default_size_is_wider_and_content_fit(self) -> None:
+    def test_ai_usage_tab_default_size_is_compact_and_content_fit(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
                 ui = WindowsSupporterMainUI(root=object(), startup_manager=object(), monitor=object())
 
         width, height = ui._tab_sizes.get(ui._TAB_AI_USAGE)
         min_width, min_height = ui._tab_minsizes.get(ui._TAB_AI_USAGE)
-        # 프로필 2개(2열 카드) 콘텐츠 요구 높이가 ~740px이므로 기본 창은
-        # 스크롤 없이 주요 항목이 보이는 크기여야 한다.
-        self.assertGreaterEqual(width, 1100)
-        self.assertGreaterEqual(height, 740)
-        self.assertGreaterEqual(min_width, 940)
-        self.assertLessEqual(min_height, 600)
+        # 콘텐츠가 mount되면 실제 요청 크기가 우선하고, mount 전 fallback은
+        # Windows 배율을 중복 적용하지 않는 compact 기준을 사용한다.
+        self.assertEqual((width, height), (900, 520))
+        self.assertEqual((min_width, min_height), (720, 420))
+
+    def test_ai_usage_content_fit_uses_mounted_view_preferred_size(self) -> None:
+        with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
+            with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
+                ui = WindowsSupporterMainUI(
+                    root=object(),
+                    startup_manager=object(),
+                    monitor=object(),
+                )
+
+        class _View:
+            def preferred_size(self):
+                return (1139, 500)
+
+        ui._tab_ai_usage = object()
+        ui._ai_usage_view = _View()
+
+        self.assertEqual(
+            ui._content_window_size(ui._TAB_AI_USAGE),
+            (1139, 500),
+        )
 
     def test_ui_scale_clamps_tk_scaling_ratio(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
@@ -132,14 +152,14 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
                 return 2.0
 
         ui._root = type("Root", (), {"tk": _TkBridge()})()
-        self.assertAlmostEqual(ui._ui_scale(), 1.5)
+        self.assertEqual(ui._ui_scale(), 1.0)
 
         class _HugeBridge:
             def call(self, *_args):
                 return 99.0
 
         ui._root = type("Root", (), {"tk": _HugeBridge()})()
-        self.assertEqual(ui._ui_scale(), 3.0)
+        self.assertEqual(ui._ui_scale(), 1.0)
 
     def test_base_ui_scaling_raises_default_font_scale_before_widgets(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
@@ -159,10 +179,9 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._apply_base_ui_scaling()
 
         base = 96.0 / 72.0
-        expected = base * ui._UI_BASE_SCALE
-        self.assertEqual(calls, [("tk:scaling", expected)])
+        self.assertEqual(calls, [])
 
-        # 시스템 scaling이 이미 더 높으면 그 값을 유지한다.
+        # 시스템 scaling이 더 높아도 앱의 compact 상한으로 낮춘다.
         calls.clear()
 
         class _HighDpiBridge:
@@ -174,7 +193,7 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
 
         ui._root = type("Root", (), {"tk": _HighDpiBridge()})()
         ui._apply_base_ui_scaling()
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, [("set", base)])
 
         # tk에 접근할 수 없는 테스트 더블은 조용히 무시한다.
         ui._root = object()
@@ -209,11 +228,316 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         ui._apply_tab_geometry(ui._TAB_AI_USAGE)
 
         self.assertEqual(root.geometry_calls[-1], "768x452")
-        self.assertEqual(root.minsize_calls[-1], (768, 452))
+        self.assertEqual(root.minsize_calls[-1], (720, 420))
         self.assertEqual(
             root.resize_events,
-            [("minsize", (768, 452)), ("geometry", "768x452")],
+            [("minsize", (720, 420)), ("geometry", "768x452")],
         )
+
+    def _build_dashboard_geometry_ui(self, *, user_size):
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+                self.maxsize_calls = []
+
+            def winfo_width(self):
+                return 1200
+
+            def winfo_height(self):
+                return 900
+
+            def winfo_screenwidth(self):
+                return 1920
+
+            def winfo_screenheight(self):
+                return 1080
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+            def maxsize(self, width, height):
+                self.maxsize_calls.append((int(width), int(height)))
+
+        class _Tab:
+            def winfo_reqwidth(self):
+                return 330
+
+            def winfo_reqheight(self):
+                return 700
+
+        class _Notebook:
+            def winfo_reqwidth(self):
+                return 350
+
+            def winfo_reqheight(self):
+                return 730
+
+        class _Footer:
+            def winfo_reqwidth(self):
+                return 330
+
+            def winfo_reqheight(self):
+                return 25
+
+        class _View:
+            def preferred_size(self):
+                return (340, 700)
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1600, 1000)
+        ui._current_tab = ui._TAB_DASHBOARD
+        ui._tab_dashboard = _Tab()
+        ui._notebook = _Notebook()
+        ui._footer_frame = _Footer()
+        ui._dashboard_view = _View()
+        if user_size is not None:
+            ui._tab_user_sizes[ui._TAB_DASHBOARD] = user_size
+        return ui, root
+
+    def test_dashboard_remembered_height_is_capped_to_content(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=(330, 914))
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # 콘텐츠 요구 700 + chrome(footer 25 + notebook-tab 30) = 755.
+        # 기억된 914를 그대로 적용하면 균등 행이 늘어나 카드 내부에
+        # 빈 공간이 생기므로 콘텐츠 높이로 클램프한다.
+        self.assertEqual(root.geometry_calls[-1], "330x755")
+        self.assertEqual(root.maxsize_calls[-1], (10000, 755))
+
+    def test_dashboard_resize_ceiling_uses_content_not_applied_height(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=(330, 500))
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # 콘텐츠보다 낮게 줄인 사용자 높이는 유지하되, 리사이즈 상한은
+        # 콘텐츠 높이(755)로 둬야 다시 키울 수 있다.
+        self.assertEqual(root.geometry_calls[-1], "330x500")
+        self.assertEqual(root.maxsize_calls[-1], (10000, 755))
+
+    def test_dashboard_geometry_without_view_still_uses_fallback(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=None)
+        ui._dashboard_view = None
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # view가 없으면 콘텐츠 높이를 알 수 없으므로 상한도 적용하지 않고
+        # 기본 화면 크기 상한을 유지한다. 높이는 탭 요구 크기 측정 경로를
+        # 그대로 따른다(700 + chrome 55 = 755).
+        self.assertEqual(root.maxsize_calls[-1], (1920, 1080))
+        self.assertEqual(root.geometry_calls[-1], "350x755")
+
+    def test_non_dashboard_tab_restores_screen_maxsize(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+                self.maxsize_calls = []
+
+            def winfo_width(self):
+                return 1200
+
+            def winfo_height(self):
+                return 900
+
+            def winfo_screenwidth(self):
+                return 1920
+
+            def winfo_screenheight(self):
+                return 1080
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+            def maxsize(self, width, height):
+                self.maxsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1600, 1000)
+
+        ui._apply_tab_geometry(ui._TAB_AI_USAGE)
+
+        # 다른 탭은 기존처럼 화면 크기 상한으로 복원한다.
+        self.assertEqual(root.maxsize_calls[-1], (1920, 1080))
+
+    def test_user_resize_is_kept_separate_from_automatic_tab_fallback(self) -> None:
+        ui, root, _ = self._build_ui()
+        ui._current_tab = ui._TAB_AI_USAGE
+        fallback = ui._tab_sizes[ui._TAB_AI_USAGE]
+        ui._auto_geometry_sizes.add((900, 520))
+
+        ui._on_root_configure(SimpleNamespace(widget=root, width=900, height=520))
+        self.assertNotIn(ui._TAB_AI_USAGE, ui._tab_user_sizes)
+        self.assertNotIn((900, 520), ui._auto_geometry_sizes)
+
+        # An actual later resize to a familiar automatic size is still user
+        # intent; the deferred auto event above must not poison that state.
+        ui._on_root_configure(SimpleNamespace(widget=root, width=900, height=520))
+        self.assertEqual(ui._tab_user_sizes[ui._TAB_AI_USAGE], (900, 520))
+
+        ui._on_root_configure(SimpleNamespace(widget=root, width=760, height=460))
+        self.assertEqual(ui._tab_user_sizes[ui._TAB_AI_USAGE], (760, 460))
+        self.assertEqual(ui._tab_sizes[ui._TAB_AI_USAGE], fallback)
+        self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (760, 460))
+
+    def test_synchronous_minsize_configure_is_not_saved_as_a_user_resize(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+
+            def winfo_width(self):
+                return 900
+
+            def winfo_height(self):
+                return 520
+
+            def geometry(self, value):
+                self.geometry_calls.append(value)
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._current_tab = ui._TAB_AI_USAGE
+        original_minsize = root.minsize
+
+        def minsize_with_configure(width, height):
+            original_minsize(width, height)
+            ui._on_root_configure(
+                SimpleNamespace(widget=root, width=width, height=height)
+            )
+
+        root.minsize = minsize_with_configure
+        ui._apply_tab_geometry(ui._TAB_AI_USAGE)
+
+        self.assertEqual(ui._tab_user_sizes, {})
+        self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (900, 520))
+
+    def test_narrow_notebook_uses_short_tab_labels(self) -> None:
+        class _TabNotebook:
+            def __init__(self):
+                self.calls = []
+
+            def tab(self, widget, **kwargs):
+                self.calls.append((widget, kwargs))
+
+        ui, _, _ = self._build_ui()
+        notebook = _TabNotebook()
+        ui._notebook = notebook
+        ui._tab_dashboard = "dashboard"
+        ui._tab_startup = "startup"
+        ui._tab_kakao = "kakao"
+        ui._tab_wrike = "wrike"
+        ui._tab_ai_usage = "ai"
+        ui._tab_update = "update"
+
+        ui._current_tab = ui._TAB_AI_USAGE
+        ui._on_root_configure(
+            SimpleNamespace(widget=ui._root, width=760, height=460)
+        )
+
+        labels = {str(widget): options["text"] for widget, options in notebook.calls}
+        self.assertEqual(labels["startup"], "Startup")
+        self.assertEqual(labels["kakao"], "Kakao")
+        self.assertEqual(labels["ai"], "AI")
+
+        notebook.calls.clear()
+        ui._on_root_configure(
+            SimpleNamespace(widget=ui._root, width=900, height=520)
+        )
+        labels = {str(widget): options["text"] for widget, options in notebook.calls}
+        self.assertEqual(labels["startup"], "Startup Apps")
+        self.assertEqual(labels["kakao"], "KakaoTalk")
+        self.assertEqual(labels["ai"], "AI 사용량")
+
+    def test_tab_row_min_width_floors_a_narrow_user_size(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+
+            def winfo_width(self):
+                return 330
+
+            def winfo_height(self):
+                return 914
+
+            def geometry(self, value):
+                self.geometry_calls.append(str(value))
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1920, 1080)
+        ui._tab_dashboard = "dashboard"
+        ui._tab_startup = "startup"
+        ui._tab_kakao = "kakao"
+        ui._tab_wrike = "wrike"
+        ui._tab_ai_usage = "ai"
+        ui._tab_update = "update"
+        ui._measure_tab_text = lambda text: len(str(text)) * 10
+
+        # A remembered narrow user size must not compress the tab row into
+        # clipped titles; the tab row floor wins over the stored width.
+        ui._tab_user_sizes[ui._TAB_DASHBOARD] = (330, 914)
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        compact_floor = sum(len(label) * 10 + 28 for label in (
+            "Dashboard", "Startup", "Kakao", "Wrike", "AI", "Update",
+        ))
+        self.assertEqual(compact_floor, 508)
+        self.assertEqual(root.minsize_calls[-1][0], compact_floor)
+        self.assertTrue(root.geometry_calls[-1].startswith(f"{compact_floor}x"))
+
+    def test_tab_row_min_width_does_not_raise_wide_geometry(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.geometry_calls = []
+                self.minsize_calls = []
+
+            def geometry(self, value):
+                self.geometry_calls.append(str(value))
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1920, 1080)
+        ui._tab_dashboard = "dashboard"
+        ui._tab_startup = "startup"
+        ui._tab_kakao = "kakao"
+        ui._tab_wrike = "wrike"
+        ui._tab_ai_usage = "ai"
+        ui._tab_update = "update"
+        ui._measure_tab_text = lambda text: len(str(text)) * 10
+        ui._tab_user_sizes[ui._TAB_DASHBOARD] = (900, 500)
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+
+        # Full labels still fit inside a 900px window; the floor must not
+        # push the content-fit minimum back up.
+        self.assertLessEqual(root.minsize_calls[-1][0], 700)
+        self.assertTrue(root.geometry_calls[-1].startswith("900x"))
 
     def test_work_area_winapi_uses_pointer_sized_monitor_handles(self) -> None:
         class _Callable:

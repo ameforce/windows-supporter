@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import re
 
 
 COLOR_TEXT = "#111111"
@@ -18,6 +19,46 @@ COLOR_MUTED = "#6B7280"
 
 DEFAULT_LUNCH_START_MIN = 12 * 60
 DEFAULT_LUNCH_END_MIN = 13 * 60
+
+_COMPACT_CLOCK_INPUT_PATTERN = re.compile(r"\d{1,4}")
+_COLON_CLOCK_INPUT_PATTERN = re.compile(r"\d{1,2}")
+
+
+def normalize_hhmm_input(value) -> str | None:
+    """Normalize a user-entered local clock time to canonical ``HH:MM``.
+
+    Persisted workday plans still use the canonical form, while interactive
+    fields may use a short form: ``9``/``09`` means ``09:00``, ``930``/``0930``
+    means ``09:30``, and ``9:3`` means ``09:03``.
+    """
+
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+
+    if ":" in text:
+        parts = [part.strip() for part in text.split(":")]
+        if (
+            len(parts) != 2
+            or _COLON_CLOCK_INPUT_PATTERN.fullmatch(parts[0]) is None
+            or _COLON_CLOCK_INPUT_PATTERN.fullmatch(parts[1]) is None
+        ):
+            return None
+        hours = int(parts[0])
+        minutes = int(parts[1])
+    else:
+        if _COMPACT_CLOCK_INPUT_PATTERN.fullmatch(text) is None:
+            return None
+        if len(text) <= 2:
+            hours = int(text)
+            minutes = 0
+        else:
+            hours = int(text[:-2])
+            minutes = int(text[-2:])
+
+    if not 0 <= hours <= 23 or not 0 <= minutes <= 59:
+        return None
+    return f"{hours:02d}:{minutes:02d}"
 
 
 @dataclass(frozen=True)
@@ -390,6 +431,7 @@ class WorkdayOverview:
     recorded_minutes: int | None = None
     expected_now_minutes: int = 0
     realtime_delta_minutes: int | None = None
+    overtime_minutes: int = 0
     recorded_available: bool = False
     vacation_available: bool = True
     vacation_state: str = "unconfigured"
@@ -490,6 +532,7 @@ def build_workday_overview(
     vacation_available: bool = True,
     vacation_state: str = "unconfigured",
     recorded_minutes: int | None = None,
+    overtime_minutes: int = 0,
 ) -> WorkdayOverview:
     try:
         target = max(0, int(target_minutes))
@@ -542,7 +585,11 @@ def build_workday_overview(
         clock_in,
         now,
     )
-    expected_now = min(effective_target, net)
+    try:
+        overtime = max(0, min(1440, int(overtime_minutes or 0)))
+    except Exception:
+        overtime = 0
+    expected_now = min(effective_target, net) + overtime
     realtime_delta = None if actual is None else actual - expected_now
     # Compatibility reference retained for existing callers: unlike
     # expected_now, this value remains based on uncapped wall-clock net time.
@@ -569,6 +616,7 @@ def build_workday_overview(
         recorded_minutes=actual,
         expected_now_minutes=expected_now,
         realtime_delta_minutes=realtime_delta,
+        overtime_minutes=overtime,
         recorded_available=actual is not None,
         vacation_available=availability,
         vacation_state=state,

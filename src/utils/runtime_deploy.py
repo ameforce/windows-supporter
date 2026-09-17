@@ -117,20 +117,46 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
-def _read_windows_artifact_identity(path: Path) -> tuple[str, str]:
+def read_windows_artifact_metadata(path: str | os.PathLike[str]) -> dict[str, str]:
+    """Read the version-resource fields used to identify a frozen runtime."""
+
     if os.name != "nt":
         raise RuntimeError("Windows version metadata is unavailable on this platform")
     import win32api
 
+    resolved_path = Path(path)
     language = "040904B0"
     version = str(
-        win32api.GetFileVersionInfo(str(path), f"\\StringFileInfo\\{language}\\FileVersion")
+        win32api.GetFileVersionInfo(
+            str(resolved_path), f"\\StringFileInfo\\{language}\\FileVersion"
+        )
+        or ""
+    ).strip()
+    product_version = str(
+        win32api.GetFileVersionInfo(
+            str(resolved_path), f"\\StringFileInfo\\{language}\\ProductVersion"
+        )
         or ""
     ).strip()
     comments = str(
-        win32api.GetFileVersionInfo(str(path), f"\\StringFileInfo\\{language}\\Comments")
+        win32api.GetFileVersionInfo(
+            str(resolved_path), f"\\StringFileInfo\\{language}\\Comments"
+        )
         or ""
     ).strip()
+    if not version:
+        raise RuntimeError("Windows artifact FileVersion metadata is missing")
+    return {
+        "file_version": version,
+        "product_version": product_version,
+        "comments": comments,
+    }
+
+
+def _read_windows_artifact_identity(path: Path) -> tuple[str, str]:
+    metadata = read_windows_artifact_metadata(path)
+    version = metadata["file_version"]
+    comments = metadata["comments"]
     commit_match = _COMMENTS_COMMIT_RE.search(comments)
     commit = commit_match.group(1) if commit_match else ""
     if not version or not commit:
@@ -359,7 +385,17 @@ def _wait_for_readiness(
     expected_commit: str | None,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    observer: Callable[[Mapping[str, Any] | None, str], None] | None = None,
 ) -> dict[str, Any]:
+    def notify(payload: Mapping[str, Any] | None, status: str) -> None:
+        if not callable(observer):
+            return
+        try:
+            observer(dict(payload) if isinstance(payload, Mapping) else None, status)
+        except Exception:
+            # UI/reporting observers must never change deployment semantics.
+            pass
+
     deadline = monotonic() + max(0.01, float(timeout_seconds))
     ticks: list[int] = []
     last_error = "probe was not created"
@@ -378,6 +414,7 @@ def _wait_for_readiness(
                 )
                 if not ticks or tick > ticks[-1]:
                     ticks.append(tick)
+                notify(payload, "ready")
                 if len(ticks) >= max(1, int(heartbeat_samples)):
                     return {
                         "pid": int(payload["pid"]),
@@ -398,8 +435,53 @@ def _wait_for_readiness(
                     }
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                 last_error = str(exc)
+                notify(payload, last_error)
+        else:
+            notify(None, last_error)
         sleep(max(0.001, float(poll_interval)))
     raise RuntimeError(f"runtime readiness timed out: {last_error}")
+
+
+def wait_for_runtime_readiness(
+    target_path: str | os.PathLike[str],
+    *,
+    probe_path: str | os.PathLike[str],
+    token: str,
+    launcher_pid: int,
+    expected_version: str | None = None,
+    expected_commit: str | None = None,
+    controller: RuntimeProcessController | None = None,
+    timeout_seconds: float = DEFAULT_READY_TIMEOUT_SECONDS,
+    heartbeat_samples: int = DEFAULT_HEARTBEAT_SAMPLES,
+    poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    observer: Callable[[Mapping[str, Any] | None, str], None] | None = None,
+) -> dict[str, Any]:
+    """Verify a process already launched by an updater before reporting success.
+
+    The launch caller supplies the probe token through the child environment;
+    this helper then proves the responding runtime belongs to that launch and
+    has a live tray/mainloop heartbeat.
+    """
+
+    if int(launcher_pid or 0) <= 0:
+        raise RuntimeLaunchError("runtime launch returned no PID")
+    return _wait_for_readiness(
+        Path(target_path),
+        controller=controller or WindowsRuntimeProcessController(),
+        probe_path=Path(probe_path),
+        token=str(token),
+        launcher_pid=int(launcher_pid),
+        timeout_seconds=timeout_seconds,
+        heartbeat_samples=heartbeat_samples,
+        poll_interval=poll_interval,
+        expected_version=expected_version,
+        expected_commit=expected_commit,
+        sleep=sleep,
+        monotonic=monotonic,
+        observer=observer,
+    )
 
 
 def _launch_and_verify(

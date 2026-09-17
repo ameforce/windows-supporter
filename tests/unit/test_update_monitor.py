@@ -16,6 +16,8 @@ from src.utils.update_monitor import (
     GIT_COMMAND_TIMEOUT_SECONDS,
     UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS,
     UPDATE_HANDOFF_ARG,
+    UPDATE_RELEASE_MODE,
+    UPDATE_SKIP_AUTO_UPDATE_TAG_ENV,
     UPDATE_CLEANUP_ONLY_NOTICE,
     UPDATE_FORCE_CLEAN_APPROVAL_TEXT,
     UPDATE_FORCE_CLEAN_REJECTED_NOTICE,
@@ -23,6 +25,8 @@ from src.utils.update_monitor import (
     UPDATE_PROGRESS_MANUAL_ACTION_TEXT,
     UPDATE_PROGRESS_RETRY_BUTTON_TEXT,
     UPDATE_SOURCE_CHANGE_NOTICE,
+    ReleaseDownloadTelemetry,
+    ReleaseInstallerLogProgress,
     UpdateCandidate,
     UpdateHandoffProgressUi,
     UpdatePromptSession,
@@ -46,6 +50,10 @@ from src.utils.update_monitor import (
     build_update_handoff_command,
     build_update_handoff_payload,
     build_update_progress_snapshot,
+    build_release_installer_log_progress_snapshot,
+    build_release_installer_progress_snapshot,
+    build_release_launcher_progress_snapshot,
+    build_release_download_progress_snapshot,
     close_running_git_gui_processes,
     cleanup_update_handoff_executable,
     get_update_handoff_executable_path,
@@ -60,6 +68,7 @@ from src.utils.update_monitor import (
     read_update_handoff_state,
     resolve_current_tag,
     run_no_window_with_progress,
+    run_release_update_handoff,
     run_update_handoff,
     select_update_candidate,
     start_update_handoff_cleanup_thread,
@@ -467,7 +476,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(build_step.label, "빌드 실행 중")
         self.assertEqual(snapshot["title"], "Windows Supporter 업데이트")
         self.assertEqual(snapshot["label"], "빌드 실행 중")
-        self.assertEqual(snapshot["percent"], 74)
+        self.assertEqual(snapshot["percent"], 45)
         self.assertTrue(snapshot["progressbar"]["visible"])
         self.assertEqual(snapshot["progressbar"]["mode"], "determinate")
         self.assertEqual(failed["title"], "Windows Supporter 업데이트 실패")
@@ -477,6 +486,361 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(failed["labels"]["log"], UPDATE_PROGRESS_LOG_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["retry"], UPDATE_PROGRESS_RETRY_BUTTON_TEXT)
         self.assertEqual(failed["labels"]["manual_action"], UPDATE_PROGRESS_MANUAL_ACTION_TEXT)
+
+    def test_release_install_uses_indeterminate_activity_without_faking_percent(self) -> None:
+        snapshot = build_update_progress_snapshot(
+            "release_install",
+            state="running",
+            progress_mode="indeterminate",
+        )
+
+        self.assertEqual(snapshot["percent"], 72)
+        self.assertEqual(snapshot["progressbar"]["value"], 72)
+        self.assertEqual(snapshot["progressbar"]["mode"], "indeterminate")
+
+    def test_release_updater_dialogs_use_independent_zero_to_hundred_workflows(self) -> None:
+        launcher_start = build_release_launcher_progress_snapshot(
+            build_update_progress_snapshot("accepted", state="running", phase_fraction=0.0)
+        )
+        launcher_complete = build_release_launcher_progress_snapshot(
+            build_update_progress_snapshot("release_handoff_ack", state="running")
+        )
+        installer_start = build_release_installer_progress_snapshot(
+            build_update_progress_snapshot(
+                "handoff_start",
+                state="running",
+                percent=18,
+            )
+        )
+        installer_complete = build_release_installer_progress_snapshot(
+            build_update_progress_snapshot("complete", state="complete")
+        )
+
+        self.assertEqual(launcher_start["title"], "Windows Supporter 업데이트 · 1/2 준비")
+        self.assertEqual(launcher_start["percent"], 0)
+        self.assertEqual(launcher_complete["percent"], 100)
+        self.assertEqual(installer_start["title"], "Windows Supporter 업데이트 · 2/2 설치")
+        self.assertEqual(installer_start["percent"], 0)
+        self.assertEqual(installer_complete["percent"], 100)
+
+    def test_installer_log_progress_is_observed_and_keeps_activity_indeterminate(self) -> None:
+        tracker = ReleaseInstallerLogProgress()
+        snapshots = [
+            build_release_installer_log_progress_snapshot(
+                tracker,
+                "Installing file: C:\\Program Files\\Windows Supporter\\one.dll",
+            ),
+            build_release_installer_log_progress_snapshot(
+                tracker,
+                "Installing file: C:\\Program Files\\Windows Supporter\\two.dll",
+            ),
+            build_release_installer_log_progress_snapshot(
+                tracker,
+                "Creating shortcuts...",
+            ),
+        ]
+
+        self.assertEqual([item["percent"] for item in snapshots], [73, 73, 88])
+        self.assertTrue(
+            all(item["progressbar"]["mode"] == "indeterminate" for item in snapshots)
+        )
+        self.assertNotIn("one.dll", snapshots[0]["detail"])
+        self.assertIn("확인된 파일 1개", snapshots[0]["detail"])
+
+    def test_incremental_installer_log_tail_reads_each_append_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "installer.log"
+            log_path.write_text("Starting the installation process\n", encoding="utf-8")
+            tail = update_monitor_module._IncrementalLogTail(log_path)
+
+            self.assertEqual(
+                tail.read_available_lines(),
+                ["Starting the installation process"],
+            )
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write("Installing file: one.dll\n")
+            self.assertEqual(tail.read_available_lines(), ["Installing file: one.dll"])
+            self.assertEqual(tail.read_available_lines(), [])
+
+    def test_release_handoff_tails_installer_logs_and_advances_the_second_dialog(self) -> None:
+        class FakeReleaseClient:
+            def download_installer(self, _candidate, destination, *, progress_callback=None):
+                destination = Path(destination)
+                destination.mkdir(parents=True, exist_ok=True)
+                installer = destination / "WindowsSupporter-v0.23.1-Setup.exe"
+                installer.write_bytes(b"installer")
+                if progress_callback is not None:
+                    progress_callback(0, 100)
+                    progress_callback(100, 100)
+                return installer
+
+        class FakeProgressUi:
+            def __init__(self, **_kwargs):
+                self.snapshots = []
+                self.pump_calls = 0
+                self.closed = False
+
+            def show(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def set_snapshot(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def pump(self):
+                self.pump_calls += 1
+
+            def close(self):
+                self.closed = True
+
+        class FakeInstallerProcess:
+            def __init__(self, log_path: Path, installed_path: Path):
+                self._log_path = log_path
+                self._installed_path = installed_path
+                self._poll_count = 0
+
+            def poll(self):
+                self._poll_count += 1
+                self._log_path.parent.mkdir(parents=True, exist_ok=True)
+                if self._poll_count == 1:
+                    self._log_path.write_text(
+                        "Starting the installation process\n"
+                        "Installing file: one.dll\n",
+                        encoding="utf-8",
+                    )
+                    return None
+                if self._poll_count == 2:
+                    with self._log_path.open("a", encoding="utf-8") as stream:
+                        stream.write("Installing file: two.dll\n")
+                        stream.write("Installing file: three.dll\n")
+                    return None
+                if self._poll_count == 3:
+                    self._installed_path.write_bytes(b"new runtime")
+                    with self._log_path.open("a", encoding="utf-8") as stream:
+                        stream.write("Creating shortcuts...\n")
+                        stream.write("Installation process succeeded.\n")
+                    return 0
+                return 0
+
+        progress_instances = []
+        installer_commands = []
+        target_launches = []
+        readiness_waits = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            runtime = repo / "windows-supporter.exe"
+            runtime.write_bytes(b"old runtime")
+            state_path = root / "update_handoff.json"
+            candidate = UpdateCandidate(
+                tag="v0.23.1",
+                version=(0, 23, 1),
+                installer_name="WindowsSupporter-v0.23.1-Setup.exe",
+                installer_url="https://github.com/ameforce/windows-supporter/releases/download/v0.23.1/WindowsSupporter-v0.23.1-Setup.exe",
+                installer_sha256="A" * 64,
+            )
+            payload = build_update_handoff_payload(
+                repo_root=repo,
+                mode=UPDATE_RELEASE_MODE,
+                candidate=candidate,
+                install_dir=repo,
+                log_path=root / "update.log",
+            )
+            payload["progress"] = build_update_progress_snapshot(
+                "release_handoff_launch",
+                state="pending",
+                percent=18,
+            )
+            state_path.write_text(
+                __import__("json").dumps(payload),
+                encoding="utf-8",
+            )
+
+            def launcher(command, **_kwargs):
+                installer_commands.append(list(command))
+                log_switch = next(item for item in command if str(item).startswith("/LOG="))
+                return FakeInstallerProcess(Path(str(log_switch).removeprefix("/LOG=")), runtime)
+
+            def target_launcher(command, **kwargs):
+                target_launches.append((list(command), dict(kwargs)))
+                return types.SimpleNamespace(pid=731)
+
+            def runtime_readiness_waiter(_target, **kwargs):
+                readiness_waits.append(dict(kwargs))
+                observer = kwargs["observer"]
+                observer(None, "probe was not created")
+                observer({"state": "starting"}, "runtime is not ready: starting")
+                observer({"state": "ready"}, "ready")
+                return {
+                    "pid": 732,
+                    "launcher_pid": kwargs["launcher_pid"],
+                    "heartbeat_samples": 3,
+                    "mainloop_ticks": [1, 2, 3],
+                }
+
+            with patch.object(update_monitor_module, "get_update_state_dir", return_value=root / "state"):
+                rc = run_release_update_handoff(
+                    state_path,
+                    release_client=FakeReleaseClient(),
+                    installer_launcher=launcher,
+                    target_launcher=target_launcher,
+                    artifact_metadata_reader=lambda _path: {
+                        "file_version": "0.23.1.0",
+                        "product_version": "0.23.1.0",
+                        "comments": "v0.23.1 (test)",
+                    },
+                    runtime_readiness_waiter=runtime_readiness_waiter,
+                    progress_ui_factory=lambda **kwargs: progress_instances.append(
+                        FakeProgressUi(**kwargs)
+                    )
+                    or progress_instances[-1],
+                    sleep=lambda _seconds: None,
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(progress_instances), 1)
+        snapshots = progress_instances[0].snapshots
+        percents = [int(snapshot["percent"]) for snapshot in snapshots]
+        self.assertEqual(snapshots[0]["workflow"], "release_installer")
+        self.assertEqual(percents[0], 0)
+        self.assertEqual(percents, sorted(percents))
+        self.assertEqual(percents[-1], 100)
+        self.assertEqual(len(installer_commands), 1)
+        self.assertEqual(
+            Path(str(installer_commands[0][0])).name,
+            "wsu-apply.exe",
+        )
+        self.assertEqual(len(target_launches), 1)
+        self.assertEqual(target_launches[0][0], [str(runtime)])
+        self.assertIn(
+            "WINDOWS_SUPPORTER_RUNTIME_PROBE_PATH",
+            target_launches[0][1]["env"],
+        )
+        self.assertIn(
+            "WINDOWS_SUPPORTER_RUNTIME_PROBE_TOKEN",
+            target_launches[0][1]["env"],
+        )
+        self.assertEqual(len(readiness_waits), 1)
+        self.assertEqual(readiness_waits[0]["launcher_pid"], 731)
+        self.assertEqual(readiness_waits[0]["expected_version"], "0.23.1.0")
+        log_snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if str(snapshot.get("detail") or "").startswith("installer 로그 확인 중")
+        ]
+        self.assertGreaterEqual(len(log_snapshots), 3)
+        self.assertTrue(
+            all(snapshot["progressbar"]["mode"] == "indeterminate" for snapshot in log_snapshots)
+        )
+        self.assertEqual(
+            [
+                str(snapshot.get("activity", {}).get("id") or "")
+                for snapshot in log_snapshots
+            ],
+            [
+                "installer-start",
+                "installer-file-1",
+                "installer-file-2",
+                "installer-file-3",
+                "installer-shortcuts",
+                "installer-complete-log",
+            ],
+        )
+        runtime_activity_ids = [
+            str(snapshot.get("activity", {}).get("id") or "")
+            for snapshot in snapshots
+            if str(snapshot.get("step_key") or "") == "release_relaunch"
+        ]
+        self.assertEqual(
+            runtime_activity_ids,
+            [
+                "runtime-launch",
+                "runtime-process-started",
+                "runtime-probe-wait",
+                "runtime-starting",
+                "runtime-heartbeat",
+                "runtime-ready",
+            ],
+        )
+        waiting_snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if str(snapshot.get("activity", {}).get("id") or "")
+            in {"runtime-probe-wait", "runtime-starting", "runtime-heartbeat"}
+        ]
+        self.assertTrue(
+            all(snapshot["progressbar"]["mode"] == "indeterminate" for snapshot in waiting_snapshots)
+        )
+        self.assertLess(
+            next(index for index, snapshot in enumerate(snapshots) if snapshot.get("activity", {}).get("id") == "runtime-ready"),
+            next(index for index, snapshot in enumerate(snapshots) if snapshot.get("step_key") == "complete"),
+        )
+        self.assertGreater(progress_instances[0].pump_calls, 0)
+
+    def test_neutral_installer_launch_path_copies_setup_named_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "WindowsSupporter-v0.26.4-Setup.exe"
+            source.write_bytes(b"installer")
+
+            launch_path = update_monitor_module._neutral_installer_launch_path(source)
+
+            self.assertEqual(launch_path.name, "wsu-apply.exe")
+            self.assertEqual(launch_path.read_bytes(), b"installer")
+            self.assertTrue(source.exists())
+
+    def test_neutral_installer_launch_path_keeps_neutral_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "wsu-apply.exe"
+            source.write_bytes(b"installer")
+
+            self.assertEqual(
+                update_monitor_module._neutral_installer_launch_path(source),
+                source,
+            )
+
+    def test_release_download_progress_maps_bytes_to_download_stage(self) -> None:
+        snapshots = [
+            build_release_download_progress_snapshot("v0.22.3", 0, 100),
+            build_release_download_progress_snapshot("v0.22.3", 50, 100),
+            build_release_download_progress_snapshot("v0.22.3", 100, 100),
+        ]
+
+        self.assertEqual([snapshot["percent"] for snapshot in snapshots], [24, 46, 68])
+        self.assertTrue(all(snapshot["progressbar"]["visible"] for snapshot in snapshots))
+        self.assertIn("50%", snapshots[1]["detail"])
+        unknown_length = build_release_download_progress_snapshot("v0.22.3", 4096, None)
+        self.assertEqual(unknown_length["percent"], 24)
+        self.assertIn("4.0 KiB", unknown_length["detail"])
+
+    def test_release_download_progress_shows_measured_speed_and_eta_only_when_known(self) -> None:
+        known = build_release_download_progress_snapshot(
+            "v0.22.3",
+            50_000_000,
+            100_000_000,
+            bytes_per_second=5_000_000,
+        )
+        unknown = build_release_download_progress_snapshot(
+            "v0.22.3",
+            50_000,
+            None,
+            bytes_per_second=500_000,
+        )
+
+        self.assertIn("5.0 MB/s", known["detail"])
+        self.assertIn("약 00:10 남음", known["detail"])
+        self.assertIn("500 KB/s", unknown["detail"])
+        self.assertNotIn("남음", unknown["detail"])
+
+    def test_release_download_telemetry_uses_a_real_sample_window(self) -> None:
+        telemetry = ReleaseDownloadTelemetry()
+
+        self.assertIsNone(telemetry.observe(0, now=10.0))
+        self.assertIsNone(telemetry.observe(1_000_000, now=10.2))
+        self.assertAlmostEqual(
+            telemetry.observe(2_000_000, now=10.8),
+            2_500_000.0,
+        )
+        self.assertIsNone(telemetry.observe(0, now=11.0))
 
     def test_update_handoff_progress_ui_uses_borderless_shell_and_collapses_empty_activity(self) -> None:
         try:
@@ -739,6 +1103,54 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         finally:
             progress.close()
 
+    def test_update_handoff_progress_ui_keeps_runtime_readiness_wait_bar_moving(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        try:
+            probe = tk.Tk()
+            probe.withdraw()
+            probe.destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk unavailable: {exc}")
+
+        progress = UpdateHandoffProgressUi()
+        try:
+            progress.show(
+                build_release_installer_progress_snapshot(
+                    build_update_progress_snapshot(
+                        "release_relaunch",
+                        state="running",
+                        phase_fraction=0.35,
+                        progress_mode="indeterminate",
+                        detail="새 Windows Supporter 프로세스를 실행했습니다. 준비 신호를 기다립니다.",
+                    )
+                )
+            )
+            if progress._root is None:
+                self.skipTest("Tk updater window could not be created")
+
+            self.assertEqual(
+                str(progress._title_label.cget("text")),
+                "Windows Supporter 업데이트 · 2/2 설치",
+            )
+            self.assertEqual(str(progress._stage_label.cget("text")), "새 버전 재실행 중")
+            self.assertEqual(
+                str(progress._detail_label.cget("text")),
+                "새 Windows Supporter 프로세스를 실행했습니다. 준비 신호를 기다립니다.",
+            )
+            initial_offset = progress._progress_pulse_offset
+            deadline = time.monotonic() + 0.7
+            while time.monotonic() < deadline and progress._progress_pulse_offset == initial_offset:
+                progress.pump()
+                time.sleep(0.04)
+
+            self.assertGreater(progress._progress_pulse_offset, initial_offset)
+        finally:
+            progress.close()
+
     def test_update_handoff_progress_ui_uses_requested_height_at_equivalent_150_percent(self) -> None:
         try:
             import tkinter as tk
@@ -780,8 +1192,8 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         assert stale_workers is not None
         assert uv_sync is not None
         assert build is not None
-        self.assertLessEqual(stale_workers["percent"], 20)
-        self.assertLessEqual(uv_sync["percent"], 35)
+        self.assertEqual(stale_workers["percent"], 47)
+        self.assertEqual(uv_sync["percent"], 54)
         self.assertLess(build["percent"], 80)
         self.assertLess(stale_workers["percent"], uv_sync["percent"])
         self.assertLess(uv_sync["percent"], build["percent"])
@@ -888,6 +1300,61 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertIn("function Add-Descendants([int]$treePid)", script)
         self.assertIn("$childPid -eq $PID", script)
         self.assertNotIn("function Add-Descendants([int]$pid)", script)
+
+    def test_exact_runtime_shutdown_terminates_all_matching_processes_and_rechecks(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.find_calls = []
+                self.terminate_calls = []
+                self._remaining = [101, 102]
+
+            def find_exact(self, executable):
+                self.find_calls.append(Path(executable))
+                current = list(self._remaining)
+                if current:
+                    self._remaining = []
+                return current
+
+            def terminate_tree(self, pids, timeout_seconds):
+                self.terminate_calls.append((list(pids), timeout_seconds))
+                return list(pids)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "windows-supporter.exe"
+            executable.write_bytes(b"runtime")
+            controller = FakeController()
+
+            result = update_monitor_module._stop_exact_installed_runtime(
+                executable,
+                process_controller=controller,
+                timeout_seconds=4,
+            )
+
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["matched_pids"], [101, 102])
+        self.assertEqual(result["terminated_pids"], [101, 102])
+        self.assertEqual(controller.terminate_calls, [([101, 102], 4.0)])
+        self.assertEqual(len(controller.find_calls), 2)
+
+    def test_exact_runtime_shutdown_blocks_when_a_matching_process_survives(self) -> None:
+        class StuckController:
+            def find_exact(self, _executable):
+                return [777]
+
+            def terminate_tree(self, _pids, _timeout_seconds):
+                return [777]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "windows-supporter.exe"
+            executable.write_bytes(b"runtime")
+
+            with self.assertRaises(update_monitor_module.UpdateHandoffError) as caught:
+                update_monitor_module._stop_exact_installed_runtime(
+                    executable,
+                    process_controller=StuckController(),
+                )
+
+        self.assertIn("installer를 실행하지 않았습니다", str(caught.exception))
 
     def test_update_korean_ux_copy_distinguishes_cleanup_source_and_force_clean(self) -> None:
         self.assertIn("강제정리", UPDATE_FORCE_CLEAN_APPROVAL_TEXT)
@@ -1073,6 +1540,48 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("커밋되지 않은 변경", warnings[0][1])
         self.assertIn("stash", warnings[0][1])
+        self.assertEqual(launches, [True])
+
+    def test_failed_release_candidate_is_skipped_once_for_auto_check(self) -> None:
+        with patch.dict(
+            os.environ,
+            {UPDATE_SKIP_AUTO_UPDATE_TAG_ENV: "v0.5.7"},
+            clear=False,
+        ):
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=".",
+            )
+
+        candidate = UpdateCandidate(tag="v0.5.7", version=(0, 5, 7))
+        asks = []
+        launches = []
+        updater._ask_update = lambda item: asks.append(item.tag) or True
+        updater._inspect_working_tree_state = lambda: UpdateWorkingTreeState()
+        updater._prepare_repository_for_update = lambda _working_tree: True
+        updater.launch_update = lambda: launches.append(True) or True
+
+        updater._handle_check_result(
+            candidate,
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=False,
+        )
+
+        self.assertEqual(asks, [])
+        self.assertEqual(launches, [])
+        self.assertEqual(updater.get_status_snapshot()["state"], "update_available")
+        self.assertIn("직전 설치 실패", updater.get_status_snapshot()["last_error"])
+
+        updater._handle_check_result(
+            candidate,
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        self.assertEqual(asks, [candidate.tag])
         self.assertEqual(launches, [True])
 
     def test_cleanup_only_update_launch_does_not_show_uncommitted_warning(self) -> None:
@@ -1626,13 +2135,17 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(state["deployment_receipt"]["status"], "success")
         self.assertEqual(state["progress"]["label"], "업데이트 완료")
         self.assertEqual(progress_instances[0].snapshots[0]["step_key"], "handoff_start")
-        self.assertLessEqual(progress_instances[0].snapshots[0]["percent"], 5)
+        self.assertEqual(progress_instances[0].snapshots[0]["percent"], 34)
         self.assertEqual(
             [snapshot["label"] for snapshot in progress_instances[0].snapshots],
             [
-                "업데이트 프로세스 시작",
+                "업데이트 프로세스 연결 중",
                 "기존 앱 정리 중",
                 "빌드 준비 중",
+                "새 버전 배포 중",
+                "새 버전 배포 중",
+                "임시 산출물 정리 중",
+                "임시 산출물 정리 중",
                 "Windows Supporter 재실행 중",
                 "업데이트 완료",
             ],
@@ -2054,7 +2567,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         self.assertEqual(snapshots_during_ack[0]["state"], "updating")
         self.assertEqual(snapshots_during_ack[0]["progress"]["step_key"], "handoff")
-        self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 68)
+        self.assertEqual(snapshots_during_ack[0]["progress"]["percent"], 34)
         self.assertEqual(quit_calls, [True])
 
     def test_auto_update_settings_persist_and_gate_scheduling(self) -> None:
@@ -2247,7 +2760,7 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         snapshot = updater.get_status_snapshot()
         self.assertEqual(snapshot["state"], "updating")
         self.assertEqual(snapshot["progress"]["label"], "업데이트 실행 준비 중")
-        self.assertEqual(snapshot["progress"]["percent"], 68)
+        self.assertEqual(snapshot["progress"]["percent"], 34)
         self.assertEqual(len(launches), 1)
         self.assertEqual(
             launches[0][0],
@@ -2263,6 +2776,73 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         )
         self.assertEqual(state["working_tree"]["cleanup_targets"], ["build/generated.tmp"])
         self.assertEqual(state["preflight"]["force_clean_approved"], False)
+
+    def test_release_launcher_completes_before_requesting_parent_exit(self) -> None:
+        events = []
+
+        class FakeProgressUi:
+            def __init__(self, **_kwargs):
+                self.snapshots = []
+                self.closed = False
+
+            def show(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def set_snapshot(self, snapshot):
+                self.snapshots.append(dict(snapshot))
+
+            def close(self):
+                self.closed = True
+
+        progress_instances = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as fp:
+                fp.write("gitdir: .git\n")
+            Path(tmp, "windows-supporter.exe").write_bytes(b"runtime")
+            state_path = Path(tmp) / "update_handoff.json"
+            updater = WindowsSupporterUpdater(
+                root=object(),
+                event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+                repo_root=tmp,
+                popen=lambda *_args, **_kwargs: object(),
+                quit_callback=lambda: events.append(("quit",)),
+                handoff_path_provider=lambda: state_path,
+                handoff_command_builder=lambda path: [
+                    "python",
+                    "main.py",
+                    UPDATE_HANDOFF_ARG,
+                    str(path),
+                ],
+                handoff_ack_waiter=lambda _path: events.append(("ack", list(events))) or True,
+                worktree_runner=_primary_worktree_runner(tmp),
+                progress_ui_factory=lambda **kwargs: progress_instances.append(
+                    FakeProgressUi(**kwargs)
+                )
+                or progress_instances[-1],
+                release_client=object(),
+            )
+            updater._latest_tag = "v0.23.1"
+            updater._latest_candidate = UpdateCandidate(
+                tag="v0.23.1",
+                version=(0, 23, 1),
+                installer_name="WindowsSupporter-v0.23.1-Setup.exe",
+                installer_url="https://github.com/ameforce/windows-supporter/releases/download/v0.23.1/WindowsSupporter-v0.23.1-Setup.exe",
+                installer_sha256="A" * 64,
+            )
+            updater._show_or_update_preflight_progress_ui(
+                build_update_progress_snapshot("accepted", state="running", phase_fraction=0.0)
+            )
+
+            self.assertTrue(updater.launch_update())
+
+        self.assertEqual(events, [("ack", []), ("quit",)])
+        self.assertEqual(len(progress_instances), 1)
+        snapshots = progress_instances[0].snapshots
+        self.assertEqual(snapshots[0]["title"], "Windows Supporter 업데이트 · 1/2 준비")
+        self.assertEqual(snapshots[0]["percent"], 0)
+        self.assertEqual(snapshots[-1]["step_key"], "release_handoff_ack")
+        self.assertEqual(snapshots[-1]["percent"], 100)
+        self.assertTrue(progress_instances[0].closed)
 
     def test_launch_update_cleans_current_process_descendants_before_exit(self) -> None:
         events = []

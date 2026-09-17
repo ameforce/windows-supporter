@@ -3,6 +3,7 @@ import os
 import queue
 import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import patch
 
@@ -308,15 +309,38 @@ class MainUiDashboardUnitTest(unittest.TestCase):
             ensure_dashboard.assert_called_once()
             self.assertEqual(load_last_tab(valid_tabs=ui._valid_tab_keys(), path=path), "dashboard")
 
+    def test_hidden_show_fits_before_deiconifying_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "main_ui_state.json")
+            ui, root, _, _, _ = self._build_ui(path)
+            events = []
+            root.state = lambda: "withdrawn"
+            root.withdraw = lambda: events.append("withdraw")
+            root.deiconify = lambda: events.append("deiconify")
+
+            with patch.object(
+                ui,
+                "_ensure_dashboard_built",
+                side_effect=lambda: events.append("build"),
+            ):
+                with patch.object(
+                    ui,
+                    "_apply_tab_geometry",
+                    side_effect=lambda _tab: events.append("fit"),
+                ):
+                    ui.show()
+
+            self.assertEqual(events[:4], ["withdraw", "build", "fit", "deiconify"])
+
     def test_dashboard_uses_compact_default_geometry(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "main_ui_state.json")
             ui, _, _, _, _ = self._build_ui(path)
 
-            # 6개 기능 섹션이 2열 카드로 배치되므로 기본 높이는 스크롤
-            # 없이 전체 요약이 보이는 크기를 따른다.
-            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (1080, 660))
-            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (940, 500))
+            # 6개 기능 섹션이 2열 카드로 배치되며, mount 전 fallback도
+            # 작업 영역을 과도하게 점유하지 않는 compact 기준을 따른다.
+            self.assertEqual(ui._tab_sizes.get(ui._TAB_DASHBOARD), (900, 460))
+            self.assertEqual(ui._tab_minsizes.get(ui._TAB_DASHBOARD), (700, 380))
 
     def test_show_restores_persisted_valid_tab(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -712,6 +736,27 @@ class MainUiDashboardUnitTest(unittest.TestCase):
 
 
 class DashboardViewFormattingUnitTest(unittest.TestCase):
+    def test_preferred_size_uses_embedded_dashboard_and_scrollbar_requirements(self):
+        class _RequestedWidget:
+            def __init__(self, width, height):
+                self.width = width
+                self.height = height
+
+            def update_idletasks(self):
+                return None
+
+            def winfo_reqwidth(self):
+                return self.width
+
+            def winfo_reqheight(self):
+                return self.height
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._dashboard_scroll_container = _RequestedWidget(948, 491)
+        view._dashboard_scrollbar = _RequestedWidget(17, 491)
+
+        self.assertEqual(view.preferred_size(), (965, 491))
+
     def test_ai_usage_callback_prefers_primary_and_falls_back_to_codex(self):
         calls = []
         view = DashboardView(
@@ -799,8 +844,8 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
             }
         )
 
-        attached_text = next(text for text, _style in parts if text.startswith("연결된 기능:"))
-        self.assertEqual(attached_text, "연결된 기능: AI 사용량")
+        summary_text = next(text for text, _style in parts if text.startswith("전경 "))
+        self.assertEqual(summary_text, "전경 없음 · 연결 AI 사용량")
 
     def test_minutes_are_displayed_as_hours_and_minutes(self):
         view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
@@ -1101,6 +1146,305 @@ class DashboardViewFormattingUnitTest(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(parts[0], ("지원 안 됨", "disabled"))
         self.assertIn(("Git checkout 필요", "normal"), parts)
+
+
+class DashboardViewLayoutUnitTest(unittest.TestCase):
+    def _recording_widget_factories(self):
+        created = {"frames": [], "labels": [], "buttons": []}
+
+        class _Widget:
+            def __init__(self, parent=None, *_args, **kwargs):
+                self.parent = parent
+                self.kwargs = dict(kwargs)
+                self.children = []
+                self.bindings = {}
+                self.pack_kwargs = {}
+                self.grid_kwargs = {}
+                self.destroyed = False
+                self._width = 0
+                if parent is not None:
+                    parent.children.append(self)
+
+            def pack(self, **kwargs):
+                self.pack_kwargs = dict(kwargs)
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+            def configure(self, **kwargs):
+                self.kwargs.update(kwargs)
+
+            def bind(self, sequence, callback):
+                self.bindings[sequence] = callback
+
+            def after_idle(self, callback):
+                callback()
+
+            def destroy(self):
+                self.destroyed = True
+                if self.parent is not None and self in self.parent.children:
+                    self.parent.children.remove(self)
+
+            def winfo_children(self):
+                return list(self.children)
+
+            def winfo_width(self):
+                return self._width
+
+        def _frame(parent=None, **kwargs):
+            widget = _Widget(parent, **kwargs)
+            created["frames"].append(widget)
+            return widget
+
+        def _label(parent=None, **kwargs):
+            widget = _Widget(parent, **kwargs)
+            created["labels"].append(widget)
+            return widget
+
+        def _button(parent=None, **kwargs):
+            widget = _Widget(parent, **kwargs)
+            created["buttons"].append(widget)
+            return widget
+
+        return created, _frame, _label, _button
+
+    def test_dashboard_cards_stretch_to_share_row_height(self):
+        class _Grid:
+            def winfo_width(self):
+                return 0
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+        class _Card:
+            def __init__(self):
+                self.grid_kwargs = {}
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        cards = [_Card() for _ in range(6)]
+
+        view._layout_dashboard_cards(_Grid(), cards, available_width=900)
+
+        self.assertTrue(all(card.grid_kwargs["sticky"] == "nsew" for card in cards))
+
+    def test_update_card_actions_share_the_title_row_like_other_sections(self):
+        created, _frame, _label, _button = self._recording_widget_factories()
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._tk = types.SimpleNamespace(Frame=_frame, Label=_label)
+        view._ttk = types.SimpleNamespace(Button=_button)
+
+        view._add_update_section(
+            _frame(),
+            [],
+            text="#111827",
+            bg="#FFFFFF",
+            border="#E5E7EB",
+        )
+
+        title_label = next(
+            widget for widget in created["labels"] if widget.kwargs.get("text") == "Update"
+        )
+        self.assertEqual(len(created["buttons"]), 2)
+        for button in created["buttons"]:
+            self.assertIs(button.parent.parent, title_label.parent)
+        status_frame = view._status_frames["update"]
+        status_row = status_frame.parent
+        self.assertIsNot(status_row, title_label.parent)
+        self.assertEqual(status_row.children, [status_frame])
+        self.assertEqual(status_frame.grid_kwargs["sticky"], "ew")
+
+    def test_status_lines_split_parts_that_exceed_the_frame_width(self):
+        groups = [[("업데이트 가능", "enabled"), ("v0.26.0 -> v0.26.1", "normal")]]
+        widths = {"업데이트 가능": 80, "v0.26.0 -> v0.26.1": 120, " | ": 14}
+        measure = lambda text, _kind: widths[text]
+
+        wide = DashboardView._status_lines_for_width(groups, 220, measure)
+        self.assertEqual(
+            [[item[0] for item in line] for line in wide],
+            [["업데이트 가능", "v0.26.0 -> v0.26.1"]],
+        )
+
+        narrow = DashboardView._status_lines_for_width(groups, 200, measure)
+        self.assertEqual(
+            [[item[0] for item in line] for line in narrow],
+            [["업데이트 가능"], ["v0.26.0 -> v0.26.1"]],
+        )
+        self.assertFalse(any(item[2] for line in narrow for item in line))
+
+        unknown = DashboardView._status_lines_for_width(groups, 0, measure)
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(len(unknown[0]), 2)
+
+    def test_status_line_marks_oversized_part_to_wrap_in_place(self):
+        groups = [[("매우 긴 업데이트 오류 상세 메시지", "normal")]]
+        measure = lambda text, _kind: 30 if text == " | " else 240
+
+        lines = DashboardView._status_lines_for_width(groups, 100, measure)
+
+        self.assertEqual(lines, [[("매우 긴 업데이트 오류 상세 메시지", "normal", True)]])
+
+    def test_status_reflow_rebuilds_lines_when_the_frame_width_changes(self):
+        created, _frame, _label, _button = self._recording_widget_factories()
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._tk = types.SimpleNamespace(Frame=_frame, Label=_label)
+        frame = _frame()
+        frame._width = 400
+        view._status_frames["update"] = frame
+        view._measure_status_part_width = lambda text, _kind: {
+            "업데이트 가능": 80,
+            "v0.26.0 -> v0.26.1": 120,
+            " | ": 14,
+        }[text]
+
+        view._set_status_parts(
+            "update",
+            [("업데이트 가능", "enabled"), ("v0.26.0 -> v0.26.1", "normal")],
+        )
+        self.assertEqual(len(frame.children), 1)
+
+        frame._width = 200
+        frame.bindings["<Configure>"]()
+        self.assertEqual(len(frame.children), 2)
+        self.assertEqual(
+            [child.kwargs.get("text") for child in frame.children[1].children],
+            ["v0.26.0 -> v0.26.1"],
+        )
+
+        frame._width = 100
+        frame.bindings["<Configure>"]()
+        version_label = next(
+            child
+            for row in frame.children
+            for child in row.children
+            if child.kwargs.get("text") == "v0.26.0 -> v0.26.1"
+        )
+        self.assertEqual(version_label.kwargs.get("wraplength"), 100)
+
+    def test_dashboard_grid_rows_share_extra_viewport_height_evenly(self):
+        class _Grid:
+            def __init__(self):
+                self.columns = {}
+                self.rows = {}
+
+            def winfo_width(self):
+                return 0
+
+            def columnconfigure(self, index, **kwargs):
+                self.columns[int(index)] = dict(kwargs)
+
+            def rowconfigure(self, index, **kwargs):
+                self.rows[int(index)] = dict(kwargs)
+
+        class _Card:
+            def grid(self, **_kwargs):
+                return None
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        grid = _Grid()
+        cards = [_Card() for _ in range(6)]
+
+        view._layout_dashboard_cards(grid, cards, available_width=900)
+        self.assertEqual(
+            [grid.rows[row].get("weight") for row in range(3)],
+            [1, 1, 1],
+        )
+        # Uniform rows would inflate the requested content height to the
+        # tallest card and bake blank space into a content-fit window.
+        self.assertTrue(
+            all(
+                grid.rows[row].get("uniform") in (None, "")
+                for row in range(3)
+            )
+        )
+
+        # Collapsing to one column reweights the new row set, and switching
+        # back clears the stale rows so they cannot keep stale weight.
+        view._layout_dashboard_cards(grid, cards, available_width=640)
+        self.assertEqual(
+            [grid.rows[row].get("weight") for row in range(6)],
+            [1, 1, 1, 1, 1, 1],
+        )
+        view._layout_dashboard_cards(grid, cards, available_width=900)
+        self.assertEqual(
+            [grid.rows[row].get("weight") for row in range(3, 6)],
+            [0, 0, 0],
+        )
+
+    def test_dashboard_scroll_geometry_stretches_content_to_viewport(self):
+        class _Canvas:
+            def __init__(self):
+                self.item_kwargs = {}
+                self.scrollregion = None
+
+            def winfo_width(self):
+                return 330
+
+            def winfo_height(self):
+                return 914
+
+            def itemconfigure(self, _window_id, **kwargs):
+                self.item_kwargs = dict(kwargs)
+
+            def bbox(self, _tag):
+                return (0, 0, 330, 914)
+
+            def configure(self, **kwargs):
+                self.scrollregion = kwargs.get("scrollregion")
+
+        class _Container:
+            def winfo_reqheight(self):
+                return 600
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        canvas = _Canvas()
+        view._dashboard_scroll_canvas = canvas
+        view._dashboard_scroll_container = _Container()
+        view._dashboard_scroll_window_id = 7
+
+        view._sync_dashboard_scroll_geometry()
+
+        self.assertEqual(canvas.item_kwargs.get("width"), 330)
+        self.assertEqual(canvas.item_kwargs.get("height"), 914)
+
+    def test_dashboard_scroll_geometry_keeps_content_height_when_taller(self):
+        class _Canvas:
+            def __init__(self):
+                self.item_kwargs = {}
+
+            def winfo_width(self):
+                return 700
+
+            def winfo_height(self):
+                return 500
+
+            def itemconfigure(self, _window_id, **kwargs):
+                self.item_kwargs = dict(kwargs)
+
+            def bbox(self, _tag):
+                return (0, 0, 700, 1200)
+
+            def configure(self, **_kwargs):
+                return None
+
+        class _Container:
+            def winfo_reqheight(self):
+                return 1200
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        canvas = _Canvas()
+        view._dashboard_scroll_canvas = canvas
+        view._dashboard_scroll_container = _Container()
+        view._dashboard_scroll_window_id = 3
+
+        view._sync_dashboard_scroll_geometry()
+
+        self.assertEqual(canvas.item_kwargs.get("height"), 1200)
 
 
 if __name__ == "__main__":

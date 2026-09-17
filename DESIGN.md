@@ -62,10 +62,14 @@ Progress percentages represent user-perceived lifecycle stage, not elapsed time.
 Preflight and Git GUI resolution happen before build, so they must appear before
 the progress bar reaches the high build range. Build output may refine progress
 inside the build range, but it should not be the first visible progress state.
-The handoff helper owns a separate visible lifecycle after the original app
-starts exiting: it starts at 0%, shows old-app cleanup in the low range, then
-maps build.bat output from early to late percentages instead of beginning around
-80%.
+The handoff helper continues the same visible lifecycle after the original app
+starts exiting. Its state file carries the last acknowledged percent into the
+new process; it must not reset to 0% or replay an unrelated low-range stage.
+Each observable phase owns a start/end range. Byte-level download callbacks and
+structured build markers refine progress inside that phase, while opaque work
+advances at explicit phase boundaries without pretending to know its internal
+elapsed time. Progress publication is monotonic across both processes and
+across retry attempts.
 
 ## 6. Process Cleanup
 
@@ -96,7 +100,7 @@ Automated and smoke QA must cover:
 - user rejection cancels and suppresses the same prompt,
 - user approval records close/relaunch metadata in handoff state,
 - handoff relaunches Windows Supporter and any approved Git GUI app,
-- handoff helper progress starts at 0% and build output advances through the
-  full visible range,
+- handoff helper inherits the parent percent and build output advances through
+  the full visible range,
 - update handoff cleanup terminates original child processes without terminating
   the helper.

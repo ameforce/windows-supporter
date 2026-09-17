@@ -110,22 +110,141 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
     def select(self, index):
         self.panel._widgets["rows"][index][1].bindings["<Button-1>"](SimpleNamespace())
 
-    def test_selecting_date_keeps_each_log_and_excludes_other_dates(self):
+    def test_selecting_date_groups_same_ticket_and_excludes_other_dates(self):
         rows = (
             TimelogDetailRow("2026-04-06", "L1", "T1", 15, "first action", "Shared ticket", "ready"),
             TimelogDetailRow("2026-04-06", "L2", "T1", 45, "second action", "Shared ticket", "ready"),
             TimelogDetailRow("2026-04-07", "L3", "T2", 30, "Tuesday only", "Other ticket", "ready"),
         )
         self.make(_details(rows=rows))
-        self.assertEqual(self.detail_text().count("Shared ticket"), 2)
-        self.assertIn("first action", self.detail_text())
-        self.assertIn("second action", self.detail_text())
-        self.assertNotIn("Other ticket", self.detail_text())
+        text = self.detail_text()
+        self.assertEqual(text.count("Shared ticket"), 1)
+        self.assertIn("• Shared ticket · 티켓 합계 01:00 · 2건", text)
+        self.assertIn("  ◦ 00:15", text)
+        self.assertIn("  ◦ 00:45", text)
+        self.assertIn("first action", text)
+        self.assertIn("second action", text)
+        self.assertNotIn("Other ticket", text)
         self.select(1)
         self.assertIn("Other ticket", self.detail_text())
+        self.assertIn("• Other ticket · 00:30 · 1건", self.detail_text())
+        self.assertIn("  ◦ 00:30 · Tuesday only", self.detail_text())
         self.assertIn("Tuesday only", self.detail_text())
         self.assertNotIn("Shared ticket", self.detail_text())
         self.assertEqual(self.panel._selected_date_key, "2026-04-07")
+
+    def test_detail_text_groups_ticket_and_keeps_each_comment_readable(self):
+        rows = (
+            TimelogDetailRow(
+                "2026-04-06",
+                "L1",
+                "T1",
+                75,
+                "첫 번째 작업 설명",
+                "아주 긴 라이선스 검증 티켓 제목",
+                "ready",
+            ),
+            TimelogDetailRow(
+                "2026-04-06",
+                "L2",
+                "T1",
+                135,
+                "두 번째 작업 설명",
+                "아주 긴 라이선스 검증 티켓 제목",
+                "ready",
+            ),
+        )
+        self.make(_details(rows=rows))
+        text = self.detail_text()
+
+        self.assertNotIn("실제 기록 합계", text)
+        self.assertIn("• 아주 긴 라이선스 검증 티켓 제목 · 티켓 합계 03:30 · 2건", text)
+        self.assertIn("  ◦ 01:15", text)
+        self.assertIn("  ◦ 02:15", text)
+        self.assertEqual(text.count("아주 긴 라이선스 검증 티켓 제목"), 1)
+        self.assertIn("첫 번째 작업 설명", text)
+        self.assertIn("두 번째 작업 설명", text)
+        self.assertIn("  ◦ 01:15 · 첫 번째 작업 설명", text)
+        self.assertIn("  ◦ 02:15 · 두 번째 작업 설명", text)
+        self.assertNotIn("메모:", text)
+        self.assertNotIn("티켓  ", text)
+        self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 8)
+
+    def test_ticket_heading_is_single_line_and_uses_ellipsis_when_needed(self):
+        long_title = (
+            "공수처 KICS HP-UX pdfio 정규식 미지원 빌드로 CPO-00004 발생 원인 분석\n"
+            "추가 설명까지 포함된 긴 티켓 제목"
+        )
+        row = TimelogDetailRow(
+            "2026-04-06",
+            "L1",
+            "T1",
+            45,
+            "작업 메모",
+            long_title,
+            "ready",
+        )
+        self.make(_details(rows=(row,)))
+
+        heading = next(
+            line for line in self.detail_text().splitlines() if line.startswith("• ")
+        )
+        self.assertIn("...", heading)
+        self.assertNotIn("\n", heading)
+        self.assertTrue(heading.endswith(" · 00:45 · 1건"))
+        self.assertIn("  ◦ 00:45 · 작업 메모", self.detail_text())
+
+    def test_detail_viewport_uses_a_bounded_readable_height_for_loaded_rows(self):
+        self.make(_details())
+        text = self.panel._widgets["detail_text"]
+        self.assertEqual(text.kwargs["height"], 5)
+        window = self.tk.toplevels[0]
+        window.requested_height = 420
+        before_geometry_count = len(window.geometry_calls)
+
+        rows = (
+            TimelogDetailRow(
+                "2026-04-06", "L1", "T1", 45, "loaded action", "Loaded ticket", "ready",
+            ),
+            TimelogDetailRow(
+                "2026-04-06", "L2", "T1", 30, "second action", "Loaded ticket", "ready",
+            ),
+        )
+        self.holder["model"] = replace(
+            self.holder["model"],
+            day_details=_details(rows=rows),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertEqual(text.kwargs["height"], 8)
+        self.assertEqual(len(window.geometry_calls), before_geometry_count + 1)
+        self.assertIn("x420", window.geometry_calls[-1])
+
+        window.requested_height = 360
+        before_geometry_count = len(window.geometry_calls)
+        self.holder["model"] = replace(
+            self.holder["model"],
+            day_details=_details(),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertEqual(text.kwargs["height"], 5)
+        self.assertEqual(len(window.geometry_calls), before_geometry_count + 1)
+        self.assertIn("x360", window.geometry_calls[-1])
+
+    def test_single_loaded_row_gets_a_readable_nested_viewport(self):
+        self.make(_details())
+        text = self.panel._widgets["detail_text"]
+        window = self.tk.toplevels[0]
+        before_geometry_count = len(window.geometry_calls)
+        row = TimelogDetailRow(
+            "2026-04-06", "L1", "T1", 45, "loaded action", "Loaded ticket", "ready",
+        )
+        self.holder["model"] = replace(
+            self.holder["model"],
+            day_details=_details(rows=(row,)),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertEqual(text.kwargs["height"], 8)
+        self.assertEqual(len(window.geometry_calls), before_geometry_count)
 
     def test_loading_and_unavailable_never_claim_empty(self):
         self.make(_details(state="loading"))
@@ -179,16 +298,22 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertNotIn("OLD PRIVATE COMMENT", self.detail_text())
         self.assertNotIn("기록이 없습니다", self.detail_text())
 
-    def test_missing_title_preserves_minutes_and_comment_with_distinct_fallback(self):
+    def test_missing_title_preserves_minutes_and_comments_with_distinct_fallback(self):
+        task_ids = ("", "T1", "T2")
         rows = tuple(
-            TimelogDetailRow("2026-04-06", f"L{index}", "T" if index else "", 15, f"comment-{state}", title_state=state)
+            TimelogDetailRow("2026-04-06", f"L{index}", task_ids[index], 15, f"comment-{state}", title_state=state)
             for index, state in enumerate(("missing", "loading", "unavailable"))
         )
         self.make(_details(rows=rows))
+        text = self.detail_text()
+        self.assertNotIn("실제 기록 합계", text)
         for row in rows:
-            self.assertIn(row.comment, self.detail_text())
-            self.assertIn(row.ticket_text, self.detail_text())
-        self.assertNotIn("기록이 없습니다", self.detail_text())
+            self.assertIn(row.comment, text)
+            self.assertIn(row.ticket_text, text)
+        self.assertEqual(text.count("· 1건"), 3)
+        self.assertIn("comment-missing", text)
+        self.assertNotIn("메모:", text)
+        self.assertNotIn("기록이 없습니다", text)
 
     def test_default_show_reopen_toggle_and_refresh_use_passive_path(self):
         self.make(_details())
@@ -262,7 +387,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             TimelogDetailRow("2026-04-06", "L1", "T1", 1500, "Long recorded entry"),
             TimelogDetailRow("2026-04-06", "L2", "T2", 60, "Another entry"),
         )))
-        self.assertIn("실제 기록 합계 26:00", self.detail_text())
+        self.assertNotIn("실제 기록 합계", self.detail_text())
         self.assertIn("25:00", self.detail_text())
         self.assertNotIn("24:00", self.detail_text())
         self.assertEqual(self.panel._format_target_minutes(1500), "24:00")
@@ -283,7 +408,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         entry = self.panel._widgets["inline_entry"]
         entry.delete(0, "end")
         entry.insert(0, "07:37")
-        for transition in ("prompt_appears", "prompt_disappears", "today_lines_change"):
+        for transition in ("prompt_appears", "prompt_disappears"):
             with self.subTest(transition=transition):
                 before_text = self.panel._widgets["detail_text"]
                 before_text.yview_moveto(0.8)
@@ -292,8 +417,6 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
                     model = replace(model, prompt=WorktimeActivityPrompt("08:35"))
                 elif transition == "prompt_disappears":
                     model = replace(model, prompt=None)
-                else:
-                    model = replace(model, today_lines=model.today_lines + (WorktimePanelLine("Additional summary", "#111827"),))
                 self.holder["model"] = model
                 self.assertTrue(self.panel.refresh_now())
                 after_text = self.panel._widgets["detail_text"]
@@ -303,6 +426,20 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
                 self.assertEqual(self.panel._widgets["inline_entry"].get(), "07:37")
                 self.assertTrue(self.panel._inline_editor_active)
                 self.active.assert_not_called()
+
+        before_text = self.panel._widgets["detail_text"]
+        before_text.yview_moveto(0.8)
+        self.holder["model"] = replace(
+            self.holder["model"],
+            today_lines=self.holder["model"].today_lines
+            + (WorktimePanelLine("Additional summary", "#111827"),),
+        )
+        self.assertTrue(self.panel.refresh_now())
+        self.assertIs(self.panel._widgets["detail_text"], before_text)
+        self.assertEqual(before_text.yview()[0], 0.8)
+        self.assertEqual(self.panel._widgets["today_lines"][1].kwargs["text"], "추가 상태 2건")
+        self.assertEqual(self.panel._widgets["inline_entry"].get(), "07:37")
+        self.assertTrue(self.panel._inline_editor_active)
         self.holder["model"] = replace(
             _model(week_start=date(2026, 4, 13)),
             day_details=_details(start=date(2026, 4, 13), state="loading"),

@@ -200,6 +200,7 @@ class _FakeTtk:
         self.buttons = []
         self.entries = []
         self.scrollbars = []
+        self.radiobuttons = []
 
     def Entry(self, *args, **kwargs):
         widget = _FakeWidget(self, *args, **kwargs)
@@ -212,8 +213,24 @@ class _FakeTtk:
     def Scrollbar(self, *args, **kwargs):
         return _FakeScrollbar(self, *args, **kwargs)
 
+    def Radiobutton(self, *args, **kwargs):
+        widget = _FakeWidget(self, *args, **kwargs)
+        self.radiobuttons.append(widget)
+        return widget
+
 
 class CodexUsageUiUnitTest(unittest.TestCase):
+    def test_runtime_value_updates_skip_unchanged_tk_variable_writes(self) -> None:
+        variable = _FakeVar(value="ready")
+        writes = []
+        variable.trace_add("write", lambda *_args: writes.append(variable.get()))
+
+        self.assertFalse(CodexUsageSettingsView._set_var_if_changed(variable, "ready"))
+        self.assertEqual(writes, [])
+
+        self.assertTrue(CodexUsageSettingsView._set_var_if_changed(variable, "busy"))
+        self.assertEqual(writes, ["busy"])
+
     def test_post_ui_propagates_dispatch_rejection(self) -> None:
         view = CodexUsageSettingsView(
             root=None,
@@ -317,6 +334,23 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             payload={"on_demand_enabled": False, "on_demand_status": "OFF"},
         )
 
+        self.assertEqual(codex_value.grid_remove_calls, 1)
+        self.assertEqual(codex_reset.grid_remove_calls, 1)
+        self.assertEqual(cursor_od.grid_remove_calls, 1)
+
+        # A steady-state polling tick must not re-run Tk geometry operations.
+        view._update_account_metric_visibility(
+            "codex-1",
+            provider="codex",
+            descriptor_keys={"weekly_limit"},
+            payload={"weekly_limit": "80%"},
+        )
+        view._update_account_metric_visibility(
+            "cursor-1",
+            provider="cursor",
+            descriptor_keys={"included_usage"},
+            payload={"on_demand_enabled": False, "on_demand_status": "OFF"},
+        )
         self.assertEqual(codex_value.grid_remove_calls, 1)
         self.assertEqual(codex_reset.grid_remove_calls, 1)
         self.assertEqual(cursor_od.grid_remove_calls, 1)
@@ -523,6 +557,98 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "활성화 · US$8.20\u00a0사용",
         )
 
+    def test_claude_metric_rows_use_five_hour_weekly_and_scoped_contract(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        fake_tk = _FakeTk()
+        view._tk = fake_tk
+
+        metric_vars, display_vars = view._build_account_metric_rows(
+            parent=object(),
+            bg="#FFFFFF",
+            provider="claude",
+        )
+
+        self.assertEqual(
+            set(metric_vars),
+            {
+                "captured_at",
+                "five_hour_limit",
+                "five_hour_limit_reset_at",
+                "weekly_limit",
+                "weekly_limit_reset_at",
+                "weekly_scoped_limit",
+                "weekly_scoped_limit_reset_at",
+                "on_demand_status",
+            },
+        )
+        self.assertEqual(display_vars["five_hour_limit"].get(), "-")
+        self.assertEqual(display_vars["weekly_limit"].get(), "-")
+        self.assertEqual(display_vars["weekly_scoped_limit"].get(), "-")
+        self.assertEqual(display_vars["on_demand_status"].get(), "-")
+
+        metric_vars["weekly_scoped_limit"].set("Opus 40%")
+        self.assertEqual(display_vars["weekly_scoped_limit"].get(), "Opus 40%")
+
+    def test_claude_metric_visibility_hides_unreported_rows(self) -> None:
+        fake_tk = _FakeTk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        five_hour = _GridTrackingLabel(fake_tk)
+        five_hour_reset = _GridTrackingLabel(fake_tk)
+        weekly = _GridTrackingLabel(fake_tk)
+        weekly_reset = _GridTrackingLabel(fake_tk)
+        scoped = _GridTrackingLabel(fake_tk)
+        scoped_reset = _GridTrackingLabel(fake_tk)
+        extra = _GridTrackingLabel(fake_tk)
+        view._account_metric_cells = {
+            "claude-1": {
+                "five_hour_limit": five_hour,
+                "five_hour_limit_reset_at": five_hour_reset,
+                "weekly_limit": weekly,
+                "weekly_limit_reset_at": weekly_reset,
+                "weekly_scoped_limit": scoped,
+                "weekly_scoped_limit_reset_at": scoped_reset,
+                "on_demand_status": extra,
+            },
+        }
+
+        view._update_account_metric_visibility(
+            "claude-1",
+            provider="claude",
+            descriptor_keys={"five_hour_limit"},
+            payload={
+                "five_hour_limit": "65%",
+                "on_demand_enabled": True,
+                "on_demand_status": "ON · $1.9 / $50",
+            },
+        )
+
+        self.assertEqual(five_hour.grid_calls, 1)
+        self.assertEqual(five_hour_reset.grid_calls, 1)
+        self.assertEqual(weekly.grid_remove_calls, 1)
+        self.assertEqual(weekly_reset.grid_remove_calls, 1)
+        self.assertEqual(scoped.grid_remove_calls, 1)
+        self.assertEqual(scoped_reset.grid_remove_calls, 1)
+        self.assertEqual(extra.grid_calls, 1)
+
+        # When a later snapshot reports the weekly + scoped model windows.
+        view._update_account_metric_visibility(
+            "claude-1",
+            provider="claude",
+            descriptor_keys=set(),
+            payload={
+                "five_hour_limit": "65%",
+                "weekly_limit": "86%",
+                "weekly_scoped_limit": "Opus 40%",
+                "on_demand_enabled": True,
+                "on_demand_status": "ON · $1.9 / $50",
+            },
+        )
+
+        self.assertEqual(weekly.grid_calls, 1)
+        self.assertEqual(weekly_reset.grid_calls, 1)
+        self.assertEqual(scoped.grid_calls, 1)
+        self.assertEqual(scoped_reset.grid_calls, 1)
+
     def test_usage_metric_values_are_localized_without_changing_amounts(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
 
@@ -629,6 +755,51 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             <= sequences
         )
 
+    def test_mount_exposes_taskbar_side_priority_controls(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(_FakeWidget())
+
+        self.assertEqual(view._taskbar_side_priority_var.get(), "left")
+        self.assertEqual(
+            [radio.kwargs["value"] for radio in fake_ttk.radiobuttons],
+            ["left", "right"],
+        )
+
+    def test_preferred_size_measures_scroll_body_width_without_using_full_body_height(self) -> None:
+        class _RequestedWidget:
+            def __init__(self, width, height):
+                self.width = width
+                self.height = height
+
+            def update_idletasks(self):
+                return None
+
+            def winfo_reqwidth(self):
+                return self.width
+
+            def winfo_reqheight(self):
+                return self.height
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._scroll_body = _RequestedWidget(1100, 1400)
+        view._scrollbar = _RequestedWidget(17, 1400)
+        view._win = _RequestedWidget(800, 500)
+
+        self.assertEqual(view.preferred_size(), (1139, 500))
+
     def test_mount_keeps_two_account_settings_visible_inside_scroll_canvas(self) -> None:
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
@@ -659,7 +830,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         ]
         self.assertIn("모니터링 사용", checkbox_texts)
         self.assertIn("작업표시줄 오버레이", checkbox_texts)
-        self.assertIn("사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 2개)", texts)
+        self.assertIn("사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 4개)", texts)
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
 
@@ -694,6 +865,30 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             [(1, "units"), (1, "pages"), (2, "units")],
         )
         self.assertEqual(canvas.yview_moveto_calls, [0.0, 1.0])
+
+    def test_mousewheel_burst_is_coalesced_until_idle(self) -> None:
+        class _IdleCanvas(_FakeCanvas):
+            def __init__(self):
+                super().__init__()
+                self.idle_callbacks = []
+
+            def after_idle(self, callback):
+                self.idle_callbacks.append(callback)
+                return "idle-scroll"
+
+            def after_cancel(self, _after_id):
+                return None
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        canvas = _IdleCanvas()
+
+        view._queue_scroll_units(canvas, 1)
+        view._queue_scroll_units(canvas, 2)
+
+        self.assertEqual(canvas.yview_scroll_calls, [])
+        self.assertEqual(len(canvas.idle_callbacks), 1)
+        canvas.idle_callbacks[0]()
+        self.assertEqual(canvas.yview_scroll_calls, [(3, "units")])
 
     def test_scroll_navigation_reaches_focused_child_controls(self) -> None:
         class _FocusedEntry(_FakeWidget):
@@ -1525,7 +1720,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(view._profile_deletions_inflight, set())
         self.assertEqual(scheduled, [True])
 
-    def test_third_taskbar_selection_is_reverted_before_autosave(self) -> None:
+    def test_fifth_taskbar_selection_is_reverted_before_autosave(self) -> None:
         class _FakeMonitor:
             def __init__(self):
                 self.payloads = []
@@ -1536,6 +1731,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
                         {"id": "account_1", "provider": "codex"},
                         {"id": "account_2", "provider": "cursor"},
                         {"id": "profile_0", "provider": "codex"},
+                        {"id": "profile_1", "provider": "cursor"},
+                        {"id": "profile_2", "provider": "codex"},
                     ]
                 }
 
@@ -1550,7 +1747,13 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
         view._usage_url_var = _FakeVar(value="https://example.test")
-        view._account_order = ["account_1", "account_2", "profile_0"]
+        view._account_order = [
+            "account_1",
+            "account_2",
+            "profile_0",
+            "profile_1",
+            "profile_2",
+        ]
         view._account_enabled_vars = {
             profile_id: _FakeVar(value=True)
             for profile_id in view._account_order
@@ -1559,30 +1762,37 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "account_1": _FakeVar(value="codex"),
             "account_2": _FakeVar(value="cursor"),
             "profile_0": _FakeVar(value="codex"),
+            "profile_1": _FakeVar(value="cursor"),
+            "profile_2": _FakeVar(value="codex"),
         }
         view._account_taskbar_selected_vars = {
             "account_1": _FakeVar(value=True),
             "account_2": _FakeVar(value=True),
             "profile_0": _FakeVar(value=True),
+            "profile_1": _FakeVar(value=True),
+            "profile_2": _FakeVar(value=True),
         }
         view._win = _FakeWidget()
         statuses = []
         view._set_status = lambda text, level="info": statuses.append((text, level))
         view._autosave_after_id = "after-existing"
 
-        view._on_taskbar_selection_changed("profile_0")
+        view._on_taskbar_selection_changed("profile_2")
 
-        self.assertFalse(view._account_taskbar_selected_vars["profile_0"].get())
+        self.assertFalse(view._account_taskbar_selected_vars["profile_2"].get())
         self.assertEqual(view._win.after_cancel_calls, ["after-existing"])
         self.assertIsNotNone(view._autosave_after_id)
-        self.assertIn("최대 2개", statuses[-1][0])
+        self.assertIn("최대 4개", statuses[-1][0])
         self.assertEqual(statuses[-1][1], "error")
 
         _delay, autosave = view._win.after_calls[-1]
         autosave()
 
-        self.assertEqual(monitor.payloads[-1]["selected_profile_ids"], ["account_1", "account_2"])
-        self.assertIn("최대 2개", statuses[-1][0])
+        self.assertEqual(
+            monitor.payloads[-1]["selected_profile_ids"],
+            ["account_1", "account_2", "profile_0", "profile_1"],
+        )
+        self.assertIn("최대 4개", statuses[-1][0])
         self.assertEqual(statuses[-1][1], "error")
 
     def test_add_flushes_pending_autosave_inside_worker_before_profile_creation(self) -> None:
@@ -1841,6 +2051,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
         view._enabled_var = _FakeVar(value=True)
         view._taskbar_overlay_var = _FakeVar(value=False)
+        view._taskbar_side_priority_var = _FakeVar(value="right")
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
         view._usage_url_var = _FakeVar(value="https://example.test")
@@ -1851,6 +2062,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._on_save()
 
         self.assertEqual(monitor.update_payloads[-1]["taskbar_overlay_enabled"], False)
+        self.assertEqual(monitor.update_payloads[-1]["taskbar_side_priority"], "right")
         self.assertEqual(statuses[-1], ("저장됨", "ok"))
 
     def test_invalid_autosave_value_does_not_update_settings(self) -> None:

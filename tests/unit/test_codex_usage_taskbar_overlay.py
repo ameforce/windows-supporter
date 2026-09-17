@@ -86,6 +86,149 @@ class _FakeCanvas:
         self.ops.append(("oval", args, dict(kwargs)))
         return len(self.ops)
 
+    def create_line(self, *args, **kwargs):
+        self.ops.append(("line", args, dict(kwargs)))
+        return len(self.ops)
+
+    def create_polygon(self, *args, **kwargs):
+        self.ops.append(("polygon", args, dict(kwargs)))
+        return len(self.ops)
+
+
+class AiUsageTaskbarOverlayPaneTest(unittest.TestCase):
+    @staticmethod
+    def _runtime(profile_count=4):
+        return {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": f"profile-{index}",
+                    "label": f"Profile {index}",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "runtime": {"session_state": "logged_in"},
+                    "last_snapshot": {
+                        "five_hour_limit": f"{20 + index}%",
+                        "weekly_limit": f"{30 + index}%",
+                    },
+                }
+                for index in range(1, profile_count + 1)
+            ],
+        }
+
+    def test_four_selected_profiles_render_as_fixed_left_and_right_two_row_panes(self):
+        windows = []
+
+        def make_window(_root):
+            window = _FakeWindow()
+            windows.append(window)
+            return window
+
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: self._runtime(4),
+            window_factory=make_window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+
+        self.assertTrue(overlay.refresh())
+        self.assertEqual(len(windows), 2)
+        left_model, right_model = (window.draw_calls[-1] for window in windows)
+        self.assertEqual(
+            [bar["label"] for bar in left_model["bars"]],
+            ["Profile 1", "Profile 2"],
+        )
+        self.assertEqual(
+            [bar["label"] for bar in right_model["bars"]],
+            ["Profile 3", "Profile 4"],
+        )
+        left_geometry = left_model["geometry"]
+        right_geometry = right_model["geometry"]
+        self.assertLessEqual(
+            int(left_geometry["x"]) + int(left_geometry["width"]),
+            960,
+        )
+        self.assertGreaterEqual(int(right_geometry["x"]), 960)
+        self.assertEqual(left_geometry["_slot_side"], "left")
+        self.assertEqual(right_geometry["_slot_side"], "right")
+
+    def test_second_pane_is_not_created_when_only_two_profiles_are_selected(self):
+        windows = []
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: self._runtime(2),
+            window_factory=lambda _root: windows.append(_FakeWindow()) or windows[-1],
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+
+        self.assertTrue(overlay.refresh())
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(
+            [bar["label"] for bar in windows[0].draw_calls[-1]["bars"]],
+            ["Profile 1", "Profile 2"],
+        )
+
+    def test_right_priority_assigns_first_two_profiles_to_right_pane(self):
+        windows = []
+
+        def make_window(_root):
+            window = _FakeWindow()
+            windows.append(window)
+            return window
+
+        runtime = self._runtime(4)
+        runtime["taskbar_side_priority"] = "right"
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: runtime,
+            window_factory=make_window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+
+        self.assertTrue(overlay.refresh())
+        left_model, right_model = (window.draw_calls[-1] for window in windows)
+        self.assertEqual(
+            [bar["label"] for bar in left_model["bars"]],
+            ["Profile 3", "Profile 4"],
+        )
+        self.assertEqual(
+            [bar["label"] for bar in right_model["bars"]],
+            ["Profile 1", "Profile 2"],
+        )
+
+    def test_left_and_right_panes_share_one_occupancy_snapshot_per_cycle(self):
+        base_calls = []
+
+        def base_getter(width, height, work_area, geometry):
+            base_calls.append((width, height, work_area, dict(geometry)))
+            return [(100, 200)]
+
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: {},
+            occupied_span_getter=base_getter,
+        )
+        left_getter = overlay._left_pane._occupied_span_getter
+        right_getter = overlay._right_pane._occupied_span_getter
+
+        left_spans = left_getter(1920, 1080, (0, 0, 1920, 1040), {"orientation": "bottom"})
+        right_spans = right_getter(1920, 1080, (0, 0, 1920, 1040), {"orientation": "bottom"})
+
+        self.assertEqual(len(base_calls), 1)
+        self.assertEqual(base_calls[0][3].get("_exclude_spans"), None)
+        self.assertIn((100, 200), left_spans)
+        self.assertIn((100, 200), right_spans)
+        self.assertIn((960, 1920), left_spans)
+        self.assertIn((0, 960), right_spans)
+
+        # A second left request starts a new cycle rather than reusing a stale
+        # snapshot forever.
+        left_getter(1920, 1080, (0, 0, 1920, 1040), {"orientation": "bottom"})
+        self.assertEqual(len(base_calls), 2)
+
 
 class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
     def _runtime(self):
@@ -128,7 +271,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(model["bars"][0]["color"], "#f59e0b")
         self.assertEqual(model["bars"][1]["color"], "#22c55e")
 
-    def test_model_prefers_selected_provider_profiles_before_applying_total_limit(self):
+    def test_model_prefers_selected_provider_profiles_before_applying_four_profile_limit(self):
         runtime = {
             "enabled": True,
             "profiles": [
@@ -205,9 +348,12 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(
             [bar["id"] for bar in model["bars"]],
-            ["cursor-selected", "codex-selected"],
+            ["cursor-selected", "codex-selected", "cursor-over-limit"],
         )
-        self.assertEqual([bar["provider"] for bar in model["bars"]], ["cursor", "codex"])
+        self.assertEqual(
+            [bar["provider"] for bar in model["bars"]],
+            ["cursor", "codex", "cursor"],
+        )
         self.assertEqual(model["bars"][0]["profile_id"], "cursor-selected")
         self.assertEqual(model["bars"][0]["freshness"], "fresh")
         self.assertEqual(model["bars"][0]["provider_status"], "ready")
@@ -257,6 +403,64 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(metric["detail_value_text"], "US$0 / US$20")
         self.assertEqual(metric["reset_text"], "25d 00h 00m 00s")
         self.assertEqual(metric["reset_short_text"], "25d 00h 00m 00s")
+
+    def test_claude_profile_renders_five_hour_and_weekly_metric_descriptors(self):
+        runtime = {
+            "enabled": True,
+            "profiles": [
+                {
+                    "id": "claude-1",
+                    "provider": "claude",
+                    "label": "Claude 1",
+                    "enabled": True,
+                    "taskbar_selected": True,
+                    "freshness": "fresh",
+                    "provider_status": "ready",
+                    "runtime": {"session_state": "logged_in"},
+                    "last_snapshot": {
+                        "captured_at": "2026-09-14T10:00:00+00:00",
+                    },
+                    "metrics": [
+                        {
+                            "key": "five_hour_limit",
+                            "short_label": "5H",
+                            "percent": 65.0,
+                            "value_text": "65%",
+                            "short_value_text": "65%",
+                            "reset_at": "2026-09-15T05:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        },
+                        {
+                            "key": "weekly_limit",
+                            "short_label": "7D",
+                            "percent": 86.0,
+                            "value_text": "86%",
+                            "short_value_text": "86%",
+                            "reset_at": "2026-09-19T09:00:00+00:00",
+                            "reset_precision": "datetime",
+                            "state": "ready",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        self.assertTrue(model["visible"])
+        bar = model["bars"][0]
+        self.assertEqual(bar["provider"], "claude")
+        self.assertEqual(bar["label"], "Claude 1")
+        self.assertEqual(bar["percent"], 65)
+        self.assertEqual(len(bar["metrics"]), 2)
+        first, second = bar["metrics"]
+        self.assertEqual(first["metric_key"], "five_hour_limit")
+        self.assertEqual(first["short_label"], "5H")
+        self.assertEqual(first["percent"], 65.0)
+        self.assertEqual(second["metric_key"], "weekly_limit")
+        self.assertEqual(second["short_label"], "7D")
+        self.assertEqual(second["percent"], 86.0)
 
     def test_taskbar_renderer_keeps_unreported_metrics_empty(self):
         runtime = {
@@ -1350,8 +1554,61 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             op for op in canvas.ops if op[0] == "text" and op[2].get("text") == "5h"
         ][0]
 
-        self.assertGreaterEqual(status_dot[1][0] - profile_label[1][0], 64)
+        expected_label_span = (
+            taskbar_overlay._profile_label_text_width("Kim Jong")
+            + taskbar_overlay._PROFILE_LABEL_TEXT_END_GAP_PX
+            + 1
+        )
+        self.assertEqual(status_dot[1][0] - profile_label[1][0], expected_label_span)
         self.assertGreaterEqual(metric_label[1][0] - status_dot[1][2], 10)
+
+    def test_profile_label_column_uses_only_the_longest_measured_name_in_normal_slots(self):
+        labels = ("A", "Kim Jong")
+        expected = (
+            max(taskbar_overlay._profile_label_text_width(label) for label in labels)
+            + taskbar_overlay._PROFILE_LABEL_TEXT_END_GAP_PX
+        )
+
+        self.assertEqual(
+            taskbar_overlay._label_width_for_overlay_width(300, labels),
+            expected,
+        )
+        self.assertEqual(
+            taskbar_overlay._label_width_for_overlay_width(620, labels),
+            expected,
+        )
+        self.assertEqual(
+            taskbar_overlay._label_width_for_overlay_width(620, ("A",)),
+            taskbar_overlay._profile_label_text_width("A")
+            + taskbar_overlay._PROFILE_LABEL_TEXT_END_GAP_PX,
+        )
+        self.assertLess(expected, taskbar_overlay._PROFILE_LABEL_COLUMN_MIN_WIDTH_PX)
+
+    def test_short_profile_names_shrink_the_preferred_overlay_width(self):
+        short_runtime = self._runtime()
+        for profile, label in zip(short_runtime["accounts"], ("A", "B"), strict=True):
+            profile["label"] = label
+        short_model = build_codex_usage_taskbar_overlay_model(short_runtime)
+
+        long_runtime = self._runtime()
+        for profile, label in zip(
+            long_runtime["accounts"],
+            ("A long profile name", "B long profile name"),
+            strict=True,
+        ):
+            profile["label"] = label
+        long_model = build_codex_usage_taskbar_overlay_model(long_runtime)
+
+        short_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+            short_model
+        )
+        long_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+            long_model
+        )
+
+        self.assertIsNotNone(short_width)
+        self.assertIsNotNone(long_width)
+        self.assertLess(short_width, long_width)
 
     def test_draw_renders_full_profile_names_and_reserves_their_pixel_width(self):
         runtime = self._runtime()
@@ -1415,6 +1672,233 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertLessEqual(
             taskbar_overlay._profile_label_text_width(fitted),
             64,
+        )
+
+    def test_provider_icon_column_reserves_width_before_the_label(self):
+        labels = ("Codex 1",)
+        label_width = taskbar_overlay._label_width_for_overlay_width(620, labels)
+        status_width = taskbar_overlay._status_width_for_overlay_width(620)
+
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            620,
+            [()],
+            profile_labels=labels,
+        )
+
+        self.assertEqual(
+            layouts[0].metrics_x,
+            6
+            + taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+            + label_width
+            + status_width
+            + taskbar_overlay._STATUS_TO_METRICS_GAP_PX,
+        )
+
+        # A metric-bearing row that fits keeps the icon column funded too.
+        model = build_codex_usage_taskbar_overlay_model(self._runtime())
+        funded = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            620,
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+        self.assertTrue(
+            all(
+                layout.icon_width
+                == taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+                for layout in funded
+            )
+        )
+
+    def test_draw_renders_provider_icons_left_of_profile_labels(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["provider"] = "codex"
+        runtime["accounts"][1]["provider"] = "cursor"
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        preferred_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(
+            model
+        )
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(
+            dict(
+                model,
+                geometry={
+                    "x": 1400,
+                    "y": 1000,
+                    "width": preferred_width,
+                    "height": 38,
+                    "orientation": "bottom",
+                    "visible": True,
+                },
+            )
+        )
+
+        icon_left = 6
+        label_x = icon_left + taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+        line_ops = [op for op in canvas.ops if op[0] == "line"]
+        polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
+        # Codex row: real brand mark — silhouette polygon in brand violet,
+        # then the chevron and bar subpaths knocked out in panel background.
+        self.assertEqual(len(line_ops), 0)
+        row_height = (38 - 8) // 2
+        codex_polygons = [
+            op for op in polygon_ops if op[1][1] < 4 + row_height
+        ]
+        self.assertEqual(len(codex_polygons), 3)
+        self.assertEqual(
+            codex_polygons[0][2].get("fill"),
+            taskbar_overlay._CODEX_BRAND_COLOR,
+        )
+        self.assertTrue(
+            all(
+                op[2].get("fill") == taskbar_overlay._CODEX_KNOCKOUT_COLOR
+                for op in codex_polygons[1:]
+            )
+        )
+        # The knockout only reads as a hole if it repaints the exact panel
+        # surface, so pin the constant to the recorded panel rect fill.
+        panel_rects = [
+            op
+            for op in canvas.ops
+            if op[0] == "rectangle" and op[1][:2] == (0, 0)
+        ]
+        self.assertEqual(len(panel_rects), 1)
+        self.assertEqual(
+            taskbar_overlay._CODEX_KNOCKOUT_COLOR,
+            panel_rects[0][2].get("fill"),
+        )
+        self.assertTrue(
+            all(
+                icon_left <= coord <= icon_left + 10
+                for op in codex_polygons
+                for coord in op[1][::2]
+            )
+        )
+        icon_top = (
+            4 + row_height // 2 - taskbar_overlay._PROVIDER_ICON_SIZE_PX / 2
+        )
+        self.assertTrue(
+            all(
+                icon_top
+                <= coord
+                <= icon_top + taskbar_overlay._PROVIDER_ICON_SIZE_PX
+                for op in codex_polygons
+                for coord in op[1][1::2]
+            )
+        )
+        # Cursor row: pointer arrow in the brand's monochrome white.
+        cursor_polygons = [
+            op for op in polygon_ops if op[2].get("fill") == "#f8fafc"
+        ]
+        self.assertEqual(len(cursor_polygons), 1)
+        self.assertTrue(
+            all(
+                icon_left <= coord <= icon_left + 10
+                for coord in cursor_polygons[0][1][::2]
+            )
+        )
+        # Cursor mark stays in its own row (below the codex row).
+        self.assertGreater(cursor_polygons[0][1][1], 4 + row_height)
+        # Labels shift right by the icon column.
+        label_ops = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("font") == ("Segoe UI", 8, "bold")
+        ]
+        self.assertEqual(len(label_ops), 2)
+        self.assertEqual(label_ops[0][1][0], label_x)
+        self.assertEqual(label_ops[1][1][0], label_x)
+
+    def test_draw_renders_claude_burst_and_neutral_ring_for_unknown_provider(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["provider"] = "claude"
+        runtime["accounts"][1]["provider"] = "future-provider"
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+
+        overlay._draw(
+            dict(
+                model,
+                geometry={
+                    "x": 1400,
+                    "y": 1000,
+                    "width": 620,
+                    "height": 38,
+                    "orientation": "bottom",
+                    "visible": True,
+                },
+            )
+        )
+
+        polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
+        self.assertEqual(len(polygon_ops), 1)
+        self.assertEqual(polygon_ops[0][2].get("fill"), "#d97757")
+        # 16 vertices (8-spoke burst) => 32 coordinate values.
+        self.assertEqual(len(polygon_ops[0][1]), 32)
+        # Unknown providers draw the neutral ring; the status dot is the only
+        # other oval, so the ring is the one in the icon column's x range.
+        ring_ops = [
+            op
+            for op in canvas.ops
+            if op[0] == "oval" and op[1][0] < 6 + 10
+        ]
+        self.assertEqual(len(ring_ops), 1)
+        self.assertEqual(ring_ops[0][2].get("outline"), "#94a3b8")
+
+    def test_draw_keeps_provider_icon_when_slot_enters_cramped_metric_fallback(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["provider"] = "codex"
+        runtime["accounts"][1]["provider"] = "cursor"
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+        # 298px cannot fund the full metric text widths, but provider identity
+        # remains the highest-priority row chrome and must stay visible.
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            298,
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+        self.assertTrue(
+            all(
+                layout.icon_width
+                == taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+                for layout in row_layouts
+            )
+        )
+
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        overlay._draw(
+            dict(
+                model,
+                geometry={
+                    "x": 1400,
+                    "y": 1000,
+                    "width": 298,
+                    "height": 38,
+                    "orientation": "bottom",
+                    "visible": True,
+                },
+            )
+        )
+
+        polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
+        self.assertEqual(len(polygon_ops), 4)
+        label_ops = [
+            op
+            for op in canvas.ops
+            if op[0] == "text" and op[2].get("font") == ("Segoe UI", 8, "bold")
+        ]
+        self.assertTrue(label_ops)
+        self.assertTrue(
+            all(
+                op[1][0] == 6 + taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX
+                for op in label_ops
+            )
         )
 
     def test_draw_keeps_metric_columns_clear_when_preferred_cap_shows_status_text(self):
@@ -3500,6 +3984,30 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertLessEqual(pixel_spans[0]["span"][0], 320)
         self.assertGreater(pixel_spans[0]["span"][1], 320)
 
+    def test_pixel_dilation_never_reintroduces_excluded_overlay_pixels(self):
+        background = [(24, 24, 24)] * 5
+        control = [(240, 240, 240)] * 5
+        # Keep the sampled column just outside the excluded span while its
+        # dilation band still crosses that span.
+        columns = [(0, background), (276, control), (400, background)]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=columns,
+        ):
+            _spans, telemetry = taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                800,
+                600,
+                (0, 0, 800, 560),
+                {"orientation": "bottom", "_exclude_spans": [(280, 300)]},
+            )
+
+        self.assertTrue(telemetry["pixel_spans"])
+        for record in telemetry["pixel_spans"]:
+            start, end = record["span"]
+            self.assertFalse(start < 300 and end > 280)
+
     def test_work_area_conversion_records_logical_to_physical_scale(self):
         geometry = calculate_taskbar_overlay_geometry(
             1920,
@@ -4478,6 +4986,78 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             )
         )
 
+    def test_compact_preferred_width_releases_unrenderable_guidance_space(self):
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 100,
+            "value_text": "100%",
+            "color": "#22c55e",
+            "reset_text": "00h 00m 00s",
+            "reset_short_text": "00h 00m 00s",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 60~64% / 00h 30m 00s",
+            "normal_guidance_short_text": "N 60~64% / 00h 30m 00s",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 53,
+            "value_text": "53%",
+            "color": "#f59e0b",
+            "reset_text": "05d 11h 27m 46s",
+            "reset_short_text": "05d 11h 27m 46s",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 64~66% / 4d 3h",
+            "normal_guidance_short_text": "N 64~66% / 4d 3h",
+        }
+        credit = {
+            "key": "CR",
+            "metric_key": "credit",
+            "percent": None,
+            "value_text": "1,000",
+        }
+        model = {
+            "visible": True,
+            "bars": [
+                {"enabled": True, "label": "김종수", "metrics": [five_hour, weekly, credit]},
+                {"enabled": True, "label": "지혜 유", "metrics": [five_hour, weekly]},
+            ],
+        }
+
+        full_width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+        compact_width = taskbar_overlay._compact_taskbar_overlay_width_for_model(model)
+
+        self.assertIsNotNone(full_width)
+        self.assertIsNotNone(compact_width)
+        self.assertGreater(full_width, compact_width)
+
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            1080,
+            (0, 0, 1920, 1040),
+            occupied_spans=[(0, 80), (704, 1920)],
+            preferred_width=full_width,
+            compact_preferred_width=compact_width,
+        )
+
+        # The free taskbar span is wide enough for the compact content but not
+        # for the optional guidance. The overlay should fit the compact width
+        # instead of reserving the clamped span for empty guidance columns.
+        self.assertEqual(geometry["width"], compact_width)
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            int(geometry["width"]),
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+        self.assertEqual(
+            layouts[0].segment_geometry(1)[0],
+            layouts[1].segment_geometry(1)[0],
+        )
+        self.assertLess(layouts[0].segment_geometry(2)[0], int(geometry["width"]))
+
     def test_preferred_taskbar_overlay_width_below_status_text_switch_uses_dot_only(self):
         model = {
             "visible": True,
@@ -4657,13 +5237,13 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
 
         self.assertIsNotNone(width)
-        self.assertEqual(width, 514)
+        self.assertEqual(width, 537)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
             width,
             (narrow_metric, wide_metric),
         )
         narrower_row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(
-            width - 8,
+            width - 40,
             (narrow_metric, wide_metric),
         )
         required_wide_segment = taskbar_overlay._required_metric_segment_width(wide_metric)
@@ -4676,7 +5256,21 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         _narrower_offset, narrower_wide_width, _narrower_progress = (
             narrower_row_layout.segment_geometry(wide_index)
         )
+        # The provider icon is the highest-priority chrome and remains funded
+        # while the metric segment enters the cramped fallback.
+        self.assertEqual(
+            narrower_row_layout.icon_width,
+            taskbar_overlay._PROVIDER_ICON_COLUMN_WIDTH_PX,
+        )
         self.assertLess(narrower_wide_width, required_wide_segment)
+        below_text_fit = taskbar_overlay._metric_row_layout_for_overlay_width(
+            width - 48,
+            (narrow_metric, wide_metric),
+        )
+        _below_offset, below_wide_width, _below_progress = (
+            below_text_fit.segment_geometry(wide_index)
+        )
+        self.assertLess(below_wide_width, narrower_wide_width)
         layout = taskbar_overlay._fit_metric_segment_layout(
             wide_segment_width,
             wide_metric["reset_text"],
@@ -4878,7 +5472,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         width = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
         row_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width, metrics)
-        narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 1, metrics)
+        # The full badge must survive until the columns genuinely cannot fund
+        # it, so probe beyond the optional status/label compaction boundary.
+        narrower_layout = taskbar_overlay._metric_row_layout_for_overlay_width(width - 24, metrics)
 
         self.assertGreater(width, 414)
         self.assertEqual(
@@ -4891,7 +5487,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
 
     def test_draw_compacts_all_row_badges_when_full_mode_does_not_fit(self):
-        texts = self._draw_row_badge_texts(500)
+        texts = self._draw_row_badge_texts(476)
 
         # Display contract: countdown text outranks the reset badge in compact
         # mode, so each row shows the freshest time it can fit.
@@ -4958,6 +5554,84 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             ),
             f"progress widths out of bounds: {widths_by_metric}",
         )
+
+    def test_empty_five_hour_reset_does_not_reserve_weekly_column_or_starve_badge(self):
+        # Live defect: a 5H metric whose reset region renders only the "--"
+        # placeholder was still funded with the weekly countdown column, so
+        # the surplus died inside its segment as dead space and the weekly
+        # badge dropped to the one-letter short label.
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 100,
+            "value_text": "100%",
+            "color": "#22c55e",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 94,
+            "value_text": "94%",
+            "color": "#22c55e",
+            "reset_text": "05d 14h 22m 33s",
+            "reset_short_text": "5d 14h",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 60~95% / 2d 3h",
+            "normal_guidance_short_text": "N 60~95%",
+        }
+        rows = [
+            (dict(five_hour), dict(weekly)),
+            (
+                dict(five_hour),
+                dict(
+                    weekly,
+                    reset_text="01d 12h 51m 33s",
+                    reset_short_text="1d 12h",
+                    normal_guidance_text="N 30~60% / 1d 2h",
+                    normal_guidance_short_text="N 30~60%",
+                ),
+            ),
+        ]
+        labels = ("Codex 1", "Codex 2")
+        signature = tuple(
+            tuple(taskbar_overlay._metric_width_signature(m) for m in row)
+            for row in rows
+        )
+        width = taskbar_overlay._preferred_width_for_rows_cached(
+            signature, labels
+        )
+
+        row_layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            width, rows, profile_labels=labels
+        )
+
+        self.assertEqual(
+            taskbar_overlay._resolve_overlay_badge_mode(tuple(row_layouts)),
+            "full",
+        )
+        for layout in row_layouts:
+            five_hour_width = int(layout.segment_widths[0])
+            weekly_width = int(layout.segment_widths[1])
+            # The 5H column stays close to its own content instead of
+            # inheriting the weekly reset reservation (~175px before).
+            self.assertLessEqual(five_hour_width, 140)
+            self.assertLess(five_hour_width, weekly_width)
+
+        texts = []
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), self._runtime)
+        canvas = _FakeCanvas()
+        overlay._canvas = canvas
+        model = self._two_row_badge_model(
+            width, first_metrics=rows[0], second_metrics=rows[1]
+        )
+        overlay._draw(model)
+        texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
+        self.assertIn("남음", texts)
+        self.assertNotIn("남", texts)
+        # The weekly countdown survives alongside the full badge (the fit
+        # picked the short countdown shape to fund the guidance text).
+        self.assertIn("5d 14h", texts)
 
     def test_fit_reset_badge_can_be_forced_to_short_or_full_mode(self):
         short_available = (
@@ -5621,6 +6295,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             "_preferred_taskbar_overlay_width_for_model",
             return_value=760,
             create=True,
+        ), patch.object(
+            taskbar_overlay,
+            "_compact_taskbar_overlay_width_for_model",
+            return_value=760,
+            create=True,
         ):
             overlay.refresh()
             overlay.refresh()
@@ -5796,8 +6475,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(len(window.geometry_calls), 2)
-        self.assertIn("458x", window.geometry_calls[-1])
-        self.assertIn("+1034+", window.geometry_calls[-1])
+        self.assertIn("301x", window.geometry_calls[-1])
+        self.assertIn("+1191+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_hard_resamples_changed_slot_after_scheduled_delay(self):
         root = _FakeRoot()
@@ -5841,8 +6520,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertEqual(overlay._last_geometry_hard_resample_at, 101.0)
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("458x", window.geometry_calls[-1])
-        self.assertIn("+1034+", window.geometry_calls[-1])
+        self.assertIn("301x", window.geometry_calls[-1])
+        self.assertIn("+1191+", window.geometry_calls[-1])
 
     def test_geometry_monitor_tick_reuses_runtime_snapshot_and_now_for_width_change(self):
         root = _FakeRoot()
@@ -5964,6 +6643,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             work_area_getter=lambda: (0, 0, 1920, 1040),
         )
         overlay._window = window
+        overlay._window_visible = True
         overlay._last_metric_values = {"account_1:five_hour_limit": "98%"}
         overlay._last_model = {
             "visible": True,
@@ -6189,9 +6869,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertGreaterEqual(window.deiconify_calls, 1)
-        self.assertIn("458x", window.geometry_calls[-1])
+        self.assertIn("301x", window.geometry_calls[-1])
         # After the empty-slot gap recovers, content-fit width remains preferred.
-        self.assertRegex(window.geometry_calls[-1], r"458x38\+\d+\+")
+        self.assertRegex(window.geometry_calls[-1], r"301x38\+\d+\+")
 
     def test_geometry_monitor_defers_transient_width_shrink_without_jitter(self):
         root = _FakeRoot()
@@ -6330,7 +7010,106 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertNotEqual(window.geometry_calls[-1], initial_geometry)
-        self.assertIn("+1314+", window.geometry_calls[-1])
+        self.assertIn("+1471+", window.geometry_calls[-1])
+
+    def test_geometry_monitor_does_not_ping_pong_between_same_side_slots(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        # The two spans describe two candidate slots on the same side.  Each
+        # candidate is visible for two samples, which is enough for the old
+        # two-sample confirmation but is still a detector feedback cycle.
+        spans_a = [(0, 100), (400, 600), (960, 1920)]
+        spans_b = [(0, 100), (700, 900), (960, 1920)]
+        spans_by_call = [spans_a, spans_b, spans_b, spans_a, spans_a]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ), patch.object(
+            taskbar_overlay,
+            "_compact_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            initial_geometry = window.geometry_calls[-1]
+            for _index in range(4):
+                geometry_tick = [
+                    callback
+                    for _delay, callback in root.after_calls
+                    if callback.__name__ == "_geometry_monitor_tick"
+                ][-1]
+                geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 5)
+        # The first candidate may be a real sustained relocation.  Once that
+        # move is accepted, the immediate return to the prior same-side slot
+        # must not be accepted on the same short evidence window.
+        self.assertEqual(
+            window.geometry_calls,
+            [initial_geometry, "300x38+392+1041"],
+        )
+        self.assertIn("+652+", initial_geometry)
+
+    def test_live_geometry_holds_previous_slot_when_another_slot_becomes_rightmost(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [
+            [(0, 100), (400, 600), (960, 1920)],
+            [(0, 100), (400, 600), (960, 1000), (1300, 1920)],
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+            stable_slot_selection=True,
+        )
+
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=300,
+        ), patch.object(
+            taskbar_overlay,
+            "_compact_taskbar_overlay_width_for_model",
+            return_value=300,
+        ):
+            overlay.refresh()
+            initial_geometry = window.geometry_calls[-1]
+            for _index in range(2):
+                geometry_tick = [
+                    callback
+                    for _delay, callback in root.after_calls
+                    if callback.__name__ == "_geometry_monitor_tick"
+                ][-1]
+                geometry_tick()
+
+        self.assertGreaterEqual(len(occupied_calls), 3)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertIn("+652+", initial_geometry)
 
     def test_geometry_monitor_waits_before_returning_from_left_to_recovered_right_slot(self):
         root = _FakeRoot()
@@ -6723,9 +7502,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         geometry_tick()
 
         self.assertGreaterEqual(len(occupied_calls), 3)
-        self.assertIn("458x", window.geometry_calls[-1])
-        # Content-fit preferred width stays 300; confirmed slot-edge move updates x only.
-        self.assertRegex(window.geometry_calls[-1], r"458x38\+\d+\+")
+        self.assertIn("301x", window.geometry_calls[-1])
+        # Content-fit preferred width reflects the provider icon column and
+        # the compact profile-label column; confirmed slot-edge move updates
+        # x only.
+        self.assertRegex(window.geometry_calls[-1], r"301x38\+\d+\+")
 
     def test_geometry_monitor_accepts_no_slot_when_work_area_context_changes(self):
         root = _FakeRoot()
@@ -6977,6 +7758,308 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(keepalive_callbacks), 2)
 
+    def test_uia_taskbar_occupied_span_records_maps_elements_to_local_spans(self):
+        elements = [
+            _FakeUiaElement((0, 1392, 2560, 1440), control_type=50033),
+            _FakeUiaElement((774, 1392, 818, 1440), automation_id="StartButton"),
+            _FakeUiaElement((819, 1392, 863, 1440), automation_id="SearchButton"),
+            _FakeUiaElement((900, 1392, 944, 1440), offscreen=True),
+            _FakeUiaElement((2000, 1200, 2040, 1300)),
+        ]
+        automation = _FakeUiaAutomation(elements)
+
+        records = taskbar_overlay._uia_taskbar_occupied_span_records(
+            2560,
+            1392,
+            1440,
+            taskbar_hwnd=1234,
+            automation=automation,
+        )
+
+        spans = [tuple(record["span"]) for record in records]
+        self.assertEqual(spans, [(774, 818), (819, 863)])
+        self.assertEqual(records[0]["automation_id"], "StartButton")
+        self.assertEqual(records[0]["raw_basis"], "global_physical_px")
+        self.assertEqual(records[0]["source"], "uia")
+        self.assertEqual(automation.element_from_handle_calls, [1234])
+
+    def test_uia_taskbar_occupied_span_records_converts_origin_and_skips_full_band(self):
+        elements = [
+            _FakeUiaElement((2000, 1392, 2044, 1440)),
+            _FakeUiaElement((1920, 1392, 4480, 1440), control_type=50025),
+        ]
+        automation = _FakeUiaAutomation(elements)
+
+        records = taskbar_overlay._uia_taskbar_occupied_span_records(
+            2560,
+            1392,
+            1440,
+            taskbar_hwnd=77,
+            origin_x=1920,
+            automation=automation,
+        )
+
+        self.assertEqual([tuple(record["span"]) for record in records], [(80, 124)])
+        self.assertEqual(records[0]["conversion"]["origin_x"], 1920)
+
+    def test_uia_taskbar_occupied_span_records_degrades_when_uia_unavailable(self):
+        class _RaisingAutomation:
+            def ElementFromHandle(self, _hwnd):
+                raise RuntimeError("uia unavailable")
+
+        with patch.object(taskbar_overlay, "_uia_client", None), patch.object(
+            taskbar_overlay, "_uia_client_unavailable", True
+        ):
+            self.assertEqual(
+                taskbar_overlay._uia_taskbar_occupied_span_records(
+                    2560,
+                    1392,
+                    1440,
+                    taskbar_hwnd=1,
+                ),
+                [],
+            )
+        self.assertEqual(
+            taskbar_overlay._uia_taskbar_occupied_span_records(
+                2560,
+                1392,
+                1440,
+                taskbar_hwnd=1,
+                automation=_RaisingAutomation(),
+            ),
+            [],
+        )
+
+    def test_detect_horizontal_taskbar_occupied_spans_keeps_uia_icons_under_overlay_exclusion(self):
+        class _FakeWin32Gui:
+            windows = {
+                10: ("TrayNotifyWnd", (1820, 560, 1920, 600), True),
+            }
+
+            def FindWindow(self, class_name, _title):
+                return 1 if class_name == "Shell_TrayWnd" else 0
+
+            def EnumChildWindows(self, _hwnd, callback, extra):
+                for hwnd in self.windows:
+                    callback(hwnd, extra)
+
+            def GetClassName(self, hwnd):
+                return self.windows[int(hwnd)][0]
+
+            def IsWindowVisible(self, hwnd):
+                return self.windows[int(hwnd)][2]
+
+            def GetWindowRect(self, hwnd):
+                return self.windows[int(hwnd)][1]
+
+        uia_records = [
+            {
+                "automation_id": "StartButton",
+                "control_type": 50000,
+                "raw_rect": (774, 560, 818, 600),
+                "raw_basis": "global_physical_px",
+                "span": (774, 818),
+                "coordinate_basis": "physical_px",
+                "conversion": {"origin_x": 0, "band_top": 560, "band_bottom": 600},
+                "source": "uia",
+            },
+            {
+                "automation_id": "Appid: sample",
+                "control_type": 50000,
+                "raw_rect": (818, 560, 1300, 600),
+                "raw_basis": "global_physical_px",
+                "span": (818, 1300),
+                "coordinate_basis": "physical_px",
+                "conversion": {"origin_x": 0, "band_top": 560, "band_bottom": 600},
+                "source": "uia",
+            },
+        ]
+        background = [(118, 84, 154)] * 5
+        columns = [(x, background) for x in range(0, 1920, 40)]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "win32gui",
+            _FakeWin32Gui(),
+        ), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=columns,
+        ), patch.object(
+            taskbar_overlay,
+            "_uia_taskbar_occupied_span_records",
+            return_value=uia_records,
+        ):
+            spans, telemetry = taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                1920,
+                600,
+                (0, 0, 1920, 560),
+                {"orientation": "bottom", "_exclude_spans": [(700, 1300)]},
+            )
+
+        self.assertIsNotNone(spans)
+        self.assertTrue(any(start <= 774 and end >= 1300 for start, end in spans))
+        self.assertEqual(telemetry["uia_spans"], uia_records)
+        self.assertIn("50000", telemetry["uia_spans_by_control_type"])
+
+    def test_detect_horizontal_taskbar_occupied_spans_survives_pixel_capture_failure_with_uia(self):
+        class _FakeWin32Gui:
+            def FindWindow(self, class_name, _title):
+                return 1 if class_name == "Shell_TrayWnd" else 0
+
+            def EnumChildWindows(self, _hwnd, _callback, _extra):
+                return None
+
+        uia_records = [
+            {
+                "automation_id": "StartButton",
+                "control_type": 50000,
+                "raw_rect": (774, 560, 818, 600),
+                "raw_basis": "global_physical_px",
+                "span": (774, 818),
+                "coordinate_basis": "physical_px",
+                "conversion": {"origin_x": 0, "band_top": 560, "band_bottom": 600},
+                "source": "uia",
+            },
+        ]
+
+        with patch.object(taskbar_overlay.ctypes, "windll", object(), create=True), patch.object(
+            taskbar_overlay,
+            "win32gui",
+            _FakeWin32Gui(),
+        ), patch.object(
+            taskbar_overlay,
+            "_sample_taskbar_columns",
+            return_value=[],
+        ), patch.object(
+            taskbar_overlay,
+            "_uia_taskbar_occupied_span_records",
+            return_value=uia_records,
+        ):
+            spans = taskbar_overlay._detect_horizontal_taskbar_occupied_spans(
+                1920,
+                600,
+                (0, 0, 1920, 560),
+                {"orientation": "bottom"},
+            )
+
+        self.assertIsNotNone(spans)
+        self.assertTrue(any(start <= 774 and end >= 818 for start, end in spans))
+
+    def test_overlay_relocates_off_icons_marked_occupied_under_previous_geometry(self):
+        previous = {
+            "x": 700,
+            "y": 562,
+            "width": 600,
+            "height": 38,
+            "orientation": "bottom",
+            "visible": True,
+        }
+
+        geometry = calculate_taskbar_overlay_geometry(
+            1920,
+            600,
+            (0, 0, 1920, 560),
+            occupied_spans=[(0, 102), (774, 1300), (1825, 1920)],
+            preferred_width=500,
+            previous_geometry=previous,
+        )
+
+        self.assertTrue(geometry["visible"])
+        self.assertLessEqual(geometry["x"] + geometry["width"], 774)
+
+    def test_pane_occupied_span_getter_reserves_peer_window_rect(self):
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: {},
+            window_factory=lambda _root: _FakeWindow(),
+            occupied_span_getter=lambda _w, _h, _work, _geometry: [(0, 100)],
+        )
+        overlay._right_pane._window = _FakeWindow()
+        overlay._right_pane._window_visible = True
+
+        with patch.object(
+            taskbar_overlay,
+            "_current_horizontal_window_span",
+            return_value=(1700, 2100),
+        ):
+            spans = overlay._left_pane._occupied_span_getter(
+                2560,
+                1440,
+                (0, 0, 2560, 1392),
+                {"orientation": "bottom"},
+            )
+
+        self.assertIn((0, 100), spans)
+        self.assertIn((1700, 2100), spans)
+        self.assertIn((1280, 2560), spans)
+
+    def test_pane_occupied_span_getter_ignores_hidden_peer_window(self):
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: {},
+            window_factory=lambda _root: _FakeWindow(),
+            occupied_span_getter=lambda _w, _h, _work, _geometry: [],
+        )
+        overlay._right_pane._window = _FakeWindow()
+        overlay._right_pane._window_visible = False
+
+        with patch.object(
+            taskbar_overlay,
+            "_current_horizontal_window_span",
+            return_value=(1700, 2100),
+        ):
+            spans = overlay._left_pane._occupied_span_getter(
+                2560,
+                1440,
+                (0, 0, 2560, 1392),
+                {"orientation": "bottom"},
+            )
+
+        self.assertNotIn((1700, 2100), spans)
+        self.assertIn((1280, 2560), spans)
+
+
+class _FakeUiaRect:
+    def __init__(self, left, top, right, bottom):
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+
+
+class _FakeUiaElement:
+    def __init__(self, rect, control_type=50000, offscreen=False, automation_id=""):
+        self.CurrentBoundingRectangle = _FakeUiaRect(*rect)
+        self.CurrentControlType = control_type
+        self.CurrentIsOffscreen = offscreen
+        self.CurrentAutomationId = automation_id
+
+
+class _FakeUiaElementArray:
+    def __init__(self, elements):
+        self._elements = list(elements)
+        self.Length = len(self._elements)
+
+    def GetElement(self, index):
+        return self._elements[index]
+
+
+class _FakeUiaAutomation:
+    def __init__(self, elements):
+        self._elements = list(elements)
+        self.element_from_handle_calls = []
+
+    def ElementFromHandle(self, hwnd):
+        self.element_from_handle_calls.append(int(hwnd))
+        return self
+
+    def CreateTrueCondition(self):
+        return object()
+
+    def FindAll(self, _scope, _condition):
+        return _FakeUiaElementArray(self._elements)
+
 
 class _TkFakeRoot(_FakeRoot):
     def __init__(self, scaling=96.0 / 72.0):
@@ -7107,9 +8190,12 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
             row_layouts, badge_mode=mode
         )
 
-        # P2: every track shares one width, including across slots.
+        # P2: every track shares one width, including across slots. The icon
+        # reservation and compact status fallback change the exact floor from
+        # the pre-icon layout, but the cross-slot equality remains the
+        # contract.
         self.assertEqual(floors["five_hour_limit"], floors["weekly_limit"])
-        self.assertEqual(floors["weekly_limit"], 11)
+        self.assertEqual(floors["weekly_limit"], 16)
 
     def _live_like_rows(self):
         seven_day_sparse = {
@@ -7167,9 +8253,8 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
 
         # Need-based distribution satisfied both bars: the weekly slot no
         # longer degrades below the shared progress.
-        self.assertEqual(floors["weekly_limit"], 36)
-        self.assertEqual(floors["five_hour_limit"], 36)
-        self.assertEqual(floors["five_hour_limit"], 36)
+        self.assertEqual(floors["weekly_limit"], 42)
+        self.assertEqual(floors["five_hour_limit"], 42)
         self.assertNotIn("credit", floors)
 
     def test_drawn_same_slot_tracks_share_width_without_losing_text(self):
@@ -7738,6 +8823,16 @@ class _MeasuringCanvas:
     def create_oval(self, *args, **kwargs):
         item = len(self.ops) + 1
         self.ops.append(("oval", args, dict(kwargs)))
+        return item
+
+    def create_line(self, *args, **kwargs):
+        item = len(self.ops) + 1
+        self.ops.append(("line", args, dict(kwargs)))
+        return item
+
+    def create_polygon(self, *args, **kwargs):
+        item = len(self.ops) + 1
+        self.ops.append(("polygon", args, dict(kwargs)))
         return item
 
     def bbox(self, item):

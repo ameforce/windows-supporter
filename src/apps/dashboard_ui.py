@@ -6,6 +6,11 @@ from src.utils.update_monitor import format_update_status_parts
 
 
 class DashboardView:
+    # Two cards must retain enough width for their action buttons and status
+    # copy. Below this threshold a single column is narrower overall and lets
+    # the outer vertical scroll handle the additional height.
+    _TWO_COLUMN_MIN_WIDTH = 760
+    _STATUS_PART_CHROME = 8
     _CALLBACK_ALIASES = {
         "ai_usage.settings": "codex.settings",
         "ai_usage.toggle": "codex.toggle",
@@ -28,6 +33,11 @@ class DashboardView:
         self._toggle_buttons: dict[str, Any] = {}
         self._dashboard_scroll_canvas = None
         self._dashboard_scroll_container = None
+        self._dashboard_scrollbar = None
+        self._dashboard_scroll_window_id = None
+        self._dashboard_grid = None
+        self._dashboard_section_cards: list[Any] = []
+        self._status_fonts: dict[str, Any] = {}
         self._tk = None
         self._ttk = None
         return
@@ -72,23 +82,17 @@ class DashboardView:
         window_id = canvas.create_window((0, 0), window=container, anchor="nw")
         self._dashboard_scroll_canvas = canvas
         self._dashboard_scroll_container = container
+        self._dashboard_scrollbar = scrollbar
+        self._dashboard_scroll_window_id = window_id
 
-        def sync_scroll_region(_event: Any = None) -> None:
-            try:
-                canvas.configure(scrollregion=canvas.bbox("all"))
-            except Exception:
-                pass
-            return
-
-        def sync_content_width(event: Any) -> None:
-            try:
-                canvas.itemconfigure(window_id, width=max(1, int(event.width)))
-            except Exception:
-                pass
-            return
-
-        container.bind("<Configure>", sync_scroll_region)
-        canvas.bind("<Configure>", sync_content_width)
+        container.bind(
+            "<Configure>",
+            lambda _event: self._sync_dashboard_scroll_geometry(),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda _event: self._sync_dashboard_scroll_geometry(),
+        )
         canvas.bind("<Enter>", lambda _event: canvas.focus_set())
 
         header_card = tk.Frame(
@@ -97,25 +101,27 @@ class DashboardView:
             highlightthickness=1,
             highlightbackground=border,
         )
-        header_card.pack(fill="x", padx=12, pady=(12, 8))
+        header_card.pack(fill="x", padx=10, pady=(2, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
-        header_inner.pack(fill="x", padx=14, pady=10)
+        header_inner.pack(fill="x", padx=12, pady=7)
 
         tk.Label(
             header_inner,
             text="Dashboard",
             bg=card_bg,
             fg=text,
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 13, "bold"),
         ).pack(side="left")
         ttk.Button(header_inner, text="새로고침", command=self.refresh).pack(side="right")
 
         # 기능 섹션은 2열 카드 그리드로 배치한다. 세로 나열은 요약 화면을
         # 스크롤 없이 한눈에 보려는 대시보드 목적과 맞지 않았다.
         grid = tk.Frame(container, bg=bg)
-        grid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        grid.pack(fill="both", expand=True, padx=10, pady=(0, 2))
         section_cards: list[Any] = []
+        self._dashboard_grid = grid
+        self._dashboard_section_cards = section_cards
         for column in (0, 1):
             grid.columnconfigure(column, weight=1, uniform="dashboard_section")
 
@@ -138,26 +144,21 @@ class DashboardView:
             grid, section_cards, text=text, bg=card_bg, border=border
         )
         self._layout_dashboard_cards(grid, section_cards)
-        try:
-            grid.bind(
-                "<Configure>",
-                lambda event: self._layout_dashboard_cards(
-                    grid,
-                    section_cards,
-                    available_width=int(getattr(event, "width", 0) or 0),
-                ),
-                add="+",
+
+        def relayout_for_width(event: Any) -> None:
+            self._layout_dashboard_cards(
+                grid,
+                section_cards,
+                available_width=int(getattr(event, "width", 0) or 0),
             )
+            self._sync_dashboard_scroll_geometry()
+            return
+
+        try:
+            grid.bind("<Configure>", relayout_for_width, add="+")
         except TypeError:
             try:
-                grid.bind(
-                    "<Configure>",
-                    lambda event: self._layout_dashboard_cards(
-                        grid,
-                        section_cards,
-                        available_width=int(getattr(event, "width", 0) or 0),
-                    ),
-                )
+                grid.bind("<Configure>", relayout_for_width)
             except Exception:
                 pass
         except Exception:
@@ -165,7 +166,83 @@ class DashboardView:
 
         self.refresh()
         self._bind_dashboard_scroll_targets()
-        sync_scroll_region()
+        self._sync_dashboard_scroll_geometry()
+        return
+
+    def preferred_size(self) -> tuple[int, int]:
+        """Return the dashboard content size before the outer shell chrome.
+
+        The canvas itself intentionally has a small Tk requested size, so the
+        root window cannot infer the embedded frame's real requirement. Expose
+        that requirement to the shell's fit policy instead of reserving a large
+        fixed dashboard window.
+        """
+        container = self._dashboard_scroll_container
+        if container is None:
+            return (0, 0)
+        # A withdrawn Tk root is still 1x1 while its first view is built. In
+        # that state a Configure event can incorrectly collapse the dashboard
+        # to one column, making the measurement itself too narrow and too tall.
+        # Seed the intended two-column intrinsic layout before measuring; the
+        # normal Configure binding will switch to one column after a truly
+        # narrow window is applied.
+        try:
+            if (
+                self._dashboard_scroll_canvas is not None
+                and int(self._dashboard_scroll_canvas.winfo_width()) <= 1
+                and self._dashboard_grid is not None
+            ):
+                self._layout_dashboard_cards(
+                    self._dashboard_grid,
+                    self._dashboard_section_cards,
+                    available_width=self._TWO_COLUMN_MIN_WIDTH,
+                )
+        except Exception:
+            pass
+        try:
+            container.update_idletasks()
+        except Exception:
+            pass
+        try:
+            width = int(container.winfo_reqwidth())
+            height = int(container.winfo_reqheight())
+        except Exception:
+            return (0, 0)
+        scrollbar = self._dashboard_scrollbar
+        if scrollbar is not None:
+            try:
+                width += max(0, int(scrollbar.winfo_reqwidth()))
+            except Exception:
+                pass
+        return max(1, width), max(1, height)
+
+    def _sync_dashboard_scroll_geometry(self) -> None:
+        """Keep the embedded dashboard content matching the viewport.
+
+        The canvas window tracks the viewport width and stretches to the
+        viewport height whenever the content is shorter, so the card grid
+        fills the window instead of leaving a gray band below it. When the
+        content is taller the natural height wins and the scrollbar takes
+        over as before.
+        """
+
+        canvas = self._dashboard_scroll_canvas
+        container = self._dashboard_scroll_container
+        window_id = self._dashboard_scroll_window_id
+        if canvas is None or container is None or window_id is None:
+            return
+        try:
+            view_width = int(canvas.winfo_width())
+            view_height = int(canvas.winfo_height())
+            required_height = int(container.winfo_reqheight())
+            canvas.itemconfigure(
+                window_id,
+                width=max(1, view_width),
+                height=max(required_height, view_height),
+            )
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
         return
 
     def _layout_dashboard_cards(
@@ -181,7 +258,7 @@ class DashboardView:
                 width = int(grid.winfo_width())
             except Exception:
                 width = 0
-        columns = 1 if width > 1 and width < 700 else 2
+        columns = 1 if width > 1 and width < self._TWO_COLUMN_MIN_WIDTH else 2
         if getattr(grid, "_windows_supporter_dashboard_columns", None) == columns:
             return
         try:
@@ -197,18 +274,39 @@ class DashboardView:
                 )
             except Exception:
                 pass
+        row_count = (len(cards) + columns - 1) // columns
+        previous_rows = int(
+            getattr(grid, "_windows_supporter_dashboard_rows", 0) or 0
+        )
+        for row in range(max(row_count, previous_rows)):
+            try:
+                # Weight still stretches rows into a genuinely taller viewport,
+                # but a uniform row group would also inflate the requested
+                # content height to the tallest card and bake blank space into
+                # every card in a content-fit window.
+                grid.rowconfigure(
+                    row,
+                    weight=1 if row < row_count else 0,
+                    uniform="",
+                )
+            except Exception:
+                pass
+        try:
+            grid._windows_supporter_dashboard_rows = row_count
+        except Exception:
+            pass
         for index, card in enumerate(cards):
             try:
                 card.grid(
                     row=index // columns,
                     column=index % columns,
-                    sticky="nwe",
-                    padx=(0, 6)
+                    sticky="nsew",
+                    padx=(0, 5)
                     if columns > 1 and index % columns == 0
-                    else (6, 0)
+                    else (5, 0)
                     if columns > 1
                     else 0,
-                    pady=(0, 8),
+                    pady=(0, 6),
                 )
             except Exception:
                 pass
@@ -294,6 +392,7 @@ class DashboardView:
         self._set_feature_status("background", self._format_background(snapshot.get("background")))
         self._set_feature_status("update", self._format_update(snapshot.get("update")))
         self._bind_dashboard_scroll_targets()
+        self._sync_dashboard_scroll_geometry()
         return
 
     def _lazy_import_tk(self) -> bool:
@@ -462,21 +561,8 @@ class DashboardView:
             fg=text,
             font=("Segoe UI", 10, "bold"),
         ).pack(side="left")
-        row = tk.Frame(inner, bg=bg)
-        row.pack(fill="x", pady=(4, 0))
-        try:
-            row.columnconfigure(0, weight=1)
-        except Exception:
-            pass
-        status_frame = tk.Frame(row, bg=bg)
-        status_frame.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        buttons = tk.Frame(row, bg=bg)
-        buttons.grid(row=0, column=1, sticky="e")
-        try:
-            status_frame.configure(cursor="hand2")
-            self._bind_click(status_frame, "update.settings")
-        except Exception:
-            pass
+        buttons = tk.Frame(title_row, bg=bg)
+        buttons.pack(side="right")
         ttk.Button(
             buttons,
             text="업데이트 확인",
@@ -489,6 +575,19 @@ class DashboardView:
             width=12,
             command=lambda: self._invoke("update.settings"),
         ).pack(side="left")
+        row = tk.Frame(inner, bg=bg)
+        row.pack(fill="x", pady=(4, 0))
+        try:
+            row.columnconfigure(0, weight=1)
+        except Exception:
+            pass
+        status_frame = tk.Frame(row, bg=bg)
+        status_frame.grid(row=0, column=0, sticky="ew")
+        try:
+            status_frame.configure(cursor="hand2")
+            self._bind_click(status_frame, "update.settings")
+        except Exception:
+            pass
         self._status_frames["update"] = status_frame
         return
 
@@ -583,70 +682,152 @@ class DashboardView:
         frame = self._status_frames.get(str(key))
         if frame is None or tk is None:
             return
-        try:
-            for child in list(frame.winfo_children()):
-                try:
-                    child.destroy()
-                except Exception:
-                    continue
-        except Exception:
-            return
-        status_labels: list[Any] = []
-        for row_parts in self._status_part_rows(key, parts):
-            row = tk.Frame(frame, bg="#FFFFFF")
-            row.pack(anchor="w", fill="x")
-            for idx, (raw_text, kind) in enumerate(row_parts):
-                if idx > 0:
-                    tk.Label(
-                        row,
-                        text=" | ",
-                        bg="#FFFFFF",
-                        fg="#6B7280",
-                        font=("Segoe UI", 9),
-                    ).pack(side="left")
-                fg = "#111827"
-                if kind == "enabled":
-                    fg = "#059669"
-                elif kind == "disabled":
-                    fg = "#DC2626"
-                label = tk.Label(
-                    row,
-                    text=str(raw_text),
-                    bg="#FFFFFF",
-                    fg=fg,
-                    font=("Segoe UI", 9, "bold") if kind in {"enabled", "disabled"} else ("Segoe UI", 9),
-                    anchor="w",
-                    justify="left",
-                )
-                label.pack(side="left")
-                status_labels.append(label)
-                callback_name = f"{key}.settings"
-                if callable(self._get_callback(callback_name)):
-                    try:
-                        label.configure(cursor="hand2")
-                    except Exception:
-                        pass
-                    self._bind_click(label, callback_name)
-        def sync_wraplength(event: Any = None) -> None:
+        logical_rows = self._status_part_rows(key, parts)
+        applied = {"signature": None}
+
+        def measure(text_value: str, kind: str) -> int:
+            return self._measure_status_part_width(str(text_value), str(kind))
+
+        def rebuild(event: Any = None) -> None:
             try:
                 width = int(getattr(event, "width", 0) or frame.winfo_width())
             except Exception:
+                width = 0
+            signature = (width, id(logical_rows))
+            if signature == applied["signature"]:
                 return
-            if width <= 1:
+            applied["signature"] = signature
+            try:
+                for child in list(frame.winfo_children()):
+                    try:
+                        child.destroy()
+                    except Exception:
+                        continue
+            except Exception:
                 return
-            for label in status_labels:
-                try:
-                    label.configure(wraplength=width)
-                except Exception:
-                    continue
+            for line in self._status_lines_for_width(logical_rows, width, measure):
+                row = tk.Frame(frame, bg="#FFFFFF")
+                row.pack(anchor="w", fill="x")
+                for idx, (raw_text, kind, wrap) in enumerate(line):
+                    if idx > 0:
+                        self._make_status_label(row, " | ", "separator").pack(
+                            side="left", anchor="n"
+                        )
+                    label = self._make_status_label(row, raw_text, kind)
+                    label.pack(side="left", anchor="n")
+                    if wrap and width > 1:
+                        try:
+                            label.configure(wraplength=width)
+                        except Exception:
+                            pass
+                    callback_name = f"{key}.settings"
+                    if callable(self._get_callback(callback_name)):
+                        try:
+                            label.configure(cursor="hand2")
+                        except Exception:
+                            pass
+                        self._bind_click(label, callback_name)
             return
 
+        rebuild()
         try:
-            frame.bind("<Configure>", sync_wraplength)
-            frame.after_idle(sync_wraplength)
+            frame.bind("<Configure>", rebuild)
+            frame.after_idle(rebuild)
         except Exception:
             pass
         return
+
+    def _make_status_label(self, row: Any, raw_text: str, kind: str) -> Any:
+        tk = self._tk
+        fg = "#111827"
+        font = ("Segoe UI", 9)
+        if kind == "enabled":
+            fg = "#059669"
+            font = ("Segoe UI", 9, "bold")
+        elif kind == "disabled":
+            fg = "#DC2626"
+            font = ("Segoe UI", 9, "bold")
+        elif kind == "separator":
+            fg = "#6B7280"
+        return tk.Label(
+            row,
+            text=str(raw_text),
+            bg="#FFFFFF",
+            fg=fg,
+            font=font,
+            anchor="w",
+            justify="left",
+        )
+
+    @staticmethod
+    def _status_lines_for_width(
+        row_groups: list[list[tuple[str, str]]],
+        width: int,
+        measure: Callable[[str, str], int],
+    ) -> list[list[tuple[str, str, bool]]]:
+        """Group status parts into rendered lines that fit `width` pixels.
+
+        `measure(text, kind)` returns the rendered pixel width of one part
+        including label chrome. Parts that overflow the current line move to
+        a new line; a part wider than a whole line is flagged to wrap in
+        place. A non-positive or unknown width keeps every logical row on a
+        single line.
+        """
+        lines: list[list[tuple[str, str, bool]]] = []
+        try:
+            separator_width = int(measure(" | ", "separator"))
+        except Exception:
+            separator_width = 0
+        for group in row_groups or []:
+            current: list[tuple[str, str, bool]] = []
+            current_width = 0
+            for raw_text, kind in group or []:
+                try:
+                    part_width = int(measure(str(raw_text), str(kind)))
+                except Exception:
+                    part_width = 0
+                extra = part_width + (separator_width if current else 0)
+                if current and width > 1 and current_width + extra > width:
+                    lines.append(current)
+                    current = []
+                    current_width = 0
+                    extra = part_width
+                current.append((raw_text, kind, bool(width > 1 and part_width > width)))
+                current_width += extra
+            if current:
+                lines.append(current)
+        return lines
+
+    def _status_measure_fonts(self) -> dict[str, Any]:
+        if self._status_fonts:
+            return self._status_fonts
+        fonts: dict[str, Any] = {}
+        try:
+            from tkinter import font as tkfont
+        except Exception:
+            tkfont = None
+        if tkfont is not None:
+            for name, weight in (("normal", "normal"), ("bold", "bold")):
+                try:
+                    fonts[name] = tkfont.Font(
+                        family="Segoe UI", size=9, weight=weight
+                    )
+                except Exception:
+                    continue
+        self._status_fonts = fonts
+        return fonts
+
+    def _measure_status_part_width(self, text: str, kind: str) -> int:
+        font = self._status_measure_fonts().get(
+            "bold" if kind in {"enabled", "disabled"} else "normal"
+        )
+        try:
+            width = int(font.measure(str(text))) if font is not None else 0
+        except Exception:
+            width = 0
+        if width <= 0:
+            width = max(1, len(str(text))) * 10
+        return width + self._STATUS_PART_CHROME
 
     @staticmethod
     def _status_part_rows(key: str, parts: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
@@ -785,11 +966,8 @@ class DashboardView:
         attached_text = ", ".join(attached) if attached else "없음"
         return is_enabled, [
             self._enabled_part(is_enabled),
-            ("범위: 핫키/자동화", "normal"),
-            (f"핫키: {hotkeys}", "normal"),
-            (f"기능 준비: {warmup}", "normal"),
-            (f"전경 프로필: {profile}", "normal"),
-            (f"연결된 기능: {attached_text}", "normal"),
+            (f"핫키 {hotkeys} · 준비 {warmup}", "normal"),
+            (f"전경 {profile} · 연결 {attached_text}", "normal"),
         ]
 
     def _format_update(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:

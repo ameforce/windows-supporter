@@ -7,15 +7,33 @@ from datetime import date as date_type
 import math
 import re
 import time
+import unicodedata
 from typing import Any, Callable
 
-from src.apps.wrike_timelog_details import TimelogDayDetails
+from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
+from src.apps.wrike_worktime import normalize_hhmm_input
 
 
 _REFRESH_INTERVAL_MS = 1_000
 _COUNTDOWN_INTERVAL_MS = 200
 _DEFAULT_IDLE_TIMEOUT_MS = 6_000
 _MIN_IDLE_TIMEOUT_MS = 1_200
+# The quick panel is intentionally a compact, non-modal summary. These are
+# safety fallbacks; normal content still determines the requested size.
+_MIN_PANEL_WIDTH = 520
+_MIN_PANEL_HEIGHT = 330
+_COMPACT_PANEL_MAX_WIDTH = 660
+_COMPACT_PANEL_MAX_HEIGHT = 540
+_MAX_COMPACT_TODAY_LINES = 2
+# Detail text is a bounded viewport: leave enough room for the summary and
+# the first few ticket/detail rows while keeping long days scrollable.
+_DETAIL_EMPTY_TEXT_HEIGHT = 5
+_DETAIL_TEXT_HEIGHT_WITH_ROWS = 8
+_DETAIL_TEXT_MIN_HEIGHT = 3
+_DETAIL_TEXT_PAD_X = 6
+_DETAIL_GROUP_LEFT_MARGIN = 12
+_DETAIL_GROUP_FONT = ("Segoe UI", 10, "bold")
+_DETAIL_GROUP_DURATION_FONT = ("Segoe UI", 9, "bold")
 _POINTER_OFFSET_PX = 16
 _DATE_KEY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _HHMM_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -24,6 +42,10 @@ _INLINE_EDITOR_TARGET = "target_minutes"
 _INLINE_EDITOR_CLOCK_IN = "clock_in"
 _INLINE_EDITOR_PROMPT = "prompt_clock_in"
 _INLINE_EDITOR_MANUAL_BREAK = "manual_break"
+_INLINE_EDITOR_OVERTIME_START = "overtime_start"
+_INLINE_EDITOR_OVERTIME_PROMPT_START = "overtime_prompt_start"
+_INLINE_EDITOR_FLEX_PENDING = "flex_pending"
+_MAX_FLEX_PENDING_ROWS = 4
 
 _BG = "#F3F4F6"
 _CARD_BG = "#FFFFFF"
@@ -35,6 +57,8 @@ _TODAY_BG = "#DBEAFE"
 _SELECTED_BG = "#BFDBFE"
 _PROMPT_BG = "#FFF7ED"
 _PROMPT_BORDER = "#FDBA74"
+_DETAIL_TIME_BG = "#DBEAFE"
+_DETAIL_TIME_TEXT = "#1D4ED8"
 _SYNC_COLORS = {
     "ok": "#059669",
     "synced": "#059669",
@@ -105,6 +129,85 @@ class WorktimeActivityPrompt:
 
 
 @dataclass(frozen=True, slots=True)
+class WorktimeOvertimePrompt:
+    """Optional prompt shown after the projected/scheduled quit time."""
+
+    detected_time: str
+    scheduled_quit_time: str
+    assigned_minutes: int = 0
+
+    def __post_init__(self) -> None:
+        if _HHMM_PATTERN.fullmatch(self.detected_time) is None:
+            raise ValueError("detected_time must use 24-hour HH:MM format")
+        if _TARGET_HHMM_PATTERN.fullmatch(self.scheduled_quit_time) is None:
+            raise ValueError("scheduled_quit_time must use HH:MM or 24:00 format")
+        if type(self.assigned_minutes) is not int:
+            raise TypeError("assigned_minutes must be an int")
+        if not 0 <= self.assigned_minutes <= 1440:
+            raise ValueError("assigned_minutes must be between 0 and 1440")
+
+
+@dataclass(frozen=True, slots=True)
+class WorktimeOvertimeState:
+    """Live overtime state rendered in the quick panel."""
+
+    status: str
+    start_time: str
+    elapsed_minutes: int
+    scheduled_quit_time: str
+    assigned_minutes: int = 0
+    paused: bool = False
+    paused_minutes: int = 0
+    auto_paused: bool = False
+    idle_autopause_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if self.status != "active":
+            raise ValueError("overtime state status must be active")
+        if _HHMM_PATTERN.fullmatch(self.start_time) is None:
+            raise ValueError("start_time must use 24-hour HH:MM format")
+        if _TARGET_HHMM_PATTERN.fullmatch(self.scheduled_quit_time) is None:
+            raise ValueError("scheduled_quit_time must use HH:MM or 24:00 format")
+        if type(self.elapsed_minutes) is not int or self.elapsed_minutes < 0:
+            raise ValueError("elapsed_minutes must be a non-negative int")
+        if type(self.assigned_minutes) is not int:
+            raise TypeError("assigned_minutes must be an int")
+        if not 0 <= self.assigned_minutes <= 1440:
+            raise ValueError("assigned_minutes must be between 0 and 1440")
+        if type(self.paused) is not bool:
+            raise TypeError("paused must be a bool")
+        if type(self.paused_minutes) is not int or self.paused_minutes < 0:
+            raise ValueError("paused_minutes must be a non-negative int")
+        if type(self.auto_paused) is not bool:
+            raise TypeError("auto_paused must be a bool")
+        if self.auto_paused and not self.paused:
+            raise ValueError("auto_paused requires paused")
+        if type(self.idle_autopause_enabled) is not bool:
+            raise TypeError("idle_autopause_enabled must be a bool")
+
+
+@dataclass(frozen=True, slots=True)
+class WorktimeFlexPendingRecord:
+    """One completed overtime interval still waiting for Flex registration."""
+
+    date_key: str
+    label: str
+    start_time: str
+    end_time: str
+    net_minutes: int
+
+    def __post_init__(self) -> None:
+        _require_iso_date_key(self.date_key)
+        _require_nonempty_string(self.label, name="label")
+        if _HHMM_PATTERN.fullmatch(self.start_time) is None:
+            raise ValueError("start_time must use HH:MM format")
+        if _TARGET_HHMM_PATTERN.fullmatch(self.end_time) is None:
+            raise ValueError("end_time must use HH:MM or 24:00 format")
+        if type(self.net_minutes) is not int or self.net_minutes < 0:
+            raise ValueError("net_minutes must be a non-negative int")
+
+
+@dataclass(frozen=True, slots=True)
 class WorktimePanelManualBreak:
     """One selected-week break row; only raw manual rows are editable."""
 
@@ -151,6 +254,9 @@ class WorktimePanelModel:
     prompt: WorktimeActivityPrompt | None = None
     day_details: tuple[TimelogDayDetails, ...] = ()
     manual_breaks: tuple[WorktimePanelManualBreak, ...] = ()
+    overtime_prompt: WorktimeOvertimePrompt | None = None
+    overtime_state: WorktimeOvertimeState | None = None
+    flex_pending: tuple[WorktimeFlexPendingRecord, ...] = ()
 
     def __post_init__(self) -> None:
         _require_string(self.week_range, name="week_range")
@@ -183,6 +289,29 @@ class WorktimePanelModel:
             self.prompt, WorktimeActivityPrompt
         ):
             raise TypeError("prompt must be a WorktimeActivityPrompt or None")
+        if self.overtime_prompt is not None and not isinstance(
+            self.overtime_prompt, WorktimeOvertimePrompt
+        ):
+            raise TypeError(
+                "overtime_prompt must be a WorktimeOvertimePrompt or None"
+            )
+        if self.overtime_state is not None and not isinstance(
+            self.overtime_state, WorktimeOvertimeState
+        ):
+            raise TypeError(
+                "overtime_state must be a WorktimeOvertimeState or None"
+            )
+        if not isinstance(self.flex_pending, tuple):
+            raise TypeError("flex_pending must be an immutable tuple")
+        if any(
+            not isinstance(item, WorktimeFlexPendingRecord)
+            for item in self.flex_pending
+        ):
+            raise TypeError("flex_pending must contain WorktimeFlexPendingRecord values")
+        if len({item.date_key for item in self.flex_pending}) != len(
+            self.flex_pending
+        ):
+            raise ValueError("flex_pending must contain unique date_key values")
         if not isinstance(self.day_details, tuple):
             raise TypeError("day_details must be an immutable tuple")
         if self.day_details and (
@@ -242,6 +371,16 @@ class WorktimeQuickPanel:
         tk_module: Any | None = None,
         idle_timeout_ms: int = _DEFAULT_IDLE_TIMEOUT_MS,
         monotonic: Callable[[], float] = time.monotonic,
+        overtime_prompt_accept: Callable[[str], None] | None = None,
+        overtime_prompt_skip: Callable[[], None] | None = None,
+        overtime_end: Callable[[], None] | None = None,
+        overtime_toggle_pause: Callable[[], None] | None = None,
+        overtime_edit_start: Callable[[str], bool] | None = None,
+        overtime_prompt_edit: Callable[[str, str], bool] | None = None,
+        overtime_idle_autopause: Callable[[], None] | None = None,
+        flex_open: Callable[[], None] | None = None,
+        flex_pending_edit: Callable[[str, str, str], bool] | None = None,
+        flex_pending_done: Callable[[str], None] | None = None,
     ) -> None:
         callbacks = {
             "model_provider": model_provider,
@@ -274,6 +413,40 @@ class WorktimeQuickPanel:
         self._on_prompt_snooze = prompt_snooze
         self._on_prompt_skip = prompt_skip
         self._on_edit_manual_break = edit_manual_break
+        self._on_overtime_prompt_accept = (
+            overtime_prompt_accept
+            if overtime_prompt_accept is not None
+            else lambda _detected_time: None
+        )
+        self._on_overtime_prompt_skip = (
+            overtime_prompt_skip
+            if overtime_prompt_skip is not None
+            else lambda: None
+        )
+        self._on_overtime_end = (
+            overtime_end if overtime_end is not None else lambda: None
+        )
+        self._on_overtime_toggle_pause = (
+            overtime_toggle_pause
+            if overtime_toggle_pause is not None
+            else lambda: None
+        )
+        self._on_overtime_edit_start = overtime_edit_start
+        self._on_overtime_prompt_edit = overtime_prompt_edit
+        self._on_overtime_idle_autopause = (
+            overtime_idle_autopause
+            if overtime_idle_autopause is not None
+            else lambda: None
+        )
+        self._on_flex_open = (
+            flex_open if flex_open is not None else lambda: None
+        )
+        self._on_flex_pending_edit = flex_pending_edit
+        self._on_flex_pending_done = (
+            flex_pending_done
+            if flex_pending_done is not None
+            else lambda _date_key: None
+        )
         self._monotonic = monotonic
         self._tk = tk_module
 
@@ -284,6 +457,8 @@ class WorktimeQuickPanel:
         self._selected_date_key: str | None = None
         self._rendered_detail_date_key: str | None = None
         self._pending_detail_scroll: _DetailScrollAnchor | None = None
+        self._detail_text_width: int | None = None
+        self._detail_text_layout_height: int | None = None
         self._structure_signature: tuple[Any, ...] | None = None
         self._widgets: dict[str, Any] = {}
         self._refresh_after_id = None
@@ -322,7 +497,8 @@ class WorktimeQuickPanel:
         self.refresh_now()
         if not (not self._placed and self._geometry_retry_pending):
             self._geometry_retry_pending = not self._reconcile_geometry(
-                anchor_to_pointer=True
+                anchor_to_pointer=True,
+                resize_to_request=True,
             )
         if activate:
             if not _show_window_activated(window):
@@ -332,7 +508,8 @@ class WorktimeQuickPanel:
         _safe_call(window, "update_idletasks")
         if not self._geometry_retry_pending:
             self._geometry_retry_pending = not self._reconcile_geometry(
-                anchor_to_pointer=True
+                anchor_to_pointer=True,
+                resize_to_request=True,
             )
         _safe_call(window, "update_idletasks")
         if not self._geometry_retry_pending:
@@ -411,6 +588,11 @@ class WorktimeQuickPanel:
 
         signature = self._model_structure_signature(model)
         rebuilt = signature != self._structure_signature or not self._widgets
+        prior_detail_height = (
+            self._detail_text_height(self._model)
+            if self._model is not None
+            else None
+        )
         if rebuilt:
             self._render_structure(model)
             self._structure_signature = signature
@@ -418,8 +600,11 @@ class WorktimeQuickPanel:
             self._update_rendered_model(model)
 
         self._model = model
-        if rebuilt:
-            self._geometry_retry_pending = not self._reconcile_geometry()
+        detail_height_changed = prior_detail_height != self._detail_text_height(model)
+        if rebuilt or detail_height_changed:
+            self._geometry_retry_pending = not self._reconcile_geometry(
+                resize_to_request=True
+            )
             if not self._geometry_retry_pending:
                 self._restore_pending_detail_scroll()
         return True
@@ -445,6 +630,8 @@ class WorktimeQuickPanel:
         self._selected_date_key = None
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = None
+        self._detail_text_width = None
+        self._detail_text_layout_height = None
         self._structure_signature = None
         self._widgets = {}
         self._geometry_retry_pending = False
@@ -521,31 +708,64 @@ class WorktimeQuickPanel:
                 or self._manual_break_edit.date_key != self._selected_date_key
                 or self._row_for_date(model, self._manual_break_edit.date_key) is None
             )
+        elif self._inline_editor_kind == _INLINE_EDITOR_OVERTIME_PROMPT_START:
+            stale = (
+                model.overtime_prompt is None
+                or model.overtime_prompt.detected_time != self._inline_editor_context
+            )
+        elif self._inline_editor_kind == _INLINE_EDITOR_OVERTIME_START:
+            stale = model.overtime_state is None
+        elif self._inline_editor_kind == _INLINE_EDITOR_FLEX_PENDING:
+            stale = not any(
+                record.date_key == self._inline_editor_context
+                for record in model.flex_pending
+            )
         if stale:
             self._close_inline_editor(reconcile=self._visible)
 
     @staticmethod
     def _model_structure_signature(model: WorktimePanelModel) -> tuple[Any, ...]:
-        return model.prompt is not None, len(model.today_lines)
+        return (
+            model.prompt is not None,
+            model.overtime_prompt is not None,
+            model.overtime_state is not None,
+            tuple(
+                (record.date_key, record.start_time, record.end_time)
+                for record in model.flex_pending
+            ),
+            min(
+                _MAX_COMPACT_TODAY_LINES,
+                max(1, len(model.today_lines)),
+            ),
+        )
+
+    @staticmethod
+    def _visible_today_lines(
+        model: WorktimePanelModel,
+    ) -> tuple[WorktimePanelLine, ...]:
+        """Keep the transient panel summary bounded without dropping its state."""
+
+        lines = model.today_lines
+        if not lines:
+            return (WorktimePanelLine("표시할 오늘 상세가 없습니다.", _MUTED),)
+        if len(lines) <= _MAX_COMPACT_TODAY_LINES:
+            return lines
+        return (
+            lines[0],
+            WorktimePanelLine(f"추가 상태 {len(lines) - 1}건", _MUTED),
+        )
 
     def _uses_compact_density(self) -> bool:
-        """Fit all controls in the work area used for the first placement."""
+        """Keep the reusable quick panel compact on every monitor size.
 
-        window = self._window
-        if window is None:
-            return False
-        current = self._window_rect(window)
-        pointer_x, pointer_y = _pointer_position(window, self._root)
-        use_pointer = not self._placed or current is None
-        if use_pointer:
-            work_area = _work_area_for_point(pointer_x, pointer_y, window, self._root)
-        else:
-            work_area = _work_area_for_window(window, self._root)
-        try:
-            work_height = int(work_area[3]) - int(work_area[1])
-        except (IndexError, TypeError, ValueError):
-            return False
-        return 480 <= work_height <= 720
+        The previous work-area-height heuristic made the same panel switch to
+        a spacious layout on a normal monitor. That made Ctrl+Alt+W appear
+        disproportionately large and caused geometry to jump between
+        monitors. The panel has a scrollable detail viewport, so compact
+        density is the stable default.
+        """
+
+        return True
 
     @staticmethod
     def _detail_for_selected_date(
@@ -559,23 +779,282 @@ class WorktimeQuickPanel:
             None,
         )
 
+    def _detail_text_height(self, model: WorktimePanelModel) -> int:
+        """Keep the detail viewport readable without letting long logs own the panel."""
+
+        if self._detail_view == "breaks":
+            return min(6, max(3, len(self._selected_manual_breaks(model)) + 1))
+        detail = self._detail_for_selected_date(model, self._selected_date_key)
+        if detail is None or detail.state != "available" or not detail.rows:
+            return _DETAIL_EMPTY_TEXT_HEIGHT
+        # Every ticket gets a heading and every record gets a nested child row,
+        # including a ticket with only one record. Eight rows leave a useful
+        # initial slice visible; Text scrolling handles unusually long days
+        # instead of making this panel grow without bound.
+        return _DETAIL_TEXT_HEIGHT_WITH_ROWS
+
+    def _fit_detail_viewport(self, max_window_height: int) -> None:
+        """Protect the footer by shrinking only the scrollable detail viewport."""
+
+        detail_text = self._widgets.get("detail_text")
+        footer = self._widgets.get("footer")
+        window = self._window
+        if (
+            detail_text is None
+            or footer is None
+            or window is None
+            or not callable(getattr(detail_text, "configure", None))
+            or not callable(getattr(detail_text, "cget", None))
+        ):
+            return
+
+        desired_height = (
+            self._detail_text_height(self._model)
+            if self._model is not None
+            else _DETAIL_TEXT_HEIGHT_WITH_ROWS
+        )
+        desired_height = max(_DETAIL_TEXT_MIN_HEIGHT, desired_height)
+        max_window_height = max(1, int(max_window_height))
+
+        # Restore the model's preferred viewport before measuring. This lets a
+        # refresh or monitor move give rows back when enough space is available.
+        self._detail_text_layout_height = desired_height
+        _safe_call(detail_text, "configure", height=desired_height)
+        _safe_call(window, "update_idletasks")
+        footer_reqheight = _positive_int_call(footer, "winfo_reqheight", 0)
+        if footer_reqheight <= 0:
+            return
+
+        def layout_fits() -> bool:
+            return bool(
+                _positive_int_call(window, "winfo_reqheight", 0)
+                <= max_window_height
+                and _int_call(footer, "winfo_height", 0) >= footer_reqheight
+            )
+
+        if layout_fits():
+            return
+
+        for detail_height in range(
+            desired_height - 1,
+            _DETAIL_TEXT_MIN_HEIGHT - 1,
+            -1,
+        ):
+            _safe_call(detail_text, "configure", height=detail_height)
+            _safe_call(window, "update_idletasks")
+            if layout_fits():
+                self._detail_text_layout_height = detail_height
+                return
+
+        # Keep the smallest readable viewport as the final fallback on an
+        # exceptionally small or heavily scaled work area.
+        self._detail_text_layout_height = _DETAIL_TEXT_MIN_HEIGHT
+        _safe_call(detail_text, "configure", height=_DETAIL_TEXT_MIN_HEIGHT)
+        _safe_call(window, "update_idletasks")
+
+    @staticmethod
+    def _group_timelog_rows(
+        rows: tuple[TimelogDetailRow, ...],
+    ) -> tuple[tuple[TimelogDetailRow, ...], ...]:
+        """Keep one ordered group for each ticket represented by the logs."""
+
+        grouped: dict[tuple[str, str], list[TimelogDetailRow]] = {}
+        for row in rows:
+            # Unlinked logs have no shared ticket identity, so keep each one
+            # visible instead of accidentally merging unrelated entries.
+            key = (
+                ("task", row.task_id)
+                if row.task_id
+                else ("timelog", row.timelog_id)
+            )
+            grouped.setdefault(key, []).append(row)
+        return tuple(tuple(group) for group in grouped.values())
+
+    def _detail_text_line_width(self) -> int:
+        """Return a conservative single-line width for ticket headings."""
+
+        widget = self._widgets.get("detail_text")
+        width = _int_call(widget, "winfo_width", 0)
+        if width <= 1:
+            # During the first render Tk has not assigned a child width yet.
+            # Fit to the panel's safety minimum until the Configure callback
+            # can re-fit the heading against the actual viewport.
+            return max(1, _MIN_PANEL_WIDTH - 28)
+        return width
+
+    @staticmethod
+    def _estimated_text_width(value: str) -> int:
+        """Estimate Segoe UI detail text width without requiring a Tk display."""
+
+        width = 0
+        for character in str(value):
+            if character == "\t":
+                width += 28
+            elif character.isspace():
+                width += 4
+            elif unicodedata.east_asian_width(character) in {"W", "F"}:
+                width += 12
+            else:
+                width += 7
+        return width
+
+    def _detail_text_metric(self, name: str, default: int) -> int:
+        """Read one integer geometry field from the live detail widget."""
+
+        widget = self._widgets.get("detail_text")
+        cget = getattr(widget, "cget", None)
+        if not callable(cget):
+            return default
+        try:
+            return int(cget(name))
+        except Exception:
+            return default
+
+    def _measure_detail_run(self, font: tuple, value: str) -> int | None:
+        """Measure one same-font run in pixels; None without a live Tk display."""
+
+        widget = self._widgets.get("detail_text")
+        tk_interp = getattr(widget, "tk", None)
+        call = getattr(tk_interp, "call", None)
+        if not callable(call):
+            return None
+        try:
+            return int(
+                call("font", "measure", font, "-displayof", widget, str(value))
+            )
+        except Exception:
+            return None
+
+    def _detail_heading_budget(self) -> int:
+        """Pixel width a single ticket heading line may occupy."""
+
+        return max(
+            96,
+            self._detail_text_line_width()
+            - 2 * self._detail_text_metric("padx", _DETAIL_TEXT_PAD_X)
+            - 2 * self._detail_text_metric("highlightthickness", 1)
+            - _DETAIL_GROUP_LEFT_MARGIN
+            - 2,
+        )
+
+    def _ticket_heading_width(
+        self,
+        title: str,
+        suffix_a: str,
+        duration: str,
+        suffix_b: str,
+    ) -> int:
+        """Width of the composed heading across its two rendered fonts."""
+
+        group = self._measure_detail_run(
+            _DETAIL_GROUP_FONT, "• " + title + suffix_a + suffix_b
+        )
+        span = self._measure_detail_run(_DETAIL_GROUP_DURATION_FONT, duration)
+        if group is not None and span is not None:
+            return group + span
+        return self._estimated_text_width(
+            "• " + title + suffix_a + duration + suffix_b
+        )
+
+    def _ticket_heading_text(
+        self,
+        ticket_text: str,
+        *,
+        group_size: int,
+        group_duration: str,
+    ) -> str:
+        """Fit the ticket name while retaining the duration/count suffix."""
+
+        suffix_a = f" · {'티켓 합계 ' if group_size > 1 else ''}"
+        suffix_b = f" · {group_size}건"
+        title = " ".join(str(ticket_text or "").split()) or "제목 없음"
+        budget = self._detail_heading_budget()
+        if (
+            self._ticket_heading_width(title, suffix_a, group_duration, suffix_b)
+            <= budget
+        ):
+            return title
+        ellipsis = "..."
+        low, high = 0, len(title)
+        while low < high:
+            mid = (low + high + 1) // 2
+            candidate = title[:mid] + ellipsis
+            if (
+                self._ticket_heading_width(
+                    candidate, suffix_a, group_duration, suffix_b
+                )
+                <= budget
+            ):
+                low = mid
+            else:
+                high = mid - 1
+        return title[:low].rstrip() + ellipsis
+
+    def _on_detail_text_configure(self, event: Any = None) -> None:
+        """Re-fit ticket headings after Tk assigns the real viewport width."""
+
+        widget = self._widgets.get("detail_text")
+        if widget is None:
+            return
+        event_widget = getattr(event, "widget", widget)
+        if event_widget is not widget and str(event_widget) != str(widget):
+            return
+        width = _int_call(widget, "winfo_width", 0)
+        if width <= 1 or width == self._detail_text_width:
+            return
+        self._detail_text_width = width
+        model = self._model
+        if model is None or self._detail_view != "timelog":
+            return
+        self._set_detail_text(
+            widget,
+            self._selected_detail_view_text(model),
+            date_key=self._selected_date_key,
+            tagged_parts=self._selected_detail_parts(model),
+        )
+
     def _selected_detail_parts(
         self, model: WorktimePanelModel,
     ) -> tuple[tuple[str, str], ...]:
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state == "loading":
-            return (("상세 기록을 불러오는 중입니다.", "detail_comment"),)
+            return (("상세 기록을 불러오는 중입니다.", "detail_status"),)
         if detail.state == "unavailable":
-            return (("상세 기록을 확인할 수 없습니다.", "detail_comment"),)
+            return (("상세 기록을 확인할 수 없습니다.", "detail_status"),)
         if not detail.rows:
-            return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_comment"),)
-        parts = [(f"실제 기록 합계 {self._format_actual_minutes(detail.total_minutes)}", "detail_heading")]
-        for row in detail.rows:
-            parts.append((
-                f"\n{row.ticket_text} · {self._format_actual_minutes(row.minutes)}",
-                "detail_heading",
+            return (("해당 날짜에 Wrike 기록이 없습니다. · 합계 0분", "detail_status"),)
+        parts: list[tuple[str, str]] = []
+        for group in self._group_timelog_rows(detail.rows):
+            ticket = group[0]
+            group_total = sum(row.minutes for row in group)
+            group_duration = self._format_actual_minutes(group_total)
+            parts.extend((
+                ("• ", "detail_group"),
+                (
+                    self._ticket_heading_text(
+                        ticket.ticket_text,
+                        group_size=len(group),
+                        group_duration=group_duration,
+                    ),
+                    "detail_group",
+                ),
+                (f" · {'티켓 합계 ' if len(group) > 1 else ''}", "detail_group"),
+                (group_duration, "detail_group_duration"),
+                (f" · {len(group)}건", "detail_group"),
+                ("\n", "detail_group"),
             ))
-            parts.append((f"\n{row.comment.strip() or '코멘트 없음'}", "detail_comment"))
+            for row in group:
+                comment = " ".join(str(row.comment or "").split())
+                parts.extend((
+                    ("  ◦ ", "detail_child"),
+                    (self._format_actual_minutes(row.minutes), "detail_child_duration"),
+                ))
+                if comment:
+                    parts.extend((
+                        (" · ", "detail_child"),
+                        (comment, "detail_comment"),
+                    ))
+                parts.append(("\n", "detail_child"))
         return tuple(parts)
 
     def _selected_detail_text(self, model: WorktimePanelModel) -> str:
@@ -619,7 +1098,7 @@ class WorktimeQuickPanel:
             text=(
                 "선택 날짜 휴게 기록"
                 if breaks_view
-                else "선택 날짜 실제 기록 · 티켓 / 시간 / 코멘트"
+                else "선택 날짜 타임로그"
             ),
         )
         _safe_call(
@@ -631,6 +1110,17 @@ class WorktimeQuickPanel:
             widgets.get("detail_breaks_button"),
             "configure",
             relief="sunken" if breaks_view else "solid",
+        )
+        detail_height = self._detail_text_height(model)
+        if self._detail_text_layout_height is not None:
+            detail_height = min(
+                detail_height,
+                max(_DETAIL_TEXT_MIN_HEIGHT, self._detail_text_layout_height),
+            )
+        _safe_call(
+            widgets.get("detail_text"),
+            "configure",
+            height=detail_height,
         )
         rows = self._selected_manual_breaks(model)
         menu = widgets.get("manual_break_menu")
@@ -646,11 +1136,12 @@ class WorktimeQuickPanel:
                         command=lambda row=row: self._edit_manual_break_command(row),
                     )
         editable_rows = tuple(row for row in rows if row.editable)
-        _safe_call(
-            menu_button,
-            "configure",
-            state="normal" if editable_rows else "disabled",
-        )
+        if breaks_view and editable_rows:
+            _safe_call(menu_button, "configure", state="normal")
+            _safe_call(menu_button, "pack", side="right", padx=(3, 0))
+        else:
+            _safe_call(menu_button, "configure", state="disabled")
+            _safe_call(menu_button, "pack_forget")
         self._set_detail_text(
             widgets.get("detail_text"),
             self._selected_detail_view_text(model),
@@ -665,6 +1156,9 @@ class WorktimeQuickPanel:
         self._detail_view = view
         if self._model is not None:
             self._update_detail_presentation(self._model, reset_scroll=True)
+            self._geometry_retry_pending = not self._reconcile_geometry(
+                resize_to_request=True
+            )
 
     def _ensure_tk(self) -> Any | None:
         if self._tk is not None:
@@ -687,6 +1181,8 @@ class WorktimeQuickPanel:
             self._selected_date_key = None
             self._rendered_detail_date_key = None
             self._pending_detail_scroll = None
+            self._detail_text_width = None
+            self._detail_text_layout_height = None
             self._structure_signature = None
             self._widgets = {}
             self._placed = False
@@ -1049,12 +1545,20 @@ class WorktimeQuickPanel:
         self._widgets = {}
         self._rendered_detail_date_key = None
         self._pending_detail_scroll = preserved_detail_scroll
+        self._detail_text_width = None
+        self._detail_text_layout_height = None
 
-        compact = model.prompt is not None or self._uses_compact_density()
-        section_gap = 3 if compact else 8
-        title_padding = (3, 0) if compact else (7, 2)
+        compact = (
+            model.prompt is not None
+            or model.overtime_prompt is not None
+            or model.overtime_state is not None
+            or bool(model.flex_pending)
+            or self._uses_compact_density()
+        )
+        section_gap = 2 if compact else 8
+        title_padding = (2, 0) if compact else (7, 2)
         row_padding = 0 if compact else 2
-        _safe_call(content, "pack_configure", padx=6 if compact else 8, pady=3 if compact else 8)
+        _safe_call(content, "pack_configure", padx=5 if compact else 8, pady=2 if compact else 8)
 
         header = tk.Frame(
             content,
@@ -1064,20 +1568,20 @@ class WorktimeQuickPanel:
         )
         header.pack(fill="x", pady=(0, section_gap))
         title_row = tk.Frame(header, bg=_CARD_BG)
-        title_row.pack(fill="x", padx=10, pady=title_padding)
+        title_row.pack(fill="x", padx=8 if compact else 10, pady=title_padding)
         tk.Label(
             title_row,
             text="Wrike 근무시간",
             bg=_CARD_BG,
             fg=_TEXT,
-            font=("Segoe UI", 13, "bold"),
+            font=("Segoe UI", 12 if compact else 13, "bold"),
         ).pack(side="left")
         week_range_label = tk.Label(
             title_row,
             text=model.week_range,
             bg=_CARD_BG,
             fg=_MUTED,
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 8 if compact else 9),
         )
         week_range_label.pack(side="right")
         sync_label = tk.Label(
@@ -1086,9 +1590,9 @@ class WorktimeQuickPanel:
             bg=_CARD_BG,
             fg=self._sync_color(model),
             anchor="w",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 8 if compact else 9),
         )
-        sync_label.pack(fill="x", padx=10, pady=(0, 3 if compact else 7))
+        sync_label.pack(fill="x", padx=8 if compact else 10, pady=(0, 1 if compact else 7))
 
         today_card = tk.Frame(
             content,
@@ -1103,34 +1607,23 @@ class WorktimeQuickPanel:
             bg=_CARD_BG,
             fg=_TEXT,
             anchor="w",
-            font=("Segoe UI", 10, "bold"),
-        ).pack(fill="x", padx=10, pady=title_padding)
+            font=("Segoe UI", 9 if compact else 10, "bold"),
+        ).pack(fill="x", padx=8 if compact else 10, pady=title_padding)
         today_line_labels = []
-        if model.today_lines:
-            for line in model.today_lines:
-                label = tk.Label(
-                    today_card,
-                    text=line.text,
-                    bg=_CARD_BG,
-                    fg=line.color,
-                    anchor="w",
-                    justify="left",
-                    font=("Segoe UI", 9),
-                )
-                label.pack(fill="x", padx=10, pady=0)
-                today_line_labels.append(label)
-        else:
+        for line in self._visible_today_lines(model):
             label = tk.Label(
                 today_card,
-                text="표시할 오늘 상세가 없습니다.",
+                text=line.text,
                 bg=_CARD_BG,
-                fg=_MUTED,
+                fg=line.color,
                 anchor="w",
-                font=("Segoe UI", 9),
+                justify="left",
+                font=("Segoe UI", 8 if compact else 9),
             )
-            label.pack(fill="x", padx=10, pady=0)
+            label.pack(fill="x", padx=8 if compact else 10, pady=0)
             today_line_labels.append(label)
-        tk.Frame(today_card, bg=_CARD_BG, height=1 if compact else 5).pack(fill="x")
+        if not compact:
+            tk.Frame(today_card, bg=_CARD_BG, height=5).pack(fill="x")
 
         week_card = tk.Frame(
             content,
@@ -1145,11 +1638,11 @@ class WorktimeQuickPanel:
             bg=_CARD_BG,
             fg=_TEXT,
             anchor="w",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 9 if compact else 10, "bold"),
         ).pack(
             fill="x",
-            padx=10,
-            pady=(2, 0) if compact else (7, 3),
+            padx=8 if compact else 10,
+            pady=(1, 0) if compact else (7, 3),
         )
         row_widgets = []
         for row_index, row in enumerate(model.rows):
@@ -1157,29 +1650,29 @@ class WorktimeQuickPanel:
             row_bg = _SELECTED_BG if selected else (_TODAY_BG if row.today else _CARD_BG)
             emphasis = "bold" if row.today or selected else "normal"
             row_frame = tk.Frame(week_card, bg=row_bg, cursor="hand2")
-            row_frame.pack(fill="x", padx=8, pady=0)
+            row_frame.pack(fill="x", padx=6 if compact else 8, pady=0)
             weekday_label = tk.Label(
                 row_frame,
                 text=row.weekday,
-                width=4,
+                width=3 if compact else 4,
                 bg=row_bg,
                 fg=_TEXT,
                 anchor="w",
                 cursor="hand2",
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", 8 if compact else 9, emphasis),
             )
-            weekday_label.pack(side="left", padx=(4, 2), pady=row_padding)
+            weekday_label.pack(side="left", padx=(3 if compact else 4, 2), pady=row_padding)
             date_label = tk.Label(
                 row_frame,
                 text=row.date,
-                width=8,
+                width=7 if compact else 8,
                 bg=row_bg,
                 fg=_MUTED,
                 anchor="w",
                 cursor="hand2",
-                font=("Segoe UI", 9),
+                font=("Segoe UI", 8 if compact else 9),
             )
-            date_label.pack(side="left", padx=(0, 8), pady=row_padding)
+            date_label.pack(side="left", padx=(0, 5 if compact else 8), pady=row_padding)
             summary_label = tk.Label(
                 row_frame,
                 text=row.summary,
@@ -1188,7 +1681,7 @@ class WorktimeQuickPanel:
                 anchor="w",
                 justify="left",
                 cursor="hand2",
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", 8 if compact else 9, emphasis),
             )
             summary_label.pack(side="left", fill="x", expand=True, pady=row_padding)
             today_label = tk.Label(
@@ -1197,7 +1690,7 @@ class WorktimeQuickPanel:
                 bg=row_bg,
                 fg="#1D4ED8",
                 cursor="hand2",
-                font=("Segoe UI", 8, "bold"),
+                font=("Segoe UI", 7 if compact else 8, "bold"),
             )
             today_label.pack(side="right", padx=4, pady=row_padding)
             widgets_for_row = (
@@ -1225,14 +1718,14 @@ class WorktimeQuickPanel:
         )
         detail_card.pack(fill="x", pady=(0, section_gap))
         detail_header = tk.Frame(detail_card, bg=_CARD_BG)
-        detail_header.pack(fill="x", padx=10, pady=title_padding)
+        detail_header.pack(fill="x", padx=8 if compact else 10, pady=title_padding)
         detail_title = tk.Label(
             detail_header,
-            text="선택 날짜 실제 기록 · 티켓 / 시간 / 코멘트",
+            text="선택 날짜 타임로그",
             bg=_CARD_BG,
             fg=_TEXT,
             anchor="w",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 9 if compact else 10, "bold"),
         )
         detail_title.pack(side="left", fill="x", expand=True)
         detail_timelog_button = tk.Button(
@@ -1244,8 +1737,9 @@ class WorktimeQuickPanel:
             activebackground="#E5E7EB",
             relief="sunken",
             borderwidth=1,
-            padx=5,
-            pady=2,
+            padx=4 if compact else 5,
+            pady=1 if compact else 2,
+            height=1,
             font=("Segoe UI", 8),
         )
         detail_timelog_button.pack(side="right", padx=(3, 0))
@@ -1258,8 +1752,9 @@ class WorktimeQuickPanel:
             activebackground="#E5E7EB",
             relief="solid",
             borderwidth=1,
-            padx=5,
-            pady=2,
+            padx=4 if compact else 5,
+            pady=1 if compact else 2,
+            height=1,
             font=("Segoe UI", 8),
         )
         detail_breaks_button.pack(side="right", padx=(3, 0))
@@ -1277,8 +1772,9 @@ class WorktimeQuickPanel:
                 activebackground="#E5E7EB",
                 relief="solid",
                 borderwidth=1,
-                padx=5,
-                pady=2,
+                padx=4 if compact else 5,
+                pady=1 if compact else 2,
+                height=1,
                 font=("Segoe UI", 8),
             )
         else:
@@ -1293,28 +1789,47 @@ class WorktimeQuickPanel:
                 activebackground="#E5E7EB",
                 relief="solid",
                 borderwidth=1,
-                padx=5,
-                pady=2,
+                padx=4 if compact else 5,
+                pady=1 if compact else 2,
                 font=("Segoe UI", 8),
             )
         manual_break_menu_button.pack(side="right", padx=(3, 0))
         detail_text_factory = getattr(tk, "Text", None)
         if callable(detail_text_factory):
             detail_area = tk.Frame(detail_card, bg=_CARD_BG)
-            detail_area.pack(fill="x", padx=10, pady=(0, 8))
+            detail_area.pack(fill="x", padx=7 if compact else 8, pady=(0, 4 if compact else 6))
             detail_text = detail_text_factory(
                 detail_area,
-                height=5,
+                height=self._detail_text_height(model),
                 bg=_CARD_BG,
                 fg=_TEXT,
                 wrap="word",
-                relief="solid",
+                relief="flat",
                 highlightthickness=1,
                 highlightbackground=_BORDER,
-                font=("Segoe UI", 10),
+                highlightcolor=_BORDER,
+                font=("Segoe UI", 8 if compact else 9),
+                padx=6 if compact else 8,
+                pady=3 if compact else 5,
+                takefocus=False,
+                cursor="arrow",
             )
-            detail_scroll = tk.Scrollbar(detail_area, command=detail_text.yview)
+            detail_scroll = tk.Scrollbar(
+                detail_area,
+                command=detail_text.yview,
+                width=10,
+                relief="flat",
+                borderwidth=0,
+                bg=_BG,
+                troughcolor=_BG,
+                activebackground=_MUTED,
+            )
             detail_text.configure(yscrollcommand=detail_scroll.set, state="disabled")
+            self._bind_additive(
+                detail_text,
+                "<Configure>",
+                self._on_detail_text_configure,
+            )
             detail_text.pack(side="left", fill="both", expand=True)
             detail_scroll.pack(side="right", fill="y")
         else:
@@ -1379,8 +1894,10 @@ class WorktimeQuickPanel:
         self._bind_additive(inline_entry, "<Return>", self._save_inline_editor_event)
         self._bind_additive(inline_entry, "<Escape>", self._cancel_inline_editor_event)
 
-        actions = tk.Frame(content, bg=_BG)
-        actions.pack(fill="x", pady=(0, 1))
+        footer = tk.Frame(content, bg=_BG)
+        footer.pack(side="bottom", fill="x", pady=(0, 1))
+        actions = tk.Frame(footer, bg=_BG)
+        actions.pack(fill="x")
         refresh_button = self._button(actions, "새로고침", self._refresh_command)
         clock_button = self._button(
             actions,
@@ -1395,7 +1912,7 @@ class WorktimeQuickPanel:
         plan_button = self._button(actions, "목표 수정", self._edit_plan_command)
         settings_button = self._button(actions, "설정", self._settings_command)
         countdown_label = tk.Label(
-            content,
+            footer,
             text=self._countdown_text(),
             bg=_BG,
             fg=_MUTED,
@@ -1414,7 +1931,7 @@ class WorktimeQuickPanel:
                 highlightthickness=1,
                 highlightbackground=_PROMPT_BORDER,
             )
-            prompt_card.pack(fill="x")
+            prompt_card.pack(fill="x", before=footer)
             prompt_label = tk.Label(
                 prompt_card,
                 text=f"{prompt.detected_time} 활동을 출근으로 반영할까요?",
@@ -1453,6 +1970,195 @@ class WorktimeQuickPanel:
                 skip_button,
             )
 
+        overtime_prompt_label = None
+        overtime_prompt_buttons: tuple[Any, ...] = ()
+        if model.overtime_prompt is not None:
+            overtime_prompt = model.overtime_prompt
+            overtime_card = tk.Frame(
+                content,
+                bg="#ECFDF5",
+                highlightthickness=1,
+                highlightbackground="#86EFAC",
+            )
+            overtime_card.pack(fill="x", pady=(section_gap, 0), before=footer)
+            assigned_text = (
+                f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
+                if overtime_prompt.assigned_minutes > 0
+                else ""
+            )
+            overtime_prompt_label = tk.Label(
+                overtime_card,
+                text=(
+                    f"퇴근 예정 {overtime_prompt.scheduled_quit_time} 이후 활동이 감지되었습니다."
+                    f"{assigned_text} 초과근무를 측정할까요?"
+                ),
+                bg="#ECFDF5",
+                fg="#166534",
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9, "bold"),
+            )
+            overtime_prompt_label.pack(fill="x", padx=10, pady=(4, 2))
+            overtime_prompt_actions = tk.Frame(overtime_card, bg="#ECFDF5")
+            overtime_prompt_actions.pack(fill="x", padx=8, pady=(0, 4))
+            overtime_start_button = self._button(
+                overtime_prompt_actions,
+                "초과근무 시작",
+                self._overtime_prompt_accept_current_command,
+            )
+            overtime_edit_button = self._button(
+                overtime_prompt_actions,
+                "시작 수정",
+                self._overtime_prompt_edit_command,
+            )
+            overtime_skip_button = self._button(
+                overtime_prompt_actions,
+                "오늘은 안 함",
+                self._overtime_prompt_skip_command,
+            )
+            overtime_prompt_buttons = (
+                overtime_start_button,
+                overtime_edit_button,
+                overtime_skip_button,
+            )
+
+        overtime_end_button = None
+        overtime_state_label = None
+        overtime_state_buttons: tuple[Any, ...] = ()
+        overtime_idle_button = None
+        if model.overtime_state is not None:
+            overtime_state = model.overtime_state
+            overtime_state_card = tk.Frame(
+                content,
+                bg="#EFF6FF",
+                highlightthickness=1,
+                highlightbackground="#BFDBFE",
+            )
+            overtime_state_card.pack(
+                fill="x", pady=(section_gap, 0), before=footer
+            )
+            overtime_state_label = tk.Label(
+                overtime_state_card,
+                text=self._overtime_state_text(overtime_state),
+                bg="#EFF6FF",
+                fg="#1E3A8A",
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9, "bold"),
+            )
+            overtime_state_label.pack(fill="x", padx=10, pady=(4, 2))
+            overtime_state_actions = tk.Frame(overtime_state_card, bg="#EFF6FF")
+            overtime_state_actions.pack(fill="x", padx=8, pady=(0, 4))
+            overtime_pause_button = self._button(
+                overtime_state_actions,
+                "다시 시작" if overtime_state.paused else "일시정지",
+                self._overtime_toggle_pause_command,
+            )
+            overtime_start_edit_button = self._button(
+                overtime_state_actions,
+                "시작 수정",
+                self._overtime_edit_start_command,
+            )
+            overtime_end_button = self._button(
+                overtime_state_actions,
+                "초과근무 종료",
+                self._overtime_end_command,
+            )
+            overtime_idle_button = self._button(
+                overtime_state_actions,
+                "자동 일시정지 끄기"
+                if overtime_state.idle_autopause_enabled
+                else "자동 일시정지 켜기",
+                self._overtime_idle_autopause_command,
+            )
+            overtime_state_buttons = (
+                overtime_pause_button,
+                overtime_start_edit_button,
+                overtime_end_button,
+                overtime_idle_button,
+            )
+
+        flex_pending_label = None
+        flex_pending_rows: tuple[Any, ...] = ()
+        flex_open_button = None
+        if model.flex_pending:
+            pending_card = tk.Frame(
+                content,
+                bg="#FFFBEB",
+                highlightthickness=1,
+                highlightbackground="#FDE68A",
+            )
+            pending_card.pack(fill="x", pady=(section_gap, 0), before=footer)
+            pending_heading = tk.Frame(pending_card, bg="#FFFBEB")
+            pending_heading.pack(fill="x", padx=8, pady=(4, 0))
+            flex_pending_label = tk.Label(
+                pending_heading,
+                text=f"Flex 등록 대기 {len(model.flex_pending)}건",
+                bg="#FFFBEB",
+                fg="#92400E",
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9, "bold"),
+            )
+            flex_pending_label.pack(side="left")
+            flex_open_button = self._button(
+                pending_heading,
+                "Flex 열기",
+                self._flex_open_command,
+            )
+            flex_open_button.pack(side="right")
+            pending_row_widgets = []
+            for record in model.flex_pending[:_MAX_FLEX_PENDING_ROWS]:
+                row = tk.Frame(pending_card, bg="#FFFBEB")
+                row.pack(fill="x", padx=8, pady=1)
+                record_label = tk.Label(
+                    row,
+                    text=(
+                        f"{record.label} · {record.start_time}–{record.end_time}"
+                        f" · {self._format_target_minutes(record.net_minutes)}"
+                    ),
+                    bg="#FFFBEB",
+                    fg="#78350F",
+                    anchor="w",
+                    justify="left",
+                    font=("Segoe UI", 9),
+                )
+                record_label.pack(side="left")
+                done_button = self._button(
+                    row,
+                    "등록 완료",
+                    lambda date_key=record.date_key: (
+                        self._flex_pending_done_command(date_key)
+                    ),
+                )
+                done_button.pack(side="right")
+                edit_button = self._button(
+                    row,
+                    "시간 수정",
+                    lambda item=record: self._flex_pending_edit_command(item),
+                )
+                edit_button.pack(side="right")
+                pending_row_widgets.append(
+                    {
+                        "date_key": record.date_key,
+                        "label": record_label,
+                        "edit_button": edit_button,
+                        "done_button": done_button,
+                    }
+                )
+            flex_pending_rows = tuple(pending_row_widgets)
+            if len(model.flex_pending) > _MAX_FLEX_PENDING_ROWS:
+                more_label = tk.Label(
+                    pending_card,
+                    text=f"· 추가 {len(model.flex_pending) - _MAX_FLEX_PENDING_ROWS}건",
+                    bg="#FFFBEB",
+                    fg="#92400E",
+                    anchor="w",
+                    justify="left",
+                    font=("Segoe UI", 9),
+                )
+                more_label.pack(fill="x", padx=10, pady=(0, 4))
+
         self._widgets = {
             "week_range": week_range_label,
             "sync": sync_label,
@@ -1464,9 +2170,11 @@ class WorktimeQuickPanel:
             "detail_breaks_button": detail_breaks_button,
             "manual_break_menu": manual_break_menu,
             "manual_break_menu_button": manual_break_menu_button,
+            "footer": footer,
             "refresh_button": refresh_button,
             "clock_button": clock_button,
             "break_button": break_button,
+            "overtime_end_button": overtime_end_button,
             "plan_button": plan_button,
             "settings_button": settings_button,
             "inline_editor": inline_editor,
@@ -1478,6 +2186,14 @@ class WorktimeQuickPanel:
             "countdown": countdown_label,
             "prompt_label": prompt_label,
             "prompt_buttons": prompt_buttons,
+            "overtime_prompt_label": overtime_prompt_label,
+            "overtime_prompt_buttons": overtime_prompt_buttons,
+            "flex_pending_label": flex_pending_label,
+            "flex_pending_rows": flex_pending_rows,
+            "flex_open_button": flex_open_button,
+            "overtime_state_label": overtime_state_label,
+            "overtime_state_buttons": overtime_state_buttons,
+            "overtime_idle_button": overtime_idle_button,
         }
         self._update_detail_presentation(model)
         if self._inline_editor_active and self._inline_editor_kind is not None:
@@ -1497,6 +2213,7 @@ class WorktimeQuickPanel:
 
     def _update_rendered_model(self, model: WorktimePanelModel) -> None:
         widgets = self._widgets
+        row_font_size = 8 if self._uses_compact_density() else 9
         widgets["week_range"].configure(text=model.week_range)
         widgets["sync"].configure(
             text=f"동기화 · {model.sync_text}",
@@ -1504,14 +2221,8 @@ class WorktimeQuickPanel:
         )
 
         today_labels = widgets["today_lines"]
-        if model.today_lines:
-            for label, line in zip(today_labels, model.today_lines):
-                label.configure(text=line.text, fg=line.color)
-        else:
-            today_labels[0].configure(
-                text="표시할 오늘 상세가 없습니다.",
-                fg=_MUTED,
-            )
+        for label, line in zip(today_labels, self._visible_today_lines(model)):
+            label.configure(text=line.text, fg=line.color)
 
         for row_widgets, row in zip(widgets["rows"], model.rows):
             row_frame, weekday_label, date_label, summary_label, today_label = (
@@ -1524,14 +2235,14 @@ class WorktimeQuickPanel:
             weekday_label.configure(
                 text=row.weekday,
                 bg=row_bg,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             date_label.configure(text=row.date, bg=row_bg)
             summary_label.configure(
                 text=row.summary,
                 bg=row_bg,
                 fg=row.color,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             today_label.configure(text="오늘" if row.today else "", bg=row_bg)
 
@@ -1543,6 +2254,30 @@ class WorktimeQuickPanel:
         widgets["break_button"].configure(
             text="휴게 종료" if model.break_active else "휴게 시작"
         )
+        overtime_state_label = widgets.get("overtime_state_label")
+        overtime_state_buttons = widgets.get("overtime_state_buttons") or ()
+        if model.overtime_state is not None:
+            if overtime_state_label is not None:
+                overtime_state_label.configure(
+                    text=self._overtime_state_text(model.overtime_state)
+                )
+            if overtime_state_buttons:
+                overtime_state_buttons[0].configure(
+                    text=(
+                        "다시 시작"
+                        if model.overtime_state.paused
+                        else "일시정지"
+                    )
+                )
+            overtime_idle_button = widgets.get("overtime_idle_button")
+            if overtime_idle_button is not None:
+                overtime_idle_button.configure(
+                    text=(
+                        "자동 일시정지 끄기"
+                        if model.overtime_state.idle_autopause_enabled
+                        else "자동 일시정지 켜기"
+                    )
+                )
         self._update_countdown_label()
 
         if model.prompt is not None:
@@ -1552,8 +2287,24 @@ class WorktimeQuickPanel:
             )
             accept_button = widgets["prompt_buttons"][0]
             accept_button.configure(text=f"{prompt.detected_time}으로 출근")
+        if model.overtime_prompt is not None:
+            overtime_prompt = model.overtime_prompt
+            assigned_text = (
+                f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
+                if overtime_prompt.assigned_minutes > 0
+                else ""
+            )
+            overtime_label = widgets.get("overtime_prompt_label")
+            if overtime_label is not None:
+                overtime_label.configure(
+                    text=(
+                        f"퇴근 예정 {overtime_prompt.scheduled_quit_time} 이후 활동이 감지되었습니다."
+                        f"{assigned_text} 초과근무를 측정할까요?"
+                    )
+                )
 
     def _update_row_selection(self, model: WorktimePanelModel) -> None:
+        row_font_size = 8 if self._uses_compact_density() else 9
         for row_widgets, row in zip(self._widgets.get("rows", ()), model.rows):
             row_frame, weekday_label, date_label, summary_label, today_label = (
                 row_widgets
@@ -1566,14 +2317,14 @@ class WorktimeQuickPanel:
                 weekday_label,
                 "configure",
                 bg=row_bg,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             _safe_call(date_label, "configure", bg=row_bg)
             _safe_call(
                 summary_label,
                 "configure",
                 bg=row_bg,
-                font=("Segoe UI", 9, emphasis),
+                font=("Segoe UI", row_font_size, emphasis),
             )
             _safe_call(today_label, "configure", bg=row_bg)
         self._update_detail_presentation(model, reset_scroll=True)
@@ -1614,18 +2365,45 @@ class WorktimeQuickPanel:
             if callable(tag_configure) and tagged_parts is not None:
                 try:
                     tag_configure(
-                        "detail_heading",
-                        foreground=_TEXT,
-                        font=("Segoe UI", 10, "bold"),
-                        spacing3=2,
-                    )
-                    tag_configure(
-                        "detail_comment",
+                        "detail_status",
                         foreground=_MUTED,
                         font=("Segoe UI", 9),
                         lmargin1=12,
                         lmargin2=12,
                         spacing3=4,
+                    )
+                    tag_configure(
+                        "detail_group",
+                        foreground=_TEXT,
+                        font=_DETAIL_GROUP_FONT,
+                        lmargin1=12,
+                        lmargin2=12,
+                        spacing1=3,
+                        spacing3=2,
+                    )
+                    tag_configure(
+                        "detail_group_duration",
+                        foreground=_DETAIL_TIME_TEXT,
+                        background=_DETAIL_TIME_BG,
+                        font=_DETAIL_GROUP_DURATION_FONT,
+                    )
+                    tag_configure(
+                        "detail_child",
+                        foreground=_MUTED,
+                        font=("Segoe UI", 9),
+                        lmargin1=28,
+                        lmargin2=28,
+                        spacing3=3,
+                    )
+                    tag_configure(
+                        "detail_child_duration",
+                        foreground=_DETAIL_TIME_TEXT,
+                        font=("Segoe UI", 9, "bold"),
+                    )
+                    tag_configure(
+                        "detail_comment",
+                        foreground=_MUTED,
+                        font=("Segoe UI", 9),
                     )
                     for text, tag in tagged_parts:
                         widget.insert("end", text, tag)
@@ -1786,11 +2564,12 @@ class WorktimeQuickPanel:
             activeforeground=_TEXT,
             relief="solid",
             borderwidth=1,
-            padx=8,
-            pady=4,
-            font=("Segoe UI", 9),
+            padx=6,
+            pady=2,
+            height=1,
+            font=("Segoe UI", 8),
         )
-        button.pack(side="left", padx=(0, 6), pady=2)
+        button.pack(side="left", padx=(0, 4), pady=1)
         return button
 
     @staticmethod
@@ -1822,10 +2601,10 @@ class WorktimeQuickPanel:
 
     @staticmethod
     def _parse_clock_time(value: object) -> tuple[str | None, str | None]:
-        text = str(value or "").strip()
-        if _HHMM_PATTERN.fullmatch(text) is None:
-            return None, "HH:MM (00:00–23:59) 형식으로 입력해 주세요."
-        return text, None
+        normalized = normalize_hhmm_input(value)
+        if normalized is None:
+            return None, "9, 930, 9:30 또는 HH:MM 형식으로 입력해 주세요. (00:00–23:59)"
+        return normalized, None
 
     @staticmethod
     def _parse_manual_break_times(
@@ -1874,6 +2653,24 @@ class WorktimeQuickPanel:
                 f"{self._manual_break_edit.start_time} - "
                 f"{self._manual_break_edit.end_time}"
             )
+        if kind == _INLINE_EDITOR_OVERTIME_PROMPT_START:
+            return str(context or "")
+        if kind == _INLINE_EDITOR_OVERTIME_START:
+            if model.overtime_state is None:
+                return ""
+            return str(model.overtime_state.start_time)
+        if kind == _INLINE_EDITOR_FLEX_PENDING:
+            record = next(
+                (
+                    item
+                    for item in model.flex_pending
+                    if item.date_key == context
+                ),
+                None,
+            )
+            if record is None:
+                return ""
+            return f"{record.start_time} - {record.end_time}"
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     @staticmethod
@@ -1884,11 +2681,17 @@ class WorktimeQuickPanel:
         if kind == _INLINE_EDITOR_TARGET:
             return f"{context or '선택 날짜'} 목표 순근무 시간", "HH:MM (00:00–24:00)"
         if kind == _INLINE_EDITOR_CLOCK_IN:
-            return "오늘 출근 시간", "HH:MM (00:00–23:59)"
+            return "오늘 출근 시간", "예: 9 · 930 · 9:30"
         if kind == _INLINE_EDITOR_PROMPT:
-            return "감지된 출근 시간", "HH:MM (00:00–23:59)"
+            return "감지된 출근 시간", "예: 9 · 930 · 9:30"
         if kind == _INLINE_EDITOR_MANUAL_BREAK:
             return "완료한 수동 휴게", "HH:MM - HH:MM"
+        if kind == _INLINE_EDITOR_OVERTIME_PROMPT_START:
+            return "초과근무 시작 시간", "예: 18 · 1830 · 18:30"
+        if kind == _INLINE_EDITOR_OVERTIME_START:
+            return "초과근무 시작 시간", "예: 18 · 1830 · 18:30"
+        if kind == _INLINE_EDITOR_FLEX_PENDING:
+            return f"{context or '초과근무'} 기록 수정", "HH:MM - HH:MM"
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     def _show_inline_editor(
@@ -1900,7 +2703,6 @@ class WorktimeQuickPanel:
     ) -> None:
         editor = self._widgets.get("inline_editor")
         entry = self._widgets.get("inline_entry")
-        actions = self._widgets.get("actions")
         if editor is None or entry is None:
             return
         title, hint = self._inline_editor_copy(kind, context)
@@ -1909,7 +2711,14 @@ class WorktimeQuickPanel:
         self._inline_editor_context = context
         _safe_call(self._widgets.get("inline_title"), "configure", text=title)
         _safe_call(self._widgets.get("inline_hint"), "configure", text=hint)
-        _safe_call(entry, "configure", width=17 if kind == _INLINE_EDITOR_MANUAL_BREAK else 8)
+        _safe_call(
+            entry,
+            "configure",
+            width=17
+            if kind
+            in {_INLINE_EDITOR_MANUAL_BREAK, _INLINE_EDITOR_FLEX_PENDING}
+            else 8,
+        )
         _set_entry_text(entry, str(initial_value))
         _safe_call(self._widgets.get("inline_error"), "configure", text="")
         _safe_call(
@@ -1917,7 +2726,7 @@ class WorktimeQuickPanel:
             "pack",
             fill="x",
             pady=(0, 6),
-            before=actions,
+            before=self._widgets.get("footer"),
         )
         _safe_call(entry, "focus_set")
         _safe_call(entry, "selection_range", 0, "end")
@@ -1998,6 +2807,51 @@ class WorktimeQuickPanel:
                         failure_message = (
                             "출근 시간을 저장하지 못했거나 요청이 만료되었습니다."
                         )
+        elif kind in {
+            _INLINE_EDITOR_OVERTIME_START,
+            _INLINE_EDITOR_OVERTIME_PROMPT_START,
+        }:
+            clock_value, error = self._parse_clock_time(raw_value)
+            if error is None and clock_value is not None:
+                if kind == _INLINE_EDITOR_OVERTIME_START:
+                    if self._on_overtime_edit_start is None:
+                        error = "초과근무 수정 기능을 사용할 수 없습니다."
+                    else:
+                        callback = (
+                            lambda: self._on_overtime_edit_start(clock_value) is True
+                        )
+                        failure_message = "초과근무 시작 시간을 저장하지 못했습니다."
+                else:
+                    context = self._inline_editor_context
+                    if context is None:
+                        error = "수정할 초과근무 알림이 만료되었습니다."
+                    elif self._on_overtime_prompt_edit is None:
+                        error = "초과근무 수정 기능을 사용할 수 없습니다."
+                    else:
+                        callback = (
+                            lambda: self._on_overtime_prompt_edit(
+                                context, clock_value
+                            )
+                            is True
+                        )
+                        failure_message = (
+                            "초과근무 시작 시간을 저장하지 못했거나 요청이 만료되었습니다."
+                        )
+        elif kind == _INLINE_EDITOR_FLEX_PENDING:
+            start_time, end_time, error = self._parse_manual_break_times(raw_value)
+            context = self._inline_editor_context
+            if context is None:
+                error = "수정할 초과근무 기록이 만료되었습니다."
+            elif self._on_flex_pending_edit is None:
+                error = "초과근무 기록 수정 기능을 사용할 수 없습니다."
+            elif error is None and start_time is not None and end_time is not None:
+                callback = (
+                    lambda: self._on_flex_pending_edit(
+                        context, start_time, end_time
+                    )
+                    is True
+                )
+                failure_message = "초과근무 기록을 저장하지 못했습니다."
         elif kind == _INLINE_EDITOR_MANUAL_BREAK:
             start_time, end_time, error = self._parse_manual_break_times(raw_value)
             break_row = self._manual_break_edit
@@ -2184,6 +3038,95 @@ class WorktimeQuickPanel:
     def _prompt_skip_command(self) -> None:
         self._run_command(self._on_prompt_skip)
 
+    @staticmethod
+    def _overtime_state_text(state: WorktimeOvertimeState) -> str:
+        if state.paused:
+            heading = (
+                "초과근무 자동 일시정지 중"
+                if state.auto_paused
+                else "초과근무 일시정지 중"
+            )
+            return (
+                f"{heading} · 시작 {state.start_time} · "
+                f"경과 {state.elapsed_minutes}분 · 정지 {state.paused_minutes}분"
+            )
+        assigned = (
+            f" · Flex 배정 {state.assigned_minutes}분"
+            if state.assigned_minutes > 0
+            else ""
+        )
+        return (
+            f"초과근무 측정 중 · 시작 {state.start_time} · "
+            f"경과 {state.elapsed_minutes}분{assigned}"
+        )
+
+    def _overtime_prompt_accept_current_command(self) -> None:
+        model = self._model
+        if model is None or model.overtime_prompt is None:
+            return
+        self._run_command(
+            self._on_overtime_prompt_accept,
+            model.overtime_prompt.detected_time,
+        )
+
+    def _overtime_prompt_skip_command(self) -> None:
+        self._run_command(self._on_overtime_prompt_skip)
+
+    def _overtime_prompt_edit_command(self) -> None:
+        model = self._model
+        if (
+            model is None
+            or model.overtime_prompt is None
+            or self._on_overtime_prompt_edit is None
+        ):
+            return
+        detected = model.overtime_prompt.detected_time
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_OVERTIME_PROMPT_START,
+            detected,
+            context=detected,
+        )
+
+    def _overtime_toggle_pause_command(self) -> None:
+        self._run_command(self._on_overtime_toggle_pause)
+
+    def _overtime_edit_start_command(self) -> None:
+        model = self._model
+        if (
+            model is None
+            or model.overtime_state is None
+            or self._on_overtime_edit_start is None
+        ):
+            return
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_OVERTIME_START,
+            model.overtime_state.start_time,
+        )
+
+    def _overtime_end_command(self) -> None:
+        self._run_command(self._on_overtime_end)
+
+    def _overtime_idle_autopause_command(self) -> None:
+        self._run_command(self._on_overtime_idle_autopause)
+
+    def _flex_open_command(self) -> None:
+        self._run_command(self._on_flex_open)
+
+    def _flex_pending_done_command(self, date_key: str) -> None:
+        self._run_command(self._on_flex_pending_done, date_key)
+
+    def _flex_pending_edit_command(
+        self,
+        record: WorktimeFlexPendingRecord,
+    ) -> None:
+        if self._on_flex_pending_edit is None:
+            return
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_FLEX_PENDING,
+            f"{record.start_time} - {record.end_time}",
+            context=record.date_key,
+        )
+
     def _reconcile_geometry(
         self,
         *,
@@ -2197,8 +3140,6 @@ class WorktimeQuickPanel:
             return False
         _safe_call(window, "update_idletasks")
 
-        requested_width = _positive_int_call(window, "winfo_reqwidth", 680)
-        requested_height = _positive_int_call(window, "winfo_reqheight", 480)
         current = self._window_rect(window)
         pointer_x, pointer_y = _pointer_position(window, self._root)
         use_pointer = bool(anchor_to_pointer or not self._placed or current is None)
@@ -2215,14 +3156,33 @@ class WorktimeQuickPanel:
         work_width = max(1, work_right - work_left)
         work_height = max(1, work_bottom - work_top)
 
+        self._fit_detail_viewport(
+            min(_COMPACT_PANEL_MAX_HEIGHT, work_height)
+        )
+        _safe_call(window, "update_idletasks")
+        requested_width = min(
+            _COMPACT_PANEL_MAX_WIDTH,
+            _positive_int_call(window, "winfo_reqwidth", 680),
+        )
+        requested_height = min(
+            _COMPACT_PANEL_MAX_HEIGHT,
+            _positive_int_call(window, "winfo_reqheight", 480),
+        )
+
         current_width = current[2] if current is not None else 1
         current_height = current[3] if current is not None else 1
         if resize_to_request:
-            width = min(max(requested_width, 680), work_width)
-            height = min(max(requested_height, 480), work_height)
+            width = min(max(requested_width, _MIN_PANEL_WIDTH), work_width)
+            height = min(max(requested_height, _MIN_PANEL_HEIGHT), work_height)
         else:
-            width = min(max(current_width, requested_width, 680), work_width)
-            height = min(max(current_height, requested_height, 480), work_height)
+            width = min(
+                max(current_width, requested_width, _MIN_PANEL_WIDTH),
+                work_width,
+            )
+            height = min(
+                max(current_height, requested_height, _MIN_PANEL_HEIGHT),
+                work_height,
+            )
 
         if use_pointer:
             x = pointer_x + _POINTER_OFFSET_PX
