@@ -403,6 +403,15 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
     def test_structure_changes_preserve_same_date_detail_scroll_and_unsaved_editor(self):
         rows = tuple(TimelogDetailRow("2026-04-07", f"L{i}", "T1", 15, f"Action {i}") for i in range(30))
         self.make(_details(rows=rows))
+        # Collapse the today summary first: with three summary rows the panel
+        # already shows the compact (note, arrival/quit, overflow) shape, so
+        # adding one more row exercises collapse without a rebuild.
+        self.holder["model"] = replace(
+            self.holder["model"],
+            today_lines=self.holder["model"].today_lines
+            + (WorktimePanelLine("Third summary", "#111827"),),
+        )
+        self.assertTrue(self.panel.refresh_now())
         self.select(1)
         self.tk.button("목표 수정").invoke()
         entry = self.panel._widgets["inline_entry"]
@@ -437,7 +446,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertTrue(self.panel.refresh_now())
         self.assertIs(self.panel._widgets["detail_text"], before_text)
         self.assertEqual(before_text.yview()[0], 0.8)
-        self.assertEqual(self.panel._widgets["today_lines"][1].kwargs["text"], "추가 상태 2건")
+        self.assertEqual(self.panel._widgets["today_lines"][2].kwargs["text"], "추가 상태 2건")
         self.assertEqual(self.panel._widgets["inline_entry"].get(), "07:37")
         self.assertTrue(self.panel._inline_editor_active)
         self.holder["model"] = replace(

@@ -1449,22 +1449,31 @@ class WorktimeQuickPanelTests(unittest.TestCase):
     def test_today_summary_collapses_surplus_statuses_without_rebuilding(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
-        holder = {"model": _model()}
+        holder = {
+            "model": _model(
+                today_lines=(
+                    WorktimePanelLine("Wrike 기록 1:30 · 현재 기대 2:00", "#2563EB"),
+                    WorktimePanelLine("출근 09:00 · 예상 퇴근 18:00", "#059669"),
+                    WorktimePanelLine("세 번째 상태", "#111827"),
+                )
+            )
+        }
         panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
         panel.show(activate=False)
         original_button = fake_tk.button("새로고침")
 
         holder["model"] = _model(
             today_lines=holder["model"].today_lines
-            + (WorktimePanelLine("세 번째 상태", "#111827"),)
+            + (WorktimePanelLine("네 번째 상태", "#111827"),)
         )
         self.assertTrue(panel.refresh_now())
 
         self.assertIs(fake_tk.button("새로고침"), original_button)
         today_labels = panel._widgets["today_lines"]
-        self.assertEqual(len(today_labels), 2)
+        self.assertEqual(len(today_labels), 3)
         self.assertEqual(today_labels[0].kwargs["text"], "Wrike 기록 1:30 · 현재 기대 2:00")
-        self.assertEqual(today_labels[1].kwargs["text"], "추가 상태 2건")
+        self.assertEqual(today_labels[1].kwargs["text"], "출근 09:00 · 예상 퇴근 18:00")
+        self.assertEqual(today_labels[2].kwargs["text"], "추가 상태 2건")
 
     def test_provider_failure_and_invalid_model_preserve_last_good_render(self) -> None:
         root = _FakeRoot()
@@ -1622,13 +1631,13 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 prompt=WorktimeActivityPrompt("08:35"),
             )
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "660x540-1000+50")
+            self.assertEqual(window.geometry_calls[-1], "660x570-1000+50")
             self.assertEqual(work_area.call_count, 1)
 
             work_area.return_value = (-800, -100, 0, 500)
             holder["model"] = _model(actual_text="텍스트만 변경", prompt=None)
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "660x540-800-40")
+            self.assertEqual(window.geometry_calls[-1], "660x570-800-70")
             self.assertEqual(work_area.call_count, 2)
 
     def test_first_show_uses_compact_density_for_a_640_pixel_work_area(self) -> None:
@@ -2042,7 +2051,7 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             panel._render_structure(model)
             window.update_idletasks()
 
-            self.assertEqual(len(panel._widgets["today_lines"]), 2)
+            self.assertEqual(len(panel._widgets["today_lines"]), 3)
             self.assertEqual(int(panel._widgets["detail_text"].cget("height")), 8)
             self.assertLessEqual(window.winfo_reqwidth(), _COMPACT_PANEL_MAX_WIDTH)
             self.assertLessEqual(window.winfo_reqheight(), _COMPACT_PANEL_MAX_HEIGHT)
