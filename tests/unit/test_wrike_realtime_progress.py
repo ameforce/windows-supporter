@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from src.apps.Monitor import Monitor
 from src.apps.Wrike import Wrike
 from src.apps.flex_worktime import FlexDaySchedule, FlexWorkBlock
+from src.apps.wrike_worktime_panel import WorktimeQuickPanel
 from src.apps.wrike_ical import CalendarError, CalendarErrorCode, CalendarSuccess
 from src.apps.wrike_timelog_details import TimelogDayDetails
 from src.apps.wrike_ui import WrikeSettingsView
@@ -516,7 +517,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         model = wrike._Wrike__build_worktime_panel_model()
         self.assertIn("Flex 근무 8시간 · 실제 출근 08:45 기준", model.today_lines[0].text)
         self.assertNotIn("Flex 퇴근 17:00", model.today_lines[0].text)
-        self.assertIn("출근 08:45 · 예상 퇴근 17:45", model.today_lines[2].text)
+        self.assertIn("출근 08:45 · 예상 퇴근 17:45", model.today_lines[1].text)
 
         wrike._Wrike__maybe_record_overtime_activity(
             datetime(2026, 4, 6, 17, 46),
@@ -526,6 +527,52 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(pending)
         self.assertEqual(pending["status"], "pending")
         self.assertEqual(pending["scheduled_quit"], "2026-04-06T17:45:00")
+
+    def test_local_arrival_priority_and_flex_duration_drive_panel(self) -> None:
+        """사용자 지정 계약: 실제 출근 우선 + Flex 근무시간 + 휴게 = 예상 퇴근."""
+        _FrozenDateTime.current = datetime(2026, 4, 6, 16, 0)
+        wrike = self._new_wrike()
+        day = date(2026, 4, 6)
+        now = _FrozenDateTime.current
+        local_arrival = datetime(2026, 4, 6, 9, 15)
+        flex_arrival = datetime(2026, 4, 6, 8, 0)
+        wrike.update_workday_plan(day, 7 * 60, "09:15")
+        schedule = FlexDaySchedule(
+            date=day,
+            blocks=(),
+            break_intervals=(
+                (datetime(2026, 4, 6, 12, 0), datetime(2026, 4, 6, 13, 0)),
+            ),
+            scheduled_start=flex_arrival,
+            regular_quit=datetime(2026, 4, 6, 17, 0),
+            scheduled_quit=datetime(2026, 4, 6, 17, 0),
+            actual_start=flex_arrival,
+            actual_quit=None,
+            target_minutes=8 * 60,
+            overtime_assigned_minutes=0,
+            overtime_scheduled_quit=None,
+            fetched_at=now,
+        )
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {day: schedule}
+
+        plan = wrike._Wrike__plan_for_date(day)
+        self.assertEqual(plan["clock_in"], "09:15")
+        self.assertEqual(plan["target_net_minutes"], 8 * 60)
+        overview = wrike._Wrike__today_overview(now)
+        self.assertEqual(overview.clock_in, local_arrival)
+        self.assertEqual(
+            overview.projected_quit,
+            datetime(2026, 4, 6, 18, 15),
+        )
+        self.assertEqual(
+            wrike._Wrike__overtime_scheduled_quit(day, overview, now),
+            datetime(2026, 4, 6, 18, 15),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        visible = WorktimeQuickPanel._visible_today_lines(model)
+        self.assertIn("출근 09:15 · 예상 퇴근 18:15", visible[1].text)
 
     def test_flex_actual_clock_out_is_displayed_instead_of_projected_quit(self) -> None:
         _FrozenDateTime.current = datetime(2026, 4, 6, 18, 30)
@@ -558,7 +605,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             wrike._Wrike__flex_schedule_by_date = {day: schedule}
 
         model = wrike._Wrike__build_worktime_panel_model()
-        today_text = model.today_lines[2].text
+        today_text = model.today_lines[1].text
         self.assertIn("출근 08:45 · 실제 퇴근 18:12", today_text)
         self.assertNotIn("예상 퇴근", today_text)
 
