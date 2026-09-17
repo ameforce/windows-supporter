@@ -70,6 +70,7 @@ USAGE_METRIC_KEYS = (
     "weekly_limit",
     "gpt_5_3_codex_spark_five_hour_limit",
     "gpt_5_3_codex_spark_weekly_limit",
+    "monthly_limit",
     "remaining_credit",
 )
 
@@ -84,6 +85,7 @@ USAGE_RESET_AT_KEYS = (
     "weekly_limit_reset_at",
     "gpt_5_3_codex_spark_five_hour_limit_reset_at",
     "gpt_5_3_codex_spark_weekly_limit_reset_at",
+    "monthly_limit_reset_at",
 )
 
 USAGE_HISTORY_KEYS = (
@@ -98,6 +100,7 @@ USAGE_SNAPSHOT_META_KEYS = (
     "weekly_limit_reset_at",
     "gpt_5_3_codex_spark_five_hour_limit_reset_at",
     "gpt_5_3_codex_spark_weekly_limit_reset_at",
+    "monthly_limit_reset_at",
 )
 
 USAGE_LIMIT_RESET_AT_KEY_BY_METRIC: dict[str, str] = {
@@ -109,6 +112,7 @@ USAGE_LIMIT_RESET_AT_KEY_BY_METRIC: dict[str, str] = {
     "gpt_5_3_codex_spark_weekly_limit": (
         "gpt_5_3_codex_spark_weekly_limit_reset_at"
     ),
+    "monthly_limit": "monthly_limit_reset_at",
 }
 
 FIVE_HOUR_RESET_MAX_OFFSET_SECONDS = 36 * 60 * 60
@@ -128,6 +132,7 @@ USAGE_METRIC_LABELS: dict[str, str] = {
     "weekly_limit": "주간 사용 한도",
     "gpt_5_3_codex_spark_five_hour_limit": "gpt-5.3-codex-spark 5시간 사용 한도",
     "gpt_5_3_codex_spark_weekly_limit": "gpt-5.3-codex-spark 주간 사용 한도",
+    "monthly_limit": "월간 사용 한도",
     "remaining_credit": "남은 크레딧",
 }
 
@@ -136,6 +141,7 @@ USAGE_METRIC_SHORT_LABELS: dict[str, str] = {
     "weekly_limit": "주간 사용 한도",
     "gpt_5_3_codex_spark_five_hour_limit": "gpt-5.3-codex-spark 5시간 사용 한도",
     "gpt_5_3_codex_spark_weekly_limit": "gpt-5.3-codex-spark 주간 사용 한도",
+    "monthly_limit": "월간 사용 한도",
     "remaining_credit": "남은 크레딧",
 }
 
@@ -146,6 +152,7 @@ USAGE_RESET_LABELS: dict[str, str] = {
     "weekly_limit_reset_at": "주간 한도",
     "gpt_5_3_codex_spark_five_hour_limit_reset_at": "gpt-5.3-codex-spark 5시간 한도",
     "gpt_5_3_codex_spark_weekly_limit_reset_at": "gpt-5.3-codex-spark 주간 한도",
+    "monthly_limit_reset_at": "월간 한도",
 }
 
 CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
@@ -181,6 +188,7 @@ async () => {
   const aliases = {
     five_hour_limit: ['5시간 사용 한도', '5시간한도', '5-hour usage limit', '5 hour usage limit', '5h usage limit'],
     weekly_limit: ['주간 사용 한도', '주간한도', 'weekly usage limit', 'weekly limit'],
+    monthly_limit: ['월간 사용 한도', '월간한도', 'monthly usage limit', 'monthly limit'],
     gpt_5_3_codex_spark_five_hour_limit: [
       'gpt-5.3-codex-spark 5시간 사용 한도',
       'gpt-5.3 codex spark 5시간 사용 한도',
@@ -542,6 +550,12 @@ USAGE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
         "주간한도",
         "weekly usage limit",
         "weekly limit",
+    ),
+    "monthly_limit": (
+        "월간 사용 한도",
+        "월간한도",
+        "monthly usage limit",
+        "monthly limit",
     ),
     "gpt_5_3_codex_spark_five_hour_limit": (
         "gpt-5.3-codex-spark 5시간 사용 한도",
@@ -1440,12 +1454,14 @@ class UsageSnapshot:
     weekly_limit: str = ""
     gpt_5_3_codex_spark_five_hour_limit: str = ""
     gpt_5_3_codex_spark_weekly_limit: str = ""
+    monthly_limit: str = ""
     remaining_credit: str = ""
     captured_at: str = ""
     five_hour_limit_reset_at: str = ""
     weekly_limit_reset_at: str = ""
     gpt_5_3_codex_spark_five_hour_limit_reset_at: str = ""
     gpt_5_3_codex_spark_weekly_limit_reset_at: str = ""
+    monthly_limit_reset_at: str = ""
     reported_metric_keys: tuple[str, ...] = ()
 
     @classmethod
@@ -1487,6 +1503,9 @@ class UsageSnapshot:
                 "gpt_5_3_codex_spark_weekly_limit",
                 payload.get("gpt_5_3_codex_spark_weekly_limit", "")
             ),
+            monthly_limit=_normalize_metric_candidate(
+                "monthly_limit", payload.get("monthly_limit", "")
+            ),
             remaining_credit=normalize_usage_value(payload.get("remaining_credit", "")),
             captured_at=normalize_usage_value(payload.get("captured_at", "")),
             five_hour_limit_reset_at=normalize_usage_value(
@@ -1501,6 +1520,9 @@ class UsageSnapshot:
             gpt_5_3_codex_spark_weekly_limit_reset_at=normalize_usage_value(
                 payload.get("gpt_5_3_codex_spark_weekly_limit_reset_at", "")
             ),
+            monthly_limit_reset_at=normalize_usage_value(
+                payload.get("monthly_limit_reset_at", "")
+            ),
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -1513,6 +1535,7 @@ class UsageSnapshot:
             "gpt_5_3_codex_spark_weekly_limit": normalize_usage_value(
                 self.gpt_5_3_codex_spark_weekly_limit
             ),
+            "monthly_limit": normalize_usage_value(self.monthly_limit),
             "remaining_credit": normalize_usage_value(self.remaining_credit),
             "captured_at": normalize_usage_value(self.captured_at),
             "five_hour_limit_reset_at": normalize_usage_value(
@@ -1524,6 +1547,9 @@ class UsageSnapshot:
             ),
             "gpt_5_3_codex_spark_weekly_limit_reset_at": normalize_usage_value(
                 self.gpt_5_3_codex_spark_weekly_limit_reset_at
+            ),
+            "monthly_limit_reset_at": normalize_usage_value(
+                self.monthly_limit_reset_at
             ),
         }
 

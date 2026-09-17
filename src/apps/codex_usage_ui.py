@@ -108,6 +108,8 @@ class CodexUsageSettingsView:
         self._live_five_hour_reset_var = None
         self._live_weekly_var = None
         self._live_weekly_reset_var = None
+        self._live_monthly_var = None
+        self._live_monthly_reset_var = None
         self._live_spark_five_hour_var = None
         self._live_spark_five_hour_reset_var = None
         self._live_spark_weekly_var = None
@@ -302,6 +304,8 @@ class CodexUsageSettingsView:
         self._live_five_hour_reset_var = tk.StringVar(value="-")
         self._live_weekly_var = tk.StringVar(value="-")
         self._live_weekly_reset_var = tk.StringVar(value="-")
+        self._live_monthly_var = tk.StringVar(value="-")
+        self._live_monthly_reset_var = tk.StringVar(value="-")
         self._live_spark_five_hour_var = tk.StringVar(value="-")
         self._live_spark_five_hour_reset_var = tk.StringVar(value="-")
         self._live_spark_weekly_var = tk.StringVar(value="-")
@@ -915,6 +919,10 @@ class CodexUsageSettingsView:
                 ("주간 한도 초기화", self._live_weekly_reset_var),
             ),
             (
+                ("월간 사용 한도", self._live_monthly_var),
+                ("월간 한도 초기화", self._live_monthly_reset_var),
+            ),
+            (
                 ("Spark 5시간 한도", self._live_spark_five_hour_var),
                 ("Spark 5시간 초기화", self._live_spark_five_hour_reset_var),
             ),
@@ -1308,6 +1316,7 @@ class CodexUsageSettingsView:
                 (("captured_at", "최근 확인 시각"), ("remaining_credit", "남은 크레딧")),
                 (("five_hour_limit", "5시간 사용 한도"), ("five_hour_limit_reset_at", "5시간 한도 초기화")),
                 (("weekly_limit", "주간 사용 한도"), ("weekly_limit_reset_at", "주간 한도 초기화")),
+                (("monthly_limit", "월간 사용 한도"), ("monthly_limit_reset_at", "월간 한도 초기화")),
                 (
                     ("gpt_5_3_codex_spark_five_hour_limit", "Spark 5시간 한도"),
                     ("gpt_5_3_codex_spark_five_hour_limit_reset_at", "Spark 5시간 초기화"),
@@ -3063,6 +3072,9 @@ class CodexUsageSettingsView:
         weekly = _val("weekly_limit")
         if five_hour != "-" or weekly != "-":
             parts.append(f"5시간 {five_hour} / 주간 {weekly}")
+        monthly = _val("monthly_limit")
+        if monthly != "-":
+            parts.append(f"월간 {monthly}")
         spark_five_hour = _val("gpt_5_3_codex_spark_five_hour_limit")
         spark_weekly = _val("gpt_5_3_codex_spark_weekly_limit")
         if spark_five_hour != "-" or spark_weekly != "-":
@@ -3457,6 +3469,12 @@ class CodexUsageSettingsView:
                 self._set_var_if_changed(
                     self._live_weekly_reset_var,
                     _fmt_reset("weekly_limit_reset_at"),
+                )
+            self._set_var_if_changed(self._live_monthly_var, _val("monthly_limit"))
+            if self._live_monthly_reset_var is not None:
+                self._set_var_if_changed(
+                    self._live_monthly_reset_var,
+                    _fmt_reset("monthly_limit_reset_at"),
                 )
             self._set_var_if_changed(
                 self._live_spark_five_hour_var,
