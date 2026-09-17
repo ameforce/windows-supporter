@@ -91,7 +91,7 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP: (900, 520),
             self._TAB_KAKAO: (640, 320),
             self._TAB_WRIKE: (760, 520),
-            self._TAB_AI_USAGE: (900, 520),
+            self._TAB_AI_USAGE: (1040, 640),
             self._TAB_UPDATE: (620, 320),
             self._TAB_POWER: (700, 360),
         }
@@ -100,7 +100,7 @@ class WindowsSupporterMainUI:
             self._TAB_STARTUP: (700, 400),
             self._TAB_KAKAO: (560, 280),
             self._TAB_WRIKE: (640, 400),
-            self._TAB_AI_USAGE: (720, 420),
+            self._TAB_AI_USAGE: (880, 480),
             self._TAB_UPDATE: (520, 280),
             self._TAB_POWER: (600, 300),
         }
