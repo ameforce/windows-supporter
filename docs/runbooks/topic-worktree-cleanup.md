@@ -62,7 +62,7 @@ worktree가 있었으면 `path`와 task creation evidence를 식별하는 `creat
 6. 모든 entry를 creation provenance와 대조해 task-owned 또는 보존 대상으로 분류한다. `.venv`, `build`, `dist`, generated spec/exe/cache 같은 이름만으로 ownership을 추정하지 않는다.
 7. 제거 직전에 같은 inventory를 다시 읽고 byte-for-byte 일치하는지 확인한다. 새 항목, 미분류 항목, 보존 대상이 하나라도 있으면 제거하지 않는다.
 8. worktree 아래 executable/tool을 쓰는 process가 없고 시작프로그램, 자동 업데이트, 주기 실행이 exact path를 가리키지 않는지 확인한다.
-9. main physical tagged artifact와 persistent runtime 경로가 정상인지 확인한다.
+9. installed persistent executable과 startup registration 경로가 정상인지 확인한다.
 
 ## mutation
 
