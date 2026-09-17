@@ -186,6 +186,24 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             time.sleep(0.01)
         return bool(predicate())
 
+    def test_codex_provider_metrics_include_monthly_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_manager(tmp)
+
+            metrics = manager._CodexUsageMultiMonitor__build_provider_metrics(
+                "codex",
+                {
+                    "monthly_limit": "0%",
+                    "monthly_limit_reset_at": "2026-10-10T21:55:00+09:00",
+                    "remaining_credit": "865",
+                },
+            )
+
+            self.assertEqual([item["key"] for item in metrics], ["monthly_limit"])
+            self.assertEqual(metrics[0]["short_label"], "30D")
+            self.assertEqual(metrics[0]["value_text"], "0%")
+            self.assertEqual(metrics[0]["short_value_text"], "0%")
+
     def test_shutdown_cancels_scheduler_and_shuts_down_every_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)

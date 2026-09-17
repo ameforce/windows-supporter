@@ -787,6 +787,31 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(model["bars"][0]["status_text"], "OK")
         self.assertEqual(model["bars"][0]["status_color"], "#22c55e")
 
+    def test_model_includes_monthly_metric_for_monthly_only_snapshot(self):
+        runtime = self._runtime()
+        runtime["accounts"][0]["last_snapshot"] = {
+            "monthly_limit": "0%",
+            "monthly_limit_reset_at": "2026-10-10T21:55:00+09:00",
+            "remaining_credit": "865",
+            "captured_at": "2026-09-17T18:00:00+09:00",
+        }
+
+        model = build_codex_usage_taskbar_overlay_model(runtime)
+
+        bar = model["bars"][0]
+        keys = [metric["key"] for metric in bar["metrics"]]
+        self.assertIn("30d", keys)
+        monthly = next(
+            metric for metric in bar["metrics"] if metric["key"] == "30d"
+        )
+        self.assertEqual(monthly["metric_key"], "monthly_limit")
+        self.assertEqual(monthly["value_text"], "0%")
+        # The reported monthly limit (not a "--" placeholder) owns the
+        # headline, and the usable credit keeps its own slot.
+        self.assertEqual(bar["percent"], 0)
+        self.assertEqual(bar["value_text"], "0%")
+        self.assertIn("credit", [metric.get("metric_key") for metric in bar["metrics"]])
+
     def test_model_keeps_taskbar_status_stable_during_background_collection(self):
         runtime = self._runtime()
         runtime["accounts"][0]["runtime"]["collect_inflight"] = True

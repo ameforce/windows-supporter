@@ -3203,6 +3203,7 @@ class CodexUsageMultiMonitor:
         for key, short_label, reset_key in (
             ("five_hour_limit", "5H", "five_hour_limit_reset_at"),
             ("weekly_limit", "7D", "weekly_limit_reset_at"),
+            ("monthly_limit", "30D", "monthly_limit_reset_at"),
         ):
             raw_value = str(snapshot.get(key) or "").strip()
             if not raw_value:

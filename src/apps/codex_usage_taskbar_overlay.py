@@ -94,6 +94,7 @@ _NATIVE_OWNER_CLASS_PREFIX = "WindowsSupporterOverlayOwner_"
 _TASKBAR_METRICS = (
     ("five_hour_limit", "5h"),
     ("weekly_limit", "7d"),
+    ("monthly_limit", "30d"),
 )
 _TASKBAR_OCCUPIED_CHILD_CLASSES = {
     "Button",
@@ -146,6 +147,7 @@ _FULLSCREEN_EXCLUDED_WINDOW_TITLES = {
 _RESET_KEY_BY_METRIC = {
     "five_hour_limit": "five_hour_limit_reset_at",
     "weekly_limit": "weekly_limit_reset_at",
+    "monthly_limit": "monthly_limit_reset_at",
 }
 _RESET_WINDOW_BY_METRIC = {
     "five_hour_limit": {
@@ -160,11 +162,18 @@ _RESET_WINDOW_BY_METRIC = {
         "far_seconds": 3 * 24 * 60 * 60,
         "very_far_seconds": 5 * 24 * 60 * 60,
     },
+    "monthly_limit": {
+        "urgent_seconds": 24 * 60 * 60,
+        "soon_seconds": 3 * 24 * 60 * 60,
+        "far_seconds": 10 * 24 * 60 * 60,
+        "very_far_seconds": 20 * 24 * 60 * 60,
+    },
 }
 _RESET_DETAIL_COLUMN_WIDTH_PX = 48
 # Fixed countdown shapes ("00d 00h 00m 00s" / "00h 00m 00s") need these floors
 # so the reserved column holds the widest tick of the metric's own format.
 _RESET_WEEKLY_COLUMN_WIDTH_PX = 78
+_RESET_MONTHLY_COLUMN_WIDTH_PX = 78
 _RESET_FIVE_HOUR_COLUMN_WIDTH_PX = 58
 _RESET_SHORT_COLUMN_WIDTH_PX = 28
 _RESET_PLACEHOLDER_TEXT = "--"
@@ -316,6 +325,7 @@ _FIVE_HOUR_RESET_MAX_SECONDS = 36 * 60 * 60
 _SNAPSHOT_WINDOW_SECONDS_BY_METRIC = {
     "five_hour_limit": 5 * 60 * 60,
     "weekly_limit": 7 * 24 * 60 * 60,
+    "monthly_limit": 30 * 24 * 60 * 60,
 }
 _SNAPSHOT_ON_TRACK_MAX_PROJECTED_REMAINING_PERCENT = 10.0
 # CodexUsageMonitor.__now_iso stores captured_at as a naive KST wall-clock
@@ -483,6 +493,13 @@ def build_codex_usage_taskbar_overlay_model(
                     break
         else:
             for metric_key, short_label in _TASKBAR_METRICS:
+                if metric_key == "monthly_limit" and not (
+                    str(snapshot.get("monthly_limit") or "").strip()
+                    or str(snapshot.get("monthly_limit_reset_at") or "").strip()
+                ):
+                    # Monthly is plan-dependent: hide the slot when the
+                    # account never reports it instead of a permanent "--".
+                    continue
                 reset_key = _RESET_KEY_BY_METRIC.get(metric_key, "")
                 metrics.append(
                     _build_metric(
@@ -495,19 +512,28 @@ def build_codex_usage_taskbar_overlay_model(
                         now=now,
                     )
                 )
+        def _is_reported(metric: dict[str, Any]) -> bool:
+            return str(metric.get("value_text") or "") != "--"
+
         credit_metric = _credit_metric_descriptor(snapshot)
-        if credit_metric is not None and len(metrics) < 3:
+        if credit_metric is not None and sum(1 for m in metrics if _is_reported(m)) < 3:
             # Display contract: credit always occupies its own compact slot
             # (5h, weekly, credit) whenever the account reports a usable
             # balance. Credit without a percent never replaces a reported
-            # usage limit's slot order.
+            # usage limit's slot order. Unreported "--" placeholders do not
+            # consume the credit slot.
             metrics.append(credit_metric)
-        primary_metric = metrics[0] if metrics else {
-            "percent": None,
-            "value_text": "--",
-            "state": "unknown",
-            "color": _bar_color(profile_enabled, None),
-        }
+        primary_metric = next(
+            (m for m in metrics if _is_reported(m)),
+            metrics[0]
+            if metrics
+            else {
+                "percent": None,
+                "value_text": "--",
+                "state": "unknown",
+                "color": _bar_color(profile_enabled, None),
+            },
+        )
         row_state = (
             str(primary_metric["state"])
             if status["state"] == "ready"
@@ -1287,7 +1313,8 @@ def _resolve_overlay_badge_mode(row_layouts: tuple[_MetricRowLayout, ...]) -> st
 _METRIC_SLOT_ORDER_RANKS = {
     "five_hour_limit": 0,
     "weekly_limit": 1,
-    "credit": 2,
+    "monthly_limit": 2,
+    "credit": 3,
 }
 
 
@@ -1299,6 +1326,7 @@ def _metric_slot_key(metric: dict[str, Any]) -> str:
 _METRIC_TOOLTIP_NAMES = {
     "five_hour_limit": "5시간 한도",
     "weekly_limit": "주간 한도",
+    "monthly_limit": "월간 한도",
     "credit": "크레딧",
 }
 
@@ -7253,7 +7281,8 @@ def _build_normal_guidance(
         normal_transition_seconds = max(0, int(math.ceil(transition_seconds)))
 
     transition_text = _format_guidance_duration_verbose(
-        normal_transition_seconds, weekly=(str(metric_key or "") == "weekly_limit")
+        normal_transition_seconds,
+        weekly=(str(metric_key or "") in {"weekly_limit", "monthly_limit"}),
     )
 
     range_text = (
@@ -8019,6 +8048,8 @@ def _reset_column_width_for_text(text: str, *, metric_key: str = "") -> int:
         minimum = _RESET_FIVE_HOUR_COLUMN_WIDTH_PX
     elif str(metric_key or "") == "weekly_limit":
         minimum = _RESET_WEEKLY_COLUMN_WIDTH_PX
+    elif str(metric_key or "") == "monthly_limit":
+        minimum = _RESET_MONTHLY_COLUMN_WIDTH_PX
     return max(minimum, _inline_text_width(value) + 2)
 
 

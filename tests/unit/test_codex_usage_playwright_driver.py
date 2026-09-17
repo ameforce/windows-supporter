@@ -556,6 +556,22 @@ class CodexUsagePlaywrightDriverTest(unittest.TestCase):
         self.assertEqual(status.state, BrowserState.HEADED_LOGIN)
         self.assertTrue(status.login_window_open)
 
+    def test_open_login_accepts_monthly_only_usage_page(self) -> None:
+        monthly_probe: UsageProbePayload = {
+            "url": USAGE_URL,
+            "mainText": "월간 사용 한도 0% 남음",
+            "metricBlocks": [{"metric_key": "monthly_limit"}],
+        }
+        login_page = FakePage(url="about:blank", probe=monthly_probe)
+        driver, _chromium, _controller = make_driver(
+            [FakeContext([login_page]), FakeContext([FakePage()])]
+        )
+
+        result = driver.open_login()
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.probe, monthly_probe)
+
     def test_shutdown_stops_playwright_exactly_once(self) -> None:
         driver, _chromium, controller = make_driver([FakeContext([FakePage()])])
         _ = driver.collect()
