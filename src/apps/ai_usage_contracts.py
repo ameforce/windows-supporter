@@ -44,6 +44,123 @@ def is_valid_taskbar_side_priority(value: object) -> bool:
     return key in {"left", "left_first", "right", "right_first"}
 
 
+TASKBAR_PANE_SIZE = 2
+TASKBAR_SELECTED_LIMIT = 4
+
+
+def resolve_taskbar_pane_assignment(
+    order: list[str] | tuple[str, ...],
+    selected_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str],
+    priority: object,
+) -> dict[str, list[str]]:
+    """Map the ordered profile list onto left/right/pool boxes.
+
+    The overlay renders the first two selected profiles on the priority
+    side pane and the next two on the opposite pane
+    (``_PANE_SIZE = 2``). This helper exposes that same mapping so the
+    settings surface can show one box per physical side plus a pool box
+    for profiles that are stored but not shown on the taskbar.
+    """
+    normalized_order = [str(item or "").strip() for item in (order or [])]
+    normalized_order = [item for item in normalized_order if item]
+    selected_set = {str(item or "").strip() for item in (selected_ids or [])}
+    selected_set.discard("")
+    selected_in_order = [
+        item for item in normalized_order if item in selected_set
+    ][: max(0, int(TASKBAR_SELECTED_LIMIT))]
+    side = normalize_taskbar_side_priority(priority).value
+    if side == TaskbarSidePriority.RIGHT.value:
+        right = selected_in_order[: int(TASKBAR_PANE_SIZE)]
+        left = selected_in_order[int(TASKBAR_PANE_SIZE) :]
+    else:
+        left = selected_in_order[: int(TASKBAR_PANE_SIZE)]
+        right = selected_in_order[int(TASKBAR_PANE_SIZE) :]
+    selected_prefix = set(selected_in_order)
+    pool = [item for item in normalized_order if item not in selected_prefix]
+    return {"left": list(left), "right": list(right), "pool": list(pool)}
+
+
+def plan_taskbar_drop(
+    order: list[str] | tuple[str, ...],
+    selected_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str],
+    priority: object,
+    dragged_id: str,
+    target_side: str,
+    target_index: int,
+) -> dict[str, list[str]]:
+    """Compute a new order/selection after a drag-and-drop gesture.
+
+    ``target_side`` is one of ``"left"``, ``"right"`` or ``"pool"``.
+    Dropping into a side pane marks the profile as taskbar-selected;
+    dropping into the pool clears that flag. Each side pane holds at
+    most ``TASKBAR_PANE_SIZE`` profiles and the selected prefix holds
+    at most ``TASKBAR_SELECTED_LIMIT`` profiles.
+
+    A side-pane drop inserts into the global selected sequence at the
+    visual position, so a card pushed past a pane boundary shifts into
+    the peer pane instead of being rejected. Concretely the bottom gap
+    of the priority pane and the top gap of the opposite pane address
+    the same sequence index. The returned order is canonicalized as
+    selected-first; pool-only reorders may therefore move pool ids
+    after the selected prefix without changing the mapping.
+    """
+    dragged = str(dragged_id or "").strip()
+    if not dragged:
+        raise ValueError("dragged profile id is empty")
+    normalized_order = [str(item or "").strip() for item in (order or [])]
+    normalized_order = [item for item in normalized_order if item]
+    if dragged not in normalized_order:
+        raise ValueError("dragged profile is unknown")
+    target = str(target_side or "").strip().lower()
+    if target not in {"left", "right", "pool"}:
+        raise ValueError("target side must be left, right or pool")
+    assignment = resolve_taskbar_pane_assignment(
+        normalized_order, selected_ids, priority
+    )
+    side = normalize_taskbar_side_priority(priority).value
+    if side == TaskbarSidePriority.RIGHT.value:
+        selected_seq = list(assignment["right"]) + list(assignment["left"])
+    else:
+        selected_seq = list(assignment["left"]) + list(assignment["right"])
+    pool_seq = list(assignment["pool"])
+    was_selected = dragged in set(selected_seq)
+    if target == "pool":
+        if was_selected:
+            selected_seq.remove(dragged)
+        elif dragged in pool_seq:
+            pool_seq.remove(dragged)
+        index = max(0, min(int(target_index), len(pool_seq)))
+        pool_seq.insert(index, dragged)
+        new_order = list(selected_seq) + list(pool_seq)
+        for item in normalized_order:
+            if item not in set(new_order):
+                new_order.append(item)
+        return {"order": new_order, "selected": list(selected_seq)}
+    # Dropping into a side pane inserts into the global selected sequence
+    # at the visual position. Profiles pushed past a pane boundary shift
+    # into the other pane instead of being rejected, so moves between two
+    # full panes behave like a reorder of the selected sequence.
+    if was_selected:
+        selected_seq.remove(dragged)
+    elif dragged in pool_seq:
+        pool_seq.remove(dragged)
+    else:
+        raise ValueError("dragged profile is unknown")
+    if not was_selected and len(selected_seq) >= int(TASKBAR_SELECTED_LIMIT):
+        raise ValueError("taskbar-selected profiles exceed the maximum")
+    offset = 0 if target == side else int(TASKBAR_PANE_SIZE)
+    index = max(0, int(target_index))
+    insert_at = min(offset + index, len(selected_seq))
+    selected_seq.insert(insert_at, dragged)
+    new_order = list(selected_seq) + [item for item in pool_seq if item != dragged]
+    # Preserve previously unseen ids (defensive: callers pass full order,
+    # so this is normally empty).
+    for item in normalized_order:
+        if item not in set(new_order):
+            new_order.append(item)
+    return {"order": new_order, "selected": list(selected_seq)}
+
+
 @unique
 class UsageState(StrEnum):
     READY = "ready"
