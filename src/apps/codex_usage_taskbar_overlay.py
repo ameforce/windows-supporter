@@ -2935,6 +2935,15 @@ class CodexUsageTaskbarOverlay:
 
     def _geometry_monitor_tick(self) -> None:
         self._geometry_after_id = None
+        try:
+            self._run_geometry_monitor_tick()
+        except Exception:
+            # Sampling, model construction and window creation can fail before
+            # the drawing recovery boundary. Never lose the only recovery timer.
+            self._geometry_invalidated = True
+            self._schedule_geometry_monitor_tick()
+
+    def _run_geometry_monitor_tick(self) -> None:
         model = self._last_model
         if not isinstance(model, dict):
             return
@@ -2993,16 +3002,18 @@ class CodexUsageTaskbarOverlay:
         content_changed = _overlay_render_signature(model) != _overlay_render_signature(
             updated_model
         )
-        if geometry_changed or content_changed:
+        surface_missing = not self._window_is_alive(window)
+        surface_needs_restore = surface_missing or not self._window_visible
+        if geometry_changed or content_changed or surface_needs_restore:
             if bool(updated_model.get("visible")):
-                if window is None:
+                if surface_missing:
                     window = self._ensure_window()
                 if window is None:
                     self._last_model = updated_model
                     self._schedule_geometry_monitor_tick()
                     return
                 try:
-                    if geometry_changed:
+                    if geometry_changed or surface_needs_restore:
                         self._apply_geometry(window, geometry)
                     self._update_metric_change_flash(updated_model)
                     self._draw(updated_model)
@@ -3018,8 +3029,10 @@ class CodexUsageTaskbarOverlay:
                     return
                 try:
                     window.deiconify()
+                    self._window_visible = True
                 except Exception:
-                    pass
+                    self._window_visible = False
+                self._schedule_keepalive_tick()
                 self._force_native_repaint(window)
             else:
                 if not bool(geometry.get("visible", True)):
@@ -3169,18 +3182,20 @@ class CodexUsageTaskbarOverlay:
             self._pending_regression_context = candidate_context
             self._pending_regression_count = 1
             return dict(previous_geometry)
-        if (
+        same_pending_candidate = (
             isinstance(self._pending_regression_geometry, dict)
+            and self._pending_regression_geometry == dict(candidate_geometry)
             and _transient_geometry_context_key(self._pending_regression_context)
             == candidate_stable_context
-            and int(self._pending_regression_count) >= required_count - 1
-        ):
+        )
+        count = self._pending_regression_count + 1 if same_pending_candidate else 1
+        if count >= required_count:
             self._clear_pending_regression_geometry()
             self._remember_same_side_transition(previous_geometry, candidate_geometry)
             return candidate_geometry
         self._pending_regression_geometry = dict(candidate_geometry)
         self._pending_regression_context = candidate_context
-        self._pending_regression_count = 1
+        self._pending_regression_count = count
         return dict(previous_geometry)
 
     def _cancel_geometry_monitor_tick(self) -> None:
