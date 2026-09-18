@@ -155,6 +155,8 @@ USAGE_RESET_LABELS: dict[str, str] = {
     "monthly_limit_reset_at": "월간 한도",
 }
 
+USAGE_LIMIT_RESET_MIN_FORWARD_JUMP_SECONDS = 3600
+
 CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 CODEX_USAGE_CANONICAL_PATH = "/codex/cloud/settings/analytics"
 CODEX_USAGE_CANONICAL_FRAGMENT = "usage"
@@ -1654,6 +1656,14 @@ class UsageChange:
     after: str
 
 
+@dataclass
+class UsageLimitReset:
+    key: str
+    label: str
+    previous_reset_at: str
+    new_reset_at: str
+
+
 def merge_snapshot_with_previous(
     current: UsageSnapshot,
     previous: UsageSnapshot | None,
@@ -1727,6 +1737,47 @@ def compute_usage_changes(
     return changes
 
 
+def compute_usage_limit_resets(
+    baselines: dict[str, str] | None,
+    current: UsageSnapshot,
+    *,
+    now: datetime | None = None,
+) -> list[UsageLimitReset]:
+    if not isinstance(current, UsageSnapshot) or not current.has_any_metric():
+        return []
+    now_dt = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    now_ts = now_dt.timestamp()
+    resets: list[UsageLimitReset] = []
+    baseline_map = baselines if isinstance(baselines, dict) else {}
+    curr_payload = current.to_dict()
+    for metric_key in USAGE_METRIC_KEYS:
+        reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
+        if not reset_key:
+            continue
+        baseline_raw = normalize_usage_value(baseline_map.get(metric_key, ""))
+        new_raw = normalize_usage_value(curr_payload.get(reset_key, ""))
+        if not baseline_raw or not new_raw or baseline_raw == new_raw:
+            continue
+        baseline_dt = _parse_base_reset_datetime(baseline_raw)
+        new_dt = _parse_base_reset_datetime(new_raw)
+        if baseline_dt is None or new_dt is None:
+            continue
+        if baseline_dt.timestamp() > now_ts:
+            continue
+        forward_jump = (new_dt - baseline_dt).total_seconds()
+        if forward_jump < float(USAGE_LIMIT_RESET_MIN_FORWARD_JUMP_SECONDS):
+            continue
+        resets.append(
+            UsageLimitReset(
+                key=metric_key,
+                label=USAGE_METRIC_LABELS.get(metric_key, metric_key),
+                previous_reset_at=baseline_raw,
+                new_reset_at=new_raw,
+            )
+        )
+    return resets
+
+
 class _UnavailableBrowserSession:
     def __init__(self, error: str = "browser_session_create_failed") -> None:
         self.__error = str(error or "browser_session_create_failed")
@@ -1786,6 +1837,8 @@ class CodexUsageMonitor:
         self.__worker_epoch = 0
         self.__active_tooltip = None
         self.__pending_change_tooltip_changes: dict[str, UsageChange] = {}
+        self.__pending_limit_reset_events: dict[str, UsageLimitReset] = {}
+        self.__limit_reset_baselines: dict[str, str] = {}
         self.__pending_change_tooltip_snapshot: UsageSnapshot | None = None
         self.__pending_change_tooltip_input_tick: int | None = None
         self.__pending_change_tooltip_after_id = None
@@ -1832,6 +1885,7 @@ class CodexUsageMonitor:
         self.__interval_sec = 90.0
         self.__min_interval_sec = 10.0
         self.__tooltip_duration_ms = 7000
+        self.__limit_reset_sound_enabled = True
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__navigation_timeout_ms = 30000
         self.__login_timeout_sec = 180.0
@@ -1992,6 +2046,7 @@ class CodexUsageMonitor:
             "enabled": bool(self.__enabled),
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
+            "limit_reset_sound_enabled": bool(self.__limit_reset_sound_enabled),
             "usage_url": str(self.__usage_url),
             "collection_mode": "playwright",
             "settings_path": str(self.__settings_path),
@@ -2025,6 +2080,9 @@ class CodexUsageMonitor:
         self.__enabled = enabled
         self.__interval_sec = float(interval_sec)
         self.__tooltip_duration_ms = int(tooltip_ms)
+        self.__limit_reset_sound_enabled = bool(
+            data.get("limit_reset_sound_enabled", self.__limit_reset_sound_enabled)
+        )
         self.__refresh_session_state_from_profile()
         self.__save_settings()
         if bool(self.__external_scheduler):
@@ -2767,7 +2825,16 @@ class CodexUsageMonitor:
         self.__set_session_state("logged_in")
         self.__clear_auth_attention()
         changes = compute_usage_changes(prev, merged)
+        resets = compute_usage_limit_resets(self.__limit_reset_baselines, merged)
+        self.__update_limit_reset_baselines(merged)
         self.__commit_merged_snapshot(merged)
+        if resets:
+            self.__ui_post(
+                lambda: self.__queue_limit_reset_notification_until_input(
+                    list(resets),
+                    merged,
+                )
+            )
         return changes
 
     def __previous_snapshot_for_backfill(
@@ -2795,6 +2862,28 @@ class CodexUsageMonitor:
         return not (
             bool(allow_previous_backfill) and bool(self.__snapshot_backfill_allowed)
         )
+
+    def __update_limit_reset_baselines(self, snapshot: UsageSnapshot) -> None:
+        if not isinstance(snapshot, UsageSnapshot):
+            return
+        payload = snapshot.to_dict()
+        for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items():
+            new_raw = normalize_usage_value(payload.get(reset_key, ""))
+            if not new_raw:
+                continue
+            baseline_raw = normalize_usage_value(
+                self.__limit_reset_baselines.get(metric_key, "")
+            )
+            if not baseline_raw:
+                self.__limit_reset_baselines[metric_key] = new_raw
+                continue
+            baseline_dt = _parse_base_reset_datetime(baseline_raw)
+            new_dt = _parse_base_reset_datetime(new_raw)
+            if new_dt is None:
+                continue
+            if baseline_dt is None or new_dt > baseline_dt:
+                self.__limit_reset_baselines[metric_key] = new_raw
+        return
 
     def __commit_merged_snapshot(self, snapshot: UsageSnapshot) -> None:
         self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
@@ -3532,7 +3621,10 @@ class CodexUsageMonitor:
         if root is None or not changes:
             return
         current_input_tick = self.__get_last_input_tick()
-        was_empty = not bool(self.__pending_change_tooltip_changes)
+        was_empty = not (
+            self.__pending_change_tooltip_changes
+            or self.__pending_limit_reset_events
+        )
         for item in changes:
             key = str(item.key or "").strip()
             if not key:
@@ -3553,6 +3645,44 @@ class CodexUsageMonitor:
             self.__pending_change_tooltip_snapshot = UsageSnapshot.from_dict(
                 snapshot.to_dict()
             )
+        self.__gate_pending_notification(current_input_tick, was_empty)
+        return
+
+    def __queue_limit_reset_notification_until_input(
+        self,
+        resets: list[UsageLimitReset],
+        snapshot: UsageSnapshot | None = None,
+    ) -> None:
+        root = self.__root
+        if root is None or not resets:
+            return
+        current_input_tick = self.__get_last_input_tick()
+        was_empty = not (
+            self.__pending_change_tooltip_changes
+            or self.__pending_limit_reset_events
+        )
+        for item in resets:
+            key = str(item.key or "").strip()
+            if not key:
+                continue
+            self.__pending_limit_reset_events[key] = item
+        if not (
+            self.__pending_change_tooltip_changes
+            or self.__pending_limit_reset_events
+        ):
+            return
+        if isinstance(snapshot, UsageSnapshot):
+            self.__pending_change_tooltip_snapshot = UsageSnapshot.from_dict(
+                snapshot.to_dict()
+            )
+        self.__gate_pending_notification(current_input_tick, was_empty)
+        return
+
+    def __gate_pending_notification(
+        self,
+        current_input_tick: int | None,
+        was_empty: bool,
+    ) -> None:
         if current_input_tick is None:
             self.__show_pending_change_tooltip_now()
             return
@@ -3560,7 +3690,9 @@ class CodexUsageMonitor:
             self.__pending_change_tooltip_input_tick = int(current_input_tick)
         elif self.__pending_change_tooltip_input_tick is not None:
             try:
-                if int(current_input_tick) != int(self.__pending_change_tooltip_input_tick):
+                if int(current_input_tick) != int(
+                    self.__pending_change_tooltip_input_tick
+                ):
                     self.__show_pending_change_tooltip_now()
                     return
             except Exception:
@@ -3605,7 +3737,10 @@ class CodexUsageMonitor:
 
     def __flush_pending_change_tooltip_if_input_seen(self) -> None:
         self.__pending_change_tooltip_after_id = None
-        if not self.__pending_change_tooltip_changes:
+        if not (
+            self.__pending_change_tooltip_changes
+            or self.__pending_limit_reset_events
+        ):
             return
         baseline_tick = self.__pending_change_tooltip_input_tick
         current_tick = self.__get_last_input_tick()
@@ -3624,8 +3759,10 @@ class CodexUsageMonitor:
 
     def __show_pending_change_tooltip_now(self) -> None:
         changes_by_key = dict(self.__pending_change_tooltip_changes)
+        resets_by_key = dict(self.__pending_limit_reset_events)
         snapshot = self.__pending_change_tooltip_snapshot
         self.__pending_change_tooltip_changes = {}
+        self.__pending_limit_reset_events = {}
         self.__pending_change_tooltip_snapshot = None
         self.__pending_change_tooltip_input_tick = None
         after_id = self.__pending_change_tooltip_after_id
@@ -3636,7 +3773,7 @@ class CodexUsageMonitor:
                 root.after_cancel(after_id)
             except Exception:
                 pass
-        if not changes_by_key:
+        if not changes_by_key and not resets_by_key:
             return
         ordered: list[UsageChange] = []
         for key in USAGE_METRIC_KEYS:
@@ -3644,16 +3781,26 @@ class CodexUsageMonitor:
             if item is not None:
                 ordered.append(item)
         ordered.extend(changes_by_key.values())
-        self.__show_change_tooltip(ordered, snapshot)
+        ordered_resets: list[UsageLimitReset] = []
+        for key in USAGE_METRIC_KEYS:
+            item = resets_by_key.pop(key, None)
+            if item is not None:
+                ordered_resets.append(item)
+        ordered_resets.extend(resets_by_key.values())
+        self.__show_change_tooltip(ordered, snapshot, resets=ordered_resets)
         return
 
     def __show_change_tooltip(
         self,
         changes: list[UsageChange],
         snapshot: UsageSnapshot | None = None,
+        resets: list[UsageLimitReset] | None = None,
     ) -> None:
         root = self.__root
-        if root is None or not changes:
+        if root is None:
+            return
+        reset_items = [item for item in (resets or []) if item is not None]
+        if not changes and not reset_items:
             return
         current = snapshot if isinstance(snapshot, UsageSnapshot) else self.get_last_snapshot()
         metric_colors: dict[str, str] = {}
@@ -3661,7 +3808,12 @@ class CodexUsageMonitor:
             color = self.__resolve_change_color(item)
             if color:
                 metric_colors[str(item.key)] = color
-        lines = self.__build_change_tooltip_lines(changes, current, metric_colors)
+        lines = self.__build_change_tooltip_lines(
+            changes,
+            current,
+            metric_colors,
+            resets=reset_items,
+        )
         if self.__snapshot_has_reset_info(current):
             lines = _RefreshableTooltipLines(
                 lines,
@@ -3669,9 +3821,26 @@ class CodexUsageMonitor:
                     changes,
                     current,
                     metric_colors,
+                    resets=reset_items,
                 ),
             )
+        if reset_items:
+            self.__play_limit_reset_sound()
+            self.__show_alert_tooltip("", lines=lines)
+            return
         self.__show_tooltip("", lines=lines)
+        return
+
+    def __play_limit_reset_sound(self) -> None:
+        if not bool(self.__limit_reset_sound_enabled):
+            return
+        try:
+            from src.utils.reset_fanfare import play_reset_fanfare
+
+            if not play_reset_fanfare():
+                self.__log("limit reset sound playback unavailable")
+        except Exception as exc:
+            self.__log_exception("limit reset sound playback failed", exc)
         return
 
     def __build_change_tooltip_lines(
@@ -3679,11 +3848,24 @@ class CodexUsageMonitor:
         changes: list[UsageChange],
         snapshot: UsageSnapshot | None,
         metric_colors: dict[str, str],
+        resets: list[UsageLimitReset] | None = None,
     ) -> list[tuple[str, str | None]]:
         lines: list[tuple[str, str | None]] = [("Codex 현재 사용량", None)]
         lines.extend(self.__build_snapshot_lines(snapshot, metric_colors=metric_colors))
-        lines.append(("--------------------------------", None))
-        lines.append(("변경", None))
+        reset_items = [item for item in (resets or []) if item is not None]
+        if reset_items:
+            lines.append(("--------------------------------", None))
+            lines.append(("사용 한도 초기화", None))
+            for item in reset_items:
+                lines.append(
+                    (
+                        f"{self.__metric_short_label(item.key)} 초기화됨",
+                        "#16A34A",
+                    )
+                )
+        if changes:
+            lines.append(("--------------------------------", None))
+            lines.append(("변경", None))
         for item in changes:
             before = item.before if item.before else "-"
             after = item.after if item.after else "-"
@@ -4050,6 +4232,25 @@ class CodexUsageMonitor:
     ) -> None:
         if self.__emit_managed_notification(text, lines=lines, duration_ms=duration_ms):
             return
+        self.__present_local_tooltip(text, lines=lines, duration_ms=duration_ms)
+        return
+
+    def __show_alert_tooltip(
+        self,
+        text: str,
+        lines: list[tuple[str, str | None]] | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        self.__emit_managed_notification(text, lines=lines, duration_ms=duration_ms)
+        self.__present_local_tooltip(text, lines=lines, duration_ms=duration_ms)
+        return
+
+    def __present_local_tooltip(
+        self,
+        text: str,
+        lines: list[tuple[str, str | None]] | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
         root = self.__root
         if root is None:
             return
@@ -4450,6 +4651,15 @@ class CodexUsageMonitor:
             tooltip = 1200
             dirty = True
         self.__tooltip_duration_ms = int(tooltip)
+        try:
+            self.__limit_reset_sound_enabled = bool(
+                data.get(
+                    "limit_reset_sound_enabled",
+                    self.__limit_reset_sound_enabled,
+                )
+            )
+        except Exception:
+            self.__limit_reset_sound_enabled = True
         usage_url = normalize_usage_value(data.get("usage_url", self.__usage_url))
         if usage_url:
             canonical_usage_url = canonicalize_codex_usage_url(usage_url)
@@ -4466,6 +4676,7 @@ class CodexUsageMonitor:
             "enabled": bool(self.__enabled),
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
+            "limit_reset_sound_enabled": bool(self.__limit_reset_sound_enabled),
             "usage_url": str(self.__usage_url),
         }
         self.__write_json_file(self.__settings_path, payload)
@@ -4491,6 +4702,23 @@ class CodexUsageMonitor:
         snap = UsageSnapshot.from_dict(raw_snapshot)
         self.__last_snapshot = snap
         self.__usage_history = self.__normalize_usage_history(raw_history)
+        raw_baselines = data.get("limit_reset_baselines")
+        baselines: dict[str, str] = {}
+        if isinstance(raw_baselines, dict):
+            baselines = {
+                str(key): normalize_usage_value(value)
+                for key, value in raw_baselines.items()
+                if str(key) in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC
+                and normalize_usage_value(value)
+            }
+        if not baselines:
+            snap_payload = snap.to_dict()
+            baselines = {
+                metric_key: normalize_usage_value(snap_payload.get(reset_key, ""))
+                for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items()
+                if normalize_usage_value(snap_payload.get(reset_key, ""))
+            }
+        self.__limit_reset_baselines = baselines
         self.__set_profile_name(
             data.get("profile_name", ""),
             verified=data.get("profile_name_verified") is True,
@@ -4537,6 +4765,7 @@ class CodexUsageMonitor:
             "auth_attention_source": str(self.__auth_attention_source or ""),
             "last_snapshot": self.__last_snapshot.to_dict(),
             "usage_history": self.__get_usage_history_snapshot(),
+            "limit_reset_baselines": dict(self.__limit_reset_baselines),
         }
         self.__write_json_file(self.__state_path, payload)
         return
