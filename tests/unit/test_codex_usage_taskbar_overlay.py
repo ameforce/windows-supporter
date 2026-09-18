@@ -7219,6 +7219,151 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertGreaterEqual(len(occupied_calls), 3)
         self.assertEqual(window.geometry_calls[-1], initial_geometry)
 
+    def _geometry_monitor_tick_callback(self, root):
+        return [
+            callback
+            for _delay, callback in root.after_calls
+            if callback.__name__ == "_geometry_monitor_tick"
+        ][-1]
+
+    def test_geometry_monitor_holds_slot_through_alternating_slot_loss_bursts(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        live_slot = [(0, 900), (1700, 1920)]
+        slot_gone = [(0, 1920)]
+        spans_by_call = [live_slot] + [
+            span
+            for _round in range(6)
+            for span in (slot_gone, live_slot)
+        ]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        initial_geometry = window.geometry_calls[-1]
+
+        for _round in range(12):
+            self._geometry_monitor_tick_callback(root)()
+
+        self.assertEqual(window.withdraw_calls, 0)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertTrue(overlay._window_visible)
+        self.assertIsNotNone(overlay._geometry_after_id)
+
+    def test_geometry_monitor_hides_after_sustained_slot_loss(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [[(0, 900), (1700, 1920)]] + [[(0, 1920)]] * 8
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+
+        for _round in range(8):
+            self._geometry_monitor_tick_callback(root)()
+
+        self.assertGreaterEqual(window.withdraw_calls, 1)
+        self.assertFalse(overlay._window_visible)
+        self.assertIsNotNone(overlay._geometry_after_id)
+
+    def test_geometry_monitor_slot_loss_streak_resets_when_slot_reappears(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        live_slot = [(0, 900), (1700, 1920)]
+        slot_gone = [(0, 1920)]
+        # Three denied samples, a recovery, then three more denied samples:
+        # each burst stays below the sustained-loss confirmation threshold.
+        spans_by_call = [live_slot] + [slot_gone] * 3 + [live_slot] + [
+            slot_gone
+        ] * 3
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        initial_geometry = window.geometry_calls[-1]
+
+        for _round in range(7):
+            self._geometry_monitor_tick_callback(root)()
+
+        self.assertEqual(window.withdraw_calls, 0)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertTrue(overlay._window_visible)
+
+    def test_geometry_monitor_slot_loss_hold_keeps_slot_during_content_refresh(self):
+        root = _FakeRoot()
+        window = _FakeWindow()
+        occupied_calls = []
+        spans_by_call = [[(0, 900), (1700, 1920)], [(0, 1920)]]
+
+        def occupied_span_getter(width, height, work_area, geometry):
+            index = min(len(occupied_calls), len(spans_by_call) - 1)
+            occupied_calls.append((width, height, work_area, dict(geometry)))
+            return spans_by_call[index]
+
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: window,
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=occupied_span_getter,
+        )
+
+        overlay.refresh()
+        overlay._last_geometry_hard_resample_at = taskbar_overlay.time.monotonic()
+        initial_geometry = window.geometry_calls[-1]
+
+        # A refresh with a different preferred width must not bypass the
+        # slot-loss dwell: content ticks ride the same flickering evidence.
+        with patch.object(
+            taskbar_overlay,
+            "_preferred_taskbar_overlay_width_for_model",
+            return_value=620,
+        ):
+            overlay.refresh()
+
+        self.assertEqual(window.withdraw_calls, 0)
+        self.assertEqual(window.geometry_calls, [initial_geometry])
+        self.assertTrue(overlay._window_visible)
+
     def test_geometry_monitor_ignores_transient_x_shift_when_slot_width_is_unchanged(self):
         root = _FakeRoot()
         window = _FakeWindow()
