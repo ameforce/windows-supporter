@@ -3434,7 +3434,8 @@ class CodexUsageTaskbarOverlay:
             return dict(previous_geometry)
         same_pending_candidate = (
             isinstance(self._pending_regression_geometry, dict)
-            and self._pending_regression_geometry == dict(candidate_geometry)
+            and _pending_regression_candidate_key(self._pending_regression_geometry)
+            == _pending_regression_candidate_key(candidate_geometry)
             and _transient_geometry_context_key(self._pending_regression_context)
             == candidate_stable_context
         )
@@ -5690,6 +5691,21 @@ def _slot_loss_context_key(context: Any) -> Any:
                 items.append(normalized)
         return tuple(items)
     return context
+
+
+def _pending_regression_candidate_key(geometry: dict[str, Any]) -> Any:
+    """Confirmation identity for a pending regression candidate.
+
+    Hidden candidates only differ in bookkeeping fields such as
+    fallback_reason, so exact dict equality pins the confirmation count at
+    one whenever the detector flaps between two hidden shapes and a
+    genuinely lost slot would never hide.  Every hidden candidate is one
+    confirmation class; visible candidates keep exact dict equality so
+    distinct slots still need their own consecutive evidence.
+    """
+    if not bool(geometry.get("visible", True)):
+        return ("hidden",)
+    return dict(geometry)
 
 
 def _free_spans_from_geometry_context(context: Any) -> list[tuple[int, int]] | None:
