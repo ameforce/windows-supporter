@@ -649,6 +649,20 @@ class WindowsSupporterMainUI:
                 # minimum back above the content-fit size.
                 min_width = min(int(fallback_min_width), max_width, width)
                 min_height = min(int(fallback_min_height), max_height, height)
+                # A view may expose a separate narrow-state floor (for example
+                # stacked panes) so the preferred side-by-side size does not
+                # become the resize floor and lock the narrow layout out.
+                view_min_width, view_min_height = self._content_minimum_size(
+                    tab_key
+                )
+                if view_min_width > 1:
+                    min_width = min(
+                        min_width, max(1, min(view_min_width, max_width))
+                    )
+                if view_min_height > 1:
+                    min_height = min(
+                        min_height, max(1, min(view_min_height, max_height))
+                    )
                 tab_row_min = self._notebook_tab_row_min_width(width)
                 if tab_row_min > 0:
                     min_width = max(min_width, min(int(tab_row_min), max_width))
@@ -797,6 +811,32 @@ class WindowsSupporterMainUI:
         return (
             max(1, int(measured[0]) + chrome_width),
             max(1, int(measured[1]) + chrome_height),
+        )
+
+    def _content_minimum_size(self, tab_key: str) -> tuple[int, int]:
+        view = self._tab_view(tab_key)
+        getter = getattr(view, "minimum_size", None)
+        if not callable(getter):
+            return (0, 0)
+        try:
+            value = getter()
+        except Exception:
+            return (0, 0)
+        if not isinstance(value, (tuple, list)) or len(value) < 2:
+            return (0, 0)
+        try:
+            measured = (int(value[0]), int(value[1]))
+        except Exception:
+            return (0, 0)
+        if measured[0] <= 1 or measured[1] <= 1:
+            return (0, 0)
+        tab = self._tab_widget(tab_key)
+        chrome_width, chrome_height = (
+            self._window_chrome_size(tab) if tab is not None else (0, 0)
+        )
+        return (
+            max(1, measured[0] + int(chrome_width)),
+            max(1, measured[1] + int(chrome_height)),
         )
 
     def _dashboard_content_height(self) -> int:
