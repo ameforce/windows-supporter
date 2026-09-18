@@ -80,6 +80,13 @@ _LEFT_TO_RIGHT_SWITCH_DWELL_SEC = 1.0
 # evidence than the first relocation.  This is the cycle breaker for a
 # detector whose two adjacent samples are influenced by the overlay itself.
 _SAME_SIDE_SLOT_RETURN_CONFIRMATION_COUNT = 4
+# Consecutive geometry samples that must all fail to keep a usable witness
+# for the applied slot before the overlay accepts that the slot is gone.
+# Pixel occupancy flickers: animated taskbar elements, toasts and the
+# overlay's own just-vacated pixels can erase a live slot for a sample or
+# two and hand it back on the next read, and each repeated burst would
+# otherwise cycle hide/show and shrink/grow at the monitor tick rate.
+_GEOMETRY_SLOT_LOSS_CONFIRM_TICKS = 4
 _STABLE_SLOT_MIN_OVERLAP_PX = 32
 _SLOT_SIDE_LEFT = "left"
 _SLOT_SIDE_RIGHT = "right"
@@ -2604,6 +2611,7 @@ class CodexUsageTaskbarOverlay:
         self._pending_regression_geometry: dict[str, int | str] | None = None
         self._pending_regression_context = None
         self._pending_regression_count = 0
+        self._slot_loss_streak = 0
         self._pending_side_transition: tuple[str, str] | None = None
         self._pending_side_transition_context = None
         self._pending_side_transition_started_at = 0.0
@@ -2735,6 +2743,7 @@ class CodexUsageTaskbarOverlay:
         self._clear_pending_regression_geometry()
         self._clear_pending_side_transition()
         self._last_same_side_transition = None
+        self._slot_loss_streak = 0
         self._fullscreen_suppressed = False
         return
 
@@ -2751,6 +2760,7 @@ class CodexUsageTaskbarOverlay:
         self._cancel_content_tick()
         self._clear_pending_regression_geometry()
         self._clear_pending_side_transition()
+        self._slot_loss_streak = 0
         self._schedule_geometry_monitor_tick()
         return
 
@@ -2758,6 +2768,7 @@ class CodexUsageTaskbarOverlay:
         self._geometry_invalidated = True
         self._cached_geometry_context = None
         self._cached_geometry = None
+        self._slot_loss_streak = 0
         self._clear_pending_regression_geometry()
         self._clear_pending_side_transition()
         self._last_same_side_transition = None
@@ -3245,6 +3256,69 @@ class CodexUsageTaskbarOverlay:
             return int(_SAME_SIDE_SLOT_RETURN_CONFIRMATION_COUNT)
         return 2
 
+    def _hold_geometry_for_slot_loss(
+        self,
+        previous_geometry: dict[str, Any],
+        candidate_geometry: dict[str, int | str],
+        *,
+        previous_context: Any,
+        candidate_context: Any,
+    ) -> bool:
+        """Keep the applied geometry until slot-loss evidence is sustained.
+
+        The pixel sampler reads whatever is painted in the taskbar band, so
+        animated shell elements, toasts and the overlay's own just-vacated
+        pixels can erase the live slot for a sample or two and hand it back
+        on the next read. Each repeated burst would otherwise cycle
+        hide/show at the monitor tick rate, which is the observed
+        virtual-desktop flicker. Counting consecutive samples that both
+        deny the current slot and produce a hidden candidate keeps those
+        bursts from hiding the pane; visible candidates still go through
+        the regular pending/dwell path so genuine relocations keep their
+        existing confirmation contract, and any sample that finds the slot
+        again resets the count immediately.
+        """
+        if not bool(self._window_visible) or not bool(
+            previous_geometry.get("visible", True)
+        ):
+            self._slot_loss_streak = 0
+            return False
+        try:
+            previous_width = int(previous_geometry.get("width", 0) or 0)
+        except (TypeError, ValueError):
+            previous_width = 0
+        if previous_width <= 0:
+            self._slot_loss_streak = 0
+            return False
+        free_spans = _free_spans_from_geometry_context(candidate_context)
+        if free_spans is None:
+            return False
+        if _slot_loss_context_key(previous_context) != _slot_loss_context_key(
+            candidate_context
+        ):
+            self._slot_loss_streak = 0
+            return False
+        if (
+            _previous_geometry_stable_free_slot(free_spans, previous_geometry)
+            is not None
+            or bool(candidate_geometry.get("visible", True))
+        ):
+            self._slot_loss_streak = 0
+            return False
+        self._slot_loss_streak = int(self._slot_loss_streak) + 1
+        if int(self._slot_loss_streak) < _GEOMETRY_SLOT_LOSS_CONFIRM_TICKS:
+            _debug_overlay_geometry(
+                f"slot-loss-hold streak={self._slot_loss_streak} "
+                f"prev_x={previous_geometry.get('x')} "
+                f"prev_w={previous_geometry.get('width')} "
+                f"free_spans={free_spans!r}"
+            )
+            return True
+        # The streak intentionally stays saturated while every sample denies
+        # the slot so the regular regression/pending path sees each further
+        # candidate immediately instead of only every Nth tick.
+        return False
+
     def _stabilize_transient_geometry_regression(
         self,
         previous_geometry: dict[str, Any],
@@ -3253,6 +3327,27 @@ class CodexUsageTaskbarOverlay:
         previous_context: Any,
         candidate_context: Any,
     ) -> dict[str, int | str]:
+        if not bool(self._window_visible):
+            applied_geometry = _model_geometry(self._last_model)
+            if isinstance(applied_geometry, dict) and not bool(
+                applied_geometry.get("visible", True)
+            ):
+                # The caller's previous_geometry deliberately falls back to
+                # the last visible rect so a recovered slot keeps its side
+                # identity.  While the window is actually hidden that ghost
+                # is not the applied state: returning it from a pending hold
+                # rebuilds a visible model and resurrects the pane on every
+                # other tick, which is the observed hide/show flicker.  Use
+                # the geometry that is really on screen so "hold" keeps the
+                # pane hidden and a usable slot still re-shows it.
+                previous_geometry = applied_geometry
+        if self._hold_geometry_for_slot_loss(
+            previous_geometry,
+            candidate_geometry,
+            previous_context=previous_context,
+            candidate_context=candidate_context,
+        ):
+            return dict(previous_geometry)
         previous_side = _horizontal_geometry_slot_side(previous_geometry)
         candidate_side = _horizontal_geometry_slot_side(candidate_geometry)
         if previous_side and candidate_side and previous_side != candidate_side:
@@ -3339,7 +3434,8 @@ class CodexUsageTaskbarOverlay:
             return dict(previous_geometry)
         same_pending_candidate = (
             isinstance(self._pending_regression_geometry, dict)
-            and self._pending_regression_geometry == dict(candidate_geometry)
+            and _pending_regression_candidate_key(self._pending_regression_geometry)
+            == _pending_regression_candidate_key(candidate_geometry)
             and _transient_geometry_context_key(self._pending_regression_context)
             == candidate_stable_context
         )
@@ -5552,6 +5648,95 @@ def _transient_geometry_context_key(context: Any) -> Any:
                 items.append(normalized)
         return tuple(items)
     return context
+
+
+_SLOT_LOSS_CONTEXT_IGNORED_KEYS = frozenset(
+    {
+        "occupied_spans",
+        "free_spans",
+        "preferred_width",
+        "compact_preferred_width",
+    }
+)
+
+
+def _slot_loss_context_key(context: Any) -> Any:
+    """Stable context minus every input that can flicker between samples.
+
+    Occupied/free spans are the raw flickering evidence and the preferred
+    widths ride the content tick, so both are ignored here: otherwise a
+    harmless one-second text refresh would masquerade as a topology change
+    and bypass the slot-loss dwell on every single content update.
+    """
+    if context is None:
+        return None
+    if isinstance(context, tuple):
+        if (
+            len(context) == 2
+            and isinstance(context[0], str)
+            and context[0] in _SLOT_LOSS_CONTEXT_IGNORED_KEYS
+        ):
+            return None
+        items = []
+        for item in context:
+            normalized = _slot_loss_context_key(item)
+            if normalized is not None:
+                items.append(normalized)
+        return tuple(items)
+    if isinstance(context, list):
+        items = []
+        for item in context:
+            normalized = _slot_loss_context_key(item)
+            if normalized is not None:
+                items.append(normalized)
+        return tuple(items)
+    return context
+
+
+def _pending_regression_candidate_key(geometry: dict[str, Any]) -> Any:
+    """Confirmation identity for a pending regression candidate.
+
+    Hidden candidates only differ in bookkeeping fields such as
+    fallback_reason, so exact dict equality pins the confirmation count at
+    one whenever the detector flaps between two hidden shapes and a
+    genuinely lost slot would never hide.  Every hidden candidate is one
+    confirmation class; visible candidates keep exact dict equality so
+    distinct slots still need their own consecutive evidence.
+    """
+    if not bool(geometry.get("visible", True)):
+        return ("hidden",)
+    return dict(geometry)
+
+
+def _free_spans_from_geometry_context(context: Any) -> list[tuple[int, int]] | None:
+    """Extract the padded free spans recorded inside a geometry context.
+
+    The monitor-target path nests the per-target context one level deep, so
+    the search walks tuples and lists until the tagged item is found. None
+    means the context carries no occupancy evidence at all, which is not
+    the same thing as an empty span list: a failed or skipped sample must
+    not count as slot loss.
+    """
+    stack = [context]
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, (list, tuple)):
+            continue
+        if (
+            len(item) == 2
+            and item[0] == "free_spans"
+            and isinstance(item[1], (list, tuple))
+        ):
+            spans: list[tuple[int, int]] = []
+            for span in item[1]:
+                try:
+                    start, end = span
+                    spans.append((int(start), int(end)))
+                except Exception:
+                    continue
+            return spans
+        stack.extend(item)
+    return None
 
 
 def _is_transient_geometry_x_shift(
