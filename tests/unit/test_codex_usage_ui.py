@@ -854,14 +854,15 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._pane_boxes = {
             "left": _SizingWidget(reqwidth=430),
             "right": _SizingWidget(reqwidth=380),
+            "pool": _SizingWidget(reqwidth=500),
         }
 
         min_width, min_height = view.minimum_size()
 
-        # 스택 상태의 최소 폭은 가장 넓은 상자 하나분이다. 나란히 배치
-        # 요구 폭이 minsize로 들어가면 사용자가 창을 좁혀도 스택 폴백에
-        # 도달할 수 없다. 430 + 18(body padx) + 17 + 24.
-        self.assertEqual(min_width, 430 + 18 + 17 + 24)
+        # 스택 상태의 최소 폭은 가장 넓은 상자 하나분이고 pool도 포함된다.
+        # 나란히 배치 요구 폭이 minsize로 들어가면 사용자가 창을 좁혀도
+        # 스택 폴백에 도달할 수 없다. 500 + 18(body padx) + 17 + 24.
+        self.assertEqual(min_width, 500 + 18 + 17 + 24)
         self.assertEqual(min_height, 500)
         self.assertLess(min_width, view.preferred_size()[0])
 
@@ -1012,7 +1013,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         card = _SizingWidget()
         row = _SizingWidget()
         row._windows_supporter_unwrapped_reqwidth = 370
-        row.grid_info = lambda: {"padx": (8, 8)}
+        # Tk의 스칼라 padx=8은 양쪽 8+8=16을 뜻한다.
+        row.grid_info = lambda: {"padx": 8}
         card.grid_info = lambda: {"padx": (4, 4)}
         row.master = card
         card.master = left_box
@@ -1156,6 +1158,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             [(0, 0), (1, 0)],
         )
         self.assertIn((1, {"weight": 0}), side_row.columnconfigure_calls)
+        # grid는 미지정 옵션을 유지하므로 스택 시 이전 padx가 남지 않게
+        # 명시적으로 0을 줘야 한다.
+        self.assertEqual(left_box.grid_kwargs["padx"], 0)
+        self.assertEqual(right_box.grid_kwargs["padx"], 0)
 
         panes2 = _FakeWidget()
         side_row2 = _SizingWidget()

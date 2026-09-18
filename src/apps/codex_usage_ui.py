@@ -1327,7 +1327,7 @@ class CodexUsageSettingsView:
         use_frames = len(frames) >= rows_needed
         for index, frame in enumerate(frames):
             try:
-                if index < rows_needed:
+                if use_frames and index < rows_needed:
                     frame.grid(row=index, column=0, sticky="w")
                 else:
                     frame.grid_remove()
@@ -1609,12 +1609,15 @@ class CodexUsageSettingsView:
                     padx = 0
             else:
                 try:
-                    padx = int(padx)
+                    # Tk의 스칼라 padx는 양쪽에 적용되므로 두 배로 센다.
+                    padx = 2 * int(padx)
                 except Exception:
                     padx = 0
             inset += max(0, padx)
             if not first:
                 try:
+                    # 마크된 반응형 행 컨테이너는 현재 hl=0/bd=0이므로 자체
+                    # 경계선이 요구 폭에 포함되지 않는다는 전제가 성립한다.
                     inset += 2 * int(node.cget("highlightthickness") or 0)
                 except Exception:
                     pass
