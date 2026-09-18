@@ -341,11 +341,6 @@ class CodexUsageSettingsView:
         # 최소 폭을 키우고 URL 입력칸을 화면 오른쪽으로 밀어냈다.
         options = tk.Frame(body, bg=card_bg)
         options.grid(row=row, column=0, columnspan=4, sticky="we", pady=3)
-        try:
-            options.columnconfigure(0, weight=1)
-            options.columnconfigure(1, weight=1)
-        except Exception:
-            pass
         option_widgets = []
         for checkbox_text, target_var in (
             ("모니터링 사용", self._enabled_var),
@@ -514,11 +509,48 @@ class CodexUsageSettingsView:
         # padding on both sides. The embedded body's own padding is already
         # included in winfo_reqwidth().
         measured_width = body_width + scrollbar_width + 22
+        # 세로 스택 상태의 body 요구 폭은 상자 하나분이라 좁게 보고된다.
+        # 의도한 나란히 배치의 요구 폭을 하한으로 보고해야 스택 상태의
+        # 측정값이 창을 좁게 고착시키는 순환이 끊긴다. body의 좌우
+        # padding(padx=9)과 카드 경계선(1px씩)을 더한다.
+        side_by_side = self._pane_side_by_side_min_width()
+        if side_by_side > 0:
+            measured_width = max(
+                measured_width,
+                side_by_side + 18 + scrollbar_width + 24,
+            )
         width = max(1, measured_width, container_width)
         # The body is intentionally scrollable, so its full content height
         # must not turn the first AI tab open into a very tall window.
         height = max(1, container_height)
         return width, height
+
+    def minimum_size(self) -> tuple[int, int]:
+        """Expose the narrowest usable AI-tab size to the main shell.
+
+        나란히 배치가 불가능한 폭에서는 상자가 세로로 쌓이는 것이 의도된
+        폴백이다. minsize가 나란히 배치 요구 폭까지 올라가면 사용자가 창을
+        좁혀도 그 폴백에 도달할 수 없으므로, 스택 상태의 최소 폭(가장 넓은
+        상자 하나분)을 별도로 보고한다.
+        """
+        body = self._scroll_body
+        if body is None:
+            return (0, 0)
+        scrollbar_width = 0
+        scrollbar = self._scrollbar
+        if scrollbar is not None:
+            try:
+                scrollbar_width = max(0, int(scrollbar.winfo_reqwidth()))
+            except Exception:
+                pass
+        box_width = 0
+        for box in (self._pane_boxes or {}).values():
+            box_width = max(box_width, self._pane_box_unwrapped_width(box))
+        if box_width <= 0:
+            return (0, 0)
+        width = box_width + 18 + scrollbar_width + 24
+        _, height = self.preferred_size()
+        return (max(1, width), max(1, height))
 
     def _add_account_sections(
         self,
@@ -931,7 +963,11 @@ class CodexUsageSettingsView:
                 command=lambda aid=account_id, name=label: self._on_delete_profile(aid, name),
             )
             action_widgets.append(delete_button)
-            self._bind_responsive_widget_row(actions, action_widgets, columns=5)
+            self._bind_responsive_widget_row(
+                actions,
+                action_widgets,
+                columns=len(action_widgets),
+            )
             self._account_query_buttons[account_id] = query_button
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
@@ -1221,11 +1257,6 @@ class CodexUsageSettingsView:
         if container is None:
             return
         try:
-            container._windows_supporter_responsive_widgets = list(widgets)
-            container._windows_supporter_responsive_columns = int(max(1, columns))
-        except Exception:
-            pass
-        try:
             container.bind(
                 "<Configure>",
                 lambda event, host=container, children=list(widgets), max_columns=columns: self._reflow_widget_row(
@@ -1257,28 +1288,114 @@ class CodexUsageSettingsView:
                 width = int(container.winfo_width())
             except Exception:
                 width = 0
-        requested = sum(self._widget_requested_width(widget) for widget in children)
-        gap = max(4, (len(children) - 1) * 8)
-        columns = min(max(1, int(max_columns)), len(children))
-        if width > 1 and requested + gap > width:
-            columns = 1
-        for column in range(max(1, int(max_columns))):
+        # 균등 열로 나누지 않고 고정 간격으로 왼쪽부터 놓는다. 행 폭을
+        # 넘는 위젯만 다음 행으로 넘기므로, 열 너비가 만드는 빈 공간과
+        # 넘칠 때 전부 1열로 접히는 폴백이 없다. 랩된 각 행은 별도
+        # 프레임에 pack으로 놓는다. 한 그리드에 여러 행을 두면 열 폭이
+        # 모든 행의 최댓값으로 잡혀 간격이 깨지고 클리핑이 생긴다.
+        gap = 8
+        column_cap = max(1, int(max_columns))
+        widget_widths = [
+            self._widget_requested_width(widget) for widget in children
+        ]
+        # 랩이 적용되면 컨테이너의 winfo_reqwidth()가 줄어 상자 측정 기준이
+        # 흔들린다. 랩 없는 상태의 요구 폭을 별도로 저장해 두면 판정이
+        # 현재 배치 상태와 무관하게 안정된다.
+        try:
+            container._windows_supporter_unwrapped_reqwidth = (
+                sum(widget_widths) + gap * max(0, len(children) - 1)
+            )
+        except Exception:
+            pass
+        row = 0
+        column = 0
+        cursor = 0
+        placements = []
+        for widget, widget_width in zip(children, widget_widths):
+            if column > 0 and (
+                column >= column_cap
+                or (width > 1 and cursor + widget_width > width)
+            ):
+                row += 1
+                column = 0
+                cursor = 0
+            placements.append((widget, row, column))
+            cursor += widget_width + gap
+            column += 1
+        rows_needed = placements[-1][1] + 1
+        frames = self._widget_row_frames(container, rows_needed)
+        use_frames = len(frames) >= rows_needed
+        for index, frame in enumerate(frames):
             try:
-                container.columnconfigure(column, weight=1 if column < columns else 0)
+                if use_frames and index < rows_needed:
+                    frame.grid(row=index, column=0, sticky="w")
+                else:
+                    frame.grid_remove()
             except Exception:
                 pass
-        for index, widget in enumerate(children):
+        for index, (widget, row_index, column_index) in enumerate(placements):
+            last_in_row = (
+                index + 1 >= len(placements)
+                or placements[index + 1][1] != row_index
+            )
+            padx = (0, 0) if last_in_row else (0, gap)
             try:
-                widget.grid(
-                    row=index // columns,
-                    column=index % columns,
-                    sticky="w",
-                    padx=(0, 8) if index % columns < columns - 1 else 0,
-                    pady=(0, 2),
-                )
+                if use_frames:
+                    try:
+                        widget.grid_remove()
+                    except Exception:
+                        pass
+                    widget.pack(
+                        in_=frames[row_index],
+                        side="left",
+                        padx=padx,
+                        pady=(0, 2),
+                    )
+                else:
+                    widget.grid(
+                        row=row_index,
+                        column=column_index,
+                        sticky="w",
+                        padx=padx,
+                        pady=(0, 2),
+                    )
+            except Exception:
+                pass
+        for column_index in range(column_cap):
+            try:
+                container.columnconfigure(column_index, weight=0)
             except Exception:
                 pass
         return
+
+    def _widget_row_frames(self, container: Any, count: int) -> list[Any]:
+        frames = list(
+            getattr(container, "_windows_supporter_row_frames", []) or []
+        )
+        while len(frames) < count:
+            frame = None
+            tk = self._tk
+            bg = None
+            try:
+                bg = container.cget("bg")
+            except Exception:
+                bg = None
+            try:
+                if tk is not None:
+                    if bg is None:
+                        frame = tk.Frame(container)
+                    else:
+                        frame = tk.Frame(container, bg=bg)
+            except Exception:
+                frame = None
+            if frame is None:
+                break
+            frames.append(frame)
+        try:
+            container._windows_supporter_row_frames = list(frames)
+        except Exception:
+            pass
+        return frames
 
     def _reflow_metric_grid(
         self,
@@ -1403,30 +1520,114 @@ class CodexUsageSettingsView:
             pass
         return
 
-    def _profile_card_column_count(
-        self,
-        widget: Any,
-        *,
-        available_width: int | None = None,
-        card_count: int | None = None,
-    ) -> int:
+    def _pane_side_by_side_min_width(self) -> int:
+        # 나란히 배치에 필요한 폭은 두 상자 콘텐츠의 "랩 없는" 요청 폭 합으로
+        # 정한다. 현재 배치(랩·스택) 상태를 읽으면 측정값이 배치에 따라
+        # 흔들려, 좁은 창이 스스로를 정당화하는 순환이 생긴다.
+        widths = [
+            self._pane_box_unwrapped_width((self._pane_boxes or {}).get(side))
+            for side in ("left", "right")
+        ]
+        if any(item <= 0 for item in widths):
+            return 0
+        return sum(widths) + 10
+
+    def _pane_box_unwrapped_width(self, box: Any) -> int:
+        # 상자의 요구 폭은 자식 행이 랩되면 작아지고 wraplength 라벨은
+        # 할당 폭을 따라가므로 둘 다 측정 기준으로 쓸 수 없다. 대신 상자
+        # 안의 "줄일 수 없는" 리프 콘텐츠만 본다: 반응형 행은 저장된
+        # 랩 없는 요구 폭, 그 외 리프는 고정 요구 폭. wraplength가 있는
+        # 라벨은 좁아져도 줄바꿈되므로 요구 폭에서 제외한다. 컨테이너
+        # 자체 폭은 자식 상태를 그대로 반영해 탄력적이므로 제외한다.
+        if box is None:
+            return 0
+        base = 0
         try:
-            scaling = float(widget.tk.call("tk", "scaling"))
+            stack = list(box.winfo_children())
         except Exception:
-            scaling = 4.0 / 3.0
-        width = int(available_width or 0)
-        if width <= 1:
+            stack = []
+        while stack:
+            node = stack.pop()
             try:
-                width = int(widget.winfo_width())
+                node_children = list(node.winfo_children())
             except Exception:
-                width = 0
-        columns = 1 if scaling >= 1.65 or (width > 1 and width < 760) else 2
-        # 카드가 하나뿐이면 2열 그리드의 좌측 절반만 차지해 우측이 텅
-        # 빈 레이아웃이 된다. 단일 프로필(가장 흔한 기본 상태)은 전체
-        # 폭을 쓴다.
-        if card_count is not None and int(card_count) <= 1:
-            columns = 1
-        return columns
+                node_children = []
+            stack.extend(node_children)
+            try:
+                unwrapped = int(
+                    getattr(node, "_windows_supporter_unwrapped_reqwidth", 0)
+                    or 0
+                )
+            except Exception:
+                unwrapped = 0
+            if unwrapped > 0:
+                base = max(
+                    base, unwrapped + self._horizontal_inset(node, box)
+                )
+                continue
+            if node_children:
+                continue
+            try:
+                wraplength = int(node.cget("wraplength") or 0)
+            except Exception:
+                wraplength = 0
+            if wraplength > 0:
+                continue
+            leaf_width = self._widget_requested_width(node)
+            if leaf_width > 0:
+                base = max(
+                    base, leaf_width + self._horizontal_inset(node, box)
+                )
+        if base <= 0:
+            # 측정 가능한 자식이 없으면 상자 자체 요구 폭으로 폴백한다.
+            base = self._widget_requested_width(box)
+        return base
+
+    def _horizontal_inset(self, widget: Any, ancestor: Any) -> int:
+        # 위젯이 상자 안에서 차지하는 양쪽 여백 합계: 각 hop의 grid/pack padx와
+        # 중간 프레임·상자의 경계선 두께다. pack -in 배치는 name 계층을 바꾸지
+        # 않으므로 master 기준으로만 오른다. 측정 대상 리프 자신의 경계선은
+        # 이미 요구 폭에 포함되므로 첫 hop은 제외한다.
+        inset = 0
+        node = widget
+        first = True
+        while node is not None and node is not ancestor:
+            padx = 0
+            try:
+                padx = node.grid_info().get("padx", 0) or 0
+            except Exception:
+                padx = 0
+            if not padx:
+                try:
+                    padx = node.pack_info().get("padx", 0) or 0
+                except Exception:
+                    padx = 0
+            if isinstance(padx, (tuple, list)):
+                try:
+                    padx = sum(int(item) for item in padx)
+                except Exception:
+                    padx = 0
+            else:
+                try:
+                    # Tk의 스칼라 padx는 양쪽에 적용되므로 두 배로 센다.
+                    padx = 2 * int(padx)
+                except Exception:
+                    padx = 0
+            inset += max(0, padx)
+            if not first:
+                try:
+                    # 마크된 반응형 행 컨테이너는 현재 hl=0/bd=0이므로 자체
+                    # 경계선이 요구 폭에 포함되지 않는다는 전제가 성립한다.
+                    inset += 2 * int(node.cget("highlightthickness") or 0)
+                except Exception:
+                    pass
+            first = False
+            node = getattr(node, "master", None)
+        try:
+            inset += 2 * int(ancestor.cget("highlightthickness") or 0)
+        except Exception:
+            pass
+        return inset
 
     def _reflow_pane_boxes(
         self,
@@ -1435,20 +1636,33 @@ class CodexUsageSettingsView:
         *,
         available_width: int | None = None,
     ) -> None:
-        # 왼쪽/오른쪽 상자는 넓은 화면에서 나란히, 좁은 화면에서 세로로
-        # 쌓는다. 기존 프로필 카드 그리드가 쓰던 760px·150% 배율 계약을
-        # 그대로 재사용한다.
-        columns = self._profile_card_column_count(
-            panes,
-            available_width=available_width,
-            card_count=2,
-        )
+        # 왼쪽/오른쪽 상자는 두 상자가 실제로 들어갈 폭이 되면 나란히,
+        # 그보다 좁으면 세로로 쌓는다. 세로일 때는 비는 열이 남은 폭을
+        # 먹지 않게 column weight도 함께 맞춘다.
+        width = int(available_width or 0)
+        if width <= 1:
+            try:
+                width = int(panes.winfo_width())
+            except Exception:
+                width = 0
+        needed = self._pane_side_by_side_min_width()
+        # 필요 폭을 알 수 없으면 스택이 fail-safe다. 좁은 창에서 나란히
+        # 두면 양쪽이 잘리지만, 세로로 쌓으면 전체 내용이 보인다.
+        columns = 1 if needed <= 0 or (width > 1 and width < needed) else 2
         if getattr(panes, "_windows_supporter_pane_columns", None) == columns:
             return
         try:
             panes._windows_supporter_pane_columns = columns
         except Exception:
             pass
+        for column_index in range(2):
+            try:
+                side_row.columnconfigure(
+                    column_index,
+                    weight=1 if column_index < columns else 0,
+                )
+            except Exception:
+                pass
         for index, side in enumerate(("left", "right")):
             box = (self._pane_boxes or {}).get(side)
             if box is None:
@@ -1463,10 +1677,13 @@ class CodexUsageSettingsView:
                         pady=0,
                     )
                 else:
+                    # grid()는 생략한 옵션을 유지하므로 나란히 배치 때의
+                    # 좌우 padx가 스택에서도 남지 않게 명시적으로 둔다.
                     box.grid(
                         row=index,
                         column=0,
                         sticky="we",
+                        padx=0,
                         pady=(0, 6) if index == 0 else 0,
                     )
             except Exception:
