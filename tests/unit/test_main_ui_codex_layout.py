@@ -141,6 +141,45 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
             (1139, 500),
         )
 
+    def test_ai_usage_minimum_size_lowers_resize_floor_below_preferred(self) -> None:
+        class _GeometryRoot(_FakeRoot):
+            def __init__(self):
+                super().__init__()
+                self.minsize_calls = []
+
+            def minsize(self, width, height):
+                self.minsize_calls.append((int(width), int(height)))
+
+        class _Tab:
+            def winfo_reqwidth(self):
+                return 830
+
+            def winfo_reqheight(self):
+                return 500
+
+        class _View:
+            def preferred_size(self):
+                return (819, 500)
+
+            def minimum_size(self):
+                return (430, 500)
+
+        root = _GeometryRoot()
+        ui, _, _ = self._build_ui(root=root)
+        ui._work_area_size = lambda: (1600, 1000)
+        ui._tab_ai_usage = _Tab()
+        ui._ai_usage_view = _View()
+
+        ui._apply_tab_geometry(ui._TAB_AI_USAGE)
+
+        # 나란히 배치 요구 폭(819+chrome)은 open 크기이고, minsize는
+        # 스택 상태 최소 폭(430+chrome)으로 낮아져 사용자가 창을 좁혀
+        # 세로 스택 폴백에 도달할 수 있다. tab_row_min이 하한을 올릴 수
+        # 있으므로 preferred 미만이면 된다.
+        applied_min = root.minsize_calls[-1][0]
+        self.assertLess(applied_min, 819)
+        self.assertGreaterEqual(applied_min, 430)
+
     def test_ui_scale_clamps_tk_scaling_ratio(self) -> None:
         with patch.object(WindowsSupporterMainUI, "_lazy_import_tk", return_value=None):
             with patch.object(WindowsSupporterMainUI, "_build_shell", return_value=None):
