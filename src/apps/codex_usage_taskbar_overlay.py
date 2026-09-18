@@ -1556,6 +1556,51 @@ def _proportional_extra_shares(
     return shares
 
 
+# Detail-funding order for the middle band: when the slot cannot fund every
+# column's countdown|guidance detail, the surplus reveals guidance one column
+# at a time instead of spreading thinly enough that none reaches it. The
+# weekly window outranks the hourly one; unlisted slots (credit carries no
+# guidance) fund last and normally take nothing.
+_METRIC_DETAIL_FUNDING_PRIORITY = (
+    "weekly_limit",
+    "five_hour_limit",
+    "monthly_limit",
+)
+
+
+def _detail_funding_shares(
+    slot_keys: list[str],
+    required_by_slot: dict[str, int],
+    detail_required_by_slot: dict[str, int],
+    extra_px: int,
+) -> dict[str, int]:
+    """Fund columns toward their detail width in priority order.
+
+    Each grant is capped at that slot's floor-to-detail gap, so a funded
+    column lands exactly on the width that draws its full joined text; a
+    column whose floor already covers detail (no guidance) takes nothing.
+    """
+    shares = {key: 0 for key in slot_keys}
+    remaining = max(0, int(extra_px))
+    order = {
+        key: rank for rank, key in enumerate(_METRIC_DETAIL_FUNDING_PRIORITY)
+    }
+    for key in sorted(
+        slot_keys, key=lambda item: (order.get(item, len(order)), item)
+    ):
+        gap = max(
+            0,
+            int(detail_required_by_slot.get(key, 0) or 0)
+            - int(required_by_slot.get(key, 0) or 0),
+        )
+        grant = min(gap, remaining)
+        if grant <= 0:
+            continue
+        shares[key] = grant
+        remaining -= grant
+    return shares
+
+
 def _metric_rows_layout_for_overlay_width(
     width: int,
     rows: list[tuple[dict[str, Any], ...] | list[dict[str, Any]]],
@@ -1589,6 +1634,7 @@ def _metric_rows_layout_for_overlay_width(
     slot_keys = _metric_slot_keys(rows_metrics)
     counts = len(slot_keys)
     required_by_slot: dict[str, int] = {}
+    detail_required_by_slot: dict[str, int] = {}
     reserved_reset_by_slot: dict[str, int] = {}
     for metrics in rows_metrics:
         for metric in metrics:
@@ -1603,6 +1649,17 @@ def _metric_rows_layout_for_overlay_width(
             )
             if required > required_by_slot.get(key, 0):
                 required_by_slot[key] = required
+            # Detail requirement: the column width that also draws the joined
+            # countdown|guidance text. Guidance-less metrics get the same
+            # width as the floor, so they never inflate the detail request.
+            detail_required = min(
+                _required_metric_segment_width(
+                    metric, badge_mode="full", require_detail=True
+                ),
+                _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+            )
+            if detail_required > detail_required_by_slot.get(key, 0):
+                detail_required_by_slot[key] = detail_required
             detail_text, short_text = _metric_guidance_texts(metric)
             reserved_reset = _metric_reset_reserved_px(
                 detail_text,
@@ -1683,20 +1740,46 @@ def _metric_rows_layout_for_overlay_width(
             0, overlay_width - metrics_x - _OVERLAY_RIGHT_PADDING_PX - right_air
         )
 
+    detail_need = (
+        sum(detail_required_by_slot.values()) + segment_gap * max(0, counts - 1)
+    )
+    # Cramped fallbacks need each slot's countdown minimum. The bar-preserving
+    # funding floor adds the minimum track width on top of it, because funding
+    # straight off the text-only minimum would starve unfunded columns to a
+    # zero-width bar, which then drags the shared bar floor down and erases
+    # every track. Credit slots carry no bar to protect.
+    min_by_slot: dict[str, int] = {}
+    for key in slot_keys:
+        for metrics in rows_metrics:
+            for metric in metrics:
+                if _metric_slot_key(metric) == key:
+                    min_by_slot[key] = _metric_countdown_min_width(metric)
+                    break
+            if key in min_by_slot:
+                break
+    total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
+    bar_floor_by_slot = {
+        key: min_by_slot[key]
+        + (0 if key == "credit" else _METRIC_PROGRESS_MIN_WIDTH_PX)
+        for key in slot_keys
+    }
+    bar_funded_min = (
+        sum(bar_floor_by_slot.values()) + segment_gap * max(0, counts - 1)
+    )
     column_widths: dict[str, int] = {}
     column_progresses: dict[str, int] = {}
-    if counts and total_required <= metrics_width:
+    if counts and detail_need <= metrics_width:
         # Text-first allocation on the shared grid: reserve each column's
         # widest requirement across rows and hand the leftover to the bars,
         # so no row's text is dropped while free width remains. Leftover goes
         # by need (starved text-heavy columns first, never credit), so bars
         # converge instead of leaving dead space beside cramped ones.
-        extra = metrics_width - total_required
+        extra = metrics_width - detail_need
         shares = _proportional_extra_shares(
-            slot_keys, required_by_slot, extra, skip=("credit",)
+            slot_keys, detail_required_by_slot, extra, skip=("credit",)
         )
         for key in slot_keys:
-            column_width = required_by_slot[key] + shares.get(key, 0)
+            column_width = detail_required_by_slot[key] + shares.get(key, 0)
             column_widths[key] = column_width
             column_progresses[key] = int(
                 max(
@@ -1711,66 +1794,76 @@ def _metric_rows_layout_for_overlay_width(
                     ),
                 )
             )
-    else:
-        # Cramped fallback: each shared column first keeps the width that
-        # preserves its fixed countdown + percent (bar, badge, and guidance
-        # yield first); any leftover widens the columns so the render fit can
-        # re-add those elements as space allows.
-        min_by_slot: dict[str, int] = {}
+    elif counts and bar_funded_min <= metrics_width:
+        # Priority funding on the bar-preserving floor: the weekly column
+        # reaches its joined countdown|guidance text before the hourly one
+        # does. One policy spans the whole middle range so reveal stays
+        # monotone — mixing a floors-first band above this one let a
+        # lower-priority column's larger floor outrank the funded column and
+        # hide an already-revealed guidance over a band boundary.
+        extra = metrics_width - bar_funded_min
+        shares = _detail_funding_shares(
+            slot_keys,
+            bar_floor_by_slot,
+            detail_required_by_slot,
+            extra,
+        )
         for key in slot_keys:
-            for metrics in rows_metrics:
-                for metric in metrics:
-                    if _metric_slot_key(metric) == key:
-                        min_by_slot[key] = _metric_countdown_min_width(metric)
-                        break
-                if key in min_by_slot:
-                    break
-        total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
-        if counts and total_min <= metrics_width:
-            extra = metrics_width - total_min
-            shares = _proportional_extra_shares(
-                slot_keys, min_by_slot, extra, skip=("credit",)
+            column_width = bar_floor_by_slot[key] + shares.get(key, 0)
+            column_widths[key] = column_width
+            column_progresses[key] = min(
+                _metric_progress_width_for_segment(
+                    column_width,
+                    reserved_reset_by_slot.get(key),
+                    cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
+                ),
+                _METRIC_PROGRESS_MAX_WIDTH_PX,
             )
+    elif counts and total_min <= metrics_width:
+        extra = metrics_width - total_min
+        shares = _proportional_extra_shares(
+            slot_keys, min_by_slot, extra, skip=("credit",)
+        )
+        for key in slot_keys:
+            column_width = min_by_slot[key] + shares.get(key, 0)
+            column_widths[key] = column_width
+            column_progresses[key] = min(
+                _metric_progress_width_for_segment(
+                    column_width,
+                    reserved_reset_by_slot.get(key),
+                    cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
+                ),
+                _METRIC_PROGRESS_MAX_WIDTH_PX,
+            )
+    else:
+        # Equal split as a last resort: even the countdown minimums do not
+        # fit, so the render fit drops text inside each column the same
+        # way on every row.
+        equal_width = _metric_segment_width_for_metrics_width(
+            metrics_width, counts, segment_gap
+        )
+        fits = all(
+            _metric_fits_badge_mode(
+                metric,
+                equal_width,
+                _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
+                "short",
+            )
+            for metrics in rows_metrics
+            for metric in metrics
+        )
+        for key in slot_keys:
+            column_widths[key] = equal_width
+        if fits or equal_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
             for key in slot_keys:
-                column_width = min_by_slot[key] + shares.get(key, 0)
-                column_widths[key] = column_width
-                column_progresses[key] = min(
-                    _metric_progress_width_for_segment(
-                        column_width,
-                        reserved_reset_by_slot.get(key),
-                        cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
-                    ),
-                    _METRIC_PROGRESS_MAX_WIDTH_PX,
+                column_progresses[key] = _metric_progress_width_for_segment(
+                    equal_width,
+                    reserved_reset_by_slot.get(key),
+                    cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
                 )
         else:
-            # Equal split as a last resort: even the countdown minimums do not
-            # fit, so the render fit drops text inside each column the same
-            # way on every row.
-            equal_width = _metric_segment_width_for_metrics_width(
-                metrics_width, counts, segment_gap
-            )
-            fits = all(
-                _metric_fits_badge_mode(
-                    metric,
-                    equal_width,
-                    _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX,
-                    "short",
-                )
-                for metrics in rows_metrics
-                for metric in metrics
-            )
             for key in slot_keys:
-                column_widths[key] = equal_width
-            if fits or equal_width < _MIN_COMPACT_SEGMENT_FOR_TEXT_PX:
-                for key in slot_keys:
-                    column_progresses[key] = _metric_progress_width_for_segment(
-                        equal_width,
-                        reserved_reset_by_slot.get(key),
-                        cap=_METRIC_PROGRESS_MAX_WIDTH_PX,
-                    )
-            else:
-                for key in slot_keys:
-                    column_progresses[key] = _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
+                column_progresses[key] = _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX
 
     offsets_by_slot: dict[str, int] = {}
     cursor = 0
@@ -1821,8 +1914,15 @@ def _required_metric_segment_width(
     metric: dict[str, Any],
     *,
     badge_mode: str = "any",
+    require_detail: bool = False,
 ) -> int:
-    return int(_required_metric_segment_width_cached(_metric_width_signature(metric), badge_mode))
+    return int(
+        _required_metric_segment_width_cached(
+            _metric_width_signature(metric),
+            badge_mode,
+            bool(require_detail),
+        )
+    )
 
 
 def _metric_width_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
@@ -1849,6 +1949,7 @@ def _metric_width_signature(metric: dict[str, Any]) -> tuple[Any, ...]:
 def _required_metric_segment_width_cached(
     signature: tuple[Any, ...],
     badge_mode: str,
+    require_detail: bool = False,
 ) -> int:
     (
         metric_key,
@@ -1913,6 +2014,19 @@ def _required_metric_segment_width_cached(
                 or str(layout.get("display_reset_text") or "")
             ):
                 continue
+        # Detail funding asks for the joined countdown|guidance text to draw
+        # whole, not just any countdown variant. Badge-less metrics carry the
+        # text in display_reset_text instead. Metrics without guidance already
+        # satisfy this at their floor width because their detail text is the
+        # countdown itself, and metrics without any reset text draw a "--"
+        # placeholder — they have nothing to fund and must not gate the
+        # request on an empty detail string.
+        if require_detail and detail_text:
+            drawn_text = str(badge_fit.get("time_text") or "") or str(
+                layout.get("display_reset_text") or ""
+            )
+            if drawn_text != detail_text:
+                continue
         return int(candidate_width)
     return _TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX
 
@@ -1923,6 +2037,7 @@ def _preferred_width_for_rows_cached(
     profile_labels: tuple[str, ...] = (),
     *,
     require_status_text: bool = False,
+    require_detail: bool = False,
 ) -> int:
     rows = tuple(
         tuple(_metric_from_width_signature(sig) for sig in row)
@@ -1943,7 +2058,7 @@ def _preferred_width_for_rows_cached(
             list(rows),
             profile_labels=profile_labels,
         )
-        return all(
+        fits_floor = all(
             int(row_layout.icon_width) > 0
             and (
                 not require_status_text
@@ -1956,6 +2071,23 @@ def _preferred_width_for_rows_cached(
                 min_progress_px=_METRIC_REQUIRED_PROGRESS_FLOOR_PX,
             )
             for row_layout in row_layouts
+        )
+        if not (fits_floor and require_detail):
+            return fits_floor
+        # The detail-funded request accepts a width only when every column
+        # can draw its joined countdown|guidance text — the pane should ask
+        # for the room the feature needs instead of stopping at the width
+        # where the guidance silently drops.
+        return all(
+            int(segment_width_value)
+            >= _required_metric_segment_width(
+                metric, badge_mode="full", require_detail=True
+            )
+            for row_layout in row_layouts
+            for metric, segment_width_value in zip(
+                row_layout.visible_metrics,
+                row_layout.segment_widths,
+            )
         )
 
     # The 300..900 sweep is too wide for a per-second layout budget when a
@@ -2073,6 +2205,7 @@ def _preferred_taskbar_overlay_width_for_model(model: dict[str, Any]) -> int | N
         rows,
         profile_labels,
         require_status_text=True,
+        require_detail=True,
     )
 
 
@@ -2133,12 +2266,6 @@ def _overlay_render_signature(model: dict[str, Any] | None) -> tuple[Any, ...]:
         model.get("state"),
         tuple(bars_signature),
     )
-
-
-def _wide_slot_preferred_width(model: dict[str, Any], minimum_width: int) -> int:
-    """Return content-fit width only; do not inflate into unused empty-slot space."""
-    _ = model
-    return int(minimum_width)
 
 
 def _model_geometry(model: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -4806,17 +4933,10 @@ def _fit_horizontal_geometry_to_empty_slot(
             )
         return fitted
 
-    compact_fit = bool(
-        compact_target_width is not None
-        and compact_target_width < target_width
-        and available < target_width
-    )
-    width_target = (
-        int(compact_target_width)
-        if compact_fit and compact_target_width is not None
-        else int(target_width)
-    )
-    width = min(width_target, available)
+    # Fill the slot up to the preferred request instead of shrinking to the
+    # compact request: any width between them still funds the floor columns,
+    # and the middle-band layout decides which columns reveal their detail.
+    width = min(int(target_width), int(available))
     fitted["width"] = int(width)
     fitted["x"] = int(max(start, end - width))
     fitted["_slot_side"] = _slot_side_for_geometry(
