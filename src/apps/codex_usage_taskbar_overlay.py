@@ -6007,7 +6007,24 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
     if band_bottom - band_top < 8:
         return None, telemetry
 
-    excluded_spans = _geometry_exclude_spans(geometry, int(screen_width))
+    raw_excluded_spans = _geometry_exclude_spans(geometry, int(screen_width))
+    # Pixel dilation and the free-slot padding are symmetric safety margins.
+    # If sampling is masked only to the exact live window edge, a fragment cut
+    # at that edge becomes occupied evidence and the later padding consumes
+    # another margin inside the window. Repeating the read then shrinks the
+    # overlay by two margins per tick until it disappears. Mask the self-owned
+    # margin too, so an unchanged taskbar produces the live rect as a fixed
+    # point. UIA below remains the authoritative witness for real controls
+    # underneath this wider sampling mask.
+    pixel_excluded_spans = _merge_spans(
+        [
+            (
+                max(0, int(start) - _EMPTY_SLOT_PADDING_PX),
+                min(int(screen_width), int(end) + _EMPTY_SLOT_PADDING_PX),
+            )
+            for start, end in raw_excluded_spans
+        ]
+    )
     child_records = _taskbar_child_occupied_span_records(
         int(screen_width),
         int(band_top) + origin_y,
@@ -6030,7 +6047,7 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
     suppressed_child_records = [
         record
         for record in child_records
-        if _child_span_is_structural_overlay_container(record, excluded_spans)
+        if _child_span_is_structural_overlay_container(record, raw_excluded_spans)
     ]
     if suppressed_child_records:
         telemetry["suppressed_child_spans"] = suppressed_child_records
@@ -6039,14 +6056,15 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
         for record in child_records
         if record not in suppressed_child_records
     ]
-    if excluded_spans:
-        occupied = _subtract_spans(occupied, excluded_spans)
-    telemetry["excluded_spans"] = excluded_spans
+    if raw_excluded_spans:
+        occupied = _subtract_spans(occupied, raw_excluded_spans)
+    telemetry["excluded_spans"] = raw_excluded_spans
+    telemetry["sampling_excluded_spans"] = pixel_excluded_spans
     # UIA reports the real taskbar elements (XAML icons, Start/Search, tray)
     # with exact bounds and, crucially, keeps reporting them while the overlay
-    # covers them. Their spans therefore bypass ``excluded_spans``: subtracting
-    # the overlay's own rect here is what let a transient misplacement hide the
-    # icons underneath it forever.
+    # covers them. Their spans therefore bypass the sampling exclusion:
+    # subtracting the overlay here is what let a transient misplacement hide
+    # the icons underneath it forever.
     uia_records = _uia_taskbar_occupied_span_records(
         int(screen_width),
         int(band_top) + origin_y,
@@ -6081,11 +6099,11 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
         sampled_columns = [
             (x, colors)
             for x, colors in columns
-            if not excluded_spans
+            if not raw_excluded_spans
             or not _span_overlaps_any(
                 int(x),
                 int(x) + _TASKBAR_SAMPLE_STEP_PX,
-                excluded_spans,
+                raw_excluded_spans,
             )
         ]
         background = _median_background_color(sampled_columns or columns)
@@ -6101,7 +6119,7 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
                 # Do not feed those self pixels into the next slot decision;
                 # UIA records above remain the trusted witness for real icons
                 # covered by the overlay.
-                pixel_fragments = _subtract_spans([raw_span], excluded_spans)
+                pixel_fragments = _subtract_spans([raw_span], pixel_excluded_spans)
                 for span in pixel_fragments:
                     telemetry["pixel_spans"].append(
                         {
