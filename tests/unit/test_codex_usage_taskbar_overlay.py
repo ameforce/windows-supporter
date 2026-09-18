@@ -5011,7 +5011,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             )
         )
 
-    def test_compact_preferred_width_releases_unrenderable_guidance_space(self):
+    def test_free_slot_width_funds_guidance_before_clamping(self):
         five_hour = {
             "key": "5h",
             "metric_key": "five_hour_limit",
@@ -5068,10 +5068,12 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             compact_preferred_width=compact_width,
         )
 
-        # The free taskbar span is wide enough for the compact content but not
-        # for the optional guidance. The overlay should fit the compact width
-        # instead of reserving the clamped span for empty guidance columns.
-        self.assertEqual(geometry["width"], compact_width)
+        # The free taskbar span (80..704 minus insets = 608px) is narrower
+        # than the detail-funded request but wider than the compact floor.
+        # The overlay fills the whole free span and lets the middle-band
+        # layout decide which columns reveal their joined guidance —
+        # here the weekly column already draws its countdown|guidance text.
+        self.assertEqual(geometry["width"], 608)
         layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
             int(geometry["width"]),
             [tuple(bar["metrics"]) for bar in model["bars"]],
@@ -5081,7 +5083,279 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             layouts[0].segment_geometry(1)[0],
             layouts[1].segment_geometry(1)[0],
         )
+        mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(layouts))
+        floors = taskbar_overlay._slot_minimum_progress_widths(
+            layouts, badge_mode=mode
+        )
+        for row_layout in layouts:
+            for metric, segment_width in zip(
+                row_layout.visible_metrics, row_layout.segment_widths
+            ):
+                if taskbar_overlay._metric_slot_key(metric) != "weekly_limit":
+                    continue
+                fit = taskbar_overlay._fit_metric_segment_layout(
+                    segment_width,
+                    lock_progress=True,
+                    **taskbar_overlay._metric_segment_fit_kwargs(
+                        metric,
+                        floors.get("weekly_limit"),
+                        badge_mode=mode,
+                    ),
+                )
+                self.assertIn(
+                    "N ",
+                    str(fit["badge_fit"].get("time_text") or ""),
+                )
         self.assertLess(layouts[0].segment_geometry(2)[0], int(geometry["width"]))
+
+    def test_guidance_reveal_follows_column_priority_across_widths(self):
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 100,
+            "value_text": "100%",
+            "color": "#22c55e",
+            "reset_text": "00h 00m 00s",
+            "reset_short_text": "00h 00m 00s",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 60~64% / 00h 30m 00s",
+            "normal_guidance_short_text": "N 60~64% / 00h 30m 00s",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 53,
+            "value_text": "53%",
+            "color": "#f59e0b",
+            "reset_text": "05d 11h 27m 46s",
+            "reset_short_text": "05d 11h 27m 46s",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 64~66% / 4d 3h",
+            "normal_guidance_short_text": "N 64~66% / 4d 3h",
+        }
+        credit = {
+            "key": "CR",
+            "metric_key": "credit",
+            "percent": None,
+            "value_text": "1,000",
+        }
+        rows = [
+            (five_hour, weekly, credit),
+            (five_hour, weekly),
+        ]
+        profile_labels = ("김종수", "지혜 유")
+
+        def drawn_texts(overlay_width):
+            layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+                overlay_width, rows, profile_labels=profile_labels
+            )
+            mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(layouts))
+            floors = taskbar_overlay._slot_minimum_progress_widths(
+                layouts, badge_mode=mode
+            )
+            texts = {}
+            for row_layout in layouts:
+                for metric, segment_width in zip(
+                    row_layout.visible_metrics, row_layout.segment_widths
+                ):
+                    slot = taskbar_overlay._metric_slot_key(metric)
+                    fit = taskbar_overlay._fit_metric_segment_layout(
+                        segment_width,
+                        lock_progress=True,
+                        **taskbar_overlay._metric_segment_fit_kwargs(
+                            metric,
+                            floors.get(slot),
+                            badge_mode=mode,
+                        ),
+                    )
+                    texts.setdefault(slot, []).append(
+                        str(fit["badge_fit"].get("time_text") or "")
+                        or str(fit.get("display_reset_text") or "")
+                    )
+            return texts
+
+        # Narrow floor: countdowns still draw, no guidance is funded yet.
+        texts = drawn_texts(500)
+        self.assertTrue(texts["five_hour_limit"][0].startswith("00h"))
+        self.assertTrue(texts["weekly_limit"][0].startswith("05d"))
+        for slot_texts in texts.values():
+            for text in slot_texts:
+                self.assertNotIn("N ", text)
+
+        # Middle band: the weekly column is funded to its joined
+        # countdown|guidance text before the hourly column.
+        texts = drawn_texts(608)
+        for text in texts["weekly_limit"]:
+            self.assertIn("N ", text)
+        for text in texts["five_hour_limit"]:
+            self.assertNotIn("N ", text)
+
+        # Wide slot: every metric column draws its joined guidance.
+        texts = drawn_texts(760)
+        for text in texts["weekly_limit"] + texts["five_hour_limit"]:
+            self.assertIn("N ", text)
+
+    def test_preferred_width_stops_at_the_detail_funding_need(self):
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 100,
+            "value_text": "100%",
+            "color": "#22c55e",
+            "reset_text": "00h 00m 00s",
+            "reset_short_text": "00h 00m 00s",
+            "reset_badge_label": "남음",
+            "reset_badge_short_label": "남",
+            "normal_guidance_text": "N 60~64% / 00h 30m 00s",
+            "normal_guidance_short_text": "N 60~64% / 00h 30m 00s",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 53,
+            "value_text": "53%",
+            "color": "#f59e0b",
+            "reset_text": "05d 11h 27m 46s",
+            "reset_short_text": "05d 11h 27m 46s",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 64~66% / 4d 3h",
+            "normal_guidance_short_text": "N 64~66% / 4d 3h",
+        }
+        credit = {
+            "key": "CR",
+            "metric_key": "credit",
+            "percent": None,
+            "value_text": "1,000",
+        }
+        model = {
+            "visible": True,
+            "bars": [
+                {"enabled": True, "label": "김종수", "metrics": [five_hour, weekly, credit]},
+                {"enabled": True, "label": "지혜 유", "metrics": [five_hour, weekly]},
+            ],
+        }
+
+        preferred = taskbar_overlay._preferred_taskbar_overlay_width_for_model(model)
+        compact = taskbar_overlay._compact_taskbar_overlay_width_for_model(model)
+
+        self.assertIsNotNone(preferred)
+        self.assertIsNotNone(compact)
+        # The request exceeds the compact floor so the slot can fund joined
+        # guidance, but stays below the sweep cap — an empty taskbar must not
+        # inflate the pane beyond what the content can draw.
+        self.assertGreater(int(preferred), int(compact))
+        self.assertLess(
+            int(preferred),
+            taskbar_overlay._TEXT_FRIENDLY_EMPTY_SLOT_WIDTH_PX,
+        )
+        layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+            int(preferred),
+            [tuple(bar["metrics"]) for bar in model["bars"]],
+            profile_labels=tuple(bar["label"] for bar in model["bars"]),
+        )
+        mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(layouts))
+        floors = taskbar_overlay._slot_minimum_progress_widths(
+            layouts, badge_mode=mode
+        )
+        for row_layout in layouts:
+            for metric, segment_width in zip(
+                row_layout.visible_metrics, row_layout.segment_widths
+            ):
+                slot = taskbar_overlay._metric_slot_key(metric)
+                if slot == "credit":
+                    continue
+                fit = taskbar_overlay._fit_metric_segment_layout(
+                    segment_width,
+                    lock_progress=True,
+                    **taskbar_overlay._metric_segment_fit_kwargs(
+                        metric,
+                        floors.get(slot),
+                        badge_mode=mode,
+                    ),
+                )
+                self.assertIn(
+                    "N ",
+                    str(fit["badge_fit"].get("time_text") or ""),
+                )
+
+    def test_guidance_reveal_is_monotone_across_band_boundaries(self):
+        # Regression for the review finding: a priority column that already
+        # draws its joined guidance must not lose it as the pane widens —
+        # an earlier floors-first band let a lower-priority column's larger
+        # floor outrank the funded column across a band boundary.
+        five_hour = {
+            "key": "5h",
+            "metric_key": "five_hour_limit",
+            "percent": 53,
+            "value_text": "53%",
+            "color": "#f59e0b",
+            "reset_text": "04h 30m 00s",
+            "reset_short_text": "04h 30m 00s",
+            "reset_badge_label": "부족",
+            "reset_badge_short_label": "부",
+            "normal_guidance_text": "N 60~64% / 00h 30m 00s",
+            "normal_guidance_short_text": "N 60~64% / 00h 30m 00s",
+        }
+        weekly = {
+            "key": "7d",
+            "metric_key": "weekly_limit",
+            "percent": 53,
+            "value_text": "53%",
+            "color": "#f59e0b",
+            "reset_text": "05d 11h 27m 46s",
+            "reset_short_text": "05d 11h 27m 46s",
+            # Badge-less metric: the joined text lands in display_reset_text.
+            "normal_guidance_text": "N 64~66% / 4d 3h",
+            "normal_guidance_short_text": "N 64~66% / 4d 3h",
+        }
+        rows = [(five_hour, weekly)]
+
+        shown = {"weekly_limit": False, "five_hour_limit": False}
+        first_reveal = {}
+        for width in range(400, 900, 4):
+            layouts = taskbar_overlay._metric_rows_layout_for_overlay_width(
+                width, rows
+            )
+            mode = taskbar_overlay._resolve_overlay_badge_mode(tuple(layouts))
+            floors = taskbar_overlay._slot_minimum_progress_widths(
+                layouts, badge_mode=mode
+            )
+            for row_layout in layouts:
+                for metric, segment_width in zip(
+                    row_layout.visible_metrics, row_layout.segment_widths
+                ):
+                    slot = taskbar_overlay._metric_slot_key(metric)
+                    fit = taskbar_overlay._fit_metric_segment_layout(
+                        segment_width,
+                        lock_progress=True,
+                        **taskbar_overlay._metric_segment_fit_kwargs(
+                            metric,
+                            floors.get(slot),
+                            badge_mode=mode,
+                        ),
+                    )
+                    text = str(fit["badge_fit"].get("time_text") or "") or str(
+                        fit.get("display_reset_text") or ""
+                    )
+                    has_guidance = "N " in text
+                    if shown[slot] and not has_guidance:
+                        self.fail(
+                            f"{slot} lost its guidance at width {width}"
+                        )
+                    if has_guidance and not shown[slot]:
+                        shown[slot] = True
+                        first_reveal.setdefault(slot, width)
+
+        self.assertEqual(
+            first_reveal.get("weekly_limit"), 500,
+            "weekly column should reveal guidance first",
+        )
+        self.assertLess(
+            first_reveal["weekly_limit"], first_reveal["five_hour_limit"]
+        )
 
     def test_preferred_taskbar_overlay_width_below_status_text_switch_uses_dot_only(self):
         model = {
@@ -5654,9 +5928,11 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         texts = [op[2].get("text") for op in canvas.ops if op[0] == "text"]
         self.assertIn("남음", texts)
         self.assertNotIn("남", texts)
-        # The weekly countdown survives alongside the full badge (the fit
-        # picked the short countdown shape to fund the guidance text).
-        self.assertIn("5d 14h", texts)
+        # The weekly column is funded toward its detail width first, so the
+        # full countdown and the joined guidance both draw instead of the
+        # countdown degrading to its short shape.
+        self.assertIn("05d 14h 22m 33s", texts)
+        self.assertIn("N 60~95% / 2d 3h", texts)
 
     def test_fit_reset_badge_can_be_forced_to_short_or_full_mode(self):
         short_available = (
@@ -8218,9 +8494,11 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
         # P2: every track shares one width, including across slots. The icon
         # reservation and compact status fallback change the exact floor from
         # the pre-icon layout, but the cross-slot equality remains the
-        # contract.
+        # contract. Detail funding can also lower the shared floor: a funded
+        # column that reaches its joined guidance text yields bar width for
+        # the text, and every track follows that minimum.
         self.assertEqual(floors["five_hour_limit"], floors["weekly_limit"])
-        self.assertEqual(floors["weekly_limit"], 16)
+        self.assertEqual(floors["weekly_limit"], 10)
 
     def _live_like_rows(self):
         seven_day_sparse = {
@@ -8277,9 +8555,11 @@ class SlotMinimumBarUnitTest(unittest.TestCase):
         )
 
         # Need-based distribution satisfied both bars: the weekly slot no
-        # longer degrades below the shared progress.
-        self.assertEqual(floors["weekly_limit"], 42)
-        self.assertEqual(floors["five_hour_limit"], 42)
+        # longer degrades below the shared progress. At the detail-funded
+        # width every column fits its joined text with room to spare, so the
+        # shared floor sits at the progress cap.
+        self.assertEqual(floors["weekly_limit"], 48)
+        self.assertEqual(floors["five_hour_limit"], 48)
         self.assertNotIn("credit", floors)
 
     def test_drawn_same_slot_tracks_share_width_without_losing_text(self):
