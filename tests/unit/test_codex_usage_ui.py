@@ -185,6 +185,51 @@ class _FakeButton(_FakeWidget):
         return None
 
 
+class _SizingWidget(_FakeWidget):
+    def __init__(
+        self,
+        owner=None,
+        *args,
+        reqwidth=0,
+        reqheight=0,
+        width=0,
+        **kwargs,
+    ):
+        super().__init__(owner, *args, **kwargs)
+        self._reqwidth = int(reqwidth)
+        self._reqheight = int(reqheight)
+        self._width = int(width)
+        self.columnconfigure_calls = []
+
+    def winfo_reqwidth(self):
+        return self._reqwidth
+
+    def winfo_reqheight(self):
+        return self._reqheight
+
+    def winfo_width(self):
+        return self._width
+
+    def columnconfigure(self, index, *_args, **kwargs):
+        self.columnconfigure_calls.append((int(index), dict(kwargs)))
+        return None
+
+
+class _RequestedWidget:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+
+    def update_idletasks(self):
+        return None
+
+    def winfo_reqwidth(self):
+        return self.width
+
+    def winfo_reqheight(self):
+        return self.height
+
+
 class _FakeScrollbar(_FakeWidget):
     def __init__(self, owner=None, *args, **kwargs):
         super().__init__(owner, *args, **kwargs)
@@ -779,26 +824,47 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         )
 
     def test_preferred_size_measures_scroll_body_width_without_using_full_body_height(self) -> None:
-        class _RequestedWidget:
-            def __init__(self, width, height):
-                self.width = width
-                self.height = height
-
-            def update_idletasks(self):
-                return None
-
-            def winfo_reqwidth(self):
-                return self.width
-
-            def winfo_reqheight(self):
-                return self.height
-
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         view._scroll_body = _RequestedWidget(1100, 1400)
         view._scrollbar = _RequestedWidget(17, 1400)
         view._win = _RequestedWidget(800, 500)
 
         self.assertEqual(view.preferred_size(), (1139, 500))
+
+    def test_preferred_size_reports_side_by_side_floor_when_boxes_are_stacked(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._scroll_body = _RequestedWidget(500, 1400)
+        view._scrollbar = _RequestedWidget(17, 1400)
+        view._win = _RequestedWidget(600, 500)
+        view._pane_boxes = {
+            "left": _SizingWidget(reqwidth=430),
+            "right": _SizingWidget(reqwidth=380),
+        }
+
+        # 스택 상태의 body 요구 폭(500) 대신 나란히 배치 요구 폭을 보고해
+        # 스택 측정값이 창을 좁게 고착시키는 순환을 끊는다.
+        # 430 + 380 + 10(상자 간 padx) + 18(body padx) + 17 + 24.
+        self.assertEqual(view.preferred_size(), (879, 500))
+
+    def test_minimum_size_reports_stacked_floor_below_preferred(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._scroll_body = _RequestedWidget(500, 1400)
+        view._scrollbar = _RequestedWidget(17, 1400)
+        view._win = _RequestedWidget(600, 500)
+        view._pane_boxes = {
+            "left": _SizingWidget(reqwidth=430),
+            "right": _SizingWidget(reqwidth=380),
+            "pool": _SizingWidget(reqwidth=500),
+        }
+
+        min_width, min_height = view.minimum_size()
+
+        # 스택 상태의 최소 폭은 가장 넓은 상자 하나분이고 pool도 포함된다.
+        # 나란히 배치 요구 폭이 minsize로 들어가면 사용자가 창을 좁혀도
+        # 스택 폴백에 도달할 수 없다. 500 + 18(body padx) + 17 + 24.
+        self.assertEqual(min_width, 500 + 18 + 17 + 24)
+        self.assertEqual(min_height, 500)
+        self.assertLess(min_width, view.preferred_size()[0])
 
     def test_mount_keeps_two_account_settings_visible_inside_scroll_canvas(self) -> None:
         fake_tk = _FakeTk()
@@ -922,57 +988,155 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         button_callbacks["<Down>"](object())
         self.assertEqual(canvas.yview_scroll_calls, [(1, "pages"), (1, "units")])
 
-    def test_profile_cards_collapse_to_one_column_at_150_percent_scaling(self) -> None:
+    def test_pane_side_by_side_min_width_sums_box_requests(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._pane_boxes = {
+            "left": _SizingWidget(reqwidth=430),
+            "right": _SizingWidget(reqwidth=380),
+        }
 
-        class _TkBridge:
-            def call(self, *_args):
-                return 2.0
-
-        widget = type("Widget", (), {"tk": _TkBridge()})()
-
-        self.assertEqual(view._profile_card_column_count(widget), 1)
-        self.assertEqual(view._profile_card_column_count(object()), 2)
-
-    def test_single_profile_card_spans_full_width(self) -> None:
-        view = CodexUsageSettingsView(root=None, codex_monitor=None)
-
-        class _TkBridge:
-            def call(self, *_args):
-                return 4.0 / 3.0
-
-        widget = type("Widget", (), {"tk": _TkBridge()})()
-
-        # 카드가 하나뿐이면 2열 그리드 좌측 절반만 차지하는 레이아웃이
-        # 되지 않도록 넉넉한 폭에서도 1열을 유지한다.
         self.assertEqual(
-            view._profile_card_column_count(
-                widget,
-                available_width=900,
-                card_count=1,
-            ),
-            1,
+            view._pane_side_by_side_min_width(),
+            430 + 380 + 10,
         )
+
+    def test_pane_side_by_side_min_width_returns_zero_when_unmeasured(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._pane_boxes = {"left": _FakeWidget(), "right": _FakeWidget()}
+
+        self.assertEqual(view._pane_side_by_side_min_width(), 0)
+
+    def test_pane_side_by_side_min_width_uses_unwrapped_row_requirement(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        left_box = _SizingWidget(reqwidth=335)
+        right_box = _SizingWidget(reqwidth=335)
+        card = _SizingWidget()
+        row = _SizingWidget()
+        row._windows_supporter_unwrapped_reqwidth = 370
+        # Tk의 스칼라 padx=8은 양쪽 8+8=16을 뜻한다.
+        row.grid_info = lambda: {"padx": 8}
+        card.grid_info = lambda: {"padx": (4, 4)}
+        row.master = card
+        card.master = left_box
+        left_box.children = [card]
+        card.children = [row]
+        view._pane_boxes = {"left": left_box, "right": right_box}
+
+        # 상자의 현재 요구 폭(335)은 행이 랩된 상태를 반영한다. 랩 없는
+        # 행 요구 폭(370)에 상자까지의 padx(16+8)를 더한 실측(394)으로
+        # 나란히 필요 폭을 정해야 판정이 흔들리지 않는다.
         self.assertEqual(
-            view._profile_card_column_count(
-                widget,
-                available_width=900,
-                card_count=2,
-            ),
-            2,
+            view._pane_side_by_side_min_width(),
+            (370 + 16 + 8) + 335 + 10,
+        )
+
+    def test_widget_row_keeps_all_widgets_on_one_row_when_they_fit(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        container = _SizingWidget(width=500)
+        widgets = [_SizingWidget(reqwidth=70) for _ in range(6)]
+
+        view._reflow_widget_row(
+            container,
+            widgets,
+            max_columns=6,
+            available_width=500,
+        )
+
+        self.assertEqual(
+            [
+                (widget.grid_kwargs["row"], widget.grid_kwargs["column"])
+                for widget in widgets
+            ],
+            [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5)],
+        )
+        # 균등 weight 대신 내용 크기 열을 써서 간격이 균일하다.
+        self.assertIn((5, {"weight": 0}), container.columnconfigure_calls)
+
+    def test_widget_row_wraps_only_the_widgets_that_overflow(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        container = _SizingWidget(width=300)
+        widgets = [_SizingWidget(reqwidth=100) for _ in range(4)]
+
+        view._reflow_widget_row(
+            container,
+            widgets,
+            max_columns=4,
+            available_width=300,
+        )
+
+        # 넘치는 위젯만 다음 행으로 간다. 전부 1열로 접히지 않는다.
+        self.assertEqual(
+            [
+                (widget.grid_kwargs["row"], widget.grid_kwargs["column"])
+                for widget in widgets
+            ],
+            [(0, 0), (0, 1), (1, 0), (1, 1)],
+        )
+
+    def test_widget_row_packs_wrapped_widgets_into_separate_row_frames(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = _FakeTk()
+        container = _SizingWidget(width=300)
+        widgets = [_SizingWidget(reqwidth=100) for _ in range(4)]
+
+        view._reflow_widget_row(
+            container,
+            widgets,
+            max_columns=4,
+            available_width=300,
+        )
+
+        # 랩된 행은 별도 프레임에 pack으로 놓인다. 한 그리드에 두 행을
+        # 두면 열 폭이 행들의 최댓값으로 잡혀 간격이 깨지고 클리핑이
+        # 생기므로, 행마다 독립 프레임을 써야 간격이 균일하다.
+        frames = container._windows_supporter_row_frames
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(
+            [(widget.pack_kwargs["in_"] is frames[0],
+              widget.pack_kwargs["in_"] is frames[1])
+             for widget in widgets],
+            [(True, False), (True, False), (False, True), (False, True)],
+        )
+        for widget in widgets:
+            self.assertEqual(widget.pack_kwargs["side"], "left")
+        # 행의 마지막 위젯에는 뒤쪽 간격을 두지 않아 실제 행 폭이
+        # 요구 폭 계산과 정확히 일치한다.
+        self.assertEqual(
+            [widget.pack_kwargs["padx"] for widget in widgets],
+            [(0, 8), (0, 0), (0, 8), (0, 0)],
+        )
+
+    def test_widget_row_records_unwrapped_requirement_for_pane_measure(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        container = _SizingWidget(width=100)
+        widgets = [_SizingWidget(reqwidth=70) for _ in range(3)]
+
+        view._reflow_widget_row(
+            container,
+            widgets,
+            max_columns=3,
+            available_width=100,
+        )
+
+        # 랩 상태와 무관하게 측정되는 "랩 없는" 요구 폭이다.
+        # 70 * 3 + 8 * 2.
+        self.assertEqual(
+            container._windows_supporter_unwrapped_reqwidth,
+            70 * 3 + 8 * 2,
         )
 
     def test_pane_boxes_record_side_by_side_columns_when_wide(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         panes = _FakeWidget()
-        side_row = _FakeWidget()
-        left_box = _FakeWidget()
-        right_box = _FakeWidget()
+        side_row = _SizingWidget()
+        left_box = _SizingWidget(reqwidth=400)
+        right_box = _SizingWidget(reqwidth=400)
         view._pane_boxes = {"left": left_box, "right": right_box}
 
         view._reflow_pane_boxes(panes, side_row, available_width=820)
         self.assertEqual(left_box.grid_kwargs["column"], 0)
         self.assertEqual(right_box.grid_kwargs["column"], 1)
+        self.assertIn((1, {"weight": 1}), side_row.columnconfigure_calls)
         try:
             self.assertEqual(panes._windows_supporter_pane_columns, 2)
         except AttributeError:
@@ -981,22 +1145,28 @@ class CodexUsageUiUnitTest(unittest.TestCase):
     def test_pane_boxes_stack_when_viewport_crosses_narrow_boundary(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         panes = _FakeWidget()
-        side_row = _FakeWidget()
-        left_box = _FakeWidget()
-        right_box = _FakeWidget()
+        side_row = _SizingWidget()
+        left_box = _SizingWidget(reqwidth=400)
+        right_box = _SizingWidget(reqwidth=400)
         view._pane_boxes = {"left": left_box, "right": right_box}
 
+        # 나란히 필요 폭(810)보다 좁으면 세로로 쌓고 빈 열 weight를 뺀다.
         view._reflow_pane_boxes(panes, side_row, available_width=700)
         self.assertEqual(
             [(left_box.grid_kwargs["row"], left_box.grid_kwargs["column"]),
              (right_box.grid_kwargs["row"], right_box.grid_kwargs["column"])],
             [(0, 0), (1, 0)],
         )
+        self.assertIn((1, {"weight": 0}), side_row.columnconfigure_calls)
+        # grid는 미지정 옵션을 유지하므로 스택 시 이전 padx가 남지 않게
+        # 명시적으로 0을 줘야 한다.
+        self.assertEqual(left_box.grid_kwargs["padx"], 0)
+        self.assertEqual(right_box.grid_kwargs["padx"], 0)
 
         panes2 = _FakeWidget()
-        side_row2 = _FakeWidget()
-        left_box2 = _FakeWidget()
-        right_box2 = _FakeWidget()
+        side_row2 = _SizingWidget()
+        left_box2 = _SizingWidget(reqwidth=400)
+        right_box2 = _SizingWidget(reqwidth=400)
         view._pane_boxes = {"left": left_box2, "right": right_box2}
 
         view._reflow_pane_boxes(panes2, side_row2, available_width=820)
@@ -1005,39 +1175,14 @@ class CodexUsageUiUnitTest(unittest.TestCase):
              (right_box2.grid_kwargs["row"], right_box2.grid_kwargs["column"])],
             [(0, 0), (0, 1)],
         )
-
-    def test_profile_cards_collapse_to_one_column_when_viewport_is_narrow(self) -> None:
-        view = CodexUsageSettingsView(root=None, codex_monitor=None)
-
-        class _TkBridge:
-            def call(self, *_args):
-                return 4.0 / 3.0
-
-        widget = type("Widget", (), {"tk": _TkBridge()})()
-
-        self.assertEqual(
-            view._profile_card_column_count(widget, available_width=700),
-            1,
-        )
-        self.assertEqual(
-            view._profile_card_column_count(widget, available_width=640),
-            1,
-        )
-        self.assertEqual(
-            view._profile_card_column_count(widget, available_width=768),
-            2,
-        )
-        self.assertEqual(
-            view._profile_card_column_count(widget, available_width=820),
-            2,
-        )
+        self.assertIn((1, {"weight": 1}), side_row2.columnconfigure_calls)
 
     def test_pane_boxes_reflow_when_viewport_crosses_narrow_boundary(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         panes = _FakeWidget()
-        side_row = _FakeWidget()
-        left_box = _FakeWidget()
-        right_box = _FakeWidget()
+        side_row = _SizingWidget()
+        left_box = _SizingWidget(reqwidth=400)
+        right_box = _SizingWidget(reqwidth=400)
         view._pane_boxes = {"left": left_box, "right": right_box}
 
         view._reflow_pane_boxes(panes, side_row, available_width=700)
