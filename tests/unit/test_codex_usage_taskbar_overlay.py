@@ -4033,6 +4033,148 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
             start, end = record["span"]
             self.assertFalse(start < 300 and end > 280)
 
+    def test_pixel_sampling_exclusion_is_fixed_point_across_repeated_reads(self):
+        screen_width = 2304
+        work_area = (0, 0, screen_width, 1392)
+        current_slot = (1710, 2053)
+        initial_slot = current_slot
+        background = [(24, 24, 24)] * 5
+        control = [(240, 240, 240)] * 5
+        observed_widths = []
+
+        for _round in range(24):
+            start, end = current_slot
+            columns = [
+                (
+                    x,
+                    control
+                    if (1416 <= x < start) or (end <= x < screen_width)
+                    else background,
+                )
+                for x in range(0, screen_width, 4)
+            ]
+            geometry = {
+                "orientation": "bottom",
+                "_screen_origin_x": 0,
+                "_screen_origin_y": 0,
+                "_taskbar_hwnd": 1,
+                "_exclude_spans": [current_slot],
+            }
+            with patch.object(
+                taskbar_overlay.ctypes,
+                "windll",
+                object(),
+                create=True,
+            ), patch.object(
+                taskbar_overlay,
+                "win32gui",
+                None,
+            ), patch.object(
+                taskbar_overlay,
+                "_uia_taskbar_occupied_span_records",
+                return_value=[],
+            ), patch.object(
+                taskbar_overlay,
+                "_sample_taskbar_columns",
+                return_value=columns,
+            ):
+                _spans, telemetry = (
+                    taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                        screen_width,
+                        1440,
+                        work_area,
+                        geometry,
+                    )
+                )
+
+            candidates = [
+                tuple(span)
+                for span in telemetry["free_spans"]
+                if int(span[0]) >= 1400
+            ]
+            self.assertTrue(candidates)
+            current_slot = max(candidates, key=lambda span: int(span[1]))
+            observed_widths.append(current_slot[1] - current_slot[0])
+            self.assertEqual(telemetry["excluded_spans"], [initial_slot])
+            self.assertEqual(
+                telemetry["sampling_excluded_spans"],
+                [
+                    (
+                        initial_slot[0]
+                        - taskbar_overlay._EMPTY_SLOT_PADDING_PX,
+                        initial_slot[1]
+                        + taskbar_overlay._EMPTY_SLOT_PADDING_PX,
+                    )
+                ],
+            )
+
+        self.assertEqual(current_slot, initial_slot)
+        self.assertEqual(observed_widths, [initial_slot[1] - initial_slot[0]] * 24)
+
+    def test_pixel_sampling_exclusion_keeps_multiple_panes_as_fixed_points(self):
+        screen_width = 2304
+        current_slots = [(100, 682), (1718, 2045)]
+        initial_slots = list(current_slots)
+        background = [(24, 24, 24)] * 5
+        control = [(240, 240, 240)] * 5
+
+        for _round in range(24):
+            columns = [
+                (
+                    x,
+                    background
+                    if any(start <= x < end for start, end in current_slots)
+                    else control,
+                )
+                for x in range(0, screen_width, 4)
+            ]
+            geometry = {
+                "orientation": "bottom",
+                "_screen_origin_x": 0,
+                "_screen_origin_y": 0,
+                "_taskbar_hwnd": 1,
+                "_exclude_spans": list(current_slots),
+            }
+            with patch.object(
+                taskbar_overlay.ctypes,
+                "windll",
+                object(),
+                create=True,
+            ), patch.object(
+                taskbar_overlay,
+                "win32gui",
+                None,
+            ), patch.object(
+                taskbar_overlay,
+                "_uia_taskbar_occupied_span_records",
+                return_value=[],
+            ), patch.object(
+                taskbar_overlay,
+                "_sample_taskbar_columns",
+                return_value=columns,
+            ), patch.object(
+                taskbar_overlay,
+                "_median_background_color",
+                return_value=background[0],
+            ):
+                _spans, telemetry = (
+                    taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                        screen_width,
+                        1440,
+                        (0, 0, screen_width, 1392),
+                        geometry,
+                    )
+                )
+
+            current_slots = [
+                tuple(span)
+                for span in telemetry["free_spans"]
+                if tuple(span) in initial_slots
+            ]
+            self.assertEqual(current_slots, initial_slots)
+
+        self.assertEqual(current_slots, initial_slots)
+
     def test_work_area_conversion_records_logical_to_physical_scale(self):
         geometry = calculate_taskbar_overlay_geometry(
             1920,
