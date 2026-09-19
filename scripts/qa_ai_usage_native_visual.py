@@ -28,6 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 SCENARIO_NAMES = (
     "zero-profiles",
     "mixed-ready-standard",
+    "refresh-layout-stability-wide",
     "one-profile-125",
     "dynamic-three-profiles",
     "four-taskbar-profiles",
@@ -163,6 +164,13 @@ def build_scenario_fixture(
             else "final"
         )
         interaction = {"action": "none", "profile_id": ""}
+        if scenario == "refresh-layout-stability-wide":
+            window_size = [1600, 760]
+            phase = "interaction"
+            interaction = {
+                "action": "refresh_layout_stability",
+                "profile_id": "",
+            }
         codex_id = "codex_primary"
         cursor_id = "cursor_primary"
 
@@ -697,11 +705,199 @@ def _collect_widget_metrics(root: Any) -> dict[str, Any]:
     }
 
 
+def _layout_stability_targets(view: Any) -> dict[str, Any]:
+    targets: dict[str, Any] = {
+        "canvas": getattr(view, "_scroll_canvas", None),
+        "scrollbar": getattr(view, "_scrollbar", None),
+    }
+    pane_boxes = getattr(view, "_pane_boxes", {})
+    if isinstance(pane_boxes, dict):
+        for side in ("left", "right"):
+            targets[f"pane:{side}"] = pane_boxes.get(side)
+    cards = getattr(view, "_pane_card_widgets", {})
+    if isinstance(cards, dict):
+        for account_id, card in cards.items():
+            targets[f"card:{account_id}"] = card
+    metric_cells = getattr(view, "_account_metric_cells", {})
+    if isinstance(metric_cells, dict):
+        for account_id, by_key in metric_cells.items():
+            if not isinstance(by_key, dict):
+                continue
+            for metric_key, cells in by_key.items():
+                widgets = view._metric_cell_widgets(cells)
+                for index, widget in enumerate(widgets):
+                    role = "label" if index == 0 else "value"
+                    targets[f"metric:{account_id}:{metric_key}:{role}"] = widget
+    return {key: widget for key, widget in targets.items() if widget is not None}
+
+
+def _mapped_horizontal_geometry(widget: Any, root: Any) -> list[int] | None:
+    try:
+        if not widget.winfo_ismapped():
+            return None
+        return [
+            int(widget.winfo_rootx()) - int(root.winfo_rootx()),
+            int(widget.winfo_width()),
+        ]
+    except Exception:
+        return None
+
+
+def _mutated_runtime(
+    original: dict[str, Any],
+    state: str,
+) -> dict[str, Any]:
+    runtime = copy.deepcopy(original)
+    for collection_name in ("profiles", "accounts"):
+        collection = runtime.get(collection_name, [])
+        if not isinstance(collection, list):
+            continue
+        for entry in collection:
+            if not isinstance(entry, dict):
+                continue
+            provider = str(entry.get("provider") or "codex").lower()
+            snapshot = entry.get("last_snapshot")
+            if not isinstance(snapshot, dict):
+                continue
+            if state == "long-values":
+                if provider == "codex":
+                    snapshot["remaining_credit"] = "US$1,234,567,890.12"
+                elif provider == "cursor":
+                    snapshot["on_demand_status"] = (
+                        "Enabled - US$1,234,567,890.12 used"
+                    )
+            elif state == "short-values":
+                if provider == "codex":
+                    snapshot["remaining_credit"] = "$1"
+                elif provider == "cursor":
+                    snapshot["on_demand_status"] = "Enabled"
+            elif state == "optional-hidden":
+                if provider == "codex":
+                    for key in (
+                        "gpt_5_3_codex_spark_five_hour_limit",
+                        "gpt_5_3_codex_spark_five_hour_limit_reset_at",
+                        "gpt_5_3_codex_spark_weekly_limit",
+                        "gpt_5_3_codex_spark_weekly_limit_reset_at",
+                    ):
+                        snapshot[key] = ""
+                elif provider == "cursor":
+                    snapshot["on_demand_status"] = ""
+                    snapshot["on_demand_enabled"] = False
+    return runtime
+
+
+def _apply_refresh_layout_stability(
+    view: Any,
+    manager: SyntheticAiUsageManager,
+) -> dict[str, Any]:
+    root = getattr(view, "_win", None)
+    if root is None:
+        return {
+            "action": "refresh_layout_stability",
+            "applied": False,
+            "error": "missing_view_root",
+            "manager_calls": [],
+        }
+    original = copy.deepcopy(manager._runtime)
+    samples: list[dict[str, Any]] = []
+    try:
+        for state in (
+            "initial",
+            "long-values",
+            "short-values",
+            "optional-hidden",
+            "restored",
+        ):
+            manager._runtime = (
+                copy.deepcopy(original)
+                if state in {"initial", "restored"}
+                else _mutated_runtime(original, state)
+            )
+            view._refresh_runtime_status()
+            view._stop_runtime_refresh()
+            for _ in range(4):
+                root.update_idletasks()
+                root.update()
+            targets = _layout_stability_targets(view)
+            samples.append(
+                {
+                    "state": state,
+                    "geometry": {
+                        key: geometry
+                        for key, widget in targets.items()
+                        if (
+                            geometry := _mapped_horizontal_geometry(
+                                widget,
+                                root.winfo_toplevel(),
+                            )
+                        )
+                        is not None
+                    },
+                }
+            )
+    finally:
+        manager._runtime = original
+        try:
+            view._refresh_runtime_status()
+            view._stop_runtime_refresh()
+            root.update_idletasks()
+            root.update()
+        except Exception:
+            pass
+
+    target_names = sorted(
+        {
+            key
+            for sample in samples
+            for key in sample.get("geometry", {})
+        }
+    )
+    unstable: list[dict[str, Any]] = []
+    for target in target_names:
+        geometries = [
+            sample["geometry"][target]
+            for sample in samples
+            if target in sample.get("geometry", {})
+        ]
+        if len(geometries) < 2:
+            continue
+        x_values = sorted({int(item[0]) for item in geometries})
+        width_values = sorted({int(item[1]) for item in geometries})
+        if len(x_values) > 1 or len(width_values) > 1:
+            unstable.append(
+                {
+                    "target": target,
+                    "x_values": x_values,
+                    "width_values": width_values,
+                    "max_x_delta": max(x_values) - min(x_values),
+                    "max_width_delta": max(width_values) - min(width_values),
+                }
+            )
+    return {
+        "action": "refresh_layout_stability",
+        "applied": not unstable,
+        "states": [sample["state"] for sample in samples],
+        "sampled_targets": len(target_names),
+        "max_x_delta": max(
+            (int(item["max_x_delta"]) for item in unstable),
+            default=0,
+        ),
+        "max_width_delta": max(
+            (int(item["max_width_delta"]) for item in unstable),
+            default=0,
+        ),
+        "unstable_targets": unstable,
+        "manager_calls": copy.deepcopy(manager.calls),
+    }
+
+
 def _apply_interaction(view: Any, manager: SyntheticAiUsageManager, fixture: dict[str, Any]) -> dict[str, Any]:
     interaction = fixture.get("interaction", {})
     if not isinstance(interaction, dict) or interaction.get("action") == "none":
         return {"action": "none", "applied": True, "manager_calls": []}
     action = str(interaction.get("action") or "")
+    if action == "refresh_layout_stability":
+        return _apply_refresh_layout_stability(view, manager)
     if action in {"mousewheel_scroll", "keyboard_end_scroll"}:
         canvas = getattr(view, "_scroll_canvas", None)
         if canvas is None:

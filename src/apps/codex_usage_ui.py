@@ -1397,6 +1397,40 @@ class CodexUsageSettingsView:
             pass
         return frames
 
+    def _configure_stable_value_grid(
+        self,
+        grid: Any,
+        rows: list[Any],
+        *,
+        pair_columns: int,
+    ) -> None:
+        # 값 문자열의 요청 폭이나 선택 행의 표시 여부가 바뀌어도 열 경계가
+        # 움직이지 않도록, 모든 정적 라벨의 최대 폭과 값 열의 균등 지분을
+        # 먼저 예약한다. 숨긴 행도 rows에는 남아 있어 같은 예약 폭을 쓴다.
+        label_reserve = 0
+        for cells in rows:
+            widgets = self._metric_cell_widgets(cells)
+            if not widgets:
+                continue
+            label_reserve = max(
+                label_reserve,
+                self._widget_requested_width(widgets[0]),
+            )
+        value_uniform = "ai_usage_value_columns" if pair_columns > 1 else ""
+        for column in range(4):
+            active = column // 2 < pair_columns
+            is_value = column % 2 == 1
+            try:
+                grid.columnconfigure(
+                    column,
+                    weight=1 if active and is_value else 0,
+                    minsize=label_reserve if active and not is_value else 0,
+                    uniform=value_uniform if active and is_value else "",
+                )
+            except Exception:
+                pass
+        return
+
     def _reflow_metric_grid(
         self,
         metric_grid: Any,
@@ -1417,14 +1451,11 @@ class CodexUsageSettingsView:
             except Exception:
                 width = 0
         pair_columns = 2 if width <= 1 or width >= 700 else 1
-        for column in range(4):
-            try:
-                metric_grid.columnconfigure(
-                    column,
-                    weight=1 if column % 2 == 1 and column // 2 < pair_columns else 0,
-                )
-            except Exception:
-                pass
+        self._configure_stable_value_grid(
+            metric_grid,
+            [cells for _key, cells in rows],
+            pair_columns=pair_columns,
+        )
         visibility = self._account_metric_visibility.get(str(account_id or ""), {})
         for index, (key, cells) in enumerate(rows):
             pair_column = index % pair_columns
@@ -1461,14 +1492,11 @@ class CodexUsageSettingsView:
             except Exception:
                 width = 0
         pair_columns = 2 if width <= 1 or width >= 700 else 1
-        for column in range(4):
-            try:
-                runtime_grid.columnconfigure(
-                    column,
-                    weight=1 if column % 2 == 1 and column // 2 < pair_columns else 0,
-                )
-            except Exception:
-                pass
+        self._configure_stable_value_grid(
+            runtime_grid,
+            rows,
+            pair_columns=pair_columns,
+        )
         hidden_spark = {
             id(widget)
             for widget in self._live_spark_cells
@@ -1521,16 +1549,16 @@ class CodexUsageSettingsView:
         return
 
     def _pane_side_by_side_min_width(self) -> int:
-        # 나란히 배치에 필요한 폭은 두 상자 콘텐츠의 "랩 없는" 요청 폭 합으로
-        # 정한다. 현재 배치(랩·스택) 상태를 읽으면 측정값이 배치에 따라
-        # 흔들려, 좁은 창이 스스로를 정당화하는 순환이 생긴다.
+        # 넓은 상태의 두 상자는 같은 폭을 예약한다. 따라서 각 열이 가장
+        # 넓은 상자의 "랩 없는" 요청 폭을 수용할 때만 나란히 배치한다.
+        # 현재 배치(랩·스택) 상태를 읽지 않아 임계값 자체도 흔들리지 않는다.
         widths = [
             self._pane_box_unwrapped_width((self._pane_boxes or {}).get(side))
             for side in ("left", "right")
         ]
         if any(item <= 0 for item in widths):
             return 0
-        return sum(widths) + 10
+        return (2 * max(widths)) + 10
 
     def _pane_box_unwrapped_width(self, box: Any) -> int:
         # 상자의 요구 폭은 자식 행이 랩되면 작아지고 wraplength 라벨은
@@ -1655,11 +1683,13 @@ class CodexUsageSettingsView:
             panes._windows_supporter_pane_columns = columns
         except Exception:
             pass
+        pane_uniform = "ai_usage_pane_columns" if columns > 1 else ""
         for column_index in range(2):
             try:
                 side_row.columnconfigure(
                     column_index,
                     weight=1 if column_index < columns else 0,
+                    uniform=pane_uniform,
                 )
             except Exception:
                 pass
