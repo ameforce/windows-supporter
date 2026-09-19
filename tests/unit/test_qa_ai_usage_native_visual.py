@@ -31,6 +31,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             (
                 "zero-profiles",
                 "mixed-ready-standard",
+                "refresh-layout-stability-wide",
                 "one-profile-125",
                 "dynamic-three-profiles",
                 "four-taskbar-profiles",
@@ -50,8 +51,14 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 11)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 12)
         by_name = {fixture["name"]: fixture for fixture in fixtures}
+        stability = by_name["refresh-layout-stability-wide"]
+        self.assertEqual(stability["window_size"], [1600, 760])
+        self.assertEqual(
+            stability["interaction"]["action"],
+            "refresh_layout_stability",
+        )
         self.assertEqual(by_name["zero-profiles"]["settings"]["profiles"], [])
         self.assertEqual(by_name["zero-profiles"]["runtime"]["profiles"], [])
         self.assertEqual(len(by_name["one-profile-125"]["settings"]["profiles"]), 1)

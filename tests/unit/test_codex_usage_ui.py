@@ -841,10 +841,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "right": _SizingWidget(reqwidth=380),
         }
 
-        # 스택 상태의 body 요구 폭(500) 대신 나란히 배치 요구 폭을 보고해
-        # 스택 측정값이 창을 좁게 고착시키는 순환을 끊는다.
-        # 430 + 380 + 10(상자 간 padx) + 18(body padx) + 17 + 24.
-        self.assertEqual(view.preferred_size(), (879, 500))
+        # 두 상자가 같은 폭으로 가장 넓은 상자(430)를 각각 수용한다.
+        # 430 * 2 + 10(상자 간 padx) + 18(body padx) + 17 + 24.
+        self.assertEqual(view.preferred_size(), (929, 500))
 
     def test_minimum_size_reports_stacked_floor_below_preferred(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
@@ -988,7 +987,70 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         button_callbacks["<Down>"](object())
         self.assertEqual(canvas.yview_scroll_calls, [(1, "pages"), (1, "units")])
 
-    def test_pane_side_by_side_min_width_sums_box_requests(self) -> None:
+    def test_stable_value_grid_reserves_hidden_labels_and_equal_value_columns(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        grid = _SizingWidget(width=900)
+        rows = [
+            (_SizingWidget(reqwidth=80), _SizingWidget(reqwidth=20)),
+            (_SizingWidget(reqwidth=120), _SizingWidget(reqwidth=190)),
+            (_SizingWidget(reqwidth=95), _SizingWidget(reqwidth=40)),
+        ]
+
+        view._configure_stable_value_grid(
+            grid,
+            rows,
+            pair_columns=2,
+        )
+
+        self.assertEqual(
+            grid.columnconfigure_calls,
+            [
+                (0, {"weight": 0, "minsize": 120, "uniform": ""}),
+                (
+                    1,
+                    {
+                        "weight": 1,
+                        "minsize": 0,
+                        "uniform": "ai_usage_value_columns",
+                    },
+                ),
+                (2, {"weight": 0, "minsize": 120, "uniform": ""}),
+                (
+                    3,
+                    {
+                        "weight": 1,
+                        "minsize": 0,
+                        "uniform": "ai_usage_value_columns",
+                    },
+                ),
+            ],
+        )
+
+    def test_stable_value_grid_releases_second_pair_when_narrow(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        grid = _SizingWidget(width=600)
+        rows = [
+            (_SizingWidget(reqwidth=80), _SizingWidget(reqwidth=20)),
+            (_SizingWidget(reqwidth=120), _SizingWidget(reqwidth=190)),
+        ]
+
+        view._configure_stable_value_grid(
+            grid,
+            rows,
+            pair_columns=1,
+        )
+
+        self.assertEqual(
+            grid.columnconfigure_calls,
+            [
+                (0, {"weight": 0, "minsize": 120, "uniform": ""}),
+                (1, {"weight": 1, "minsize": 0, "uniform": ""}),
+                (2, {"weight": 0, "minsize": 0, "uniform": ""}),
+                (3, {"weight": 0, "minsize": 0, "uniform": ""}),
+            ],
+        )
+
+    def test_pane_side_by_side_min_width_reserves_equal_pane_widths(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         view._pane_boxes = {
             "left": _SizingWidget(reqwidth=430),
@@ -997,7 +1059,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(
             view._pane_side_by_side_min_width(),
-            430 + 380 + 10,
+            (2 * 430) + 10,
         )
 
     def test_pane_side_by_side_min_width_returns_zero_when_unmeasured(self) -> None:
@@ -1022,12 +1084,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         card.children = [row]
         view._pane_boxes = {"left": left_box, "right": right_box}
 
-        # 상자의 현재 요구 폭(335)은 행이 랩된 상태를 반영한다. 랩 없는
-        # 행 요구 폭(370)에 상자까지의 padx(16+8)를 더한 실측(394)으로
-        # 나란히 필요 폭을 정해야 판정이 흔들리지 않는다.
+        # 가장 넓은 왼쪽 상자 실측(394)을 두 열 모두 예약한다.
         self.assertEqual(
             view._pane_side_by_side_min_width(),
-            (370 + 16 + 8) + 335 + 10,
+            (2 * (370 + 16 + 8)) + 10,
         )
 
     def test_widget_row_keeps_all_widgets_on_one_row_when_they_fit(self) -> None:
@@ -1136,7 +1196,14 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._reflow_pane_boxes(panes, side_row, available_width=820)
         self.assertEqual(left_box.grid_kwargs["column"], 0)
         self.assertEqual(right_box.grid_kwargs["column"], 1)
-        self.assertIn((1, {"weight": 1}), side_row.columnconfigure_calls)
+        self.assertIn(
+            (0, {"weight": 1, "uniform": "ai_usage_pane_columns"}),
+            side_row.columnconfigure_calls,
+        )
+        self.assertIn(
+            (1, {"weight": 1, "uniform": "ai_usage_pane_columns"}),
+            side_row.columnconfigure_calls,
+        )
         try:
             self.assertEqual(panes._windows_supporter_pane_columns, 2)
         except AttributeError:
@@ -1157,7 +1224,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
              (right_box.grid_kwargs["row"], right_box.grid_kwargs["column"])],
             [(0, 0), (1, 0)],
         )
-        self.assertIn((1, {"weight": 0}), side_row.columnconfigure_calls)
+        self.assertIn(
+            (1, {"weight": 0, "uniform": ""}),
+            side_row.columnconfigure_calls,
+        )
         # grid는 미지정 옵션을 유지하므로 스택 시 이전 padx가 남지 않게
         # 명시적으로 0을 줘야 한다.
         self.assertEqual(left_box.grid_kwargs["padx"], 0)
@@ -1175,7 +1245,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
              (right_box2.grid_kwargs["row"], right_box2.grid_kwargs["column"])],
             [(0, 0), (0, 1)],
         )
-        self.assertIn((1, {"weight": 1}), side_row2.columnconfigure_calls)
+        self.assertIn(
+            (1, {"weight": 1, "uniform": "ai_usage_pane_columns"}),
+            side_row2.columnconfigure_calls,
+        )
 
     def test_pane_boxes_reflow_when_viewport_crosses_narrow_boundary(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
