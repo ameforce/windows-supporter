@@ -1451,22 +1451,27 @@ class CodexUsageMultiMonitor:
                     return
                 progress = self.__ensure_taskbar_progress()
                 if progress is not None:
-                    if bool(rebind_native_owner):
-                        rebind = getattr(progress, "invalidate_native_owner", None)
-                        if callable(rebind):
-                            rebind()
-                    if bool(topology_reset):
-                        resetter = getattr(
-                            progress,
-                            "prepare_for_display_topology_change",
-                            None,
-                        )
-                        if callable(resetter):
-                            resetter()
-                    elif bool(invalidate_geometry):
-                        invalidator = getattr(progress, "invalidate_geometry", None)
-                        if callable(invalidator):
-                            invalidator()
+                    # Prep failures must not skip refresh(): a reset leaves the
+                    # panes model-less, and only refresh() rebuilds that state.
+                    try:
+                        if bool(rebind_native_owner):
+                            rebind = getattr(progress, "invalidate_native_owner", None)
+                            if callable(rebind):
+                                rebind()
+                        if bool(topology_reset):
+                            resetter = getattr(
+                                progress,
+                                "prepare_for_display_topology_change",
+                                None,
+                            )
+                            if callable(resetter):
+                                resetter()
+                        elif bool(invalidate_geometry):
+                            invalidator = getattr(progress, "invalidate_geometry", None)
+                            if callable(invalidator):
+                                invalidator()
+                    except Exception:
+                        pass
                     progress.refresh()
             except Exception:
                 pass
