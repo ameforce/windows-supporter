@@ -2911,7 +2911,10 @@ class CodexUsageTaskbarOverlay:
             self._cancel_flash_tick()
             return
         if self._flash_after_id is not None:
-            return
+            if self._timer_pending(self._flash_after_id):
+                return
+            self._drop_stale_after_id(self._flash_after_id)
+            self._flash_after_id = None
         delay_ms = _FLASH_TICK_MS
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
@@ -2931,6 +2934,8 @@ class CodexUsageTaskbarOverlay:
 
     def _flash_tick(self) -> None:
         self._flash_after_id = None
+        if self._halted:
+            return
         model = self._last_model
         if not isinstance(model, dict):
             return
@@ -2974,10 +2979,26 @@ class CodexUsageTaskbarOverlay:
             return False
         return True
 
+    def _drop_stale_after_id(self, after_id: Any) -> None:
+        """Best-effort cancel for a Tcl timer ``after_info`` reported dead.
+
+        Bounds a theoretical ``after_info`` false negative: if the id was
+        actually live, dropping it here prevents a duplicate timer when the
+        caller reschedules.
+        """
+        canceller = getattr(self._root, "after_cancel", None)
+        if callable(canceller):
+            try:
+                canceller(after_id)
+            except Exception:
+                pass
+        return
+
     def _schedule_content_tick(self, delay_ms: int | None = None) -> None:
         if self._content_after_id is not None:
             if self._timer_pending(self._content_after_id):
                 return
+            self._drop_stale_after_id(self._content_after_id)
             self._content_after_id = None
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
@@ -3067,6 +3088,7 @@ class CodexUsageTaskbarOverlay:
         if self._keepalive_after_id is not None:
             if self._timer_pending(self._keepalive_after_id):
                 return
+            self._drop_stale_after_id(self._keepalive_after_id)
             self._keepalive_after_id = None
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
@@ -3114,10 +3136,11 @@ class CodexUsageTaskbarOverlay:
         finally:
             if self._window is not None and not self._window_is_alive(self._window):
                 self._discard_dead_window(self._window)
-        if self._window_visible:
-            # Any surviving loop re-arms siblings whose Tcl timers vanished.
-            self._schedule_content_tick()
-            self._schedule_geometry_monitor_tick()
+        # Any surviving loop re-arms siblings whose Tcl timers vanished; the
+        # monitor is also the loop that restores a withdrawn pane, so the
+        # re-arm must not be gated on _window_visible.
+        self._schedule_content_tick()
+        self._schedule_geometry_monitor_tick()
         self._schedule_keepalive_tick()
         return
 
@@ -3161,6 +3184,7 @@ class CodexUsageTaskbarOverlay:
         if self._geometry_after_id is not None:
             if self._timer_pending(self._geometry_after_id):
                 return
+            self._drop_stale_after_id(self._geometry_after_id)
             self._geometry_after_id = None
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):

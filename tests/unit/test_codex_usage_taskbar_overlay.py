@@ -8832,6 +8832,24 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertNotIn((1700, 2100), spans)
         self.assertIn((1280, 2560), spans)
 
+    def test_refresh_isolates_failing_pane_from_sibling(self):
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: {},
+            window_factory=lambda _root: _FakeWindow(),
+            occupied_span_getter=lambda _w, _h, _work, _geometry: [],
+        )
+
+        with patch.object(
+            overlay._left_pane, "refresh", side_effect=RuntimeError("left boom")
+        ), patch.object(
+            overlay._right_pane, "refresh", return_value=True
+        ) as right_refresh:
+            ok = overlay.refresh()
+
+        self.assertFalse(ok)
+        right_refresh.assert_called_once_with()
+
 
 class _FakeUiaRect:
     def __init__(self, left, top, right, bottom):
