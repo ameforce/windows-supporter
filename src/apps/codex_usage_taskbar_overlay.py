@@ -2617,6 +2617,11 @@ class CodexUsageTaskbarOverlay:
         self._pending_side_transition_started_at = 0.0
         self._last_same_side_transition: tuple[tuple[Any, ...], tuple[Any, ...]] | None = None
         self._fullscreen_suppressed = False
+        # hide() is the only intentional stop: while it is set the tick loops
+        # must not re-arm themselves.  Every other empty-model state is a
+        # transient (topology reset, surface teardown) the loops must poll
+        # through instead of dying silently.
+        self._halted = False
         self._window_visible = False
         self._active_taskbar_hwnd = 0
         self._native_owner_hwnd = 0
@@ -2628,6 +2633,7 @@ class CodexUsageTaskbarOverlay:
         return
 
     def refresh(self) -> bool:
+        self._halted = False
         try:
             runtime = self._runtime_getter()
         except Exception:
@@ -2728,6 +2734,7 @@ class CodexUsageTaskbarOverlay:
         return True
 
     def hide(self) -> None:
+        self._halted = True
         window = self._window
         if window is None:
             return
@@ -2947,9 +2954,31 @@ class CodexUsageTaskbarOverlay:
                 pass
         return
 
+    def _timer_pending(self, after_id: Any) -> bool:
+        """Return False when the Tcl ``after`` event behind ``after_id`` is gone.
+
+        Tcl can drop a pending timer without running it (interp teardown,
+        session transitions), and the Python-side id then blocks every
+        ``_schedule_*_tick`` call forever: the loop looks armed but never
+        fires.  ``after_info`` raises for consumed ids on a real Tk root;
+        doubles that cannot answer are trusted so tests stay cheap.
+        """
+        if after_id is None:
+            return False
+        info = getattr(self._root, "after_info", None)
+        if not callable(info):
+            return True
+        try:
+            info(after_id)
+        except Exception:
+            return False
+        return True
+
     def _schedule_content_tick(self, delay_ms: int | None = None) -> None:
         if self._content_after_id is not None:
-            return
+            if self._timer_pending(self._content_after_id):
+                return
+            self._content_after_id = None
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
             return
@@ -2964,8 +2993,13 @@ class CodexUsageTaskbarOverlay:
 
     def _content_tick(self) -> None:
         self._content_after_id = None
+        if self._halted:
+            return
         previous_model = self._last_model
         if not isinstance(previous_model, dict):
+            # A topology reset clears the model before refresh() rebuilds it;
+            # keep polling through the transient instead of dying silently.
+            self._schedule_content_tick(delay_ms=_CONTENT_TICK_MS)
             return
         if not bool(previous_model.get("visible", True)):
             return
@@ -3008,6 +3042,11 @@ class CodexUsageTaskbarOverlay:
         finally:
             if self._window is not None and not self._window_is_alive(self._window):
                 self._discard_dead_window(self._window)
+        # Reaching here means the pane is live and visible; re-arm any sibling
+        # loop whose Tcl timer vanished so no single timer loss can freeze the
+        # overlay at a stale geometry.
+        self._schedule_keepalive_tick()
+        self._schedule_geometry_monitor_tick()
         self._schedule_content_tick(delay_ms=_CONTENT_TICK_MS)
         return
 
@@ -3026,7 +3065,9 @@ class CodexUsageTaskbarOverlay:
 
     def _schedule_keepalive_tick(self, delay_ms: int | None = None) -> None:
         if self._keepalive_after_id is not None:
-            return
+            if self._timer_pending(self._keepalive_after_id):
+                return
+            self._keepalive_after_id = None
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
             return
@@ -3041,9 +3082,14 @@ class CodexUsageTaskbarOverlay:
 
     def _keepalive_tick(self) -> None:
         self._keepalive_after_id = None
+        if self._halted:
+            return
         window = self._window
         model = self._last_model
         if not isinstance(model, dict):
+            # Same transient as the other loops: a topology reset clears the
+            # model before refresh() rebuilds it.  Keep polling through it.
+            self._schedule_keepalive_tick()
             return
         if not bool(model.get("visible", True)):
             return
@@ -3068,6 +3114,10 @@ class CodexUsageTaskbarOverlay:
         finally:
             if self._window is not None and not self._window_is_alive(self._window):
                 self._discard_dead_window(self._window)
+        if self._window_visible:
+            # Any surviving loop re-arms siblings whose Tcl timers vanished.
+            self._schedule_content_tick()
+            self._schedule_geometry_monitor_tick()
         self._schedule_keepalive_tick()
         return
 
@@ -3084,9 +3134,34 @@ class CodexUsageTaskbarOverlay:
                 pass
         return
 
+    def _reassert_overlay_text_scaling(self) -> None:
+        """Re-apply the overlay Tk scaling floor when ambient scaling drifted.
+
+        Text-width budgets are cached keyed on text only, so measuring under
+        a lowered shared scaling poisons preferred widths until something
+        clears those caches.  The check is one Tcl query per tick; the full
+        re-apply (which invalidates the caches) runs only when the floor was
+        actually lost, e.g. by another component sharing the root.
+        """
+        tk_api = getattr(self._root, "tk", None)
+        call = getattr(tk_api, "call", None)
+        if not callable(call):
+            return
+        try:
+            current = float(call("tk", "scaling"))
+        except Exception:
+            return
+        floor = (96.0 / 72.0) * _OVERLAY_UI_BASE_SCALE
+        if current >= floor - 1e-9:
+            return
+        _apply_overlay_base_ui_scaling(self._root)
+        return
+
     def _schedule_geometry_monitor_tick(self, delay_ms: int | None = None) -> None:
         if self._geometry_after_id is not None:
-            return
+            if self._timer_pending(self._geometry_after_id):
+                return
+            self._geometry_after_id = None
         scheduler = getattr(self._root, "after", None)
         if not callable(scheduler):
             return
@@ -3101,6 +3176,8 @@ class CodexUsageTaskbarOverlay:
 
     def _geometry_monitor_tick(self) -> None:
         self._geometry_after_id = None
+        if self._halted:
+            return
         try:
             self._run_geometry_monitor_tick()
         except Exception:
@@ -3112,7 +3189,12 @@ class CodexUsageTaskbarOverlay:
     def _run_geometry_monitor_tick(self) -> None:
         model = self._last_model
         if not isinstance(model, dict):
+            # A topology reset clears the model before refresh() rebuilds it.
+            # The monitor is the only placement-recovery loop, so it must keep
+            # polling through that transient instead of dying silently.
+            self._schedule_geometry_monitor_tick()
             return
+        self._reassert_overlay_text_scaling()
         window = self._window
         now = time.monotonic()
         hard_resample = (
@@ -3207,6 +3289,7 @@ class CodexUsageTaskbarOverlay:
                     self.hide()
                 return
         self._schedule_content_tick()
+        self._schedule_keepalive_tick()
         self._schedule_geometry_monitor_tick()
         return
 
@@ -8980,8 +9063,17 @@ class AiUsageTaskbarOverlay:
         return getter
 
     def refresh(self) -> bool:
-        left_ok = bool(self._left_pane.refresh())
-        right_ok = bool(self._right_pane.refresh())
+        # A failing pane must not starve its sibling: refresh each pane
+        # independently so one exception leaves the other pane's recovery
+        # loops armed.
+        try:
+            left_ok = bool(self._left_pane.refresh())
+        except Exception:
+            left_ok = False
+        try:
+            right_ok = bool(self._right_pane.refresh())
+        except Exception:
+            right_ok = False
         right_model = self._right_pane._last_model
         right_geometry = _model_geometry(right_model)
         if not isinstance(right_geometry, dict):

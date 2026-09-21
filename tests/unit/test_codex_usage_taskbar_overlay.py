@@ -63,6 +63,35 @@ class _FakeWindow:
         self.lift_calls += 1
 
 
+class _AfterInfoFakeRoot(_FakeRoot):
+    """FakeRoot that can answer ``after_info`` like a real Tk interp.
+
+    Tcl consumes or drops timer ids independently of the Python-side
+    bookkeeping; tracking the live id set lets tests simulate a timer that
+    vanished Tcl-side while ``overlay._*_after_id`` still believes it armed.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.live_after_ids = set()
+
+    def after(self, delay_ms, callback):
+        after_id = super().after(delay_ms, callback)
+        self.live_after_ids.add(after_id)
+        return after_id
+
+    def after_cancel(self, after_id):
+        super().after_cancel(after_id)
+        self.live_after_ids.discard(after_id)
+
+    def after_info(self, after_id=None):
+        if after_id is None:
+            return tuple(sorted(self.live_after_ids))
+        if after_id in self.live_after_ids:
+            return (after_id, "timer")
+        raise RuntimeError(f"unknown timer {after_id}")
+
+
 class _FakeCanvas:
     def __init__(self):
         self.ops = []
@@ -7556,6 +7585,116 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(window.geometry_calls, [initial_geometry])
         self.assertTrue(overlay._window_visible)
 
+    def test_geometry_monitor_keeps_polling_while_model_is_missing(self):
+        # _last_model is briefly None across a display-topology reset.  The
+        # monitor is the only loop that re-derives placement, so hitting the
+        # transient must not kill it: otherwise the pane stays frozen at its
+        # last applied rect until an external refresh() happens to re-arm it.
+        root = _FakeRoot()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        overlay.refresh()
+
+        overlay._last_model = None
+        overlay._geometry_monitor_tick()
+
+        self.assertIsNotNone(overlay._geometry_after_id)
+
+        overlay.refresh()
+        overlay._geometry_monitor_tick()
+        self.assertIsNotNone(overlay._geometry_after_id)
+
+    def test_content_and_keepalive_ticks_survive_missing_model(self):
+        root = _FakeRoot()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        overlay.refresh()
+
+        overlay._last_model = None
+        overlay._content_tick()
+        overlay._keepalive_tick()
+
+        self.assertIsNotNone(overlay._content_after_id)
+        self.assertIsNotNone(overlay._keepalive_after_id)
+
+    def test_hide_still_halts_self_recovery_ticks_until_refresh(self):
+        root = _FakeRoot()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        overlay.refresh()
+        overlay.hide()
+
+        # An intentionally hidden pane must not resurrect itself: ticks that
+        # fire while halted stay dead until refresh() re-arms the pane.
+        overlay._last_model = None
+        overlay._geometry_monitor_tick()
+        overlay._content_tick()
+        overlay._keepalive_tick()
+
+        self.assertIsNone(overlay._geometry_after_id)
+        self.assertIsNone(overlay._content_after_id)
+        self.assertIsNone(overlay._keepalive_after_id)
+
+        self.assertTrue(overlay.refresh())
+        self.assertIsNotNone(overlay._geometry_after_id)
+        self.assertIsNotNone(overlay._content_after_id)
+        self.assertIsNotNone(overlay._keepalive_after_id)
+
+    def test_stale_timer_id_does_not_block_geometry_monitor_rescheduling(self):
+        root = _AfterInfoFakeRoot()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        overlay.refresh()
+        stale_id = overlay._geometry_after_id
+
+        # Tcl dropped the timer without running it; a bookkeeping-only id
+        # must not block re-arming the only recovery loop forever.
+        root.live_after_ids.discard(stale_id)
+        overlay._schedule_geometry_monitor_tick()
+
+        self.assertIsNotNone(overlay._geometry_after_id)
+        self.assertNotEqual(overlay._geometry_after_id, stale_id)
+        self.assertIn(overlay._geometry_after_id, root.live_after_ids)
+
+    def test_content_tick_re_arms_a_lost_geometry_timer(self):
+        root = _AfterInfoFakeRoot()
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            self._runtime,
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        overlay.refresh()
+
+        # The geometry timer vanished Tcl-side while the content loop kept
+        # running — a surviving loop must re-arm its siblings.
+        root.live_after_ids.discard(overlay._geometry_after_id)
+        overlay._content_tick()
+
+        self.assertIsNotNone(overlay._geometry_after_id)
+        self.assertIn(overlay._geometry_after_id, root.live_after_ids)
+
     def test_geometry_monitor_slot_loss_hold_keeps_slot_during_content_refresh(self):
         root = _FakeRoot()
         window = _FakeWindow()
@@ -8827,6 +8966,82 @@ class OverlayUiScalingUnitTest(unittest.TestCase):
             overlay.prepare_for_display_topology_change()
 
         self.assertEqual(root.scaling_sets, [144.0 / 72.0])
+
+    def test_geometry_monitor_tick_restores_drifted_tk_scaling_floor(self):
+        floor = 96.0 / 72.0 * taskbar_overlay._OVERLAY_UI_BASE_SCALE
+        root = _TkFakeRoot(scaling=floor)
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            lambda: {
+                "enabled": True,
+                "collect_inflight": False,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "label": "Codex 1",
+                        "enabled": True,
+                        "runtime": {
+                            "monitor_state": "idle",
+                            "session_state": "logged_in",
+                        },
+                        "last_snapshot": {"five_hour_limit": "47%"},
+                    }
+                ],
+            },
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        overlay.refresh()
+        root.scaling_sets.clear()
+
+        # Another component sharing this Tk root pulled scaling back to the
+        # base level; text widths measured now would be cached at the wrong
+        # scale, so the monitor must re-assert the floor before measuring.
+        root._scaling = 96.0 / 72.0
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=None
+        ):
+            overlay._geometry_monitor_tick()
+
+        self.assertIn(floor, root.scaling_sets)
+
+    def test_geometry_monitor_tick_leaves_scaling_at_floor_untouched(self):
+        floor = 96.0 / 72.0 * taskbar_overlay._OVERLAY_UI_BASE_SCALE
+        root = _TkFakeRoot(scaling=floor)
+        overlay = CodexUsageTaskbarOverlay(
+            root,
+            lambda: {
+                "enabled": True,
+                "collect_inflight": False,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "label": "Codex 1",
+                        "enabled": True,
+                        "runtime": {
+                            "monitor_state": "idle",
+                            "session_state": "logged_in",
+                        },
+                        "last_snapshot": {"five_hour_limit": "47%"},
+                    }
+                ],
+            },
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+        overlay.refresh()
+        root.scaling_sets.clear()
+
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=None
+        ):
+            overlay._geometry_monitor_tick()
+
+        # The floor already holds: re-checking must not rewrite it and must
+        # not churn the text-width caches every tick.
+        self.assertEqual(root.scaling_sets, [])
 
 
 class SlotMinimumBarUnitTest(unittest.TestCase):
