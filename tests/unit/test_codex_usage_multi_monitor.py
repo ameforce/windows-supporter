@@ -4600,6 +4600,26 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                     f"reason={reason}",
                 )
 
+    def test_topology_reset_failure_still_refreshes_taskbar_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            class _FailingResetOverlay(_FakeTaskbarOverlay):
+                def prepare_for_display_topology_change(self):
+                    self.topology_reset_calls += 1
+                    raise RuntimeError("reset exploded")
+
+            _FakeTaskbarOverlay.instances = []
+            manager, _children = self._build_manager(
+                tmp,
+                taskbar_progress_factory=_FailingResetOverlay,
+            )
+            manager.attach(object(), event_queue=None)
+
+            manager.on_display_topology_changed("remote_connect")
+
+            overlay = _FakeTaskbarOverlay.instances[0]
+            self.assertEqual(overlay.topology_reset_calls, 1)
+            self.assertEqual(overlay.refresh_calls, 2)
+
     def test_update_settings_refreshes_taskbar_overlay_after_disabling_manager(self):
         with tempfile.TemporaryDirectory() as tmp:
             _FakeTaskbarOverlay.instances = []
