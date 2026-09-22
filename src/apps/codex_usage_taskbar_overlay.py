@@ -824,6 +824,9 @@ def _draw_taskbar_provider_icon(
     provider: Any,
     x: int,
     center_y: float,
+    *,
+    size: float = _PROVIDER_ICON_SIZE_PX,
+    knockout_color: Any = None,
 ) -> None:
     """Draw the provider's small brand glyph in the row's left icon box.
 
@@ -831,63 +834,102 @@ def _draw_taskbar_provider_icon(
     brand violet with the `>_` knocked out in the panel background. Cursor
     is a pointer arrow (monochrome brand), Claude a radial burst (coral).
     Unknown providers get a neutral ring so the column never renders blank.
+
+    `size` scales the glyph relative to the 10px taskbar box so other
+    surfaces can render the same mark larger. `knockout_color` overrides
+    the surface color used for the Codex `>_` knockout; it must match the
+    canvas background or the knockout reads as a dark shape on light cards.
     """
+    scale = float(size) / float(_PROVIDER_ICON_SIZE_PX)
     left = float(x)
-    size = float(_PROVIDER_ICON_SIZE_PX)
-    top = float(center_y) - size / 2.0
+    icon_size = float(size)
+    top = float(center_y) - icon_size / 2.0
+    knockout = (
+        str(knockout_color) if knockout_color is not None else _CODEX_KNOCKOUT_COLOR
+    )
     key = str(provider or "").strip().lower()
     if key == "codex":
         blob = [
-            left + coord if index % 2 == 0 else top + coord
+            left + coord * scale if index % 2 == 0 else top + coord * scale
             for index, coord in enumerate(_CODEX_BLOB_OUTLINE)
         ]
         canvas.create_polygon(*blob, fill=_CODEX_BRAND_COLOR, outline="")
         for outline in (_CODEX_CHEVRON_OUTLINE, _CODEX_BAR_OUTLINE):
-            knockout = [
-                left + coord if index % 2 == 0 else top + coord
+            knockout_polygon = [
+                left + coord * scale if index % 2 == 0 else top + coord * scale
                 for index, coord in enumerate(outline)
             ]
             canvas.create_polygon(
-                *knockout, fill=_CODEX_KNOCKOUT_COLOR, outline=""
+                *knockout_polygon, fill=knockout, outline=""
             )
         return
     if key == "cursor":
         canvas.create_polygon(
-            left + 1.5,
-            top + 0.4,
-            left + 1.5,
-            top + 7.8,
-            left + 3.6,
-            top + 6.1,
-            left + 5.0,
-            top + 9.2,
-            left + 6.4,
-            top + 8.4,
-            left + 5.0,
-            top + 5.4,
-            left + 8.1,
-            top + 5.4,
+            left + 1.5 * scale,
+            top + 0.4 * scale,
+            left + 1.5 * scale,
+            top + 7.8 * scale,
+            left + 3.6 * scale,
+            top + 6.1 * scale,
+            left + 5.0 * scale,
+            top + 9.2 * scale,
+            left + 6.4 * scale,
+            top + 8.4 * scale,
+            left + 5.0 * scale,
+            top + 5.4 * scale,
+            left + 8.1 * scale,
+            top + 5.4 * scale,
             fill="#f8fafc",
             outline="#0f172a",
         )
         return
     if key == "claude":
-        center_x = left + size / 2.0
+        center_x = left + icon_size / 2.0
         points: list[float] = []
         for index in range(16):
             angle = -math.pi / 2.0 + index * (math.pi / 8.0)
-            radius = size / 2.0 - 0.4 if index % 2 == 0 else size * 0.19
+            radius = (
+                icon_size / 2.0 - 0.4 * scale
+                if index % 2 == 0
+                else icon_size * 0.19
+            )
             points.append(center_x + radius * math.cos(angle))
             points.append(center_y + radius * math.sin(angle))
         canvas.create_polygon(*points, fill="#d97757", outline="")
         return
     canvas.create_oval(
-        left + 1.6,
-        top + 1.6,
-        left + size - 1.6,
-        top + size - 1.6,
+        left + 1.6 * scale,
+        top + 1.6 * scale,
+        left + icon_size - 1.6 * scale,
+        top + icon_size - 1.6 * scale,
         outline="#94a3b8",
-        width=1.2,
+        width=max(1.0, 1.2 * scale),
+    )
+
+
+def draw_provider_mark(
+    canvas: Any,
+    provider: Any,
+    x: float,
+    center_y: float,
+    *,
+    size: float = _PROVIDER_ICON_SIZE_PX,
+    background: Any = None,
+) -> None:
+    """Draw the provider brand glyph on any Tk canvas.
+
+    Shared renderer for surfaces outside the taskbar overlay (for example
+    the AI usage settings cards). `background` is the surface color used
+    for the Codex `>_` knockout; when omitted the taskbar panel color is
+    used so the overlay keeps its established look.
+    """
+    _draw_taskbar_provider_icon(
+        canvas,
+        provider,
+        x,
+        center_y,
+        size=size,
+        knockout_color=background,
     )
 
 
