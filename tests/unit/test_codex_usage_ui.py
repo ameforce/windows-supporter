@@ -15,6 +15,7 @@ class _FakeLabel:
         self.grid_kwargs = {}
         self.bind_calls = []
         self.grid_remove_calls = 0
+        self.configure_calls = []
         owner.labels.append(self)
 
     def pack(self, **kwargs):
@@ -32,6 +33,11 @@ class _FakeLabel:
 
     def bind(self, event, callback):
         self.bind_calls.append((event, callback))
+        return None
+
+    def configure(self, **kwargs):
+        self.kwargs.update(kwargs)
+        self.configure_calls.append(dict(kwargs))
         return None
 
 
@@ -75,6 +81,9 @@ class _FakeWidget:
         self.configure_calls.append(dict(kwargs))
         return None
 
+    def cget(self, key):
+        return self.kwargs.get(key)
+
     def columnconfigure(self, *_args, **_kwargs):
         return None
 
@@ -103,6 +112,8 @@ class _FakeCanvas(_FakeWidget):
         self.itemconfigure_calls = []
         self.yview_scroll_calls = []
         self.yview_moveto_calls = []
+        self.drawn_items = []
+        self.delete_calls = []
         if owner is not None:
             owner.canvases.append(self)
 
@@ -120,6 +131,23 @@ class _FakeCanvas(_FakeWidget):
     def create_window(self, *args, **kwargs):
         self.windows.append((args, kwargs))
         return len(self.windows)
+
+    def create_polygon(self, *args, **kwargs):
+        self.drawn_items.append(("polygon", args, dict(kwargs)))
+        return len(self.drawn_items)
+
+    def create_oval(self, *args, **kwargs):
+        self.drawn_items.append(("oval", args, dict(kwargs)))
+        return len(self.drawn_items)
+
+    def create_text(self, *args, **kwargs):
+        self.drawn_items.append(("text", args, dict(kwargs)))
+        return len(self.drawn_items)
+
+    def delete(self, *args):
+        self.delete_calls.append(args)
+        self.drawn_items.clear()
+        return None
 
     def itemconfigure(self, item, **kwargs):
         self.itemconfigure_calls.append((item, dict(kwargs)))
@@ -887,7 +915,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view.mount(parent)
 
-        self.assertEqual(len(fake_tk.canvases), 1)
+        scroll_canvases = [canvas for canvas in fake_tk.canvases if canvas.windows]
+        self.assertEqual(len(scroll_canvases), 1)
         self.assertEqual(len(fake_ttk.scrollbars), 1)
         texts = [label.kwargs.get("text") for label in fake_tk.labels]
         checkbox_texts = [
@@ -898,6 +927,62 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("사용량 프로필 (저장 제한 없음 · 작업표시줄 표시 최대 4개)", texts)
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
+
+    def test_account_cards_render_provider_mark_that_follows_selection(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        parent = _FakeWidget()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {
+            "settings_path": "",
+            "state_path": "",
+            "profile_dir": "",
+            "accounts": [
+                {"id": "account_1", "label": "Codex 1", "enabled": True, "provider": "codex"},
+                {"id": "account_2", "label": "Claude 1", "enabled": True, "provider": "claude"},
+            ],
+        }
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+
+        view.mount(parent)
+
+        mark_1 = view._account_provider_marks.get("account_1")
+        mark_2 = view._account_provider_marks.get("account_2")
+        self.assertIsNotNone(mark_1)
+        self.assertIsNotNone(mark_2)
+        # Codex mark = silhouette blob + two `>_` knockout polygons.
+        self.assertEqual(
+            [item[0] for item in mark_1.drawn_items],
+            ["polygon", "polygon", "polygon"],
+        )
+        self.assertEqual(mark_1.drawn_items[0][2].get("fill"), "#7a9dff")
+        # The knockout must match the card background, not the dark taskbar
+        # panel color, or the `>_` shows as a dark shape on the white card.
+        self.assertEqual(mark_1.drawn_items[1][2].get("fill"), "#FFFFFF")
+        # Claude mark = single radial burst polygon.
+        self.assertEqual([item[0] for item in mark_2.drawn_items], ["polygon"])
+        self.assertEqual(mark_2.drawn_items[0][2].get("fill"), "#d97757")
+
+        # Provider combobox change redraws the mark on the same canvas.
+        mark_1.drawn_items.clear()
+        mark_1.delete_calls.clear()
+        view._account_provider_vars["account_1"].set("cursor")
+
+        self.assertEqual(mark_1.delete_calls, [("all",)])
+        self.assertEqual([item[0] for item in mark_1.drawn_items], ["polygon"])
+        self.assertEqual(mark_1.drawn_items[0][2].get("fill"), "#f8fafc")
+
+        # The mark sits inside the draggable header row, so it must take the
+        # same fleur cursor and drag bindings as the header and label.
+        drag_sequences = {sequence for sequence, _callback in mark_1.bind_calls}
+        self.assertIn("<ButtonPress-1>", drag_sequences)
+        self.assertIn("<B1-Motion>", drag_sequences)
+        self.assertIn("<ButtonRelease-1>", drag_sequences)
+        self.assertIn({"cursor": "fleur"}, mark_1.configure_calls)
 
     def test_scroll_navigation_handles_keyboard_and_mouse_wheel(self) -> None:
         fake_tk = _FakeTk()

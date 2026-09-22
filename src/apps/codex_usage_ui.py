@@ -13,6 +13,7 @@ from src.apps.ai_usage_contracts import (
     resolve_taskbar_pane_assignment,
 )
 from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
+from src.apps.codex_usage_taskbar_overlay import draw_provider_mark
 
 
 class CodexUsageSettingsView:
@@ -49,6 +50,7 @@ class CodexUsageSettingsView:
         self._logout_button = None
         self._account_enabled_vars = {}
         self._account_provider_vars = {}
+        self._account_provider_marks = {}
         self._account_taskbar_selected_vars = {}
         self._account_query_buttons = {}
         self._account_login_buttons = {}
@@ -184,6 +186,7 @@ class CodexUsageSettingsView:
         self._account_metric_visibility = {}
         self._account_text_widgets = {}
         self._account_provider_vars = {}
+        self._account_provider_marks = {}
         self._account_taskbar_selected_vars = {}
         self._pane_boxes = {}
         self._pane_lists = {}
@@ -827,9 +830,21 @@ class CodexUsageSettingsView:
             header = tk.Frame(card, bg=card_bg)
             header.grid(row=0, column=0, sticky="we", padx=8, pady=(6, 1))
             try:
-                header.columnconfigure(0, weight=1)
+                header.columnconfigure(1, weight=1)
             except Exception:
                 pass
+            # 작업표시줄 행과 같은 순서로 브랜드 마크를 제목 왼쪽에 그려서
+            # 카드가 어느 provider의 프로필인지 한눈에 읽히게 한다.
+            provider_mark = tk.Canvas(
+                header,
+                width=14,
+                height=14,
+                bg=card_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            provider_mark.grid(row=0, column=0, sticky="w", padx=(0, 4))
+            self._account_provider_marks[account_id] = provider_mark
             profile_label = tk.Label(
                 header,
                 text=label,
@@ -841,7 +856,7 @@ class CodexUsageSettingsView:
                 justify="left",
                 wraplength=self._scaled_wrap_length(260),
             )
-            profile_label.grid(row=0, column=0, sticky="we")
+            profile_label.grid(row=0, column=1, sticky="we")
 
             # provider 선택은 프로필 제목과 같은 행 오른쪽에 둬서 카드의
             # 소유권을 먼저 읽고 조작 순서를 나중에 읽게 한다.
@@ -856,14 +871,23 @@ class CodexUsageSettingsView:
                 )
             else:
                 provider_box = ttk.Entry(header, textvariable=provider_var, width=8)
-            provider_box.grid(row=0, column=1, sticky="e", padx=(8, 0))
+            provider_box.grid(row=0, column=2, sticky="e", padx=(8, 0))
+            self._redraw_provider_mark(account_id)
+            try:
+                provider_var.trace_add(
+                    "write",
+                    lambda *_args, aid=account_id: self._redraw_provider_mark(aid),
+                )
+            except Exception:
+                pass
 
             try:
                 header.bind(
                     "<Configure>",
-                    lambda event, label_widget=profile_label, provider_widget=provider_box: self._fit_profile_header(
+                    lambda event, label_widget=profile_label, provider_widget=provider_box, mark_widget=provider_mark: self._fit_profile_header(
                         label_widget,
                         provider_widget,
+                        mark_widget,
                         int(getattr(event, "width", 0) or 0),
                     ),
                 )
@@ -875,9 +899,10 @@ class CodexUsageSettingsView:
             try:
                 header.configure(cursor="fleur")
                 profile_label.configure(cursor="fleur")
+                provider_mark.configure(cursor="fleur")
             except Exception:
                 pass
-            for drag_widget in (header, profile_label):
+            for drag_widget in (header, profile_label, provider_mark):
                 try:
                     drag_widget.bind(
                         "<ButtonPress-1>",
@@ -889,7 +914,7 @@ class CodexUsageSettingsView:
                     pass
 
             controls = tk.Frame(header, bg=card_bg)
-            controls.grid(row=1, column=0, columnspan=2, sticky="we", pady=(3, 2))
+            controls.grid(row=1, column=0, columnspan=3, sticky="we", pady=(3, 2))
             control_widgets = [
                 tk.Checkbutton(
                     controls,
@@ -1207,13 +1232,34 @@ class CodexUsageSettingsView:
             pass
         return
 
-    def _fit_profile_header(self, label: Any, provider: Any, width: int) -> None:
+    def _redraw_provider_mark(self, account_id: str) -> None:
+        canvas = self._account_provider_marks.get(str(account_id or ""))
+        provider_var = self._account_provider_vars.get(str(account_id or ""))
+        if canvas is None or provider_var is None:
+            return
+        try:
+            provider = str(provider_var.get() or "codex").strip().lower()
+            canvas.delete("all")
+            draw_provider_mark(
+                canvas,
+                provider,
+                1,
+                7,
+                size=12,
+                background=str(canvas.cget("bg") or "#FFFFFF"),
+            )
+        except Exception:
+            pass
+        return
+
+    def _fit_profile_header(self, label: Any, provider: Any, mark: Any, width: int) -> None:
         available = int(width or 0)
         if available <= 1:
             available = 360
         provider_width = self._widget_requested_width(provider)
+        mark_width = self._widget_requested_width(mark) + 4
         try:
-            label.configure(wraplength=max(90, available - provider_width - 28))
+            label.configure(wraplength=max(90, available - provider_width - mark_width - 28))
         except Exception:
             pass
         return
