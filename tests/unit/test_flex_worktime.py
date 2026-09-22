@@ -263,6 +263,242 @@ class FlexScheduleParserTests(unittest.TestCase):
         self.assertEqual(schedule.scheduled_quit.strftime("%H:%M"), "20:00")
         self.assertEqual(schedule.overtime_scheduled_quit.strftime("%H:%M"), "20:00")
 
+    def test_parses_annual_leave_and_company_day_off_from_daily_schedules(self) -> None:
+        payloads = [
+            {
+                "userIdHash": "opaque-user-id",
+                "dailySchedules": [
+                    {
+                        "date": "2026-09-21",
+                        "timeBlocks": [
+                            {
+                                "type": "ANNUAL_TIME_OFF",
+                                "value": {
+                                    "allDay": True,
+                                    "usedMinutes": 480,
+                                    "status": "APPROVAL_COMPLETED",
+                                    "approval": {"status": "APPROVED"},
+                                    "cancelApprovals": [],
+                                },
+                            }
+                        ],
+                        "dayOffs": [],
+                    },
+                    {
+                        "date": "2026-09-24",
+                        "timeBlocks": [],
+                        "dayOffs": [{"type": "CUSTOM_HOLIDAY"}],
+                    },
+                ],
+            },
+            {"employeeNumber": "E-42"},
+        ]
+
+        schedules, employee_number = _parse_browser_response_payloads(
+            payloads,
+            employee_number="",
+            now=datetime(2026, 9, 21, 9, 0),
+        )
+
+        leave = schedules[date(2026, 9, 21)]
+        self.assertTrue(leave.leave_all_day)
+        self.assertEqual(leave.leave_minutes, 480)
+        self.assertEqual(leave.target_minutes, 480)
+        self.assertEqual(leave.regular_work_minutes, 0)
+        self.assertEqual(leave.day_off_types, ())
+        holiday = schedules[date(2026, 9, 24)]
+        self.assertEqual(holiday.day_off_types, ("CUSTOM_HOLIDAY",))
+        self.assertEqual(holiday.target_minutes, 0)
+        self.assertEqual(employee_number, "E-42")
+
+    def test_ignores_pending_or_cancelled_leave_blocks(self) -> None:
+        payloads = [
+            {
+                "userIdHash": "opaque-user-id",
+                "dailySchedules": [
+                    {
+                        "date": "2026-09-21",
+                        "timeBlocks": [
+                            {
+                                "type": "ANNUAL_TIME_OFF",
+                                "value": {
+                                    "allDay": True,
+                                    "usedMinutes": 480,
+                                    "status": "APPROVAL_IN_PROGRESS",
+                                    "approval": {"status": "PENDING"},
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "date": "2026-09-22",
+                        "timeBlocks": [
+                            {
+                                "type": "ANNUAL_TIME_OFF",
+                                "value": {
+                                    "allDay": True,
+                                    "usedMinutes": 480,
+                                    "status": "APPROVAL_COMPLETED",
+                                    "approval": {"status": "APPROVED"},
+                                    "cancelApprovals": [
+                                        {"status": "APPROVED"}
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+        ]
+
+        schedules, _employee_number = _parse_browser_response_payloads(
+            payloads,
+            employee_number="",
+            now=datetime(2026, 9, 21, 9, 0),
+        )
+
+        self.assertNotIn(date(2026, 9, 21), schedules)
+        self.assertNotIn(date(2026, 9, 22), schedules)
+
+    def test_parses_half_day_leave_interval_and_minutes(self) -> None:
+        payloads = [
+            {
+                "userIdHash": "opaque-user-id",
+                "dailySchedules": [
+                    {
+                        "date": "2026-09-10",
+                        "timeBlocks": [
+                            {
+                                "type": "WORK",
+                                "value": {
+                                    "startTimestamp": self._flex_timestamp(9),
+                                    "endTimestampExclusive": self._flex_timestamp(13),
+                                    "workFormId": "basic-work-form",
+                                },
+                            },
+                            {
+                                "type": "ANNUAL_TIME_OFF",
+                                "value": {
+                                    "allDay": False,
+                                    "usedMinutes": 240,
+                                    "timeOffRegisterUnit": "HALF_PM",
+                                    "status": "APPROVAL_COMPLETED",
+                                    "approval": {"status": "APPROVED"},
+                                    "startTimestamp": self._flex_timestamp(14),
+                                    "endTimestampExclusive": self._flex_timestamp(18),
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+            {
+                "workForms": [
+                    {
+                        "customerWorkFormId": "basic-work-form",
+                        "type": "WORK",
+                        "display": {"name": "기본 근무"},
+                    },
+                ]
+            },
+        ]
+
+        schedules, _employee_number = _parse_browser_response_payloads(
+            payloads,
+            employee_number="",
+            now=datetime(2026, 9, 10, 19, 0),
+        )
+        schedule = schedules[date(2026, 9, 10)]
+
+        self.assertFalse(schedule.leave_all_day)
+        self.assertEqual(schedule.leave_minutes, 240)
+        self.assertEqual(schedule.target_minutes, 480)
+        self.assertEqual(schedule.regular_work_minutes, 240)
+        self.assertEqual(len(schedule.leave_intervals), 1)
+        start, end = schedule.leave_intervals[0]
+        self.assertEqual((start.hour, start.minute), (14, 0))
+        self.assertEqual((end.hour, end.minute), (18, 0))
+
+    def test_all_day_leave_without_used_minutes_keeps_the_day(self) -> None:
+        payload = {
+            "userWorkSchedules": [
+                {
+                    "employeeNumber": "E-42",
+                    "days": [
+                        {
+                            "date": "2026-09-21",
+                            "workBlocks": [],
+                            "timeOffBlocks": [
+                                {
+                                    "type": "TIME_OFF",
+                                    "value": {
+                                        "allDay": True,
+                                        "status": "APPROVAL_COMPLETED",
+                                        "approval": {"status": "APPROVED"},
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        result = parse_flex_schedule_response(
+            payload,
+            employee_number="E-42",
+            now=datetime(2026, 9, 21, 9, 0),
+        )
+        schedule = result[datetime(2026, 9, 21).date()]
+
+        self.assertTrue(schedule.leave_all_day)
+        self.assertEqual(schedule.leave_minutes, 0)
+        self.assertEqual(schedule.target_minutes, 0)
+
+    def test_time_off_under_work_blocks_is_not_counted_as_work(self) -> None:
+        payload = {
+            "userWorkSchedules": [
+                {
+                    "employeeNumber": "E-42",
+                    "days": [
+                        {
+                            "date": "2026-09-10",
+                            "workBlocks": [
+                                {
+                                    "type": "ANNUAL_TIME_OFF",
+                                    "blockFrom": "2026-09-10T09:00:00",
+                                    "blockTo": "2026-09-10T18:00:00",
+                                    "value": {
+                                        "allDay": True,
+                                        "usedMinutes": 480,
+                                        "status": "APPROVAL_COMPLETED",
+                                    },
+                                },
+                                {
+                                    "type": "WORK_RECORD",
+                                    "formName": "기본 근무",
+                                    "blockFrom": "2026-09-10T09:00:00",
+                                    "blockTo": "2026-09-10T17:00:00",
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        result = parse_flex_schedule_response(
+            payload,
+            employee_number="E-42",
+            now=datetime(2026, 9, 10, 19, 0),
+        )
+        schedule = result[datetime(2026, 9, 10).date()]
+
+        self.assertTrue(schedule.leave_all_day)
+        self.assertEqual(schedule.leave_minutes, 480)
+        self.assertEqual(schedule.target_minutes, 960)
+        self.assertEqual(schedule.regular_work_minutes, 480)
+
     def test_extracts_labelled_employee_number_from_visible_text(self) -> None:
         self.assertEqual(
             extract_flex_employee_number("내 계정 · 사번: 12345"),
