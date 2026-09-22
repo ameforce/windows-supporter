@@ -713,6 +713,147 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIn("휴가 4시간", rows[half_day.isoformat()])
         self.assertIn("적용 4시간", rows[half_day.isoformat()])
 
+    def test_today_panel_shows_leave_label_instead_of_clock_line(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 9, 0)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+        day = date(2026, 4, 6)
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {
+                day: self._leave_schedule(day, now=_FrozenDateTime.current),
+            }
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertEqual(model.today_lines[1].text, "휴가🌴")
+        self.assertEqual(model.today_lines[1].color, "#059669")
+
+        overview = wrike._Wrike__today_overview(_FrozenDateTime.current)
+        self.assertTrue(overview.vacation_all_day)
+        self.assertEqual(overview.rest_day_label, "휴가🌴")
+        tooltip_texts = [
+            text for text, _color in overview.as_lines(_FrozenDateTime.current)
+        ]
+        self.assertIn("휴가🌴", tooltip_texts)
+        self.assertFalse(
+            any("출근" in text and "순경과" in text for text in tooltip_texts)
+        )
+
+    def test_today_panel_shows_holiday_label_for_flex_day_off(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 7, 9, 0)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+        day = date(2026, 4, 7)
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {
+                day: self._leave_schedule(
+                    day,
+                    now=_FrozenDateTime.current,
+                    leave_minutes=0,
+                    leave_all_day=False,
+                    target_minutes=0,
+                    day_off_types=("CUSTOM_HOLIDAY",),
+                ),
+            }
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertEqual(model.today_lines[1].text, "휴일")
+        self.assertEqual(model.today_lines[1].color, "#059669")
+
+    def test_half_day_leave_keeps_clock_line(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 8, 9, 0)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+        day = date(2026, 4, 8)
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {
+                day: self._leave_schedule(
+                    day,
+                    now=_FrozenDateTime.current,
+                    leave_minutes=240,
+                    leave_all_day=False,
+                ),
+            }
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("출근 -", model.today_lines[1].text)
+        self.assertIn("예상 퇴근", model.today_lines[1].text)
+
+    def test_leave_label_yields_to_actual_clock_in(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 12, 0)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+        day = date(2026, 4, 6)
+        schedule = replace(
+            self._leave_schedule(day, now=_FrozenDateTime.current),
+            actual_start=datetime(2026, 4, 6, 8, 50),
+        )
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {day: schedule}
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("출근 08:50", model.today_lines[1].text)
+        self.assertNotIn("휴가🌴", model.today_lines[1].text)
+
+    def test_leave_label_hidden_by_flex_actual_start_under_explicit_plan(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 12, 0)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (0, 0, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+        day = date(2026, 4, 6)
+        ok, _err = wrike.update_workday_plan(day, 8 * 60, None)
+        self.assertTrue(ok)
+        schedule = replace(
+            self._leave_schedule(day, now=_FrozenDateTime.current),
+            actual_start=datetime(2026, 4, 6, 8, 50),
+        )
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {day: schedule}
+
+        overview = wrike._Wrike__today_overview(_FrozenDateTime.current)
+        self.assertTrue(overview.actual_event)
+        self.assertIsNone(overview.rest_day_label)
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("출근 -", model.today_lines[1].text)
+        self.assertNotIn("휴가🌴", model.today_lines[1].text)
+        tooltip_texts = [
+            text for text, _color in overview.as_lines(_FrozenDateTime.current)
+        ]
+        self.assertNotIn("휴가🌴", tooltip_texts)
+
     def test_flex_half_leave_with_explicit_plan_deducts_leave_once(self) -> None:
         day = date(2026, 4, 6)
         _FrozenDateTime.current = datetime(2026, 4, 6, 14, 0)

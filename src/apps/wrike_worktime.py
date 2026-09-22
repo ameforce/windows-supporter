@@ -436,11 +436,25 @@ class WorkdayOverview:
     vacation_available: bool = True
     vacation_state: str = "unconfigured"
     expected_available: bool = True
+    vacation_all_day: bool = False
+    day_off: bool = False
+    actual_event: bool = False
 
     @property
     def actual_minutes(self) -> int | None:
         """Wrike-recorded minutes used as the realtime actual value."""
         return self.recorded_minutes
+
+    @property
+    def rest_day_label(self) -> str | None:
+        """Display label replacing the clock-in row on leave/holiday days."""
+        if self.clock_in is not None or self.actual_event:
+            return None
+        if self.vacation_all_day:
+            return "휴가🌴"
+        if self.day_off:
+            return "휴일"
+        return None
 
     def as_lines(self, now: datetime) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = []
@@ -461,16 +475,20 @@ class WorkdayOverview:
             recorded_color if self.expected_available else COLOR_MUTED,
         ))
 
-        if self.clock_in is not None:
-            reference = format_minutes(self.net_elapsed_minutes)
-            clock_text = format_hhmm(self.clock_in)
+        rest_label = self.rest_day_label
+        if rest_label is not None:
+            lines.append((rest_label, COLOR_OK))
         else:
-            reference = "-"
-            clock_text = "-"
-        lines.append((
-            f"출근 {clock_text} · 출근 후 순경과 {reference}",
-            COLOR_ACCENT,
-        ))
+            if self.clock_in is not None:
+                reference = format_minutes(self.net_elapsed_minutes)
+                clock_text = format_hhmm(self.clock_in)
+            else:
+                reference = "-"
+                clock_text = "-"
+            lines.append((
+                f"출근 {clock_text} · 출근 후 순경과 {reference}",
+                COLOR_ACCENT,
+            ))
 
         breakdown = self.break_labels if self.break_labels else "없음"
         active_note = " · 휴게 진행 중" if self.manual_break_active else ""
@@ -533,6 +551,8 @@ def build_workday_overview(
     vacation_state: str = "unconfigured",
     recorded_minutes: int | None = None,
     overtime_minutes: int = 0,
+    day_off: bool = False,
+    actual_event: bool = False,
 ) -> WorkdayOverview:
     try:
         target = max(0, int(target_minutes))
@@ -625,6 +645,9 @@ def build_workday_overview(
         vacation_available=availability,
         vacation_state=state,
         expected_available=True,
+        vacation_all_day=bool(vacation_all_day),
+        day_off=bool(day_off),
+        actual_event=bool(actual_event),
     )
 
 
