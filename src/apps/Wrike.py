@@ -2686,7 +2686,8 @@ class Wrike:
                     0,
                     min(
                         1440,
-                        int(flex_schedule.regular_work_minutes),
+                        int(flex_schedule.regular_work_minutes)
+                        + int(flex_schedule.leave_minutes),
                     ),
                 )
             return {
@@ -2751,6 +2752,35 @@ class Wrike:
         }
 
     def __vacation_result_for_date(self, target_day) -> dict:
+        result = self.__vacation_ical_result_for_date(target_day)
+        return self.__merge_flex_leave_vacation(result, target_day)
+
+    def __merge_flex_leave_vacation(self, result, target_day) -> dict:
+        merged = dict(result) if isinstance(result, dict) else {}
+        schedule = self.__flex_schedule_for_day(target_day)
+        if not isinstance(schedule, FlexDaySchedule):
+            return merged
+        intervals = list(merged.get("intervals") or [])
+        for span in getattr(schedule, "leave_intervals", ()) or ():
+            try:
+                start, end = span
+            except Exception:
+                continue
+            if (
+                isinstance(start, datetime)
+                and isinstance(end, datetime)
+                and end > start
+            ):
+                intervals.append((start, end))
+        merged["intervals"] = intervals
+        merged["leave_minutes"] = max(
+            0, int(getattr(schedule, "leave_minutes", 0) or 0)
+        )
+        if getattr(schedule, "leave_all_day", False):
+            merged["all_day"] = True
+        return merged
+
+    def __vacation_ical_result_for_date(self, target_day) -> dict:
         try:
             cache_key = target_day.isoformat()
         except Exception:
@@ -2894,6 +2924,7 @@ class Wrike:
             intervals=intervals,
             vacation_intervals=vacation_intervals,
             vacation_all_day=bool(vacation.get("all_day")),
+            vacation_minutes=int(vacation.get("leave_minutes") or 0),
             vacation_available=vacation_available,
             vacation_state=str(vacation.get("availability_state") or "error"),
             recorded_minutes=recorded_minutes,
@@ -2950,6 +2981,8 @@ class Wrike:
                 else self.__plan_for_date(now.date())
             )
             if resolved_plan.get("clock_in"):
+                return None
+            if int(resolved_plan.get("target_net_minutes", 0)) <= 0:
                 return None
             prompt = self.__worktime_state_store.get_activity_prompt(now.date())
         except Exception:
@@ -3132,6 +3165,11 @@ class Wrike:
                     )
                 else:
                     vacation_minutes = 0
+                leave_floor = int(vacation.get("leave_minutes") or 0)
+                if leave_floor:
+                    vacation_minutes = min(
+                        target, max(vacation_minutes, leave_floor)
+                    )
             effective_target = max(0, target - vacation_minutes)
             overtime_minutes = self.__overtime_net_minutes_for_day(target_day)
             effective_target += overtime_minutes

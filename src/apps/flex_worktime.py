@@ -112,6 +112,10 @@ class FlexDaySchedule:
     overtime_assigned_minutes: int
     overtime_scheduled_quit: datetime | None
     fetched_at: datetime
+    leave_minutes: int = 0
+    leave_all_day: bool = False
+    leave_intervals: tuple[tuple[datetime, datetime], ...] = ()
+    day_off_types: tuple[str, ...] = ()
 
     @property
     def has_data(self) -> bool:
@@ -119,13 +123,15 @@ class FlexDaySchedule:
 
     @property
     def regular_work_minutes(self) -> int:
-        """Return the net regular-work duration without assigned overtime."""
+        """Return net regular work without assigned overtime or leave."""
 
         return max(
             0,
             min(
                 1440,
-                int(self.target_minutes) - int(self.overtime_assigned_minutes),
+                int(self.target_minutes)
+                - int(self.overtime_assigned_minutes)
+                - int(self.leave_minutes),
             ),
         )
 
@@ -357,6 +363,8 @@ def _normalize_block(raw: dict) -> FlexWorkBlock | None:
         merged = dict(nested)
         merged.update({key: value for key, value in raw.items() if key != "block"})
         raw = merged
+    if _normalize_source_type(raw).endswith("TIME_OFF"):
+        return None
     start = _parse_datetime(
         _first_value(
             raw,
@@ -422,6 +430,115 @@ def _overlap_minutes(
     return total
 
 
+def _normalize_time_off_entry(raw: dict) -> dict | None:
+    """Normalize one approved-leave block into minutes/all-day/interval facts."""
+
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("value")
+    if not isinstance(value, dict):
+        value = raw
+    try:
+        used_minutes = max(
+            0,
+            min(
+                1440,
+                int(
+                    _first_value(value, "usedMinutes", "minutes", "used")
+                    or _first_value(raw, "usedMinutes", "minutes", "used")
+                    or 0
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        used_minutes = 0
+    status = str(
+        _first_value(value, "status", "approvalStatus")
+        or _first_value(raw, "status", "approvalStatus")
+        or ""
+    ).upper()
+    approval = _first_value(value, "approval") or raw.get("approval")
+    approval_status = (
+        str(_first_value(approval, "status") or "").upper()
+        if isinstance(approval, dict)
+        else ""
+    )
+    if not approval_status:
+        approval_status = str(
+            _first_value(value, "approvalStatus")
+            or _first_value(raw, "approvalStatus")
+            or ""
+        ).upper()
+    cancel_approvals = _as_list(
+        _first_value(value, "cancelApprovals") or raw.get("cancelApprovals")
+    )
+    cancelled = any(
+        isinstance(entry, dict)
+        and str(entry.get("status") or "").strip().upper() == "APPROVED"
+        for entry in cancel_approvals
+    )
+    approved = (not cancelled) and (
+        status in {"APPROVAL_COMPLETED", "APPROVED"}
+        or approval_status == "APPROVED"
+    )
+    all_day_flag = (
+        _first_value(value, "allDay", "all_day")
+        if _first_value(value, "allDay", "all_day") is not None
+        else _first_value(raw, "allDay", "all_day")
+    )
+    all_day = all_day_flag is True or str(all_day_flag).strip().lower() == "true"
+    start = _parse_datetime(
+        _first_value(
+            value, "startTimestamp", "blockFrom", "from", "start", "startAt"
+        )
+        or _first_value(raw, "startTimestamp", "blockFrom", "from", "start", "startAt")
+    )
+    end = _parse_datetime(
+        _first_value(
+            value,
+            "endTimestampExclusive",
+            "endTimestamp",
+            "blockTo",
+            "to",
+            "end",
+            "endAt",
+        )
+        or _first_value(
+            raw,
+            "endTimestampExclusive",
+            "endTimestamp",
+            "blockTo",
+            "to",
+            "end",
+            "endAt",
+        )
+    )
+    interval = None
+    if (
+        isinstance(start, datetime)
+        and isinstance(end, datetime)
+        and end > start
+    ):
+        interval = (start, end)
+    return {
+        "approved": approved,
+        "all_day": all_day,
+        "used_minutes": used_minutes,
+        "interval": interval,
+    }
+
+
+def _day_off_types(raw_day: dict) -> tuple[str, ...]:
+    entries = _as_list(_first_value(raw_day, "dayOffs", "day_offs", "holidays"))
+    result: list[str] = []
+    for entry in entries:
+        raw_type = entry.get("type") if isinstance(entry, dict) else entry
+        value = str(raw_type or "").strip().upper().replace("-", "_")
+        if value:
+            result.append(value)
+    return tuple(result)
+
+
 def _choose_planned_blocks(blocks: tuple[FlexWorkBlock, ...]) -> tuple[FlexWorkBlock, ...]:
     records = tuple(block for block in blocks if block.is_record)
     if records:
@@ -473,9 +590,45 @@ def parse_flex_schedule_response(
                 for block in (_normalize_block(item) for item in raw_blocks)
                 if block is not None
             )
-            if not blocks:
+            raw_leave_items = list(
+                _as_list(
+                    _first_value(
+                        day_entry,
+                        "timeOffBlocks",
+                        "timeOffs",
+                        "leaveBlocks",
+                    )
+                )
+            )
+            if not raw_leave_items:
+                for item in raw_blocks:
+                    kind = _normalize_source_type(item)
+                    if kind.endswith("TIME_OFF"):
+                        raw_leave_items.append(item)
+            leave_entries = tuple(
+                entry
+                for entry in (
+                    _normalize_time_off_entry(item) for item in raw_leave_items
+                )
+                if entry is not None and entry["approved"]
+            )
+            leave_minutes = sum(
+                int(entry["used_minutes"]) for entry in leave_entries
+            )
+            leave_all_day = any(entry["all_day"] for entry in leave_entries)
+            leave_intervals = tuple(
+                entry["interval"]
+                for entry in leave_entries
+                if entry["interval"] is not None
+            )
+            has_leave = bool(leave_minutes or leave_all_day or leave_intervals)
+            day_off_types = _day_off_types(day_entry)
+            if not blocks and not has_leave and not day_off_types:
                 continue
-            target_day = hinted_day or min(block.start.date() for block in blocks)
+            target_day = hinted_day or min(
+                (block.start.date() for block in blocks),
+                default=None,
+            )
             if target_day is None:
                 continue
             day_start = datetime.combine(target_day, datetime.min.time())
@@ -486,7 +639,7 @@ def parse_flex_schedule_response(
                 if block.start < day_end
                 and (block.end is None or block.end > day_start)
             )
-            if not day_blocks:
+            if not day_blocks and not has_leave and not day_off_types:
                 continue
             break_blocks = tuple(block for block in day_blocks if block.is_break)
             break_intervals = tuple(
@@ -558,10 +711,14 @@ def parse_flex_schedule_response(
                 scheduled_quit=scheduled_quit,
                 actual_start=actual_start,
                 actual_quit=actual_quit,
-                target_minutes=max(0, min(1440, int(target_minutes))),
+                target_minutes=max(0, min(1440, int(target_minutes) + leave_minutes)),
                 overtime_assigned_minutes=max(0, min(1440, int(overtime_minutes))),
                 overtime_scheduled_quit=overtime_quit,
                 fetched_at=current,
+                leave_minutes=max(0, min(1440, leave_minutes)),
+                leave_all_day=leave_all_day,
+                leave_intervals=leave_intervals,
+                day_off_types=day_off_types,
             )
     return result
 
@@ -898,6 +1055,7 @@ def _modern_flex_schedule_payload(
         if target_day is None:
             continue
         normalized_blocks: list[dict[str, Any]] = []
+        normalized_leave: list[dict[str, Any]] = []
         raw_blocks = _first_value(raw_day, "timeBlocks", "blocks")
         for raw_block in _as_list(raw_blocks):
             if not isinstance(raw_block, dict):
@@ -905,6 +1063,14 @@ def _modern_flex_schedule_payload(
             value = raw_block.get("value")
             if not isinstance(value, dict):
                 value = raw_block
+            block_kind = str(
+                _first_value(raw_block, "type", "blockType", "sourceType", "workType")
+                or _first_value(value, "type", "blockType", "sourceType", "workType")
+                or ""
+            ).strip().upper().replace("-", "_")
+            if block_kind.endswith("TIME_OFF"):
+                normalized_leave.append({"type": "TIME_OFF", "value": value})
+                continue
             start = _first_value(
                 value,
                 "startTimestamp",
@@ -923,11 +1089,7 @@ def _modern_flex_schedule_payload(
             )
             if _parse_datetime(start) is None:
                 continue
-            raw_type = str(
-                _first_value(raw_block, "type", "blockType", "sourceType", "workType")
-                or _first_value(value, "type", "blockType", "sourceType", "workType")
-                or ""
-            ).strip().upper().replace("-", "_")
+            raw_type = block_kind
             form_id = _first_value(
                 value,
                 "workFormId",
@@ -950,11 +1112,14 @@ def _modern_flex_schedule_payload(
                     "blockTo": end,
                 }
             )
-        if normalized_blocks:
+        day_off_types = _day_off_types(raw_day)
+        if normalized_blocks or normalized_leave or day_off_types:
             normalized_days.append(
                 {
                     "date": target_day.isoformat(),
                     "workBlocks": normalized_blocks,
+                    "timeOffBlocks": normalized_leave,
+                    "dayOffs": day_off_types,
                 }
             )
     if not normalized_days:

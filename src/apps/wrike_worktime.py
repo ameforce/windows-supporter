@@ -553,6 +553,10 @@ def build_workday_overview(
             now,
             all_day=vacation_all_day,
         )
+        try:
+            vacation = min(target, max(vacation, int(vacation_minutes or 0)))
+        except Exception:
+            pass
     else:
         try:
             vacation = max(0, int(vacation_minutes or 0))
