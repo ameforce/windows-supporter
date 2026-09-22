@@ -2931,6 +2931,13 @@ class Wrike:
             overtime_minutes=self.__overtime_net_minutes_for_day(
                 now.date(), now
             ),
+            day_off=bool(
+                getattr(plan.get("flex_schedule"), "day_off_types", ())
+            ),
+            actual_event=any(
+                isinstance(getattr(plan.get("flex_schedule"), attr, None), datetime)
+                for attr in ("actual_start", "actual_quit")
+            ),
         )
 
     def __delta_text(self, delta) -> tuple[str, str]:
@@ -3068,6 +3075,7 @@ class Wrike:
                 else "-"
             )
         )
+        rest_label = overview.rest_day_label
         sync_text = self.__snapshot_sync_text(snapshot, now)
         if self.__flex_enabled:
             flex_status = self.__flex_status_snapshot()
@@ -3104,9 +3112,13 @@ class Wrike:
                 else "#6B7280",
             ),
             WorktimePanelLine(
-                f"출근 {clock_text} · {quit_label} {quit_text}"
-                + (" (임시)" if provisional else ""),
-                "#111827",
+                rest_label
+                if rest_label is not None
+                else (
+                    f"출근 {clock_text} · {quit_label} {quit_text}"
+                    + (" (임시)" if provisional else "")
+                ),
+                "#059669" if rest_label is not None else "#111827",
             ),
             WorktimePanelLine(
                 (
