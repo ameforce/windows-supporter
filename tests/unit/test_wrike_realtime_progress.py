@@ -609,6 +609,170 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIn("출근 08:45 · 실제 퇴근 18:12", today_text)
         self.assertNotIn("예상 퇴근", today_text)
 
+    @staticmethod
+    def _leave_schedule(
+        day: date,
+        *,
+        now: datetime,
+        leave_minutes: int = 480,
+        leave_all_day: bool = True,
+        target_minutes: int = 8 * 60,
+        day_off_types: tuple[str, ...] = (),
+    ) -> FlexDaySchedule:
+        return FlexDaySchedule(
+            date=day,
+            blocks=(),
+            break_intervals=(),
+            scheduled_start=None,
+            regular_quit=None,
+            scheduled_quit=None,
+            actual_start=None,
+            actual_quit=None,
+            target_minutes=target_minutes,
+            overtime_assigned_minutes=0,
+            overtime_scheduled_quit=None,
+            fetched_at=now,
+            leave_minutes=leave_minutes,
+            leave_all_day=leave_all_day,
+            day_off_types=day_off_types,
+        )
+
+    def _configure_unconfigured_vacation(self, wrike: Wrike) -> None:
+        wrike._Wrike__vacation_ical_url_session = ""
+        wrike._Wrike__vacation_ical_calendar = {}
+        wrike._Wrike__vacation_ical_state = "unconfigured"
+        wrike._Wrike__vacation_ical_last_error = ""
+
+    def test_flex_all_day_leave_suppresses_prompt_and_daily_target(self) -> None:
+        day = date(2026, 4, 6)
+        _FrozenDateTime.current = datetime(2026, 4, 6, 8, 5)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {
+                day: self._leave_schedule(day, now=_FrozenDateTime.current),
+            }
+
+        vacation = wrike._Wrike__vacation_result_for_date(day)
+        self.assertTrue(vacation.get("all_day"))
+        self.assertEqual(vacation.get("leave_minutes"), 480)
+        self.assertTrue(vacation.get("automatic_prompt_allowed"))
+
+        wrike._Wrike__on_worktime_activity(datetime(2026, 4, 6, 8, 5))
+        self.assertIsNone(
+            wrike._Wrike__worktime_state_store.get_activity_prompt(day)
+        )
+        self.assertIsNone(wrike.get_workday_plan(day)["clock_in"])
+
+        overview = wrike._Wrike__today_overview(_FrozenDateTime.current)
+        self.assertEqual(overview.vacation_minutes, 480)
+        self.assertEqual(overview.effective_target_minutes, 0)
+        self.assertIsNone(overview.projected_quit)
+
+    def test_flex_leave_weekday_row_deducts_target_and_holiday_is_off(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 9, 0)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        self._install_snapshot(
+            wrike,
+            self._fresh_snapshot(
+                (330, 0, 0, 0, 0, 0, 0),
+                fetched_at=_FrozenDateTime.current,
+            ),
+        )
+        leave_day = date(2026, 4, 6)
+        holiday = date(2026, 4, 7)
+        half_day = date(2026, 4, 8)
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {
+                leave_day: self._leave_schedule(
+                    leave_day, now=_FrozenDateTime.current
+                ),
+                holiday: self._leave_schedule(
+                    holiday,
+                    now=_FrozenDateTime.current,
+                    leave_minutes=0,
+                    leave_all_day=False,
+                    target_minutes=0,
+                    day_off_types=("CUSTOM_HOLIDAY",),
+                ),
+                half_day: self._leave_schedule(
+                    half_day,
+                    now=_FrozenDateTime.current,
+                    leave_minutes=240,
+                    leave_all_day=False,
+                    target_minutes=8 * 60,
+                ),
+            }
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        rows = {row.date_key: row.summary for row in model.rows}
+
+        self.assertIn("초과 5시간 30분", rows[leave_day.isoformat()])
+        self.assertEqual(rows[holiday.isoformat()], "휴무")
+        self.assertIn("휴가 4시간", rows[half_day.isoformat()])
+        self.assertIn("적용 4시간", rows[half_day.isoformat()])
+
+    def test_flex_half_leave_with_explicit_plan_deducts_leave_once(self) -> None:
+        day = date(2026, 4, 6)
+        _FrozenDateTime.current = datetime(2026, 4, 6, 14, 0)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        wrike.update_workday_plan(day, 8 * 60, "09:00")
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {
+                day: self._leave_schedule(
+                    day,
+                    now=_FrozenDateTime.current,
+                    leave_minutes=240,
+                    leave_all_day=False,
+                    target_minutes=8 * 60,
+                ),
+            }
+
+        plan = wrike._Wrike__plan_for_date(day)
+        self.assertEqual(plan["target_net_minutes"], 8 * 60)
+        overview = wrike._Wrike__today_overview(_FrozenDateTime.current)
+        self.assertEqual(overview.vacation_minutes, 240)
+        self.assertEqual(overview.effective_target_minutes, 240)
+
+    def test_pending_prompt_hidden_on_flex_day_off(self) -> None:
+        day = date(2026, 4, 6)
+        _FrozenDateTime.current = datetime(2026, 4, 6, 8, 10)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+        wrike._Wrike__worktime_state_store.record_activity_prompt_pending(
+            day,
+            datetime(2026, 4, 6, 8, 5),
+        )
+        with wrike._Wrike__flex_schedule_lock:
+            wrike._Wrike__flex_schedule_by_date = {
+                day: self._leave_schedule(
+                    day,
+                    now=_FrozenDateTime.current,
+                    leave_minutes=0,
+                    leave_all_day=False,
+                    target_minutes=0,
+                    day_off_types=("CUSTOM_HOLIDAY",),
+                ),
+            }
+
+        self.assertIsNone(
+            wrike._Wrike__visible_activity_prompt(_FrozenDateTime.current)
+        )
+
+    def test_flex_leave_day_without_schedule_falls_back_normally(self) -> None:
+        day = date(2026, 4, 6)
+        _FrozenDateTime.current = datetime(2026, 4, 6, 8, 5)
+        wrike = self._new_wrike()
+        self._configure_unconfigured_vacation(wrike)
+
+        plan = wrike._Wrike__plan_for_date(day)
+        self.assertEqual(plan["target_net_minutes"], 8 * 60)
+        vacation = wrike._Wrike__vacation_result_for_date(day)
+        self.assertFalse(vacation.get("all_day"))
+        self.assertFalse(vacation.get("leave_minutes"))
+
     def test_overtime_idle_auto_pause_and_input_auto_resume(self) -> None:
         _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
         wrike = self._new_wrike()
