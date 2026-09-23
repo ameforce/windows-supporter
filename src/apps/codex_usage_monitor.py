@@ -156,6 +156,10 @@ USAGE_RESET_LABELS: dict[str, str] = {
 }
 
 USAGE_LIMIT_RESET_MIN_FORWARD_JUMP_SECONDS = 3600
+# Reset timestamps can disappear when a usage window has fully replenished.
+USAGE_LIMIT_RESET_COMPLETE_PERCENT = 99.0
+USAGE_LIMIT_RESET_MIN_PERCENTAGE_POINT_JUMP = 5.0
+USAGE_LIMIT_RESET_MAX_INFERENCE_GAP_SECONDS = 15 * 60
 
 CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
 CODEX_USAGE_CANONICAL_PATH = "/codex/cloud/settings/analytics"
@@ -1662,6 +1666,7 @@ class UsageLimitReset:
     label: str
     previous_reset_at: str
     new_reset_at: str
+    detected_by: str = "reset_at"
 
 
 def merge_snapshot_with_previous(
@@ -1741,41 +1746,119 @@ def compute_usage_limit_resets(
     baselines: dict[str, str] | None,
     current: UsageSnapshot,
     *,
+    previous: UsageSnapshot | None = None,
+    observed_snapshot: UsageSnapshot | None = None,
     now: datetime | None = None,
 ) -> list[UsageLimitReset]:
     if not isinstance(current, UsageSnapshot) or not current.has_any_metric():
         return []
+    observed = (
+        observed_snapshot
+        if isinstance(observed_snapshot, UsageSnapshot)
+        else current
+    )
     now_dt = now if isinstance(now, datetime) else datetime.now(timezone.utc)
     now_ts = now_dt.timestamp()
     resets: list[UsageLimitReset] = []
     baseline_map = baselines if isinstance(baselines, dict) else {}
-    curr_payload = current.to_dict()
+    observed_payload = observed.to_dict()
+    prev_payload = previous.to_dict() if isinstance(previous, UsageSnapshot) else {}
+    current_at = _parse_base_reset_datetime(observed.captured_at)
+    previous_at = _parse_base_reset_datetime(previous.captured_at) if isinstance(
+        previous, UsageSnapshot
+    ) else None
+    observation_at = current_at or now_dt
     for metric_key in USAGE_METRIC_KEYS:
         reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
         if not reset_key:
             continue
         baseline_raw = normalize_usage_value(baseline_map.get(metric_key, ""))
-        new_raw = normalize_usage_value(curr_payload.get(reset_key, ""))
-        if not baseline_raw or not new_raw or baseline_raw == new_raw:
+        new_raw = normalize_usage_value(observed_payload.get(reset_key, ""))
+        if baseline_raw and new_raw and baseline_raw != new_raw:
+            baseline_dt = _parse_base_reset_datetime(baseline_raw)
+            new_dt = _parse_base_reset_datetime(new_raw)
+            if (
+                baseline_dt is not None
+                and new_dt is not None
+                and baseline_dt.timestamp() <= now_ts
+                and (new_dt - baseline_dt).total_seconds()
+                >= float(USAGE_LIMIT_RESET_MIN_FORWARD_JUMP_SECONDS)
+            ):
+                resets.append(
+                    UsageLimitReset(
+                        key=metric_key,
+                        label=USAGE_METRIC_LABELS.get(metric_key, metric_key),
+                        previous_reset_at=baseline_raw,
+                        new_reset_at=new_raw,
+                    )
+                )
+                continue
+        if new_raw:
             continue
-        baseline_dt = _parse_base_reset_datetime(baseline_raw)
-        new_dt = _parse_base_reset_datetime(new_raw)
-        if baseline_dt is None or new_dt is None:
+
+        if observed.reported_metric_keys and metric_key not in set(
+            observed.reported_metric_keys
+        ):
             continue
-        if baseline_dt.timestamp() > now_ts:
+        previous_percent = _parse_usage_limit_remaining_percent(
+            metric_key, prev_payload.get(metric_key, "")
+        )
+        current_percent = _parse_usage_limit_remaining_percent(
+            metric_key, observed_payload.get(metric_key, "")
+        )
+        if (
+            current_percent is None
+            or current_percent < USAGE_LIMIT_RESET_COMPLETE_PERCENT
+        ):
             continue
-        forward_jump = (new_dt - baseline_dt).total_seconds()
-        if forward_jump < float(USAGE_LIMIT_RESET_MIN_FORWARD_JUMP_SECONDS):
+
+        scheduled_reset_raw = baseline_raw or normalize_usage_value(
+            prev_payload.get(reset_key, "")
+        )
+        scheduled_reset_at = _parse_base_reset_datetime(scheduled_reset_raw)
+        scheduled_reset_elapsed = bool(
+            scheduled_reset_at is not None
+            and scheduled_reset_at <= observation_at
+        )
+        rapid_full_replenishment = False
+        if (
+            previous_percent is not None
+            and previous_percent < USAGE_LIMIT_RESET_COMPLETE_PERCENT
+            and previous_at is not None
+            and current_at is not None
+        ):
+            elapsed_seconds = (current_at - previous_at).total_seconds()
+            rapid_full_replenishment = bool(
+                0 < elapsed_seconds <= USAGE_LIMIT_RESET_MAX_INFERENCE_GAP_SECONDS
+                and current_percent - previous_percent
+                >= USAGE_LIMIT_RESET_MIN_PERCENTAGE_POINT_JUMP
+            )
+        if not (scheduled_reset_elapsed or rapid_full_replenishment):
             continue
         resets.append(
             UsageLimitReset(
                 key=metric_key,
                 label=USAGE_METRIC_LABELS.get(metric_key, metric_key),
-                previous_reset_at=baseline_raw,
-                new_reset_at=new_raw,
+                previous_reset_at=scheduled_reset_raw,
+                new_reset_at="",
+                detected_by="usage_replenished",
             )
         )
     return resets
+
+
+def _parse_usage_limit_remaining_percent(metric_key: str, value: Any) -> float | None:
+    normalized = _normalize_metric_candidate(metric_key, str(value or ""))
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)%", normalized)
+    if match is None:
+        return None
+    try:
+        percentage = float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= percentage <= 100.0:
+        return None
+    return percentage
 
 
 class _UnavailableBrowserSession:
@@ -2825,8 +2908,13 @@ class CodexUsageMonitor:
         self.__set_session_state("logged_in")
         self.__clear_auth_attention()
         changes = compute_usage_changes(prev, merged)
-        resets = compute_usage_limit_resets(self.__limit_reset_baselines, merged)
-        self.__update_limit_reset_baselines(merged)
+        resets = compute_usage_limit_resets(
+            self.__limit_reset_baselines,
+            merged,
+            previous=prev,
+            observed_snapshot=snapshot,
+        )
+        self.__update_limit_reset_baselines(merged, resets=resets)
         self.__commit_merged_snapshot(merged)
         if resets:
             self.__ui_post(
@@ -2863,13 +2951,33 @@ class CodexUsageMonitor:
             bool(allow_previous_backfill) and bool(self.__snapshot_backfill_allowed)
         )
 
-    def __update_limit_reset_baselines(self, snapshot: UsageSnapshot) -> None:
+    def __update_limit_reset_baselines(
+        self,
+        snapshot: UsageSnapshot,
+        resets: list[UsageLimitReset] | None = None,
+    ) -> None:
         if not isinstance(snapshot, UsageSnapshot):
             return
         payload = snapshot.to_dict()
+        inferred_reset_keys_without_timestamp = {
+            item.key
+            for item in (resets or [])
+            if isinstance(item, UsageLimitReset)
+            and item.detected_by == "usage_replenished"
+            and not normalize_usage_value(
+                payload.get(
+                    USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(item.key, ""),
+                    "",
+                )
+            )
+        }
         for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items():
             new_raw = normalize_usage_value(payload.get(reset_key, ""))
             if not new_raw:
+                if metric_key in inferred_reset_keys_without_timestamp:
+                    # Drop the stale deadline so it cannot re-alert when the
+                    # provider later begins reporting a post-reset deadline.
+                    self.__limit_reset_baselines.pop(metric_key, None)
                 continue
             baseline_raw = normalize_usage_value(
                 self.__limit_reset_baselines.get(metric_key, "")
