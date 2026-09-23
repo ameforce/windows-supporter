@@ -43,7 +43,6 @@ class CodexUsageSettingsView:
         self._taskbar_side_priority_var = None
         self._interval_var = None
         self._tooltip_var = None
-        self._usage_url_var = None
         self._status_var = None
         self._status_label = None
         self._login_button = None
@@ -164,11 +163,6 @@ class CodexUsageSettingsView:
         if not isinstance(accounts, list):
             accounts = settings.get("accounts")
         has_multi_accounts = isinstance(accounts, list)
-        has_codex_profile = not isinstance(accounts, list) or any(
-            not isinstance(raw, dict)
-            or str(raw.get("provider", "codex") or "codex").strip().lower() == "codex"
-            for raw in accounts
-        )
         self._login_button = None
         self._logout_button = None
         self._account_query_buttons = {}
@@ -320,7 +314,6 @@ class CodexUsageSettingsView:
         )
         self._interval_var = tk.StringVar(value="")
         self._tooltip_var = tk.StringVar(value="")
-        self._usage_url_var = tk.StringVar(value="")
         self._collect_state_var = tk.StringVar(value="-")
         self._next_collect_var = tk.StringVar(value="-")
         self._live_time_var = tk.StringVar(value="-")
@@ -374,20 +367,37 @@ class CodexUsageSettingsView:
             fg="#374151",
             font=("Segoe UI", 9),
         ).pack(side="left")
-        radio_factory = getattr(ttk, "Radiobutton", None)
-        if not callable(radio_factory):
-            radio_factory = getattr(tk, "Radiobutton", None)
-        if callable(radio_factory):
-            for label, value in (
-                ("왼쪽 우선", TaskbarSidePriority.LEFT.value),
-                ("오른쪽 우선", TaskbarSidePriority.RIGHT.value),
-            ):
-                radio_factory(
+        # 기본 ttk.Radiobutton 스타일은 테마 배경(회색)을 칠해 흰 카드 위에
+        # 떠 보인다. 표시 모양은 그대로 두고 배경만 카드 색으로 맞춘다.
+        radio_style = self._card_radio_style(card_bg)
+        for label, value in (
+            ("왼쪽 우선", TaskbarSidePriority.LEFT.value),
+            ("오른쪽 우선", TaskbarSidePriority.RIGHT.value),
+        ):
+            radio = None
+            if radio_style and callable(getattr(ttk, "Radiobutton", None)):
+                radio = ttk.Radiobutton(
                     placement,
                     text=label,
                     variable=self._taskbar_side_priority_var,
                     value=value,
-                ).pack(side="left", padx=(12, 0))
+                    style=radio_style,
+                )
+            elif callable(getattr(tk, "Radiobutton", None)):
+                radio = tk.Radiobutton(
+                    placement,
+                    text=label,
+                    variable=self._taskbar_side_priority_var,
+                    value=value,
+                    bg=card_bg,
+                    activebackground=card_bg,
+                    selectcolor=card_bg,
+                    fg="#111827",
+                    activeforeground="#111827",
+                    font=("Segoe UI", 9),
+                )
+            if radio is not None:
+                radio.pack(side="left", padx=(12, 0))
         row += 1
 
         tk.Label(
@@ -404,23 +414,6 @@ class CodexUsageSettingsView:
             pady=2,
         )
         row += 1
-
-        if has_codex_profile:
-            tk.Label(
-                body,
-                text="Codex 조회 URL",
-                bg=card_bg,
-                fg="#111827",
-                font=("Segoe UI", 9),
-            ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
-            ttk.Entry(body, textvariable=self._usage_url_var, width=24).grid(
-                row=row,
-                column=1,
-                columnspan=3,
-                sticky="we",
-                pady=2,
-            )
-            row += 1
 
         settings_path = str(settings.get("settings_path", "") or "").strip()
         state_path = str(settings.get("state_path", "") or "").strip()
@@ -1231,6 +1224,25 @@ class CodexUsageSettingsView:
         except Exception:
             pass
         return
+
+    def _card_radio_style(self, card_bg: str) -> str:
+        ttk = self._ttk
+        style_factory = getattr(ttk, "Style", None)
+        if not callable(style_factory):
+            return ""
+        name = "WS.Card.TRadiobutton"
+        try:
+            style = style_factory()
+            style.configure(
+                name,
+                background=card_bg,
+                foreground="#111827",
+                font=("Segoe UI", 9),
+            )
+            style.map(name, background=[("active", card_bg)])
+        except Exception:
+            return ""
+        return name
 
     def _redraw_provider_mark(self, account_id: str) -> None:
         canvas = self._account_provider_marks.get(str(account_id or ""))
@@ -2352,10 +2364,6 @@ class CodexUsageSettingsView:
                 self._tooltip_var.set(self._format_seconds(float(tooltip_ms) / 1000.0))
             except Exception:
                 pass
-            try:
-                self._usage_url_var.set(str(settings.get("usage_url", "") or ""))
-            except Exception:
-                pass
             accounts = settings.get("profiles")
             if not isinstance(accounts, list):
                 accounts = settings.get("accounts")
@@ -2681,7 +2689,6 @@ class CodexUsageSettingsView:
             self._taskbar_overlay_var,
             self._taskbar_side_priority_var,
             self._interval_var,
-            self._usage_url_var,
             *self._account_enabled_vars.values(),
             *self._account_provider_vars.values(),
             *self._account_taskbar_selected_vars.values(),
@@ -2766,7 +2773,6 @@ class CodexUsageSettingsView:
             self._set_status(f"저장 실패: {parse_error}", level="error")
             return None
         tooltip_sec = self._parse_seconds(self._tooltip_var.get(), default=7.0)
-        usage_url = str(self._usage_url_var.get() or "").strip()
         accounts = self._build_account_settings_payload()
         selected_profile_ids = [
             str(item.get("id") or "")
@@ -2789,7 +2795,6 @@ class CodexUsageSettingsView:
             ).value,
             "interval_sec": interval_sec,
             "tooltip_duration_ms": int(round(tooltip_sec * 1000.0)),
-            "usage_url": usage_url,
             "profiles": accounts,
             "accounts": accounts,
             "profile_order": [str(item.get("id") or "") for item in accounts],

@@ -181,6 +181,7 @@ class _FakeTk:
         self.labels = []
         self.canvases = []
         self.checkbuttons = []
+        self.radiobuttons = []
 
     def Label(self, *args, **kwargs):
         return _FakeLabel(self, *args, **kwargs)
@@ -200,6 +201,11 @@ class _FakeTk:
     def Checkbutton(self, *args, **kwargs):
         widget = _FakeWidget(self, *args, **kwargs)
         self.checkbuttons.append(widget)
+        return widget
+
+    def Radiobutton(self, *args, **kwargs):
+        widget = _FakeWidget(self, *args, **kwargs)
+        self.radiobuttons.append(widget)
         return widget
 
 
@@ -274,6 +280,7 @@ class _FakeTtk:
         self.entries = []
         self.scrollbars = []
         self.radiobuttons = []
+        self.styles = _FakeStyle()
 
     def Entry(self, *args, **kwargs):
         widget = _FakeWidget(self, *args, **kwargs)
@@ -290,6 +297,21 @@ class _FakeTtk:
         widget = _FakeWidget(self, *args, **kwargs)
         self.radiobuttons.append(widget)
         return widget
+
+    def Style(self):
+        return self.styles
+
+
+class _FakeStyle:
+    def __init__(self):
+        self.configured = {}
+        self.mapped = {}
+
+    def configure(self, name, **kwargs):
+        self.configured.setdefault(name, {}).update(kwargs)
+
+    def map(self, name, **kwargs):
+        self.mapped.setdefault(name, {}).update(kwargs)
 
 
 class CodexUsageUiUnitTest(unittest.TestCase):
@@ -850,6 +872,20 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             [radio.kwargs["value"] for radio in fake_ttk.radiobuttons],
             ["left", "right"],
         )
+        # 테마 기본 회색 대신 카드 배경을 칠하는 전용 스타일을 쓴다.
+        self.assertEqual(
+            {radio.kwargs["style"] for radio in fake_ttk.radiobuttons},
+            {"WS.Card.TRadiobutton"},
+        )
+        self.assertEqual(
+            fake_ttk.styles.configured["WS.Card.TRadiobutton"]["background"],
+            "#FFFFFF",
+        )
+        self.assertEqual(
+            fake_ttk.styles.mapped["WS.Card.TRadiobutton"]["background"],
+            [("active", "#FFFFFF")],
+        )
+        self.assertEqual(fake_tk.radiobuttons, [])
 
     def test_preferred_size_measures_scroll_body_width_without_using_full_body_height(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
@@ -1523,7 +1559,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_side_priority_var = _FakeVar(value="right")
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._account_order = ["account_1", "account_2"]
         view._account_enabled_vars = {}
         view._account_provider_vars = {}
@@ -1544,9 +1579,11 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertTrue(view._save_settings())
         self.assertEqual(monitor.update_calls[-1]["taskbar_side_priority"], "right")
+        # 화면이 조회 주소를 보내지 않으므로 관리자는 고정 주소를 유지한다.
+        self.assertNotIn("usage_url", monitor.update_calls[-1])
         self.assertEqual(remounts, [True])
 
-    def test_mount_hides_codex_url_when_every_profile_is_cursor(self) -> None:
+    def test_mount_never_renders_codex_url_input(self) -> None:
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
         parent = _FakeWidget()
@@ -1563,10 +1600,16 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             "profiles": [
                 {
                     "id": "account_1",
+                    "provider": "codex",
+                    "label": "Codex 1",
+                    "enabled": True,
+                },
+                {
+                    "id": "account_2",
                     "provider": "cursor",
                     "label": "Cursor 1",
                     "enabled": True,
-                }
+                },
             ],
         }
         view._load_settings = lambda: None
@@ -1574,10 +1617,12 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view.mount(parent)
 
+        # Codex 조회 주소는 고정 상수(CURRENT_CODEX_USAGE_URL)라 사용자가
+        # 바꿀 입력칸을 두지 않는다. Codex 프로필이 있어도 마찬가지다.
         texts = [label.kwargs.get("text") for label in fake_tk.labels]
         self.assertNotIn("Codex 조회 URL", texts)
         self.assertNotIn("조회 URL", texts)
-        self.assertEqual(len(fake_ttk.entries), 2)
+        self.assertFalse(hasattr(view, "_usage_url_var"))
 
     def test_mount_renders_all_saved_profiles_with_add_and_delete_actions(self) -> None:
         class _FakeMonitor:
@@ -1940,7 +1985,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.invalid/usage")
         view._account_order = ["account_1", "account_2"]
         view._account_taskbar_selected_vars = {
             "account_1": _FakeVar(value=True),
@@ -2181,7 +2225,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._account_order = [
             "account_1",
             "account_2",
@@ -2489,7 +2532,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_side_priority_var = _FakeVar(value="right")
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         statuses = []
         view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
         view._hide_main_ui = lambda: self.fail("autosave/manual save must not hide main UI")
@@ -2518,7 +2560,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="invalid")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         statuses = []
         view._set_status = lambda text, level="info": statuses.append((str(text), str(level)))
 
@@ -2549,7 +2590,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._set_status = lambda *_args, **_kwargs: None
 
         self.assertFalse(view._autosave_now())
@@ -2586,7 +2626,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._set_status = lambda *_args, **_kwargs: None
 
         result = view._autosave_now()
@@ -2862,7 +2901,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._account_enabled_vars = {
             "account_1": _FakeVar(value=True),
             "account_2": _FakeVar(value=True),
@@ -2900,7 +2938,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._account_order = ["account_1", "account_2"]
         view._account_enabled_vars = {
             "account_1": _FakeVar(value=True),
@@ -2948,7 +2985,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._account_order = ["account_1"]
         view._account_enabled_vars = {"account_1": _FakeVar(value=True)}
         view._account_provider_vars = {"account_1": _FakeVar(value="cursor")}
@@ -2979,7 +3015,6 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._taskbar_overlay_var = _FakeVar(value=True)
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
-        view._usage_url_var = _FakeVar(value="https://example.test")
         view._account_order = ["account_1"]
         view._account_enabled_vars = {"account_1": _FakeVar(value=True)}
         provider_var = _FakeVar(value="cursor")
