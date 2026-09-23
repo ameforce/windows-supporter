@@ -4,6 +4,7 @@ import ctypes
 import math
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -6234,7 +6235,11 @@ def _detect_horizontal_taskbar_occupied_spans_with_debug(
     # covers them. Their spans therefore bypass the sampling exclusion:
     # subtracting the overlay here is what let a transient misplacement hide
     # the icons underneath it forever.
-    uia_records = _uia_taskbar_occupied_span_records(
+    # The UIA tree walk is a cross-process COM round trip per element and
+    # used to be the largest remaining cost of the 500ms geometry tick on the
+    # UI thread. A background sampler owns it; the tick reads the latest
+    # completed result and only waits when this exact request is new.
+    uia_records = _UIA_SPAN_SAMPLER.records(
         int(screen_width),
         int(band_top) + origin_y,
         int(band_bottom) + origin_y,
@@ -6459,7 +6464,9 @@ _uia_client_unavailable = False
 def _uia_automation() -> Any | None:
     """Return a process-wide IUIAutomation client, or None when unavailable.
 
-    The client is created lazily on the calling (UI) thread. Every failure
+    The client is created lazily on the calling thread; in the app that is
+    the _UiaSpanSampler worker, which joins the multithreaded apartment so
+    the client stays usable if the worker is ever restarted. Every failure
     degrades to ``None`` so occupancy detection falls back to the Win32 child
     and pixel-sampling sources instead of losing a tick.
     """
@@ -6609,6 +6616,172 @@ def _uia_taskbar_occupied_spans(
             origin_x=origin_x,
         )
     ]
+
+
+_UIA_SAMPLER_FIRST_RESULT_WAIT_SEC = 1.5
+_UIA_SAMPLER_MIN_INTERVAL_SEC = 0.25
+_UIA_SAMPLER_MAX_KEYS = 16
+# A result older than this (e.g. after the tick paused for fullscreen) is not
+# trusted for placement; the caller waits for a fresh walk instead.
+_UIA_SAMPLER_MAX_RESULT_AGE_SEC = 2.0
+
+
+class _UiaSpanSampler:
+    """Run UIA taskbar sampling on a background thread.
+
+    ``records()`` never performs the UIA walk on the caller's thread. It
+    returns the latest completed result for the request and asks the worker
+    for a fresh one, so the placement lags the live taskbar by at most one
+    sampling pass (the geometry tick already samples every 500ms). A request
+    seen for the first time (startup, display topology change) or whose last
+    result is older than ``max_result_age_sec`` waits briefly for a fresh
+    result so placement still honours the icons; a timeout or failure yields
+    ``[]`` (or the newest result, when one exists) like a failed direct walk.
+    """
+
+    def __init__(
+        self,
+        *,
+        first_result_wait_sec: float = _UIA_SAMPLER_FIRST_RESULT_WAIT_SEC,
+        min_interval_sec: float = _UIA_SAMPLER_MIN_INTERVAL_SEC,
+        max_keys: int = _UIA_SAMPLER_MAX_KEYS,
+        max_result_age_sec: float = _UIA_SAMPLER_MAX_RESULT_AGE_SEC,
+    ) -> None:
+        self._first_result_wait_sec = max(0.0, float(first_result_wait_sec))
+        self._max_result_age_sec = max(0.0, float(max_result_age_sec))
+        self._min_interval_sec = max(0.0, float(min_interval_sec))
+        self._max_keys = max(1, int(max_keys))
+        self._condition = threading.Condition()
+        self._results: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
+        self._pending: dict[tuple[Any, ...], tuple[Callable[..., Any], tuple[Any, ...]]] = {}
+        self._thread: threading.Thread | None = None
+
+    def records(
+        self,
+        screen_width: int,
+        band_top: int,
+        band_bottom: int,
+        *,
+        taskbar_hwnd: int = 0,
+        origin_x: int = 0,
+    ) -> list[dict[str, Any]]:
+        # Resolve the sampling function at call time so a replaced module
+        # attribute is honoured, and key the cache on it so results from one
+        # sampler are never served for another.
+        sampler = _uia_taskbar_occupied_span_records
+        args = (
+            int(screen_width),
+            int(band_top),
+            int(band_bottom),
+            int(taskbar_hwnd),
+            int(origin_x),
+        )
+        key = (sampler,) + args
+        with self._condition:
+            self._pending[key] = (sampler, args)
+            self._ensure_worker_locked()
+            self._condition.notify_all()
+            if self._first_result_wait_sec > 0 and not self._fresh_locked(key):
+                self._condition.wait_for(
+                    lambda: self._fresh_locked(key),
+                    timeout=self._first_result_wait_sec,
+                )
+            entry = self._results.get(key)
+        records = entry[1] if entry else []
+        return [dict(record) for record in records]
+
+    def _fresh_locked(self, key: tuple[Any, ...]) -> bool:
+        entry = self._results.get(key)
+        if entry is None:
+            return False
+        if self._max_result_age_sec <= 0:
+            return True
+        return time.monotonic() - entry[0] <= self._max_result_age_sec
+
+    def _ensure_worker_locked(self) -> None:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            return
+        _preload_comtypes()
+        thread = threading.Thread(
+            target=self._run,
+            name="WindowsSupporterUiaSpanSampler",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+
+    def _run(self) -> None:
+        _join_multithreaded_com_apartment()
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: bool(self._pending))
+                batch = list(self._pending.items())
+                self._pending.clear()
+            for key, (sampler, args) in batch:
+                screen_width, band_top, band_bottom, taskbar_hwnd, origin_x = args
+                try:
+                    records = sampler(
+                        screen_width,
+                        band_top,
+                        band_bottom,
+                        taskbar_hwnd=taskbar_hwnd,
+                        origin_x=origin_x,
+                    )
+                    records = list(records or [])
+                except Exception:
+                    records = []
+                with self._condition:
+                    self._results.pop(key, None)
+                    self._results[key] = (time.monotonic(), records)
+                    while len(self._results) > self._max_keys:
+                        self._results.pop(next(iter(self._results)))
+                    self._condition.notify_all()
+            if self._min_interval_sec > 0:
+                # Throttle only repeat refreshes; a request with no result yet
+                # (someone may be waiting for it) is served immediately.
+                with self._condition:
+                    self._condition.wait_for(
+                        lambda: any(
+                            not self._fresh_locked(key) for key in self._pending
+                        ),
+                        timeout=self._min_interval_sec,
+                    )
+
+
+_COINIT_MULTITHREADED = 0x0
+
+
+def _preload_comtypes() -> None:
+    # comtypes initializes COM as STA on the thread that first imports it and
+    # raises RPC_E_CHANGED_MODE on a thread that already joined the MTA. The
+    # worker joins the MTA, so it must never be the first importer: import it
+    # here on the (already OLE-initialized) calling thread before starting
+    # the worker. Failure only means UIA stays unavailable, as before.
+    try:
+        import comtypes  # noqa: F401
+        import comtypes.client  # noqa: F401
+    except Exception:
+        pass
+    return
+
+
+def _join_multithreaded_com_apartment() -> None:
+    # comtypes is already imported by _preload_comtypes() on the caller
+    # thread, so joining the MTA through ole32 here is deterministic and the
+    # later comtypes.CoInitialize() in _uia_automation() fails harmlessly.
+    ole32 = getattr(getattr(ctypes, "oledll", None), "ole32", None)
+    initialize = getattr(ole32, "CoInitializeEx", None)
+    if not callable(initialize):
+        return
+    try:
+        initialize(None, _COINIT_MULTITHREADED)
+    except Exception:
+        pass
+    return
+
+
+_UIA_SPAN_SAMPLER = _UiaSpanSampler()
 
 
 def _taskbar_sample_rows(band_top: int, band_bottom: int) -> list[int]:
