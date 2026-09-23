@@ -1945,7 +1945,15 @@ class CodexUsageSettingsView:
             # 변경 잠금 중에는 놓아도 취소되므로 표시만 지운다. 여기서
             # _profile_settings_mutation_blocked()를 부르면 상태 문구가
             # 매 움직임마다 덮어써지므로 조용히 처리한다.
+            if state.get("target") is None:
+                return
             state["target"] = None
+            for box in (self._pane_boxes or {}).values():
+                try:
+                    if box is not None:
+                        box.configure(highlightbackground="#E5E7EB", highlightthickness=1)
+                except Exception:
+                    pass
             for indicator in (self._drop_indicators or {}).values():
                 try:
                     if indicator is not None:
@@ -1959,6 +1967,21 @@ class CodexUsageSettingsView:
         except Exception:
             return
         found = self._pane_drop_target_at(x_root, y_root)
+        # Tk는 포인터가 같은 슬롯에 있어도 이동 이벤트를 반복해서 보낸다.
+        # 위치 확인은 계속하되, 드롭 대상이 바뀔 때만 위젯 배치를 갱신한다.
+        target: tuple[str, int] | None = None
+        if found is None:
+            if state.get("target") is None:
+                return
+        else:
+            side, position = found
+            target = (side, int(position))
+            try:
+                current_position = int(state.get("index", 0))
+            except Exception:
+                current_position = None
+            if state.get("target") == side and current_position == target[1]:
+                return
         for box in (self._pane_boxes or {}).values():
             try:
                 if box is not None:
@@ -1971,19 +1994,19 @@ class CodexUsageSettingsView:
                     indicator.grid_remove()
             except Exception:
                 pass
-        if found is None:
+        if target is None:
             state["target"] = None
             return
-        side, position = found
+        side, position = target
         state["target"] = side
-        state["index"] = int(position)
+        state["index"] = position
         box = (self._pane_boxes or {}).get(side)
         try:
             if box is not None:
                 box.configure(highlightbackground="#2563EB", highlightthickness=2)
         except Exception:
             pass
-        self._show_drop_indicator(side, int(position))
+        self._show_drop_indicator(side, position)
         return
 
     def _on_pane_drag_release(self, event: Any = None) -> None:
