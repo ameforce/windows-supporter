@@ -240,6 +240,37 @@ class ComputeUsageLimitResetsTest(unittest.TestCase):
         self.assertEqual([item.key for item in resets], ["five_hour_limit"])
         self.assertEqual(resets[0].detected_by, "usage_replenished")
 
+    def test_future_schedule_blocks_rapid_replenishment_inference(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        future_reset = _iso(now + timedelta(minutes=30))
+        previous = _limit_snapshot("70%", now - timedelta(minutes=1), future_reset)
+        current = _limit_snapshot("100%", now)
+
+        self.assertEqual(
+            compute_usage_limit_resets(
+                {"five_hour_limit": future_reset},
+                current,
+                previous=previous,
+                now=now,
+            ),
+            [],
+        )
+
+    def test_invalid_schedule_blocks_rapid_replenishment_inference(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        previous = _limit_snapshot("70%", now - timedelta(minutes=1))
+        current = _limit_snapshot("100%", now)
+
+        self.assertEqual(
+            compute_usage_limit_resets(
+                {"five_hour_limit": "not-a-date"},
+                current,
+                previous=previous,
+                now=now,
+            ),
+            [],
+        )
+
     def test_small_or_slow_full_replenishment_is_not_inferred_as_a_reset(self) -> None:
         now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         small_change = compute_usage_limit_resets(

@@ -1833,7 +1833,10 @@ def compute_usage_limit_resets(
                 and current_percent - previous_percent
                 >= USAGE_LIMIT_RESET_MIN_PERCENTAGE_POINT_JUMP
             )
-        if not (scheduled_reset_elapsed or rapid_full_replenishment):
+        if not (
+            scheduled_reset_elapsed
+            or (not scheduled_reset_raw and rapid_full_replenishment)
+        ):
             continue
         resets.append(
             UsageLimitReset(
