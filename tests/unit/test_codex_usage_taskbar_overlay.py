@@ -9062,6 +9062,169 @@ class OverlayUiScalingUnitTest(unittest.TestCase):
         self.assertEqual(root.scaling_sets, [])
 
 
+class _RoundingTkFakeRoot(_TkFakeRoot):
+    """Tk stores scaling as pixels per point from the screen's millimetre
+    size, so the value read back is slightly off from the value set."""
+
+    # 96dpi: setting 1.666666... reads back as 1.6662566625666255.
+    READBACK_RATIO = 1.6662566625666255 / (96.0 / 72.0 * 1.25)
+
+    @property
+    def tk(self):
+        root = self
+
+        class _Tk:
+            def call(self, *args):
+                if len(args) == 2 and args[0] == "tk" and args[1] == "scaling":
+                    return root._scaling
+                if len(args) == 3 and args[0] == "tk" and args[1] == "scaling":
+                    root._scaling = float(args[2]) * root.READBACK_RATIO
+                    root.scaling_sets.append(float(args[2]))
+                    return ""
+                raise AssertionError(f"unexpected tk call: {args!r}")
+
+        return _Tk()
+
+
+class OverlayScalingCacheChurnRegressionTest(unittest.TestCase):
+    def setUp(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.0)
+
+    def tearDown(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.0)
+
+    def _overlay(self, root):
+        return CodexUsageTaskbarOverlay(
+            root,
+            lambda: {
+                "enabled": True,
+                "collect_inflight": False,
+                "accounts": [
+                    {
+                        "id": "account_1",
+                        "label": "Codex 1",
+                        "enabled": True,
+                        "runtime": {
+                            "monitor_state": "idle",
+                            "session_state": "logged_in",
+                        },
+                        "last_snapshot": {"five_hour_limit": "47%"},
+                    }
+                ],
+            },
+            window_factory=lambda _root: _FakeWindow(),
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda _width, _height, _work_area, _geometry: None,
+        )
+
+    def test_geometry_ticks_tolerate_tk_scaling_readback_rounding(self):
+        root = _RoundingTkFakeRoot(scaling=96.0 / 72.0)
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=96.0 / 72.0
+        ):
+            taskbar_overlay._apply_overlay_base_ui_scaling(root)
+            overlay = self._overlay(root)
+            overlay.refresh()
+            root.scaling_sets.clear()
+            with patch.object(
+                taskbar_overlay,
+                "_clear_overlay_width_caches",
+                wraps=taskbar_overlay._clear_overlay_width_caches,
+            ) as clears:
+                for _ in range(3):
+                    overlay._geometry_monitor_tick()
+
+        # The floor holds up to Tk's rounding: ticks must neither rewrite the
+        # scaling nor throw away the cached width search every 500ms.
+        self.assertEqual(root.scaling_sets, [])
+        self.assertEqual(clears.call_count, 0)
+
+    def test_apply_within_readback_rounding_keeps_scaling_and_width_scale(self):
+        floor = 96.0 / 72.0 * taskbar_overlay._OVERLAY_UI_BASE_SCALE
+        root = _RoundingTkFakeRoot(scaling=floor * _RoundingTkFakeRoot.READBACK_RATIO)
+
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=96.0 / 72.0
+        ):
+            applied = taskbar_overlay._apply_overlay_base_ui_scaling(root)
+
+        self.assertEqual(root.scaling_sets, [])
+        self.assertAlmostEqual(applied, root._scaling)
+        self.assertEqual(
+            taskbar_overlay._overlay_text_width_scale(),
+            taskbar_overlay._OVERLAY_UI_BASE_SCALE,
+        )
+
+    def test_restoring_a_lost_floor_invalidates_width_caches(self):
+        floor = 96.0 / 72.0 * taskbar_overlay._OVERLAY_UI_BASE_SCALE
+        root = _RoundingTkFakeRoot(scaling=floor * _RoundingTkFakeRoot.READBACK_RATIO)
+        overlay = self._overlay(root)
+        with patch.object(
+            taskbar_overlay, "_current_system_scaling", return_value=96.0 / 72.0
+        ):
+            taskbar_overlay._apply_overlay_base_ui_scaling(root)
+            overlay.refresh()
+            root.scaling_sets.clear()
+            # Another component sharing the root lowered the scaling; widths
+            # measured meanwhile are narrower than what the floor draws.
+            root._scaling = 96.0 / 72.0
+            with patch.object(
+                taskbar_overlay,
+                "_clear_overlay_width_caches",
+                wraps=taskbar_overlay._clear_overlay_width_caches,
+            ) as clears:
+                overlay._geometry_monitor_tick()
+
+        self.assertEqual(root.scaling_sets, [floor])
+        self.assertGreaterEqual(clears.call_count, 1)
+        self.assertEqual(
+            taskbar_overlay._overlay_text_width_scale(),
+            taskbar_overlay._OVERLAY_UI_BASE_SCALE,
+        )
+
+    def test_reapplying_same_width_scale_keeps_width_caches(self):
+        taskbar_overlay._set_overlay_text_width_scale(1.25)
+        with patch.object(
+            taskbar_overlay,
+            "_clear_overlay_width_caches",
+            wraps=taskbar_overlay._clear_overlay_width_caches,
+        ) as clears:
+            taskbar_overlay._set_overlay_text_width_scale(1.25)
+            self.assertEqual(clears.call_count, 0)
+            taskbar_overlay._set_overlay_text_width_scale(1.5)
+            self.assertEqual(clears.call_count, 1)
+
+    def test_installing_measurer_keeps_applied_width_scale(self):
+        try:
+            import tkinter as tk
+        except Exception as exc:  # pragma: no cover - no Tk available
+            self.skipTest(f"Tk unavailable: {exc}")
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:  # pragma: no cover - headless host
+            self.skipTest(f"Tk unavailable: {exc}")
+        root.withdraw()
+        previous_context = dict(taskbar_overlay._TK_MEASURE_CONTEXT)
+        try:
+            taskbar_overlay._set_overlay_text_width_scale(1.25)
+            with patch.object(
+                taskbar_overlay,
+                "_clear_overlay_width_caches",
+                wraps=taskbar_overlay._clear_overlay_width_caches,
+            ) as clears:
+                taskbar_overlay._install_tkfont_measurer(root)
+
+            # New fonts invalidate cached widths, but the width scale keeps
+            # following the applied Tk scaling instead of dropping to 1.0.
+            self.assertEqual(clears.call_count, 1)
+            self.assertEqual(taskbar_overlay._overlay_text_width_scale(), 1.25)
+        finally:
+            taskbar_overlay._TK_MEASURE_CONTEXT.clear()
+            taskbar_overlay._TK_MEASURE_CONTEXT.update(previous_context)
+            taskbar_overlay._tk_measure_text_live.cache_clear()
+            root.destroy()
+
+
 class SlotMinimumBarUnitTest(unittest.TestCase):
     def test_global_minimum_unifies_all_slots(self):
         short_texts = {
