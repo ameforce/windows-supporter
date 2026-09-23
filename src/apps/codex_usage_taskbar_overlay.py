@@ -2409,6 +2409,13 @@ _OVERLAY_UI_BASE_SCALE = 1.25
 # (active_scaling / base) or the drawn ink exceeds every budget. Kept at 1.0
 # until _apply_overlay_base_ui_scaling observes a target different from base.
 _OVERLAY_TEXT_WIDTH_SCALE = 1.0
+# Tk stores `tk scaling` as pixels per point derived from the screen size in
+# millimetres, so the value read back differs from the value set by up to
+# ~0.1% (e.g. 1.66667 reads back as 1.66626 at 96dpi). Scaling comparisons
+# must tolerate that rounding; with an exact comparison every geometry tick
+# "re-applied" the floor and cleared every width cache, turning the cached
+# 300..900px width search into ~300ms of UI-thread work twice per second.
+_TK_SCALING_TOLERANCE = 0.01
 
 
 def _overlay_text_width_scale() -> float:
@@ -2418,11 +2425,20 @@ def _overlay_text_width_scale() -> float:
 def _set_overlay_text_width_scale(scale: float) -> None:
     global _OVERLAY_TEXT_WIDTH_SCALE
     try:
-        _OVERLAY_TEXT_WIDTH_SCALE = max(1.0, float(scale))
+        next_scale = max(1.0, float(scale))
     except Exception:
-        _OVERLAY_TEXT_WIDTH_SCALE = 1.0
+        next_scale = 1.0
+    if abs(next_scale - float(_OVERLAY_TEXT_WIDTH_SCALE)) <= 1e-9:
+        # Re-applying the same scale must not discard the width caches.
+        return
+    _OVERLAY_TEXT_WIDTH_SCALE = next_scale
     # Budgets derived from text widths are cached keyed on text only; the
     # scale factor is not part of the key, so any change invalidates them.
+    _clear_overlay_width_caches()
+    return
+
+
+def _clear_overlay_width_caches() -> None:
     try:
         _required_metric_segment_width_cached.cache_clear()
     except Exception:
@@ -2474,10 +2490,9 @@ def _install_tkfont_measurer(root: Any) -> None:
             pt: tkfont.Font(root=root, font=spec) for pt, spec in _CONTEXT_FONT_BY_PT.items()
         }
         # New root/fonts measure with their own metrics; stale widths would
-        # poison every subsequent fit.
-        _tk_measure_text_live.cache_clear()
-        # The active scale must follow this root's applied scaling from now on.
-        _set_overlay_text_width_scale(1.0)
+        # poison every subsequent fit. The width scale itself keeps following
+        # the root scaling applied by _apply_overlay_base_ui_scaling().
+        _clear_overlay_width_caches()
     except Exception:
         return
 
@@ -2593,14 +2608,19 @@ def _apply_overlay_base_ui_scaling(root: Any) -> float | None:
         # Track the live system scale in both directions (a restart would
         # observe `fresh`); the floor only guards legibility minimums.
         target = max(fresh, base * _OVERLAY_UI_BASE_SCALE)
-    if abs(target - current) <= 1e-9:
-        _set_overlay_text_width_scale(max(1.0, current / base))
+    if abs(target - current) <= _TK_SCALING_TOLERANCE:
+        # Already applied; Tk only rounded the stored value.
+        _set_overlay_text_width_scale(max(1.0, target / base))
         return current
     try:
         tk_call("tk", "scaling", target)
     except Exception:
         _set_overlay_text_width_scale(max(1.0, current / base))
         return current
+    # Live font measurements follow `tk scaling`, so widths measured before
+    # this rewrite (e.g. while another component had lowered the scaling)
+    # are stale even when the width scale factor itself stays the same.
+    _clear_overlay_width_caches()
     _set_overlay_text_width_scale(max(1.0, target / base))
     return target
 
@@ -3217,7 +3237,7 @@ class CodexUsageTaskbarOverlay:
         except Exception:
             return
         floor = (96.0 / 72.0) * _OVERLAY_UI_BASE_SCALE
-        if current >= floor - 1e-9:
+        if current >= floor - _TK_SCALING_TOLERANCE:
             return
         _apply_overlay_base_ui_scaling(self._root)
         return
