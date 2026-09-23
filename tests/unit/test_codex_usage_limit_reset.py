@@ -9,6 +9,7 @@ from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
     UsageSnapshot,
     compute_usage_limit_resets,
+    merge_snapshot_with_previous,
 )
 
 
@@ -33,6 +34,20 @@ def _snapshot(
         _metrics(),
         captured_at=captured_at,
         reset_info=reset_info or {},
+    )
+
+
+def _limit_snapshot(
+    value: str,
+    captured_at: datetime,
+    reset_at: str = "",
+) -> UsageSnapshot:
+    reset_info = {"five_hour_limit_reset_at": reset_at} if reset_at else {}
+    return UsageSnapshot.from_metrics(
+        {"five_hour_limit": value},
+        captured_at=_iso(captured_at),
+        reset_info=reset_info,
+        reported_metric_keys=("five_hour_limit",),
     )
 
 
@@ -154,6 +169,142 @@ class ComputeUsageLimitResetsTest(unittest.TestCase):
         now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         self.assertEqual(compute_usage_limit_resets(baselines, current, now=now), [])
 
+    def test_elapsed_reset_is_detected_when_new_reset_time_is_missing(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        previous_at = now - timedelta(minutes=1)
+        due_at = now - timedelta(seconds=30)
+        previous = _limit_snapshot("96%", previous_at, _iso(due_at))
+        current = _limit_snapshot("100%", now)
+
+        resets = compute_usage_limit_resets(
+            {"five_hour_limit": _iso(due_at)},
+            current,
+            previous=previous,
+            now=now,
+        )
+
+        self.assertEqual([item.key for item in resets], ["five_hour_limit"])
+        self.assertEqual(resets[0].detected_by, "usage_replenished")
+        self.assertEqual(resets[0].new_reset_at, "")
+
+    def test_elapsed_reset_is_detected_when_first_observation_is_already_full(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        due_at = now - timedelta(minutes=5)
+        previous = _limit_snapshot("100%", now - timedelta(minutes=1))
+        current = _limit_snapshot("100%", now)
+
+        resets = compute_usage_limit_resets(
+            {"five_hour_limit": _iso(due_at)},
+            current,
+            previous=previous,
+            now=now,
+        )
+
+        self.assertEqual([item.key for item in resets], ["five_hour_limit"])
+        self.assertEqual(resets[0].detected_by, "usage_replenished")
+
+    def test_backfilled_metric_does_not_infer_reset_when_current_value_is_unparseable(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        previous = _limit_snapshot("100%", now - timedelta(minutes=1))
+        observed = UsageSnapshot.from_metrics(
+            {"weekly_limit": "80%"},
+            captured_at=_iso(now),
+            reported_metric_keys=("five_hour_limit", "weekly_limit"),
+        )
+        merged = merge_snapshot_with_previous(observed, previous)
+
+        self.assertEqual(merged.five_hour_limit, "100%")
+        self.assertEqual(
+            compute_usage_limit_resets(
+                {"five_hour_limit": _iso(now - timedelta(minutes=5))},
+                merged,
+                previous=previous,
+                observed_snapshot=observed,
+                now=now,
+            ),
+            [],
+        )
+
+    def test_rapid_full_replenishment_is_detected_without_any_reset_time(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        previous = _limit_snapshot("70%", now - timedelta(seconds=30))
+        current = _limit_snapshot("100%", now)
+
+        resets = compute_usage_limit_resets(
+            {},
+            current,
+            previous=previous,
+            now=now,
+        )
+
+        self.assertEqual([item.key for item in resets], ["five_hour_limit"])
+        self.assertEqual(resets[0].detected_by, "usage_replenished")
+
+    def test_future_schedule_blocks_rapid_replenishment_inference(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        future_reset = _iso(now + timedelta(minutes=30))
+        previous = _limit_snapshot("70%", now - timedelta(minutes=1), future_reset)
+        current = _limit_snapshot("100%", now)
+
+        self.assertEqual(
+            compute_usage_limit_resets(
+                {"five_hour_limit": future_reset},
+                current,
+                previous=previous,
+                now=now,
+            ),
+            [],
+        )
+
+    def test_invalid_schedule_blocks_rapid_replenishment_inference(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        previous = _limit_snapshot("70%", now - timedelta(minutes=1))
+        current = _limit_snapshot("100%", now)
+
+        self.assertEqual(
+            compute_usage_limit_resets(
+                {"five_hour_limit": "not-a-date"},
+                current,
+                previous=previous,
+                now=now,
+            ),
+            [],
+        )
+
+    def test_small_or_slow_full_replenishment_is_not_inferred_as_a_reset(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        small_change = compute_usage_limit_resets(
+            {},
+            _limit_snapshot("100%", now),
+            previous=_limit_snapshot("97%", now - timedelta(seconds=30)),
+            now=now,
+        )
+        long_gap = compute_usage_limit_resets(
+            {},
+            _limit_snapshot("100%", now),
+            previous=_limit_snapshot("70%", now - timedelta(minutes=16)),
+            now=now,
+        )
+
+        self.assertEqual(small_change, [])
+        self.assertEqual(long_gap, [])
+
+    def test_present_reset_time_remains_authoritative(self) -> None:
+        now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        previous_at = "2026-09-18T10:30:00+09:00"
+        previous = _limit_snapshot("70%", now - timedelta(minutes=1), previous_at)
+        current = _limit_snapshot("100%", now, "2026-09-18T11:00:00+09:00")
+
+        self.assertEqual(
+            compute_usage_limit_resets(
+                {"five_hour_limit": previous_at},
+                current,
+                previous=previous,
+                now=now,
+            ),
+            [],
+        )
+
 
 class MonitorLimitResetNotificationTest(unittest.TestCase):
     def _make_monitor(self, config_dir: str, **kwargs) -> CodexUsageMonitor:
@@ -216,6 +367,101 @@ class MonitorLimitResetNotificationTest(unittest.TestCase):
             joined = " | ".join(str(line[0]) for line in lines)
             self.assertIn("사용 한도 초기화", joined)
             self.assertIn("5시간 사용 한도 초기화됨", joined)
+
+    def test_reset_without_new_timestamp_notifies_once_and_discards_stale_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            monitor._CodexUsageMonitor__root = _FakeRoot()
+            now = datetime.now(timezone.utc)
+            due_at = now - timedelta(seconds=30)
+            previous = _limit_snapshot(
+                "100%",
+                now - timedelta(minutes=1),
+                _iso(due_at),
+            )
+            current = _limit_snapshot("100%", now)
+            later = _limit_snapshot(
+                "100%",
+                now + timedelta(seconds=45),
+                _iso(now + timedelta(hours=4)),
+            )
+            shown: list = []
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__ui_post",
+                side_effect=lambda fn: fn(),
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__get_last_input_tick",
+                return_value=None,
+                create=True,
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__show_alert_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(
+                    (text, lines, duration_ms)
+                ),
+            ), patch(
+                "src.utils.reset_fanfare.play_reset_fanfare", return_value=True
+            ) as play_mock:
+                monitor.handle_snapshot(previous)
+                monitor.handle_snapshot(current)
+                self.assertNotIn(
+                    "five_hour_limit",
+                    monitor._CodexUsageMonitor__limit_reset_baselines,
+                )
+                monitor.handle_snapshot(later)
+
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(play_mock.call_count, 1)
+            joined = " | ".join(str(line[0]) for line in (shown[0][1] or []))
+            self.assertIn("5시간 사용 한도 초기화됨", joined)
+
+    def test_unparseable_backfilled_metric_does_not_notify_or_discard_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            monitor._CodexUsageMonitor__root = _FakeRoot()
+            now = datetime.now(timezone.utc)
+            due_at = now - timedelta(minutes=1)
+            previous = _limit_snapshot("100%", now - timedelta(minutes=2))
+            observed = UsageSnapshot.from_metrics(
+                {"weekly_limit": "80%"},
+                captured_at=_iso(now),
+                reported_metric_keys=("five_hour_limit", "weekly_limit"),
+            )
+            monitor._CodexUsageMonitor__last_snapshot = previous
+            monitor._CodexUsageMonitor__limit_reset_baselines = {
+                "five_hour_limit": _iso(due_at)
+            }
+            shown: list = []
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__ui_post",
+                side_effect=lambda fn: fn(),
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__get_last_input_tick",
+                return_value=None,
+                create=True,
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__show_alert_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(
+                    (text, lines, duration_ms)
+                ),
+            ), patch(
+                "src.utils.reset_fanfare.play_reset_fanfare", return_value=True
+            ) as play_mock:
+                monitor.handle_snapshot(observed)
+
+            self.assertEqual(shown, [])
+            self.assertEqual(play_mock.call_count, 0)
+            self.assertEqual(
+                monitor._CodexUsageMonitor__limit_reset_baselines[
+                    "five_hour_limit"
+                ],
+                _iso(due_at),
+            )
 
     def test_same_reset_timestamp_does_not_realert(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
