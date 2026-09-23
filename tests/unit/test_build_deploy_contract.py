@@ -37,10 +37,16 @@ class BuildDeployContractTest(unittest.TestCase):
         )
         self.assertIn('tcltk\\_tcl_data;_tcl_data', script)
         self.assertIn('tcltk\\_tk_data;_tk_data', script)
-        # Onefile extraction must stay beside the executable.  A system temp
-        # parent such as C:\\Windows\\Temp can be non-enumerable for an
-        # elevated launch, which makes Tcl reject an otherwise valid init.tcl.
-        self.assertIn('--runtime-tmpdir "."', script)
+        # Onefile extraction uses a per-user root expanded by the bootloader at
+        # run time. A system temp parent such as C:\\Windows\\Temp can be
+        # non-enumerable for an elevated launch, and an executable-relative
+        # "." fails in a non-writable working folder (hotfix v0.31.5). The
+        # doubled percent signs keep the build account's path out of the exe.
+        self.assertIn(
+            '--runtime-tmpdir "%%LOCALAPPDATA%%\\windows-supporter\\runtime"',
+            script,
+        )
+        self.assertNotIn('--runtime-tmpdir "."', script)
         self.assertIn('set "TEMP=%SystemRoot%\\Temp"', script)
         self.assertIn('set "TMP=%SystemRoot%\\Temp"', script)
         # The staged entry points must be verified inside the built archive so
