@@ -14,6 +14,7 @@ from src.apps.ai_usage_contracts import (
 )
 from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
 from src.apps.codex_usage_taskbar_overlay import draw_provider_mark
+from src.apps.profile_detail_canvas import ProfileDetailCanvas
 
 
 class CodexUsageSettingsView:
@@ -62,9 +63,8 @@ class CodexUsageSettingsView:
         self._account_metric_vars = {}
         self._account_metric_display_vars = {}
         self._account_metric_cells = {}
-        self._account_metric_layouts = {}
         self._account_metric_visibility = {}
-        self._account_text_widgets = {}
+        self._account_detail_canvases = {}
         self._account_order: list[str] = []
         self._pane_boxes: dict[str, Any] = {}
         self._pane_lists: dict[str, Any] = {}
@@ -176,9 +176,8 @@ class CodexUsageSettingsView:
         self._account_metric_vars = {}
         self._account_metric_display_vars = {}
         self._account_metric_cells = {}
-        self._account_metric_layouts = {}
         self._account_metric_visibility = {}
-        self._account_text_widgets = {}
+        self._account_detail_canvases = {}
         self._account_provider_vars = {}
         self._account_provider_marks = {}
         self._account_taskbar_selected_vars = {}
@@ -989,116 +988,56 @@ class CodexUsageSettingsView:
             self._account_query_buttons[account_id] = query_button
             self._account_login_buttons[account_id] = login_button
             self._account_logout_buttons[account_id] = logout_button
-            detail_row = 2
             status_var = tk.StringVar(value="조회 상태: -")
             snapshot_var = tk.StringVar(value="값 상태: -")
             self._account_status_vars[account_id] = status_var
             self._account_snapshot_vars[account_id] = snapshot_var
-            text_widgets = []
-            for value_var in (status_var, snapshot_var):
-                status_label = tk.Label(
-                    card,
-                    textvariable=value_var,
-                    bg=card_bg,
-                    fg="#6B7280",
-                    font=("Segoe UI", 8),
-                    anchor="w",
-                    justify="left",
-                    wraplength=self._scaled_wrap_length(260),
-                )
-                status_label.grid(
-                    row=detail_row,
-                    column=0,
-                    sticky="we",
-                    padx=8,
-                    pady=(0, 1),
-                )
-                text_widgets.append(status_label)
-                detail_row += 1
-            metric_grid = tk.Frame(card, bg=card_bg)
-            metric_grid.grid(
-                row=detail_row,
+            # 상태 줄·지표 표·경로 줄을 캔버스 하나에 그린다. 각각 Label로
+            # 두면 카드당 네이티브 창이 수십 개가 되어 탭 열기와 창 크기
+            # 조절이 프로필 수에 비례해 멈춘다.
+            detail = ProfileDetailCanvas(tk, card, bg=card_bg)
+            detail.canvas.grid(
+                row=2,
                 column=0,
                 sticky="we",
                 padx=8,
-                pady=(1, 3),
+                pady=(0, 2),
             )
-            try:
-                # 라벨-값-라벨-값 4열: 값들이 같은 열에 정렬되어야 한눈에
-                # 스캔된다. 라벨 열은 내용에 맞고 값 열이 남은 폭을 가진다.
-                metric_grid.columnconfigure(0, weight=0)
-                metric_grid.columnconfigure(1, weight=1)
-                metric_grid.columnconfigure(2, weight=0)
-                metric_grid.columnconfigure(3, weight=1)
-            except Exception:
-                pass
+            for value_var in (status_var, snapshot_var):
+                detail.add_line(
+                    section="top",
+                    variable=value_var,
+                    wraplength=self._scaled_wrap_length(260),
+                )
             metric_vars, display_vars = self._build_account_metric_rows(
-                metric_grid,
-                card_bg,
+                detail,
                 provider=provider,
                 account_id=account_id,
             )
             self._account_metric_vars[account_id] = metric_vars
             self._account_metric_display_vars[account_id] = display_vars
-            self._account_text_widgets[account_id] = text_widgets
-            try:
-                metric_grid.bind(
-                    "<Configure>",
-                    lambda event, grid=metric_grid, aid=account_id: self._reflow_metric_grid(
-                        grid,
-                        aid,
-                        available_width=int(getattr(event, "width", 0) or 0),
-                    ),
-                )
-            except Exception:
-                pass
-            detail_row += 1
+            self._account_detail_canvases[account_id] = detail
             for prefix, key, clickable in (
                 ("설정 파일", "settings_path", True),
                 ("상태 파일", "state_path", False),
                 ("프로필 경로", "profile_dir", False),
             ):
                 value = str(raw.get(key, "") or "").strip()
-                path_label = tk.Label(
-                    card,
+                detail.add_line(
+                    section="bottom",
                     text=(
                         f"{prefix}: {self._shorten_path(value, max_chars=48)}"
                         if value
                         else f"{prefix}: (알 수 없음)"
                     ),
-                    bg=card_bg,
-                    fg="#2563EB" if clickable and value else text_muted,
-                    font=("Segoe UI", 8),
-                    anchor="w",
-                    justify="left",
+                    fill="#2563EB" if clickable and value else text_muted,
                     wraplength=self._scaled_wrap_length(300),
-                )
-                path_label.grid(
-                    row=detail_row,
-                    column=0,
-                    sticky="we",
-                    padx=8,
-                    pady=(0, 1),
-                )
-                if clickable and value:
-                    try:
-                        path_label.configure(cursor="hand2")
-                        path_label.bind("<Button-1>", lambda _e, path=value: self._open_path(path))
-                    except Exception:
-                        pass
-                text_widgets.append(path_label)
-                detail_row += 1
-            try:
-                card.bind(
-                    "<Configure>",
-                    lambda event, card_widget=card, aid=account_id: self._fit_account_card_text(
-                        card_widget,
-                        aid,
-                        int(getattr(event, "width", 0) or 0),
+                    on_click=(
+                        (lambda path=value: self._open_path(path))
+                        if clickable and value
+                        else None
                     ),
                 )
-            except Exception:
-                pass
         self._reflow_pane_boxes(panes, side_row)
         try:
             panes.bind(
@@ -1219,10 +1158,7 @@ class CodexUsageSettingsView:
         if available <= 1:
             available = 520
         action_width = self._widget_requested_width(action)
-        try:
-            title.configure(wraplength=max(120, available - action_width - 16))
-        except Exception:
-            pass
+        self._set_wraplength(title, max(120, available - action_width - 16))
         return
 
     def _card_radio_style(self, card_bg: str) -> str:
@@ -1243,6 +1179,23 @@ class CodexUsageSettingsView:
         except Exception:
             return ""
         return name
+
+    @staticmethod
+    def _set_wraplength(widget: Any, wraplength: int) -> None:
+        # 같은 값을 다시 configure하면 Tk가 요구 크기를 재계산하고 배치를
+        # 다시 예약해, <Configure> 처리기가 변화 없이 연쇄를 키운다.
+        if widget is None:
+            return
+        try:
+            if int(widget.cget("wraplength") or 0) == int(wraplength):
+                return
+        except Exception:
+            pass
+        try:
+            widget.configure(wraplength=wraplength)
+        except Exception:
+            pass
+        return
 
     def _redraw_provider_mark(self, account_id: str) -> None:
         canvas = self._account_provider_marks.get(str(account_id or ""))
@@ -1270,25 +1223,10 @@ class CodexUsageSettingsView:
             available = 360
         provider_width = self._widget_requested_width(provider)
         mark_width = self._widget_requested_width(mark) + 4
-        try:
-            label.configure(wraplength=max(90, available - provider_width - mark_width - 28))
-        except Exception:
-            pass
-        return
-
-    def _fit_account_card_text(self, card: Any, account_id: str, width: int) -> None:
-        available = int(width or 0)
-        if available <= 1:
-            try:
-                available = int(card.winfo_width())
-            except Exception:
-                available = 360
-        wraplength = max(100, available - 18)
-        for widget in self._account_text_widgets.get(str(account_id or ""), ()):
-            try:
-                widget.configure(wraplength=wraplength)
-            except Exception:
-                pass
+        self._set_wraplength(
+            label,
+            max(90, available - provider_width - mark_width - 28),
+        )
         return
 
     @staticmethod
@@ -1381,6 +1319,21 @@ class CodexUsageSettingsView:
             cursor += widget_width + gap
             column += 1
         rows_needed = placements[-1][1] + 1
+        # 폭이 조금 바뀌어도 줄바꿈 결과가 같으면 grid_remove/pack을 반복하지
+        # 않는다. 반복하면 위젯이 매번 다시 배치되어 배치 연쇄가 커진다.
+        placement_signature = tuple(
+            (id(widget), row_index, column_index)
+            for widget, row_index, column_index in placements
+        )
+        if (
+            getattr(container, "_windows_supporter_row_placement", None)
+            == placement_signature
+        ):
+            return
+        try:
+            container._windows_supporter_row_placement = placement_signature
+        except Exception:
+            pass
         frames = self._widget_row_frames(container, rows_needed)
         use_frames = len(frames) >= rows_needed
         for index, frame in enumerate(frames):
@@ -1487,56 +1440,6 @@ class CodexUsageSettingsView:
                 )
             except Exception:
                 pass
-        return
-
-    def _reflow_metric_grid(
-        self,
-        metric_grid: Any,
-        account_id: str,
-        *,
-        available_width: int | None = None,
-    ) -> None:
-        layout = self._account_metric_layouts.get(str(account_id or ""))
-        if not isinstance(layout, dict):
-            return
-        rows = layout.get("rows")
-        if not isinstance(rows, list) or not rows:
-            return
-        width = int(available_width or 0)
-        if width <= 1:
-            try:
-                width = int(metric_grid.winfo_width())
-            except Exception:
-                width = 0
-        pair_columns = 2 if width <= 1 or width >= 700 else 1
-        self._configure_stable_value_grid(
-            metric_grid,
-            [cells for _key, cells in rows],
-            pair_columns=pair_columns,
-        )
-        visibility = self._account_metric_visibility.get(str(account_id or ""), {})
-        for index, (key, cells) in enumerate(rows):
-            pair_column = index % pair_columns
-            row = index // pair_columns
-            widgets = self._metric_cell_widgets(cells)
-            for widget_index, widget in enumerate(widgets):
-                try:
-                    if visibility.get(key, True):
-                        widget.grid(
-                            row=row,
-                            column=pair_column * 2 + widget_index,
-                            sticky="we" if widget_index else "e",
-                            padx=(6, 12) if widget_index == 1 and pair_column == 0 else (6, 0)
-                            if widget_index == 1
-                            else (0, 6)
-                            if pair_column == 0
-                            else (18, 6),
-                            pady=1,
-                        )
-                    else:
-                        widget.grid_remove()
-                except Exception:
-                    pass
         return
 
     def _reflow_runtime_grid(self, runtime_grid: Any, *, available_width: int | None = None) -> None:
@@ -1657,7 +1560,7 @@ class CodexUsageSettingsView:
                 wraplength = int(node.cget("wraplength") or 0)
             except Exception:
                 wraplength = 0
-            if wraplength > 0:
+            if wraplength > 0 or getattr(node, "_windows_supporter_wraps", False):
                 continue
             leaf_width = self._widget_requested_width(node)
             if leaf_width > 0:
@@ -2089,8 +1992,7 @@ class CodexUsageSettingsView:
 
     def _build_account_metric_rows(
         self,
-        parent: Any,
-        bg: str,
+        table: Any,
         *,
         provider: str = "codex",
         account_id: str = "",
@@ -2127,13 +2029,8 @@ class CodexUsageSettingsView:
             )
         metric_vars: dict[str, Any] = {}
         display_vars: dict[str, Any] = {}
-        if account_id:
-            self._account_metric_layouts[account_id] = {
-                "parent": parent,
-                "rows": [],
-            }
-        for row_index, row in enumerate(rows):
-            for pair_index, (key, label) in enumerate(row):
+        for row in rows:
+            for key, label in row:
                 value_var = tk.StringVar(value="-")
                 display_var = tk.StringVar(value="-")
                 metric_vars[key] = value_var
@@ -2142,22 +2039,16 @@ class CodexUsageSettingsView:
                     value_var,
                     display_var,
                 )
-                cells = self._add_metric_cell(
-                    parent,
-                    row_index,
-                    pair_index,
+                cell = table.add(
+                    key,
                     label,
                     display_var,
-                    bg,
                     wraplength=self._scaled_wrap_length(
                         320 if key == "on_demand_status" else 200
                     ),
                 )
-                if account_id and cells is not None:
-                    self._account_metric_cells.setdefault(account_id, {})[key] = cells
-                    self._account_metric_layouts[account_id]["rows"].append((key, cells))
-        if account_id:
-            self._reflow_metric_grid(parent, account_id)
+                if account_id and cell is not None:
+                    self._account_metric_cells.setdefault(account_id, {})[key] = cell
         return metric_vars, display_vars
 
     def _bind_metric_display_value(
@@ -2196,58 +2087,6 @@ class CodexUsageSettingsView:
             return True
         except Exception:
             return False
-
-    def _add_metric_cell(
-        self,
-        parent: Any,
-        row: int,
-        pair_index: int,
-        label: str,
-        display_var: Any,
-        bg: str,
-        *,
-        wraplength: int = 200,
-    ) -> tuple[Any, Any] | None:
-        tk = self._tk
-        if tk is None:
-            return None
-        column = int(pair_index)
-        label_pad = (0, 6) if column == 0 else (18, 6)
-        label_cell = tk.Label(
-            parent,
-            text=str(label),
-            bg=bg,
-            fg="#6B7280",
-            font=("Segoe UI", 9),
-            anchor="e",
-            justify="right",
-            wraplength=max(90, int(wraplength // 2)),
-        )
-        label_cell.grid(
-            row=row,
-            column=column * 2,
-            sticky="e",
-            padx=label_pad,
-            pady=1,
-        )
-        value_cell = tk.Label(
-            parent,
-            textvariable=display_var,
-            bg=bg,
-            fg="#111827",
-            font=("Segoe UI", 9),
-            anchor="w",
-            justify="left",
-            wraplength=max(1, int(wraplength)),
-        )
-        value_cell.grid(
-            row=row,
-            column=column * 2 + 1,
-            sticky="we",
-            padx=(6, 0) if column else (6, 12),
-            pady=1,
-        )
-        return (label_cell, value_cell)
 
     def _add_value_row(
         self,

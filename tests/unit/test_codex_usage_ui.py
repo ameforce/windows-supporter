@@ -209,6 +209,22 @@ class _FakeTk:
         return widget
 
 
+class _FakeDetailTable:
+    def __init__(self):
+        self.added = []
+
+    def add(self, key, label, display_var, *, wraplength):
+        self.added.append(
+            {
+                "key": key,
+                "label": label,
+                "display_var": display_var,
+                "wraplength": int(wraplength),
+            }
+        )
+        return object()
+
+
 class _FakeButton(_FakeWidget):
     def __init__(self, owner=None, *args, **kwargs):
         super().__init__(owner, *args, **kwargs)
@@ -552,6 +568,69 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
                 view._schedule_runtime_refresh.assert_called_once_with(1000)
 
+    def test_fit_handlers_skip_unchanged_wraplength(self) -> None:
+        class _WrapLabel:
+            def __init__(self):
+                self.options = {"wraplength": 0}
+                self.configure_calls = []
+
+            def cget(self, key):
+                return self.options[key]
+
+            def configure(self, **kwargs):
+                self.configure_calls.append(dict(kwargs))
+                self.options.update(kwargs)
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        label = _WrapLabel()
+
+        view._set_wraplength(label, 240)
+        view._set_wraplength(label, 240)
+        view._set_wraplength(label, 250)
+
+        # 같은 값의 configure는 Tk 배치를 다시 예약해 <Configure> 연쇄를
+        # 키우므로, 값이 바뀔 때만 적용한다.
+        self.assertEqual(label.configure_calls, [{"wraplength": 240}, {"wraplength": 250}])
+
+    def test_responsive_row_reflow_skips_unchanged_placement(self) -> None:
+        class _RowChild(_FakeWidget):
+            def __init__(self, width):
+                super().__init__()
+                self.pack_calls = 0
+                self.grid_remove_calls = 0
+                self._width = width
+
+            def winfo_reqwidth(self):
+                return self._width
+
+            def pack(self, **kwargs):
+                self.pack_calls += 1
+                super().pack(**kwargs)
+
+            def grid_remove(self):
+                self.grid_remove_calls += 1
+
+        class _RowFrame(_FakeWidget):
+            def grid_remove(self):
+                return None
+
+        class _RowTk:
+            def Frame(self, *args, **kwargs):
+                return _RowFrame(None, *args, **kwargs)
+
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = _RowTk()
+        container = _SizingWidget(width=400)
+        children = [_RowChild(100), _RowChild(100)]
+
+        view._reflow_widget_row(container, children, max_columns=2, available_width=400)
+        view._reflow_widget_row(container, children, max_columns=2, available_width=390)
+        self.assertEqual([child.pack_calls for child in children], [1, 1])
+
+        # 폭이 줄어 줄바꿈 결과가 바뀌면 다시 배치한다.
+        view._reflow_widget_row(container, children, max_columns=2, available_width=150)
+        self.assertEqual([child.pack_calls for child in children], [2, 2])
+
     def test_rate_limit_status_uses_user_facing_retry_countdown(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
 
@@ -582,45 +661,34 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(value_label.grid_kwargs.get("sticky"), "w")
         self.assertGreater(int(value_label.kwargs.get("wraplength", 0)), 0)
 
-    def test_account_metric_rows_align_values_in_label_value_grid(self) -> None:
+    def test_account_metric_rows_feed_detail_table_in_pair_order(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         fake_tk = _FakeTk()
         view._tk = fake_tk
+        table = _FakeDetailTable()
 
-        metric_vars, _display_vars = view._build_account_metric_rows(
-            parent=object(),
-            bg="#FFFFFF",
+        metric_vars, display_vars = view._build_account_metric_rows(
+            table,
+            account_id="codex-1",
         )
 
-        self.assertIn("captured_at", metric_vars)
-        # 라벨-값-라벨-값 4열: 값이 항상 홀수 열에 정렬되어 눈이 열을 따라
-        # 훑을 수 있어야 한다.
-        label_cells = [
-            label
-            for label in fake_tk.labels
-            if label.kwargs.get("text")
-        ]
-        value_cells = [
-            label
-            for label in fake_tk.labels
-            if label.kwargs.get("textvariable") is not None
-        ]
+        # 지표는 Label 쌍이 아니라 카드 상세 캔버스의 행으로 들어간다.
+        # 라벨-값-라벨-값 표에서 같은 행의 두 지표가 연달아 추가되어야
+        # 표가 짝수·홀수 순서로 두 열에 정렬한다.
+        self.assertEqual(fake_tk.labels, [])
         self.assertEqual(
-            {label.grid_kwargs.get("column") for label in label_cells},
-            {0, 2},
+            [entry["key"] for entry in table.added[:4]],
+            ["captured_at", "remaining_credit", "five_hour_limit", "five_hour_limit_reset_at"],
         )
         self.assertEqual(
-            {label.grid_kwargs.get("column") for label in value_cells},
-            {1, 3},
+            [entry["label"] for entry in table.added[:2]],
+            ["최근 확인 시각", "남은 크레딧"],
         )
-        self.assertTrue(
-            all(label.kwargs.get("anchor") == "e" for label in label_cells)
-        )
-        self.assertTrue(
-            all(int(label.kwargs.get("wraplength", 0)) <= 260 for label in value_cells)
-        )
+        self.assertTrue(all(entry["wraplength"] <= 260 for entry in table.added))
+        self.assertEqual(set(view._account_metric_cells["codex-1"]), set(metric_vars))
 
-        captured_display = value_cells[0].kwargs.get("textvariable")
+        captured_display = table.added[0]["display_var"]
+        self.assertIs(captured_display, display_vars["captured_at"])
         metric_vars["captured_at"].set("2026-06-25 09:07:55")
         self.assertEqual(captured_display.get(), "2026-06-25 09:07:55")
 
@@ -629,9 +697,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         fake_tk = _FakeTk()
         view._tk = fake_tk
 
+        table = _FakeDetailTable()
         metric_vars, display_vars = view._build_account_metric_rows(
-            parent=object(),
-            bg="#FFFFFF",
+            table,
             provider="cursor",
         )
 
@@ -642,10 +710,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(display_vars["included_usage"].get(), "-")
         self.assertEqual(display_vars["billing_reset_at"].get(), "-")
         self.assertEqual(display_vars["on_demand_status"].get(), "-")
-        self.assertGreaterEqual(
-            int(fake_tk.labels[-1].kwargs.get("wraplength", 0)),
-            300,
-        )
+        self.assertEqual(table.added[-1]["key"], "on_demand_status")
+        self.assertGreaterEqual(table.added[-1]["wraplength"], 300)
         metric_vars["on_demand_status"].set("활성화 · US$8.20\u00a0사용")
         self.assertEqual(
             display_vars["on_demand_status"].get(),
@@ -658,8 +724,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._tk = fake_tk
 
         metric_vars, display_vars = view._build_account_metric_rows(
-            parent=object(),
-            bg="#FFFFFF",
+            _FakeDetailTable(),
             provider="claude",
         )
 
@@ -1474,8 +1539,16 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         texts = [label.kwargs.get("text") for label in fake_tk.labels]
         self.assertIn("Codex 1", texts)
         self.assertIn("Codex 2", texts)
-        self.assertIn("프로필 경로: profile-1", texts)
-        self.assertIn("프로필 경로: profile-2", texts)
+        # 상태·경로 줄은 카드의 상세 캔버스 텍스트 항목으로 그린다.
+        canvas_texts = [
+            kwargs.get("text")
+            for canvas in fake_tk.canvases
+            for kind, _args, kwargs in canvas.drawn_items
+            if kind == "text"
+        ]
+        self.assertIn("프로필 경로: profile-1", canvas_texts)
+        self.assertIn("프로필 경로: profile-2", canvas_texts)
+        self.assertIn("조회 상태: -", canvas_texts)
 
     def test_mount_renders_saved_right_priority_boxes_on_first_paint(self) -> None:
         class _FakeMonitor:

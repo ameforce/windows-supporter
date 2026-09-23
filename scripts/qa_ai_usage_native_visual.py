@@ -697,6 +697,20 @@ def _collect_widget_metrics(root: Any) -> dict[str, Any]:
         )
         if text and intersects_viewport and requested_width > width + 1:
             text_overflow.append(path)
+        if widget_class == "Canvas" and intersects_viewport:
+            # 카드 상세 영역은 Label 대신 캔버스 텍스트 항목으로 그리므로,
+            # 보이는 텍스트 항목이 캔버스 폭을 넘는지 따로 확인한다.
+            try:
+                for item in widget.find_all():
+                    if widget.type(item) != "text":
+                        continue
+                    if str(widget.itemcget(item, "state")) == "hidden":
+                        continue
+                    box = widget.bbox(item)
+                    if box and (box[0] < -1 or box[2] > width + 1):
+                        text_overflow.append(f"{path}#{item}")
+            except Exception:
+                pass
     return {
         "widget_count": len(widgets),
         "clipped_widgets": clipped,
@@ -723,15 +737,37 @@ def _layout_stability_targets(view: Any) -> dict[str, Any]:
         for account_id, by_key in metric_cells.items():
             if not isinstance(by_key, dict):
                 continue
-            for metric_key, cells in by_key.items():
-                widgets = view._metric_cell_widgets(cells)
-                for index, widget in enumerate(widgets):
-                    role = "label" if index == 0 else "value"
-                    targets[f"metric:{account_id}:{metric_key}:{role}"] = widget
+            for metric_key, cell in by_key.items():
+                # 지표는 카드 상세 캔버스의 텍스트 항목이다. 이름 오른쪽 끝과
+                # 값 왼쪽 시작이 값 길이·선택 행 표시와 무관하게 고정돼야 한다.
+                for role in ("label", "value"):
+                    targets[f"metric:{account_id}:{metric_key}:{role}"] = (
+                        "metric-cell",
+                        cell,
+                        role,
+                    )
     return {key: widget for key, widget in targets.items() if widget is not None}
 
 
+def _metric_cell_horizontal_geometry(target: Any, root: Any) -> list[int] | None:
+    _kind, cell, role = target
+    try:
+        canvas = cell.owner.canvas
+        if not cell.visible or not canvas.winfo_ismapped():
+            return None
+        item = cell.label_item if role == "label" else cell.value_item
+        x = float(canvas.coords(item)[0])
+        # 텍스트 항목의 줄바꿈 폭은 열 폭을 따른다. 이를 폭으로 기록해 값
+        # 길이·선택 행 표시에 따른 열 폭 흔들림도 잡는다.
+        wrap_width = int(float(canvas.itemcget(item, "width") or 0))
+        return [int(canvas.winfo_rootx()) - int(root.winfo_rootx()) + int(x), wrap_width]
+    except Exception:
+        return None
+
+
 def _mapped_horizontal_geometry(widget: Any, root: Any) -> list[int] | None:
+    if isinstance(widget, tuple) and widget and widget[0] == "metric-cell":
+        return _metric_cell_horizontal_geometry(widget, root)
     try:
         if not widget.winfo_ismapped():
             return None
