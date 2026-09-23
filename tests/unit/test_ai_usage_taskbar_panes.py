@@ -21,6 +21,22 @@ class _FakeVar:
         return None
 
 
+class _FakePaneWidget:
+    def __init__(self):
+        self.configure_calls = []
+        self.grid_calls = []
+        self.grid_remove_calls = 0
+
+    def configure(self, **kwargs):
+        self.configure_calls.append(kwargs)
+
+    def grid(self, **kwargs):
+        self.grid_calls.append(kwargs)
+
+    def grid_remove(self):
+        self.grid_remove_calls += 1
+
+
 class ResolveTaskbarPaneAssignmentTest(unittest.TestCase):
     def test_left_priority_maps_first_two_to_left(self) -> None:
         assignment = resolve_taskbar_pane_assignment(
@@ -179,6 +195,134 @@ class ApplyPaneDropTest(unittest.TestCase):
         self.assertFalse(view._pane_assignment_rendered_stale())
         view._taskbar_side_priority_var.set("right")
         self.assertTrue(view._pane_assignment_rendered_stale())
+
+
+class PaneDragFeedbackTest(unittest.TestCase):
+    def _build_view(self, target):
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        profile_ids = [f"profile-{index}" for index in range(8)]
+        view._profile_deletions_inflight = set()
+        view._profile_actions_inflight = set()
+        view._drag_state = {"id": profile_ids[0], "target": None, "index": 0}
+        view._pane_boxes = {
+            side: _FakePaneWidget() for side in ("left", "right", "pool")
+        }
+        view._pane_lists = {
+            side: _FakePaneWidget() for side in ("left", "right", "pool")
+        }
+        view._drop_indicators = {
+            side: _FakePaneWidget() for side in ("left", "right", "pool")
+        }
+        view._pane_card_widgets = {
+            profile_id: _FakePaneWidget() for profile_id in profile_ids
+        }
+        view._rendered_pane_assignment = {
+            "left": [],
+            "right": [],
+            "pool": profile_ids,
+        }
+        view._pane_drop_target_at = lambda *_args: target[0]
+        return view, profile_ids
+
+    def test_repeated_motion_in_same_slot_does_not_reflow_eight_profiles(self) -> None:
+        target = [("pool", 2)]
+        view, profile_ids = self._build_view(target)
+        event = type("Event", (), {"x_root": 10, "y_root": 20})()
+
+        view._on_pane_drag_motion(event)
+        box_configure_counts = {
+            side: len(box.configure_calls)
+            for side, box in view._pane_boxes.items()
+        }
+
+        for _ in range(99):
+            view._on_pane_drag_motion(event)
+
+        self.assertEqual(
+            {side: len(box.configure_calls) for side, box in view._pane_boxes.items()},
+            box_configure_counts,
+        )
+
+        self.assertEqual(view._drag_state["target"], "pool")
+        self.assertEqual(view._drag_state["index"], 2)
+        self.assertEqual(
+            [len(view._pane_card_widgets[item].grid_calls) for item in profile_ids[1:]],
+            [1] * 7,
+        )
+        self.assertEqual(len(view._drop_indicators["pool"].grid_calls), 1)
+
+        target[0] = ("pool", 3)
+        view._on_pane_drag_motion(event)
+
+        self.assertEqual(view._drag_state["index"], 3)
+        self.assertEqual(
+            [len(view._pane_card_widgets[item].grid_calls) for item in profile_ids[1:]],
+            [2] * 7,
+        )
+        self.assertEqual(len(view._drop_indicators["pool"].grid_calls), 2)
+
+        target[0] = ("left", 0)
+        view._on_pane_drag_motion(event)
+
+        self.assertEqual(view._drag_state["target"], "left")
+        self.assertEqual(view._drag_state["index"], 0)
+        self.assertEqual(len(view._drop_indicators["left"].grid_calls), 1)
+        self.assertEqual(view._drop_indicators["pool"].grid_remove_calls, 3)
+
+    def test_repeated_motion_outside_panes_clears_feedback_once(self) -> None:
+        target = [("pool", 2)]
+        view, _profile_ids = self._build_view(target)
+        event = type("Event", (), {"x_root": 10, "y_root": 20})()
+        view._on_pane_drag_motion(event)
+
+        target[0] = None
+        for _ in range(100):
+            view._on_pane_drag_motion(event)
+
+        self.assertIsNone(view._drag_state["target"])
+        self.assertEqual(view._drop_indicators["pool"].grid_remove_calls, 2)
+        self.assertEqual(
+            [widget.grid_remove_calls for widget in view._drop_indicators.values()],
+            [2, 2, 2],
+        )
+
+    def test_inflight_transition_clears_target_highlight_once(self) -> None:
+        target = [("left", 0)]
+        view, _profile_ids = self._build_view(target)
+        event = type("Event", (), {"x_root": 10, "y_root": 20})()
+        view._on_pane_drag_motion(event)
+        self.assertEqual(
+            view._pane_boxes["left"].configure_calls[-1],
+            {"highlightbackground": "#2563EB", "highlightthickness": 2},
+        )
+
+        view._profile_actions_inflight.add("profile-1")
+        view._on_pane_drag_motion(event)
+        self.assertIsNone(view._drag_state["target"])
+        self.assertEqual(
+            view._pane_boxes["left"].configure_calls[-1],
+            {"highlightbackground": "#E5E7EB", "highlightthickness": 1},
+        )
+        box_call_counts = {
+            side: len(box.configure_calls)
+            for side, box in view._pane_boxes.items()
+        }
+        indicator_remove_counts = {
+            side: indicator.grid_remove_calls
+            for side, indicator in view._drop_indicators.items()
+        }
+
+        for _ in range(100):
+            view._on_pane_drag_motion(event)
+
+        self.assertEqual(
+            {side: len(box.configure_calls) for side, box in view._pane_boxes.items()},
+            box_call_counts,
+        )
+        self.assertEqual(
+            {side: indicator.grid_remove_calls for side, indicator in view._drop_indicators.items()},
+            indicator_remove_counts,
+        )
 
 
 if __name__ == "__main__":
