@@ -9225,6 +9225,193 @@ class OverlayScalingCacheChurnRegressionTest(unittest.TestCase):
             root.destroy()
 
 
+_MTA_PROBE_SCRIPT = 'import ctypes, sys\nassert "comtypes" not in sys.modules\nimport src.apps.codex_usage_taskbar_overlay as ov\nassert "comtypes" not in sys.modules\ndef probe(*_a, **_k):\n    import comtypes  # must import cleanly on the MTA worker\n    t = ctypes.c_int(); q = ctypes.c_int()\n    ctypes.oledll.ole32.CoGetApartmentType(ctypes.byref(t), ctypes.byref(q))\n    return [{"span": (0, 8), "apartment": t.value}]\nov._uia_taskbar_occupied_span_records = probe\nprint(ov._UiaSpanSampler(min_interval_sec=0.0).records(1920, 0, 40)[0]["apartment"])\n'
+
+
+class UiaSpanSamplerTest(unittest.TestCase):
+    def _record(self, start):
+        return {"span": (start, start + 40), "control_type": 50000, "source": "uia"}
+
+    def test_uia_walk_runs_off_the_calling_thread(self):
+        import threading
+
+        threads = []
+
+        def sampler(*_args, **_kwargs):
+            threads.append(threading.get_ident())
+            return [self._record(100)]
+
+        uia = taskbar_overlay._UiaSpanSampler(min_interval_sec=0.0)
+        with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+            records = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+
+        self.assertEqual(records, [self._record(100)])
+        self.assertTrue(threads)
+        self.assertNotIn(threading.get_ident(), threads)
+
+    def test_refresh_never_blocks_the_caller_after_first_result(self):
+        import threading
+        import time as _time
+
+        release = threading.Event()
+        calls = []
+
+        def sampler(*_args, **_kwargs):
+            calls.append(1)
+            if len(calls) > 1:
+                release.wait(5.0)
+                return [self._record(300)]
+            return [self._record(100)]
+
+        uia = taskbar_overlay._UiaSpanSampler(min_interval_sec=0.0)
+        try:
+            with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+                first = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+                started = _time.perf_counter()
+                # The worker is now stuck in a slow walk for the refresh.
+                second = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+                third = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+                elapsed = _time.perf_counter() - started
+        finally:
+            release.set()
+
+        self.assertEqual(first, [self._record(100)])
+        self.assertEqual(second, [self._record(100)])
+        self.assertEqual(third, [self._record(100)])
+        self.assertLess(elapsed, 0.5)
+
+    def test_new_request_times_out_to_empty_then_serves_result(self):
+        import threading
+
+        release = threading.Event()
+
+        def sampler(*_args, **_kwargs):
+            release.wait(5.0)
+            return [self._record(200)]
+
+        uia = taskbar_overlay._UiaSpanSampler(first_result_wait_sec=0.05, min_interval_sec=0.0)
+        with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+            self.assertEqual(uia.records(1920, 1000, 1040, taskbar_hwnd=1), [])
+            release.set()
+            deadline = threading.Event()
+            for _ in range(100):
+                records = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+                if records:
+                    break
+                deadline.wait(0.02)
+
+        self.assertEqual(records, [self._record(200)])
+
+    def test_sampler_failure_degrades_to_empty(self):
+        def sampler(*_args, **_kwargs):
+            raise RuntimeError("uia unavailable")
+
+        uia = taskbar_overlay._UiaSpanSampler(min_interval_sec=0.0)
+        with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+            self.assertEqual(uia.records(1920, 1000, 1040, taskbar_hwnd=1), [])
+
+    def test_returned_records_are_copies(self):
+        def sampler(*_args, **_kwargs):
+            return [self._record(100)]
+
+        uia = taskbar_overlay._UiaSpanSampler(min_interval_sec=0.0)
+        with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+            records = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+            records[0]["span"] = (0, 1)
+            again = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+
+        self.assertEqual(again[0]["span"], (100, 140))
+
+    def test_distinct_requests_do_not_share_results(self):
+        def sampler(_width, band_top, _band_bottom, **_kwargs):
+            return [self._record(int(band_top))]
+
+        uia = taskbar_overlay._UiaSpanSampler(min_interval_sec=0.0)
+        with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+            top = uia.records(1920, 0, 40, taskbar_hwnd=1)
+            bottom = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+
+        self.assertEqual(top[0]["span"], (0, 40))
+        self.assertEqual(bottom[0]["span"], (1000, 1040))
+
+    def test_stale_result_waits_for_a_fresh_walk(self):
+        import itertools
+        import time as _time
+
+        counter = itertools.count(100, 100)
+
+        def sampler(*_args, **_kwargs):
+            return [self._record(next(counter))]
+
+        uia = taskbar_overlay._UiaSpanSampler(min_interval_sec=0.0, max_result_age_sec=0.05)
+        with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+            first = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+            _time.sleep(0.15)
+            resumed = uia.records(1920, 1000, 1040, taskbar_hwnd=1)
+
+        # After a pause longer than the age bound the caller must not place
+        # with the old spans; it waits for a newer walk.
+        self.assertEqual(first[0]["span"], (100, 140))
+        self.assertNotEqual(resumed[0]["span"], (100, 140))
+
+    def test_result_cache_is_bounded(self):
+        def sampler(_width, band_top, _band_bottom, **_kwargs):
+            return [self._record(int(band_top))]
+
+        uia = taskbar_overlay._UiaSpanSampler(min_interval_sec=0.0, max_keys=3)
+        with patch.object(taskbar_overlay, "_uia_taskbar_occupied_span_records", sampler):
+            for top in range(6):
+                uia.records(1920, top, top + 40, taskbar_hwnd=1)
+            with uia._condition:
+                size = len(uia._results)
+
+        self.assertLessEqual(size, 3)
+
+    def test_worker_joins_mta_and_uses_comtypes_in_a_fresh_process(self):
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        repo_root = Path(taskbar_overlay.__file__).resolve().parents[2]
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", "-c", _MTA_PROBE_SCRIPT],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # APTTYPE_MTA == 1 (APTTYPE_MAINSTA == 3 would mean the worker became
+        # the process main STA without a message pump).
+        self.assertEqual(result.stdout.strip(), "1")
+
+    def test_geometry_detection_uses_background_sampler(self):
+        calls = []
+
+        def records(*args, **kwargs):
+            calls.append((args, kwargs))
+            return []
+
+        with patch.object(taskbar_overlay._UIA_SPAN_SAMPLER, "records", side_effect=records), patch.object(
+            taskbar_overlay,
+            "_uia_taskbar_occupied_span_records",
+            side_effect=AssertionError("UIA walk must not run on the caller thread"),
+        ), patch.object(
+            taskbar_overlay, "_taskbar_child_occupied_span_records", return_value=[]
+        ), patch.object(
+            taskbar_overlay, "_sample_taskbar_columns", return_value=[]
+        ):
+            taskbar_overlay._detect_horizontal_taskbar_occupied_spans_with_debug(
+                1920,
+                1080,
+                (0, 0, 1920, 1040),
+                {"orientation": "bottom", "_taskbar_hwnd": 7},
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["taskbar_hwnd"], 7)
+
+
 class SlotMinimumBarUnitTest(unittest.TestCase):
     def test_global_minimum_unifies_all_slots(self):
         short_texts = {
