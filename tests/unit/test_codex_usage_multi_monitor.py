@@ -161,6 +161,60 @@ class _FakeTaskbarOverlay:
         return None
 
 
+class _LabelAwareChildMonitor(_FakeChildMonitor):
+    def __init__(self, config_dir: str, profile_dir: str) -> None:
+        super().__init__(config_dir=config_dir, profile_dir=profile_dir)
+        self.alert_label_provider = None
+
+    def set_alert_label_provider(self, provider) -> None:
+        self.alert_label_provider = provider
+
+
+class ChildAlertLabelBindingTest(unittest.TestCase):
+    def test_children_resolve_their_card_label_for_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            children: list[_LabelAwareChildMonitor] = []
+
+            def factory(config_dir: str, profile_dir: str):
+                child = _LabelAwareChildMonitor(config_dir=config_dir, profile_dir=profile_dir)
+                children.append(child)
+                return child
+
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=factory,
+            )
+            accounts = manager.get_runtime_status()["accounts"]
+            self.assertEqual(len(children), len(accounts))
+            for child, account in zip(children, accounts):
+                self.assertTrue(callable(child.alert_label_provider))
+                self.assertEqual(child.alert_label_provider(), account["label"])
+
+            profiles = manager.get_settings_snapshot()["profiles"]
+            profiles[0]["custom_label"] = "내 업무"
+            profiles[0]["label_mode"] = "custom"
+            ok, error = manager.update_settings({"profiles": profiles})
+            self.assertTrue(ok, error)
+            first_id = manager.get_runtime_status()["accounts"][0]["id"]
+            label = manager.get_runtime_status()["accounts"][0]["label"]
+            self.assertEqual(label, "내 업무")
+            current_child = manager._CodexUsageMultiMonitor__children[first_id]
+            self.assertEqual(current_child.alert_label_provider(), "내 업무")
+
+    def test_label_is_empty_for_removed_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = CodexUsageMultiMonitor(
+                config_dir=os.path.join(tmp, "config"),
+                local_base_dir=os.path.join(tmp, "local"),
+                monitor_factory=lambda c, p: _LabelAwareChildMonitor(c, p),
+            )
+            self.assertEqual(
+                manager._CodexUsageMultiMonitor__alert_label_for("missing-profile"),
+                "",
+            )
+
+
 class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
     def _build_manager(self, tmp: str, taskbar_progress_factory=None):
         children: list[_FakeChildMonitor] = []

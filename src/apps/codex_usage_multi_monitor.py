@@ -3241,6 +3241,17 @@ class CodexUsageMultiMonitor:
         profile_dir: str,
         profile_id: str,
     ) -> Any:
+        child = self.__call_monitor_factory(provider, config_dir, profile_dir, profile_id)
+        self.__bind_child_alert_label(child, profile_id)
+        return child
+
+    def __call_monitor_factory(
+        self,
+        provider: str,
+        config_dir: str,
+        profile_dir: str,
+        profile_id: str,
+    ) -> Any:
         factory = self.__monitor_factory
         candidates = (
             (provider, config_dir, profile_dir, profile_id),
@@ -3258,6 +3269,31 @@ class CodexUsageMultiMonitor:
                 continue
             return factory(*args)
         return factory(config_dir, profile_dir)
+
+    def __bind_child_alert_label(self, child: Any, profile_id: str) -> None:
+        setter = getattr(child, "set_alert_label_provider", None)
+        if not callable(setter):
+            return
+        normalized_id = str(profile_id or "")
+        try:
+            setter(lambda: self.__alert_label_for(normalized_id))
+        except Exception:
+            pass
+        return
+
+    def __alert_label_for(self, profile_id: str) -> str:
+        # Same label as the profile card, resolved when the alert is shown so
+        # a rename or a newly verified profile name is reflected.
+        account = self.__account_settings.get(profile_id)
+        if account is None:
+            return ""
+        try:
+            return str(
+                self.__display_account_label(account, self.__safe_child_runtime(profile_id))
+                or ""
+            ).strip()
+        except Exception:
+            return ""
 
     def __replace_child_monitor(self, account_id: str) -> None:
         old_child = self.__children.get(account_id)
