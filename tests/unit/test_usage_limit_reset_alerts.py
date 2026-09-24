@@ -29,7 +29,7 @@ def _reset(key: str, label: str) -> UsageLimitReset:
 
 
 class UsageLimitResetAlertTest(unittest.TestCase):
-    def _alert(self, *, tick=lambda: None, sound=True, root=None):
+    def _alert(self, *, tick=lambda: None, sound=True, root=None, label=None):
         self.sounds: list = []
         self.tooltips: list = []
         self.root = root or _Root()
@@ -39,6 +39,7 @@ class UsageLimitResetAlertTest(unittest.TestCase):
             get_root=lambda: self.root,
             get_duration_ms=lambda: 7000,
             sound_enabled=lambda: sound,
+            get_label=label,
             input_tick=tick,
             play_sound=lambda: self.sounds.append(1) or True,
             show_tooltip=lambda root, lines, ms: self.tooltips.append((lines, ms)),
@@ -54,6 +55,21 @@ class UsageLimitResetAlertTest(unittest.TestCase):
         self.assertEqual(lines[0][0], "Claude 사용 한도 초기화")
         self.assertEqual(lines[1], ("주간 사용 한도 초기화됨", "#16A34A"))
         self.assertEqual(duration, 7000)
+
+    def test_header_names_the_profile_when_label_is_known(self) -> None:
+        alert = self._alert(label=lambda: "  업무 계정 ")
+        alert.submit([_reset("weekly_limit", "주간 사용 한도")])
+        self.assertEqual(self.tooltips[0][0][0][0], "Claude 사용 한도 초기화 - 업무 계정")
+
+    def test_header_falls_back_when_label_is_empty_or_fails(self) -> None:
+        def broken() -> str:
+            raise RuntimeError("manager closed")
+
+        for label in (lambda: "", broken):
+            with self.subTest(label=label):
+                alert = self._alert(label=label)
+                alert.submit([_reset("weekly_limit", "주간 사용 한도")])
+                self.assertEqual(self.tooltips[0][0][0][0], "Claude 사용 한도 초기화")
 
     def test_waits_for_new_user_input_then_flushes_merged_resets(self) -> None:
         ticks = [100]
@@ -230,6 +246,20 @@ class ClaudeLimitResetDetectionTest(unittest.TestCase):
             self.assertIn("weekly_limit", restarted._limit_reset_baselines)
             restarted.collect(force=True)
             self.assertEqual(self.submitted, [["weekly_limit"]])
+
+    def test_alert_header_uses_label_provider_from_profile_manager(self) -> None:
+        monitor = ClaudeUsageMonitor(
+            profile_id="claude-1",
+            browser_session_factory=lambda _config: _Session(),
+        )
+        self.assertEqual(monitor._limit_reset_alert._header(), "Claude 사용 한도 초기화")
+        monitor.set_alert_label_provider(lambda: "Claude 2")
+        self.assertEqual(
+            monitor._limit_reset_alert._header(),
+            "Claude 사용 한도 초기화 - Claude 2",
+        )
+        monitor.set_alert_label_provider(None)
+        self.assertEqual(monitor._limit_reset_alert._header(), "Claude 사용 한도 초기화")
 
     def test_sound_setting_roundtrips_in_settings_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

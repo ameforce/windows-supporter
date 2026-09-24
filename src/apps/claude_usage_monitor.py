@@ -1204,6 +1204,7 @@ class ClaudeUsageMonitor:
         self._stale_after_sec = max(self._refresh_interval_sec, float(stale_after_sec))
         self._tooltip_duration_ms = 7000
         self._limit_reset_sound_enabled = True
+        self._alert_label_provider: Callable[[], str] | None = None
         self._limit_reset_lock = threading.Lock()
         self._limit_reset_baselines: dict[str, str] = {}
         self._last_committed_limit_usage: dict[str, str] | None = None
@@ -1247,6 +1248,7 @@ class ClaudeUsageMonitor:
             get_root=lambda: self._root,
             get_duration_ms=lambda: int(self._tooltip_duration_ms),
             sound_enabled=lambda: bool(self._limit_reset_sound_enabled),
+            get_label=self._resolve_alert_label,
         )
         config = PlaywrightSessionConfig(
             profile_dir=self.profile_dir,
@@ -1944,6 +1946,20 @@ class ClaudeUsageMonitor:
                     self._limit_reset_baselines,
                     UsageSnapshot.from_dict(self._last_committed_limit_usage),
                 )
+
+    def set_alert_label_provider(self, provider: Callable[[], str] | None) -> None:
+        # The profile manager owns the label shown on the profile card; alerts
+        # use the same label so the user can tell which profile was reset.
+        self._alert_label_provider = provider if callable(provider) else None
+
+    def _resolve_alert_label(self) -> str:
+        provider = self._alert_label_provider
+        if provider is None:
+            return ""
+        try:
+            return str(provider() or "").strip()
+        except Exception:
+            return ""
 
     def _post_ui(self, fn: Callable[[], None]) -> bool:
         queue_obj = self._event_queue
