@@ -1850,6 +1850,53 @@ def compute_usage_limit_resets(
     return resets
 
 
+def advance_limit_reset_baselines(
+    baselines: dict[str, str],
+    snapshot: UsageSnapshot,
+    resets: list[UsageLimitReset] | None = None,
+) -> None:
+    """Advance per-metric reset baselines in place after an observation.
+
+    Shared by every provider that alerts on usage-limit resets so the
+    baseline contract (only move forward, drop a stale deadline after a
+    timestamp-less inferred reset) cannot drift between providers.
+    """
+    if not isinstance(snapshot, UsageSnapshot) or not isinstance(baselines, dict):
+        return
+    payload = snapshot.to_dict()
+    inferred_reset_keys_without_timestamp = {
+        item.key
+        for item in (resets or [])
+        if isinstance(item, UsageLimitReset)
+        and item.detected_by == "usage_replenished"
+        and not normalize_usage_value(
+            payload.get(
+                USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(item.key, ""),
+                "",
+            )
+        )
+    }
+    for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items():
+        new_raw = normalize_usage_value(payload.get(reset_key, ""))
+        if not new_raw:
+            if metric_key in inferred_reset_keys_without_timestamp:
+                # Drop the stale deadline so it cannot re-alert when the
+                # provider later begins reporting a post-reset deadline.
+                baselines.pop(metric_key, None)
+            continue
+        baseline_raw = normalize_usage_value(baselines.get(metric_key, ""))
+        if not baseline_raw:
+            baselines[metric_key] = new_raw
+            continue
+        baseline_dt = _parse_base_reset_datetime(baseline_raw)
+        new_dt = _parse_base_reset_datetime(new_raw)
+        if new_dt is None:
+            continue
+        if baseline_dt is None or new_dt > baseline_dt:
+            baselines[metric_key] = new_raw
+    return
+
+
 def _parse_usage_limit_remaining_percent(metric_key: str, value: Any) -> float | None:
     normalized = _normalize_metric_candidate(metric_key, str(value or ""))
     match = re.fullmatch(r"(\d+(?:\.\d+)?)%", normalized)
@@ -2820,17 +2867,19 @@ class CodexUsageMonitor:
                             return
                         self.__set_session_state("logged_in")
                         self.__clear_auth_attention()
-                        merged = merge_snapshot_with_previous(
-                            refreshed,
-                            self.__previous_snapshot_for_backfill(
-                                allow_previous_backfill=source_key != "manual_login"
-                            ),
+                        previous = self.__previous_snapshot_for_backfill(
+                            allow_previous_backfill=source_key != "manual_login"
                         )
+                        merged = merge_snapshot_with_previous(refreshed, previous)
                         if self.__should_reset_usage_history_for_commit(
                             allow_previous_backfill=source_key != "manual_login"
                         ):
                             self.__usage_history = []
-                        self.__commit_merged_snapshot(merged)
+                        self.__commit_merged_snapshot(
+                            merged,
+                            previous=previous,
+                            observed_snapshot=refreshed,
+                        )
                         snapshot = merged
                         self.__profile_in_use_detected = False
                         self.__failure_count = 0
@@ -2911,21 +2960,7 @@ class CodexUsageMonitor:
         self.__set_session_state("logged_in")
         self.__clear_auth_attention()
         changes = compute_usage_changes(prev, merged)
-        resets = compute_usage_limit_resets(
-            self.__limit_reset_baselines,
-            merged,
-            previous=prev,
-            observed_snapshot=snapshot,
-        )
-        self.__update_limit_reset_baselines(merged, resets=resets)
-        self.__commit_merged_snapshot(merged)
-        if resets:
-            self.__ui_post(
-                lambda: self.__queue_limit_reset_notification_until_input(
-                    list(resets),
-                    merged,
-                )
-            )
+        self.__commit_merged_snapshot(merged, previous=prev, observed_snapshot=snapshot)
         return changes
 
     def __previous_snapshot_for_backfill(
@@ -2959,49 +2994,43 @@ class CodexUsageMonitor:
         snapshot: UsageSnapshot,
         resets: list[UsageLimitReset] | None = None,
     ) -> None:
-        if not isinstance(snapshot, UsageSnapshot):
-            return
-        payload = snapshot.to_dict()
-        inferred_reset_keys_without_timestamp = {
-            item.key
-            for item in (resets or [])
-            if isinstance(item, UsageLimitReset)
-            and item.detected_by == "usage_replenished"
-            and not normalize_usage_value(
-                payload.get(
-                    USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(item.key, ""),
-                    "",
-                )
-            )
-        }
-        for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items():
-            new_raw = normalize_usage_value(payload.get(reset_key, ""))
-            if not new_raw:
-                if metric_key in inferred_reset_keys_without_timestamp:
-                    # Drop the stale deadline so it cannot re-alert when the
-                    # provider later begins reporting a post-reset deadline.
-                    self.__limit_reset_baselines.pop(metric_key, None)
-                continue
-            baseline_raw = normalize_usage_value(
-                self.__limit_reset_baselines.get(metric_key, "")
-            )
-            if not baseline_raw:
-                self.__limit_reset_baselines[metric_key] = new_raw
-                continue
-            baseline_dt = _parse_base_reset_datetime(baseline_raw)
-            new_dt = _parse_base_reset_datetime(new_raw)
-            if new_dt is None:
-                continue
-            if baseline_dt is None or new_dt > baseline_dt:
-                self.__limit_reset_baselines[metric_key] = new_raw
+        advance_limit_reset_baselines(
+            self.__limit_reset_baselines,
+            snapshot,
+            resets=resets,
+        )
         return
 
-    def __commit_merged_snapshot(self, snapshot: UsageSnapshot) -> None:
+    def __commit_merged_snapshot(
+        self,
+        snapshot: UsageSnapshot,
+        *,
+        previous: UsageSnapshot | None,
+        observed_snapshot: UsageSnapshot,
+    ) -> list[UsageLimitReset]:
+        # Every committed observation runs limit-reset detection. The manual
+        # and multi-profile background collect path used to commit directly,
+        # so its snapshots never advanced the reset baselines nor alerted.
+        resets = compute_usage_limit_resets(
+            self.__limit_reset_baselines,
+            snapshot,
+            previous=previous,
+            observed_snapshot=observed_snapshot,
+        )
+        self.__update_limit_reset_baselines(snapshot, resets=resets)
         self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
         self.__append_usage_history_sample(self.__last_snapshot)
         self.__snapshot_backfill_allowed = True
         self.__save_state()
-        return
+        if resets:
+            committed = self.__last_snapshot
+            self.__ui_post(
+                lambda: self.__queue_limit_reset_notification_until_input(
+                    list(resets),
+                    committed,
+                )
+            )
+        return resets
 
     def __append_usage_history_sample(self, snapshot: UsageSnapshot) -> None:
         sample = self.__build_usage_history_sample(snapshot)
