@@ -1958,6 +1958,7 @@ class CodexUsageMonitor:
         self.__ui_thread_id: int | None = None
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
+        self.__alert_label_provider: Callable[[], str] | None = None
         self.__external_scheduler = False
         self.__local_usage_provider = local_usage_provider
         self.__browser_session_factory = browser_session_factory
@@ -2115,6 +2116,21 @@ class CodexUsageMonitor:
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         return
+
+    def set_alert_label_provider(self, provider: Callable[[], str] | None) -> None:
+        # The profile manager owns the label shown on the profile card; alerts
+        # use the same label so the user can tell which profile was reset.
+        self.__alert_label_provider = provider if callable(provider) else None
+        return
+
+    def __resolve_alert_label(self) -> str:
+        provider = self.__alert_label_provider
+        if provider is None:
+            return ""
+        try:
+            return str(provider() or "").strip()
+        except Exception:
+            return ""
 
     def __set_usage_url(self, value: str) -> tuple[bool, str | None]:
         previous = str(getattr(self, "_CodexUsageMonitor__usage_url", "") or "")
@@ -3990,7 +4006,11 @@ class CodexUsageMonitor:
         metric_colors: dict[str, str],
         resets: list[UsageLimitReset] | None = None,
     ) -> list[tuple[str, str | None]]:
-        lines: list[tuple[str, str | None]] = [("Codex 현재 사용량", None)]
+        header = "Codex 현재 사용량"
+        label = self.__resolve_alert_label()
+        if label:
+            header = f"{header} - {label}"
+        lines: list[tuple[str, str | None]] = [(header, None)]
         lines.extend(self.__build_snapshot_lines(snapshot, metric_colors=metric_colors))
         reset_items = [item for item in (resets or []) if item is not None]
         if reset_items:

@@ -368,6 +368,46 @@ class MonitorLimitResetNotificationTest(unittest.TestCase):
             self.assertIn("사용 한도 초기화", joined)
             self.assertIn("5시간 사용 한도 초기화됨", joined)
 
+    def test_reset_alert_header_names_the_profile(self) -> None:
+        def broken() -> str:
+            raise RuntimeError("manager closed")
+
+        cases = (
+            (lambda: "Codex 7", "Codex 현재 사용량 - Codex 7"),
+            (lambda: "", "Codex 현재 사용량"),
+            (broken, "Codex 현재 사용량"),
+            (None, "Codex 현재 사용량"),
+        )
+        for provider, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                monitor = self._make_monitor(tmp)
+                monitor._CodexUsageMonitor__root = _FakeRoot()
+                monitor.set_alert_label_provider(provider)
+                previous, current = self._rolled_reset_pair()
+                shown: list = []
+                with patch.object(
+                    monitor,
+                    "_CodexUsageMonitor__ui_post",
+                    side_effect=lambda fn: fn(),
+                ), patch.object(
+                    monitor,
+                    "_CodexUsageMonitor__get_last_input_tick",
+                    return_value=None,
+                    create=True,
+                ), patch.object(
+                    monitor,
+                    "_CodexUsageMonitor__show_alert_tooltip",
+                    side_effect=lambda text, lines=None, duration_ms=None: shown.append(
+                        (text, lines, duration_ms)
+                    ),
+                ), patch("src.utils.reset_fanfare.play_reset_fanfare", return_value=True):
+                    monitor.handle_snapshot(previous)
+                    monitor.handle_snapshot(current)
+
+                self.assertEqual(len(shown), 1)
+                lines = list(shown[0][1] or [])
+                self.assertEqual(lines[0][0], expected)
+
     def test_reset_without_new_timestamp_notifies_once_and_discards_stale_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             monitor = self._make_monitor(tmp)
