@@ -763,6 +763,101 @@ class MonitorLimitResetNotificationTest(unittest.TestCase):
             self.assertEqual(play_mock.call_count, 1)
 
 
+class _ImmediateThread:
+    def __init__(self, target=None, daemon=None, **_kwargs) -> None:
+        self._target = target
+
+    def start(self) -> None:
+        if self._target is not None:
+            self._target()
+
+
+class CollectPathLimitResetTest(unittest.TestCase):
+    """Snapshots committed by the background/manual collect path must run the
+    same reset detection as handle_snapshot (the multi-profile manager's
+    automatic refresh uses this path)."""
+
+    def _make_monitor(self, config_dir: str) -> CodexUsageMonitor:
+        class _Session:
+            def shutdown(self) -> bool:
+                return True
+
+        return CodexUsageMonitor(
+            config_dir=config_dir,
+            profile_dir=os.path.join(config_dir, "profile"),
+            browser_session_factory=lambda _config: _Session(),
+        )
+
+    def _collect(self, monitor: CodexUsageMonitor, snapshot: UsageSnapshot, shown: list, source: str) -> None:
+        with patch(
+            "src.apps.codex_usage_monitor.threading.Thread", _ImmediateThread
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__collect_snapshot_guarded",
+            return_value=(snapshot, None),
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__get_background_collect_block_reason",
+            return_value="",
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__ui_post",
+            side_effect=lambda fn: fn(),
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__ui_post_coalesced",
+            side_effect=lambda *fns: None,
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__get_last_input_tick",
+            return_value=None,
+            create=True,
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__show_alert_tooltip",
+            side_effect=lambda text, lines=None, duration_ms=None: shown.append(lines),
+        ), patch(
+            "src.utils.reset_fanfare.play_reset_fanfare", return_value=True
+        ):
+            monitor.show_current_status(force_refresh=True, source=source)
+
+    def test_auto_refresh_commit_detects_elapsed_weekly_reset(self) -> None:
+        now = datetime.now(timezone.utc)
+        before = UsageSnapshot.from_metrics(
+            {"weekly_limit": "5%"},
+            captured_at=_iso(now - timedelta(days=1)),
+            reset_info={"weekly_limit_reset_at": _iso(now - timedelta(hours=20))},
+            reported_metric_keys=("weekly_limit",),
+        )
+        after = UsageSnapshot.from_metrics(
+            {"weekly_limit": "99%"},
+            captured_at=_iso(now),
+            reset_info={"weekly_limit_reset_at": _iso(now + timedelta(days=7))},
+            reported_metric_keys=("weekly_limit",),
+        )
+        for source in ("auto_monitor", "manual_query", "manual_login"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                monitor = self._make_monitor(tmp)
+                monitor._CodexUsageMonitor__root = _FakeRoot()
+                shown: list = []
+                self._collect(monitor, before, shown, source)
+                self.assertEqual(shown, [])
+                self._collect(monitor, after, shown, source)
+
+                self.assertEqual(len(shown), 1)
+                joined = " | ".join(str(line[0]) for line in shown[0] or [])
+                self.assertIn("주간 사용 한도 초기화됨", joined)
+                baselines = monitor._CodexUsageMonitor__limit_reset_baselines
+                self.assertEqual(
+                    baselines.get("weekly_limit"),
+                    after.to_dict()["weekly_limit_reset_at"],
+                )
+
+                # The same window must not alert again on the next refresh.
+                self._collect(monitor, after, shown, source)
+                self.assertEqual(len(shown), 1)
+
+
 class ResetFanfareWavTest(unittest.TestCase):
     def test_build_fanfare_wav_bytes_is_valid_non_silent_wav(self) -> None:
         import io

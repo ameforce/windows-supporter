@@ -34,6 +34,7 @@ from src.apps.codex_usage_browser_types import (
 )
 from src.apps.claude_usage_playwright_driver import ClaudeUsagePlaywrightDriver
 from src.apps.claude_usage_playwright_worker import run_claude_playwright_worker
+from src.apps.usage_limit_reset_alerts import UsageLimitResetAlert
 
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
@@ -1202,6 +1203,10 @@ class ClaudeUsageMonitor:
         )
         self._stale_after_sec = max(self._refresh_interval_sec, float(stale_after_sec))
         self._tooltip_duration_ms = 7000
+        self._limit_reset_sound_enabled = True
+        self._limit_reset_lock = threading.Lock()
+        self._limit_reset_baselines: dict[str, str] = {}
+        self._last_committed_limit_usage: dict[str, str] | None = None
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._load_settings_file()
         self._root: Any = None
@@ -1236,6 +1241,13 @@ class ClaudeUsageMonitor:
         self._restore_last_success()
         if self._last_reading.state == UsageState.STALE:
             self._last_error_type = UsageErrorType.TRANSIENT
+        self._limit_reset_alert = UsageLimitResetAlert(
+            title="Claude",
+            post_ui=self._post_ui,
+            get_root=lambda: self._root,
+            get_duration_ms=lambda: int(self._tooltip_duration_ms),
+            sound_enabled=lambda: bool(self._limit_reset_sound_enabled),
+        )
         config = PlaywrightSessionConfig(
             profile_dir=self.profile_dir,
             usage_url=CLAUDE_USAGE_URL,
@@ -1294,7 +1306,7 @@ class ClaudeUsageMonitor:
                 if reading.state == UsageState.READY:
                     self._failure_count = 0
                     self._last_error_type = UsageErrorType.NONE
-                    self._save_last_success(reading)
+                    self._commit_ready_reading(reading)
                 else:
                     self._failure_count = min(self._failure_count + 1, 999)
                     self._last_error_type = self._error_type_from_result(result, reading)
@@ -1441,7 +1453,7 @@ class ClaudeUsageMonitor:
             if self._last_reading.state == UsageState.READY:
                 self._failure_count = 0
                 self._last_error_type = UsageErrorType.NONE
-                self._save_last_success(self._last_reading)
+                self._commit_ready_reading(self._last_reading)
             elif result.error in {
                 BrowserErrorCode.LOGIN_REQUIRED.value,
                 BrowserErrorCode.CLOUDFLARE_CHALLENGE.value,
@@ -1784,7 +1796,7 @@ class ClaudeUsageMonitor:
             if reading.state == UsageState.READY:
                 self._failure_count = 0
                 self._last_error_type = UsageErrorType.NONE
-                self._save_last_success(reading)
+                self._commit_ready_reading(reading)
                 self._append_collection_event(source="manual_login_poll")
                 self._emit_update("manual_login")
                 return
@@ -1835,6 +1847,9 @@ class ClaudeUsageMonitor:
         except (TypeError, ValueError):
             duration = self._tooltip_duration_ms
         self._tooltip_duration_ms = max(1200, duration)
+        self._limit_reset_sound_enabled = bool(
+            data.get("limit_reset_sound_enabled", self._limit_reset_sound_enabled)
+        )
 
     def _save_settings_file(self) -> None:
         if not self._persistence_enabled:
@@ -1848,6 +1863,7 @@ class ClaudeUsageMonitor:
                     "enabled": bool(self._enabled),
                     "interval_sec": float(self._refresh_interval_sec),
                     "tooltip_duration_ms": int(self._tooltip_duration_ms),
+                    "limit_reset_sound_enabled": bool(self._limit_reset_sound_enabled),
                     "collection_mode": CLAUDE_COLLECTION_MODE,
                 },
             )
@@ -1906,6 +1922,88 @@ class ClaudeUsageMonitor:
         if profile_name:
             self._profile_name = profile_name
             self._profile_name_verified = profile_name_verified
+        raw_baselines = data.get("limit_reset_baselines")
+        if isinstance(raw_baselines, dict):
+            self._limit_reset_baselines = {
+                str(key): str(value)
+                for key, value in raw_baselines.items()
+                if str(key or "").strip() and str(value or "").strip()
+            }
+        if reading.is_usable:
+            self._last_committed_limit_usage = self._limit_usage_payload()
+            if not self._limit_reset_baselines:
+                # Same as the Codex state loader: seed baselines from the
+                # restored deadlines so a reset that happened while the app
+                # was not running is still detected on the first reading.
+                from src.apps.codex_usage_monitor import (
+                    UsageSnapshot,
+                    advance_limit_reset_baselines,
+                )
+
+                advance_limit_reset_baselines(
+                    self._limit_reset_baselines,
+                    UsageSnapshot.from_dict(self._last_committed_limit_usage),
+                )
+
+    def _post_ui(self, fn: Callable[[], None]) -> bool:
+        queue_obj = self._event_queue
+        if queue_obj is None:
+            return False
+        try:
+            queue_obj.put(fn)
+            return True
+        except Exception:
+            return False
+
+    def _limit_usage_payload(self) -> dict[str, str]:
+        snapshot = self.get_last_snapshot().to_dict()
+        reading = self._last_reading
+        return {
+            "captured_at": str(reading.last_success_at or reading.captured_at or ""),
+            "five_hour_limit": str(snapshot.get("five_hour_limit") or ""),
+            "five_hour_limit_reset_at": str(snapshot.get("five_hour_limit_reset_at") or ""),
+            "weekly_limit": str(snapshot.get("weekly_limit") or ""),
+            "weekly_limit_reset_at": str(snapshot.get("weekly_limit_reset_at") or ""),
+        }
+
+    def _observe_limit_resets(self) -> list[Any]:
+        # Same detection and baseline contract as the Codex monitor, so a
+        # Claude session/weekly window reset alerts exactly once as well.
+        from src.apps.codex_usage_monitor import (
+            UsageSnapshot,
+            advance_limit_reset_baselines,
+            compute_usage_limit_resets,
+        )
+
+        current_payload = self._limit_usage_payload()
+        current = UsageSnapshot.from_dict(current_payload)
+        if not current.has_any_metric():
+            return []
+        previous_payload = self._last_committed_limit_usage
+        previous = (
+            UsageSnapshot.from_dict(previous_payload)
+            if isinstance(previous_payload, dict)
+            else None
+        )
+        resets = compute_usage_limit_resets(
+            self._limit_reset_baselines,
+            current,
+            previous=previous,
+            observed_snapshot=current,
+        )
+        advance_limit_reset_baselines(self._limit_reset_baselines, current, resets=resets)
+        self._last_committed_limit_usage = current_payload
+        if resets:
+            self._limit_reset_alert.submit(list(resets))
+        return resets
+
+    def _commit_ready_reading(self, reading: AiUsageReading) -> None:
+        # collect(), manual login and the login poll can commit from
+        # different threads; observe and persist atomically so a reset is
+        # neither alerted twice nor saved with half-updated baselines.
+        with self._limit_reset_lock:
+            self._observe_limit_resets()
+            self._save_last_success(reading)
 
     def _save_last_success(self, reading: AiUsageReading) -> None:
         if (
@@ -1939,6 +2037,7 @@ class ClaudeUsageMonitor:
                     "scoped_weekly_reset_at": self._scoped_weekly_reset_at,
                     "scoped_weekly_label": self._scoped_weekly_label,
                     "extra_usage_text": self._extra_usage_text,
+                    "limit_reset_baselines": dict(self._limit_reset_baselines),
                 },
             )
         except OSError:
