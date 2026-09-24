@@ -64,6 +64,7 @@ class UsageLimitResetAlert:
         get_root: Callable[[], Any],
         get_duration_ms: Callable[[], int],
         sound_enabled: Callable[[], bool] = lambda: True,
+        get_label: Callable[[], str] | None = None,
         input_tick: Callable[[], int | None] = _last_input_tick,
         play_sound: Callable[[], bool] = _play_fanfare,
         show_tooltip: Callable[[Any, list[tuple[str, str | None]], int], Any] = _show_tooltip,
@@ -74,6 +75,7 @@ class UsageLimitResetAlert:
         self._get_root = get_root
         self._get_duration_ms = get_duration_ms
         self._sound_enabled = sound_enabled
+        self._get_label = get_label
         self._input_tick = input_tick
         self._play_sound = play_sound
         self._show_tooltip = show_tooltip
@@ -134,6 +136,18 @@ class UsageLimitResetAlert:
         self._schedule_poll()
         return
 
+    def _header(self) -> str:
+        header = f"{self._title} 사용 한도 초기화"
+        label = ""
+        if callable(self._get_label):
+            try:
+                label = str(self._get_label() or "").strip()
+            except Exception:
+                label = ""
+        if label:
+            return f"{header} - {label}"
+        return header
+
     def _flush(self) -> None:
         resets = list(self._pending.values())
         self._pending = {}
@@ -148,7 +162,7 @@ class UsageLimitResetAlert:
         root = self._get_root()
         if root is None:
             return
-        lines: list[tuple[str, str | None]] = [(f"{self._title} 사용 한도 초기화", None)]
+        lines: list[tuple[str, str | None]] = [(self._header(), None)]
         for item in resets:
             label = str(getattr(item, "label", "") or getattr(item, "key", ""))
             lines.append((f"{label} 초기화됨", RESET_LINE_COLOR))
