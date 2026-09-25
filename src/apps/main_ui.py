@@ -6,6 +6,7 @@ from typing import Any
 
 from src.apps.main_ui_state import load_last_tab, save_last_tab
 from src.utils.app_version import get_app_version_label
+from src.utils.tk_viewport import SettledViewport
 
 
 class WindowsSupporterMainUI:
@@ -49,6 +50,7 @@ class WindowsSupporterMainUI:
 
         self._notebook = None
         self._shell_frame = None
+        self._shell_viewport = None
         self._footer_frame = None
         self._version_label = None
         self._tab_dashboard = None
@@ -293,9 +295,14 @@ class WindowsSupporterMainUI:
         shell = ttk.Frame(root)
         self._shell_frame = shell
         try:
-            shell.pack(fill="both", expand=True)
+            if callable(getattr(shell, "place", None)):
+                size = self._scaled_size(self._tab_sizes[self._TAB_DASHBOARD])
+                self._shell_viewport = SettledViewport(root, shell, *size)
+            else:
+                shell.pack(fill="both", expand=True)
         except Exception:
-            pass
+            self._shell_viewport = None
+            shell.pack(fill="both", expand=True)
 
         footer = ttk.Frame(shell)
         self._footer_frame = footer
@@ -465,6 +472,11 @@ class WindowsSupporterMainUI:
             widget = self._tab_widget(tab_key)
             if widget is None:
                 continue
+            try:
+                if str(tab(widget, "text")) == label:
+                    continue
+            except Exception:
+                pass
             try:
                 tab(widget, text=label)
             except Exception:
@@ -707,6 +719,8 @@ class WindowsSupporterMainUI:
                     pass
                 self._auto_geometry_sizes.add((int(width), int(height)))
                 try:
+                    if self._shell_viewport is not None:
+                        self._shell_viewport.commit(width, height)
                     root.geometry(geometry)
                 except Exception:
                     pass
