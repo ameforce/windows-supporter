@@ -63,7 +63,7 @@ class _TextLine:
 
 
 class ProfileDetailCanvas:
-    def __init__(self, tk: Any, parent: Any, *, bg: str) -> None:
+    def __init__(self, tk: Any, parent: Any, *, bg: str, canvas: Any = None) -> None:
         self._cells: list[MetricCell] = []
         self._top_lines: list[_TextLine] = []
         self._bottom_lines: list[_TextLine] = []
@@ -71,7 +71,7 @@ class ProfileDetailCanvas:
         self._layout_after_id: Any = None
         self._destroyed = False
         self._requested_size: Any = None
-        self.canvas = tk.Canvas(
+        self.canvas = canvas if canvas is not None else tk.Canvas(
             parent,
             bg=bg,
             highlightthickness=0,
@@ -105,6 +105,7 @@ class ProfileDetailCanvas:
         variable: Any = None,
         fill: str = LABEL_FG,
         on_click: Callable[[], None] | None = None,
+        font: Any = LINE_FONT,
     ) -> int:
         """Add a full-width text line above ("top") or below ("bottom") the table."""
         canvas = self.canvas
@@ -115,7 +116,7 @@ class ProfileDetailCanvas:
             anchor="nw",
             justify="left",
             fill=fill,
-            font=LINE_FONT,
+            font=font,
             width=max(1, int(wraplength)),
         )
         line = _TextLine(item, wraplength)
