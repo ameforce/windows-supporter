@@ -3,6 +3,9 @@ from __future__ import annotations
 import io
 import math
 import struct
+import tempfile
+import threading
+from pathlib import Path
 import wave
 
 _SAMPLE_RATE = 22050
@@ -12,6 +15,9 @@ _TOTAL_SECONDS = 0.80
 _POP_SECONDS = 0.03
 _OVERLAP_SECONDS = 0.02
 _last_buffer: bytes | None = None
+_sound_cache: tempfile.TemporaryDirectory | None = None
+_sound_path: Path | None = None
+_sound_lock = threading.Lock()
 
 
 def _note_samples(freq: float, duration_s: float, volume: float) -> list[float]:
@@ -70,17 +76,34 @@ def build_fanfare_wav_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _cached_fanfare_path() -> Path:
+    """Keep an owned, complete WAV alive for native asynchronous playback."""
+    global _last_buffer, _sound_cache, _sound_path
+    with _sound_lock:
+        if _sound_path is not None and _sound_path.is_file():
+            return _sound_path
+        data = _last_buffer or build_fanfare_wav_bytes()
+        if _sound_cache is None:
+            _sound_cache = tempfile.TemporaryDirectory(prefix="windows-supporter-fanfare-")
+        path = Path(_sound_cache.name) / "reset.wav"
+        path.write_bytes(data)
+        _last_buffer = data
+        _sound_path = path
+        return path
+
+
 def play_reset_fanfare() -> bool:
-    global _last_buffer
     try:
         import winsound
-    except Exception:
+    except ImportError:
         return False
     try:
-        data = _last_buffer or build_fanfare_wav_bytes()
-        flags = winsound.SND_MEMORY | winsound.SND_ASYNC | winsound.SND_NODEFAULT
-        winsound.PlaySound(data, flags)
-        _last_buffer = data
+        # Python explicitly rejects SND_MEMORY | SND_ASYNC. A cached WAV file
+        # permits native asynchronous playback without blocking Tk for 0.8s,
+        # adding a worker per alert, or depending on a packaged audio asset.
+        path = _cached_fanfare_path()
+        flags = winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
+        winsound.PlaySound(str(path), flags)
         return True
     except Exception:
         return False

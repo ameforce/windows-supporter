@@ -734,5 +734,20 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
             self.assertIsNone(ui._kakao_retry_after_id)
 
 
+    def test_duplicate_selected_tab_notification_does_not_refit_or_save(self):
+        from unittest.mock import Mock
+        ui, _, _ = self._build_ui()
+        ui._tab_ai_usage = object()
+        ui._notebook = SimpleNamespace(select=lambda: str(ui._tab_ai_usage))
+        ui._ensure_ai_usage_built = Mock()
+        ui._apply_tab_geometry = Mock()
+        ui._apply_notebook_labels_for_width = Mock()
+        ui._save_last_tab = Mock()
+        ui._ensure_selected_tab_built()
+        ui._ensure_selected_tab_built()
+        ui._apply_tab_geometry.assert_called_once_with(ui._TAB_AI_USAGE)
+        ui._save_last_tab.assert_called_once_with(ui._TAB_AI_USAGE)
+
+
 if __name__ == "__main__":
     unittest.main()

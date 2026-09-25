@@ -955,10 +955,13 @@ class CodexUsageUiUnitTest(unittest.TestCase):
     def test_preferred_size_measures_scroll_body_width_without_using_full_body_height(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         view._scroll_body = _RequestedWidget(1100, 1400)
+        from unittest.mock import Mock
+        view._scroll_body.update_idletasks = Mock()
         view._scrollbar = _RequestedWidget(17, 1400)
         view._win = _RequestedWidget(800, 500)
 
         self.assertEqual(view.preferred_size(), (1139, 500))
+        view._scroll_body.update_idletasks.assert_not_called()
 
     def test_preferred_size_reports_side_by_side_floor_when_boxes_are_stacked(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
@@ -1351,6 +1354,44 @@ class CodexUsageUiUnitTest(unittest.TestCase):
             [widget.pack_kwargs["padx"] for widget in widgets],
             [(0, 8), (0, 0), (0, 8), (0, 0)],
         )
+
+    def test_responsive_controls_are_raised_above_their_geometry_hosts(self):
+        from unittest.mock import Mock
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = _FakeTk()
+        container = _SizingWidget(width=300)
+        widgets = [_SizingWidget(reqwidth=100) for _ in range(4)]
+        for widget in widgets:
+            widget.lift = Mock()
+        view._reflow_widget_row(container, widgets, max_columns=4, available_width=300)
+        for widget in widgets:
+            widget.lift.assert_called_once()
+        view._reflow_widget_row(container, widgets, max_columns=4, available_width=300)
+        for widget in widgets:
+            widget.lift.assert_called_once()
+
+    def test_move_button_boundaries_follow_current_order(self):
+        from unittest.mock import Mock, call
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._account_order = ['c', 'a', 'b']
+        view._account_move_buttons = {key: (object(), object()) for key in view._account_order}
+        view._set_button_enabled = Mock()
+        view._refresh_move_buttons()
+        expected = []
+        for index, key in enumerate(view._account_order):
+            up, down = view._account_move_buttons[key]
+            expected.extend([call(up, index > 0), call(down, index < 2)])
+        self.assertEqual(view._set_button_enabled.call_args_list, expected)
+
+    def test_immediate_autosave_cancels_pending_timer_before_saving(self):
+        from unittest.mock import Mock
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._win = _FakeWidget()
+        view._autosave_after_id = 'pending-save'
+        view._save_settings = Mock(return_value=True)
+        self.assertTrue(view._autosave_now())
+        self.assertEqual(view._win.after_cancel_calls, ['pending-save'])
+        view._save_settings.assert_called_once_with(reschedule_transient=True)
 
     def test_widget_row_records_unwrapped_requirement_for_pane_measure(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
