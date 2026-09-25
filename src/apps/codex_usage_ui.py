@@ -15,6 +15,8 @@ from src.apps.ai_usage_contracts import (
 from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
 from src.apps.codex_usage_taskbar_overlay import draw_provider_mark
 from src.apps.profile_detail_canvas import ProfileDetailCanvas
+from src.apps.profile_controls import ProfileActionBinding, ProfileInspector
+from src.apps.profile_board import ProfileBoard
 
 
 class CodexUsageSettingsView:
@@ -68,6 +70,9 @@ class CodexUsageSettingsView:
         self._account_detail_canvases = {}
         self._account_order: list[str] = []
         self._pane_card_parent = None
+        self._profile_inspector = None
+        self._profile_board = None
+        self._active_account_id = None
         self._pane_boxes: dict[str, Any] = {}
         self._pane_lists: dict[str, Any] = {}
         self._pane_titles: dict[str, Any] = {}
@@ -86,6 +91,7 @@ class CodexUsageSettingsView:
         self._scroll_after_id = None
         self._scroll_root_bindings: list[tuple[str, Any]] = []
         self._scroll_window_id = None
+        self._scroll_window_width = None
         self._header_card = None
         self._content_card = None
         self._scrollbar = None
@@ -141,6 +147,7 @@ class CodexUsageSettingsView:
         if parent is None:
             return
         self._parent = parent
+        self._scroll_window_width = None
         self._lazy_import_tk()
         self._stop_runtime_refresh()
         self._cancel_pending_autosave()
@@ -220,7 +227,7 @@ class CodexUsageSettingsView:
         header_card.pack(fill="x", padx=8, pady=(8, 6))
 
         header_inner = tk.Frame(header_card, bg=card_bg)
-        header_inner.pack(fill="x", padx=12, pady=8)
+        header_inner.pack(anchor="w", padx=12, pady=8) if has_multi_accounts else header_inner.pack(fill="x", padx=12, pady=8)
 
         title_row = tk.Frame(header_inner, bg=card_bg)
         title_row.pack(fill="x")
@@ -251,7 +258,7 @@ class CodexUsageSettingsView:
 
         tk.Label(
             header_inner,
-            text="작업표시줄에 표시할 AI 사용량 프로필과 조회 주기를 설정합니다.",
+            text="카드 제목을 선택하면 위에서 설정합니다. 제목을 끌어 순서와 표시 위치를 바꿀 수 있습니다.",
             bg=card_bg,
             fg=text_muted,
             font=("Segoe UI", 9),
@@ -520,7 +527,7 @@ class CodexUsageSettingsView:
         width = max(1, measured_width, container_width)
         # The body is intentionally scrollable, so its full content height
         # must not turn the first AI tab open into a very tall window.
-        height = max(1, container_height)
+        height = max(640 if self._profile_board is not None else 1, container_height)
         return width, height
 
     def minimum_size(self) -> tuple[int, int]:
@@ -653,134 +660,20 @@ class CodexUsageSettingsView:
         for side in ("left", "right", "pool"):
             for profile_id in assignment.get(side, []):
                 box_of[str(profile_id)] = side
-        panes = tk.Frame(body, bg=card_bg)
-        self._pane_card_parent = panes
-        panes.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 2))
-        try:
-            panes.columnconfigure(0, weight=1)
-        except Exception:
-            pass
-        self._pane_boxes = {}
-        self._pane_lists = {}
-        self._pane_titles = {}
-        self._pane_hints = {}
+        self._profile_inspector = ProfileInspector(self, self._header_card, card_bg)
+        self._profile_inspector.frame.pack(anchor="w", padx=12, pady=(0, 8))
+        row += 1
+        board = ProfileBoard(tk, body, self, assignment, priority_value)
+        self._profile_board = board
+        self._pane_card_parent = board.canvas
+        # Profiles share the existing viewport; only visible rows are rasterized.
+        self._pane_boxes = dict(board.groups)
+        self._pane_lists = dict(board.groups)
+        self._pane_titles = {side:group.title for side,group in board.groups.items()}
+        self._pane_hints = {side:group.hint for side,group in board.groups.items()}
+        self._drop_indicators = dict(board.indicators)
         self._pane_card_widgets = {}
-        self._drop_indicators = {}
         self._drag_state = None
-        side_row = tk.Frame(panes, bg=card_bg)
-        side_row.grid(row=0, column=0, sticky="we")
-        try:
-            side_row.columnconfigure(0, weight=1)
-            side_row.columnconfigure(1, weight=1)
-        except Exception:
-            pass
-        if priority_value == TaskbarSidePriority.RIGHT.value:
-            slot_hint = {
-                "left": f"{TASKBAR_PANE_SIZE + 1}·{TASKBAR_PANE_SIZE * 2}번 슬롯",
-                "right": f"1·{TASKBAR_PANE_SIZE}번 슬롯",
-            }
-        else:
-            slot_hint = {
-                "left": f"1·{TASKBAR_PANE_SIZE}번 슬롯",
-                "right": f"{TASKBAR_PANE_SIZE + 1}·{TASKBAR_PANE_SIZE * 2}번 슬롯",
-            }
-        side_titles = {"left": "왼쪽 영역", "right": "오른쪽 영역"}
-        for column, side in enumerate(("left", "right")):
-            box = tk.Frame(
-                side_row,
-                bg=card_bg,
-                highlightthickness=1,
-                highlightbackground=border,
-            )
-            box.grid(
-                row=0,
-                column=column,
-                sticky="nwe",
-                padx=(0, 5) if column == 0 else (5, 0),
-            )
-            try:
-                box.columnconfigure(0, weight=1)
-            except Exception:
-                pass
-            title = tk.Label(
-                box,
-                text=f"{side_titles[side]} ({len(assignment.get(side, []))}/{TASKBAR_PANE_SIZE})",
-                bg=card_bg,
-                fg="#111827",
-                font=("Segoe UI", 9, "bold"),
-                anchor="w",
-            )
-            title.grid(row=0, column=0, sticky="we", padx=8, pady=(6, 0))
-            hint = tk.Label(
-                box,
-                text=f"작업표시줄 {slot_hint[side]} · 카드 위: 교환 · 사이: 이동",
-                bg=card_bg,
-                fg=text_muted,
-                font=("Segoe UI", 8),
-                anchor="w",
-            )
-            hint.grid(row=1, column=0, sticky="we", padx=8, pady=(0, 4))
-            host = tk.Frame(box, bg=card_bg)
-            host.grid(row=2, column=0, sticky="we", padx=4, pady=(0, 4))
-            try:
-                host.columnconfigure(0, weight=1)
-            except Exception:
-                pass
-            indicator = tk.Frame(host, bg="#2563EB", height=3)
-            try:
-                indicator.grid_remove()
-            except Exception:
-                pass
-            self._pane_boxes[side] = box
-            self._pane_lists[side] = host
-            self._pane_titles[side] = title
-            self._pane_hints[side] = hint
-            self._drop_indicators[side] = indicator
-        pool_box = tk.Frame(
-            panes,
-            bg=card_bg,
-            highlightthickness=1,
-            highlightbackground=border,
-        )
-        pool_box.grid(row=1, column=0, sticky="we", pady=(6, 0))
-        try:
-            pool_box.columnconfigure(0, weight=1)
-        except Exception:
-            pass
-        pool_title = tk.Label(
-            pool_box,
-            text=f"표시 안 함 (보관함) ({len(assignment.get('pool', []))})",
-            bg=card_bg,
-            fg="#111827",
-            font=("Segoe UI", 9, "bold"),
-            anchor="w",
-        )
-        pool_title.grid(row=0, column=0, sticky="we", padx=8, pady=(6, 0))
-        pool_hint = tk.Label(
-            pool_box,
-            text="끌어다 놓으면 작업표시줄에서 제외 · 표시 체크를 켜면 복귀",
-            bg=card_bg,
-            fg=text_muted,
-            font=("Segoe UI", 8),
-            anchor="w",
-        )
-        pool_hint.grid(row=1, column=0, sticky="we", padx=8, pady=(0, 4))
-        pool_host = tk.Frame(pool_box, bg=card_bg)
-        pool_host.grid(row=2, column=0, sticky="we", padx=4, pady=(0, 4))
-        try:
-            pool_host.columnconfigure(0, weight=1)
-        except Exception:
-            pass
-        pool_indicator = tk.Frame(pool_host, bg="#2563EB", height=3)
-        try:
-            pool_indicator.grid_remove()
-        except Exception:
-            pass
-        self._pane_boxes["pool"] = pool_box
-        self._pane_lists["pool"] = pool_host
-        self._pane_titles["pool"] = pool_title
-        self._pane_hints["pool"] = pool_hint
-        self._drop_indicators["pool"] = pool_indicator
         box_rows = {"left": 0, "right": 0, "pool": 0}
         for index, raw in enumerate(ordered_accounts):
             if not isinstance(raw, dict):
@@ -805,190 +698,37 @@ class CodexUsageSettingsView:
             if card_host is None:
                 card_host = self._pane_lists.get("pool", body)
                 card_side = "pool"
-            card = tk.Frame(
-                panes,
-                bg=card_bg,
-                highlightthickness=1,
-                highlightbackground=border,
-            )
-            card.grid(
-                in_=card_host,
-                row=box_rows.get(card_side, 0),
-                column=0,
-                sticky="nwe",
-                pady=(0, 6),
-            )
+            card = board.create_region(account_id, card_side, box_rows.get(card_side, 0))
+            detail = ProfileDetailCanvas(tk, None, bg=card_bg, canvas=card)
+            card.detail = detail
+            card.configure(highlightthickness=1, highlightbackground=border, takefocus=True)
+            card._windows_supporter_unwrapped_reqwidth = 280
+            card.grid(in_=card_host, row=box_rows.get(card_side, 0), column=0,
+                      sticky="nwe", pady=(0, 6))
             box_rows[card_side] = box_rows.get(card_side, 0) + 1
             self._pane_card_widgets[account_id] = card
-            try:
-                card.columnconfigure(0, weight=1)
-            except Exception:
-                pass
-            header = tk.Frame(card, bg=card_bg)
-            header.grid(row=0, column=0, sticky="we", padx=8, pady=(6, 1))
-            try:
-                header.columnconfigure(1, weight=1)
-            except Exception:
-                pass
-            # 작업표시줄 행과 같은 순서로 브랜드 마크를 제목 왼쪽에 그려서
-            # 카드가 어느 provider의 프로필인지 한눈에 읽히게 한다.
-            provider_mark = tk.Canvas(
-                header,
-                width=14,
-                height=14,
-                bg=card_bg,
-                highlightthickness=0,
-                bd=0,
-            )
-            provider_mark.grid(row=0, column=0, sticky="w", padx=(0, 4))
-            self._account_provider_marks[account_id] = provider_mark
-            profile_label = tk.Label(
-                header,
-                text=label,
-                textvariable=label_var,
-                bg=card_bg,
-                fg="#111827",
-                font=("Segoe UI", 10, "bold"),
-                anchor="w",
-                justify="left",
-                wraplength=self._scaled_wrap_length(260),
-            )
-            profile_label.grid(row=0, column=1, sticky="we")
-
-            # provider 선택은 프로필 제목과 같은 행 오른쪽에 둬서 카드의
-            # 소유권을 먼저 읽고 조작 순서를 나중에 읽게 한다.
-            provider_box_factory = getattr(ttk, "Combobox", None)
-            if callable(provider_box_factory):
-                provider_box = provider_box_factory(
-                    header,
-                    textvariable=provider_var,
-                    values=("codex", "cursor", "claude"),
-                    state="readonly",
-                    width=8,
-                )
-            else:
-                provider_box = ttk.Entry(header, textvariable=provider_var, width=8)
-            provider_box.grid(row=0, column=2, sticky="e", padx=(8, 0))
-            self._redraw_provider_mark(account_id)
-            try:
-                provider_var.trace_add(
-                    "write",
-                    lambda *_args, aid=account_id: self._redraw_provider_mark(aid),
-                )
-            except Exception:
-                pass
-
-            try:
-                header.bind(
-                    "<Configure>",
-                    lambda event, label_widget=profile_label, provider_widget=provider_box, mark_widget=provider_mark: self._fit_profile_header(
-                        label_widget,
-                        provider_widget,
-                        mark_widget,
-                        int(getattr(event, "width", 0) or 0),
-                    ),
-                )
-            except Exception:
-                pass
-
-            # 제목줄 끌기: 같은 상자 안 순서 변경과 상자 사이 이동을 모두
-            # 처리한다. 키보드·버튼 경로(▲▼·표시 체크)는 그대로 유지한다.
-            try:
-                header.configure(cursor="fleur")
-                profile_label.configure(cursor="fleur")
-                provider_mark.configure(cursor="fleur")
-            except Exception:
-                pass
-            for drag_widget in (header, profile_label, provider_mark):
-                try:
-                    drag_widget.bind(
-                        "<ButtonPress-1>",
-                        lambda event, aid=account_id: self._on_pane_drag_start(aid, event),
-                    )
-                    drag_widget.bind("<B1-Motion>", self._on_pane_drag_motion)
-                    drag_widget.bind("<ButtonRelease-1>", self._on_pane_drag_release)
-                    drag_widget.bind("<Escape>", self._cancel_pane_drag)
-                    drag_widget.bind("<Unmap>", self._cancel_pane_drag)
-                except Exception:
-                    pass
-
-            controls = tk.Frame(header, bg=card_bg)
-            controls.grid(row=1, column=0, columnspan=3, sticky="we", pady=(3, 2))
-            control_widgets = [
-                tk.Checkbutton(
-                    controls,
-                    text="수집",
-                    variable=enabled_var,
-                    bg=card_bg,
-                    activebackground=card_bg,
-                    selectcolor=card_bg,
-                    fg="#111827",
-                    activeforeground="#111827",
-                    font=("Segoe UI", 9),
-                ),
-                tk.Checkbutton(
-                    controls,
-                    text="작업표시줄 표시",
-                    variable=selected_var,
-                    bg=card_bg,
-                    activebackground=card_bg,
-                    selectcolor=card_bg,
-                    fg="#111827",
-                    activeforeground="#111827",
-                    font=("Segoe UI", 9),
-                    command=lambda aid=account_id: self._on_taskbar_selection_changed(aid),
-                ),
-            ]
-            self._bind_responsive_widget_row(controls, control_widgets, columns=2)
-
-            actions = tk.Frame(card, bg=card_bg)
-            actions.grid(row=1, column=0, sticky="we", padx=8, pady=(0, 2))
-            action_widgets = []
+            header_var = tk.StringVar(value=f"{provider.title()} · {label}")
+            detail._header_var = header_var
+            def update_header(*_args, label=label_var, provider=provider_var, target=header_var):
+                target.set(f"{str(provider.get()).title()} · {label.get()}")
+            label_var.trace_add("write", update_header)
+            provider_var.trace_add("write", update_header)
+            header_item = detail.add_line(section="top", variable=header_var,
+                                          wraplength=320, fill="#111827", font=("Segoe UI", 10, "bold"))
+            card.tag_bind(header_item, "<ButtonPress-1>", lambda event, aid=account_id:
+                          self._select_and_drag_profile(aid, event))
+            card.bind("<B1-Motion>", self._on_pane_drag_motion)
+            card.bind("<ButtonRelease-1>", self._on_pane_drag_release)
+            card.bind("<Escape>", self._cancel_pane_drag)
+            card.bind("<Unmap>", self._cancel_pane_drag)
             if len(ordered_accounts) > 1:
-                up = ttk.Button(actions, text="▲", width=3,
-                                command=lambda aid=account_id: self._on_move_account(aid, -1))
-                down = ttk.Button(actions, text="▼", width=3,
-                                  command=lambda aid=account_id: self._on_move_account(aid, 1))
+                up, down = ProfileActionBinding(), ProfileActionBinding()
                 self._account_move_buttons[account_id] = (up, down)
-                action_widgets.extend((up, down))
                 self._set_button_enabled(up, index > 0)
-                self._set_button_enabled(down, index < len(ordered_accounts) - 1)
-            query_button = ttk.Button(
-                actions,
-                text="새로고침",
-                width=8,
-                command=lambda aid=account_id: self._on_account_query(aid),
-            )
-            action_widgets.append(query_button)
-            login_button = ttk.Button(
-                actions,
-                text="연결",
-                width=6,
-                command=lambda aid=account_id: self._on_account_login(aid),
-            )
-            action_widgets.append(login_button)
-            logout_button = ttk.Button(
-                actions,
-                text="연결 해제",
-                width=8,
-                command=lambda aid=account_id: self._on_account_release_profile(aid),
-            )
-            action_widgets.append(logout_button)
-            delete_button = ttk.Button(
-                actions,
-                text="삭제",
-                width=6,
-                command=lambda aid=account_id, name=label: self._on_delete_profile(aid, name),
-            )
-            action_widgets.append(delete_button)
-            self._bind_responsive_widget_row(
-                actions,
-                action_widgets,
-                columns=len(action_widgets),
-            )
-            self._account_query_buttons[account_id] = query_button
-            self._account_login_buttons[account_id] = login_button
-            self._account_logout_buttons[account_id] = logout_button
+                self._set_button_enabled(down, index < len(ordered_accounts)-1)
+            self._account_query_buttons[account_id] = ProfileActionBinding()
+            self._account_login_buttons[account_id] = ProfileActionBinding()
+            self._account_logout_buttons[account_id] = ProfileActionBinding()
             status_var = tk.StringVar(value="조회 상태: -")
             snapshot_var = tk.StringVar(value="값 상태: -")
             self._account_status_vars[account_id] = status_var
@@ -996,14 +736,6 @@ class CodexUsageSettingsView:
             # 상태 줄·지표 표·경로 줄을 캔버스 하나에 그린다. 각각 Label로
             # 두면 카드당 네이티브 창이 수십 개가 되어 탭 열기와 창 크기
             # 조절이 프로필 수에 비례해 멈춘다.
-            detail = ProfileDetailCanvas(tk, card, bg=card_bg)
-            detail.canvas.grid(
-                row=2,
-                column=0,
-                sticky="we",
-                padx=8,
-                pady=(0, 2),
-            )
             for value_var in (status_var, snapshot_var):
                 detail.add_line(
                     section="top",
@@ -1039,31 +771,12 @@ class CodexUsageSettingsView:
                         else None
                     ),
                 )
-        self._reflow_pane_boxes(panes, side_row)
-        try:
-            panes.bind(
-                "<Configure>",
-                lambda event: self._reflow_pane_boxes(
-                    panes,
-                    side_row,
-                    available_width=int(getattr(event, "width", 0) or 0),
-                ),
-                add="+",
-            )
-        except TypeError:
-            try:
-                panes.bind(
-                    "<Configure>",
-                    lambda event: self._reflow_pane_boxes(
-                        panes,
-                        side_row,
-                        available_width=int(getattr(event, "width", 0) or 0),
-                    ),
-                )
-            except Exception:
-                pass
-        except Exception:
-            pass
+        active = self._active_account_id
+        if active not in self._account_order:
+            active = self._account_order[0] if self._account_order else None
+        if active is not None:
+            self._profile_inspector.select(active)
+        board.request_layout()
         row += 1
         return row
 
@@ -1507,8 +1220,18 @@ class CodexUsageSettingsView:
         if canvas is None or window_id is None:
             return
         width = max(1, int(getattr(event, "width", 1) or 1))
+        if self._profile_board is not None:
+            # Board graphics fill the viewport, but the native toolbar should
+            # retain its intrinsic width instead of resizing every control.
+            try:
+                width = min(width, max(620, int(self._scroll_body.winfo_reqwidth())))
+            except Exception:
+                pass
+        if width == self._scroll_window_width:
+            return
         try:
             canvas.itemconfigure(window_id, width=width)
+            self._scroll_window_width = width
         except Exception:
             pass
         return
@@ -1523,7 +1246,8 @@ class CodexUsageSettingsView:
         ]
         if any(item <= 0 for item in widths):
             return 0
-        return (2 * max(widths)) + 10
+        required = (2 * max(widths)) + 10
+        return max(620, required) if self._profile_board is not None else required
 
     def _pane_box_unwrapped_width(self, box: Any) -> int:
         # 상자의 요구 폭은 자식 행이 랩되면 작아지고 wraplength 라벨은
@@ -1956,6 +1680,10 @@ class CodexUsageSettingsView:
                 position += 1
             return side, position
         return None
+
+    def _select_and_drag_profile(self, profile_id: str, event: Any) -> None:
+        self._profile_inspector.select(profile_id)
+        self._on_pane_drag_start(profile_id, event)
 
     def _on_pane_drag_start(self, account_id: str, event: Any = None) -> None:
         self._cancel_pane_drag()

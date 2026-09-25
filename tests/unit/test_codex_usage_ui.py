@@ -31,7 +31,7 @@ class _FakeLabel:
         self.grid_remove_calls += 1
         return None
 
-    def bind(self, event, callback):
+    def bind(self, event, callback, add=None):
         self.bind_calls.append((event, callback))
         return None
 
@@ -73,11 +73,12 @@ class _FakeWidget:
         self.grid_kwargs = dict(kwargs)
         return None
 
-    def bind(self, event, callback):
+    def bind(self, event, callback, add=None):
         self.bind_calls.append((event, callback))
         return None
 
     def configure(self, **kwargs):
+        self.kwargs.update(kwargs)
         self.configure_calls.append(dict(kwargs))
         return None
 
@@ -99,6 +100,9 @@ class _FakeWidget:
     def after(self, delay_ms, callback):
         self.after_calls.append((int(delay_ms), callback))
         return f"after-{len(self.after_calls)}"
+
+    def after_idle(self, callback):
+        return self.after(0, callback)
 
     def after_cancel(self, after_id):
         self.after_cancel_calls.append(after_id)
@@ -131,6 +135,25 @@ class _FakeCanvas(_FakeWidget):
     def create_window(self, *args, **kwargs):
         self.windows.append((args, kwargs))
         return len(self.windows)
+
+    def create_rectangle(self, *args, **kwargs):
+        self.drawn_items.append(("rectangle", args, dict(kwargs)))
+        return len(self.drawn_items)
+
+    def coords(self, item, *args):
+        if args:
+            kind, _, options = self.drawn_items[item-1]
+            self.drawn_items[item-1] = (kind, args, options)
+        return self.drawn_items[item-1][1]
+
+    def itemcget(self, item, key):
+        return self.drawn_items[item-1][2].get(key, "")
+
+    def tag_bind(self, *args):
+        return None
+
+    def tag_raise(self, *args):
+        return None
 
     def create_polygon(self, *args, **kwargs):
         self.drawn_items.append(("polygon", args, dict(kwargs)))
@@ -297,6 +320,9 @@ class _FakeTtk:
         self.scrollbars = []
         self.radiobuttons = []
         self.styles = _FakeStyle()
+
+    def Combobox(self, *args, **kwargs):
+        return self.Entry(*args, **kwargs)
 
     def Entry(self, *args, **kwargs):
         widget = _FakeWidget(self, *args, **kwargs)
@@ -1032,7 +1058,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
 
-    def test_account_cards_render_provider_mark_that_follows_selection(self) -> None:
+    def test_profile_headers_identify_provider_and_follow_selection(self) -> None:
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
         parent = _FakeWidget()
@@ -1054,39 +1080,16 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view.mount(parent)
 
-        mark_1 = view._account_provider_marks.get("account_1")
-        mark_2 = view._account_provider_marks.get("account_2")
-        self.assertIsNotNone(mark_1)
-        self.assertIsNotNone(mark_2)
-        # Codex mark = silhouette blob + two `>_` knockout polygons.
-        self.assertEqual(
-            [item[0] for item in mark_1.drawn_items],
-            ["polygon", "polygon", "polygon"],
-        )
-        self.assertEqual(mark_1.drawn_items[0][2].get("fill"), "#7a9dff")
-        # The knockout must match the card background, not the dark taskbar
-        # panel color, or the `>_` shows as a dark shape on the white card.
-        self.assertEqual(mark_1.drawn_items[1][2].get("fill"), "#FFFFFF")
-        # Claude mark = single radial burst polygon.
-        self.assertEqual([item[0] for item in mark_2.drawn_items], ["polygon"])
-        self.assertEqual(mark_2.drawn_items[0][2].get("fill"), "#d97757")
-
-        # Provider combobox change redraws the mark on the same canvas.
-        mark_1.drawn_items.clear()
-        mark_1.delete_calls.clear()
+        first = view._account_detail_canvases["account_1"]
+        second = view._account_detail_canvases["account_2"]
+        self.assertEqual(first._header_var.get(), "Codex · Codex 1")
+        self.assertEqual(second._header_var.get(), "Claude · Claude 1")
         view._account_provider_vars["account_1"].set("cursor")
-
-        self.assertEqual(mark_1.delete_calls, [("all",)])
-        self.assertEqual([item[0] for item in mark_1.drawn_items], ["polygon"])
-        self.assertEqual(mark_1.drawn_items[0][2].get("fill"), "#f8fafc")
-
-        # The mark sits inside the draggable header row, so it must take the
-        # same fleur cursor and drag bindings as the header and label.
-        drag_sequences = {sequence for sequence, _callback in mark_1.bind_calls}
-        self.assertIn("<ButtonPress-1>", drag_sequences)
-        self.assertIn("<B1-Motion>", drag_sequences)
-        self.assertIn("<ButtonRelease-1>", drag_sequences)
-        self.assertIn({"cursor": "fleur"}, mark_1.configure_calls)
+        self.assertEqual(first._header_var.get(), "Cursor · Codex 1")
+        view._profile_inspector.select("account_2")
+        self.assertIs(view._profile_inspector.provider.kwargs["textvariable"],
+                      view._account_provider_vars["account_2"])
+        self.assertIs(first.canvas.board.canvas, second.canvas.board.canvas)
 
     def test_scroll_navigation_handles_keyboard_and_mouse_wheel(self) -> None:
         fake_tk = _FakeTk()
@@ -1113,6 +1116,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         callbacks["<Home>"](object())
         callbacks["<End>"](object())
         callbacks["<MouseWheel>"](type("Event", (), {"delta": -240})())
+        view._flush_pending_scroll()
 
         self.assertEqual(
             canvas.yview_scroll_calls,
@@ -1577,7 +1581,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view.mount(parent)
 
-        texts = [label.kwargs.get("text") for label in fake_tk.labels]
+        texts = list(view._account_labels.values())
         self.assertIn("Codex 1", texts)
         self.assertIn("Codex 2", texts)
         # 상태·경로 줄은 카드의 상세 캔버스 텍스트 항목으로 그린다.
@@ -1640,8 +1644,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         rendered = view._rendered_pane_assignment
         self.assertEqual(rendered["right"], ["account_1", "account_2"])
         self.assertEqual(rendered["left"], ["account_3", "account_4"])
-        self.assertIn("1·2번 슬롯", view._pane_hints["right"].kwargs.get("text", ""))
-        self.assertIn("3·4번 슬롯", view._pane_hints["left"].kwargs.get("text", ""))
+        self.assertIn("1·2번 슬롯", view._scroll_canvas.itemcget(view._pane_hints["right"].item, "text"))
+        self.assertIn("3·4번 슬롯", view._scroll_canvas.itemcget(view._pane_hints["left"].item, "text"))
 
     def test_save_remounts_when_pane_assignment_goes_stale(self) -> None:
         class _FakeMonitor:
@@ -1780,14 +1784,14 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view.mount(_FakeWidget())
 
-        texts = [label.kwargs.get("text") for label in fake_tk.labels]
+        texts = list(view._account_labels.values())
         self.assertEqual(view._account_order, [f"profile_{index:032x}" for index in range(3)])
         self.assertIn("프로필 1", texts)
         self.assertIn("프로필 2", texts)
         self.assertIn("프로필 3", texts)
         button_texts = [button.kwargs.get("text") for button in fake_ttk.buttons]
         self.assertIn("프로필 추가", button_texts)
-        self.assertEqual(button_texts.count("삭제"), 3)
+        self.assertEqual(button_texts.count("삭제"), 1)
 
     def test_mount_with_zero_profiles_still_exposes_add_action(self) -> None:
         fake_tk = _FakeTk()
@@ -1809,7 +1813,8 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         button_texts = [button.kwargs.get("text") for button in fake_ttk.buttons]
         self.assertIn("프로필 추가", button_texts)
-        self.assertNotIn("연결", button_texts)
+        self.assertEqual(view._profile_inspector.selected_id, "")
+        self.assertEqual(view._profile_inspector.buttons["login"].kwargs["state"], "disabled")
 
     def test_add_and_delete_profile_actions_remount_after_confirmed_manager_change(self) -> None:
         class _FakeMonitor:
@@ -2798,9 +2803,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("저장", button_texts)
         self.assertNotIn("로드하기", button_texts)
         self.assertNotIn("툴팁(초)", [label.kwargs.get("text") for label in fake_tk.labels])
-        self.assertEqual(button_texts.count("연결"), 2)
-        self.assertEqual(button_texts.count("연결 해제"), 2)
-        self.assertEqual(button_texts.count("새로고침"), 2)
+        self.assertEqual(button_texts.count("연결"), 1)
+        self.assertEqual(button_texts.count("연결 해제"), 1)
+        self.assertEqual(button_texts.count("새로고침"), 1)
         self.assertIn("▲", button_texts)
         self.assertIn("▼", button_texts)
 
