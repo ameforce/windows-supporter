@@ -33,6 +33,7 @@ class ProfileDetailCanvasTest(unittest.TestCase):
 
     def _resize(self, width: int) -> None:
         self.detail._on_configure(SimpleNamespace(width=width))
+        self.root.update_idletasks()
 
     def _x(self, item: int) -> int:
         return int(self.detail.canvas.coords(item)[0])
@@ -160,6 +161,28 @@ class ProfileDetailCanvasTest(unittest.TestCase):
         self.detail.add_line(section="bottom", text="상태 파일: -", wraplength=300)
 
         self.assertEqual(self.root.winfo_children(), [self.detail.canvas])
+
+
+    def test_configure_burst_is_coalesced_until_idle(self):
+        from unittest.mock import patch
+        self.root.update_idletasks()
+        with patch.object(self.detail, 'layout', wraps=self.detail.layout) as layout:
+            for width in range(450, 550):
+                self.detail._on_configure(SimpleNamespace(width=width))
+            layout.assert_not_called()
+            self.root.update_idletasks()
+            layout.assert_called_once()
+        self.assertEqual(self.detail._width, 549)
+        self.assertEqual(int(self.detail.canvas.cget('width')), 1)
+
+    def test_destroy_cancels_pending_layout(self):
+        after_id = self.detail._layout_after_id
+        self.assertIsNotNone(after_id)
+        self.detail.canvas.destroy()
+        self.assertIsNone(self.detail._layout_after_id)
+        self.assertNotIn(after_id, self.root.tk.call('after', 'info'))
+        self.detail.request_layout()
+        self.assertIsNone(self.detail._layout_after_id)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ class CodexUsageSettingsView:
         self._account_provider_marks = {}
         self._account_taskbar_selected_vars = {}
         self._account_query_buttons = {}
+        self._account_move_buttons = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_labels: dict[str, str] = {}
@@ -66,6 +67,7 @@ class CodexUsageSettingsView:
         self._account_metric_visibility = {}
         self._account_detail_canvases = {}
         self._account_order: list[str] = []
+        self._pane_card_parent = None
         self._pane_boxes: dict[str, Any] = {}
         self._pane_lists: dict[str, Any] = {}
         self._pane_titles: dict[str, Any] = {}
@@ -141,6 +143,7 @@ class CodexUsageSettingsView:
         self._parent = parent
         self._lazy_import_tk()
         self._stop_runtime_refresh()
+        self._cancel_pending_autosave()
         tk = self._tk
         ttk = self._ttk
         if tk is None or ttk is None:
@@ -166,6 +169,7 @@ class CodexUsageSettingsView:
         self._login_button = None
         self._logout_button = None
         self._account_query_buttons = {}
+        self._account_move_buttons = {}
         self._account_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_labels = {}
@@ -477,10 +481,9 @@ class CodexUsageSettingsView:
         body = self._scroll_body
         if body is None:
             return (0, 0)
-        try:
-            body.update_idletasks()
-        except Exception:
-            pass
+        # Geometry settling belongs to the shell, not a size getter. Nested
+        # idle drains here repaint intermediate layouts repeatedly while the
+        # shell queries preferred/minimum sizes in the same transaction.
         try:
             body_width = int(body.winfo_reqwidth())
         except Exception:
@@ -651,6 +654,7 @@ class CodexUsageSettingsView:
             for profile_id in assignment.get(side, []):
                 box_of[str(profile_id)] = side
         panes = tk.Frame(body, bg=card_bg)
+        self._pane_card_parent = panes
         panes.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 2))
         try:
             panes.columnconfigure(0, weight=1)
@@ -709,7 +713,7 @@ class CodexUsageSettingsView:
             title.grid(row=0, column=0, sticky="we", padx=8, pady=(6, 0))
             hint = tk.Label(
                 box,
-                text=f"작업표시줄 {slot_hint[side]} · 제목을 끌어 순서 변경",
+                text=f"작업표시줄 {slot_hint[side]} · 카드 위: 교환 · 사이: 이동",
                 bg=card_bg,
                 fg=text_muted,
                 font=("Segoe UI", 8),
@@ -802,12 +806,13 @@ class CodexUsageSettingsView:
                 card_host = self._pane_lists.get("pool", body)
                 card_side = "pool"
             card = tk.Frame(
-                card_host,
+                panes,
                 bg=card_bg,
                 highlightthickness=1,
                 highlightbackground=border,
             )
             card.grid(
+                in_=card_host,
                 row=box_rows.get(card_side, 0),
                 column=0,
                 sticky="nwe",
@@ -902,6 +907,8 @@ class CodexUsageSettingsView:
                     )
                     drag_widget.bind("<B1-Motion>", self._on_pane_drag_motion)
                     drag_widget.bind("<ButtonRelease-1>", self._on_pane_drag_release)
+                    drag_widget.bind("<Escape>", self._cancel_pane_drag)
+                    drag_widget.bind("<Unmap>", self._cancel_pane_drag)
                 except Exception:
                     pass
 
@@ -938,20 +945,14 @@ class CodexUsageSettingsView:
             actions.grid(row=1, column=0, sticky="we", padx=8, pady=(0, 2))
             action_widgets = []
             if len(ordered_accounts) > 1:
-                if index > 0:
-                    action_widgets.append(ttk.Button(
-                        actions,
-                        text="▲",
-                        width=3,
-                        command=lambda aid=account_id: self._on_move_account(aid, -1),
-                    ))
-                if index < len(ordered_accounts) - 1:
-                    action_widgets.append(ttk.Button(
-                        actions,
-                        text="▼",
-                        width=3,
-                        command=lambda aid=account_id: self._on_move_account(aid, 1),
-                    ))
+                up = ttk.Button(actions, text="▲", width=3,
+                                command=lambda aid=account_id: self._on_move_account(aid, -1))
+                down = ttk.Button(actions, text="▼", width=3,
+                                  command=lambda aid=account_id: self._on_move_account(aid, 1))
+                self._account_move_buttons[account_id] = (up, down)
+                action_widgets.extend((up, down))
+                self._set_button_enabled(up, index > 0)
+                self._set_button_enabled(down, index < len(ordered_accounts) - 1)
             query_button = ttk.Button(
                 actions,
                 text="새로고침",
@@ -1362,6 +1363,9 @@ class CodexUsageSettingsView:
                         padx=padx,
                         pady=(0, 2),
                     )
+                    # Keep controls above their younger geometry-host siblings.
+                    if callable(getattr(widget, 'lift', None)):
+                        widget.lift()
                 else:
                     widget.grid(
                         row=row_index,
@@ -1535,6 +1539,15 @@ class CodexUsageSettingsView:
             stack = list(box.winfo_children())
         except Exception:
             stack = []
+        # Cards share a stable ancestor so grid(in_=...) can move them without
+        # destroying widgets. Include their logical children in pane measurement.
+        for side, candidate in (self._pane_boxes or {}).items():
+            if candidate is box:
+                stack.extend(
+                    card for profile_id in (self._rendered_pane_assignment or {}).get(side, [])
+                    if (card := self._pane_card_widgets.get(profile_id)) is not None
+                    and getattr(card, "master", None) is self._pane_card_parent
+                )
         while stack:
             node = stack.pop()
             try:
@@ -1611,7 +1624,14 @@ class CodexUsageSettingsView:
                 except Exception:
                     pass
             first = False
-            node = getattr(node, "master", None)
+            parent = getattr(node, "master", None)
+            try:
+                geometry_parent = node.grid_info().get("in") or node.pack_info().get("in")
+                if geometry_parent is not None:
+                    parent = geometry_parent if hasattr(geometry_parent, "master") else node.nametowidget(str(geometry_parent))
+            except Exception:
+                pass
+            node = parent
         try:
             inset += 2 * int(ancestor.cget("highlightthickness") or 0)
         except Exception:
@@ -1722,34 +1742,86 @@ class CodexUsageSettingsView:
                 return True
         return False
 
-    def _apply_pane_drop(
-        self,
-        dragged_id: str,
-        target_side: str,
-        target_index: int,
-    ) -> None:
+    def _sync_pane_assignment(self) -> bool:
+        """Reposition existing cards; preserve controls, focus and scroll state."""
+        if self._pane_card_parent is None:
+            return False
         order, selected, priority = self._pane_ui_state()
-        plan = plan_taskbar_drop(
-            order, selected, priority, dragged_id, target_side, target_index
-        )
-        self._account_order = list(plan["order"])
-        selected_set = set(plan["selected"])
-        self._loading_settings = True
+        if set(order) != set(self._pane_card_widgets):
+            return False
+        assignment = resolve_taskbar_pane_assignment(order, selected, priority)
+        previous = self._rendered_pane_assignment or {}
+        for side in ("left", "right", "pool"):
+            host = self._pane_lists.get(side)
+            if host is None:
+                return False
+            old = list(previous.get(side, []))
+            for index, profile_id in enumerate(assignment[side]):
+                if index < len(old) and old[index] == profile_id:
+                    continue
+                card = self._pane_card_widgets[profile_id]
+                card.grid(in_=host, row=index, column=0, sticky="nwe", pady=(0, 6))
+                if callable(getattr(card, "lift", None)):
+                    card.lift()
+            title = self._pane_titles.get(side)
+            hint = self._pane_hints.get(side)
+            if side == "pool":
+                text = f"표시 안 함 (보관함) ({len(assignment[side])})"
+            else:
+                name = "왼쪽 영역" if side == "left" else "오른쪽 영역"
+                text = f"{name} ({len(assignment[side])}/{TASKBAR_PANE_SIZE})"
+                slots = "1·2번 슬롯" if side == priority else "3·4번 슬롯"
+                if hint is not None:
+                    hint.configure(text=f"작업표시줄 {slots} · 카드 위: 교환 · 사이: 이동")
+            if title is not None:
+                title.configure(text=text)
+        self._rendered_pane_assignment = assignment
+        self._rendered_side_priority = priority
+        self._refresh_move_buttons()
+        return True
+
+    def _refresh_move_buttons(self) -> None:
+        for index, profile_id in enumerate(self._account_order):
+            buttons = self._account_move_buttons.get(profile_id)
+            if buttons is not None:
+                self._set_button_enabled(buttons[0], index > 0)
+                self._set_button_enabled(buttons[1], index < len(self._account_order) - 1)
+
+    def _apply_pane_drop(
+        self, dragged_id: str, target_side: str, target_index: int,
+        *, target_profile_id: str | None = None,
+    ) -> bool:
+        order, selected, priority = self._pane_ui_state()
+        plan = plan_taskbar_drop(order, selected, priority, dragged_id, target_side, target_index,
+                                 target_profile_id=target_profile_id)
+        if plan["order"] == order and set(plan["selected"]) == set(selected):
+            return True
+
+        def apply_ui(new_order: list[str], new_selected: list[str]) -> None:
+            self._account_order = list(new_order)
+            selected_set = set(new_selected)
+            was_loading = self._loading_settings
+            self._loading_settings = True
+            try:
+                for profile_id, variable in self._account_taskbar_selected_vars.items():
+                    self._set_var_if_changed(variable, profile_id in selected_set)
+            finally:
+                self._loading_settings = was_loading
+
+        self._cancel_pending_autosave()
+        apply_ui(plan["order"], plan["selected"])
         try:
-            for profile_id, var in (self._account_taskbar_selected_vars or {}).items():
-                try:
-                    if var is not None:
-                        var.set(profile_id in selected_set)
-                except Exception:
-                    pass
-        finally:
-            self._loading_settings = False
-        if self._autosave_now():
-            # 상자 배치가 바뀌면 _apply_settings_update 안에서 이미 다시
-            # 그렸으므로 여기서 또 그리지 않는다. 바뀌지 않았으면 다시
-            # 그릴 이유도 없다.
-            self._set_status("저장됨", level="ok")
-        return
+            saved = bool(self._autosave_now())
+        except Exception:
+            apply_ui(order, selected)
+            self._cancel_pending_autosave()
+            raise
+        if not saved:
+            self._cancel_pending_autosave()
+            apply_ui(order, selected)
+            return False
+        self._set_status("교환하여 저장됨" if target_profile_id else "저장됨", level="ok")
+        return True
 
     def _restore_pane_card_rows(self) -> None:
         rendered = self._rendered_pane_assignment
@@ -1772,33 +1844,83 @@ class CodexUsageSettingsView:
         return
 
     def _show_drop_indicator(self, side: str, position: int) -> None:
-        host = (self._pane_lists or {}).get(side)
-        indicator = (self._drop_indicators or {}).get(side)
+        host = self._pane_lists.get(side)
+        indicator = self._drop_indicators.get(side)
         if host is None or indicator is None:
             return
-        rendered = (self._rendered_pane_assignment or {}).get(side, [])
-        dragged = (self._drag_state or {}).get("id") if isinstance(self._drag_state, dict) else None
-        visible = [profile_id for profile_id in rendered if profile_id != dragged]
+        dragged = (self._drag_state or {}).get("id")
+        visible = [item for item in (self._rendered_pane_assignment or {}).get(side, []) if item != dragged]
         position = max(0, min(int(position), len(visible)))
-        row = 0
         try:
-            for index, profile_id in enumerate(visible):
-                if index == position:
-                    indicator.grid(row=row, column=0, sticky="we", pady=(0, 4))
-                    row += 1
-                card = (self._pane_card_widgets or {}).get(profile_id)
-                if card is not None:
-                    card.grid(row=row, column=0, sticky="nwe", pady=(0, 6))
-                    row += 1
-            if position >= len(visible):
-                indicator.grid(row=row, column=0, sticky="we", pady=(0, 4))
+            y = 0
+            if position < len(visible):
+                card = self._pane_card_widgets[visible[position]]
+                y = card.winfo_rooty() - host.winfo_rooty()
+            elif visible:
+                card = self._pane_card_widgets[visible[-1]]
+                y = card.winfo_rooty() - host.winfo_rooty() + card.winfo_height()
+            indicator.place(x=0, y=max(0, y), relwidth=1, height=3)
+            indicator.lift()
         except Exception:
             pass
-        return
+
+    def _pane_swap_target_at(self, side: str, y_root: int) -> str | None:
+        if side == "pool":
+            return None
+        for profile_id in (self._rendered_pane_assignment or {}).get(side, []):
+            card = self._pane_card_widgets.get(profile_id)
+            try:
+                top, height = int(card.winfo_rooty()), int(card.winfo_height())
+                margin = min(12, max(2, height // 5))
+                if top + margin <= y_root < top + height - margin:
+                    return profile_id
+            except Exception:
+                continue
+        return None
+
+    def _clear_pane_drag_feedback(self, state: dict[str, Any]) -> None:
+        side = state.get("target")
+        for widget in (self._pane_boxes.get(side), self._pane_card_widgets.get(state.get("swap"))):
+            try:
+                if widget is not None:
+                    widget.configure(highlightbackground="#E5E7EB")
+            except Exception:
+                pass
+        try:
+            indicator = self._drop_indicators.get(side)
+            if indicator is not None:
+                indicator.place_forget()
+        except Exception:
+            pass
+        state.update(target=None, index=0, swap=None)
+
+    def _cancel_pane_drag(self, _event: Any = None) -> str:
+        state = self._drag_state
+        self._drag_state = None
+        if isinstance(state, dict):
+            self._clear_pane_drag_feedback(state)
+            try:
+                self._pane_card_widgets[state["id"]].configure(highlightbackground="#E5E7EB")
+            except Exception:
+                pass
+            try:
+                if state.get("grab") is not None:
+                    state["grab"].grab_release()
+            except Exception:
+                pass
+        return "break"
 
     def _pane_drop_target_at(self, x_root: int, y_root: int) -> tuple[str, int] | None:
         if not self._pane_boxes:
             return None
+        canvas = self._scroll_canvas
+        if canvas is not None:
+            try:
+                if not (canvas.winfo_rootx() <= x_root < canvas.winfo_rootx() + canvas.winfo_width()
+                        and canvas.winfo_rooty() <= y_root < canvas.winfo_rooty() + canvas.winfo_height()):
+                    return None
+            except Exception:
+                return None
         rendered = self._rendered_pane_assignment
         if not isinstance(rendered, dict):
             return None
@@ -1836,138 +1958,84 @@ class CodexUsageSettingsView:
         return None
 
     def _on_pane_drag_start(self, account_id: str, event: Any = None) -> None:
+        self._cancel_pane_drag()
         if self._profile_settings_mutation_blocked():
-            self._drag_state = None
             return
         normalized = str(account_id or "").strip()
-        if not normalized or normalized not in (self._pane_card_widgets or {}):
-            self._drag_state = None
+        card = self._pane_card_widgets.get(normalized)
+        if card is None:
             return
-        self._drag_state = {"id": normalized, "target": None, "index": 0}
-        card = (self._pane_card_widgets or {}).get(normalized)
+        widget = getattr(event, "widget", None) or card
+        start = (int(event.x_root), int(event.y_root)) if event is not None else None
+        self._drag_state = {"id": normalized, "target": None, "index": 0, "swap": None,
+                            "start": start, "active": False, "grab": widget}
         try:
-            if card is not None:
-                card.configure(highlightbackground="#2563EB", highlightthickness=2)
+            widget.grab_set()
+            widget.focus_set()
+            card.configure(highlightbackground="#2563EB")
         except Exception:
             pass
-        return
 
     def _on_pane_drag_motion(self, event: Any = None) -> None:
         state = self._drag_state
         if not isinstance(state, dict) or not state.get("id"):
             return
         if self._profile_deletions_inflight or self._profile_actions_inflight:
-            # 변경 잠금 중에는 놓아도 취소되므로 표시만 지운다. 여기서
-            # _profile_settings_mutation_blocked()를 부르면 상태 문구가
-            # 매 움직임마다 덮어써지므로 조용히 처리한다.
-            if state.get("target") is None:
-                return
-            state["target"] = None
-            for box in (self._pane_boxes or {}).values():
-                try:
-                    if box is not None:
-                        box.configure(highlightbackground="#E5E7EB", highlightthickness=1)
-                except Exception:
-                    pass
-            for indicator in (self._drop_indicators or {}).values():
-                try:
-                    if indicator is not None:
-                        indicator.grid_remove()
-                except Exception:
-                    pass
+            if state.get("target") is not None:
+                self._clear_pane_drag_feedback(state)
             return
         try:
-            x_root = int(getattr(event, "x_root", 0) or 0)
-            y_root = int(getattr(event, "y_root", 0) or 0)
-        except Exception:
+            x_root, y_root = int(event.x_root), int(event.y_root)
+        except (AttributeError, TypeError, ValueError):
             return
+        start = state.get("start")
+        if not state.get("active") and start is not None:
+            if max(abs(x_root - start[0]), abs(y_root - start[1])) < 5:
+                return
+        state["active"] = True
         found = self._pane_drop_target_at(x_root, y_root)
-        # Tk는 포인터가 같은 슬롯에 있어도 이동 이벤트를 반복해서 보낸다.
-        # 위치 확인은 계속하되, 드롭 대상이 바뀔 때만 위젯 배치를 갱신한다.
-        target: tuple[str, int] | None = None
         if found is None:
-            if state.get("target") is None:
-                return
-        else:
-            side, position = found
-            target = (side, int(position))
-            try:
-                current_position = int(state.get("index", 0))
-            except Exception:
-                current_position = None
-            if state.get("target") == side and current_position == target[1]:
-                return
-        for box in (self._pane_boxes or {}).values():
-            try:
-                if box is not None:
-                    box.configure(highlightbackground="#E5E7EB", highlightthickness=1)
-            except Exception:
-                pass
-        for indicator in (self._drop_indicators or {}).values():
-            try:
-                if indicator is not None:
-                    indicator.grid_remove()
-            except Exception:
-                pass
-        if target is None:
-            state["target"] = None
+            if state.get("target") is not None:
+                self._clear_pane_drag_feedback(state)
             return
-        side, position = target
-        state["target"] = side
-        state["index"] = position
-        box = (self._pane_boxes or {}).get(side)
+        side, position = found
+        swap_id = self._pane_swap_target_at(side, y_root)
+        assignment = self._rendered_pane_assignment or {}
+        if swap_id is None and side != "pool" and state["id"] in assignment.get("pool", []):
+            selected_count = len(assignment.get("left", [])) + len(assignment.get("right", []))
+            occupants = assignment.get(side, [])
+            if selected_count >= TASKBAR_PROFILE_LIMIT and occupants:
+                swap_id = occupants[max(0, min(position, len(occupants) - 1))]
+        if (state.get("target"), state.get("index"), state.get("swap")) == (side, position, swap_id):
+            return
+        self._clear_pane_drag_feedback(state)
+        state.update(target=side, index=position, swap=swap_id)
         try:
-            if box is not None:
-                box.configure(highlightbackground="#2563EB", highlightthickness=2)
+            self._pane_boxes[side].configure(highlightbackground="#2563EB")
+            self._pane_card_widgets[state["id"]].configure(highlightbackground="#2563EB")
+            if swap_id and swap_id != state["id"]:
+                self._pane_card_widgets[swap_id].configure(highlightbackground="#059669")
         except Exception:
             pass
-        self._show_drop_indicator(side, position)
-        return
+        if swap_id is None:
+            self._show_drop_indicator(side, position)
 
     def _on_pane_drag_release(self, event: Any = None) -> None:
-        state = self._drag_state
-        self._drag_state = None
-        for card in (self._pane_card_widgets or {}).values():
-            try:
-                if card is not None:
-                    card.configure(highlightbackground="#E5E7EB", highlightthickness=1)
-            except Exception:
-                pass
-        for box in (self._pane_boxes or {}).values():
-            try:
-                if box is not None:
-                    box.configure(highlightbackground="#E5E7EB", highlightthickness=1)
-            except Exception:
-                pass
-        for indicator in (self._drop_indicators or {}).values():
-            try:
-                if indicator is not None:
-                    indicator.grid_remove()
-            except Exception:
-                pass
-        if not isinstance(state, dict) or not state.get("id"):
+        if event is not None:
+            # Release coordinates are authoritative, not the last motion event.
+            self._on_pane_drag_motion(event)
+        state = dict(self._drag_state or {})
+        self._cancel_pane_drag()
+        if not state.get("id") or not state.get("active", True):
             return
         target = state.get("target")
-        if target not in ("left", "right", "pool"):
-            self._restore_pane_card_rows()
-            return
-        if self._profile_settings_mutation_blocked():
-            self._restore_pane_card_rows()
+        if target not in ("left", "right", "pool") or self._profile_settings_mutation_blocked():
             return
         try:
-            self._apply_pane_drop(
-                str(state.get("id")),
-                str(target),
-                int(state.get("index", 0)),
-            )
-        except ValueError:
-            self._restore_pane_card_rows()
-            self._set_status(
-                f"이동 실패: 작업표시줄 표시 프로필은 최대 {TASKBAR_PROFILE_LIMIT}개입니다.",
-                level="error",
-            )
-        except Exception:
-            self._restore_pane_card_rows()
+            self._apply_pane_drop(str(state["id"]), str(target), int(state.get("index", 0)),
+                                  target_profile_id=state.get("swap"))
+        except Exception as exc:
+            self._set_status(f"이동 실패: {exc}", level="error")
         return
 
     def _wrap_scale(self) -> float:
@@ -2577,8 +2645,8 @@ class CodexUsageSettingsView:
         self._autosave_after_id = None
         return
 
-    def _autosave_now(self) -> None:
-        self._autosave_after_id = None
+    def _autosave_now(self) -> bool:
+        self._cancel_pending_autosave()
         return self._save_settings(reschedule_transient=True)
 
     def _parse_positive_seconds_strict(self, text: str, label: str) -> tuple[float, str | None]:
@@ -2666,8 +2734,11 @@ class CodexUsageSettingsView:
                 # 상자 배치가 바뀌는 저장(우선순위 뒤집기·표시 체크 변경)은
                 # 다시 그려야 상자 제목과 슬롯 안내가 실제 배치와 일치한다.
                 # 저장이 끝난 뒤 다시 그리므로 입력 손실이 없다.
-                if provider_changed or self._pane_assignment_rendered_stale():
+                if provider_changed:
                     self._remount()
+                elif self._pane_assignment_rendered_stale():
+                    if not self._sync_pane_assignment():
+                        self._remount()
                 if self._preserve_status_after_next_autosave:
                     self._preserve_status_after_next_autosave = False
                 else:
@@ -4023,6 +4094,9 @@ class CodexUsageSettingsView:
             if reconcile():
                 self._schedule_runtime_refresh(1000)
                 return
+        if self._drag_state is not None:
+            self._schedule_runtime_refresh(300)
+            return
         runtime = self._safe_get_runtime()
         session_state = str(runtime.get("session_state", "logged_out") or "logged_out")
         profile_in_use = bool(runtime.get("profile_in_use", False))
