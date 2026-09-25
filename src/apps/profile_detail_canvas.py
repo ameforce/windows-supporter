@@ -69,6 +69,7 @@ class ProfileDetailCanvas:
         self._bottom_lines: list[_TextLine] = []
         self._width = 0
         self._layout_after_id: Any = None
+        self._destroyed = False
         self._requested_size: Any = None
         self.canvas = tk.Canvas(
             parent,
@@ -87,6 +88,7 @@ class ProfileDetailCanvas:
             pass
         try:
             self.canvas.bind("<Configure>", self._on_configure)
+            self.canvas.bind("<Destroy>", self._on_destroy)
         except Exception:
             pass
 
@@ -161,7 +163,20 @@ class ProfileDetailCanvas:
         self.request_layout()
         return
 
+    def _on_destroy(self, event: Any = None) -> None:
+        if event is not None and getattr(event, "widget", self.canvas) is not self.canvas:
+            return
+        self._destroyed = True
+        after_id, self._layout_after_id = self._layout_after_id, None
+        if after_id is not None:
+            try:
+                self.canvas.after_cancel(after_id)
+            except Exception:
+                pass
+
     def request_layout(self) -> None:
+        if self._destroyed:
+            return
         # 같은 idle 주기의 값 변경·표시 전환을 한 번의 배치로 합친다.
         if self._layout_after_id is not None:
             return
@@ -182,7 +197,7 @@ class ProfileDetailCanvas:
         if width <= 1 or width == self._width:
             return
         self._width = width
-        self.layout()
+        self.request_layout()
         return
 
     def _trace_text(self, variable: Any, item: int) -> None:
@@ -338,25 +353,20 @@ class ProfileDetailCanvas:
         return y, natural
 
     def layout(self) -> None:
-        if self.canvas is None:
+        if self.canvas is None or self._destroyed:
             return
-        y, natural_top = self._place_lines(self._top_lines, 0)
+        y, _ = self._place_lines(self._top_lines, 0)
         if self._cells:
-            y, natural_table = self._place_table(y + _TABLE_TOP_GAP)
+            y, _ = self._place_table(y + _TABLE_TOP_GAP)
             y += _TABLE_BOTTOM_GAP
-        else:
-            natural_table = 0
-        y, natural_bottom = self._place_lines(self._bottom_lines, y)
-        requested_width = max(1, natural_top, natural_table, natural_bottom)
-        if self._width > 1:
-            # bbox가 이미 글자 둘레 여백을 포함하므로 자연 폭 합산이 할당
-            # 폭을 1~2px 넘을 수 있다. 할당 폭을 넘겨 요구하지 않는다.
-            requested_width = min(requested_width, self._width)
-        requested = (requested_width, max(1, y))
+        y, _ = self._place_lines(self._bottom_lines, y)
+        # The grid supplies horizontal space. Wrapped text must not feed its
+        # allocated width back into the requested width and trigger reflow.
+        requested = (1, max(1, y))
         if requested != self._requested_size:
             self._requested_size = requested
             try:
-                self.canvas.configure(width=requested[0], height=requested[1])
+                self.canvas.configure(height=requested[1])
             except Exception:
                 pass
         return

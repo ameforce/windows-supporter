@@ -1005,12 +1005,14 @@ class WindowsSupporterMainUI:
             # applied. Select the target first so a user resize cannot be
             # attributed to the tab being left.
             self._current_tab = new_tab
-            self._apply_tab_geometry(new_tab)
+            if new_tab != old_tab:
+                self._apply_tab_geometry(new_tab)
             try:
                 self._apply_notebook_labels_for_width(self._root.winfo_width())
             except Exception:
                 self._apply_notebook_labels_for_width()
-            self._save_last_tab(new_tab)
+            if new_tab != old_tab:
+                self._save_last_tab(new_tab)
             return
         except Exception:
             return

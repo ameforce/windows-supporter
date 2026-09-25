@@ -87,6 +87,8 @@ def plan_taskbar_drop(
     dragged_id: str,
     target_side: str,
     target_index: int,
+    *,
+    target_profile_id: str | None = None,
 ) -> dict[str, list[str]]:
     """Compute a new order/selection after a drag-and-drop gesture.
 
@@ -96,7 +98,9 @@ def plan_taskbar_drop(
     most ``TASKBAR_PANE_SIZE`` profiles and the selected prefix holds
     at most ``TASKBAR_SELECTED_LIMIT`` profiles.
 
-    A side-pane drop inserts into the global selected sequence at the
+    An occupied-card target swaps exactly those two profiles. A pool drop
+    into a full selected set exchanges the nearest slot rather than failing.
+    A gap drop inserts into the global selected sequence at the
     visual position, so a card pushed past a pane boundary shifts into
     the peer pane instead of being rejected. Concretely the bottom gap
     of the priority pane and the top gap of the opposite pane address
@@ -124,6 +128,23 @@ def plan_taskbar_drop(
         selected_seq = list(assignment["left"]) + list(assignment["right"])
     pool_seq = list(assignment["pool"])
     was_selected = dragged in set(selected_seq)
+    # An occupied card is a slot, not an insertion gap. Swap only the two
+    # addressed identities, including their selection flags when promoting
+    # from the pool. Other profiles must not slide into another side pane.
+    swap_id = str(target_profile_id or "").strip()
+    if swap_id and (target == "pool" or swap_id not in assignment[target]):
+        raise ValueError("swap target is not in the target side pane")
+    if not swap_id and target != "pool" and not was_selected and len(selected_seq) >= TASKBAR_SELECTED_LIMIT:
+        occupants = assignment[target]
+        if occupants:
+            swap_id = occupants[max(0, min(int(target_index), len(occupants) - 1))]
+    if swap_id:
+        if swap_id != dragged:
+            source = selected_seq if was_selected else pool_seq
+            source_index = source.index(dragged)
+            target_position = selected_seq.index(swap_id)
+            source[source_index], selected_seq[target_position] = swap_id, dragged
+        return {"order": selected_seq + pool_seq, "selected": list(selected_seq)}
     if target == "pool":
         if was_selected:
             selected_seq.remove(dragged)

@@ -26,6 +26,8 @@ class _FakePaneWidget:
         self.configure_calls = []
         self.grid_calls = []
         self.grid_remove_calls = 0
+        self.place_calls = []
+        self.place_forget_calls = 0
 
     def configure(self, **kwargs):
         self.configure_calls.append(kwargs)
@@ -35,6 +37,22 @@ class _FakePaneWidget:
 
     def grid_remove(self):
         self.grid_remove_calls += 1
+
+
+    def place(self, **kwargs):
+        self.place_calls.append(kwargs)
+
+    def place_forget(self):
+        self.place_forget_calls += 1
+
+    def lift(self):
+        pass
+
+    def winfo_rooty(self):
+        return 0
+
+    def winfo_height(self):
+        return 100
 
 
 class ResolveTaskbarPaneAssignmentTest(unittest.TestCase):
@@ -106,16 +124,11 @@ class PlanTaskbarDropTest(unittest.TestCase):
         )
         self.assertEqual(plan["selected"], ["a", "c"])
 
-    def test_full_selection_rejects_pool_promotion(self) -> None:
-        with self.assertRaises(ValueError):
-            plan_taskbar_drop(
-                ["a", "b", "c", "d", "e"],
-                ["a", "b", "c", "d"],
-                "left",
-                "e",
-                "left",
-                0,
-            )
+    def test_full_selection_swaps_pool_profile_into_target_slot(self) -> None:
+        plan = plan_taskbar_drop(["a", "b", "c", "d", "e"], ["a", "b", "c", "d"],
+                                 "left", "e", "left", 0)
+        self.assertEqual(plan["selected"], ["e", "b", "c", "d"])
+        self.assertEqual(plan["order"], ["e", "b", "c", "d", "a"])
 
     def test_priority_pane_bottom_gap_aliases_to_peer_pane_top(self) -> None:
         # Linear-sequence semantics: left-bottom (position 2) and
@@ -247,9 +260,9 @@ class PaneDragFeedbackTest(unittest.TestCase):
         self.assertEqual(view._drag_state["index"], 2)
         self.assertEqual(
             [len(view._pane_card_widgets[item].grid_calls) for item in profile_ids[1:]],
-            [1] * 7,
+            [0] * 7,
         )
-        self.assertEqual(len(view._drop_indicators["pool"].grid_calls), 1)
+        self.assertEqual(len(view._drop_indicators["pool"].place_calls), 1)
 
         target[0] = ("pool", 3)
         view._on_pane_drag_motion(event)
@@ -257,17 +270,17 @@ class PaneDragFeedbackTest(unittest.TestCase):
         self.assertEqual(view._drag_state["index"], 3)
         self.assertEqual(
             [len(view._pane_card_widgets[item].grid_calls) for item in profile_ids[1:]],
-            [2] * 7,
+            [0] * 7,
         )
-        self.assertEqual(len(view._drop_indicators["pool"].grid_calls), 2)
+        self.assertEqual(len(view._drop_indicators["pool"].place_calls), 2)
 
         target[0] = ("left", 0)
         view._on_pane_drag_motion(event)
 
         self.assertEqual(view._drag_state["target"], "left")
         self.assertEqual(view._drag_state["index"], 0)
-        self.assertEqual(len(view._drop_indicators["left"].grid_calls), 1)
-        self.assertEqual(view._drop_indicators["pool"].grid_remove_calls, 3)
+        self.assertEqual(len(view._drop_indicators["left"].place_calls), 1)
+        self.assertEqual(view._drop_indicators["pool"].place_forget_calls, 2)
 
     def test_repeated_motion_outside_panes_clears_feedback_once(self) -> None:
         target = [("pool", 2)]
@@ -280,10 +293,10 @@ class PaneDragFeedbackTest(unittest.TestCase):
             view._on_pane_drag_motion(event)
 
         self.assertIsNone(view._drag_state["target"])
-        self.assertEqual(view._drop_indicators["pool"].grid_remove_calls, 2)
+        self.assertEqual(view._drop_indicators["pool"].place_forget_calls, 1)
         self.assertEqual(
-            [widget.grid_remove_calls for widget in view._drop_indicators.values()],
-            [2, 2, 2],
+            [widget.place_forget_calls for widget in view._drop_indicators.values()],
+            [0, 0, 1],
         )
 
     def test_inflight_transition_clears_target_highlight_once(self) -> None:
@@ -293,7 +306,7 @@ class PaneDragFeedbackTest(unittest.TestCase):
         view._on_pane_drag_motion(event)
         self.assertEqual(
             view._pane_boxes["left"].configure_calls[-1],
-            {"highlightbackground": "#2563EB", "highlightthickness": 2},
+            {"highlightbackground": "#2563EB"},
         )
 
         view._profile_actions_inflight.add("profile-1")
@@ -301,7 +314,7 @@ class PaneDragFeedbackTest(unittest.TestCase):
         self.assertIsNone(view._drag_state["target"])
         self.assertEqual(
             view._pane_boxes["left"].configure_calls[-1],
-            {"highlightbackground": "#E5E7EB", "highlightthickness": 1},
+            {"highlightbackground": "#E5E7EB"},
         )
         box_call_counts = {
             side: len(box.configure_calls)
@@ -323,6 +336,64 @@ class PaneDragFeedbackTest(unittest.TestCase):
             {side: indicator.grid_remove_calls for side, indicator in view._drop_indicators.items()},
             indicator_remove_counts,
         )
+
+
+class ExactPaneSwapRegressionTest(unittest.TestCase):
+    def test_each_occupied_slot_exchanges_only_the_two_identities(self):
+        original = ["a", "b", "c", "d", "e", "f"]
+        for priority in ("left", "right"):
+            assignment = resolve_taskbar_pane_assignment(original, original[:4], priority)
+            for dragged in original:
+                for side in ("left", "right"):
+                    for target in assignment[side]:
+                        with self.subTest(priority=priority, dragged=dragged, target=target):
+                            plan = plan_taskbar_drop(original, original[:4], priority, dragged,
+                                                     side, 0, target_profile_id=target)
+                            expected = list(original)
+                            source_index, target_index = expected.index(dragged), expected.index(target)
+                            expected[source_index], expected[target_index] = target, dragged
+                            self.assertEqual(plan["order"], expected)
+                            self.assertEqual(plan["selected"], expected[:4])
+                            self.assertEqual(original, ["a", "b", "c", "d", "e", "f"])
+
+    def test_full_gap_drop_stays_in_the_requested_pane(self):
+        order = ["a", "b", "c", "d", "e"]
+        for priority in ("left", "right"):
+            for side in ("left", "right"):
+                for index in (-10, 0, 1, 2, 99):
+                    plan = plan_taskbar_drop(order, order[:4], priority, "e", side, index)
+                    resolved = resolve_taskbar_pane_assignment(plan["order"], plan["selected"], priority)
+                    self.assertIn("e", resolved[side])
+                    self.assertEqual(len(plan["selected"]), 4)
+                    self.assertEqual(set(plan["order"]), set(order))
+
+    def test_invalid_explicit_slot_is_rejected(self):
+        with self.assertRaises(ValueError):
+            plan_taskbar_drop(["a", "b", "c"], ["a", "b"], "left", "c", "right", 0,
+                              target_profile_id="a")
+
+    def test_failed_save_rolls_back_order_and_flags(self):
+        view = ApplyPaneDropTest()._build_view(order=["a", "b", "c", "d", "e"], selected=["a", "b", "c", "d"])
+        view._autosave_now = lambda: False
+        self.assertFalse(view._apply_pane_drop("e", "left", 0, target_profile_id="a"))
+        self.assertEqual(view._pane_ui_state()[:2], (["a", "b", "c", "d", "e"], ["a", "b", "c", "d"]))
+
+    def test_self_drop_is_a_noop_without_a_save(self):
+        view = ApplyPaneDropTest()._build_view(order=["a", "b", "c"], selected=["a", "b"])
+        self.assertTrue(view._apply_pane_drop("a", "left", 0, target_profile_id="a"))
+        self.assertEqual(view._autosave_calls, 0)
+
+    def test_release_uses_final_coordinates(self):
+        from unittest.mock import Mock
+        target = [("left", 0)]
+        view, ids = PaneDragFeedbackTest()._build_view(target)
+        event = type("Event", (), {"x_root": 10, "y_root": 20})()
+        view._on_pane_drag_motion(event)
+        target[0] = ("right", 1)
+        view._apply_pane_drop = Mock()
+        view._on_pane_drag_release(event)
+        view._apply_pane_drop.assert_called_once_with(ids[0], "right", 1, target_profile_id=None)
+        self.assertIsNone(view._drag_state)
 
 
 if __name__ == "__main__":
