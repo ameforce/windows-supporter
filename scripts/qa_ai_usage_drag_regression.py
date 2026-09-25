@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.qa_ai_usage_native_visual import SyntheticAiUsageManager, build_scenario_fixture, _capture_window_png, _walk_widgets
 from src.apps.main_ui import WindowsSupporterMainUI
 from src.utils.reset_fanfare import play_reset_fanfare
+from scripts.native_window_capture import capture_window
 import tkinter as tk
 
 
@@ -38,12 +39,17 @@ def main() -> None:
     ui.show('ai_usage'); root.update()
     results['first_open_ms'] = round((time.perf_counter()-started)*1000, 3)
     root.geometry('1200x900+100+100'); root.update()
+    if getattr(ui, "_shell_viewport", None) is not None:
+        ui._shell_viewport.flush()
+        root.update()
     view = ui._ai_usage_view
     assert view is not None
     view._stop_runtime_refresh()
     original_widgets = dict(view._pane_card_widgets)
     all_ids = set(view._account_order)
     def settle():
+        if getattr(ui, "_shell_viewport", None) is not None:
+            ui._shell_viewport.flush()
         root.update_idletasks(); root.update()
     def bounds():
         return {key:(card.winfo_rootx(),card.winfo_rooty(),card.winfo_width(),card.winfo_height())
@@ -62,25 +68,31 @@ def main() -> None:
                 assert int(info['row']) == index
     left = view._rendered_pane_assignment['left'][0]
     right = view._rendered_pane_assignment['right'][0]
-    source = view._pane_card_widgets[left].winfo_children()[0]
+    source = view._profile_board.canvas
+    source_region = view._pane_card_widgets[left]
     target = view._pane_card_widgets[right]
-    source.event_generate('<ButtonPress-1>', x=8, y=8,
-                          rootx=source.winfo_rootx()+8, rooty=source.winfo_rooty()+8)
+    px = source_region.winfo_rootx()+12
+    py = source_region.winfo_rooty()+12
+    sx, sy = px-source.winfo_rootx(), py-source.winfo_rooty()
+    source.event_generate('<Motion>', x=sx, y=sy, rootx=px, rooty=py)
+    source.event_generate('<ButtonPress-1>', x=sx, y=sy, rootx=px, rooty=py)
     settle()
     assert view._drag_state['id'] == left
     before = bounds()
     x, y = target.winfo_rootx()+40, target.winfo_rooty()+40
     started = time.perf_counter()
-    source.event_generate('<B1-Motion>', x=10, y=10, rootx=x, rooty=y, state=256)
+    source.event_generate('<B1-Motion>', x=x-source.winfo_rootx(), y=y-source.winfo_rooty(), rootx=x, rooty=y, state=256)
     settle()
     results['drag_motion_ms'] = round((time.perf_counter()-started)*1000, 3)
     assert view._drag_state['swap'] == right
     assert before == bounds(), 'hover must never change card geometry'
-    source.event_generate('<ButtonRelease-1>', x=10, y=10, rootx=x, rooty=y)
+    source.event_generate('<ButtonRelease-1>', x=x-source.winfo_rootx(), y=y-source.winfo_rooty(), rootx=x, rooty=y)
     settle(); assert_retained()
     assert view._rendered_pane_assignment['left'][0] == right
     assert view._rendered_pane_assignment['right'][0] == left
     results['native_event_swap'] = True
+    results['profile_native_hwnds'] = len({card.winfo_id() for card in view._pane_card_widgets.values()})
+    assert results['profile_native_hwnds'] == 1
     pool = view._rendered_pane_assignment['pool'][0]
     displaced = view._rendered_pane_assignment['left'][1]
     assert view._apply_pane_drop(pool, 'left', 1, target_profile_id=displaced)
@@ -117,7 +129,7 @@ def main() -> None:
     results['cancel_preserves_order'] = True
     view._stop_runtime_refresh()
     root.lift(); root.update(); time.sleep(0.1); root.update()
-    _capture_window_png(root, args.output_dir / 'verified-ai-usage.png')
+    results['capture_engine'] = capture_window(root, args.output_dir / 'verified-ai-usage.png')
     results['callback_errors'] = errors
     assert not errors, errors
     if args.play_sound:
