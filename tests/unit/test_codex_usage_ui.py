@@ -170,7 +170,13 @@ class _FakeCanvas(_FakeWidget):
 
     def delete(self, *args):
         self.delete_calls.append(args)
-        self.drawn_items.clear()
+        if "all" in args:
+            self.drawn_items.clear()
+            return None
+        # Item ids are list positions; keep them stable like Tk does.
+        for item in args:
+            if isinstance(item, int) and 0 < item <= len(self.drawn_items):
+                self.drawn_items[item-1] = ("deleted", (), {})
         return None
 
     def itemconfigure(self, item, **kwargs):
@@ -1059,7 +1065,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("실시간 상태", texts)
         self.assertNotIn("다음 모니터링까지", texts)
 
-    def test_profile_headers_identify_provider_and_follow_selection(self) -> None:
+    def test_profile_headers_show_provider_mark_and_name_and_follow_selection(self) -> None:
         fake_tk = _FakeTk()
         fake_ttk = _FakeTtk()
         parent = _FakeWidget()
@@ -1083,10 +1089,36 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         first = view._account_detail_canvases["account_1"]
         second = view._account_detail_canvases["account_2"]
-        self.assertEqual(first._header_var.get(), "Codex · Codex 1")
-        self.assertEqual(second._header_var.get(), "Claude · Claude 1")
-        view._account_provider_vars["account_1"].set("cursor")
-        self.assertEqual(first._header_var.get(), "Cursor · Codex 1")
+        board_canvas = first.canvas.board.canvas
+
+        def mark(account_id):
+            return [board_canvas.drawn_items[item-1] for item in view._account_provider_marks[account_id]]
+
+        # The title is the profile name; the provider reads from the mark.
+        self.assertEqual(first._header_var.get(), "Codex 1")
+        self.assertEqual(second._header_var.get(), "Claude 1")
+        # Codex: brand silhouette + `>_` knocked out in the card surface.
+        self.assertEqual([kind for kind, _coords, _options in mark("account_1")], ["polygon"] * 3)
+        self.assertEqual(mark("account_1")[0][2]["fill"], "#7a9dff")
+        self.assertTrue(all(options["fill"] == "#FFFFFF" for _kind, _coords, options in mark("account_1")[1:]))
+        self.assertEqual([options["fill"] for _kind, _coords, options in mark("account_2")], ["#d97757"])
+        for account_id in ("account_1", "account_2"):
+            region = view._pane_card_widgets[account_id]
+            for _kind, coords, options in mark(account_id):
+                # Owned by the card (moves with it), inside the reserved
+                # leading slot before the title text.
+                self.assertEqual(options["tags"], (region.tag,))
+                self.assertTrue(all(3 <= x <= 3 + 12 for x in coords[::2]))
+        header_line = first._top_lines[0]
+        self.assertEqual(header_line.leading, 12 + 5)
+        # A provider change replaces only that card's mark, in place.
+        old_items = tuple(view._account_provider_marks["account_1"])
+        second_items = list(view._account_provider_marks["account_2"])
+        view._account_provider_vars["account_1"].set("claude")
+        self.assertIn(old_items, board_canvas.delete_calls)
+        self.assertEqual([options["fill"] for _kind, _coords, options in mark("account_1")], ["#d97757"])
+        self.assertEqual(view._account_provider_marks["account_2"], second_items)
+        self.assertEqual(first._header_var.get(), "Codex 1")
         self.assertTrue(view._select_profile("account_2"))
         self.assertEqual(view._active_account_id, "account_2")
         self.assertTrue(view._pane_card_widgets["account_2"].selected)

@@ -19,6 +19,34 @@ from src.apps.profile_controls import PROFILE_MENU_GLYPH, ProfileActionBinding, 
 from src.apps.profile_board import ProfileBoard
 
 
+_PROFILE_HEADER_FONT = ("Segoe UI", 10, "bold")
+# 제목 글꼴 줄 높이를 모를 때(테스트 대역)의 값. Segoe UI 10pt bold, 96 DPI.
+_PROFILE_HEADER_FALLBACK_LINESPACE = 17
+# provider 마크 한 변. v0.33.18 카드와 같은 12px을 최소로 두고, 높은 DPI에서는
+# 제목 줄 높이를 따라 커진다.
+_PROVIDER_MARK_MIN_SIZE = 12
+_PROVIDER_MARK_LINESPACE_RATIO = 0.7
+_PROVIDER_MARK_TEXT_GAP = 5
+
+
+class _ProviderMarkSurface:
+    """draw_provider_mark target that records the mark items it draws on a card."""
+
+    def __init__(self, region: Any) -> None:
+        self._region = region
+        self.items: list[Any] = []
+
+    def create_polygon(self, *coords: Any, **options: Any) -> Any:
+        item = self._region.create_polygon(*coords, **options)
+        self.items.append(item)
+        return item
+
+    def create_oval(self, *coords: Any, **options: Any) -> Any:
+        item = self._region.create_oval(*coords, **options)
+        self.items.append(item)
+        return item
+
+
 class CodexUsageSettingsView:
     def __init__(
         self,
@@ -52,7 +80,9 @@ class CodexUsageSettingsView:
         self._logout_button = None
         self._account_enabled_vars = {}
         self._account_provider_vars = {}
+        # profile id -> Canvas item ids of that card's provider mark.
         self._account_provider_marks = {}
+        self._header_linespace_px = 0
         self._account_taskbar_selected_vars = {}
         self._account_query_buttons = {}
         self._account_move_buttons = {}
@@ -191,6 +221,7 @@ class CodexUsageSettingsView:
         self._account_detail_canvases = {}
         self._account_provider_vars = {}
         self._account_provider_marks = {}
+        self._header_linespace_px = 0
         self._account_taskbar_selected_vars = {}
         self._pane_boxes = {}
         self._pane_lists = {}
@@ -711,20 +742,22 @@ class CodexUsageSettingsView:
                       sticky="nwe", pady=(0, 6))
             box_rows[card_side] = box_rows.get(card_side, 0) + 1
             self._pane_card_widgets[account_id] = card
-            header_var = tk.StringVar(value=f"{provider.title()} · {label}")
-            detail._header_var = header_var
-            def update_header(*_args, label=label_var, provider=provider_var, target=header_var):
-                target.set(f"{str(provider.get()).title()} · {label.get()}")
-            label_var.trace_add("write", update_header)
-            provider_var.trace_add("write", update_header)
+            # 제목줄은 provider 마크 + 프로필 이름이다(v0.33.18과 같은 구성). 마크는
+            # 카드 영역 tag를 공유하는 Canvas 도형이라 카드당 네이티브 창이 늘지 않는다.
+            detail._header_var = label_var
             header_item = detail.add_line(
-                section="top", variable=header_var, wraplength=320, fill="#111827",
-                font=("Segoe UI", 10, "bold"), trailing_text=PROFILE_MENU_GLYPH,
+                section="top", variable=label_var, wraplength=320, fill="#111827",
+                font=_PROFILE_HEADER_FONT, trailing_text=PROFILE_MENU_GLYPH,
                 trailing_fill="#4B5563", trailing_font=("Segoe UI", 9, "bold"),
                 on_trailing_click=lambda event, aid=account_id: self._open_profile_menu(aid, event),
+                leading_width=self._provider_mark_size() + _PROVIDER_MARK_TEXT_GAP,
             )
             card.tag_bind(header_item, "<ButtonPress-1>", lambda event, aid=account_id:
                           self._select_and_drag_profile(aid, event))
+            self._redraw_provider_mark(account_id)
+            provider_var.trace_add(
+                "write", lambda *_args, aid=account_id: self._redraw_provider_mark(aid)
+            )
             # Release, not press: the popup must not take the same button's
             # release as a choice of its first entry.
             card.tag_bind(card.tag, "<ButtonRelease-3>", lambda event, aid=account_id:
@@ -923,24 +956,82 @@ class CodexUsageSettingsView:
             pass
         return
 
+    def _profile_header_linespace(self) -> int:
+        cached = int(getattr(self, "_header_linespace_px", 0) or 0)
+        if cached > 0:
+            return cached
+        linespace = 0
+        try:
+            import tkinter.font as tkfont
+
+            linespace = int(
+                tkfont.Font(root=self._scroll_canvas, font=_PROFILE_HEADER_FONT).metrics(
+                    "linespace"
+                )
+            )
+        except Exception:
+            linespace = 0
+        self._header_linespace_px = (
+            linespace if linespace > 0 else _PROFILE_HEADER_FALLBACK_LINESPACE
+        )
+        return self._header_linespace_px
+
+    def _provider_mark_size(self) -> int:
+        return max(
+            _PROVIDER_MARK_MIN_SIZE,
+            round(self._profile_header_linespace() * _PROVIDER_MARK_LINESPACE_RATIO),
+        )
+
     def _redraw_provider_mark(self, account_id: str) -> None:
-        canvas = self._account_provider_marks.get(str(account_id or ""))
-        provider_var = self._account_provider_vars.get(str(account_id or ""))
-        if canvas is None or provider_var is None:
+        """Draw the card's provider mark left of its title on the shared canvas.
+
+        The mark is 1-3 polygons tagged with the card region, so it moves with
+        the card's single canvas.move and adds no native window. A provider
+        change replaces only this card's mark items.
+        """
+        key = str(account_id or "")
+        region = self._pane_card_widgets.get(key)
+        provider_var = self._account_provider_vars.get(key)
+        if region is None or provider_var is None or not callable(
+            getattr(region, "create_polygon", None)
+        ):
             return
         try:
+            region.delete(*self._account_provider_marks.get(key, ()))
+        except Exception:
+            pass
+        surface = _ProviderMarkSurface(region)
+        try:
             provider = str(provider_var.get() or "codex").strip().lower()
-            canvas.delete("all")
+            left, center_y = ProfileDetailCanvas.first_line_glyph_center(
+                self._profile_header_linespace()
+            )
+            try:
+                background = str(region.board.canvas.itemcget(region.outline, "fill"))
+            except Exception:
+                background = ""
             draw_provider_mark(
-                canvas,
+                surface,
                 provider,
-                1,
-                7,
-                size=12,
-                background=str(canvas.cget("bg") or "#FFFFFF"),
+                left,
+                center_y,
+                size=self._provider_mark_size(),
+                background=background or "#FFFFFF",
             )
         except Exception:
             pass
+        self._account_provider_marks[key] = list(surface.items)
+        for item in surface.items:
+            # 제목과 같이 마크를 눌러도 선택·끌기가 시작된다. 우클릭 메뉴는 카드
+            # tag 바인딩이 이미 받는다.
+            try:
+                region.tag_bind(
+                    item,
+                    "<ButtonPress-1>",
+                    lambda event, aid=key: self._select_and_drag_profile(aid, event),
+                )
+            except Exception:
+                pass
         return
 
     def _fit_profile_header(self, label: Any, provider: Any, mark: Any, width: int) -> None:
