@@ -1858,6 +1858,57 @@ def terminate_process_descendants(
     return result_payload
 
 
+def create_topmost_dialog_owner(root: Any) -> Any:
+    """Return a hidden topmost Toplevel to own a native message box.
+
+    The updater lives in the tray: its Tk root is withdrawn, and a periodic
+    check usually finishes while another application is in the foreground.
+    A message box owned by that root was created below the active window
+    (not topmost, not foreground), so the update prompt stayed hidden.
+    Owning it from a withdrawn topmost Toplevel makes the native box topmost
+    too. Windows still leaves keyboard focus with the active application.
+    """
+    try:
+        import tkinter as tk
+    except Exception:
+        return None
+    if not isinstance(root, tk.Misc):
+        return None
+    try:
+        owner = tk.Toplevel(root)
+    except Exception:
+        return None
+    try:
+        owner.withdraw()
+        owner.attributes("-topmost", True)
+        owner.update_idletasks()
+    except Exception:
+        try:
+            owner.destroy()
+        except Exception:
+            pass
+        return None
+    return owner
+
+
+def show_topmost_messagebox(root: Any, kind: str, title: str, message: str) -> Any:
+    """Show ``tkinter.messagebox.<kind>`` above other windows, then clean up."""
+    from tkinter import messagebox
+
+    show = getattr(messagebox, str(kind))
+    owner = create_topmost_dialog_owner(root)
+    try:
+        if owner is None:
+            return show(title, message)
+        return show(title, message, parent=owner)
+    finally:
+        if owner is not None:
+            try:
+                owner.destroy()
+            except Exception:
+                pass
+
+
 class UpdateHandoffProgressUi:
     def __init__(self, *, log_path: str | os.PathLike[str] = "") -> None:
         self._log_path = str(log_path or "")
@@ -3811,6 +3862,7 @@ class WindowsSupporterUpdater:
             os.environ.get(UPDATE_SKIP_AUTO_UPDATE_TAG_ENV) or ""
         ).strip()
         self._worker_active = False
+        self._prompt_active = False
         self._state = "idle"
         self._current_tag = ""
         self._latest_tag = ""
@@ -3831,7 +3883,10 @@ class WindowsSupporterUpdater:
         return
 
     def check_now(self, *, manual: bool = False) -> None:
-        if self._worker_active:
+        if self._worker_active or self._prompt_active:
+            # A topmost prompt no longer disables the settings window, so a
+            # second check could otherwise stack another prompt for the same
+            # release while the first one is still open.
             return
         if self._mark_unavailable_if_needed():
             if manual:
@@ -4147,7 +4202,12 @@ class WindowsSupporterUpdater:
         if not manual and not self._session.should_prompt(candidate.tag):
             return
 
-        if self._ask_update(candidate):
+        self._prompt_active = True
+        try:
+            accepted = bool(self._ask_update(candidate))
+        finally:
+            self._prompt_active = False
+        if accepted:
             self._state = "updating"
             self._publish_update_progress(
                 "accepted",
@@ -4346,10 +4406,10 @@ class WindowsSupporterUpdater:
     def _ask_close_git_gui_processes(self, process_names: Sequence[str]) -> bool:
         names = ", ".join(str(name) for name in process_names if str(name).strip())
         try:
-            from tkinter import messagebox
-
             return bool(
-                messagebox.askyesno(
+                show_topmost_messagebox(
+                    self._root,
+                    "askyesno",
                     "업데이트를 계속하려면 Git 앱을 닫아야 합니다",
                     (
                         f"{names}가 windows-supporter checkout을 사용 중일 수 있어 "
@@ -4400,10 +4460,10 @@ class WindowsSupporterUpdater:
 
     def _ask_update(self, candidate: UpdateCandidate) -> bool:
         try:
-            from tkinter import messagebox
-
             return bool(
-                messagebox.askyesno(
+                show_topmost_messagebox(
+                    self._root,
+                    "askyesno",
                     "Windows Supporter 업데이트",
                     f"새 버전 {candidate.tag}이 있습니다.\n지금 업데이트할까요?",
                 )
@@ -4413,28 +4473,24 @@ class WindowsSupporterUpdater:
 
     def _show_info(self, title: str, message: str) -> None:
         try:
-            from tkinter import messagebox
-
-            messagebox.showinfo(title, message)
+            show_topmost_messagebox(self._root, "showinfo", title, message)
         except Exception:
             pass
         return
 
     def _show_warning(self, title: str, message: str) -> None:
         try:
-            from tkinter import messagebox
-
-            messagebox.showwarning(title, message)
+            show_topmost_messagebox(self._root, "showwarning", title, message)
         except Exception:
             pass
         return
 
     def _ask_force_clean(self, working_tree: UpdateWorkingTreeState) -> bool:
         try:
-            from tkinter import messagebox
-
             return bool(
-                messagebox.askyesno(
+                show_topmost_messagebox(
+                    self._root,
+                    "askyesno",
                     "Windows Supporter 업데이트",
                     build_force_clean_approval_message(working_tree),
                 )

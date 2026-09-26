@@ -3044,5 +3044,92 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(launches, [])
 
 
+def _make_tray_updater(root=None, **kwargs):
+    return WindowsSupporterUpdater(
+        root=object() if root is None else root,
+        event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+        repo_root=".",
+        **kwargs,
+    )
+
+
+class UpdatePromptTopmostTest(unittest.TestCase):
+    def test_update_prompt_is_owned_by_a_hidden_topmost_window(self) -> None:
+        import tkinter as tk
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:  # pragma: no cover - headless host
+            self.skipTest(f"Tk unavailable: {exc}")
+        root.withdraw()
+        try:
+            updater = _make_tray_updater(root)
+            seen = []
+
+            def fake_askyesno(title, message, **kwargs):
+                owner = kwargs.get("parent")
+                seen.append({
+                    "title": title,
+                    "message": message,
+                    "owner": owner,
+                    "topmost": bool(int(owner.attributes("-topmost"))),
+                    "state": owner.state(),
+                })
+                return True
+
+            with patch("tkinter.messagebox.askyesno", side_effect=fake_askyesno):
+                accepted = updater._ask_update(UpdateCandidate(tag="v0.33.20", version=(0, 33, 20)))
+
+            self.assertTrue(accepted)
+            self.assertEqual(len(seen), 1)
+            self.assertIn("v0.33.20", seen[0]["message"])
+            self.assertTrue(seen[0]["topmost"])
+            self.assertEqual(seen[0]["state"], "withdrawn")
+            # The temporary owner is removed once the prompt returns.
+            self.assertFalse(bool(int(root.tk.call("winfo", "exists", str(seen[0]["owner"])))))
+        finally:
+            root.destroy()
+
+    def test_dialogs_keep_the_default_owner_without_a_tk_root(self) -> None:
+        updater = _make_tray_updater()
+        calls = []
+        with patch(
+            "tkinter.messagebox.showwarning",
+            side_effect=lambda *args, **kwargs: calls.append((args, kwargs)),
+        ):
+            updater._show_warning("title", "message")
+        self.assertEqual(calls, [(("title", "message"), {})])
+
+    def test_a_second_check_cannot_stack_a_prompt_while_one_is_open(self) -> None:
+        started = []
+        updater = _make_tray_updater(
+            thread_factory=lambda target=None, daemon=None: types.SimpleNamespace(
+                start=lambda: started.append(target)
+            ),
+        )
+        updater._mark_unavailable_if_needed = lambda: False
+        observed = []
+
+        def ask(_candidate):
+            observed.append(updater._prompt_active)
+            # e.g. the user presses "지금 업데이트 확인" while the prompt is up
+            updater.check_now(manual=True)
+            return False
+
+        updater._ask_update = ask
+        updater._handle_check_result(
+            UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        self.assertEqual(observed, [True])
+        self.assertEqual(started, [])
+        self.assertFalse(updater._prompt_active)
+        updater.check_now(manual=True)
+        self.assertEqual(len(started), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
