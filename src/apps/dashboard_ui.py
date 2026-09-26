@@ -10,6 +10,9 @@ class DashboardView:
     # copy. Below this threshold a single column is narrower overall and lets
     # the outer vertical scroll handle the additional height.
     _TWO_COLUMN_MIN_WIDTH = 760
+    # The card grid is packed with this horizontal inset inside the scrolled
+    # container, so the viewport must be wider than the grid by twice this.
+    _GRID_PADX = 10
     _STATUS_PART_CHROME = 8
     _CALLBACK_ALIASES = {
         "ai_usage.settings": "codex.settings",
@@ -24,10 +27,20 @@ class DashboardView:
         *,
         status_provider: Callable[[], dict[str, Any]],
         callbacks: dict[str, Callable[[], Any]],
+        on_layout_changed: Callable[[], Any] | None = None,
     ) -> None:
         self._root = root
         self._status_provider = status_provider
         self._callbacks = dict(callbacks)
+        # Called after a live column switch so the shell can re-fit its
+        # content-height ceiling to the layout that is actually shown.
+        self._on_layout_changed = (
+            on_layout_changed if callable(on_layout_changed) else None
+        )
+        self._scroll_sync_after_id = None
+        self._scroll_sync_running = False
+        self._scroll_sync_dirty = False
+        self._dashboard_scroll_item_size = None
         self._parent = None
         self._status_frames: dict[str, Any] = {}
         self._toggle_buttons: dict[str, Any] = {}
@@ -53,6 +66,8 @@ class DashboardView:
             return
         self._status_frames = {}
         self._toggle_buttons = {}
+        self._cancel_dashboard_scroll_sync()
+        self._dashboard_scroll_item_size = None
 
         try:
             for child in list(parent.winfo_children()):
@@ -87,11 +102,11 @@ class DashboardView:
 
         container.bind(
             "<Configure>",
-            lambda _event: self._sync_dashboard_scroll_geometry(),
+            lambda _event: self._request_dashboard_scroll_sync(),
         )
         canvas.bind(
             "<Configure>",
-            lambda _event: self._sync_dashboard_scroll_geometry(),
+            lambda _event: self._on_dashboard_viewport_configure(),
         )
         canvas.bind("<Enter>", lambda _event: canvas.focus_set())
 
@@ -118,7 +133,7 @@ class DashboardView:
         # 기능 섹션은 2열 카드 그리드로 배치한다. 세로 나열은 요약 화면을
         # 스크롤 없이 한눈에 보려는 대시보드 목적과 맞지 않았다.
         grid = tk.Frame(container, bg=bg)
-        grid.pack(fill="both", expand=True, padx=10, pady=(0, 2))
+        grid.pack(fill="both", expand=True, padx=self._GRID_PADX, pady=(0, 2))
         section_cards: list[Any] = []
         self._dashboard_grid = grid
         self._dashboard_section_cards = section_cards
@@ -143,15 +158,10 @@ class DashboardView:
         self._add_update_section(
             grid, section_cards, text=text, bg=card_bg, border=border
         )
-        self._layout_dashboard_cards(grid, section_cards)
+        self._layout_dashboard_cards(grid, section_cards, notify=False)
 
-        def relayout_for_width(event: Any) -> None:
-            self._layout_dashboard_cards(
-                grid,
-                section_cards,
-                available_width=int(getattr(event, "width", 0) or 0),
-            )
-            self._sync_dashboard_scroll_geometry()
+        def relayout_for_width(_event: Any) -> None:
+            self._on_dashboard_viewport_configure()
             return
 
         try:
@@ -166,7 +176,7 @@ class DashboardView:
 
         self.refresh()
         self._bind_dashboard_scroll_targets()
-        self._sync_dashboard_scroll_geometry()
+        self._request_dashboard_scroll_sync()
         return
 
     def preferred_size(self) -> tuple[int, int]:
@@ -196,6 +206,7 @@ class DashboardView:
                     self._dashboard_grid,
                     self._dashboard_section_cards,
                     available_width=self._TWO_COLUMN_MIN_WIDTH,
+                    notify=False,
                 )
         except Exception:
             pass
@@ -208,6 +219,16 @@ class DashboardView:
             height = int(container.winfo_reqheight())
         except Exception:
             return (0, 0)
+        # A two-column measurement is only a truthful fit when the viewport it
+        # produces keeps two columns. Two compact cards are usually narrower
+        # than the column threshold, so the fitted window used to flip to one
+        # (about twice as tall) column on the next Configure while the shell
+        # still capped the height at the two-column content.
+        columns = getattr(
+            self._dashboard_grid, "_windows_supporter_dashboard_columns", None
+        )
+        if columns == 2:
+            width = max(width, self._TWO_COLUMN_MIN_WIDTH + 2 * self._GRID_PADX)
         scrollbar = self._dashboard_scrollbar
         if scrollbar is not None:
             try:
@@ -235,12 +256,119 @@ class DashboardView:
             view_width = int(canvas.winfo_width())
             view_height = int(canvas.winfo_height())
             required_height = int(container.winfo_reqheight())
-            canvas.itemconfigure(
-                window_id,
-                width=max(1, view_width),
-                height=max(required_height, view_height),
-            )
+        except Exception:
+            return
+        size = (max(1, view_width), max(1, required_height, view_height))
+        try:
+            if size != self._dashboard_scroll_item_size:
+                canvas.itemconfigure(window_id, width=size[0], height=size[1])
+                self._dashboard_scroll_item_size = size
             canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+        return
+
+    def _on_dashboard_viewport_configure(self) -> None:
+        self._relayout_for_viewport()
+        self._request_dashboard_scroll_sync()
+        return
+
+    def _relayout_for_viewport(self) -> None:
+        """Choose the column count from the scroll viewport, never the grid.
+
+        Until the scroll window is pinned to the viewport, the grid is laid
+        out at the container's natural width, and that width depends on the
+        current column count. Deciding from it flipped a two-column layout to
+        one column before the window was even mapped. An unmapped viewport
+        keeps the current (seeded) layout.
+        """
+        canvas = self._dashboard_scroll_canvas
+        grid = self._dashboard_grid
+        if canvas is None or grid is None:
+            return
+        try:
+            viewport = int(canvas.winfo_width())
+        except Exception:
+            return
+        if viewport <= 1:
+            return
+        self._layout_dashboard_cards(
+            grid,
+            self._dashboard_section_cards,
+            available_width=max(2, viewport - 2 * self._GRID_PADX),
+        )
+        return
+
+    def _request_dashboard_scroll_sync(self) -> None:
+        """Schedule one scroll-geometry sync after pending layout has settled.
+
+        The canvas window pins the embedded frame to the height it is given.
+        A column switch or a status re-wrap changes the frame's requirement
+        only in later idle geometry passes, so a sync run directly from the
+        triggering Configure read the old requirement. The pinned frame then
+        never received another Configure, and every card stayed squeezed
+        below its own requested height.
+        """
+        if self._scroll_sync_running:
+            self._scroll_sync_dirty = True
+            return
+        if self._scroll_sync_after_id is not None:
+            return
+        canvas = self._dashboard_scroll_canvas
+        after_idle = getattr(canvas, "after_idle", None)
+        if not callable(after_idle):
+            self._flush_dashboard_scroll_sync()
+            return
+        try:
+            self._scroll_sync_after_id = after_idle(self._flush_dashboard_scroll_sync)
+        except Exception:
+            self._scroll_sync_after_id = None
+            self._flush_dashboard_scroll_sync()
+        return
+
+    def _flush_dashboard_scroll_sync(self) -> None:
+        self._scroll_sync_after_id = None
+        if self._scroll_sync_running:
+            self._scroll_sync_dirty = True
+            return
+        self._scroll_sync_running = True
+        try:
+            container = self._dashboard_scroll_container
+            settle = getattr(container, "update_idletasks", None)
+            if callable(settle):
+                try:
+                    # Status rows -> card -> grid -> container each publish
+                    # their requirement in a separate idle pass.
+                    settle()
+                except Exception:
+                    pass
+            self._sync_dashboard_scroll_geometry()
+        finally:
+            self._scroll_sync_running = False
+        if self._scroll_sync_dirty:
+            self._scroll_sync_dirty = False
+            self._request_dashboard_scroll_sync()
+        return
+
+    def _cancel_dashboard_scroll_sync(self) -> None:
+        pending, self._scroll_sync_after_id = self._scroll_sync_after_id, None
+        self._scroll_sync_dirty = False
+        if pending is None:
+            return
+        after_cancel = getattr(self._dashboard_scroll_canvas, "after_cancel", None)
+        if callable(after_cancel):
+            try:
+                after_cancel(pending)
+            except Exception:
+                pass
+        return
+
+    def _notify_layout_changed(self) -> None:
+        callback = self._on_layout_changed
+        if callback is None:
+            return
+        try:
+            callback()
         except Exception:
             pass
         return
@@ -251,6 +379,7 @@ class DashboardView:
         cards: list[Any],
         *,
         available_width: int | None = None,
+        notify: bool = True,
     ) -> None:
         width = int(available_width or 0)
         if width <= 1:
@@ -259,7 +388,8 @@ class DashboardView:
             except Exception:
                 width = 0
         columns = 1 if width > 1 and width < self._TWO_COLUMN_MIN_WIDTH else 2
-        if getattr(grid, "_windows_supporter_dashboard_columns", None) == columns:
+        previous_columns = getattr(grid, "_windows_supporter_dashboard_columns", None)
+        if previous_columns == columns:
             return
         try:
             grid._windows_supporter_dashboard_columns = columns
@@ -310,6 +440,13 @@ class DashboardView:
                 )
             except Exception:
                 pass
+        if previous_columns is not None:
+            # The new column count changes the content height only after the
+            # grid re-measures, so the scroll window and the shell's height
+            # ceiling must follow once that has happened.
+            self._request_dashboard_scroll_sync()
+            if notify:
+                self._notify_layout_changed()
         return
 
     @staticmethod
@@ -392,7 +529,7 @@ class DashboardView:
         self._set_feature_status("background", self._format_background(snapshot.get("background")))
         self._set_feature_status("update", self._format_update(snapshot.get("update")))
         self._bind_dashboard_scroll_targets()
-        self._sync_dashboard_scroll_geometry()
+        self._request_dashboard_scroll_sync()
         return
 
     def _lazy_import_tk(self) -> bool:
@@ -727,6 +864,9 @@ class DashboardView:
                         except Exception:
                             pass
                         self._bind_click(label, callback_name)
+            # Re-wrapped rows change the card height; the pinned scroll
+            # window has to follow the new requirement.
+            self._request_dashboard_scroll_sync()
             return
 
         rebuild()

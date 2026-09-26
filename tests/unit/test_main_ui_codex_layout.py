@@ -431,6 +431,48 @@ class MainUiCodexLayoutUnitTest(unittest.TestCase):
         self.assertEqual(ui._tab_sizes[ui._TAB_AI_USAGE], fallback)
         self.assertEqual(ui._preferred_window_size(ui._TAB_AI_USAGE), (760, 460))
 
+    def test_late_configure_for_the_automatic_fit_is_not_saved_as_user_size(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=None)
+
+        ui._apply_tab_geometry(ui._TAB_DASHBOARD)
+        applied = root.geometry_calls[-1].split("+", 1)[0]
+        width, height = (int(value) for value in applied.split("x"))
+        # Windows can report the fitted size again when it maps the window,
+        # after the transient guard set has already been cleared.
+        ui._auto_geometry_sizes.clear()
+
+        for _ in range(2):
+            ui._on_root_configure(
+                SimpleNamespace(widget=root, width=width, height=height)
+            )
+        self.assertNotIn(ui._TAB_DASHBOARD, ui._tab_user_sizes)
+
+        ui._on_root_configure(
+            SimpleNamespace(widget=root, width=width + 40, height=height)
+        )
+        self.assertEqual(ui._tab_user_sizes[ui._TAB_DASHBOARD], (width + 40, height))
+
+        # Returning to the old automatic size is now a deliberate resize.
+        ui._on_root_configure(SimpleNamespace(widget=root, width=width, height=height))
+        self.assertEqual(ui._tab_user_sizes[ui._TAB_DASHBOARD], (width, height))
+
+    def test_dashboard_column_switch_refits_height_ceiling(self) -> None:
+        ui, root = self._build_dashboard_geometry_ui(user_size=None)
+
+        class _StackedView:
+            def preferred_size(self):
+                return (340, 900)
+
+        ui._dashboard_view = _StackedView()
+        ui._on_dashboard_layout_changed()
+        # 900 content + footer 25 + notebook tab chrome 30.
+        self.assertEqual(root.maxsize_calls[-1], (10000, 955))
+
+        root.maxsize_calls.clear()
+        ui._current_tab = ui._TAB_AI_USAGE
+        ui._on_dashboard_layout_changed()
+        self.assertEqual(root.maxsize_calls, [])
+
     def test_synchronous_minsize_configure_is_not_saved_as_a_user_resize(self) -> None:
         class _GeometryRoot(_FakeRoot):
             def __init__(self):

@@ -15,7 +15,7 @@ from src.apps.ai_usage_contracts import (
 from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
 from src.apps.codex_usage_taskbar_overlay import draw_provider_mark
 from src.apps.profile_detail_canvas import ProfileDetailCanvas
-from src.apps.profile_controls import ProfileActionBinding, ProfileInspector
+from src.apps.profile_controls import PROFILE_MENU_GLYPH, ProfileActionBinding, ProfileCardMenu
 from src.apps.profile_board import ProfileBoard
 
 
@@ -70,7 +70,7 @@ class CodexUsageSettingsView:
         self._account_detail_canvases = {}
         self._account_order: list[str] = []
         self._pane_card_parent = None
-        self._profile_inspector = None
+        self._profile_menu = None
         self._profile_board = None
         self._active_account_id = None
         self._pane_boxes: dict[str, Any] = {}
@@ -258,7 +258,10 @@ class CodexUsageSettingsView:
 
         tk.Label(
             header_inner,
-            text="카드 제목을 선택하면 위에서 설정합니다. 제목을 끌어 순서와 표시 위치를 바꿀 수 있습니다.",
+            text=(
+                "제목을 끌어 순서와 표시 위치를 바꿉니다. "
+                f"프로필 동작은 카드의 {PROFILE_MENU_GLYPH} 메뉴나 우클릭으로 실행합니다."
+            ),
             bg=card_bg,
             fg=text_muted,
             font=("Segoe UI", 9),
@@ -660,11 +663,12 @@ class CodexUsageSettingsView:
         for side in ("left", "right", "pool"):
             for profile_id in assignment.get(side, []):
                 box_of[str(profile_id)] = side
-        self._profile_inspector = ProfileInspector(self, self._header_card, card_bg)
-        self._profile_inspector.frame.pack(anchor="w", padx=12, pady=(0, 8))
         row += 1
         board = ProfileBoard(tk, body, self, assignment, priority_value)
         self._profile_board = board
+        # Per-profile actions live in one shared popup menu opened from each
+        # card; cards themselves stay windowless canvas regions.
+        self._profile_menu = ProfileCardMenu(self, board.canvas)
         self._pane_card_parent = board.canvas
         # Profiles share the existing viewport; only visible rows are rasterized.
         self._pane_boxes = dict(board.groups)
@@ -713,10 +717,18 @@ class CodexUsageSettingsView:
                 target.set(f"{str(provider.get()).title()} · {label.get()}")
             label_var.trace_add("write", update_header)
             provider_var.trace_add("write", update_header)
-            header_item = detail.add_line(section="top", variable=header_var,
-                                          wraplength=320, fill="#111827", font=("Segoe UI", 10, "bold"))
+            header_item = detail.add_line(
+                section="top", variable=header_var, wraplength=320, fill="#111827",
+                font=("Segoe UI", 10, "bold"), trailing_text=PROFILE_MENU_GLYPH,
+                trailing_fill="#4B5563", trailing_font=("Segoe UI", 9, "bold"),
+                on_trailing_click=lambda event, aid=account_id: self._open_profile_menu(aid, event),
+            )
             card.tag_bind(header_item, "<ButtonPress-1>", lambda event, aid=account_id:
                           self._select_and_drag_profile(aid, event))
+            # Release, not press: the popup must not take the same button's
+            # release as a choice of its first entry.
+            card.tag_bind(card.tag, "<ButtonRelease-3>", lambda event, aid=account_id:
+                          self._open_profile_menu(aid, event))
             card.bind("<B1-Motion>", self._on_pane_drag_motion)
             card.bind("<ButtonRelease-1>", self._on_pane_drag_release)
             card.bind("<Escape>", self._cancel_pane_drag)
@@ -775,7 +787,7 @@ class CodexUsageSettingsView:
         if active not in self._account_order:
             active = self._account_order[0] if self._account_order else None
         if active is not None:
-            self._profile_inspector.select(active)
+            self._select_profile(active)
         board.request_layout()
         row += 1
         return row
@@ -1681,9 +1693,62 @@ class CodexUsageSettingsView:
             return side, position
         return None
 
+    def _select_profile(self, profile_id: str) -> bool:
+        """Highlight one card; keyboard navigation and Shift+F10 follow it."""
+        normalized = str(profile_id or "")
+        if normalized not in self._account_order:
+            return False
+        self._active_account_id = normalized
+        board = self._profile_board
+        if board is not None:
+            board.select(normalized)
+        return True
+
     def _select_and_drag_profile(self, profile_id: str, event: Any) -> None:
-        self._profile_inspector.select(profile_id)
+        self._select_profile(profile_id)
         self._on_pane_drag_start(profile_id, event)
+
+    def _open_profile_menu(self, profile_id: str, event: Any = None) -> str:
+        menu = self._profile_menu
+        normalized = str(profile_id or "")
+        if menu is None or normalized not in self._account_order:
+            return "break"
+        self._cancel_pane_drag()
+        try:
+            x_root, y_root = int(event.x_root), int(event.y_root)
+        except (AttributeError, TypeError, ValueError):
+            x_root, y_root = self._profile_menu_anchor(normalized)
+        self._select_profile(normalized)
+        try:
+            menu.open(normalized, x_root, y_root)
+        except Exception:
+            pass
+        return "break"
+
+    def _open_profile_menu_for_selection(self) -> str:
+        """Keyboard route (Shift+F10 / Menu key) to the selected card's menu."""
+        order = self._account_order
+        if not order:
+            return "break"
+        profile_id = self._active_account_id
+        if profile_id not in order:
+            profile_id = order[0]
+        board = self._profile_board
+        if board is not None:
+            try:
+                board.ensure_visible(profile_id)
+            except Exception:
+                pass
+        return self._open_profile_menu(profile_id)
+
+    def _profile_menu_anchor(self, profile_id: str) -> tuple[int, int]:
+        card = self._pane_card_widgets.get(profile_id)
+        try:
+            x = int(card.winfo_rootx()) + max(0, int(card.winfo_width()) - 24)
+            y = int(card.winfo_rooty()) + 24
+        except Exception:
+            x = y = 0
+        return x, y
 
     def _on_pane_drag_start(self, account_id: str, event: Any = None) -> None:
         self._cancel_pane_drag()

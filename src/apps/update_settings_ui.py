@@ -78,6 +78,9 @@ class UpdateSettingsView:
             font=("Segoe UI", 9),
             wraplength=560,
             justify="left",
+            # sticky="we" stretches the label across the card; without an
+            # explicit anchor Tk centers its single line in that width.
+            anchor="w",
         ).grid(row=1, column=0, columnspan=3, sticky="we", pady=(2, 8))
 
         self._enabled_var = tk.BooleanVar(value=True)

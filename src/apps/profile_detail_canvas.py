@@ -57,9 +57,15 @@ class MetricCell:
 
 
 class _TextLine:
-    def __init__(self, item: int, wraplength: int) -> None:
+    def __init__(self, item: int, wraplength: int, trailing_item: int | None = None) -> None:
         self.item = item
         self.wraplength = max(1, int(wraplength))
+        # Optional right-aligned glyph on the same row (a card's menu button).
+        self.trailing_item = trailing_item
+
+
+# Space kept between a line's text and its right-aligned trailing glyph.
+_TRAILING_GAP = 8
 
 
 class ProfileDetailCanvas:
@@ -106,8 +112,16 @@ class ProfileDetailCanvas:
         fill: str = LABEL_FG,
         on_click: Callable[[], None] | None = None,
         font: Any = LINE_FONT,
+        trailing_text: str = "",
+        on_trailing_click: Callable[[Any], Any] | None = None,
+        trailing_fill: str = LABEL_FG,
+        trailing_font: Any = None,
     ) -> int:
-        """Add a full-width text line above ("top") or below ("bottom") the table."""
+        """Add a full-width text line above ("top") or below ("bottom") the table.
+
+        ``trailing_text`` draws a right-aligned glyph on the same row, still as
+        a canvas item, and shortens the line's wrap width by its width.
+        """
         canvas = self.canvas
         item = canvas.create_text(
             0,
@@ -119,7 +133,20 @@ class ProfileDetailCanvas:
             font=font,
             width=max(1, int(wraplength)),
         )
-        line = _TextLine(item, wraplength)
+        trailing_item = None
+        if trailing_text:
+            trailing_item = canvas.create_text(
+                0,
+                0,
+                text=str(trailing_text),
+                anchor="ne",
+                justify="right",
+                fill=trailing_fill,
+                font=trailing_font if trailing_font is not None else font,
+            )
+            if on_trailing_click is not None:
+                self._bind_trailing_click(trailing_item, on_trailing_click)
+        line = _TextLine(item, wraplength, trailing_item)
         (self._top_lines if section == "top" else self._bottom_lines).append(line)
         if variable is not None:
             self._trace_text(variable, item)
@@ -221,6 +248,18 @@ class ProfileDetailCanvas:
             pass
         return
 
+    def _bind_trailing_click(self, item: int, callback: Callable[[Any], Any]) -> None:
+        canvas = self.canvas
+        try:
+            # Released on the glyph: a popup opened by the press would take
+            # the same button's release as a choice of its first entry.
+            canvas.tag_bind(item, "<ButtonRelease-1>", lambda event: callback(event))
+            canvas.tag_bind(item, "<Enter>", lambda _event: canvas.configure(cursor="hand2"))
+            canvas.tag_bind(item, "<Leave>", lambda _event: canvas.configure(cursor=""))
+        except Exception:
+            pass
+        return
+
     def _on_text(self, item: int, variable: Any) -> None:
         text = self._var_text(variable)
         try:
@@ -271,14 +310,27 @@ class ProfileDetailCanvas:
                 if self._width <= 1
                 else self._width - 2 * _TEXT_INSET
             )
+            trailing_width = trailing_height = 0
+            if line.trailing_item is not None:
+                trailing_width, trailing_height = self._item_size(line.trailing_item)
+                trailing_width += _TRAILING_GAP
+                right = (
+                    line.wraplength + 2 * _TEXT_INSET
+                    if self._width <= 1
+                    else self._width
+                ) - _TEXT_INSET
+                try:
+                    self.canvas.coords(line.trailing_item, right, y + _LINE_TOP)
+                except Exception:
+                    pass
             try:
-                self.canvas.itemconfigure(line.item, width=max(1, wrap))
+                self.canvas.itemconfigure(line.item, width=max(1, wrap - trailing_width))
                 self.canvas.coords(line.item, _TEXT_INSET, y + _LINE_TOP)
             except Exception:
                 pass
             line_width, line_height = self._item_size(line.item)
-            natural = max(natural, line_width + 2 * _TEXT_INSET)
-            y += line_height + _LINE_ADVANCE
+            natural = max(natural, line_width + trailing_width + 2 * _TEXT_INSET)
+            y += max(line_height, trailing_height) + _LINE_ADVANCE
         return y, natural
 
     def _place_table(self, y: int) -> tuple[int, int]:

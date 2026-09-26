@@ -84,6 +84,10 @@ class WindowsSupporterMainUI:
         # 본 뒤 작은 화면까지 같은 여백을 물려받는다.
         self._tab_user_sizes: dict[str, tuple[int, int]] = {}
         self._auto_geometry_sizes: set[tuple[int, int]] = set()
+        # The last size this shell applied on its own. Every Configure that
+        # still reports it belongs to that fit, however late Windows delivers
+        # it; only a different size is a user resize.
+        self._last_auto_geometry: tuple[int, int] | None = None
         self._applying_tab_geometry = False
         # 탭 크기는 실제 콘텐츠 요구 크기를 우선한다. 이 값들은 콘텐츠가
         # 아직 mount되지 않았거나 요청 크기를 측정할 수 없는 탭의 compact
@@ -439,6 +443,15 @@ class WindowsSupporterMainUI:
             # same dimensions must still be honoured.
             self._auto_geometry_sizes.discard((width, height))
             return
+        if (width, height) == self._last_auto_geometry:
+            # Mapping a freshly fitted window can report the fitted size again
+            # after the transient set above was cleared. The window has not
+            # moved away from the automatic fit, so this is not user intent;
+            # recording it froze the first fit as the tab's size forever.
+            return
+        # A different size supersedes the automatic fit. Returning to that
+        # size later is a genuine user resize and must be recorded.
+        self._last_auto_geometry = None
         self._tab_user_sizes[str(tab_key)] = (width, height)
         self._apply_notebook_labels_for_width(width)
         return
@@ -718,6 +731,7 @@ class WindowsSupporterMainUI:
                 except Exception:
                     pass
                 self._auto_geometry_sizes.add((int(width), int(height)))
+                self._last_auto_geometry = (int(width), int(height))
                 try:
                     if self._shell_viewport is not None:
                         self._shell_viewport.commit(width, height)
@@ -1044,11 +1058,31 @@ class WindowsSupporterMainUI:
                 self._root,
                 status_provider=self._get_dashboard_status_snapshot,
                 callbacks=self._get_dashboard_callbacks(),
+                on_layout_changed=self._on_dashboard_layout_changed,
             )
             self._dashboard_view.mount(self._tab_dashboard)
             self._dashboard_built = True
         except Exception:
             self._dashboard_built = False
+        return
+
+    def _on_dashboard_layout_changed(self) -> None:
+        """Re-fit the dashboard height ceiling after a live column switch.
+
+        The ceiling set by the tab fit belongs to the column count measured
+        then. Narrowing the window below the two-column threshold stacks the
+        cards, and keeping the old ceiling stopped the window from growing to
+        the taller one-column content.
+        """
+        if self._applying_tab_geometry or self._current_tab != self._TAB_DASHBOARD:
+            return
+        content_height = self._dashboard_content_height()
+        if content_height <= 1:
+            return
+        try:
+            self._root.maxsize(10000, max(1, int(content_height)))
+        except Exception:
+            pass
         return
 
     def _attach_updater_status_callback(self) -> None:
