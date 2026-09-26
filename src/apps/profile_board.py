@@ -90,6 +90,25 @@ class CardRegion:
         self.item_options[item] = dict(options)
         return item
 
+    def create_polygon(self, *coords, **options):
+        return self._create_shape("polygon", coords, options)
+
+    def create_oval(self, *coords, **options):
+        return self._create_shape("oval", coords, options)
+
+    def _create_shape(self, kind, coords, options):
+        # A fixed glyph (the provider mark) shares the card tag, so the one
+        # canvas.move(tag) in place_at carries it without its own coords call.
+        options["tags"] = (self.tag,)
+        translated = [v+(self.x if i % 2 == 0 else self.y) for i, v in enumerate(coords)]
+        return getattr(self.board.canvas, "create_"+kind)(*translated, **options)
+
+    def delete(self, *items):
+        # Only this card's item ids; a tag such as "all" would clear every card.
+        owned = [item for item in items if isinstance(item, int)]
+        if owned:
+            self.board.canvas.delete(*owned)
+
     def coords(self, item, *values):
         if not values:
             return self.local_coords.get(item, ())

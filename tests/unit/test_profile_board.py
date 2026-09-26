@@ -146,6 +146,48 @@ class ProfileBoardNativeTest(unittest.TestCase):
         self.assertTrue(board.canvas.bind("<Shift-F10>"))
         self.assertTrue(board.canvas.bind("<App>"))
 
+    def test_provider_marks_are_card_canvas_items_left_of_the_title(self):
+        board = self.view._profile_board
+        canvas = board.canvas
+        widgets = len(_walk_widgets(self.root))
+        for profile_id in self.view._account_order:
+            region = self.view._pane_card_widgets[profile_id]
+            items = self.view._account_provider_marks[profile_id]
+            self.assertTrue(items)
+            self.assertTrue(all(region.tag in canvas.gettags(item) for item in items))
+            # Pressing the mark starts selection/drag like the title does.
+            self.assertTrue(all(canvas.tag_bind(item, "<ButtonPress-1>") for item in items))
+
+        def assert_mark_left_of_title(profile_id):
+            region = self.view._pane_card_widgets[profile_id]
+            title = canvas.bbox(region.detail._top_lines[0].item)
+            mark = canvas.bbox(*self.view._account_provider_marks[profile_id])
+            self.assertLessEqual(mark[2], title[0])
+            self.assertGreaterEqual(mark[0], region.x)
+            # On the title's first line.
+            self.assertGreater(mark[3], title[1])
+            self.assertLess(mark[1], title[1] + 20)
+
+        first, second = self.view._account_order[:2]
+        for width in (1100, 700, 1100):
+            board.width = width
+            board.layout()
+            self.root.update_idletasks()
+            assert_mark_left_of_title(first)
+            assert_mark_left_of_title(second)
+
+        # A provider change swaps only this card's mark, where the card is now.
+        self.view._schedule_autosave = Mock()
+        old = list(self.view._account_provider_marks[first])
+        second_items = list(self.view._account_provider_marks[second])
+        self.view._account_provider_vars[first].set("claude")
+        self.assertTrue(all(canvas.type(item) is None for item in old))
+        new = self.view._account_provider_marks[first]
+        self.assertEqual([canvas.itemcget(item, "fill") for item in new], ["#d97757"])
+        self.assertEqual(self.view._account_provider_marks[second], second_items)
+        assert_mark_left_of_title(first)
+        self.assertEqual(len(_walk_widgets(self.root)), widgets)
+
     def test_refresh_relayouts_only_the_changed_profile(self):
         first, second = self.view._account_order[:2]
         from unittest.mock import patch
