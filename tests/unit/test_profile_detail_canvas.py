@@ -186,6 +186,21 @@ class ProfileDetailCanvasTest(unittest.TestCase):
         first_value = self.detail.cells[0].value_item
         self.assertGreater(self._y(first_value), max(title_box[3], glyph_box[3]) - 1)
 
+    def test_leading_slot_shifts_the_line_and_shortens_its_wrap(self) -> None:
+        plain = self.detail.add_line(section="top", text="프로필 이름", wraplength=320)
+        led = self.detail.add_line(
+            section="top", text="프로필 이름", wraplength=320, leading_width=17
+        )
+        self._resize(480)
+
+        self.assertEqual(self._x(plain), 3)
+        self.assertEqual(self._x(led), 3 + 17)
+        self.assertEqual(int(self.detail.canvas.itemcget(plain, "width")), 480 - 6)
+        self.assertEqual(int(self.detail.canvas.itemcget(led, "width")), 480 - 6 - 17)
+        # The first top line starts at the canvas top, so its glyph slot is fixed.
+        self.assertEqual(self._y(plain), 3)
+        self.assertEqual(ProfileDetailCanvas.first_line_glyph_center(18), (3.0, 12.0))
+
     def test_one_native_widget_per_card_detail(self) -> None:
         self.detail.add_line(section="top", text="값 상태: -", wraplength=260)
         self.detail.add_line(section="bottom", text="상태 파일: -", wraplength=300)
