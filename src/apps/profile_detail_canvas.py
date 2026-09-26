@@ -57,11 +57,19 @@ class MetricCell:
 
 
 class _TextLine:
-    def __init__(self, item: int, wraplength: int, trailing_item: int | None = None) -> None:
+    def __init__(
+        self,
+        item: int,
+        wraplength: int,
+        trailing_item: int | None = None,
+        leading: int = 0,
+    ) -> None:
         self.item = item
         self.wraplength = max(1, int(wraplength))
         # Optional right-aligned glyph on the same row (a card's menu button).
         self.trailing_item = trailing_item
+        # Space kept left of the text for a glyph the owner draws (provider mark).
+        self.leading = max(0, int(leading))
 
 
 # Space kept between a line's text and its right-aligned trailing glyph.
@@ -102,6 +110,15 @@ class ProfileDetailCanvas:
     def cells(self) -> list[MetricCell]:
         return list(self._cells)
 
+    @staticmethod
+    def first_line_glyph_center(line_height: float) -> tuple[float, float]:
+        """Left edge and vertical center of the first top line's leading glyph.
+
+        The first top line always starts at the canvas top, so a fixed-size
+        glyph drawn there never has to move when the lines re-lay out.
+        """
+        return float(_TEXT_INSET), float(_LINE_TOP) + float(line_height) / 2.0
+
     def add_line(
         self,
         *,
@@ -116,11 +133,14 @@ class ProfileDetailCanvas:
         on_trailing_click: Callable[[Any], Any] | None = None,
         trailing_fill: str = LABEL_FG,
         trailing_font: Any = None,
+        leading_width: int = 0,
     ) -> int:
         """Add a full-width text line above ("top") or below ("bottom") the table.
 
         ``trailing_text`` draws a right-aligned glyph on the same row, still as
         a canvas item, and shortens the line's wrap width by its width.
+        ``leading_width`` keeps that many pixels free left of the text for a
+        fixed glyph the owner draws (see ``first_line_glyph_center``).
         """
         canvas = self.canvas
         item = canvas.create_text(
@@ -146,7 +166,7 @@ class ProfileDetailCanvas:
             )
             if on_trailing_click is not None:
                 self._bind_trailing_click(trailing_item, on_trailing_click)
-        line = _TextLine(item, wraplength, trailing_item)
+        line = _TextLine(item, wraplength, trailing_item, leading_width)
         (self._top_lines if section == "top" else self._bottom_lines).append(line)
         if variable is not None:
             self._trace_text(variable, item)
@@ -324,12 +344,16 @@ class ProfileDetailCanvas:
                 except Exception:
                     pass
             try:
-                self.canvas.itemconfigure(line.item, width=max(1, wrap - trailing_width))
-                self.canvas.coords(line.item, _TEXT_INSET, y + _LINE_TOP)
+                self.canvas.itemconfigure(
+                    line.item, width=max(1, wrap - trailing_width - line.leading)
+                )
+                self.canvas.coords(line.item, _TEXT_INSET + line.leading, y + _LINE_TOP)
             except Exception:
                 pass
             line_width, line_height = self._item_size(line.item)
-            natural = max(natural, line_width + trailing_width + 2 * _TEXT_INSET)
+            natural = max(
+                natural, line.leading + line_width + trailing_width + 2 * _TEXT_INSET
+            )
             y += max(line_height, trailing_height) + _LINE_ADVANCE
         return y, natural
 

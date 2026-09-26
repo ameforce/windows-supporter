@@ -1842,19 +1842,26 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                 for coord in op[1][1::2]
             )
         )
-        # Cursor row: pointer arrow in the brand's monochrome white.
+        # Cursor row: the brand cube in monochrome white on the dark panel,
+        # then its cursor facet knocked out in the panel color.
         cursor_polygons = [
-            op for op in polygon_ops if op[2].get("fill") == "#f8fafc"
+            op for op in polygon_ops if op[1][1] > 4 + row_height
         ]
-        self.assertEqual(len(cursor_polygons), 1)
+        self.assertEqual(len(cursor_polygons), 2)
+        self.assertEqual(
+            cursor_polygons[0][2].get("fill"),
+            taskbar_overlay._CURSOR_MARK_ON_DARK_COLOR,
+        )
+        self.assertEqual(
+            cursor_polygons[1][2].get("fill"), taskbar_overlay._PANEL_BG_COLOR
+        )
         self.assertTrue(
             all(
                 icon_left <= coord <= icon_left + 10
-                for coord in cursor_polygons[0][1][::2]
+                for op in cursor_polygons
+                for coord in op[1][::2]
             )
         )
-        # Cursor mark stays in its own row (below the codex row).
-        self.assertGreater(cursor_polygons[0][1][1], 4 + row_height)
         # Labels shift right by the icon column.
         label_ops = [
             op
@@ -1903,6 +1910,36 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(len(ring_ops), 1)
         self.assertEqual(ring_ops[0][2].get("outline"), "#94a3b8")
 
+    def test_cursor_mark_is_the_brand_cube_inked_for_its_surface(self):
+        def draw(**options):
+            canvas = _FakeCanvas()
+            taskbar_overlay.draw_provider_mark(canvas, "cursor", 3, 12, size=12, **options)
+            return [op for op in canvas.ops if op[0] == "polygon"]
+
+        for options, surface, ink in (
+            ({}, taskbar_overlay._PANEL_BG_COLOR, taskbar_overlay._CURSOR_MARK_ON_DARK_COLOR),
+            ({"background": "#FFFFFF"}, "#FFFFFF", taskbar_overlay._CURSOR_MARK_ON_LIGHT_COLOR),
+            ({"background": "#fff"}, "#fff", taskbar_overlay._CURSOR_MARK_ON_LIGHT_COLOR),
+        ):
+            with self.subTest(surface=surface):
+                cube, facet = draw(**options)
+                # A hexagon (not the old 7-point pointer arrow) with the facet
+                # knocked out in the exact surface color.
+                self.assertEqual(len(cube[1]), 28)
+                self.assertEqual(len(facet[1]), 16)
+                self.assertEqual(cube[2].get("fill"), ink)
+                self.assertEqual(facet[2].get("fill"), surface)
+                self.assertEqual(cube[2].get("outline"), "")
+                xs, ys = cube[1][::2], cube[1][1::2]
+                self.assertTrue(all(3 <= x <= 3 + 12 for x in xs))
+                self.assertTrue(all(12 - 6 <= y <= 12 + 6 for y in ys))
+                self.assertTrue(
+                    min(xs) < min(facet[1][::2]) and max(facet[1][::2]) < max(xs)
+                )
+                self.assertTrue(
+                    min(ys) < min(facet[1][1::2]) and max(facet[1][1::2]) < max(ys)
+                )
+
     def test_draw_keeps_provider_icon_when_slot_enters_cramped_metric_fallback(self):
         runtime = self._runtime()
         runtime["accounts"][0]["provider"] = "codex"
@@ -1941,7 +1978,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         )
 
         polygon_ops = [op for op in canvas.ops if op[0] == "polygon"]
-        self.assertEqual(len(polygon_ops), 4)
+        # Codex: silhouette + two knockouts; Cursor: cube + facet knockout.
+        self.assertEqual(len(polygon_ops), 5)
         label_ops = [
             op
             for op in canvas.ops
