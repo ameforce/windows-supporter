@@ -1446,6 +1446,228 @@ class DashboardViewLayoutUnitTest(unittest.TestCase):
 
         self.assertEqual(canvas.item_kwargs.get("height"), 1200)
 
+    def test_preferred_size_keeps_the_two_column_threshold_width(self):
+        class _RequestedWidget:
+            def __init__(self, width, height):
+                self.width = width
+                self.height = height
+
+            def update_idletasks(self):
+                return None
+
+            def winfo_reqwidth(self):
+                return self.width
+
+            def winfo_reqheight(self):
+                return self.height
+
+        class _Grid:
+            _windows_supporter_dashboard_columns = 2
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        view._dashboard_scroll_container = _RequestedWidget(600, 379)
+        view._dashboard_scrollbar = _RequestedWidget(17, 379)
+        view._dashboard_grid = _Grid()
+
+        # Two compact cards need only 600px, but a 600px viewport would flip
+        # the grid (760px threshold + 2 * 10px inset) into one taller column.
+        self.assertEqual(view.preferred_size(), (797, 379))
+
+        view._dashboard_grid._windows_supporter_dashboard_columns = 1
+        self.assertEqual(view.preferred_size(), (617, 379))
+
+    def test_scroll_sync_waits_for_settled_requirement_and_coalesces(self):
+        events = []
+
+        class _Container:
+            def __init__(self):
+                self.reqheight = 379
+
+            def update_idletasks(self):
+                events.append("settle")
+                # A column switch publishes the taller requirement only in a
+                # later idle geometry pass.
+                self.reqheight = 619
+
+            def winfo_reqheight(self):
+                events.append(("read", self.reqheight))
+                return self.reqheight
+
+        class _Canvas:
+            def __init__(self):
+                self.idle = []
+                self.items = []
+
+            def after_idle(self, callback):
+                self.idle.append(callback)
+                return f"idle-{len(self.idle)}"
+
+            def after_cancel(self, _after_id):
+                return None
+
+            def winfo_width(self):
+                return 648
+
+            def winfo_height(self):
+                return 366
+
+            def itemconfigure(self, item, **kwargs):
+                self.items.append((item, dict(kwargs)))
+
+            def bbox(self, _tag):
+                return (0, 0, 648, 619)
+
+            def configure(self, **_kwargs):
+                return None
+
+        view = DashboardView(object(), status_provider=lambda: {}, callbacks={})
+        canvas = _Canvas()
+        view._dashboard_scroll_canvas = canvas
+        view._dashboard_scroll_container = _Container()
+        view._dashboard_scroll_window_id = "window"
+
+        view._request_dashboard_scroll_sync()
+        view._request_dashboard_scroll_sync()
+        self.assertEqual(len(canvas.idle), 1)
+        self.assertEqual(canvas.items, [])
+
+        canvas.idle.pop()()
+        self.assertEqual(events[:2], ["settle", ("read", 619)])
+        self.assertEqual(canvas.items, [("window", {"width": 648, "height": 619})])
+
+        # An unchanged requirement does not re-pin the embedded frame.
+        view._request_dashboard_scroll_sync()
+        canvas.idle.pop()()
+        self.assertEqual(len(canvas.items), 1)
+
+    def test_column_switch_requests_sync_and_notifies_only_live_changes(self):
+        class _Grid:
+            def winfo_width(self):
+                return 0
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+            def rowconfigure(self, *_args, **_kwargs):
+                return None
+
+        class _Card:
+            def grid(self, **_kwargs):
+                return None
+
+        notified = []
+        requests = []
+        view = DashboardView(
+            object(),
+            status_provider=lambda: {},
+            callbacks={},
+            on_layout_changed=lambda: notified.append(True),
+        )
+        view._request_dashboard_scroll_sync = lambda: requests.append(True)
+        grid = _Grid()
+        cards = [_Card() for _ in range(6)]
+
+        view._layout_dashboard_cards(grid, cards, available_width=900, notify=False)
+        self.assertEqual((requests, notified), ([], []))
+
+        view._layout_dashboard_cards(grid, cards, available_width=640)
+        self.assertEqual((len(requests), len(notified)), (1, 1))
+
+        view._layout_dashboard_cards(grid, cards, available_width=620)
+        self.assertEqual((len(requests), len(notified)), (1, 1))
+
+        # The shell's own measurement seeds two columns without re-entering
+        # its fit through the layout callback.
+        view._layout_dashboard_cards(grid, cards, available_width=900, notify=False)
+        self.assertEqual((len(requests), len(notified)), (2, 1))
+
+
+class DashboardNativeFitTest(unittest.TestCase):
+    """Real Tk geometry: cards must never be squeezed below their request."""
+
+    SNAPSHOT = {
+        "startup": {"enabled": True, "total_count": 5, "running_count": 5},
+        "ai_usage": {
+            "enabled": True,
+            "monitor_state": "running",
+            "session_state": "logged_in",
+            "profiles": [
+                {"id": "a", "label": "Daeng - kwg0085", "provider": "codex",
+                 "enabled": True, "taskbar_selected": True,
+                 "runtime": {"session_state": "logged_in", "monitor_state": "idle"}},
+                {"id": "b", "label": "Daeng - enmsoftware", "provider": "codex",
+                 "enabled": True, "taskbar_selected": True,
+                 "runtime": {"session_state": "logged_in", "monitor_state": "idle"}},
+            ],
+        },
+        "kakao": {"enabled": True, "tick_active": True, "target_display_num": 33},
+        "wrike": {"monitor_enabled": True, "api_token_configured": True,
+                  "daily_target_minutes": 480},
+        "background": {"enabled": True, "hotkeys_registered": True,
+                       "features_warmup_done": True,
+                       "foreground_hotkey_profile": "default",
+                       "wrike_attached": True, "ai_usage_attached": True},
+        "update": {"state": "current", "current_tag": "v0.33.20"},
+    }
+
+    def setUp(self):
+        import tkinter as tk
+
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:  # pragma: no cover - headless host
+            self.skipTest(f"Tk unavailable: {exc}")
+        self.root.withdraw()
+        self.root.attributes("-alpha", 0.0)
+        self.errors = []
+        self.root.report_callback_exception = lambda *error: self.errors.append(error)
+        self.view = DashboardView(
+            self.root, status_provider=lambda: self.SNAPSHOT, callbacks={}
+        )
+        self.view.mount(self.root)
+
+    def tearDown(self):
+        self.root.destroy()
+        self.assertEqual(self.errors, [])
+
+    def _show(self, geometry):
+        self.root.geometry(geometry)
+        self.root.deiconify()
+        self._settle()
+
+    def _settle(self):
+        for _ in range(4):
+            self.root.update()
+
+    def _assert_no_card_is_squeezed(self, label):
+        container = self.view._dashboard_scroll_container
+        self.assertGreaterEqual(
+            container.winfo_height(), container.winfo_reqheight(), label
+        )
+        for index, card in enumerate(self.view._dashboard_section_cards):
+            self.assertGreaterEqual(
+                card.winfo_height(),
+                card.winfo_reqheight(),
+                f"{label}: card {index} squeezed",
+            )
+
+    def test_resizes_across_the_column_threshold_never_squeeze_cards(self):
+        self._show("669x438+40+40")
+        self._assert_no_card_is_squeezed("open 669x438")
+        for geometry in ("669x425", "940x425", "640x520", "669x438"):
+            self.root.geometry(geometry)
+            self._settle()
+            self._assert_no_card_is_squeezed(geometry)
+        self.assertEqual(self.view._dashboard_grid._windows_supporter_dashboard_columns, 1)
+
+    def test_two_column_fit_width_keeps_two_columns(self):
+        # Measured before the first map, exactly like the shell's tab fit.
+        width, height = self.view.preferred_size()
+        self._show(f"{width}x{height}+40+40")
+
+        self.assertEqual(self.view._dashboard_grid._windows_supporter_dashboard_columns, 2)
+        self._assert_no_card_is_squeezed(f"fit {width}x{height}")
+
 
 if __name__ == "__main__":
     unittest.main()
