@@ -95,6 +95,62 @@ class UpdateSettingsViewUnitTest(unittest.TestCase):
         self.assertIn("상태: checking", view._status_label.text)
         self.assertIn("진행: 업데이트 확인 중 | 6%", view._status_label.text)
 
+    def test_stretched_description_label_is_left_aligned(self) -> None:
+        created = []
+
+        class _Widget:
+            def __init__(self, *_args, **kwargs):
+                self.kwargs = dict(kwargs)
+                created.append(self)
+
+            def pack(self, **_kwargs):
+                return None
+
+            def grid(self, **kwargs):
+                self.grid_kwargs = dict(kwargs)
+
+            def columnconfigure(self, *_args, **_kwargs):
+                return None
+
+            def configure(self, **kwargs):
+                self.kwargs.update(kwargs)
+
+            def bind(self, *_args, **_kwargs):
+                return None
+
+            def winfo_children(self):
+                return []
+
+        class _Tk:
+            Frame = _Widget
+            Label = _Widget
+
+            @staticmethod
+            def BooleanVar(value=None):
+                return _FakeVar(value)
+
+            @staticmethod
+            def StringVar(value=None):
+                return _FakeVar(value)
+
+        class _Ttk:
+            Checkbutton = _Widget
+            Spinbox = _Widget
+            Button = _Widget
+
+        view = UpdateSettingsView(root=object(), updater=_FakeUpdater())
+        view._tk = _Tk()
+        view._ttk = _Ttk()
+        view.mount(_Widget())
+
+        description = next(
+            widget
+            for widget in created
+            if str(widget.kwargs.get("text", "")).startswith("GitHub Release installer")
+        )
+        self.assertEqual(description.grid_kwargs.get("sticky"), "we")
+        self.assertEqual(description.kwargs.get("anchor"), "w")
+
 
 if __name__ == "__main__":
     unittest.main()

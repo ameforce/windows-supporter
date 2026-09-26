@@ -2,9 +2,11 @@ from __future__ import annotations
 
 # noqa: SIZE_OK — legacy updater/UI integration module; recovery logic stays extracted.
 
+import copy
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -1858,6 +1860,57 @@ def terminate_process_descendants(
     return result_payload
 
 
+def create_topmost_dialog_owner(root: Any) -> Any:
+    """Return a hidden topmost Toplevel to own a native message box.
+
+    The updater lives in the tray: its Tk root is withdrawn, and a periodic
+    check usually finishes while another application is in the foreground.
+    A message box owned by that root was created below the active window
+    (not topmost, not foreground), so the update prompt stayed hidden.
+    Owning it from a withdrawn topmost Toplevel makes the native box topmost
+    too. Windows still leaves keyboard focus with the active application.
+    """
+    try:
+        import tkinter as tk
+    except Exception:
+        return None
+    if not isinstance(root, tk.Misc):
+        return None
+    try:
+        owner = tk.Toplevel(root)
+    except Exception:
+        return None
+    try:
+        owner.withdraw()
+        owner.attributes("-topmost", True)
+        owner.update_idletasks()
+    except Exception:
+        try:
+            owner.destroy()
+        except Exception:
+            pass
+        return None
+    return owner
+
+
+def show_topmost_messagebox(root: Any, kind: str, title: str, message: str) -> Any:
+    """Show ``tkinter.messagebox.<kind>`` above other windows, then clean up."""
+    from tkinter import messagebox
+
+    show = getattr(messagebox, str(kind))
+    owner = create_topmost_dialog_owner(root)
+    try:
+        if owner is None:
+            return show(title, message)
+        return show(title, message, parent=owner)
+    finally:
+        if owner is not None:
+            try:
+                owner.destroy()
+            except Exception:
+                pass
+
+
 class UpdateHandoffProgressUi:
     def __init__(self, *, log_path: str | os.PathLike[str] = "") -> None:
         self._log_path = str(log_path or "")
@@ -2555,15 +2608,26 @@ class UpdateHandoffProgressUi:
         self.retry_requested = True
         return
 
-    def wait_for_retry_or_close(self) -> bool:
-        if self._root is None:
+    def poll_retry_or_close(self) -> bool | None:
+        """Non-blocking retry decision for a UI loop that owns this window.
+
+        Returns ``True`` once retry was requested, ``False`` when the window
+        is closed (or was never shown) and ``None`` while still undecided.
+        """
+        if self.retry_requested:
+            self.retry_requested = False
+            return True
+        if self._root is None or self._closed:
             return False
-        while not self._closed and not self.retry_requested:
+        return None
+
+    def wait_for_retry_or_close(self) -> bool:
+        while True:
+            decision = self.poll_retry_or_close()
+            if decision is not None:
+                return decision
             self.pump()
             time.sleep(0.1)
-        should_retry = bool(self.retry_requested)
-        self.retry_requested = False
-        return should_retry
 
     def _show_manual_action(self) -> None:
         try:
@@ -2582,6 +2646,170 @@ class UpdateHandoffProgressUi:
         except Exception:
             pass
         return
+
+
+def _copy_progress_snapshot(snapshot: Any) -> dict[str, Any]:
+    try:
+        return copy.deepcopy(dict(snapshot or {}))
+    except Exception:
+        return dict(snapshot or {})
+
+
+class _ThreadedProgressUiProxy:
+    """Worker-side progress UI; every call is handed to the hosting UI thread."""
+
+    def __init__(self, commands: queue.SimpleQueue) -> None:
+        self._commands = commands
+
+    def show(self, snapshot: dict[str, Any]) -> None:
+        self._commands.put(("show", _copy_progress_snapshot(snapshot)))
+
+    def set_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self._commands.put(("set_snapshot", _copy_progress_snapshot(snapshot)))
+
+    def close(self) -> None:
+        self._commands.put(("close", None))
+
+    def pump(self) -> None:
+        # The hosting thread processes window events continuously; a worker
+        # must never touch Tk.
+        return None
+
+    def wait_for_retry_or_close(self) -> bool:
+        decided = threading.Event()
+        holder: dict[str, bool] = {}
+        self._commands.put(("wait", (decided, holder)))
+        decided.wait()
+        return bool(holder.get("retry"))
+
+
+class ThreadedProgressUiHost:
+    """Run update work off the Tk thread while this thread keeps the UI live.
+
+    The helper used to run every update step on the thread that owned the
+    progress window. Window events were handled only when a step published
+    progress (at most 5-10 Hz) and never while it waited for the old app to
+    exit, stopped processes, hashed or copied the runtime, or verified the
+    install. The borderless window is moved by its own Tk bindings, so it
+    could not be dragged during an update.
+
+    ``run(work)`` calls ``work(progress_ui_factory)`` on a worker thread. The
+    factory returns a proxy whose calls are queued; the calling thread builds
+    the real window lazily, applies queued snapshots in order and pumps Tk
+    about every ``poll_seconds``.
+    """
+
+    POLL_SECONDS = 0.01
+
+    def __init__(
+        self,
+        ui_factory: Callable[..., Any] | None = None,
+        *,
+        poll_seconds: float | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._ui_factory = ui_factory if callable(ui_factory) else UpdateHandoffProgressUi
+        self._poll_seconds = max(
+            0.001,
+            float(self.POLL_SECONDS if poll_seconds is None else poll_seconds),
+        )
+        self._sleep = sleep
+        self._commands: queue.SimpleQueue = queue.SimpleQueue()
+        self._ui: Any = None
+        self._ui_open = False
+        self._ui_kwargs: dict[str, Any] = {}
+
+    def progress_ui_factory(self, **kwargs: Any) -> _ThreadedProgressUiProxy:
+        self._ui_kwargs = dict(kwargs)
+        return _ThreadedProgressUiProxy(self._commands)
+
+    def run(self, work: Callable[[Callable[..., Any]], Any]) -> int:
+        outcome: dict[str, Any] = {}
+        finished = threading.Event()
+
+        def worker() -> None:
+            try:
+                outcome["result"] = work(self.progress_ui_factory)
+            except BaseException as exc:  # re-raised on the hosting thread
+                outcome["error"] = exc
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=worker, name="update-handoff-worker", daemon=True)
+        thread.start()
+        pending_wait = None
+        while True:
+            pending_wait = self._drain(pending_wait)
+            self._pump()
+            if pending_wait is not None:
+                pending_wait = self._resolve_wait(pending_wait)
+            if finished.is_set() and self._commands.empty() and pending_wait is None:
+                break
+            self._sleep(self._poll_seconds)
+        thread.join()
+        if self._ui is not None and self._ui_open:
+            try:
+                self._ui.close()
+            except Exception:
+                pass
+        self._ui_open = False
+        if "error" in outcome:
+            raise outcome["error"]
+        return int(outcome.get("result") or 0)
+
+    def _ensure_ui(self) -> Any:
+        if self._ui is None:
+            try:
+                self._ui = self._ui_factory(**self._ui_kwargs)
+            except Exception:
+                self._ui = None
+        return self._ui
+
+    def _drain(self, pending_wait: Any) -> Any:
+        while True:
+            try:
+                command, payload = self._commands.get_nowait()
+            except queue.Empty:
+                return pending_wait
+            if command == "wait":
+                pending_wait = payload
+                continue
+            ui = self._ensure_ui() if command in {"show", "set_snapshot"} else self._ui
+            method = getattr(ui, command, None) if ui is not None else None
+            if not callable(method):
+                continue
+            try:
+                if payload is None:
+                    method()
+                else:
+                    method(payload)
+            except Exception:
+                pass
+            self._ui_open = command != "close"
+
+    def _pump(self) -> None:
+        pump = getattr(self._ui, "pump", None) if self._ui is not None else None
+        if not callable(pump):
+            return
+        try:
+            pump()
+        except Exception:
+            pass
+
+    def _resolve_wait(self, pending_wait: Any) -> Any:
+        decided, holder = pending_wait
+        poll = getattr(self._ui, "poll_retry_or_close", None) if self._ui is not None else None
+        decision: bool | None = False
+        if callable(poll):
+            try:
+                decision = poll()
+            except Exception:
+                decision = False
+        if decision is None:
+            return pending_wait
+        holder["retry"] = bool(decision)
+        decided.set()
+        return None
 
 
 def _process_exists(pid: int) -> bool:
@@ -3366,7 +3594,9 @@ def run_update_handoff(
     state_path = str(state_path)
     state = read_update_handoff_state(state_path)
     if str(state.get("mode") or "").strip() == UPDATE_RELEASE_MODE:
-        return run_release_update_handoff(state_path)
+        # The caller's factory decides where the window lives; the release
+        # path must not fall back to a window owned by the worker thread.
+        return run_release_update_handoff(state_path, progress_ui_factory=progress_ui_factory)
     repo_root = str(state.get("repo_root") or "").strip()
     log_path = str(state.get("log_path") or get_update_log_path())
     if not repo_root:
@@ -3725,11 +3955,25 @@ def run_update_handoff(
     return 1
 
 
+def run_update_handoff_with_responsive_ui(
+    state_path: str | os.PathLike[str],
+    *,
+    ui_factory: Callable[..., Any] | None = None,
+    host_factory: Callable[..., Any] | None = None,
+) -> int:
+    """Run the handoff on a worker while this thread owns the progress window."""
+    handoff = run_update_handoff
+    host = (host_factory or ThreadedProgressUiHost)(ui_factory or UpdateHandoffProgressUi)
+    return host.run(
+        lambda progress_ui_factory: handoff(state_path, progress_ui_factory=progress_ui_factory)
+    )
+
+
 def run_update_handoff_from_argv(argv: Sequence[str] | None = None) -> bool:
     if not is_update_handoff_argv(argv):
         return False
     state_path = get_update_handoff_state_arg(argv)
-    raise SystemExit(run_update_handoff(state_path))
+    raise SystemExit(run_update_handoff_with_responsive_ui(state_path))
 
 
 class UpdatePromptSession:
@@ -3811,6 +4055,7 @@ class WindowsSupporterUpdater:
             os.environ.get(UPDATE_SKIP_AUTO_UPDATE_TAG_ENV) or ""
         ).strip()
         self._worker_active = False
+        self._prompt_active = False
         self._state = "idle"
         self._current_tag = ""
         self._latest_tag = ""
@@ -3831,7 +4076,10 @@ class WindowsSupporterUpdater:
         return
 
     def check_now(self, *, manual: bool = False) -> None:
-        if self._worker_active:
+        if self._worker_active or self._prompt_active:
+            # A topmost prompt no longer disables the settings window, so a
+            # second check could otherwise stack another prompt for the same
+            # release while the first one is still open.
             return
         if self._mark_unavailable_if_needed():
             if manual:
@@ -4147,7 +4395,12 @@ class WindowsSupporterUpdater:
         if not manual and not self._session.should_prompt(candidate.tag):
             return
 
-        if self._ask_update(candidate):
+        self._prompt_active = True
+        try:
+            accepted = bool(self._ask_update(candidate))
+        finally:
+            self._prompt_active = False
+        if accepted:
             self._state = "updating"
             self._publish_update_progress(
                 "accepted",
@@ -4328,6 +4581,43 @@ class WindowsSupporterUpdater:
             pass
         return
 
+    def _call_with_live_preflight_ui(self, fn: Callable[[], Any]) -> Any:
+        """Run one blocking launch step while the preflight window stays live.
+
+        The first dialog stays open until the updater process acknowledges
+        its state (up to ``UPDATE_HANDOFF_ACK_TIMEOUT_SECONDS``) and while the
+        current process tree is cleaned. Both steps used to block the Tk
+        thread, so the borderless window froze and could not be dragged. The
+        step now runs on a worker and this thread keeps pumping the window.
+        """
+        progress_ui = self._preflight_progress_ui
+        pump = getattr(progress_ui, "pump", None)
+        if not callable(pump):
+            return fn()
+        outcome: dict[str, Any] = {}
+        finished = threading.Event()
+
+        def run() -> None:
+            try:
+                outcome["result"] = fn()
+            except BaseException as exc:  # re-raised on the Tk thread
+                outcome["error"] = exc
+            finally:
+                finished.set()
+
+        try:
+            threading.Thread(target=run, name="update-preflight-step", daemon=True).start()
+        except Exception:
+            return fn()
+        while not finished.wait(0.015):
+            try:
+                pump()
+            except Exception:
+                pass
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("result")
+
     def _is_worktree_dirty(self) -> bool:
         return self._inspect_working_tree_state().has_source_changes
 
@@ -4346,10 +4636,10 @@ class WindowsSupporterUpdater:
     def _ask_close_git_gui_processes(self, process_names: Sequence[str]) -> bool:
         names = ", ".join(str(name) for name in process_names if str(name).strip())
         try:
-            from tkinter import messagebox
-
             return bool(
-                messagebox.askyesno(
+                show_topmost_messagebox(
+                    self._root,
+                    "askyesno",
                     "업데이트를 계속하려면 Git 앱을 닫아야 합니다",
                     (
                         f"{names}가 windows-supporter checkout을 사용 중일 수 있어 "
@@ -4400,10 +4690,10 @@ class WindowsSupporterUpdater:
 
     def _ask_update(self, candidate: UpdateCandidate) -> bool:
         try:
-            from tkinter import messagebox
-
             return bool(
-                messagebox.askyesno(
+                show_topmost_messagebox(
+                    self._root,
+                    "askyesno",
                     "Windows Supporter 업데이트",
                     f"새 버전 {candidate.tag}이 있습니다.\n지금 업데이트할까요?",
                 )
@@ -4413,28 +4703,24 @@ class WindowsSupporterUpdater:
 
     def _show_info(self, title: str, message: str) -> None:
         try:
-            from tkinter import messagebox
-
-            messagebox.showinfo(title, message)
+            show_topmost_messagebox(self._root, "showinfo", title, message)
         except Exception:
             pass
         return
 
     def _show_warning(self, title: str, message: str) -> None:
         try:
-            from tkinter import messagebox
-
-            messagebox.showwarning(title, message)
+            show_topmost_messagebox(self._root, "showwarning", title, message)
         except Exception:
             pass
         return
 
     def _ask_force_clean(self, working_tree: UpdateWorkingTreeState) -> bool:
         try:
-            from tkinter import messagebox
-
             return bool(
-                messagebox.askyesno(
+                show_topmost_messagebox(
+                    self._root,
+                    "askyesno",
                     "Windows Supporter 업데이트",
                     build_force_clean_approval_message(working_tree),
                 )
@@ -4788,12 +5074,14 @@ class WindowsSupporterUpdater:
 
         helper_pid = _coerce_positive_pid(getattr(proc, "pid", 0))
         if helper_pid > 0:
-            cleanup_result = terminate_process_descendants(
-                os.getpid(),
-                exclude_pids=(helper_pid,),
-                subprocess_module=self._subprocess,
-                timeout_seconds=3.0,
-                log=lambda message: append_update_log(log_path, message),
+            cleanup_result = self._call_with_live_preflight_ui(
+                lambda: terminate_process_descendants(
+                    os.getpid(),
+                    exclude_pids=(helper_pid,),
+                    subprocess_module=self._subprocess,
+                    timeout_seconds=3.0,
+                    log=lambda message: append_update_log(log_path, message),
+                )
             )
             terminated_pids = cleanup_result.get("terminated_pids", [])
             failed_pids = cleanup_result.get("failed_pids", [])
@@ -4811,7 +5099,9 @@ class WindowsSupporterUpdater:
             # Keep the first dialog alive until the second process has
             # acknowledged its state file.  Exiting first was the reason the
             # launcher UI visibly stopped at 18%.
-            if not self._handoff_ack_waiter(handoff_path):
+            if not self._call_with_live_preflight_ui(
+                lambda: self._handoff_ack_waiter(handoff_path)
+            ):
                 self._state = "error"
                 self._last_error = "update handoff did not acknowledge startup"
                 self._publish_update_progress(
@@ -4837,7 +5127,9 @@ class WindowsSupporterUpdater:
         if self._request_current_process_exit_for_update():
             return True
 
-        if not self._handoff_ack_waiter(handoff_path):
+        if not self._call_with_live_preflight_ui(
+            lambda: self._handoff_ack_waiter(handoff_path)
+        ):
             self._state = "error"
             self._last_error = "update handoff did not acknowledge startup"
             self._publish_update_progress(

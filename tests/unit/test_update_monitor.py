@@ -3044,5 +3044,382 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
         self.assertEqual(launches, [])
 
 
+def _make_tray_updater(root=None, **kwargs):
+    return WindowsSupporterUpdater(
+        root=object() if root is None else root,
+        event_queue=types.SimpleNamespace(put=lambda callback: callback()),
+        repo_root=".",
+        **kwargs,
+    )
+
+
+class UpdatePromptTopmostTest(unittest.TestCase):
+    def test_update_prompt_is_owned_by_a_hidden_topmost_window(self) -> None:
+        import tkinter as tk
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:  # pragma: no cover - headless host
+            self.skipTest(f"Tk unavailable: {exc}")
+        root.withdraw()
+        try:
+            updater = _make_tray_updater(root)
+            seen = []
+
+            def fake_askyesno(title, message, **kwargs):
+                owner = kwargs.get("parent")
+                seen.append({
+                    "title": title,
+                    "message": message,
+                    "owner": owner,
+                    "topmost": bool(int(owner.attributes("-topmost"))),
+                    "state": owner.state(),
+                })
+                return True
+
+            with patch("tkinter.messagebox.askyesno", side_effect=fake_askyesno):
+                accepted = updater._ask_update(UpdateCandidate(tag="v0.33.20", version=(0, 33, 20)))
+
+            self.assertTrue(accepted)
+            self.assertEqual(len(seen), 1)
+            self.assertIn("v0.33.20", seen[0]["message"])
+            self.assertTrue(seen[0]["topmost"])
+            self.assertEqual(seen[0]["state"], "withdrawn")
+            # The temporary owner is removed once the prompt returns.
+            self.assertFalse(bool(int(root.tk.call("winfo", "exists", str(seen[0]["owner"])))))
+        finally:
+            root.destroy()
+
+    def test_dialogs_keep_the_default_owner_without_a_tk_root(self) -> None:
+        updater = _make_tray_updater()
+        calls = []
+        with patch(
+            "tkinter.messagebox.showwarning",
+            side_effect=lambda *args, **kwargs: calls.append((args, kwargs)),
+        ):
+            updater._show_warning("title", "message")
+        self.assertEqual(calls, [(("title", "message"), {})])
+
+    def test_a_second_check_cannot_stack_a_prompt_while_one_is_open(self) -> None:
+        started = []
+        updater = _make_tray_updater(
+            thread_factory=lambda target=None, daemon=None: types.SimpleNamespace(
+                start=lambda: started.append(target)
+            ),
+        )
+        updater._mark_unavailable_if_needed = lambda: False
+        observed = []
+
+        def ask(_candidate):
+            observed.append(updater._prompt_active)
+            # e.g. the user presses "지금 업데이트 확인" while the prompt is up
+            updater.check_now(manual=True)
+            return False
+
+        updater._ask_update = ask
+        updater._handle_check_result(
+            UpdateCandidate(tag="v0.5.7", version=(0, 5, 7)),
+            working_tree=UpdateWorkingTreeState(),
+            error="",
+            manual=True,
+        )
+
+        self.assertEqual(observed, [True])
+        self.assertEqual(started, [])
+        self.assertFalse(updater._prompt_active)
+        updater.check_now(manual=True)
+        self.assertEqual(len(started), 1)
+
+
+class UpdateProgressThreadTest(unittest.TestCase):
+    def test_progress_window_retry_decision_can_be_polled(self) -> None:
+        ui = UpdateHandoffProgressUi(log_path="")
+        self.assertFalse(ui.poll_retry_or_close())
+        ui._root = object()
+        self.assertIsNone(ui.poll_retry_or_close())
+        ui.retry_requested = True
+        self.assertTrue(ui.poll_retry_or_close())
+        self.assertFalse(ui.retry_requested)
+        ui._closed = True
+        self.assertFalse(ui.poll_retry_or_close())
+
+    def test_threaded_host_applies_worker_calls_on_its_own_thread_in_order(self) -> None:
+        host_thread = threading.get_ident()
+        calls = []
+
+        class FakeUi:
+            def __init__(self, **kwargs):
+                calls.append(("init", threading.get_ident(), kwargs.get("log_path")))
+
+            def show(self, snapshot):
+                calls.append(("show", threading.get_ident(), snapshot["percent"]))
+
+            def set_snapshot(self, snapshot):
+                calls.append(("set_snapshot", threading.get_ident(), snapshot["percent"]))
+
+            def pump(self):
+                return None
+
+            def close(self):
+                calls.append(("close", threading.get_ident(), None))
+
+            def poll_retry_or_close(self):
+                return False
+
+        worker_threads = []
+
+        def work(progress_ui_factory):
+            worker_threads.append(threading.get_ident())
+            ui = progress_ui_factory(log_path="update.log")
+            snapshot = {"percent": 1}
+            ui.show(snapshot)
+            snapshot["percent"] = 99  # a later mutation must not leak into the queued call
+            ui.set_snapshot({"percent": 2})
+            ui.pump()
+            ui.close()
+            return 7
+
+        host = update_monitor_module.ThreadedProgressUiHost(FakeUi, poll_seconds=0.001)
+        self.assertEqual(host.run(work), 7)
+        self.assertNotEqual(worker_threads, [host_thread])
+        self.assertEqual(
+            [(name, value) for name, _thread, value in calls],
+            [("init", "update.log"), ("show", 1), ("set_snapshot", 2), ("close", None)],
+        )
+        self.assertTrue(all(thread == host_thread for _name, thread, _value in calls))
+
+    def test_threaded_host_keeps_pumping_while_the_worker_blocks(self) -> None:
+        pumps = []
+
+        class FakeUi:
+            def __init__(self, **_kwargs):
+                return None
+
+            def show(self, _snapshot):
+                return None
+
+            def pump(self):
+                pumps.append(time.monotonic())
+
+            def close(self):
+                return None
+
+        blocked = {}
+
+        def work(progress_ui_factory):
+            ui = progress_ui_factory()
+            ui.show({"percent": 0})
+            blocked["start"] = time.monotonic()
+            time.sleep(0.4)  # e.g. waiting for the previous app to exit
+            blocked["end"] = time.monotonic()
+            ui.close()
+            return 0
+
+        update_monitor_module.ThreadedProgressUiHost(FakeUi, poll_seconds=0.005).run(work)
+        during = [stamp for stamp in pumps if blocked["start"] <= stamp <= blocked["end"]]
+        self.assertGreaterEqual(len(during), 5)
+        self.assertLess(max(later - earlier for earlier, later in zip(during, during[1:])), 0.2)
+
+    def test_threaded_host_wait_blocks_only_the_worker_until_retry_or_close(self) -> None:
+        decisions = [None, None, True, None, False]
+        polled = []
+
+        class FakeUi:
+            def __init__(self, **_kwargs):
+                return None
+
+            def show(self, _snapshot):
+                return None
+
+            def pump(self):
+                return None
+
+            def close(self):
+                return None
+
+            def poll_retry_or_close(self):
+                polled.append(True)
+                return decisions.pop(0) if decisions else False
+
+        results = []
+
+        def work(progress_ui_factory):
+            ui = progress_ui_factory()
+            ui.show({"percent": 0})
+            results.append(ui.wait_for_retry_or_close())
+            results.append(ui.wait_for_retry_or_close())
+            return 1
+
+        host = update_monitor_module.ThreadedProgressUiHost(FakeUi, poll_seconds=0.001)
+        self.assertEqual(host.run(work), 1)
+        self.assertEqual(results, [True, False])
+        self.assertGreaterEqual(len(polled), 5)
+
+    def test_threaded_host_reraises_worker_errors_after_closing_the_window(self) -> None:
+        closed = []
+
+        class FakeUi:
+            def __init__(self, **_kwargs):
+                return None
+
+            def show(self, _snapshot):
+                return None
+
+            def pump(self):
+                return None
+
+            def close(self):
+                closed.append(True)
+
+        def work(progress_ui_factory):
+            progress_ui_factory().show({"percent": 5})
+            raise RuntimeError("boom")
+
+        host = update_monitor_module.ThreadedProgressUiHost(FakeUi, poll_seconds=0.001)
+        with self.assertRaises(RuntimeError):
+            host.run(work)
+        self.assertEqual(closed, [True])
+
+    def test_handoff_argv_runs_the_handoff_through_the_responsive_host(self) -> None:
+        captured = {}
+
+        def fake_handoff(state_path, *, progress_ui_factory):
+            captured["state_path"] = state_path
+            captured["proxy"] = progress_ui_factory(log_path="x.log")
+            captured["thread"] = threading.get_ident()
+            return 3
+
+        with patch.object(update_monitor_module, "run_update_handoff", side_effect=fake_handoff):
+            with self.assertRaises(SystemExit) as caught:
+                update_monitor_module.run_update_handoff_from_argv(
+                    ["windows-supporter.exe", UPDATE_HANDOFF_ARG, "state.json"]
+                )
+
+        self.assertEqual(caught.exception.code, 3)
+        self.assertTrue(str(captured["state_path"]).endswith("state.json"))
+        self.assertNotEqual(captured["thread"], threading.get_ident())
+        self.assertNotIsInstance(captured["proxy"], UpdateHandoffProgressUi)
+        self.assertIsNone(captured["proxy"].pump())
+
+    def test_release_dispatch_passes_the_caller_progress_factory(self) -> None:
+        import json
+
+        factory = object()
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "update_handoff.json"
+            state_path.write_text(json.dumps({"mode": UPDATE_RELEASE_MODE}), encoding="utf-8")
+            with patch.object(
+                update_monitor_module, "run_release_update_handoff", return_value=4
+            ) as release:
+                rc = update_monitor_module.run_update_handoff(
+                    state_path, progress_ui_factory=factory
+                )
+
+        self.assertEqual(rc, 4)
+        self.assertIs(release.call_args.kwargs["progress_ui_factory"], factory)
+
+    def test_preflight_steps_run_off_the_tk_thread_while_the_window_pumps(self) -> None:
+        tk_thread = threading.get_ident()
+        pumps = []
+
+        class FakePreflightUi:
+            def pump(self):
+                pumps.append(threading.get_ident())
+
+        updater = _make_tray_updater()
+        updater._preflight_progress_ui = FakePreflightUi()
+        step_threads = []
+
+        def slow_step():
+            step_threads.append(threading.get_ident())
+            time.sleep(0.2)
+            return "acknowledged"
+
+        self.assertEqual(updater._call_with_live_preflight_ui(slow_step), "acknowledged")
+        self.assertNotEqual(step_threads, [tk_thread])
+        self.assertGreaterEqual(len(pumps), 3)
+        self.assertTrue(all(thread == tk_thread for thread in pumps))
+
+        def failing_step():
+            raise RuntimeError("ack failed")
+
+        with self.assertRaises(RuntimeError):
+            updater._call_with_live_preflight_ui(failing_step)
+
+        updater._preflight_progress_ui = None
+        self.assertEqual(
+            updater._call_with_live_preflight_ui(threading.get_ident), tk_thread
+        )
+
+    def test_real_progress_window_stays_draggable_while_the_update_step_blocks(self) -> None:
+        import tkinter as tk
+
+        try:
+            probe = tk.Tk()
+            probe.destroy()
+        except tk.TclError as exc:  # pragma: no cover - headless host
+            self.skipTest(f"Tk unavailable: {exc}")
+        observed = {"beats": []}
+
+        class ObservedUi(UpdateHandoffProgressUi):
+            def close(self):
+                pending = observed.pop("beat_id", None)
+                if pending is not None and self._root is not None:
+                    try:
+                        self._root.after_cancel(pending)
+                    except tk.TclError:
+                        pass
+                super().close()
+
+            def show(self, snapshot):
+                super().show(snapshot)
+                root = self._root
+                if root is None or "scheduled" in observed:
+                    return
+                observed["scheduled"] = True
+
+                def beat():
+                    observed["beats"].append(time.monotonic())
+                    if self._root is not None:
+                        observed["beat_id"] = self._root.after(15, beat)
+
+                def drag():
+                    if self._root is None:
+                        return
+                    x0, y0 = int(self._root.winfo_x()), int(self._root.winfo_y())
+                    self._start_drag(types.SimpleNamespace(x_root=x0 + 40, y_root=y0 + 20))
+                    self._drag_window(types.SimpleNamespace(x_root=x0 + 100, y_root=y0 + 50))
+                    self._end_drag()
+                    self._root.update_idletasks()
+                    observed["drag"] = (
+                        x0, y0, int(self._root.winfo_x()), int(self._root.winfo_y()),
+                        time.monotonic(),
+                    )
+
+                observed["beat_id"] = root.after(15, beat)
+                root.after(200, drag)
+
+        window = {}
+
+        def work(progress_ui_factory):
+            ui = progress_ui_factory(log_path="")
+            ui.show(build_update_progress_snapshot("handoff_start", state="running", percent=0))
+            window["start"] = time.monotonic()
+            time.sleep(1.5)  # a blocking step, e.g. waiting for the old app to exit
+            window["end"] = time.monotonic()
+            ui.set_snapshot(build_update_progress_snapshot("complete", state="complete"))
+            ui.close()
+            return 0
+
+        self.assertEqual(update_monitor_module.ThreadedProgressUiHost(ObservedUi).run(work), 0)
+        start, end = window["start"], window["end"]
+        beats = [stamp for stamp in observed["beats"] if start <= stamp <= end]
+        self.assertGreaterEqual(len(beats), 10)
+        self.assertLess(max(later - earlier for earlier, later in zip(beats, beats[1:])), 0.25)
+        x0, y0, x1, y1, when = observed["drag"]
+        self.assertTrue(start <= when <= end)
+        self.assertEqual((x1 - x0, y1 - y0), (60, 30))
+
+
 if __name__ == "__main__":
     unittest.main()

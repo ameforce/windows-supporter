@@ -156,6 +156,36 @@ class ProfileDetailCanvasTest(unittest.TestCase):
         self.assertEqual(self.detail.canvas.tag_bind(top), ())
         self.assertTrue(getattr(self.detail.canvas, "_windows_supporter_wraps", False))
 
+    def test_trailing_glyph_is_right_aligned_and_shortens_the_line(self) -> None:
+        clicks = []
+        title = self.detail.add_line(
+            section="top",
+            text="Codex · 아주 긴 프로필 이름 " * 6,
+            wraplength=320,
+            trailing_text="•••",
+            on_trailing_click=lambda event: clicks.append(event),
+        )
+        self._resize(480)
+
+        items = self.detail.canvas.find_all()
+        glyph = next(
+            item for item in items
+            if self.detail.canvas.type(item) == "text"
+            and self.detail.canvas.itemcget(item, "text") == "•••"
+        )
+        glyph_box = self.detail.canvas.bbox(glyph)
+        title_box = self.detail.canvas.bbox(title)
+        # The glyph sits at the right inset on the title row, and the title
+        # wraps before it instead of running underneath.
+        self.assertEqual(int(self.detail.canvas.coords(glyph)[0]), 480 - 3)
+        self.assertEqual(self._y(glyph), self._y(title))
+        self.assertLess(title_box[2], glyph_box[0])
+        self.assertLess(int(self.detail.canvas.itemcget(title, "width")), 480 - 6)
+        self.assertIn("<ButtonRelease-1>", self.detail.canvas.tag_bind(glyph))
+        # The first metric row starts below whichever of the two is taller.
+        first_value = self.detail.cells[0].value_item
+        self.assertGreater(self._y(first_value), max(title_box[3], glyph_box[3]) - 1)
+
     def test_one_native_widget_per_card_detail(self) -> None:
         self.detail.add_line(section="top", text="값 상태: -", wraplength=260)
         self.detail.add_line(section="bottom", text="상태 파일: -", wraplength=300)
