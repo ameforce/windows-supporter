@@ -1118,6 +1118,12 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn(old_items, board_canvas.delete_calls)
         self.assertEqual([options["fill"] for _kind, _coords, options in mark("account_1")], ["#d97757"])
         self.assertEqual(view._account_provider_marks["account_2"], second_items)
+        # Cursor is its cube mark, dark on the white card, facet in the card color.
+        view._account_provider_vars["account_1"].set("cursor")
+        self.assertEqual(
+            [options["fill"] for _kind, _coords, options in mark("account_1")],
+            ["#111827", "#FFFFFF"],
+        )
         self.assertEqual(first._header_var.get(), "Codex 1")
         self.assertTrue(view._select_profile("account_2"))
         self.assertEqual(view._active_account_id, "account_2")

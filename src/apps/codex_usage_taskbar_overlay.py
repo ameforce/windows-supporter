@@ -290,8 +290,8 @@ _PROFILE_LABEL_FONT_PT = 8
 _PROFILE_LABEL_TEXT_END_GAP_PX = 6
 # Brand glyph box drawn at the row's left inset, before the profile label.
 # Codex draws its official knot-silhouette mark (sampled from the published
-# 24px SVG) with the `>_` knocked out in panel background; Cursor a pointer
-# arrow, Claude a radial burst.
+# 24px SVG) with the `>_` knocked out in panel background; Cursor its cube
+# mark with the cursor facet knocked out; Claude a radial burst.
 _PROVIDER_ICON_SIZE_PX = 10
 _PROVIDER_ICON_TO_LABEL_GAP_PX = 3
 _PROVIDER_ICON_COLUMN_WIDTH_PX = (
@@ -325,6 +325,24 @@ _CODEX_BAR_OUTLINE = (
 # #3941FF); a single tone keeps the 10px silhouette readable on the panel.
 _CODEX_BRAND_COLOR = "#7a9dff"
 _CODEX_KNOCKOUT_COLOR = _PANEL_BG_COLOR
+# Cursor mark: the cube hexagon and its cursor facet, sampled from the Simple
+# Icons `cursor.svg` 24px path (CC0 icon data; the mark is Anysphere's
+# trademark and only identifies the provider) and scaled to the 10px icon
+# box. Segment endpoints are kept; the sub-pixel corner roundings are not.
+# The facet is re-drawn in the surface color, like the Codex knockout.
+_CURSOR_CUBE_OUTLINE = (
+    5.0, 0.0, 4.79, 0.05, 0.79, 2.37, 0.61, 2.67, 0.61, 7.33, 0.79, 7.63,
+    4.79, 9.94, 5.0, 10.0, 5.21, 9.94, 9.21, 7.63, 9.39, 7.33, 9.39, 2.67,
+    9.21, 2.37, 5.21, 0.05,
+)
+_CURSOR_FACET_OUTLINE = (
+    1.11, 2.64, 8.84, 2.64, 8.96, 2.86, 5.1, 9.55, 5.0, 9.52, 5.0, 5.14,
+    4.88, 4.93, 1.08, 2.74,
+)
+# Cursor's mark is monochrome: light cube on the dark taskbar panel, dark cube
+# on light surfaces such as the settings cards.
+_CURSOR_MARK_ON_DARK_COLOR = "#f8fafc"
+_CURSOR_MARK_ON_LIGHT_COLOR = "#111827"
 _STATUS_DOT_ONLY_WIDTH_PX = 14
 _STATUS_WITH_TEXT_WIDTH_PX = 24
 _STATUS_TEXT_MIN_OVERLAY_WIDTH_PX = 420
@@ -820,6 +838,27 @@ def _fit_profile_label_text(label: Any, available_width: int) -> str:
     return f"{fitted}{ellipsis}"
 
 
+def _is_light_surface(canvas: Any, color: Any) -> bool:
+    """Whether a Tk color is light enough to need a dark monochrome mark."""
+    text = str(color or "").strip()
+    channels = None
+    digits = text[1:] if text.startswith("#") else ""
+    if len(digits) in (3, 6):
+        if len(digits) == 3:
+            digits = "".join(character * 2 for character in digits)
+        try:
+            channels = tuple(int(digits[index:index + 2], 16) / 255.0 for index in (0, 2, 4))
+        except ValueError:
+            channels = None
+    if channels is None:
+        try:
+            channels = tuple(value / 65535.0 for value in canvas.winfo_rgb(text))
+        except Exception:
+            return False
+    red, green, blue = channels
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue >= 0.5
+
+
 def _draw_taskbar_provider_icon(
     canvas: Any,
     provider: Any,
@@ -833,13 +872,16 @@ def _draw_taskbar_provider_icon(
 
     Codex renders its real mark: the knot-derived silhouette filled in the
     brand violet with the `>_` knocked out in the panel background. Cursor
-    is a pointer arrow (monochrome brand), Claude a radial burst (coral).
-    Unknown providers get a neutral ring so the column never renders blank.
+    renders its cube mark with the cursor facet knocked out; the brand is
+    monochrome, so the cube is light on dark surfaces and dark on light ones.
+    Claude is a radial burst (coral). Unknown providers get a neutral ring
+    so the column never renders blank.
 
     `size` scales the glyph relative to the 10px taskbar box so other
     surfaces can render the same mark larger. `knockout_color` overrides
-    the surface color used for the Codex `>_` knockout; it must match the
-    canvas background or the knockout reads as a dark shape on light cards.
+    the surface color used for the Codex `>_` and Cursor facet knockouts;
+    it must match the canvas background or the knockout reads as a shape
+    of its own. It also picks the Cursor cube's ink.
     """
     scale = float(size) / float(_PROVIDER_ICON_SIZE_PX)
     left = float(x)
@@ -865,24 +907,20 @@ def _draw_taskbar_provider_icon(
             )
         return
     if key == "cursor":
-        canvas.create_polygon(
-            left + 1.5 * scale,
-            top + 0.4 * scale,
-            left + 1.5 * scale,
-            top + 7.8 * scale,
-            left + 3.6 * scale,
-            top + 6.1 * scale,
-            left + 5.0 * scale,
-            top + 9.2 * scale,
-            left + 6.4 * scale,
-            top + 8.4 * scale,
-            left + 5.0 * scale,
-            top + 5.4 * scale,
-            left + 8.1 * scale,
-            top + 5.4 * scale,
-            fill="#f8fafc",
-            outline="#0f172a",
+        ink = (
+            _CURSOR_MARK_ON_LIGHT_COLOR
+            if _is_light_surface(canvas, knockout)
+            else _CURSOR_MARK_ON_DARK_COLOR
         )
+        for outline, fill in (
+            (_CURSOR_CUBE_OUTLINE, ink),
+            (_CURSOR_FACET_OUTLINE, knockout),
+        ):
+            shape = [
+                left + coord * scale if index % 2 == 0 else top + coord * scale
+                for index, coord in enumerate(outline)
+            ]
+            canvas.create_polygon(*shape, fill=fill, outline="")
         return
     if key == "claude":
         center_x = left + icon_size / 2.0
@@ -921,8 +959,8 @@ def draw_provider_mark(
 
     Shared renderer for surfaces outside the taskbar overlay (for example
     the AI usage settings cards). `background` is the surface color used
-    for the Codex `>_` knockout; when omitted the taskbar panel color is
-    used so the overlay keeps its established look.
+    for the Codex and Cursor knockouts (and the Cursor ink); when omitted
+    the taskbar panel color is used so the overlay keeps its look.
     """
     _draw_taskbar_provider_icon(
         canvas,
