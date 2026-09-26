@@ -235,7 +235,7 @@ class ProfileBoard:
             count = len(assignment.get(side, []))
             caption = f"{title} ({count}/2)" if side != "pool" else f"{title} ({count})"
             slots = "1·2번" if side == priority else "3·4번"
-            hint = f"작업표시줄 {slots} 슬롯 · 제목 선택 / 드래그로 교환" if side != "pool" else "끌어다 놓으면 작업표시줄에서 제외됩니다."
+            hint = f"작업표시줄 {slots} 슬롯 · 제목을 끌어 교환" if side != "pool" else "끌어다 놓으면 작업표시줄에서 제외됩니다."
             self.groups[side] = BoardGroup(self, side, caption, hint)
         self.indicators = {side:BoardIndicator(group) for side,group in self.groups.items()}
         self.canvas.bind("<Configure>", self._configure, add="+")
@@ -246,6 +246,9 @@ class ProfileBoard:
         self.canvas.bind("<Unmap>", self._cancel_drag)
         self.canvas.bind("<Control-Up>", lambda event:self._keyboard_select(-1))
         self.canvas.bind("<Control-Down>", lambda event:self._keyboard_select(1))
+        # Keyboard route to the selected card's shared action menu.
+        self.canvas.bind("<Shift-F10>", lambda event:self.view._open_profile_menu_for_selection())
+        self.canvas.bind("<App>", lambda event:self.view._open_profile_menu_for_selection())
 
     def create_region(self, profile_id: str, side: str, row: int) -> CardRegion:
         region = CardRegion(self, profile_id, self.groups[side], row)
@@ -310,7 +313,7 @@ class ProfileBoard:
         current = self.view._active_account_id
         index = order.index(current) if current in order else 0
         target = order[max(0,min(len(order)-1,index+direction))]
-        self.view._profile_inspector.select(target)
+        self.view._select_profile(target)
         self.ensure_visible(target)
         return "break"
 

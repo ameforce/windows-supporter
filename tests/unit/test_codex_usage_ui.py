@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from src.apps.codex_usage_ui import CodexUsageSettingsView
+from src.apps.profile_controls import PROFILE_MENU_GLYPH
 
 
 class _FakeLabel:
@@ -1086,9 +1087,12 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(second._header_var.get(), "Claude · Claude 1")
         view._account_provider_vars["account_1"].set("cursor")
         self.assertEqual(first._header_var.get(), "Cursor · Codex 1")
-        view._profile_inspector.select("account_2")
-        self.assertIs(view._profile_inspector.provider.kwargs["textvariable"],
-                      view._account_provider_vars["account_2"])
+        self.assertTrue(view._select_profile("account_2"))
+        self.assertEqual(view._active_account_id, "account_2")
+        self.assertTrue(view._pane_card_widgets["account_2"].selected)
+        self.assertFalse(view._pane_card_widgets["account_1"].selected)
+        self.assertFalse(view._select_profile("missing"))
+        self.assertEqual(view._active_account_id, "account_2")
         self.assertIs(first.canvas.board.canvas, second.canvas.board.canvas)
 
     def test_scroll_navigation_handles_keyboard_and_mouse_wheel(self) -> None:
@@ -1791,7 +1795,13 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("프로필 3", texts)
         button_texts = [button.kwargs.get("text") for button in fake_ttk.buttons]
         self.assertIn("프로필 추가", button_texts)
-        self.assertEqual(button_texts.count("삭제"), 1)
+        # Delete is reached from each card's shared menu, not a native button.
+        self.assertNotIn("삭제", button_texts)
+        menu_glyphs = [
+            item for item in fake_tk.canvases[0].drawn_items
+            if item[0] == "text" and item[2].get("text") == PROFILE_MENU_GLYPH
+        ]
+        self.assertEqual(len(menu_glyphs), 3)
 
     def test_mount_with_zero_profiles_still_exposes_add_action(self) -> None:
         fake_tk = _FakeTk()
@@ -1813,8 +1823,9 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         button_texts = [button.kwargs.get("text") for button in fake_ttk.buttons]
         self.assertIn("프로필 추가", button_texts)
-        self.assertEqual(view._profile_inspector.selected_id, "")
-        self.assertEqual(view._profile_inspector.buttons["login"].kwargs["state"], "disabled")
+        self.assertEqual(view._pane_card_widgets, {})
+        self.assertIsNone(view._active_account_id)
+        self.assertEqual(view._open_profile_menu_for_selection(), "break")
 
     def test_add_and_delete_profile_actions_remount_after_confirmed_manager_change(self) -> None:
         class _FakeMonitor:
@@ -2803,11 +2814,13 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertNotIn("저장", button_texts)
         self.assertNotIn("로드하기", button_texts)
         self.assertNotIn("툴팁(초)", [label.kwargs.get("text") for label in fake_tk.labels])
-        self.assertEqual(button_texts.count("연결"), 1)
-        self.assertEqual(button_texts.count("연결 해제"), 1)
-        self.assertEqual(button_texts.count("새로고침"), 1)
-        self.assertIn("▲", button_texts)
-        self.assertIn("▼", button_texts)
+        # Multi-profile actions moved from a native toolbar into the shared
+        # card menu; no per-profile or shared native action buttons remain.
+        for text in ("연결", "연결 해제", "새로고침", "삭제", "▲", "▼"):
+            self.assertNotIn(text, button_texts)
+        self.assertEqual(view._profile_menu.view, view)
+        self.assertEqual(set(view._account_query_buttons), {"account_1", "account_2"})
+        self.assertEqual(set(view._account_move_buttons), {"account_1", "account_2"})
 
     def test_refresh_runtime_status_updates_each_account_status_independently(self) -> None:
         class _FakeMonitor:

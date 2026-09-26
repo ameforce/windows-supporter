@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from scripts.qa_ai_usage_native_visual import build_scenario_fixture, SyntheticAiUsageManager, _walk_widgets
 from src.apps.ai_usage_ui import AIUsageSettingsView
-from src.apps.profile_controls import ProfileActionBinding
+from src.apps.profile_controls import PROFILE_MENU_GLYPH, ProfileActionBinding
 
 
 def make_manager(count):
@@ -64,18 +64,87 @@ class ProfileBoardNativeTest(unittest.TestCase):
         self.assertEqual(len(_walk_widgets(self.root)), initial)
         self.assertEqual(len({card.winfo_id() for card in self.view._pane_card_widgets.values()}), 1)
 
-    def test_inspector_targets_selected_profile_without_mutating_other_profiles(self):
+    def test_card_menu_targets_its_profile_without_mutating_other_profiles(self):
         first, second = self.view._account_order[:2]
-        inspector = self.view._profile_inspector
-        inspector.select(second)
-        self.assertEqual(inspector.selected_id, second)
-        self.assertEqual(str(inspector.enabled.cget("variable")), str(self.view._account_enabled_vars[second]))
+        card_menu = self.view._profile_menu
+        # Created on first use, and then shared by every card.
+        self.assertIsNone(card_menu.menu)
+        self.assertTrue(card_menu.bind_to(second))
+        menu = card_menu.menu
+        self.assertEqual(
+            str(menu.entrycget(card_menu.indexes["enabled"], "variable")),
+            str(self.view._account_enabled_vars[second]),
+        )
+        self.assertEqual(
+            str(card_menu.provider_menu.entrycget(0, "variable")),
+            str(self.view._account_provider_vars[second]),
+        )
         self.view._on_account_query = Mock()
-        inspector.buttons["query"].invoke()
+        menu.invoke(card_menu.indexes["query"])
         self.view._on_account_query.assert_called_once_with(second)
+        self.view._schedule_autosave = Mock()
+        menu.invoke(card_menu.indexes["enabled"])
+        self.assertFalse(self.view._account_enabled_vars[second].get())
         self.assertTrue(self.view._account_enabled_vars[first].get())
+        self.view._schedule_autosave.assert_called()
+
+        self.assertTrue(card_menu.bind_to(first))
+        self.assertIs(card_menu.menu, menu)
+        self.assertEqual(
+            str(menu.entrycget(card_menu.indexes["enabled"], "variable")),
+            str(self.view._account_enabled_vars[first]),
+        )
+
+    def test_card_menu_entries_follow_each_profile_action_state(self):
+        first, second = self.view._account_order[:2]
+        # Pin both states; the synthetic runtime decides them otherwise.
+        self.view._account_login_buttons[second].state(["disabled"])
+        self.view._account_login_buttons[first].state(["!disabled"])
+        card_menu = self.view._profile_menu
+        card_menu.bind_to(second)
+        menu = card_menu.menu
+        self.assertEqual(str(menu.entrycget(card_menu.indexes["login"], "state")), "disabled")
+        self.assertEqual(str(menu.entrycget(card_menu.indexes["delete"], "state")), "normal")
+        card_menu.bind_to(first)
+        # The first profile cannot move further up, but can move down.
+        self.assertEqual(str(menu.entrycget(card_menu.indexes["up"], "state")), "disabled")
+        self.assertEqual(str(menu.entrycget(card_menu.indexes["down"], "state")), "normal")
+        self.assertEqual(str(menu.entrycget(card_menu.indexes["login"], "state")), "normal")
+
+    def test_selection_highlight_and_keyboard_navigation_without_inspector(self):
+        first, second, third = self.view._account_order[:3]
+        self.assertTrue(self.view._select_profile(second))
         self.assertTrue(self.view._pane_card_widgets[second].selected)
         self.assertFalse(self.view._pane_card_widgets[first].selected)
+        self.view._profile_board._keyboard_select(1)
+        self.assertEqual(self.view._active_account_id, third)
+        self.assertTrue(self.view._pane_card_widgets[third].selected)
+        self.assertFalse(self.view._pane_card_widgets[second].selected)
+
+    def test_menu_glyph_right_click_and_menu_key_open_the_shared_menu(self):
+        first, second = self.view._account_order[:2]
+        board = self.view._profile_board
+        region = self.view._pane_card_widgets[second]
+        self.assertTrue(board.canvas.tag_bind(region.tag, "<ButtonRelease-3>"))
+        glyphs = [item for item in board.canvas.find_withtag(region.tag)
+                  if board.canvas.type(item) == "text"
+                  and board.canvas.itemcget(item, "text") == PROFILE_MENU_GLYPH]
+        self.assertEqual(len(glyphs), 1)
+        self.assertTrue(board.canvas.tag_bind(glyphs[0], "<ButtonRelease-1>"))
+
+        opened = []
+        self.view._profile_menu.open = lambda pid, x, y: opened.append((pid, x, y)) or True
+        self.assertEqual(
+            self.view._open_profile_menu(second, SimpleNamespace(x_root=10, y_root=20)),
+            "break",
+        )
+        self.assertEqual(opened[-1], (second, 10, 20))
+        self.assertEqual(self.view._active_account_id, second)
+        self.view._select_profile(first)
+        self.view._open_profile_menu_for_selection()
+        self.assertEqual(opened[-1][0], first)
+        self.assertTrue(board.canvas.bind("<Shift-F10>"))
+        self.assertTrue(board.canvas.bind("<App>"))
 
     def test_refresh_relayouts_only_the_changed_profile(self):
         first, second = self.view._account_order[:2]
