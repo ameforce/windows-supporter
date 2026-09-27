@@ -1204,6 +1204,8 @@ class ClaudeUsageMonitor:
         self._stale_after_sec = max(self._refresh_interval_sec, float(stale_after_sec))
         self._tooltip_duration_ms = 7000
         self._limit_reset_sound_enabled = True
+        self._limit_reset_sound_while_away = True
+        self._limit_reset_sound_policy_provider: Callable[[], tuple[bool, bool]] | None = None
         self._alert_label_provider: Callable[[], str] | None = None
         self._limit_reset_lock = threading.Lock()
         self._limit_reset_baselines: dict[str, str] = {}
@@ -1247,7 +1249,8 @@ class ClaudeUsageMonitor:
             post_ui=self._post_ui,
             get_root=lambda: self._root,
             get_duration_ms=lambda: int(self._tooltip_duration_ms),
-            sound_enabled=lambda: bool(self._limit_reset_sound_enabled),
+            sound_enabled=lambda: self._resolve_limit_reset_sound_policy()[0],
+            sound_while_away=lambda: self._resolve_limit_reset_sound_policy()[1],
             get_label=self._resolve_alert_label,
         )
         config = PlaywrightSessionConfig(
@@ -1323,6 +1326,8 @@ class ClaudeUsageMonitor:
             "provider": AiUsageProvider.CLAUDE.value,
             "interval_sec": float(self._refresh_interval_sec),
             "tooltip_duration_ms": int(self._tooltip_duration_ms),
+            "limit_reset_sound_enabled": bool(self._limit_reset_sound_enabled),
+            "limit_reset_sound_while_away": bool(self._limit_reset_sound_while_away),
             "usage_url": CLAUDE_USAGE_URL,
             "collection_mode": CLAUDE_COLLECTION_MODE,
             "collection_supported": True,
@@ -1348,6 +1353,12 @@ class ClaudeUsageMonitor:
             except (TypeError, ValueError):
                 return False, "tooltip_duration"
             self._tooltip_duration_ms = max(1200, duration)
+        if "limit_reset_sound_enabled" in data:
+            self._limit_reset_sound_enabled = bool(data.get("limit_reset_sound_enabled"))
+        if "limit_reset_sound_while_away" in data:
+            self._limit_reset_sound_while_away = bool(
+                data.get("limit_reset_sound_while_away")
+            )
         self._save_settings_file()
         return True, None
 
@@ -1852,6 +1863,9 @@ class ClaudeUsageMonitor:
         self._limit_reset_sound_enabled = bool(
             data.get("limit_reset_sound_enabled", self._limit_reset_sound_enabled)
         )
+        self._limit_reset_sound_while_away = bool(
+            data.get("limit_reset_sound_while_away", self._limit_reset_sound_while_away)
+        )
 
     def _save_settings_file(self) -> None:
         if not self._persistence_enabled:
@@ -1866,6 +1880,7 @@ class ClaudeUsageMonitor:
                     "interval_sec": float(self._refresh_interval_sec),
                     "tooltip_duration_ms": int(self._tooltip_duration_ms),
                     "limit_reset_sound_enabled": bool(self._limit_reset_sound_enabled),
+                    "limit_reset_sound_while_away": bool(self._limit_reset_sound_while_away),
                     "collection_mode": CLAUDE_COLLECTION_MODE,
                 },
             )
@@ -1951,6 +1966,25 @@ class ClaudeUsageMonitor:
         # The profile manager owns the label shown on the profile card; alerts
         # use the same label so the user can tell which profile was reset.
         self._alert_label_provider = provider if callable(provider) else None
+
+    def set_limit_reset_sound_policy_provider(
+        self,
+        provider: Callable[[], tuple[bool, bool]] | None,
+    ) -> None:
+        # The profile manager owns the reset-sound switches of the AI usage
+        # settings tab; they are read when an alert fires, so a change applies
+        # to every profile without restarting it.
+        self._limit_reset_sound_policy_provider = provider if callable(provider) else None
+
+    def _resolve_limit_reset_sound_policy(self) -> tuple[bool, bool]:
+        provider = self._limit_reset_sound_policy_provider
+        if provider is not None:
+            try:
+                enabled, while_away = provider()
+                return bool(enabled), bool(while_away)
+            except Exception:
+                pass
+        return bool(self._limit_reset_sound_enabled), bool(self._limit_reset_sound_while_away)
 
     def _resolve_alert_label(self) -> str:
         provider = self._alert_label_provider
