@@ -153,6 +153,11 @@ class CodexUsageMultiMonitor:
         self.__taskbar_side_priority = DEFAULT_TASKBAR_SIDE_PRIORITY.value
         self.__interval_sec = 90.0
         self.__tooltip_duration_ms = 7000
+        # Reset fanfare switches shared by every profile. Profiles read them
+        # through a bound policy provider when an alert fires.
+        self.__limit_reset_sound_enabled = True
+        self.__limit_reset_sound_while_away = True
+        self.__limit_reset_sound_setting_loaded = False
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__refresh_inflight = False
         self.__refresh_worker_token: object | None = None
@@ -259,6 +264,11 @@ class CodexUsageMultiMonitor:
             and "account_1" not in self.__recovery_pending_profile_ids
         ):
             self.__migrate_legacy_single_account_files_if_needed()
+        if (
+            self.__settings_write_block_reason is None
+            and not self.__limit_reset_sound_setting_loaded
+        ):
+            self.__limit_reset_sound_enabled = self.__read_profile_limit_reset_sound_opt_in()
         if self.__settings_write_block_reason is None and (
             not has_manager_settings
             or manager_settings_version < AI_USAGE_SETTINGS_VERSION
@@ -378,6 +388,8 @@ class CodexUsageMultiMonitor:
             "taskbar_side_priority": str(self.__taskbar_side_priority),
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
+            "limit_reset_sound_enabled": bool(self.__limit_reset_sound_enabled),
+            "limit_reset_sound_while_away": bool(self.__limit_reset_sound_while_away),
             "usage_url": str(self.__usage_url),
             "collection_mode": "playwright",
             "settings_path": str(self.__settings_path),
@@ -695,6 +707,8 @@ class CodexUsageMultiMonitor:
         candidate_taskbar_side_priority = self.__taskbar_side_priority
         candidate_interval_sec = self.__interval_sec
         candidate_tooltip_duration_ms = self.__tooltip_duration_ms
+        candidate_limit_reset_sound_enabled = self.__limit_reset_sound_enabled
+        candidate_limit_reset_sound_while_away = self.__limit_reset_sound_while_away
         candidate_usage_url = self.__usage_url
         if "enabled" in data:
             candidate_enabled = bool(data.get("enabled"))
@@ -716,6 +730,12 @@ class CodexUsageMultiMonitor:
             candidate_tooltip_duration_ms = _normalize_tooltip_duration_ms(
                 data.get("tooltip_duration_ms"),
                 self.__tooltip_duration_ms,
+            )
+        if "limit_reset_sound_enabled" in data:
+            candidate_limit_reset_sound_enabled = bool(data.get("limit_reset_sound_enabled"))
+        if "limit_reset_sound_while_away" in data:
+            candidate_limit_reset_sound_while_away = bool(
+                data.get("limit_reset_sound_while_away")
             )
         usage_url = data.get("usage_url")
         if isinstance(usage_url, str) and usage_url.strip():
@@ -802,6 +822,8 @@ class CodexUsageMultiMonitor:
                 taskbar_side_priority=candidate_taskbar_side_priority,
                 interval_sec=candidate_interval_sec,
                 tooltip_duration_ms=candidate_tooltip_duration_ms,
+                limit_reset_sound_enabled=candidate_limit_reset_sound_enabled,
+                limit_reset_sound_while_away=candidate_limit_reset_sound_while_away,
                 usage_url=candidate_usage_url,
             )
         except Exception:
@@ -859,6 +881,9 @@ class CodexUsageMultiMonitor:
         self.__taskbar_side_priority = candidate_taskbar_side_priority
         self.__interval_sec = candidate_interval_sec
         self.__tooltip_duration_ms = candidate_tooltip_duration_ms
+        self.__limit_reset_sound_enabled = candidate_limit_reset_sound_enabled
+        self.__limit_reset_sound_while_away = candidate_limit_reset_sound_while_away
+        self.__limit_reset_sound_setting_loaded = True
         self.__usage_url = candidate_usage_url
         self.__account_settings = candidate_settings
         self.__account_order = candidate_order
@@ -2438,6 +2463,13 @@ class CodexUsageMultiMonitor:
             data.get("tooltip_duration_ms", self.__tooltip_duration_ms),
             self.__tooltip_duration_ms,
         )
+        if "limit_reset_sound_enabled" in data:
+            self.__limit_reset_sound_enabled = bool(data.get("limit_reset_sound_enabled"))
+            self.__limit_reset_sound_setting_loaded = True
+        if "limit_reset_sound_while_away" in data:
+            self.__limit_reset_sound_while_away = bool(
+                data.get("limit_reset_sound_while_away")
+            )
         usage_url = data.get("usage_url")
         if isinstance(usage_url, str) and usage_url.strip():
             self.__usage_url = usage_url.strip()
@@ -2577,6 +2609,8 @@ class CodexUsageMultiMonitor:
         interval_sec: float | None = None,
         tooltip_duration_ms: int | None = None,
         taskbar_side_priority: str | None = None,
+        limit_reset_sound_enabled: bool | None = None,
+        limit_reset_sound_while_away: bool | None = None,
         usage_url: str | None = None,
     ) -> None:
         if self.__settings_write_block_reason is not None:
@@ -2620,6 +2654,16 @@ class CodexUsageMultiMonitor:
                 self.__tooltip_duration_ms
                 if tooltip_duration_ms is None
                 else tooltip_duration_ms
+            ),
+            "limit_reset_sound_enabled": bool(
+                self.__limit_reset_sound_enabled
+                if limit_reset_sound_enabled is None
+                else limit_reset_sound_enabled
+            ),
+            "limit_reset_sound_while_away": bool(
+                self.__limit_reset_sound_while_away
+                if limit_reset_sound_while_away is None
+                else limit_reset_sound_while_away
             ),
             "usage_url": str(self.__usage_url if usage_url is None else usage_url),
             "default_account_id": str(
@@ -3243,6 +3287,7 @@ class CodexUsageMultiMonitor:
     ) -> Any:
         child = self.__call_monitor_factory(provider, config_dir, profile_dir, profile_id)
         self.__bind_child_alert_label(child, profile_id)
+        self.__bind_child_limit_reset_sound_policy(child)
         return child
 
     def __call_monitor_factory(
@@ -3280,6 +3325,38 @@ class CodexUsageMultiMonitor:
         except Exception:
             pass
         return
+
+    def __bind_child_limit_reset_sound_policy(self, child: Any) -> None:
+        setter = getattr(child, "set_limit_reset_sound_policy_provider", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self.__limit_reset_sound_policy)
+        except Exception:
+            pass
+        return
+
+    def __limit_reset_sound_policy(self) -> tuple[bool, bool]:
+        # Resolved when an alert fires, so a settings change reaches every
+        # profile at once without pushing or restarting child monitors.
+        return (
+            bool(self.__limit_reset_sound_enabled),
+            bool(self.__limit_reset_sound_while_away),
+        )
+
+    def __read_profile_limit_reset_sound_opt_in(self) -> bool:
+        # Before v0.34.0 the reset sound switch existed only in each profile's
+        # own settings file. Keep a complete opt-out: stay silent only when
+        # every profile that stores the switch had turned it off.
+        stored: list[bool] = []
+        for paths in self.__account_paths.values():
+            data = self.__read_json_file(paths.settings_path)
+            if not isinstance(data, dict):
+                continue
+            value = data.get("limit_reset_sound_enabled")
+            if isinstance(value, bool):
+                stored.append(value)
+        return not (stored and not any(stored))
 
     def __alert_label_for(self, profile_id: str) -> str:
         # Same label as the profile card, resolved when the alert is shown so
