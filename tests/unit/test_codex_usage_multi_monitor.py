@@ -4162,6 +4162,183 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 [4321, 4321],
             )
 
+    def _build_policy_manager(self, tmp: str):
+        children: list[_FakeChildMonitor] = []
+
+        class _PolicyChild(_FakeChildMonitor):
+            def __init__(self, config_dir: str, profile_dir: str) -> None:
+                super().__init__(config_dir, profile_dir)
+                self.policy_provider = None
+
+            def set_limit_reset_sound_policy_provider(self, provider):
+                self.policy_provider = provider
+
+        def factory(config_dir: str, profile_dir: str):
+            child = _PolicyChild(config_dir=config_dir, profile_dir=profile_dir)
+            children.append(child)
+            return child
+
+        manager = CodexUsageMultiMonitor(
+            config_dir=os.path.join(tmp, "config"),
+            local_base_dir=os.path.join(tmp, "local"),
+            monitor_factory=factory,
+        )
+        return manager, children
+
+    def test_limit_reset_sound_settings_round_trip_and_reach_every_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_policy_manager(tmp)
+            snapshot = manager.get_settings_snapshot()
+            self.assertTrue(snapshot["limit_reset_sound_enabled"])
+            self.assertTrue(snapshot["limit_reset_sound_while_away"])
+            self.assertEqual(
+                [child.policy_provider() for child in children],
+                [(True, True), (True, True)],
+            )
+
+            ok, error = manager.update_settings(
+                {
+                    "limit_reset_sound_enabled": False,
+                    "limit_reset_sound_while_away": False,
+                }
+            )
+
+            self.assertTrue(ok, error)
+            snapshot = manager.get_settings_snapshot()
+            self.assertFalse(snapshot["limit_reset_sound_enabled"])
+            self.assertFalse(snapshot["limit_reset_sound_while_away"])
+            # Profiles read the switches when an alert fires; nothing is
+            # pushed into their own settings.
+            self.assertEqual(
+                [child.policy_provider() for child in children],
+                [(False, False), (False, False)],
+            )
+            for child in children:
+                for call in child.update_calls:
+                    self.assertNotIn("limit_reset_sound_enabled", call)
+                    self.assertNotIn("limit_reset_sound_while_away", call)
+
+            ok, error, created = manager.add_profile("claude")
+            self.assertTrue(ok, error)
+            self.assertEqual(children[-1].policy_provider(), (False, False))
+
+            restarted, restarted_children = self._build_policy_manager(tmp)
+            snapshot = restarted.get_settings_snapshot()
+            self.assertFalse(snapshot["limit_reset_sound_enabled"])
+            self.assertFalse(snapshot["limit_reset_sound_while_away"])
+            self.assertEqual(
+                {child.policy_provider() for child in restarted_children},
+                {(False, False)},
+            )
+
+    def test_limit_reset_sound_settings_are_not_committed_when_save_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_policy_manager(tmp)
+            before = manager.get_settings_snapshot()
+
+            with patch.object(
+                manager,
+                "_CodexUsageMultiMonitor__save_manager_settings",
+                side_effect=OSError("disk full"),
+            ):
+                ok, error = manager.update_settings(
+                    {
+                        "limit_reset_sound_enabled": False,
+                        "limit_reset_sound_while_away": False,
+                    }
+                )
+
+            self.assertFalse(ok)
+            self.assertEqual(error, "settings_save_failed")
+            self.assertEqual(manager.get_settings_snapshot(), before)
+
+    def test_limit_reset_sound_default_keeps_a_complete_profile_opt_out(self):
+        cases = (
+            ((False, False), False),
+            ((False, True), True),
+            ((None, None), True),
+        )
+        for stored, expected in cases:
+            with self.subTest(stored=stored), tempfile.TemporaryDirectory() as tmp:
+                config_dir = os.path.join(tmp, "config")
+                for account_dir, value in zip(("codex-account-1", "codex-account-2"), stored):
+                    if value is None:
+                        continue
+                    path = os.path.join(config_dir, account_dir, "codex_usage_settings.json")
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as fp:
+                        json.dump({"limit_reset_sound_enabled": value}, fp)
+
+                manager, _children = self._build_policy_manager(tmp)
+                self.assertEqual(
+                    manager.get_settings_snapshot()["limit_reset_sound_enabled"],
+                    expected,
+                )
+                # The first save records the migrated switch so it no longer
+                # depends on the per-profile files.
+                with open(os.path.join(config_dir, "ai_usage_settings.json"), encoding="utf-8") as fp:
+                    self.assertEqual(json.load(fp)["limit_reset_sound_enabled"], expected)
+                restarted, _ = self._build_policy_manager(tmp)
+                self.assertEqual(
+                    restarted.get_settings_snapshot()["limit_reset_sound_enabled"],
+                    expected,
+                )
+
+    def test_v4_upgrade_without_sound_switch_derives_it_until_the_first_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = os.path.join(tmp, "config")
+            settings_path = os.path.join(config_dir, "ai_usage_settings.json")
+            self._build_policy_manager(tmp)
+            # A v0.33.x manager file: version 4 without the new switches.
+            with open(settings_path, encoding="utf-8") as fp:
+                payload = json.load(fp)
+            payload.pop("limit_reset_sound_enabled")
+            payload.pop("limit_reset_sound_while_away")
+            with open(settings_path, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp)
+            for account_dir in ("codex-account-1", "codex-account-2"):
+                path = os.path.join(config_dir, account_dir, "codex_usage_settings.json")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fp:
+                    json.dump({"limit_reset_sound_enabled": False}, fp)
+
+            upgraded, children = self._build_policy_manager(tmp)
+
+            snapshot = upgraded.get_settings_snapshot()
+            self.assertEqual(snapshot["settings_version"], 4)
+            self.assertFalse(snapshot["limit_reset_sound_enabled"])
+            self.assertTrue(snapshot["limit_reset_sound_while_away"])
+            self.assertEqual(
+                {child.policy_provider() for child in children},
+                {(False, True)},
+            )
+            with open(settings_path, encoding="utf-8") as fp:
+                self.assertNotIn("limit_reset_sound_enabled", json.load(fp))
+
+            ok, error = upgraded.update_settings({"interval_sec": 120})
+
+            self.assertTrue(ok, error)
+            with open(settings_path, encoding="utf-8") as fp:
+                saved = json.load(fp)
+            self.assertIs(saved["limit_reset_sound_enabled"], False)
+            self.assertIs(saved["limit_reset_sound_while_away"], True)
+
+    def test_saved_limit_reset_sound_switch_wins_over_profile_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, _children = self._build_policy_manager(tmp)
+            ok, error = manager.update_settings({"limit_reset_sound_enabled": True})
+            self.assertTrue(ok, error)
+            config_dir = os.path.join(tmp, "config")
+            for account_dir in ("codex-account-1", "codex-account-2"):
+                path = os.path.join(config_dir, account_dir, "codex_usage_settings.json")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fp:
+                    json.dump({"limit_reset_sound_enabled": False}, fp)
+
+            restarted, _ = self._build_policy_manager(tmp)
+
+            self.assertTrue(restarted.get_settings_snapshot()["limit_reset_sound_enabled"])
+
     def test_taskbar_overlay_enabled_round_trips_and_controls_overlay_visibility(self):
         with tempfile.TemporaryDirectory() as tmp:
             _FakeTaskbarOverlay.instances = []

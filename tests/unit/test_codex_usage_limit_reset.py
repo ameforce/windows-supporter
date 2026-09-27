@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import patch
 
 from src.apps.codex_usage_monitor import (
@@ -801,6 +802,192 @@ class MonitorLimitResetNotificationTest(unittest.TestCase):
 
             self.assertEqual(len(shown), 1)
             self.assertEqual(play_mock.call_count, 1)
+
+    def _run_idle_then_return(
+        self,
+        monitor: CodexUsageMonitor,
+        *,
+        on_detected=None,
+    ) -> tuple[list, Any]:
+        root = _FakeRoot()
+        monitor._CodexUsageMonitor__root = root
+        previous, current = self._rolled_reset_pair()
+        shown: list = []
+        with patch.object(
+            monitor,
+            "_CodexUsageMonitor__ui_post",
+            side_effect=lambda fn: fn(),
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__get_last_input_tick",
+            side_effect=[100, 100, 101],
+            create=True,
+        ), patch.object(
+            monitor,
+            "_CodexUsageMonitor__show_alert_tooltip",
+            side_effect=lambda text, lines=None, duration_ms=None: shown.append(
+                (text, lines, duration_ms)
+            ),
+        ), patch(
+            "src.utils.reset_fanfare.play_reset_fanfare", return_value=True
+        ) as play_mock:
+            monitor.handle_snapshot(previous)
+            monitor.handle_snapshot(current)
+            if callable(on_detected):
+                on_detected(shown, play_mock)
+            # Still idle, then the user returns.
+            root.after_calls[-1][1]()
+            self.assertEqual(shown, [])
+            root.after_calls[-1][1]()
+        return shown, play_mock
+
+    def test_reset_sound_plays_at_detection_while_away_and_tooltip_waits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+
+            def at_detection(shown, play_mock):
+                self.assertEqual(shown, [])
+                self.assertEqual(play_mock.call_count, 1)
+
+            shown, play_mock = self._run_idle_then_return(
+                monitor,
+                on_detected=at_detection,
+            )
+
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(play_mock.call_count, 1)
+            joined = " | ".join(str(line[0]) for line in (shown[0][1] or []))
+            self.assertIn("5시간 사용 한도 초기화됨", joined)
+
+    def test_reset_sound_waits_for_return_when_away_playback_is_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            monitor._CodexUsageMonitor__limit_reset_sound_while_away = False
+
+            def at_detection(shown, play_mock):
+                self.assertEqual(shown, [])
+                self.assertEqual(play_mock.call_count, 0)
+
+            shown, play_mock = self._run_idle_then_return(
+                monitor,
+                on_detected=at_detection,
+            )
+
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(play_mock.call_count, 1)
+
+    def test_manager_sound_policy_controls_reset_sound(self) -> None:
+        def broken() -> tuple[bool, bool]:
+            raise RuntimeError("manager closed")
+
+        cases = (
+            # (policy provider, own while-away switch, sounds at detection, total)
+            (lambda: (False, True), True, 0, 0),
+            (lambda: (True, False), True, 0, 1),
+            (lambda: (True, True), False, 1, 1),
+            (broken, False, 0, 1),
+        )
+        for provider, own_while_away, at_detection_count, total in cases:
+            with self.subTest(total=total, at_detection=at_detection_count), tempfile.TemporaryDirectory() as tmp:
+                monitor = self._make_monitor(tmp)
+                monitor._CodexUsageMonitor__limit_reset_sound_while_away = own_while_away
+                monitor.set_limit_reset_sound_policy_provider(provider)
+
+                def at_detection(shown, play_mock, expected=at_detection_count):
+                    self.assertEqual(play_mock.call_count, expected)
+
+                shown, play_mock = self._run_idle_then_return(
+                    monitor,
+                    on_detected=at_detection,
+                )
+
+                self.assertEqual(len(shown), 1)
+                self.assertEqual(play_mock.call_count, total)
+
+    def test_failed_away_playback_is_retried_on_return(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            root = _FakeRoot()
+            monitor._CodexUsageMonitor__root = root
+            previous, current = self._rolled_reset_pair()
+            shown: list = []
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__ui_post",
+                side_effect=lambda fn: fn(),
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__get_last_input_tick",
+                side_effect=[100, 101],
+                create=True,
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__show_alert_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(lines),
+            ), patch(
+                "src.utils.reset_fanfare.play_reset_fanfare", side_effect=[False, True]
+            ) as play_mock:
+                monitor.handle_snapshot(previous)
+                monitor.handle_snapshot(current)
+                self.assertEqual(play_mock.call_count, 1)
+                root.after_calls[-1][1]()
+
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(play_mock.call_count, 2)
+
+    def test_reset_queued_after_away_playback_is_turned_off_sounds_on_return(self) -> None:
+        from src.apps.codex_usage_monitor import UsageLimitReset
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            root = _FakeRoot()
+            monitor._CodexUsageMonitor__root = root
+            policy = [(True, True)]
+            monitor.set_limit_reset_sound_policy_provider(lambda: policy[0])
+            queue = monitor._CodexUsageMonitor__queue_limit_reset_notification_until_input
+            shown: list = []
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__get_last_input_tick",
+                side_effect=[100, 100, 100, 101],
+                create=True,
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__show_alert_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(lines),
+            ), patch(
+                "src.utils.reset_fanfare.play_reset_fanfare", return_value=True
+            ) as play_mock:
+                queue([UsageLimitReset("five_hour_limit", "5시간 사용 한도", "", "")])
+                self.assertEqual(play_mock.call_count, 1)
+                policy[0] = (True, False)
+                # The same window resets again and another one arrives while
+                # the tooltip is still held; neither has sounded yet.
+                queue([UsageLimitReset("five_hour_limit", "5시간 사용 한도", "", "")])
+                queue([UsageLimitReset("weekly_limit", "주간 사용 한도", "", "")])
+                self.assertEqual(play_mock.call_count, 1)
+                self.assertEqual(shown, [])
+                root.after_calls[-1][1]()
+
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(play_mock.call_count, 2)
+            joined = " | ".join(str(line[0]) for line in (shown[0] or []))
+            self.assertIn("5시간 사용 한도 초기화됨", joined)
+            self.assertIn("주간 사용 한도 초기화됨", joined)
+
+    def test_sound_while_away_setting_roundtrip_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            self.assertTrue(
+                monitor.get_settings_snapshot()["limit_reset_sound_while_away"]
+            )
+            monitor._CodexUsageMonitor__limit_reset_sound_while_away = False
+            monitor._CodexUsageMonitor__save_settings()
+
+            reloaded = self._make_monitor(tmp)
+            self.assertFalse(
+                reloaded.get_settings_snapshot()["limit_reset_sound_while_away"]
+            )
 
 
 class _ImmediateThread:

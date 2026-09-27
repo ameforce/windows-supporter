@@ -1959,6 +1959,7 @@ class CodexUsageMonitor:
         self.__notification_sink = notification_sink if callable(notification_sink) else None
         self.__suppress_normal_tooltips = bool(suppress_normal_tooltips)
         self.__alert_label_provider: Callable[[], str] | None = None
+        self.__limit_reset_sound_policy_provider: Callable[[], tuple[bool, bool]] | None = None
         self.__external_scheduler = False
         self.__local_usage_provider = local_usage_provider
         self.__browser_session_factory = browser_session_factory
@@ -1972,6 +1973,8 @@ class CodexUsageMonitor:
         self.__active_tooltip = None
         self.__pending_change_tooltip_changes: dict[str, UsageChange] = {}
         self.__pending_limit_reset_events: dict[str, UsageLimitReset] = {}
+        # Pending resets whose fanfare already played while the tooltip waits.
+        self.__pending_limit_reset_sounded_keys: set[str] = set()
         self.__limit_reset_baselines: dict[str, str] = {}
         self.__pending_change_tooltip_snapshot: UsageSnapshot | None = None
         self.__pending_change_tooltip_input_tick: int | None = None
@@ -2020,6 +2023,7 @@ class CodexUsageMonitor:
         self.__min_interval_sec = 10.0
         self.__tooltip_duration_ms = 7000
         self.__limit_reset_sound_enabled = True
+        self.__limit_reset_sound_while_away = True
         self.__usage_url = CURRENT_CODEX_USAGE_URL
         self.__navigation_timeout_ms = 30000
         self.__login_timeout_sec = 180.0
@@ -2132,6 +2136,26 @@ class CodexUsageMonitor:
         except Exception:
             return ""
 
+    def set_limit_reset_sound_policy_provider(
+        self,
+        provider: Callable[[], tuple[bool, bool]] | None,
+    ) -> None:
+        # The profile manager owns the reset-sound switches of the AI usage
+        # settings tab; they are read when an alert fires, so a change applies
+        # to every profile without restarting it.
+        self.__limit_reset_sound_policy_provider = provider if callable(provider) else None
+        return
+
+    def __resolve_limit_reset_sound_policy(self) -> tuple[bool, bool]:
+        provider = self.__limit_reset_sound_policy_provider
+        if provider is not None:
+            try:
+                enabled, while_away = provider()
+                return bool(enabled), bool(while_away)
+            except Exception:
+                pass
+        return bool(self.__limit_reset_sound_enabled), bool(self.__limit_reset_sound_while_away)
+
     def __set_usage_url(self, value: str) -> tuple[bool, str | None]:
         previous = str(getattr(self, "_CodexUsageMonitor__usage_url", "") or "")
         candidate = canonicalize_codex_usage_url(value)
@@ -2196,6 +2220,7 @@ class CodexUsageMonitor:
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "limit_reset_sound_enabled": bool(self.__limit_reset_sound_enabled),
+            "limit_reset_sound_while_away": bool(self.__limit_reset_sound_while_away),
             "usage_url": str(self.__usage_url),
             "collection_mode": "playwright",
             "settings_path": str(self.__settings_path),
@@ -2231,6 +2256,9 @@ class CodexUsageMonitor:
         self.__tooltip_duration_ms = int(tooltip_ms)
         self.__limit_reset_sound_enabled = bool(
             data.get("limit_reset_sound_enabled", self.__limit_reset_sound_enabled)
+        )
+        self.__limit_reset_sound_while_away = bool(
+            data.get("limit_reset_sound_while_away", self.__limit_reset_sound_while_away)
         )
         self.__refresh_session_state_from_profile()
         self.__save_settings()
@@ -3817,16 +3845,27 @@ class CodexUsageMonitor:
             self.__pending_change_tooltip_changes
             or self.__pending_limit_reset_events
         )
+        queued_keys: list[str] = []
         for item in resets:
             key = str(item.key or "").strip()
             if not key:
                 continue
             self.__pending_limit_reset_events[key] = item
+            queued_keys.append(key)
         if not (
             self.__pending_change_tooltip_changes
             or self.__pending_limit_reset_events
         ):
             return
+        if queued_keys:
+            sound_enabled, sound_while_away = self.__resolve_limit_reset_sound_policy()
+            if sound_enabled and sound_while_away and self.__play_limit_reset_sound():
+                # Heard at detection even when nobody is at the keyboard; the
+                # tooltip still waits for the user's next input.
+                self.__pending_limit_reset_sounded_keys.update(queued_keys)
+            else:
+                # Not heard yet (policy or failed playback): sounds on return.
+                self.__pending_limit_reset_sounded_keys.difference_update(queued_keys)
         if isinstance(snapshot, UsageSnapshot):
             self.__pending_change_tooltip_snapshot = UsageSnapshot.from_dict(
                 snapshot.to_dict()
@@ -3916,9 +3955,11 @@ class CodexUsageMonitor:
     def __show_pending_change_tooltip_now(self) -> None:
         changes_by_key = dict(self.__pending_change_tooltip_changes)
         resets_by_key = dict(self.__pending_limit_reset_events)
+        sounded_keys = set(self.__pending_limit_reset_sounded_keys)
         snapshot = self.__pending_change_tooltip_snapshot
         self.__pending_change_tooltip_changes = {}
         self.__pending_limit_reset_events = {}
+        self.__pending_limit_reset_sounded_keys = set()
         self.__pending_change_tooltip_snapshot = None
         self.__pending_change_tooltip_input_tick = None
         after_id = self.__pending_change_tooltip_after_id
@@ -3931,6 +3972,8 @@ class CodexUsageMonitor:
                 pass
         if not changes_by_key and not resets_by_key:
             return
+        # Resets that already sounded at detection appear silently now.
+        play_reset_sound = any(key not in sounded_keys for key in resets_by_key)
         ordered: list[UsageChange] = []
         for key in USAGE_METRIC_KEYS:
             item = changes_by_key.pop(key, None)
@@ -3943,7 +3986,12 @@ class CodexUsageMonitor:
             if item is not None:
                 ordered_resets.append(item)
         ordered_resets.extend(resets_by_key.values())
-        self.__show_change_tooltip(ordered, snapshot, resets=ordered_resets)
+        self.__show_change_tooltip(
+            ordered,
+            snapshot,
+            resets=ordered_resets,
+            play_reset_sound=play_reset_sound,
+        )
         return
 
     def __show_change_tooltip(
@@ -3951,6 +3999,7 @@ class CodexUsageMonitor:
         changes: list[UsageChange],
         snapshot: UsageSnapshot | None = None,
         resets: list[UsageLimitReset] | None = None,
+        play_reset_sound: bool = True,
     ) -> None:
         root = self.__root
         if root is None:
@@ -3981,23 +4030,27 @@ class CodexUsageMonitor:
                 ),
             )
         if reset_items:
-            self.__play_limit_reset_sound()
+            if bool(play_reset_sound):
+                self.__play_limit_reset_sound()
             self.__show_alert_tooltip("", lines=lines)
             return
         self.__show_tooltip("", lines=lines)
         return
 
-    def __play_limit_reset_sound(self) -> None:
-        if not bool(self.__limit_reset_sound_enabled):
-            return
+    def __play_limit_reset_sound(self) -> bool:
+        sound_enabled, _sound_while_away = self.__resolve_limit_reset_sound_policy()
+        if not sound_enabled:
+            return False
         try:
             from src.utils.reset_fanfare import play_reset_fanfare
 
             if not play_reset_fanfare():
                 self.__log("limit reset sound playback unavailable")
+                return False
         except Exception as exc:
             self.__log_exception("limit reset sound playback failed", exc)
-        return
+            return False
+        return True
 
     def __build_change_tooltip_lines(
         self,
@@ -4820,6 +4873,15 @@ class CodexUsageMonitor:
             )
         except Exception:
             self.__limit_reset_sound_enabled = True
+        try:
+            self.__limit_reset_sound_while_away = bool(
+                data.get(
+                    "limit_reset_sound_while_away",
+                    self.__limit_reset_sound_while_away,
+                )
+            )
+        except Exception:
+            self.__limit_reset_sound_while_away = True
         usage_url = normalize_usage_value(data.get("usage_url", self.__usage_url))
         if usage_url:
             canonical_usage_url = canonicalize_codex_usage_url(usage_url)
@@ -4837,6 +4899,7 @@ class CodexUsageMonitor:
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "limit_reset_sound_enabled": bool(self.__limit_reset_sound_enabled),
+            "limit_reset_sound_while_away": bool(self.__limit_reset_sound_while_away),
             "usage_url": str(self.__usage_url),
         }
         self.__write_json_file(self.__settings_path, payload)
