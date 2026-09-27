@@ -119,12 +119,15 @@ class UsageLimitResetAlert:
             key = str(item.key)
             self._pending[key] = item
             queued_keys.append(key)
-        if _policy_flag(self._sound_enabled) and _policy_flag(self._sound_while_away):
+        if (
+            _policy_flag(self._sound_enabled)
+            and _policy_flag(self._sound_while_away)
+            and self._play()
+        ):
             # Heard at detection even when nobody is at the keyboard.
-            self._play()
             self._sounded_keys.update(queued_keys)
         else:
-            # A newly queued reset that has not sounded yet sounds on return.
+            # Not heard yet (policy or failed playback): sounds on return.
             self._sounded_keys.difference_update(queued_keys)
         tick = self._input_tick()
         if tick is None:
@@ -175,12 +178,11 @@ class UsageLimitResetAlert:
             return f"{header} - {label}"
         return header
 
-    def _play(self) -> None:
+    def _play(self) -> bool:
         try:
-            self._play_sound()
+            return bool(self._play_sound())
         except Exception:
-            pass
-        return
+            return False
 
     def _flush(self) -> None:
         resets = list(self._pending.values())

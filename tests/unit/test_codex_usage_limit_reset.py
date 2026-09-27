@@ -904,6 +904,77 @@ class MonitorLimitResetNotificationTest(unittest.TestCase):
                 self.assertEqual(len(shown), 1)
                 self.assertEqual(play_mock.call_count, total)
 
+    def test_failed_away_playback_is_retried_on_return(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            root = _FakeRoot()
+            monitor._CodexUsageMonitor__root = root
+            previous, current = self._rolled_reset_pair()
+            shown: list = []
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__ui_post",
+                side_effect=lambda fn: fn(),
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__get_last_input_tick",
+                side_effect=[100, 101],
+                create=True,
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__show_alert_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(lines),
+            ), patch(
+                "src.utils.reset_fanfare.play_reset_fanfare", side_effect=[False, True]
+            ) as play_mock:
+                monitor.handle_snapshot(previous)
+                monitor.handle_snapshot(current)
+                self.assertEqual(play_mock.call_count, 1)
+                root.after_calls[-1][1]()
+
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(play_mock.call_count, 2)
+
+    def test_reset_queued_after_away_playback_is_turned_off_sounds_on_return(self) -> None:
+        from src.apps.codex_usage_monitor import UsageLimitReset
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = self._make_monitor(tmp)
+            root = _FakeRoot()
+            monitor._CodexUsageMonitor__root = root
+            policy = [(True, True)]
+            monitor.set_limit_reset_sound_policy_provider(lambda: policy[0])
+            queue = monitor._CodexUsageMonitor__queue_limit_reset_notification_until_input
+            shown: list = []
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__get_last_input_tick",
+                side_effect=[100, 100, 100, 101],
+                create=True,
+            ), patch.object(
+                monitor,
+                "_CodexUsageMonitor__show_alert_tooltip",
+                side_effect=lambda text, lines=None, duration_ms=None: shown.append(lines),
+            ), patch(
+                "src.utils.reset_fanfare.play_reset_fanfare", return_value=True
+            ) as play_mock:
+                queue([UsageLimitReset("five_hour_limit", "5시간 사용 한도", "", "")])
+                self.assertEqual(play_mock.call_count, 1)
+                policy[0] = (True, False)
+                # The same window resets again and another one arrives while
+                # the tooltip is still held; neither has sounded yet.
+                queue([UsageLimitReset("five_hour_limit", "5시간 사용 한도", "", "")])
+                queue([UsageLimitReset("weekly_limit", "주간 사용 한도", "", "")])
+                self.assertEqual(play_mock.call_count, 1)
+                self.assertEqual(shown, [])
+                root.after_calls[-1][1]()
+
+            self.assertEqual(len(shown), 1)
+            self.assertEqual(play_mock.call_count, 2)
+            joined = " | ".join(str(line[0]) for line in (shown[0] or []))
+            self.assertIn("5시간 사용 한도 초기화됨", joined)
+            self.assertIn("주간 사용 한도 초기화됨", joined)
+
     def test_sound_while_away_setting_roundtrip_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             monitor = self._make_monitor(tmp)

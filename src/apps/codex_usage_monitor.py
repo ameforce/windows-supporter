@@ -3859,12 +3859,12 @@ class CodexUsageMonitor:
             return
         if queued_keys:
             sound_enabled, sound_while_away = self.__resolve_limit_reset_sound_policy()
-            if sound_enabled and sound_while_away:
+            if sound_enabled and sound_while_away and self.__play_limit_reset_sound():
                 # Heard at detection even when nobody is at the keyboard; the
                 # tooltip still waits for the user's next input.
-                self.__play_limit_reset_sound()
                 self.__pending_limit_reset_sounded_keys.update(queued_keys)
             else:
+                # Not heard yet (policy or failed playback): sounds on return.
                 self.__pending_limit_reset_sounded_keys.difference_update(queued_keys)
         if isinstance(snapshot, UsageSnapshot):
             self.__pending_change_tooltip_snapshot = UsageSnapshot.from_dict(
@@ -4037,18 +4037,20 @@ class CodexUsageMonitor:
         self.__show_tooltip("", lines=lines)
         return
 
-    def __play_limit_reset_sound(self) -> None:
+    def __play_limit_reset_sound(self) -> bool:
         sound_enabled, _sound_while_away = self.__resolve_limit_reset_sound_policy()
         if not sound_enabled:
-            return
+            return False
         try:
             from src.utils.reset_fanfare import play_reset_fanfare
 
             if not play_reset_fanfare():
                 self.__log("limit reset sound playback unavailable")
+                return False
         except Exception as exc:
             self.__log_exception("limit reset sound playback failed", exc)
-        return
+            return False
+        return True
 
     def __build_change_tooltip_lines(
         self,

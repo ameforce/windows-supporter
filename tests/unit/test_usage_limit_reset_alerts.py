@@ -37,10 +37,12 @@ class UsageLimitResetAlertTest(unittest.TestCase):
         while_away=True,
         root=None,
         label=None,
+        played=lambda: True,
+        no_root=False,
     ):
         self.sounds: list = []
         self.tooltips: list = []
-        self.root = root or _Root()
+        self.root = None if no_root else (root or _Root())
         return UsageLimitResetAlert(
             title="Claude",
             post_ui=lambda fn: (fn(), True)[1],
@@ -50,7 +52,7 @@ class UsageLimitResetAlertTest(unittest.TestCase):
             sound_while_away=while_away if callable(while_away) else (lambda: while_away),
             get_label=label,
             input_tick=tick,
-            play_sound=lambda: self.sounds.append(1) or True,
+            play_sound=lambda: self.sounds.append(1) or played(),
             show_tooltip=lambda root, lines, ms: self.tooltips.append((lines, ms)),
         )
 
@@ -193,6 +195,38 @@ class UsageLimitResetAlertTest(unittest.TestCase):
 
         self.assertEqual(len(self.sounds), 1)
         self.assertEqual(len(self.tooltips), 1)
+
+    def test_failed_away_playback_is_retried_on_return(self) -> None:
+        ticks = [100]
+        results = [False, True]
+        alert = self._alert(tick=lambda: ticks[0], played=lambda: results.pop(0))
+
+        alert.submit([_reset("weekly_limit", "주간 사용 한도")])
+        self.assertEqual(len(self.sounds), 1)
+
+        ticks[0] = 101
+        _delay, poll = self.root.after_calls[-1]
+        poll()
+        # The fanfare was not heard while away (no audio device), so the
+        # return tries once more with the tooltip.
+        self.assertEqual(len(self.sounds), 2)
+        self.assertEqual(len(self.tooltips), 1)
+
+    def test_away_playback_off_without_input_gate_sounds_with_the_tooltip(self) -> None:
+        alert = self._alert(while_away=False)
+        alert.submit([_reset("weekly_limit", "주간 사용 한도")])
+
+        self.assertEqual(len(self.sounds), 1)
+        self.assertEqual(len(self.tooltips), 1)
+
+    def test_missing_root_flushes_the_pending_fanfare_without_a_tooltip(self) -> None:
+        for while_away in (True, False):
+            with self.subTest(while_away=while_away):
+                alert = self._alert(tick=lambda: 100, while_away=while_away, no_root=True)
+                alert.submit([_reset("weekly_limit", "주간 사용 한도")])
+
+                self.assertEqual(len(self.sounds), 1)
+                self.assertEqual(self.tooltips, [])
 
     def test_policy_getter_failure_keeps_the_tooltip_and_stays_silent(self) -> None:
         def broken() -> bool:
