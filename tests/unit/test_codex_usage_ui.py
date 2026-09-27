@@ -2710,6 +2710,96 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertEqual(monitor.update_payloads[-1]["taskbar_side_priority"], "right")
         self.assertEqual(statuses[-1], ("저장됨", "ok"))
 
+    def test_save_includes_limit_reset_sound_toggles(self) -> None:
+        class _FakeMonitor:
+            def __init__(self):
+                self.update_payloads = []
+
+            def get_settings_snapshot(self):
+                return {"accounts": []}
+
+            def update_settings(self, payload):
+                self.update_payloads.append(dict(payload))
+                return True, None
+
+        monitor = _FakeMonitor()
+        view = CodexUsageSettingsView(root=None, codex_monitor=monitor)
+        view._enabled_var = _FakeVar(value=True)
+        view._taskbar_overlay_var = _FakeVar(value=True)
+        view._interval_var = _FakeVar(value="90")
+        view._tooltip_var = _FakeVar(value="7")
+        view._set_status = lambda *_args, **_kwargs: None
+
+        # Not mounted: the manager keeps its current switches.
+        view._on_save()
+        self.assertNotIn("limit_reset_sound_enabled", monitor.update_payloads[-1])
+        self.assertNotIn("limit_reset_sound_while_away", monitor.update_payloads[-1])
+
+        view._limit_reset_sound_var = _FakeVar(value=False)
+        view._limit_reset_sound_while_away_var = _FakeVar(value=True)
+        view._on_save()
+
+        self.assertIs(monitor.update_payloads[-1]["limit_reset_sound_enabled"], False)
+        self.assertIs(monitor.update_payloads[-1]["limit_reset_sound_while_away"], True)
+
+    def test_load_settings_reads_limit_reset_sound_toggles(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._safe_get_settings = lambda: {
+            "limit_reset_sound_enabled": False,
+            "limit_reset_sound_while_away": False,
+            "accounts": [],
+        }
+        view._set_status = lambda *_args, **_kwargs: None
+        view._limit_reset_sound_var = _FakeVar(value=True)
+        view._limit_reset_sound_while_away_var = _FakeVar(value=True)
+
+        view._load_settings()
+
+        self.assertIs(view._limit_reset_sound_var.get(), False)
+        self.assertIs(view._limit_reset_sound_while_away_var.get(), False)
+
+        view._safe_get_settings = lambda: {"accounts": []}
+        view._load_settings()
+
+        self.assertIs(view._limit_reset_sound_var.get(), True)
+        self.assertIs(view._limit_reset_sound_while_away_var.get(), True)
+
+    def test_mount_exposes_limit_reset_sound_toggles_and_links_away_playback(self) -> None:
+        fake_tk = _FakeTk()
+        fake_ttk = _FakeTtk()
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+        view._tk = fake_tk
+        view._ttk = fake_ttk
+        view._lazy_import_tk = lambda: None
+        view._safe_get_settings = lambda: {"accounts": []}
+        view._load_settings = lambda: None
+        view._start_runtime_refresh = lambda: None
+        scheduled = []
+        view._schedule_autosave = lambda **_kwargs: scheduled.append(True)
+
+        view.mount(_FakeWidget())
+
+        by_text = {
+            checkbutton.kwargs.get("text"): checkbutton
+            for checkbutton in fake_tk.checkbuttons
+        }
+        sound = by_text["초기화 효과음"]
+        while_away = by_text["자리 비움 중에도 재생"]
+        self.assertIs(sound.kwargs["variable"], view._limit_reset_sound_var)
+        self.assertIs(while_away.kwargs["variable"], view._limit_reset_sound_while_away_var)
+        self.assertEqual(while_away.kwargs.get("state"), "normal")
+
+        view._limit_reset_sound_var.set(False)
+        self.assertEqual(while_away.kwargs.get("state"), "disabled")
+        # Only greyed out: the choice returns when the sound is turned on.
+        self.assertIs(view._limit_reset_sound_while_away_var.get(), True)
+        view._limit_reset_sound_var.set(True)
+        self.assertEqual(while_away.kwargs.get("state"), "normal")
+
+        view._limit_reset_sound_while_away_var.set(False)
+        # Both switches autosave like the other options.
+        self.assertEqual(len(scheduled), 3)
+
     def test_invalid_autosave_value_does_not_update_settings(self) -> None:
         class _FakeMonitor:
             def __init__(self):

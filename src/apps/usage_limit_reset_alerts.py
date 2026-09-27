@@ -47,13 +47,26 @@ def _show_tooltip(root: Any, lines: list[tuple[str, str | None]], duration_ms: i
     return tooltip
 
 
+def _policy_flag(getter: Callable[[], bool]) -> bool:
+    try:
+        return bool(getter())
+    except Exception:
+        return False
+
+
 class UsageLimitResetAlert:
     """Present usage-limit reset alerts (fanfare + alert tooltip) once.
 
     Mirrors the Codex monitor's presentation contract for providers that do
-    not own it: alerts are merged per metric, shown on the UI thread, and
-    held until the user is active again (a new input tick) so a reset that
-    happens while the user is away is not missed.
+    not own it: alerts are merged per metric, shown on the UI thread, and the
+    tooltip is held until the user is active again (a new input tick) so a
+    reset that happens while the user is away is not missed.
+
+    The fanfare follows the reset-sound policy. With ``sound_while_away`` on
+    it plays as soon as the reset is queued, so it is heard while the user is
+    away; the held tooltip then appears silently. With it off the fanfare
+    waits for the user's return together with the tooltip. Each queued reset
+    sounds at most once.
     """
 
     def __init__(
@@ -64,6 +77,7 @@ class UsageLimitResetAlert:
         get_root: Callable[[], Any],
         get_duration_ms: Callable[[], int],
         sound_enabled: Callable[[], bool] = lambda: True,
+        sound_while_away: Callable[[], bool] = lambda: True,
         get_label: Callable[[], str] | None = None,
         input_tick: Callable[[], int | None] = _last_input_tick,
         play_sound: Callable[[], bool] = _play_fanfare,
@@ -75,12 +89,15 @@ class UsageLimitResetAlert:
         self._get_root = get_root
         self._get_duration_ms = get_duration_ms
         self._sound_enabled = sound_enabled
+        self._sound_while_away = sound_while_away
         self._get_label = get_label
         self._input_tick = input_tick
         self._play_sound = play_sound
         self._show_tooltip = show_tooltip
         self._poll_ms = max(50, int(poll_ms))
         self._pending: dict[str, Any] = {}
+        # Keys whose fanfare already played while their tooltip is held.
+        self._sounded_keys: set[str] = set()
         self._baseline_tick: int | None = None
         self._after_id: Any = None
         self._active_tooltip: Any = None
@@ -97,8 +114,18 @@ class UsageLimitResetAlert:
 
     def _queue(self, resets: list[Any]) -> None:
         was_empty = not self._pending
+        queued_keys = []
         for item in resets:
-            self._pending[str(item.key)] = item
+            key = str(item.key)
+            self._pending[key] = item
+            queued_keys.append(key)
+        if _policy_flag(self._sound_enabled) and _policy_flag(self._sound_while_away):
+            # Heard at detection even when nobody is at the keyboard.
+            self._play()
+            self._sounded_keys.update(queued_keys)
+        else:
+            # A newly queued reset that has not sounded yet sounds on return.
+            self._sounded_keys.difference_update(queued_keys)
         tick = self._input_tick()
         if tick is None:
             self._flush()
@@ -148,17 +175,26 @@ class UsageLimitResetAlert:
             return f"{header} - {label}"
         return header
 
+    def _play(self) -> None:
+        try:
+            self._play_sound()
+        except Exception:
+            pass
+        return
+
     def _flush(self) -> None:
         resets = list(self._pending.values())
+        sounded_keys = self._sounded_keys
         self._pending = {}
+        self._sounded_keys = set()
         self._baseline_tick = None
         if not resets:
             return
-        if bool(self._sound_enabled()):
-            try:
-                self._play_sound()
-            except Exception:
-                pass
+        unsounded = any(
+            str(getattr(item, "key", "") or "") not in sounded_keys for item in resets
+        )
+        if unsounded and _policy_flag(self._sound_enabled):
+            self._play()
         root = self._get_root()
         if root is None:
             return

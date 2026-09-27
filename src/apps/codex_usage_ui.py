@@ -74,6 +74,9 @@ class CodexUsageSettingsView:
         self._taskbar_side_priority_var = None
         self._interval_var = None
         self._tooltip_var = None
+        self._limit_reset_sound_var = None
+        self._limit_reset_sound_while_away_var = None
+        self._limit_reset_sound_while_away_button = None
         self._status_var = None
         self._status_label = None
         self._login_button = None
@@ -358,6 +361,8 @@ class CodexUsageSettingsView:
         )
         self._interval_var = tk.StringVar(value="")
         self._tooltip_var = tk.StringVar(value="")
+        self._limit_reset_sound_var = tk.BooleanVar(value=True)
+        self._limit_reset_sound_while_away_var = tk.BooleanVar(value=True)
         self._collect_state_var = tk.StringVar(value="-")
         self._next_collect_var = tk.StringVar(value="-")
         self._live_time_var = tk.StringVar(value="-")
@@ -400,6 +405,33 @@ class CodexUsageSettingsView:
                 )
             )
         self._bind_responsive_widget_row(options, option_widgets, columns=2)
+        row += 1
+
+        # 사용 한도 초기화 효과음은 모든 프로필에 공통이다. "자리 비움 중에도
+        # 재생"은 효과음이 켜져 있을 때만 의미가 있어 같은 줄에 두고, 효과음을
+        # 끄면 비활성으로 표시한다.
+        sound_options = tk.Frame(body, bg=card_bg)
+        sound_options.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 3))
+        sound_widgets = []
+        for checkbox_text, target_var in (
+            ("초기화 효과음", self._limit_reset_sound_var),
+            ("자리 비움 중에도 재생", self._limit_reset_sound_while_away_var),
+        ):
+            sound_widgets.append(
+                tk.Checkbutton(
+                    sound_options,
+                    text=checkbox_text,
+                    variable=target_var,
+                    bg=card_bg,
+                    activebackground=card_bg,
+                    selectcolor=card_bg,
+                    fg="#111827",
+                    activeforeground="#111827",
+                    font=("Segoe UI", 9),
+                )
+            )
+        self._limit_reset_sound_while_away_button = sound_widgets[-1]
+        self._bind_responsive_widget_row(sound_options, sound_widgets, columns=2)
         row += 1
 
         placement = tk.Frame(body, bg=card_bg)
@@ -507,6 +539,7 @@ class CodexUsageSettingsView:
 
         self._load_settings()
         self._register_autosave_traces()
+        self._bind_limit_reset_sound_controls()
         self._start_runtime_refresh()
         return
 
@@ -2155,6 +2188,18 @@ class CodexUsageSettingsView:
                 self._tooltip_var.set(self._format_seconds(float(tooltip_ms) / 1000.0))
             except Exception:
                 pass
+            try:
+                self._limit_reset_sound_var.set(
+                    bool(settings.get("limit_reset_sound_enabled", True))
+                )
+            except Exception:
+                pass
+            try:
+                self._limit_reset_sound_while_away_var.set(
+                    bool(settings.get("limit_reset_sound_while_away", True))
+                )
+            except Exception:
+                pass
             accounts = settings.get("profiles")
             if not isinstance(accounts, list):
                 accounts = settings.get("accounts")
@@ -2480,11 +2525,40 @@ class CodexUsageSettingsView:
             self._taskbar_overlay_var,
             self._taskbar_side_priority_var,
             self._interval_var,
+            self._limit_reset_sound_var,
+            self._limit_reset_sound_while_away_var,
             *self._account_enabled_vars.values(),
             *self._account_provider_vars.values(),
             *self._account_taskbar_selected_vars.values(),
         ):
             self._bind_autosave_var(var)
+        return
+
+    def _bind_limit_reset_sound_controls(self) -> None:
+        tracer = getattr(self._limit_reset_sound_var, "trace_add", None)
+        if callable(tracer):
+            try:
+                tracer("write", lambda *_args: self._sync_limit_reset_sound_controls())
+            except Exception:
+                pass
+        self._sync_limit_reset_sound_controls()
+        return
+
+    def _sync_limit_reset_sound_controls(self) -> None:
+        # 자리 비움 중 재생은 효과음이 켜져 있을 때만 의미가 있다. 값은 그대로
+        # 두어 효과음을 다시 켜면 이전 선택이 돌아온다.
+        button = self._limit_reset_sound_while_away_button
+        var = self._limit_reset_sound_var
+        if button is None or var is None:
+            return
+        try:
+            sound_enabled = bool(var.get())
+        except Exception:
+            sound_enabled = True
+        try:
+            button.configure(state="normal" if sound_enabled else "disabled")
+        except Exception:
+            pass
         return
 
     def _bind_autosave_var(self, var: Any) -> None:
@@ -2591,6 +2665,17 @@ class CodexUsageSettingsView:
             "profile_order": [str(item.get("id") or "") for item in accounts],
             "selected_profile_ids": selected_profile_ids,
         }
+        for key, var in (
+            ("limit_reset_sound_enabled", self._limit_reset_sound_var),
+            ("limit_reset_sound_while_away", self._limit_reset_sound_while_away_var),
+        ):
+            # 화면에 없는 값은 보내지 않아 관리자의 현재 값을 유지한다.
+            if var is None:
+                continue
+            try:
+                payload[key] = bool(var.get())
+            except Exception:
+                pass
         if accounts:
             payload["default_account_id"] = str(accounts[0].get("id") or "")
         return {
