@@ -2015,6 +2015,9 @@ class CodexUsageMonitor:
         self.__last_playwright_notice_ts = 0.0
         self.__playwright_notice_cooldown_sec = 1800.0
         self.__profile_in_use_detected = False
+        # A background Cloudflare edge challenge with a usable cached snapshot
+        # is retried on the environment backoff instead of pinning OUT.
+        self.__edge_challenge_backoff = False
         self.__collect_lock = threading.Lock()
 
         self.__settings_version = 1
@@ -2346,6 +2349,7 @@ class CodexUsageMonitor:
             self.__clear_auth_attention()
             self.__save_state()
             self.__failure_count = 0
+            self.__edge_challenge_backoff = False
             self.__manual_query_waiting_result = False
             self.__pause_background_monitor()
             return (
@@ -2566,7 +2570,7 @@ class CodexUsageMonitor:
         # A refused profile lock (``profile_in_use``) is not a reason to stop
         # background collection: the lock is transient on Windows, so the
         # profile keeps being re-probed on a backoff instead of waiting for a
-        # restart (see ``__profile_lock_retry_after_sec``).
+        # restart (see ``__environment_retry_after_sec``).
         return bool(
             self.__enabled
             and self.__is_logged_in_session()
@@ -2587,8 +2591,14 @@ class CodexUsageMonitor:
             return reason or "auth_attention_required"
         return ""
 
-    def __profile_lock_retry_after_sec(self) -> float:
-        """Backoff before re-probing a profile whose lock was refused."""
+    def __environment_retry_after_sec(self) -> float:
+        """Backoff before re-probing after an environmental refusal.
+
+        Used for a refused Chrome profile lock and for a background Cloudflare
+        edge challenge: neither is an account problem, so the profile keeps
+        being probed, starting at 30 s (or the collect interval if longer)
+        and doubling per consecutive failure up to 15 minutes.
+        """
 
         base = max(30.0, float(self.__interval_sec))
         exponent = max(0, min(int(self.__failure_count) - 1, 5))
@@ -2786,8 +2796,9 @@ class CodexUsageMonitor:
             "retry_after_sec": (
                 float(min(self.__interval_sec * (2 ** max(0, min(self.__failure_count - 1, 4))), 15 * 60))
                 if provider_status == "retrying"
-                else self.__profile_lock_retry_after_sec()
+                else self.__environment_retry_after_sec()
                 if monitor_state == "paused_profile_in_use"
+                or bool(self.__edge_challenge_backoff)
                 else None
             ),
             "provider_status": provider_status,
@@ -2945,6 +2956,7 @@ class CodexUsageMonitor:
                         )
                         snapshot = merged
                         self.__profile_in_use_detected = False
+                        self.__edge_challenge_backoff = False
                         self.__failure_count = 0
                         self.__last_error_type = UsageErrorType.NONE
                         self.__resume_background_monitor_if_needed()
@@ -3018,6 +3030,7 @@ class CodexUsageMonitor:
             self.__usage_history = []
         self.__cancel_pending_login_poll()
         self.__profile_in_use_detected = False
+        self.__edge_challenge_backoff = False
         self.__failure_count = 0
         self.__last_error_type = UsageErrorType.NONE
         self.__set_session_state("logged_in")
@@ -4553,10 +4566,28 @@ class CodexUsageMonitor:
         if msg in {"collect_busy", "collect_cancelled"}:
             return
         self.__last_error_type = normalize_usage_error_type(msg)
+        self.__edge_challenge_backoff = False
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = self.__is_manual_collect_source(normalized_source)
         is_manual_login = normalized_source == "manual_login"
+
+        if msg == "cloudflare_challenge" and self.__should_defer_background_auth_error(
+            msg, normalized_source
+        ):
+            # Cloudflare's edge challenge is environmental and retryable (the
+            # Claude provider contract).  Keep the session and the cached
+            # snapshot (shown as stale) and re-probe on a backoff with a fresh
+            # context, instead of pinning OUT until a manual login.
+            self.__last_error_type = UsageErrorType.TRANSIENT
+            self.__edge_challenge_backoff = True
+            self.__browser_session.close_session()
+            self.__log(
+                "collect edge challenge deferred "
+                f"source={normalized_source} retry=backoff "
+                "using_last_snapshot=true"
+            )
+            return
 
         if self.__should_defer_background_auth_error(msg, normalized_source):
             self.__set_session_state("logged_in")
@@ -4983,7 +5014,24 @@ class CodexUsageMonitor:
             self.__snapshot_backfill_allowed = bool(raw_backfill) and state == "logged_in"
         else:
             self.__snapshot_backfill_allowed = state == "logged_in"
-        if bool(data.get("auth_attention_required", False)):
+        attention_reason = normalize_usage_value(
+            data.get("auth_attention_reason", "")
+        ).lower()
+        attention_source = normalize_usage_value(
+            data.get("auth_attention_source", "")
+        ).lower()
+        if (
+            bool(data.get("auth_attention_required", False))
+            and attention_reason == "cloudflare_challenge"
+            and self.__is_deferred_background_auth_source(attention_source)
+            and state == "logged_in"
+            and snap.has_any_metric()
+        ):
+            # Written by an older build that pinned a background edge
+            # challenge to OUT; it is retried on the backoff now.
+            self.__clear_auth_attention()
+            dirty = True
+        elif bool(data.get("auth_attention_required", False)):
             self.__set_auth_attention(
                 str(data.get("auth_attention_reason", "") or "unknown"),
                 source=str(data.get("auth_attention_source", "") or ""),

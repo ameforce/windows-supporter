@@ -83,9 +83,11 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
             captured_at="2026-03-30T11:05:00",
         )
 
+        # A background Cloudflare edge challenge is covered separately: it is
+        # retried on a backoff and never pins the profile to OUT.
         for source, error in (
             ("auto_monitor", "login_required"),
-            ("monitor_tick", "cloudflare_challenge"),
+            ("monitor_tick", "login_required"),
         ):
             with self.subTest(source=source, error=error):
                 root = _DummyRoot()
@@ -134,6 +136,99 @@ class CodexUsageMonitorFlowE2ETest(unittest.TestCase):
                 self.assertTrue(bool(reloaded_status.get("auth_attention_required")))
                 self.assertEqual(reloaded_status.get("auth_attention_reason"), error)
                 self.assertEqual(reloaded_status.get("monitor_state"), "paused_auth_required")
+
+    def test_background_cloudflare_challenge_with_cache_retries_without_pinning_out(self) -> None:
+        snapshot = UsageSnapshot.from_metrics(
+            {
+                "five_hour_limit": "17 / 40",
+                "weekly_limit": "109 / 300",
+                "remaining_credit": "245",
+            },
+            captured_at="2026-03-30T11:05:00",
+        )
+
+        for source in ("auto_monitor", "monitor_tick"):
+            with self.subTest(source=source):
+                self.monitor.handle_snapshot(snapshot)
+                self.monitor._CodexUsageMonitor__interval_sec = 10.0
+                self.monitor._CodexUsageMonitor__failure_count = 1
+
+                with patch.object(
+                    self.monitor,
+                    "_CodexUsageMonitor__show_tooltip",
+                ) as show_tip:
+                    self.monitor._CodexUsageMonitor__handle_collect_error(
+                        "cloudflare_challenge",
+                        source=source,
+                    )
+
+                status = self.monitor.get_runtime_status()
+                self.assertFalse(show_tip.called)
+                self.assertEqual(status.get("session_state"), "logged_in")
+                self.assertFalse(bool(status.get("auth_attention_required")))
+                self.assertNotEqual(status.get("monitor_state"), "paused_auth_required")
+                self.assertTrue(bool(status.get("auto_monitoring_active")))
+                self.assertEqual(status.get("provider_status"), "stale")
+                self.assertEqual(status.get("last_error_type"), "transient")
+                self.assertEqual(status.get("retry_after_sec"), 30.0)
+                self.assertEqual(
+                    self.monitor.get_last_snapshot().weekly_limit,
+                    snapshot.weekly_limit,
+                )
+                reloaded = CodexUsageMonitor(
+                    config_dir=str(self._config_dir),
+                    profile_dir=str(self._profile_dir),
+                )
+                self.assertFalse(
+                    bool(reloaded.get_runtime_status().get("auth_attention_required"))
+                )
+
+        # The next successful collect ends the backoff lane.
+        self.monitor.handle_snapshot(snapshot)
+        self.assertIsNone(self.monitor.get_runtime_status().get("retry_after_sec"))
+
+    def test_persisted_background_cloudflare_pin_is_released_on_load(self) -> None:
+        snapshot = UsageSnapshot.from_metrics(
+            {"weekly_limit": "109 / 300"},
+            captured_at="2026-03-30T11:05:00",
+        )
+        self.monitor.handle_snapshot(snapshot)
+        for source, expected_pinned in (
+            ("auto_monitor", False),
+            ("monitor_tick", False),
+            ("manual_query", True),
+        ):
+            with self.subTest(source=source):
+                # State shape written by the previous build's deferral path.
+                self.monitor._CodexUsageMonitor__set_auth_attention(
+                    "cloudflare_challenge",
+                    source=source,
+                )
+                self.monitor._CodexUsageMonitor__save_state()
+
+                reloaded = CodexUsageMonitor(
+                    config_dir=str(self._config_dir),
+                    profile_dir=str(self._profile_dir),
+                )
+                status = reloaded.get_runtime_status()
+
+                self.assertEqual(
+                    bool(status.get("auth_attention_required")),
+                    expected_pinned,
+                )
+                self.assertEqual(
+                    status.get("monitor_state") == "paused_auth_required",
+                    expected_pinned,
+                )
+                payload = json.loads(
+                    Path(reloaded._CodexUsageMonitor__state_path).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    bool(payload.get("auth_attention_required")),
+                    expected_pinned,
+                )
 
     def test_background_auth_retry_success_replaces_stale_snapshot_without_backfill(self) -> None:
         previous = UsageSnapshot.from_metrics(
