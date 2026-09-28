@@ -32,6 +32,8 @@ Flex 근무정보 동기화는 저장된 앱 전용 브라우저 세션을 읽�
 - worker가 sync payload의 기존 interactive 값과 무관하게 headless client를 생성한다.
 - sync 실패 시에도 headless context를 닫고, headed context는 `open` 명령에서만 유지한다.
 - 로그인되지 않은 headless session은 창을 자동으로 띄우지 않고 `Flex 웹 열기`를 안내한다.
+  - v0.35.0부터 이 문장은 대체됐다. 로그인이 만료되면 앱이 앱 전용 Flex 로그인 창을 연다.
+    동기화 자체는 계속 headless다(`docs/release-v0.35.0-flex-login-window.md`).
 - Flex parser와 browser-flow의 기존 readiness 계약은 유지한다.
 
 전체 unittest discovery, 실제 사용자 Flex 계정 로그인, 운영 계정 기반 browser E2E는 이 hotfix의 직접 영향 범위를 벗어나므로 별도 실행하지 않는다. 변경된 worker/client 계약과 Flex browser flow만 targeted validation 대상으로 삼는다.
