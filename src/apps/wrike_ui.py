@@ -90,6 +90,7 @@ class WrikeSettingsView:
         self._autosave_after_id = None
         self._flex_status_poll_after_id = None
         self._flex_status_poll_started_at = 0.0
+        self._flex_login_wait_seen = False
         self._flex_sync_feedback_active = False
         self._flex_prompted_employee_numbers: set[str] = set()
         self._loading_settings = False
@@ -412,7 +413,7 @@ class WrikeSettingsView:
         flex_help_label = tk.Label(
             content,
             text=(
-                "관리자용 Flex API 인증정보를 요구하지 않습니다. 최초 로그인 또는 로그인 만료 시 'Flex 웹 열기'로 앱 전용 브라우저에서 본인 계정으로 로그인하세요. "
+                "관리자용 Flex API 인증정보를 요구하지 않습니다. 로그인이 필요하면 앱 전용 Flex 로그인 창을 자동으로 엽니다. 본인 계정으로 로그인하면 창이 닫히고 바로 동기화합니다(창이 남아 있으면 닫아 주세요). "
                 "동기화는 저장된 로그인 세션으로 창을 띄우지 않고 백그라운드에서 수행합니다. 사번은 로그인 후 자동 감지하며, 확인한 뒤 저장합니다. "
                 "감지되지 않으면 직접 입력할 수 있습니다. "
                 "비밀번호·토큰·클라이언트 시크릿은 저장하지 않으며, 초과근무 종료 후에는 Flex 근무 기록 페이지를 엽니다."
@@ -1812,10 +1813,40 @@ class WrikeSettingsView:
         return {
             "state": state,
             "error": error,
+            "error_code": str(flex_status.get("error_code") or "").strip().lower(),
+            "login_window_open": bool(flex_status.get("login_window_open")),
             "schedule_days": schedule_days,
             "employee_number": employee_number,
             "detected_employee_number": detected_employee_number,
         }
+
+    @staticmethod
+    def _flex_waiting_for_login(snapshot: dict[str, Any]) -> bool:
+        """Whether the app's Flex login window is open for this expiry."""
+
+        state = str(snapshot.get("state") or "").strip().lower()
+        code = str(snapshot.get("error_code") or "").strip().lower()
+        if not bool(snapshot.get("login_window_open")):
+            return False
+        return (state == "error" and code in {"login_required", "login_timeout"}) or (
+            state == "deferred" and code in {"login_pending", "login_window_open"}
+        )
+
+    @staticmethod
+    def _flex_login_wait_text(snapshot: dict[str, Any]) -> str:
+        state = str(snapshot.get("state") or "").strip().lower()
+        code = str(snapshot.get("error_code") or "").strip().lower()
+        if state == "deferred" and code == "login_window_open":
+            # The employee's own Flex window: its close starts the sync.
+            return "Flex 로그인 필요 · 열려 있는 Flex 창에서 로그인한 뒤 창을 닫으면 바로 동기화합니다."
+        if state == "error":
+            error = str(snapshot.get("error") or "").strip()
+            if error:
+                return f"Flex 로그인 필요 · {error.removeprefix('Flex 로그인이 필요합니다.').strip()}".rstrip(" ·")
+        return (
+            "Flex 로그인 필요 · 열린 Flex 로그인 창에서 로그인하면 바로 동기화합니다. "
+            "로그인 뒤에도 창이 남아 있으면 닫아 주세요."
+        )
 
     def _update_flex_sync_feedback(self, snapshot: dict[str, Any]) -> None:
         if not self._flex_sync_feedback_active:
@@ -1837,6 +1868,11 @@ class WrikeSettingsView:
                 level="ok",
             )
             self._flex_sync_feedback_active = False
+            return
+        if self._flex_waiting_for_login(snapshot):
+            # Not a failure yet: the login window is open (or on its way) and
+            # the backend syncs as soon as the employee logs in or closes it.
+            self._set_status(self._flex_login_wait_text(snapshot), level="info")
             return
         if state == "error":
             error = str(snapshot.get("error") or "Flex 동기화에 실패했습니다.").strip()
@@ -2117,6 +2153,7 @@ class WrikeSettingsView:
                 pass
         self._flex_status_poll_after_id = None
         self._flex_status_poll_started_at = time.monotonic()
+        self._flex_login_wait_seen = False
         self._poll_flex_status()
         return
 
@@ -2124,9 +2161,15 @@ class WrikeSettingsView:
         self._flex_status_poll_after_id = None
         snapshot = self._refresh_flex_status_from_backend()
         self._update_flex_sync_feedback(snapshot)
-        if str(snapshot.get("state") or "") != "loading":
+        loading = str(snapshot.get("state") or "") == "loading"
+        waiting_for_login = (
+            self._flex_sync_feedback_active
+            and self._flex_waiting_for_login(snapshot)
+        )
+        if not loading and not waiting_for_login:
             return
-        if time.monotonic() - self._flex_status_poll_started_at >= 300.0:
+        elapsed = time.monotonic() - self._flex_status_poll_started_at
+        if loading and elapsed >= 300.0 and not self._flex_login_wait_seen:
             if self._flex_sync_feedback_active:
                 self._set_status(
                     "Flex 동기화 응답을 기다리지 못했습니다. 다시 시도해 주세요.",
@@ -2134,10 +2177,25 @@ class WrikeSettingsView:
                 )
                 self._flex_sync_feedback_active = False
             return
+        if waiting_for_login:
+            self._flex_login_wait_seen = True
+        if elapsed >= 900.0:
+            # The login window may stay open for a long time; the backend
+            # still syncs after the login, this view just stops watching.
+            if self._flex_sync_feedback_active:
+                self._set_status(
+                    "Flex 로그인을 기다리는 확인을 멈췄습니다. 로그인한 뒤 창이 남아 있으면 닫아 주세요. 백그라운드에서 반영됩니다.",
+                    level="info",
+                )
+                self._flex_sync_feedback_active = False
+            return
         after = getattr(self._win, "after", None)
         if callable(after):
             try:
-                self._flex_status_poll_after_id = after(700, self._poll_flex_status)
+                self._flex_status_poll_after_id = after(
+                    1500 if waiting_for_login else 700,
+                    self._poll_flex_status,
+                )
             except Exception:
                 self._flex_status_poll_after_id = None
         return

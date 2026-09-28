@@ -540,7 +540,9 @@ class FlexBrowserClientTests(unittest.TestCase):
             client._wait_for_login(_LoginPage())
 
         self.assertEqual(ctx.exception.code, "login_required")
-        self.assertIn("Flex 웹 열기", str(ctx.exception))
+        # The app adds the recovery path (its login window or the settings
+        # guidance); the client only states the fact.
+        self.assertEqual(str(ctx.exception), "Flex 로그인이 필요합니다.")
 
     def test_schedule_client_defaults_to_headless(self) -> None:
         client = FlexBrowserClient("C:/temp/flex-profile-test")
@@ -552,3 +554,195 @@ class FlexBrowserClientTests(unittest.TestCase):
 
         self.assertEqual(result.schedules, {})
         self.assertEqual(result.employee_number, "E-42")
+
+
+class FlexLoginWindowClientTests(unittest.TestCase):
+    """The app's login window: completion check and focus behaviour."""
+
+    class _Page:
+        def __init__(self, url, *, text="", password_fields=0, closed=False):
+            self.url = url
+            self._text = text
+            self._password_fields = password_fields
+            self._closed = closed
+            self.brought_to_front = 0
+            self.gotos = []
+
+        def is_closed(self):
+            return self._closed
+
+        def title(self):
+            return "Flex"
+
+        def locator(self, selector):
+            page = self
+
+            class _Locator:
+                def inner_text(self, **_kwargs):
+                    return page._text
+
+                def count(self):
+                    return page._password_fields if "password" in selector else 0
+
+            return _Locator()
+
+        def bring_to_front(self):
+            self.brought_to_front += 1
+
+        def goto(self, url, **_kwargs):
+            self.gotos.append(url)
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+        def set_default_timeout(self, *_args):
+            return None
+
+    class _Context:
+        def __init__(self, pages):
+            self.pages = list(pages)
+
+    def _client(self, *pages, work_url=None):
+        kwargs = {"headless": False}
+        if work_url is not None:
+            kwargs["work_url"] = work_url
+        client = FlexBrowserClient("C:/temp/flex-profile-test", **kwargs)
+        client._context = self._Context(pages)
+        return client
+
+    def test_logged_in_work_record_page_completes_the_login(self) -> None:
+        page = self._Page(
+            "https://flex.team/time-tracking/my-work-record",
+            text="내 근무 기록 09:00 - 18:00",
+        )
+        self.assertTrue(self._client(page).login_completed())
+
+    def test_login_and_sso_pages_do_not_complete_the_login(self) -> None:
+        cases = {
+            "flex login route": self._Page(
+                "https://flex.team/auth/login?nextUrl=%2Ftime-tracking%2Fmy-work-record"
+            ),
+            "flex auth callback": self._Page("https://flex.team/auth/callback?code=x"),
+            "google sso": self._Page(
+                "https://accounts.google.com/v3/signin/identifier?continue=flex"
+            ),
+            "microsoft sso": self._Page("https://login.microsoftonline.com/common/oauth2"),
+            "flex landing page": self._Page(
+                "https://flex.team/", text="flex 로그인 이메일"
+            ),
+            "work record still asking for a password": self._Page(
+                "https://flex.team/time-tracking/my-work-record", password_fields=1
+            ),
+            "post-login interstitial": self._Page(
+                "https://flex.team/select-company?next=%2Ftime-tracking"
+            ),
+            "another flex page": self._Page("https://flex.team/home"),
+            "flex subdomain": self._Page(
+                "https://help.flex.team/time-tracking/my-work-record"
+            ),
+            "other host": self._Page("https://example.com/time-tracking"),
+            "closed page": self._Page(
+                "https://flex.team/time-tracking/my-work-record", closed=True
+            ),
+        }
+        for name, page in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(self._client(page).login_completed())
+
+    def test_page_mid_navigation_is_not_logged_in_yet(self) -> None:
+        page = self._Page("https://flex.team/time-tracking/my-work-record")
+
+        def navigating():
+            raise RuntimeError("Execution context was destroyed")
+
+        page.title = navigating
+        self.assertFalse(self._client(page).login_completed())
+
+    def test_any_logged_in_page_of_the_context_counts(self) -> None:
+        sso_popup = self._Page("https://accounts.google.com/signin/oauth")
+        work_page = self._Page("https://flex.team/time-tracking/my-work-record")
+        self.assertTrue(self._client(sso_popup, work_page).login_completed())
+
+    def test_trailing_slash_and_query_on_the_work_record_still_count(self) -> None:
+        page = self._Page("https://flex.team/time-tracking/my-work-record/?tab=week")
+        self.assertTrue(self._client(page).login_completed())
+
+    def test_logged_in_text_on_the_work_record_does_not_block_completion(self) -> None:
+        # A rendered, logged-in page can mention "로그인" (e.g. login history).
+        page = self._Page(
+            "https://flex.team/time-tracking/my-work-record",
+            text="flex 내 근무 기록 · 최근 로그인 기록",
+        )
+        self.assertTrue(self._client(page).login_completed())
+
+    def test_completion_host_follows_the_configured_work_url(self) -> None:
+        page = self._Page("http://127.0.0.1:8123/time-tracking/my-work-record")
+        self.assertTrue(
+            self._client(
+                page,
+                work_url="http://127.0.0.1:8123/time-tracking/my-work-record",
+            ).login_completed()
+        )
+        self.assertFalse(self._client(page).login_completed())
+
+    def test_no_context_is_not_logged_in(self) -> None:
+        self.assertFalse(
+            FlexBrowserClient("C:/temp/flex-profile-test").login_completed()
+        )
+
+    def test_login_step_on_screen_is_in_progress(self) -> None:
+        cases = {
+            "google sso": (self._Page("https://accounts.google.com/signin"), True),
+            "flex login route": (self._Page("https://flex.team/auth/login"), True),
+            "password form": (
+                self._Page("https://flex.team/workspace", password_fields=1),
+                True,
+            ),
+            "blank page before navigation": (self._Page("about:blank"), True),
+            "logged in elsewhere on flex": (self._Page("https://flex.team/home"), False),
+            "logged-in work record": (
+                self._Page("https://flex.team/time-tracking/my-work-record"),
+                False,
+            ),
+        }
+        for name, (page, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(self._client(page).login_in_progress(), expected)
+
+    def test_navigating_page_counts_as_a_login_in_progress(self) -> None:
+        page = self._Page("https://flex.team/home")
+
+        def navigating():
+            raise RuntimeError("Execution context was destroyed")
+
+        page.title = navigating
+        self.assertTrue(self._client(page).login_in_progress())
+        self.assertFalse(
+            FlexBrowserClient("C:/temp/flex-profile-test").login_in_progress()
+        )
+
+    def test_background_login_window_does_not_take_the_foreground(self) -> None:
+        page = self._Page("https://flex.team/auth/login")
+        client = self._client(page)
+
+        client.open_login_page(activate=False)
+
+        self.assertEqual(page.gotos, ["https://flex.team/time-tracking/my-work-record"])
+        self.assertEqual(page.brought_to_front, 0)
+
+    def test_explicit_login_window_is_brought_to_the_front_once(self) -> None:
+        page = self._Page("https://flex.team/auth/login")
+        client = self._client(page)
+
+        client.open_login_page(activate=True)
+
+        self.assertEqual(page.brought_to_front, 1)
+
+    def test_focus_window_brings_the_first_open_page_forward(self) -> None:
+        closed = self._Page("https://flex.team/auth/login", closed=True)
+        page = self._Page("https://flex.team/auth/login")
+        client = self._client(closed, page)
+
+        client.focus_window()
+
+        self.assertEqual((closed.brought_to_front, page.brought_to_front), (0, 1))
