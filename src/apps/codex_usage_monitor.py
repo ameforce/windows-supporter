@@ -2563,11 +2563,14 @@ class CodexUsageMonitor:
         return
 
     def __should_run_background_collection(self) -> bool:
+        # A refused profile lock (``profile_in_use``) is not a reason to stop
+        # background collection: the lock is transient on Windows, so the
+        # profile keeps being re-probed on a backoff instead of waiting for a
+        # restart (see ``__profile_lock_retry_after_sec``).
         return bool(
             self.__enabled
             and self.__is_logged_in_session()
             and not bool(self.__auth_attention_required)
-            and not bool(self.__profile_in_use_detected)
             and not bool(self.__logout_in_progress)
             and not self.__is_collect_cancel_requested()
         )
@@ -2582,9 +2585,14 @@ class CodexUsageMonitor:
         if bool(self.__auth_attention_required):
             reason = normalize_usage_value(self.__auth_attention_reason).lower()
             return reason or "auth_attention_required"
-        if bool(self.__profile_in_use_detected):
-            return "profile_in_use"
         return ""
+
+    def __profile_lock_retry_after_sec(self) -> float:
+        """Backoff before re-probing a profile whose lock was refused."""
+
+        base = max(30.0, float(self.__interval_sec))
+        exponent = max(0, min(int(self.__failure_count) - 1, 5))
+        return float(min(base * (2**exponent), 15 * 60))
 
     def __request_collect_cancel(self) -> None:
         try:
@@ -2778,6 +2786,8 @@ class CodexUsageMonitor:
             "retry_after_sec": (
                 float(min(self.__interval_sec * (2 ** max(0, min(self.__failure_count - 1, 4))), 15 * 60))
                 if provider_status == "retrying"
+                else self.__profile_lock_retry_after_sec()
+                if monitor_state == "paused_profile_in_use"
                 else None
             ),
             "provider_status": provider_status,
@@ -2873,6 +2883,15 @@ class CodexUsageMonitor:
                         source=source_key,
                         on_acquired=on_acquired,
                     )
+                    if source_key == "auto_monitor" and error not in {
+                        "collect_busy",
+                        "collect_cancelled",
+                        "profile_in_use",
+                    }:
+                        # A scheduled re-probe of a lock-paused profile reached
+                        # the browser without a refused profile lock, so the
+                        # pause no longer describes the profile.
+                        self.__profile_in_use_detected = False
                     if error == "collect_busy":
                         if bool(self.__profile_in_use_detected):
                             latest = self.get_last_snapshot()

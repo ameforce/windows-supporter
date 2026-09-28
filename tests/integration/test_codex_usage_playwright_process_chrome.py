@@ -82,6 +82,50 @@ def _handler_factory(state: _ServerState):
     return Handler
 
 
+def _hold_exclusive_file(path: Path) -> int:
+    """Open ``path`` with no sharing so another process cannot take it."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    generic_write = 0x40000000
+    open_always = 4
+    file_attribute_normal = 0x80
+    handle = kernel32.CreateFileW(
+        str(path),
+        generic_write,
+        0,
+        None,
+        open_always,
+        file_attribute_normal,
+        None,
+    )
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise OSError(ctypes.get_last_error(), "exclusive open failed", str(path))
+    return int(handle)
+
+
+def _close_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
 PROBE_SCRIPT = """
 async () => {
   const response = await fetch('/probe');
@@ -231,6 +275,70 @@ class CodexUsagePlaywrightProcessChromeIntegrationTest(unittest.TestCase):
             )
             self.assertTrue(
                 any("reason=success_count" in line for line in logs),
+                logs,
+            )
+        finally:
+            state.release_first_probe.set()
+            server.shutdown()
+            server.server_close()
+
+    def test_refused_profile_lock_is_relaunched_after_the_lock_is_released(self) -> None:
+        state = _ServerState()
+        state.hang_probe_number = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(state))
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        usage_url = f"http://127.0.0.1:{server.server_port}/usage"
+        logs: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as profile_dir:
+                self._seed_profile(profile_dir, usage_url)
+                # Stand-in for the lockfile a just-terminated owner left held
+                # or delete-pending: Chrome's ProcessSingleton refuses it.
+                lock_handle = _hold_exclusive_file(Path(profile_dir) / "lockfile")
+                released = threading.Event()
+
+                def log_and_release(line: str) -> None:
+                    logs.append(line)
+                    if (
+                        "browser profile lock retry attempt=1" in line
+                        and not released.is_set()
+                    ):
+                        _close_handle(lock_handle)
+                        released.set()
+
+                config = PlaywrightSessionConfig(
+                    profile_dir=profile_dir,
+                    usage_url=usage_url,
+                    probe_script=PROBE_SCRIPT,
+                    # Production launch budget: Chrome needs ~6 s to give up
+                    # on a refused ProcessSingleton lock.
+                    navigation_timeout_ms=30_000,
+                    command_timeout_sec=60.0,
+                    collect_timeout_sec=60.0,
+                    timeout_retry_delays_sec=(),
+                    timeout_recovery_grace_sec=2.0,
+                    worker_cleanup_timeout_sec=1.0,
+                    worker_bootstrap_timeout_sec=10.0,
+                )
+                session = CodexUsagePlaywrightSession(config, log_and_release)
+                try:
+                    result = session.collect()
+                finally:
+                    if not released.is_set():
+                        _close_handle(lock_handle)
+                        released.set()
+                    session.shutdown()
+            self.assertIsNotNone(result.probe, logs)
+            self.assertTrue(
+                any("error=profile_in_use" in line for line in logs),
+                logs,
+            )
+            self.assertTrue(
+                any(
+                    "browser profile lock retry end attempts=1 error=none" in line
+                    for line in logs
+                ),
                 logs,
             )
         finally:

@@ -27,6 +27,14 @@ from src.apps.codex_usage_process_boundary import (
 WorkerTarget = Callable[[Connection], None]
 RssSampler = Callable[[int], int | OwnedProcessMemorySample]
 
+# Chrome's Windows ProcessSingleton refuses a profile while the previous
+# owner's ``lockfile`` is still held or delete-pending.  Right after the app's
+# own planned worker recycle the lock outlived a Job whose processes had all
+# exited, and the next launch failed once with ``profile_in_use``.  A live
+# foreign Chrome takes Chrome's rendezvous path instead of this lock error, so
+# a short bounded relaunch is safe; it never inspects or stops any Chrome.
+PROFILE_LOCK_RETRY_DELAYS_SEC: tuple[float, ...] = (2.0, 4.0)
+
 
 def _run_boundary_smoke_worker(connection: Connection) -> None:
     try:
@@ -131,6 +139,8 @@ class CodexUsagePlaywrightProcessDriver:
         process_context: Any | None = None,
         clock: Callable[[], float] | None = None,
         rss_sampler: RssSampler | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        profile_lock_retry_delays_sec: tuple[float, ...] | None = None,
     ) -> None:
         self._config = config
         self._log_sink = log_sink
@@ -138,6 +148,15 @@ class CodexUsagePlaywrightProcessDriver:
         self._context = process_context or multiprocessing.get_context("spawn")
         self._clock = clock or time.monotonic
         self._rss_sampler = rss_sampler or owned_process_memory_sample
+        self._sleep = sleeper or time.sleep
+        self._profile_lock_retry_delays_sec = tuple(
+            max(0.0, float(delay))
+            for delay in (
+                PROFILE_LOCK_RETRY_DELAYS_SEC
+                if profile_lock_retry_delays_sec is None
+                else profile_lock_retry_delays_sec
+            )
+        )
         self._invoke_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._termination_lock = threading.RLock()
@@ -174,11 +193,42 @@ class CodexUsagePlaywrightProcessDriver:
         with self._invoke_lock:
             self._recycle_worker_if_needed()
             result = self._invoke_locked("collect")
+            result = self._retry_profile_lock_locked("collect", result)
             if result.error is None and result.probe is not None:
                 self._successful_collects += 1
             if result.error == BrowserErrorCode.RENDERER_CRASHED.value:
                 self.force_terminate(BrowserErrorCode.RENDERER_CRASHED.value)
             return result
+
+    def _retry_profile_lock_locked(
+        self,
+        command: str,
+        result: BrowserOperationResult,
+    ) -> BrowserOperationResult:
+        """Relaunch a few seconds later when only the profile lock lost the race."""
+
+        attempts = 0
+        for delay in self._profile_lock_retry_delays_sec:
+            if result.error != BrowserErrorCode.PROFILE_IN_USE.value or self._shutdown:
+                break
+            attempts += 1
+            self._log(
+                "browser profile lock retry "
+                f"attempt={attempts} delay_sec={delay:g} "
+                f"generation={self._process_generation}"
+            )
+            self._sleep(delay)
+            if self._shutdown:
+                break
+            # The worker stays alive after a refused launch and launches the
+            # persistent context again on the next command.
+            result = self._invoke_locked(command)
+        if attempts:
+            self._log(
+                "browser profile lock retry end "
+                f"attempts={attempts} error={result.error or 'none'}"
+            )
+        return result
 
     def open_login(self) -> BrowserOperationResult:
         if self._shutdown:

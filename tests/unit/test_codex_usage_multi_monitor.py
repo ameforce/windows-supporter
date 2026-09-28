@@ -4668,6 +4668,50 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             self.assertEqual(len(root.after_calls), 1)
             self.assertEqual(root.after_calls[0]["delay_ms"], 30000)
 
+    def test_background_monitor_reprobes_profile_lock_pause_on_child_backoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime.update(
+                {
+                    "session_state": "logged_in",
+                    "monitor_state": "paused_profile_in_use",
+                    "provider_status": "paused",
+                    "profile_in_use": True,
+                    "retry_after_sec": 60.0,
+                }
+            )
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=100.0):
+                manager.attach(root, event_queue=None)
+
+            # The WAIT profile keeps a due time instead of leaving the scheduler.
+            self.assertEqual(len(root.after_calls), 1)
+
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=101.5):
+                root.after_calls[0]["callback"]()
+
+            self.assertEqual(
+                children[0].show_calls,
+                [{"force_refresh": True, "source": "auto_monitor"}],
+            )
+            # Still refused: the next probe is spaced by the child's backoff.
+            self.assertEqual(root.after_calls[-1]["delay_ms"], 60000)
+
+            children[0].runtime.update(
+                {
+                    "monitor_state": "idle",
+                    "provider_status": "ready",
+                    "profile_in_use": False,
+                    "retry_after_sec": None,
+                }
+            )
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=161.5):
+                root.after_calls[-1]["callback"]()
+
+            self.assertEqual(len(children[0].show_calls), 2)
+
     def test_background_monitor_does_not_retry_logged_out_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
