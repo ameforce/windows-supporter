@@ -8265,11 +8265,13 @@ class Wrike:
             # been collected.
             if expected_total is not None and len(seen_entry_ids) >= expected_total:
                 break
+            # An empty page and a page without a token are both Wrike's end
+            # of the result.  They are trusted even when fewer unique entries
+            # arrived than the first page announced (entries deleted between
+            # page requests, duplicates across pages): failing closed on that
+            # mismatch could pin the week to an error again.  The shortfall is
+            # recorded in the success log line below.
             if not data_items:
-                if expected_total is not None:
-                    # The first page announced more entries than the pages
-                    # delivered; never cache an incomplete week as fresh.
-                    return None, "invalid_response"
                 break
             if "nextPageToken" not in payload:
                 break
@@ -8287,8 +8289,14 @@ class Wrike:
             seen_page_tokens.add(following_token)
             next_token = following_token
 
+        shortfall = (
+            f", announced {expected_total}"
+            if expected_total is not None and len(items) < expected_total
+            else ""
+        )
         self.__log(
             f"authoritative contact timelogs: {len(items)} entries, {page} pages"
+            f"{shortfall}"
         )
         return items, None
 

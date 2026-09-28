@@ -1322,29 +1322,79 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in items], ["a", "b", "c"])
         self.assertEqual(get_json.call_count, 2)
 
-    def test_authoritative_empty_page_before_announced_total_fails_closed(self) -> None:
-        wrike = self._new_wrike()
-        wrike._Wrike__api_get_json = Mock(
-            side_effect=[
-                {
-                    "data": [
-                        {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
-                    ],
-                    "responseSize": 3,
-                    "nextPageToken": "page-2",
-                },
-                {"data": [], "nextPageToken": "page-3"},
-            ]
-        )
+    def test_authoritative_end_of_result_is_trusted_below_announced_total(self) -> None:
+        # Entries deleted between page requests (or duplicated across pages)
+        # can leave fewer unique entries than page 1 announced.  Wrike's end
+        # of result wins so the week is never pinned to an error again.
+        endings = {
+            "empty-page-with-token": {"data": [], "nextPageToken": "page-3"},
+            "tokenless-page": {
+                "data": [{"id": "a", "trackedDate": "2026-04-06", "hours": 1}],
+            },
+        }
+        for name, second_page in endings.items():
+            with self.subTest(name=name):
+                wrike = self._new_wrike()
+                get_json = Mock(
+                    side_effect=[
+                        {
+                            "data": [
+                                {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
+                            ],
+                            "responseSize": 3,
+                            "nextPageToken": "page-2",
+                        },
+                        second_page,
+                        AssertionError("pagination must end here"),
+                    ]
+                )
+                wrike._Wrike__api_get_json = get_json
 
-        items, error = wrike._Wrike__query_authoritative_timelogs_week(
-            "token",
-            "contact",
-            self._week_datetimes(),
-        )
+                items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                    "token",
+                    "contact",
+                    self._week_datetimes(),
+                )
 
-        self.assertIsNone(items)
-        self.assertEqual(error, "invalid_response")
+                self.assertIsNone(error)
+                self.assertEqual([item["id"] for item in items], ["a"])
+                self.assertEqual(get_json.call_count, 2)
+        log_text = (
+            self.appdata / "windows-supporter" / "wrike.log"
+        ).read_text(encoding="utf-8")
+        self.assertIn("authoritative contact timelogs: 1 entries, 2 pages, announced 3", log_text)
+
+    def test_authoritative_malformed_response_size_keeps_following_tokens(self) -> None:
+        for raw_total in (True, "1", -1, 1.0, None):
+            with self.subTest(raw_total=raw_total):
+                wrike = self._new_wrike()
+                get_json = Mock(
+                    side_effect=[
+                        {
+                            "data": [
+                                {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
+                            ],
+                            "responseSize": raw_total,
+                            "nextPageToken": "page-2",
+                        },
+                        {
+                            "data": [
+                                {"id": "b", "trackedDate": "2026-04-07", "hours": 1},
+                            ],
+                        },
+                    ]
+                )
+                wrike._Wrike__api_get_json = get_json
+
+                items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                    "token",
+                    "contact",
+                    self._week_datetimes(),
+                )
+
+                self.assertIsNone(error)
+                self.assertEqual([item["id"] for item in items], ["a", "b"])
+                self.assertEqual(get_json.call_count, 2)
 
     def test_empty_week_refresh_is_fresh_zero_instead_of_request_failed(self) -> None:
         wrike = self._new_wrike()
