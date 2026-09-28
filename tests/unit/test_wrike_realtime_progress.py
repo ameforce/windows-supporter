@@ -1214,11 +1214,12 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             ["page-2"],
             {"token": "page-2"},
         )
+        first_entry = {"id": "a", "trackedDate": "2026-04-06", "hours": 1}
         for raw_token in malformed_tokens:
             with self.subTest(raw_token=raw_token):
                 wrike = self._new_wrike()
                 wrike._Wrike__api_get_json = Mock(
-                    return_value={"data": [], "nextPageToken": raw_token}
+                    return_value={"data": [first_entry], "nextPageToken": raw_token}
                 )
 
                 items, error = wrike._Wrike__query_authoritative_timelogs_week(
@@ -1234,7 +1235,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike = self._new_wrike()
         get_json = Mock(
             side_effect=[
-                {"data": [], "nextPageToken": opaque_token},
+                {"data": [first_entry], "nextPageToken": opaque_token},
                 {"data": []},
             ]
         )
@@ -1246,10 +1247,138 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             self._week_datetimes(),
         )
 
-        self.assertEqual(items, [])
         self.assertIsNone(error)
+        self.assertEqual([item["id"] for item in items], ["a"])
         second_query = parse_qs(urlparse(get_json.call_args_list[1].args[0]).query)
         self.assertEqual(second_query["nextPageToken"], [opaque_token])
+
+    def test_authoritative_empty_week_does_not_follow_wrike_placeholder_token(self) -> None:
+        # Live Wrike v4 shape for a tracked-date range without timelogs: the
+        # placeholder token is rejected with HTTP 400 invalid_parameter.
+        empty_pages = {
+            "with-response-size": {
+                "kind": "timelogs",
+                "data": [],
+                "responseSize": 0,
+                "nextPageToken": "IEAGXYZABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+            },
+            "without-response-size": {
+                "kind": "timelogs",
+                "data": [],
+                "nextPageToken": "IEAGXYZABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+            },
+        }
+        for name, page in empty_pages.items():
+            with self.subTest(name=name):
+                wrike = self._new_wrike()
+                get_json = Mock(
+                    side_effect=[
+                        page,
+                        AssertionError("placeholder token must not be followed"),
+                    ]
+                )
+                wrike._Wrike__api_get_json = get_json
+
+                items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                    "token",
+                    "contact",
+                    self._week_datetimes(),
+                )
+
+                self.assertIsNone(error)
+                self.assertEqual(items, [])
+                self.assertEqual(get_json.call_count, 1)
+
+    def test_authoritative_pagination_stops_at_announced_response_size(self) -> None:
+        wrike = self._new_wrike()
+        get_json = Mock(
+            side_effect=[
+                {
+                    "data": [
+                        {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
+                        {"id": "b", "trackedDate": "2026-04-07", "hours": 1},
+                    ],
+                    "responseSize": 3,
+                    "nextPageToken": "page-2",
+                },
+                {
+                    "data": [
+                        {"id": "c", "trackedDate": "2026-04-08", "minutes": 30},
+                    ],
+                    "nextPageToken": "trailing-placeholder",
+                },
+                AssertionError("trailing token after the full total must not be followed"),
+            ]
+        )
+        wrike._Wrike__api_get_json = get_json
+
+        items, error = wrike._Wrike__query_authoritative_timelogs_week(
+            "token",
+            "contact",
+            self._week_datetimes(),
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual([item["id"] for item in items], ["a", "b", "c"])
+        self.assertEqual(get_json.call_count, 2)
+
+    def test_authoritative_empty_page_before_announced_total_fails_closed(self) -> None:
+        wrike = self._new_wrike()
+        wrike._Wrike__api_get_json = Mock(
+            side_effect=[
+                {
+                    "data": [
+                        {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
+                    ],
+                    "responseSize": 3,
+                    "nextPageToken": "page-2",
+                },
+                {"data": [], "nextPageToken": "page-3"},
+            ]
+        )
+
+        items, error = wrike._Wrike__query_authoritative_timelogs_week(
+            "token",
+            "contact",
+            self._week_datetimes(),
+        )
+
+        self.assertIsNone(items)
+        self.assertEqual(error, "invalid_response")
+
+    def test_empty_week_refresh_is_fresh_zero_instead_of_request_failed(self) -> None:
+        wrike = self._new_wrike()
+        wrike._Wrike__root = _FakeRoot()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__wrike_api_token_session = "token"
+        wrike._Wrike__resolve_contact_identity = Mock(
+            return_value=("contact", "Integration User", None)
+        )
+        get_json = Mock(
+            side_effect=[
+                {
+                    "kind": "timelogs",
+                    "data": [],
+                    "responseSize": 0,
+                    "nextPageToken": "IEAGXYZABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+                },
+                None,
+            ]
+        )
+        wrike._Wrike__api_get_json = get_json
+
+        with patch("src.apps.Wrike.threading.Thread", _FakeThread):
+            generation = wrike._Wrike__request_timelog_snapshot_refresh(force=True)
+        _FakeThread.created[0].target()
+        wrike._Wrike__drain_ui_queue()
+
+        snapshot = wrike.get_timelog_snapshot()
+        self.assertEqual(snapshot.generation, generation)
+        self.assertEqual(snapshot.state, TimelogSnapshotState.FRESH)
+        self.assertIsNone(snapshot.error_code)
+        self.assertEqual(len(snapshot.days), 7)
+        self.assertEqual(snapshot.recorded_minutes_for(date(2026, 4, 6)), 0)
+        self.assertEqual(get_json.call_count, 1)
 
     def test_authoritative_parser_rejects_noncanonical_identity_date_and_duration(self) -> None:
         invalid_entries = {

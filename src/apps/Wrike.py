@@ -8062,6 +8062,7 @@ class Wrike:
         seen_page_tokens: set[str] = set()
         seen_entry_ids: set[str] = set()
         items: list[dict] = []
+        expected_total: int | None = None
 
         while True:
             page += 1
@@ -8079,6 +8080,12 @@ class Wrike:
             data_items = payload.get("data")
             if not isinstance(data_items, list):
                 return None, "invalid_response"
+            if page == 1:
+                # Only the first page of a paginated (or empty) result carries
+                # the total result count.
+                raw_total = payload.get("responseSize")
+                if type(raw_total) is int and raw_total >= 0:
+                    expected_total = raw_total
             for item in data_items:
                 normalized = self.__normalize_authoritative_timelog_entry(
                     item,
@@ -8093,6 +8100,21 @@ class Wrike:
                 seen_entry_ids.add(entry_id)
                 items.append(normalized)
 
+            # Wrike answers an empty result with ``data: []``,
+            # ``responseSize: 0`` and a ``nextPageToken`` that it rejects with
+            # HTTP 400 ``invalid_parameter`` when followed.  A week without
+            # timelogs (every Monday until the first entry) must therefore end
+            # here as an authoritative zero instead of failing.  The same
+            # rule stops before a trailing token once the announced total has
+            # been collected.
+            if expected_total is not None and len(seen_entry_ids) >= expected_total:
+                break
+            if not data_items:
+                if expected_total is not None:
+                    # The first page announced more entries than the pages
+                    # delivered; never cache an incomplete week as fresh.
+                    return None, "invalid_response"
+                break
             if "nextPageToken" not in payload:
                 break
             following_token = payload["nextPageToken"]
