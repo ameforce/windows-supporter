@@ -13,6 +13,7 @@ import os
 import re
 import time
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 
@@ -24,12 +25,16 @@ FLEX_WEB_URL = "https://flex.team/time-tracking/my-work-record"
 FLEX_BROWSER_PROFILE_DIR_NAME = "flex-profile"
 # Flex's web session expires on the server side (observed: seven days after
 # the employee's login).  These browser error codes mean the employee has to
-# log in again through the explicit headed ``Flex 웹 열기`` window.
+# log in again in the app's headed Flex login window.
 FLEX_LOGIN_ERROR_CODES = frozenset({"login_required", "login_timeout"})
 # A background sync that found the employee's headed Flex window still open.
-# The window is user-owned (login/SSO or overtime registration), so the sync
-# is skipped instead of closing it.
+# The window is user-owned (``Flex 웹 열기`` or overtime registration), so the
+# sync is skipped instead of closing it.
 FLEX_SYNC_DEFERRED_CODE = "login_window_open"
+# A background sync skipped while the app's own login window waits for the
+# employee to log in.  The login is still required, so the panel keeps saying
+# so instead of reporting a generic open window.
+FLEX_SYNC_LOGIN_PENDING_CODE = "login_pending"
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _BREAK_WORDS = ("휴게", "break", "rest")
@@ -1204,11 +1209,11 @@ class FlexBrowserClient:
     """Read-only Flex client backed by a persistent Playwright session.
 
     Schedule reads are headless by default so a sync cannot steal focus or
-    surface a browser window.  The explicit ``Flex 웹 열기`` action creates a
-    headed client when a normal employee must complete the organisation's
-    login/SSO flow.  The app never receives or stores the password, refresh
-    token, client secret, or browser cookies outside the Chromium profile
-    created for this purpose.
+    surface a browser window.  A headed client is created for ``Flex 웹 열기``
+    and for the login window the app opens when the saved session expired, so
+    a normal employee can complete the organisation's login/SSO flow.  The app
+    never receives or stores the password, refresh token, client secret, or
+    browser cookies outside the Chromium profile created for this purpose.
     """
 
     def __init__(
@@ -1446,8 +1451,10 @@ class FlexBrowserClient:
         if not self._requires_login(page):
             return
         if self._headless:
+            # The app decides how to recover (its login window or the
+            # settings guidance), so the message only states the fact.
             raise FlexBrowserError(
-                "Flex 로그인이 필요합니다. 설정에서 'Flex 웹 열기'를 눌러 로그인한 뒤 백그라운드 동기화를 다시 실행해 주세요.",
+                "Flex 로그인이 필요합니다.",
                 code="login_required",
             )
         try:
@@ -1479,7 +1486,13 @@ class FlexBrowserClient:
         except Exception:
             return False
 
-    def _goto_work_page(self, page, *, wait_for_login: bool) -> None:
+    def _goto_work_page(
+        self,
+        page,
+        *,
+        wait_for_login: bool,
+        activate: bool = True,
+    ) -> None:
         try:
             page.goto(
                 self._work_url,
@@ -1493,7 +1506,7 @@ class FlexBrowserClient:
             ) from exc
         if wait_for_login:
             self._wait_for_login(page)
-        elif self._requires_login(page):
+        elif activate and self._requires_login(page):
             try:
                 page.bring_to_front()
             except Exception:
@@ -1510,6 +1523,126 @@ class FlexBrowserClient:
             page.bring_to_front()
         except Exception:
             pass
+
+    def open_login_page(self, *, activate: bool = False) -> None:
+        """Open the work record in the headed login window.
+
+        Flex sends an expired session to its login screen and returns to the
+        work record afterwards.  For a background sync the app does not bring
+        the window to the front (Windows focus rules decide activation); an
+        explicit request brings it forward once.
+        """
+
+        page = self._get_page()
+        self._goto_work_page(page, wait_for_login=False, activate=False)
+        if activate:
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+    def focus_window(self) -> None:
+        """Bring the first open page of this headed browser to the front."""
+
+        context = self._context
+        if context is None:
+            return
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+        except Exception:
+            return
+        for page in pages:
+            if not self._page_is_open(page):
+                continue
+            try:
+                page.bring_to_front()
+            except Exception:
+                continue
+            return
+
+    def login_in_progress(self) -> bool:
+        """Return whether a page still shows a login step.
+
+        True for a page on another host (SSO), on a login/auth route, or with
+        a password field, and for a page that is navigating.  False means the
+        employee finished the login somewhere other than the work record.
+        """
+
+        context = self._context
+        if context is None:
+            return False
+        work_host = str(urlsplit(self._work_url).hostname or "").casefold()
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+        except Exception:
+            return True
+        for page in pages:
+            if not self._page_is_open(page):
+                continue
+            try:
+                page.title()
+                parts = urlsplit(str(getattr(page, "url", "") or ""))
+            except Exception:
+                return True
+            host = str(parts.hostname or "").casefold()
+            path = str(parts.path or "/").casefold()
+            if host != work_host:
+                return True
+            if path.startswith("/auth") or "/login" in path or "/signin" in path:
+                return True
+            try:
+                if page.locator("input[type='password']").count() > 0:
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def login_completed(self) -> bool:
+        """Return whether a page of this context shows the logged-in work record.
+
+        The login window starts at the work record and Flex returns there
+        after the login (``nextUrl``); the work record itself answers an
+        unauthenticated request with a redirect to the login screen.  So a
+        page counts only on the work record's exact host and path, without a
+        password field.  SSO hosts, subdomains, callbacks, interstitials and
+        any other Flex page leave the window to the employee, whose close
+        still triggers a sync.
+        """
+
+        context = self._context
+        if context is None:
+            return False
+        work = urlsplit(self._work_url)
+        work_host = str(work.hostname or "").casefold()
+        work_path = str(work.path or "/").casefold().rstrip("/") or "/"
+        if not work_host:
+            return False
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+        except Exception:
+            return False
+        for page in pages:
+            if not self._page_is_open(page):
+                continue
+            try:
+                # ``page.url`` is only refreshed while a call is in flight; the
+                # round trip delivers pending navigations (the post-login
+                # redirect).  A page mid-navigation is not finished yet.
+                page.title()
+                parts = urlsplit(str(getattr(page, "url", "") or ""))
+            except Exception:
+                continue
+            if str(parts.hostname or "").casefold() != work_host:
+                continue
+            if (str(parts.path or "/").casefold().rstrip("/") or "/") != work_path:
+                continue
+            try:
+                if page.locator("input[type='password']").count() > 0:
+                    continue
+            except Exception:
+                continue
+            return True
+        return False
 
     def fetch_schedule_period(
         self,
