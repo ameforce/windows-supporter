@@ -3642,7 +3642,7 @@ class CodexUsageSettingsView:
                 return "자동 조회 중"
             return "조회 중"
         if profile_in_use or monitor_state == "paused_profile_in_use" or browser_state == "profile_in_use":
-            return "프로필 사용 중 (자동 일시중지)"
+            return "프로필 사용 중 (잠시 후 자동 재시도)"
         if pending_login_poll or login_window_open:
             is_cloudflare_auth = (
                 auth_attention_reason == "cloudflare_challenge"

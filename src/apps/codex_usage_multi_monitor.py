@@ -1927,10 +1927,17 @@ class CodexUsageMultiMonitor:
                     continue
                 session_state = str(runtime.get("session_state") or "logged_out")
                 provider_status = str(runtime.get("provider_status") or "")
+                monitor_state = str(runtime.get("monitor_state") or "")
                 if (
                     session_state == "logged_in"
                     or (
                         provider_status == "retrying"
+                        and session_state != "logged_out"
+                    )
+                    # Claude/Cursor report ``unknown`` while a refused profile
+                    # lock hides their reading; the lock still clears itself.
+                    or (
+                        monitor_state == "paused_profile_in_use"
                         and session_state != "logged_out"
                     )
                     or bool(runtime.get("collect_inflight"))
@@ -1945,8 +1952,12 @@ class CodexUsageMultiMonitor:
             return False
         if bool(runtime.get("auth_attention_required")):
             return True
+        # ``paused_profile_in_use`` stays scheduled: a refused Chrome profile
+        # lock clears by itself, and excluding it here left the profile in WAIT
+        # until the app restarted.  The child's ``retry_after_sec`` spaces the
+        # re-probes (see ``__profile_collect_delay_sec``).
         monitor_state = str(runtime.get("monitor_state") or "")
-        return monitor_state in {"paused_auth_required", "paused_profile_in_use"}
+        return monitor_state == "paused_auth_required"
 
     def __get_next_collect_remaining_sec(self) -> float | None:
         due_values = [

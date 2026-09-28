@@ -2015,6 +2015,13 @@ class CodexUsageMonitor:
         self.__last_playwright_notice_ts = 0.0
         self.__playwright_notice_cooldown_sec = 1800.0
         self.__profile_in_use_detected = False
+        # A background Cloudflare edge challenge with a usable cached snapshot
+        # is retried on the environment backoff instead of pinning OUT.
+        self.__edge_challenge_backoff = False
+        # Consecutive environmental refusals (profile lock, edge challenge).
+        # Kept apart from ``__failure_count`` so a long WAIT does not use up
+        # the transient retry budget that decides ``retry_exhausted``.
+        self.__environment_failure_streak = 0
         self.__collect_lock = threading.Lock()
 
         self.__settings_version = 1
@@ -2346,6 +2353,11 @@ class CodexUsageMonitor:
             self.__clear_auth_attention()
             self.__save_state()
             self.__failure_count = 0
+            self.__edge_challenge_backoff = False
+            # A logged-out profile is never re-probed, so a WAIT left from
+            # before the logout would never clear.
+            self.__profile_in_use_detected = False
+            self.__environment_failure_streak = 0
             self.__manual_query_waiting_result = False
             self.__pause_background_monitor()
             return (
@@ -2563,11 +2575,14 @@ class CodexUsageMonitor:
         return
 
     def __should_run_background_collection(self) -> bool:
+        # A refused profile lock (``profile_in_use``) is not a reason to stop
+        # background collection: the lock is transient on Windows, so the
+        # profile keeps being re-probed on a backoff instead of waiting for a
+        # restart (see ``__environment_retry_after_sec``).
         return bool(
             self.__enabled
             and self.__is_logged_in_session()
             and not bool(self.__auth_attention_required)
-            and not bool(self.__profile_in_use_detected)
             and not bool(self.__logout_in_progress)
             and not self.__is_collect_cancel_requested()
         )
@@ -2582,9 +2597,21 @@ class CodexUsageMonitor:
         if bool(self.__auth_attention_required):
             reason = normalize_usage_value(self.__auth_attention_reason).lower()
             return reason or "auth_attention_required"
-        if bool(self.__profile_in_use_detected):
-            return "profile_in_use"
         return ""
+
+    def __environment_retry_after_sec(self) -> float:
+        """Backoff before re-probing after an environmental refusal.
+
+        Used for a refused Chrome profile lock and for a background Cloudflare
+        edge challenge: neither is an account problem, so the profile keeps
+        being probed, starting at 30 s (or the collect interval if longer)
+        and doubling per consecutive failure up to 15 minutes.
+        """
+
+        base = max(30.0, float(self.__interval_sec))
+        exponent = max(0, min(int(self.__environment_failure_streak) - 1, 5))
+        # Never probe a refused profile more often than a healthy one.
+        return float(min(base * (2**exponent), max(15 * 60, base)))
 
     def __request_collect_cancel(self) -> None:
         try:
@@ -2778,6 +2805,9 @@ class CodexUsageMonitor:
             "retry_after_sec": (
                 float(min(self.__interval_sec * (2 ** max(0, min(self.__failure_count - 1, 4))), 15 * 60))
                 if provider_status == "retrying"
+                else self.__environment_retry_after_sec()
+                if monitor_state == "paused_profile_in_use"
+                or bool(self.__edge_challenge_backoff)
                 else None
             ),
             "provider_status": provider_status,
@@ -2873,6 +2903,15 @@ class CodexUsageMonitor:
                         source=source_key,
                         on_acquired=on_acquired,
                     )
+                    if source_key == "auto_monitor" and error not in {
+                        "collect_busy",
+                        "collect_cancelled",
+                        "profile_in_use",
+                    }:
+                        # A scheduled re-probe of a lock-paused profile reached
+                        # the browser without a refused profile lock, so the
+                        # pause no longer describes the profile.
+                        self.__profile_in_use_detected = False
                     if error == "collect_busy":
                         if bool(self.__profile_in_use_detected):
                             latest = self.get_last_snapshot()
@@ -2900,8 +2939,13 @@ class CodexUsageMonitor:
                         post_terminal(lambda: self.__show_tooltip("조회가 취소되었습니다."))
                         return
                     self.__consume_manual_query_pending_result()
-                    if error is not None and bool(
-                        source_key == "auto_monitor" and self.__external_scheduler
+                    if (
+                        error is not None
+                        # A refused profile lock has its own backoff streak.
+                        and error != "profile_in_use"
+                        and bool(
+                            source_key == "auto_monitor" and self.__external_scheduler
+                        )
                     ):
                         self.__failure_count = min(self.__failure_count + 1, 8)
                     if error is not None:
@@ -2926,6 +2970,8 @@ class CodexUsageMonitor:
                         )
                         snapshot = merged
                         self.__profile_in_use_detected = False
+                        self.__edge_challenge_backoff = False
+                        self.__environment_failure_streak = 0
                         self.__failure_count = 0
                         self.__last_error_type = UsageErrorType.NONE
                         self.__resume_background_monitor_if_needed()
@@ -2999,6 +3045,8 @@ class CodexUsageMonitor:
             self.__usage_history = []
         self.__cancel_pending_login_poll()
         self.__profile_in_use_detected = False
+        self.__edge_challenge_backoff = False
+        self.__environment_failure_streak = 0
         self.__failure_count = 0
         self.__last_error_type = UsageErrorType.NONE
         self.__set_session_state("logged_in")
@@ -4534,10 +4582,37 @@ class CodexUsageMonitor:
         if msg in {"collect_busy", "collect_cancelled"}:
             return
         self.__last_error_type = normalize_usage_error_type(msg)
+        self.__edge_challenge_backoff = False
+        if msg == "profile_in_use":
+            self.__environment_failure_streak = min(
+                self.__environment_failure_streak + 1, 8
+            )
+        elif msg != "cloudflare_challenge":
+            self.__environment_failure_streak = 0
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = self.__is_manual_collect_source(normalized_source)
         is_manual_login = normalized_source == "manual_login"
+
+        if msg == "cloudflare_challenge" and self.__should_defer_background_auth_error(
+            msg, normalized_source
+        ):
+            # Cloudflare's edge challenge is environmental and retryable (the
+            # Claude provider contract).  Keep the session and the cached
+            # snapshot (shown as stale) and re-probe on a backoff with a fresh
+            # context, instead of pinning OUT until a manual login.
+            self.__last_error_type = UsageErrorType.TRANSIENT
+            self.__edge_challenge_backoff = True
+            self.__environment_failure_streak = min(
+                self.__environment_failure_streak + 1, 8
+            )
+            self.__browser_session.close_session()
+            self.__log(
+                "collect edge challenge deferred "
+                f"source={normalized_source} retry=backoff "
+                "using_last_snapshot=true"
+            )
+            return
 
         if self.__should_defer_background_auth_error(msg, normalized_source):
             self.__set_session_state("logged_in")
@@ -4964,7 +5039,24 @@ class CodexUsageMonitor:
             self.__snapshot_backfill_allowed = bool(raw_backfill) and state == "logged_in"
         else:
             self.__snapshot_backfill_allowed = state == "logged_in"
-        if bool(data.get("auth_attention_required", False)):
+        attention_reason = normalize_usage_value(
+            data.get("auth_attention_reason", "")
+        ).lower()
+        attention_source = normalize_usage_value(
+            data.get("auth_attention_source", "")
+        ).lower()
+        if (
+            bool(data.get("auth_attention_required", False))
+            and attention_reason == "cloudflare_challenge"
+            and self.__is_deferred_background_auth_source(attention_source)
+            and state == "logged_in"
+            and snap.has_any_metric()
+        ):
+            # Written by an older build that pinned a background edge
+            # challenge to OUT; it is retried on the backoff now.
+            self.__clear_auth_attention()
+            dirty = True
+        elif bool(data.get("auth_attention_required", False)):
             self.__set_auth_attention(
                 str(data.get("auth_attention_reason", "") or "unknown"),
                 source=str(data.get("auth_attention_source", "") or ""),
