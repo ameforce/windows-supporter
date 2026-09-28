@@ -1380,6 +1380,154 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(snapshot.recorded_minutes_for(date(2026, 4, 6)), 0)
         self.assertEqual(get_json.call_count, 1)
 
+    def _flex_ready_wrike(self) -> tuple[Wrike, list]:
+        wrike = self._new_wrike()
+        wrike._Wrike__root = _FakeRoot()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__flex_enabled = True
+        wrike._Wrike__flex_employee_number = "E-42"
+        tooltips: list = []
+
+        def capture_tooltip(_root, text, lines=None, duration_ms=None):
+            tooltips.append((text, list(lines or []), duration_ms))
+
+        wrike._Wrike__show_tooltip = capture_tooltip
+        return wrike, tooltips
+
+    def _run_flex_sync_once(self, wrike: Wrike, outcome, *, announce: bool = False):
+        started = []
+
+        class _ArgsThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                started.append(self)
+
+            def start(self):
+                return None
+
+        submit = Mock(return_value=outcome)
+        wrike._Wrike__submit_flex_browser_job = submit
+        with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
+            self.assertTrue(
+                wrike._Wrike__request_flex_sync(force=True, announce=announce)
+            )
+        self.assertEqual(wrike._Wrike__flex_state, "loading")
+        self.assertEqual(len(started), 1)
+        started[0].target(*started[0].args)
+        wrike._Wrike__drain_ui_queue()
+        return submit
+
+    def _wrike_log_lines(self) -> list[str]:
+        log_path = self.appdata / "windows-supporter" / "wrike.log"
+        if not log_path.exists():
+            return []
+        return [
+            line.split("] ", 1)[-1]
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_flex_login_expiry_is_named_in_panel_and_announced_once(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        login_required = (
+            "Flex 로그인이 필요합니다. 설정에서 'Flex 웹 열기'를 눌러 로그인한 뒤 "
+            "백그라운드 동기화를 다시 실행해 주세요.",
+            "login_required",
+        )
+
+        submit = self._run_flex_sync_once(wrike, (False, login_required))
+
+        # Periodic syncs mark themselves as background reads.
+        self.assertTrue(submit.call_args.args[1][4])
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error_code"], "login_required")
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex 로그인 필요", model.sync_text)
+        self.assertNotIn("Flex error", model.sync_text)
+        self.assertEqual(model.sync_state, "warning")
+        self.assertEqual([item[0] for item in tooltips], ["Flex 로그인 필요"])
+        self.assertIn("Flex 웹 열기", tooltips[0][1][1][0])
+
+        # The 5-minute retry keeps failing: no second popup, no log spam.
+        self._run_flex_sync_once(wrike, (False, login_required))
+        self.assertEqual(len(tooltips), 1)
+        self.assertEqual(
+            self._wrike_log_lines().count("flex sync failed: code=login_required"),
+            1,
+        )
+
+        self._run_flex_sync_once(wrike, (True, {}))
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "fresh")
+        self.assertEqual(status["error_code"], "")
+        self.assertIn(
+            "flex sync recovered after code=login_required",
+            self._wrike_log_lines(),
+        )
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex fresh", model.sync_text)
+        self.assertNotEqual(model.sync_state, "warning")
+
+        # The next expiry is announced again.
+        self._run_flex_sync_once(wrike, (False, login_required))
+        self.assertEqual(len(tooltips), 2)
+
+    def test_manual_flex_sync_reports_failure_without_extra_login_notice(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+
+        submit = self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+            announce=True,
+        )
+
+        self.assertFalse(submit.call_args.args[1][4])
+        self.assertEqual([item[0] for item in tooltips], ["Flex 동기화 실패"])
+
+    def test_other_flex_failures_keep_their_code_visible(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 근무 기록 화면에서 ...", "schedule_not_found")),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex error · schedule_not_found", model.sync_text)
+        self.assertEqual(model.sync_state, "warning")
+        self.assertEqual(tooltips, [])
+        self.assertIn(
+            "flex sync failed: code=schedule_not_found",
+            self._wrike_log_lines(),
+        )
+
+    def test_deferred_flex_sync_keeps_previous_state_instead_of_loading(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+        )
+        deferred = (
+            False,
+            ("Flex 창이 열려 있어 백그라운드 동기화를 미뤘습니다.", "login_window_open"),
+        )
+
+        self._run_flex_sync_once(wrike, deferred)
+        self._run_flex_sync_once(wrike, deferred)
+
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error_code"], "login_required")
+        self.assertFalse(wrike._Wrike__flex_sync_running)
+        self.assertEqual(len(tooltips), 1)
+        log_lines = self._wrike_log_lines()
+        self.assertEqual(
+            log_lines.count("flex sync deferred: headed Flex window is open"),
+            1,
+        )
+        self.assertEqual(log_lines.count("flex sync failed: code=login_required"), 1)
+
     def test_authoritative_parser_rejects_noncanonical_identity_date_and_duration(self) -> None:
         invalid_entries = {
             "non-string-id": {

@@ -64,6 +64,8 @@ from src.apps.wrike_worktime import (
 from src.apps.wrike_worktime_state import WorktimeStateStore
 from src.apps.flex_worktime import (
     FLEX_BROWSER_PROFILE_DIR_NAME,
+    FLEX_LOGIN_ERROR_CODES,
+    FLEX_SYNC_DEFERRED_CODE,
     FLEX_WEB_URL,
     FlexBrowserClient,
     FlexBrowserError,
@@ -322,7 +324,13 @@ class Wrike:
         self.__flex_sync_running = False
         self.__flex_last_success_ts = None
         self.__flex_last_error = ""
+        self.__flex_last_error_code = ""
         self.__flex_state = "unconfigured"
+        # (state, error, error_code) before the in-flight sync switched the
+        # state to "loading"; restored when a background sync is deferred.
+        self.__flex_status_before_sync = ("unconfigured", "", "")
+        self.__flex_login_notice_shown = False
+        self.__flex_sync_deferral_logged = False
         self.__flex_schedule_lock = threading.RLock()
         self.__flex_schedule_by_date: dict = {}
         self.__overtime_notice_after_id = None
@@ -795,7 +803,44 @@ class Wrike:
             # A sync is always a background read.  The only headed browser
             # operation is the explicit ``open`` command used for login.
             desired_headless = bool(sync_job)
+            deferred = False
             try:
+                if (
+                    sync_job
+                    and self.__flex_sync_payload_is_background(payload)
+                    and client is not None
+                    and client_headless is False
+                    and client.has_open_page()
+                ):
+                    # The headed window is the employee's (login/SSO or
+                    # overtime registration).  A periodic sync must not close
+                    # it; the next tick after the window closes reads Flex.
+                    deferred = True
+                    response_queue.put(
+                        (
+                            False,
+                            (
+                                "Flex 창이 열려 있어 백그라운드 동기화를 미뤘습니다.",
+                                FLEX_SYNC_DEFERRED_CODE,
+                            ),
+                        )
+                    )
+                    continue
+                if (
+                    kind == "open"
+                    and client is not None
+                    and client_headless is False
+                    and not client.has_open_page()
+                ):
+                    # The employee closed the previous Flex window; reopening
+                    # must start a new headed browser instead of failing on
+                    # the closed one and falling back to the system browser.
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = None
+                    client_headless = None
                 if client is not None and client_headless != desired_headless:
                     try:
                         client.close()
@@ -820,7 +865,7 @@ class Wrike:
                     client.open_work_record_page()
                     result = None
                 elif kind == "sync":
-                    begin_date, end_date, employee_number, now = payload
+                    begin_date, end_date, employee_number, now = payload[:4]
                     result = client.fetch_schedule_period(
                         begin_date,
                         end_date,
@@ -846,8 +891,9 @@ class Wrike:
                 # Sync contexts are bounded and never visible.  Close them on
                 # both success and failure so a retry always starts from a
                 # clean background context.  The explicit ``open`` command is
-                # the only operation that intentionally keeps a headed page.
-                if sync_job and client is not None:
+                # the only operation that intentionally keeps a headed page,
+                # and a deferred sync leaves that headed page untouched.
+                if sync_job and client is not None and not deferred:
                     try:
                         client.close()
                     except Exception:
@@ -855,6 +901,15 @@ class Wrike:
                     client = None
                     client_headless = None
         return
+
+    @staticmethod
+    def __flex_sync_payload_is_background(payload) -> bool:
+        # ``(begin, end, employee_number, now[, background])``; payloads
+        # without the flag come from an explicit user request.
+        try:
+            return len(payload) > 4 and bool(payload[4])
+        except Exception:
+            return False
 
     def __submit_flex_browser_job(
         self,
@@ -916,12 +971,14 @@ class Wrike:
             return
         if not self.__flex_enabled:
             self.__flex_state = "disabled"
+            self.__flex_last_error_code = ""
             return
         if not str(self.__flex_employee_number or "").strip():
             self.__flex_state = "unconfigured"
             self.__flex_last_error = (
                 "Flex 로그인 · 지금 동기화를 눌러 사번과 근무정보를 감지하세요."
             )
+            self.__flex_last_error_code = ""
             return
         self.__request_flex_sync(force=True)
         self.__schedule_flex_poll(root)
@@ -975,6 +1032,12 @@ class Wrike:
             self.__flex_sync_generation += 1
             generation = int(self.__flex_sync_generation)
             self.__flex_sync_running = True
+            if self.__flex_state != "loading":
+                self.__flex_status_before_sync = (
+                    str(self.__flex_state),
+                    str(self.__flex_last_error or ""),
+                    str(self.__flex_last_error_code or ""),
+                )
             self.__flex_state = "loading"
         try:
             threading.Thread(
@@ -987,6 +1050,7 @@ class Wrike:
                 self.__flex_sync_running = False
             self.__flex_state = "error"
             self.__flex_last_error = "Flex 동기화를 시작하지 못했습니다."
+            self.__flex_last_error_code = "sync_start_failed"
             return False
         return True
 
@@ -1010,6 +1074,9 @@ class Wrike:
                     week_end,
                     self.__flex_employee_number,
                     now,
+                    # Periodic/startup syncs yield to an open headed window;
+                    # an explicit "지금 동기화" request keeps closing it.
+                    not bool(announce),
                 ),
                 wait=True,
                 timeout_sec=self.__time_log_login_timeout_sec + 30.0,
@@ -1059,15 +1126,46 @@ class Wrike:
         announce: bool = False,
     ) -> None:
         error_message = ""
+        error_code = ""
+        deferred = False
+        log_line = ""
+        notify_login_required = False
         with self.__flex_schedule_lock:
             if generation != int(self.__flex_sync_generation):
                 return
             self.__flex_sync_running = False
+            previous_state, previous_error, previous_code = (
+                self.__flex_status_before_sync
+            )
             if error is not None:
+                error_code = self.__safe_flex_error_code(error[1] if len(error) > 1 else "")
+            if error is not None and error_code == FLEX_SYNC_DEFERRED_CODE:
+                # Nothing was read; keep showing what the last real sync said.
+                deferred = True
+                self.__flex_state = str(previous_state or "unconfigured")
+                self.__flex_last_error = str(previous_error or "")
+                self.__flex_last_error_code = str(previous_code or "")
+                if not self.__flex_sync_deferral_logged:
+                    self.__flex_sync_deferral_logged = True
+                    log_line = "flex sync deferred: headed Flex window is open"
+            elif error is not None:
+                self.__flex_sync_deferral_logged = False
                 self.__flex_state = "error"
                 error_message = str(error[0] or "Flex 동기화 실패")
                 self.__flex_last_error = error_message
+                self.__flex_last_error_code = error_code
+                # One line per distinct failure, not one per 5-minute retry.
+                if previous_state != "error" or previous_code != error_code:
+                    log_line = f"flex sync failed: code={error_code or 'unknown'}"
+                if (
+                    error_code in FLEX_LOGIN_ERROR_CODES
+                    and not self.__flex_login_notice_shown
+                ):
+                    self.__flex_login_notice_shown = True
+                    # A manual sync already reports its own failure below.
+                    notify_login_required = not bool(announce)
             else:
+                self.__flex_sync_deferral_logged = False
                 detected_employee_number = str(
                     detected_employee_number or ""
                 ).strip()[:120]
@@ -1081,13 +1179,40 @@ class Wrike:
                 self.__flex_schedule_by_date = dict(schedules or {})
                 self.__flex_last_success_ts = self.__lib.datetime.now()
                 self.__flex_last_error = ""
+                self.__flex_last_error_code = ""
                 self.__flex_state = "fresh"
+                self.__flex_login_notice_shown = False
+                if previous_state == "error":
+                    log_line = (
+                        "flex sync recovered after "
+                        f"code={previous_code or 'unknown'}"
+                    )
+        if log_line:
+            self.__log(log_line)
         panel = self.__worktime_panel
         if panel is not None:
             try:
                 panel.refresh_now()
             except Exception:
                 pass
+        if deferred:
+            return
+        if notify_login_required:
+            self.__show_tooltip(
+                self.__root,
+                "Flex 로그인 필요",
+                lines=[
+                    (
+                        "Flex 로그인이 만료되어 근무 일정을 가져오지 못했습니다.",
+                        "#B91C1C",
+                    ),
+                    (
+                        "설정 > Wrike 탭의 'Flex 웹 열기'로 다시 로그인한 뒤 '지금 동기화'를 눌러 주세요.",
+                        "#6B7280",
+                    ),
+                ],
+                duration_ms=max(12000, int(self.__tooltip_duration_ms)),
+            )
         if announce:
             if error_message:
                 self.__show_tooltip(
@@ -1128,6 +1253,28 @@ class Wrike:
             value = self.__flex_schedule_by_date.get(key)
         return value if isinstance(value, FlexDaySchedule) else None
 
+    @staticmethod
+    def __safe_flex_error_code(value) -> str:
+        code = str(value or "").strip().lower()
+        if not code:
+            return ""
+        if len(code) > 40 or any(
+            char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in code
+        ):
+            return "unexpected_error"
+        return code
+
+    def __flex_panel_sync_piece(self, flex_status: dict) -> tuple[str, bool]:
+        """Return the panel sync-line text for Flex and whether it needs attention."""
+
+        state = str(flex_status.get("state") or "").strip()
+        code = self.__safe_flex_error_code(flex_status.get("error_code"))
+        if state == "error" and code in FLEX_LOGIN_ERROR_CODES:
+            return "Flex 로그인 필요", True
+        if state == "error":
+            return (f"Flex error · {code}" if code else "Flex error"), True
+        return f"Flex {state}", False
+
     def __flex_status_snapshot(self) -> dict:
         with self.__flex_schedule_lock:
             return {
@@ -1138,6 +1285,7 @@ class Wrike:
                     else None
                 ),
                 "error": str(self.__flex_last_error or ""),
+                "error_code": str(self.__flex_last_error_code or ""),
                 "schedule_days": len(self.__flex_schedule_by_date),
                 "employee_number": str(self.__flex_employee_number or ""),
                 "detected_employee_number": str(
@@ -3077,9 +3225,14 @@ class Wrike:
         )
         rest_label = overview.rest_day_label
         sync_text = self.__snapshot_sync_text(snapshot, now)
+        sync_state = snapshot.state.value
         if self.__flex_enabled:
             flex_status = self.__flex_status_snapshot()
-            sync_text += f" · Flex {flex_status['state']}"
+            flex_text, flex_attention = self.__flex_panel_sync_piece(flex_status)
+            sync_text += f" · {flex_text}"
+            # A Flex failure must stay visible even while Wrike itself is fresh.
+            if flex_attention and sync_state != "error":
+                sync_state = "warning"
         flex_note = ""
         if flex_schedule is not None:
             flex_note = (
@@ -3301,7 +3454,7 @@ class Wrike:
                 f"{week_days[0].isoformat()} - {week_days[-1].isoformat()}"
             ),
             sync_text=sync_text,
-            sync_state=snapshot.state.value,
+            sync_state=sync_state,
             today_lines=today_lines,
             target_minutes=int(today_plan.get("target_net_minutes", 0)),
             clock_in_time=clock_in_time,
@@ -7168,6 +7321,9 @@ class Wrike:
                 self.__flex_schedule_by_date = {}
                 self.__flex_last_success_ts = None
                 self.__flex_last_error = ""
+                self.__flex_last_error_code = ""
+                self.__flex_login_notice_shown = False
+                self.__flex_sync_deferral_logged = False
             self.__start_flex_polling()
         else:
             self.__schedule_flex_poll()
