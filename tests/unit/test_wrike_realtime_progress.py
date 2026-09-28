@@ -1214,11 +1214,12 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             ["page-2"],
             {"token": "page-2"},
         )
+        first_entry = {"id": "a", "trackedDate": "2026-04-06", "hours": 1}
         for raw_token in malformed_tokens:
             with self.subTest(raw_token=raw_token):
                 wrike = self._new_wrike()
                 wrike._Wrike__api_get_json = Mock(
-                    return_value={"data": [], "nextPageToken": raw_token}
+                    return_value={"data": [first_entry], "nextPageToken": raw_token}
                 )
 
                 items, error = wrike._Wrike__query_authoritative_timelogs_week(
@@ -1234,7 +1235,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike = self._new_wrike()
         get_json = Mock(
             side_effect=[
-                {"data": [], "nextPageToken": opaque_token},
+                {"data": [first_entry], "nextPageToken": opaque_token},
                 {"data": []},
             ]
         )
@@ -1246,10 +1247,405 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             self._week_datetimes(),
         )
 
-        self.assertEqual(items, [])
         self.assertIsNone(error)
+        self.assertEqual([item["id"] for item in items], ["a"])
         second_query = parse_qs(urlparse(get_json.call_args_list[1].args[0]).query)
         self.assertEqual(second_query["nextPageToken"], [opaque_token])
+
+    def test_authoritative_empty_week_does_not_follow_wrike_placeholder_token(self) -> None:
+        # Live Wrike v4 shape for a tracked-date range without timelogs: the
+        # placeholder token is rejected with HTTP 400 invalid_parameter.
+        empty_pages = {
+            "with-response-size": {
+                "kind": "timelogs",
+                "data": [],
+                "responseSize": 0,
+                "nextPageToken": "IEAGXYZABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+            },
+            "without-response-size": {
+                "kind": "timelogs",
+                "data": [],
+                "nextPageToken": "IEAGXYZABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+            },
+        }
+        for name, page in empty_pages.items():
+            with self.subTest(name=name):
+                wrike = self._new_wrike()
+                get_json = Mock(
+                    side_effect=[
+                        page,
+                        AssertionError("placeholder token must not be followed"),
+                    ]
+                )
+                wrike._Wrike__api_get_json = get_json
+
+                items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                    "token",
+                    "contact",
+                    self._week_datetimes(),
+                )
+
+                self.assertIsNone(error)
+                self.assertEqual(items, [])
+                self.assertEqual(get_json.call_count, 1)
+
+    def test_authoritative_pagination_stops_at_announced_response_size(self) -> None:
+        wrike = self._new_wrike()
+        get_json = Mock(
+            side_effect=[
+                {
+                    "data": [
+                        {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
+                        {"id": "b", "trackedDate": "2026-04-07", "hours": 1},
+                    ],
+                    "responseSize": 3,
+                    "nextPageToken": "page-2",
+                },
+                {
+                    "data": [
+                        {"id": "c", "trackedDate": "2026-04-08", "minutes": 30},
+                    ],
+                    "nextPageToken": "trailing-placeholder",
+                },
+                AssertionError("trailing token after the full total must not be followed"),
+            ]
+        )
+        wrike._Wrike__api_get_json = get_json
+
+        items, error = wrike._Wrike__query_authoritative_timelogs_week(
+            "token",
+            "contact",
+            self._week_datetimes(),
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual([item["id"] for item in items], ["a", "b", "c"])
+        self.assertEqual(get_json.call_count, 2)
+
+    def test_authoritative_end_of_result_is_trusted_below_announced_total(self) -> None:
+        # Entries deleted between page requests (or duplicated across pages)
+        # can leave fewer unique entries than page 1 announced.  Wrike's end
+        # of result wins so the week is never pinned to an error again.
+        endings = {
+            "empty-page-with-token": {"data": [], "nextPageToken": "page-3"},
+            "tokenless-page": {
+                "data": [{"id": "a", "trackedDate": "2026-04-06", "hours": 1}],
+            },
+        }
+        for name, second_page in endings.items():
+            with self.subTest(name=name):
+                wrike = self._new_wrike()
+                get_json = Mock(
+                    side_effect=[
+                        {
+                            "data": [
+                                {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
+                            ],
+                            "responseSize": 3,
+                            "nextPageToken": "page-2",
+                        },
+                        second_page,
+                        AssertionError("pagination must end here"),
+                    ]
+                )
+                wrike._Wrike__api_get_json = get_json
+
+                items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                    "token",
+                    "contact",
+                    self._week_datetimes(),
+                )
+
+                self.assertIsNone(error)
+                self.assertEqual([item["id"] for item in items], ["a"])
+                self.assertEqual(get_json.call_count, 2)
+        log_text = (
+            self.appdata / "windows-supporter" / "wrike.log"
+        ).read_text(encoding="utf-8")
+        self.assertIn("authoritative contact timelogs: 1 entries, 2 pages, announced 3", log_text)
+
+    def test_authoritative_malformed_response_size_keeps_following_tokens(self) -> None:
+        for raw_total in (True, "1", -1, 1.0, None):
+            with self.subTest(raw_total=raw_total):
+                wrike = self._new_wrike()
+                get_json = Mock(
+                    side_effect=[
+                        {
+                            "data": [
+                                {"id": "a", "trackedDate": "2026-04-06", "hours": 1},
+                            ],
+                            "responseSize": raw_total,
+                            "nextPageToken": "page-2",
+                        },
+                        {
+                            "data": [
+                                {"id": "b", "trackedDate": "2026-04-07", "hours": 1},
+                            ],
+                        },
+                    ]
+                )
+                wrike._Wrike__api_get_json = get_json
+
+                items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                    "token",
+                    "contact",
+                    self._week_datetimes(),
+                )
+
+                self.assertIsNone(error)
+                self.assertEqual([item["id"] for item in items], ["a", "b"])
+                self.assertEqual(get_json.call_count, 2)
+
+    def test_empty_week_refresh_is_fresh_zero_instead_of_request_failed(self) -> None:
+        wrike = self._new_wrike()
+        wrike._Wrike__root = _FakeRoot()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__wrike_api_token_session = "token"
+        wrike._Wrike__resolve_contact_identity = Mock(
+            return_value=("contact", "Integration User", None)
+        )
+        get_json = Mock(
+            side_effect=[
+                {
+                    "kind": "timelogs",
+                    "data": [],
+                    "responseSize": 0,
+                    "nextPageToken": "IEAGXYZABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+                },
+                None,
+            ]
+        )
+        wrike._Wrike__api_get_json = get_json
+
+        with patch("src.apps.Wrike.threading.Thread", _FakeThread):
+            generation = wrike._Wrike__request_timelog_snapshot_refresh(force=True)
+        _FakeThread.created[0].target()
+        wrike._Wrike__drain_ui_queue()
+
+        snapshot = wrike.get_timelog_snapshot()
+        self.assertEqual(snapshot.generation, generation)
+        self.assertEqual(snapshot.state, TimelogSnapshotState.FRESH)
+        self.assertIsNone(snapshot.error_code)
+        self.assertEqual(len(snapshot.days), 7)
+        self.assertEqual(snapshot.recorded_minutes_for(date(2026, 4, 6)), 0)
+        self.assertEqual(get_json.call_count, 1)
+
+    def _flex_ready_wrike(self) -> tuple[Wrike, list]:
+        wrike = self._new_wrike()
+        wrike._Wrike__root = _FakeRoot()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__flex_enabled = True
+        wrike._Wrike__flex_employee_number = "E-42"
+        tooltips: list = []
+
+        def capture_tooltip(_root, text, lines=None, duration_ms=None):
+            tooltips.append((text, list(lines or []), duration_ms))
+
+        wrike._Wrike__show_tooltip = capture_tooltip
+        return wrike, tooltips
+
+    def _run_flex_sync_once(self, wrike: Wrike, outcome, *, announce: bool = False):
+        started = []
+
+        class _ArgsThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                started.append(self)
+
+            def start(self):
+                return None
+
+        submit = Mock(return_value=outcome)
+        wrike._Wrike__submit_flex_browser_job = submit
+        with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
+            self.assertTrue(
+                wrike._Wrike__request_flex_sync(force=True, announce=announce)
+            )
+        self.assertEqual(wrike._Wrike__flex_state, "loading")
+        self.assertEqual(len(started), 1)
+        started[0].target(*started[0].args)
+        wrike._Wrike__drain_ui_queue()
+        return submit
+
+    def _wrike_log_lines(self) -> list[str]:
+        log_path = self.appdata / "windows-supporter" / "wrike.log"
+        if not log_path.exists():
+            return []
+        return [
+            line.split("] ", 1)[-1]
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_flex_login_expiry_is_named_in_panel_and_announced_once(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        login_required = (
+            "Flex 로그인이 필요합니다. 설정에서 'Flex 웹 열기'를 눌러 로그인한 뒤 "
+            "백그라운드 동기화를 다시 실행해 주세요.",
+            "login_required",
+        )
+
+        submit = self._run_flex_sync_once(wrike, (False, login_required))
+
+        # Periodic syncs mark themselves as background reads.
+        self.assertTrue(submit.call_args.args[1][4])
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error_code"], "login_required")
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex 로그인 필요", model.sync_text)
+        self.assertNotIn("Flex error", model.sync_text)
+        self.assertEqual(model.sync_state, "warning")
+        self.assertEqual([item[0] for item in tooltips], ["Flex 로그인 필요"])
+        self.assertIn("Flex 웹 열기", tooltips[0][1][1][0])
+
+        # The 5-minute retry keeps failing: no second popup, no log spam.
+        self._run_flex_sync_once(wrike, (False, login_required))
+        self.assertEqual(len(tooltips), 1)
+        self.assertEqual(
+            self._wrike_log_lines().count("flex sync failed: code=login_required"),
+            1,
+        )
+
+        self._run_flex_sync_once(wrike, (True, {}))
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "fresh")
+        self.assertEqual(status["error_code"], "")
+        self.assertIn(
+            "flex sync recovered after code=login_required",
+            self._wrike_log_lines(),
+        )
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex fresh", model.sync_text)
+        self.assertNotEqual(model.sync_state, "warning")
+
+        # The next expiry is announced again.
+        self._run_flex_sync_once(wrike, (False, login_required))
+        self.assertEqual(len(tooltips), 2)
+
+    def test_manual_flex_sync_reports_failure_without_extra_login_notice(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+
+        submit = self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+            announce=True,
+        )
+
+        self.assertFalse(submit.call_args.args[1][4])
+        self.assertEqual([item[0] for item in tooltips], ["Flex 동기화 실패"])
+
+    def test_other_flex_failures_keep_their_code_visible(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 근무 기록 화면에서 ...", "schedule_not_found")),
+        )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex error · schedule_not_found", model.sync_text)
+        self.assertEqual(model.sync_state, "warning")
+        self.assertEqual(tooltips, [])
+        self.assertIn(
+            "flex sync failed: code=schedule_not_found",
+            self._wrike_log_lines(),
+        )
+
+    def test_deferred_flex_sync_reports_open_window_instead_of_loading(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+        )
+        deferred = (
+            False,
+            ("Flex 창이 열려 있어 백그라운드 동기화를 미뤘습니다.", "login_window_open"),
+        )
+
+        self._run_flex_sync_once(wrike, deferred)
+        self._run_flex_sync_once(wrike, deferred)
+
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "deferred")
+        self.assertEqual(status["error_code"], "login_window_open")
+        self.assertFalse(wrike._Wrike__flex_sync_running)
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex 창 열림 · 동기화 대기", model.sync_text)
+        self.assertNotEqual(model.sync_state, "warning")
+        self.assertEqual(len(tooltips), 1)
+        log_lines = self._wrike_log_lines()
+        self.assertEqual(
+            log_lines.count("flex sync deferred: headed Flex window is open"),
+            1,
+        )
+        self.assertEqual(log_lines.count("flex sync failed: code=login_required"), 1)
+
+        # After the window closes the next failure is a new episode: logged,
+        # but the already-shown login notice is not repeated.
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+        )
+        self.assertEqual(
+            self._wrike_log_lines().count("flex sync failed: code=login_required"),
+            2,
+        )
+        self.assertEqual(len(tooltips), 1)
+
+    def test_flex_reconfiguration_logs_the_new_configurations_first_failure(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        wrike._Wrike__flex_poll_interval_sec = 300
+        login_required = (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        self._run_flex_sync_once(wrike, login_required)
+        started = []
+
+        class _ArgsThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                started.append(self)
+
+            def start(self):
+                return None
+
+        wrike._Wrike__submit_flex_browser_job = Mock(return_value=login_required)
+        with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
+            ok, error = wrike.update_settings({"flex_poll_interval_sec": 600})
+        self.assertTrue(ok, error)
+        flex_threads = [
+            thread
+            for thread in started
+            if "run_flex_sync" in str(getattr(thread.target, "__name__", ""))
+        ]
+        self.assertEqual(len(flex_threads), 1)
+        flex_threads[0].target(*flex_threads[0].args)
+        wrike._Wrike__drain_ui_queue()
+
+        self.assertEqual(
+            self._wrike_log_lines().count("flex sync failed: code=login_required"),
+            2,
+        )
+
+    def test_wrike_error_keeps_error_color_over_flex_warning(self) -> None:
+        from src.apps.wrike_timelog_snapshot import make_error_snapshot
+
+        wrike, _tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+        )
+        with wrike._Wrike__timelog_snapshot_lock:
+            wrike._Wrike__timelog_snapshot = make_error_snapshot(
+                generation=1,
+                error_code="request_failed",
+            )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+
+        self.assertIn("error · request_failed", model.sync_text)
+        self.assertIn("Flex 로그인 필요", model.sync_text)
+        self.assertEqual(model.sync_state, "error")
 
     def test_authoritative_parser_rejects_noncanonical_identity_date_and_duration(self) -> None:
         invalid_entries = {

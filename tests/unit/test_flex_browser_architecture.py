@@ -214,6 +214,165 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
         self.assertEqual(close_response.get_nowait(), (True, None))
         self.assertTrue(created[0].closed)
 
+    @staticmethod
+    def _worker_app() -> Wrike:
+        app = Wrike.__new__(Wrike)
+        app._Wrike__flex_browser_queue = queue.Queue()
+        app._Wrike__flex_browser_profile_dir = "C:/temp/flex-profile-test"
+        app._Wrike__time_log_login_timeout_sec = 10.0
+        app._Wrike__flex_browser_stop_event = threading.Event()
+        app._Wrike__ensure_playwright_ready = lambda: True
+        app._Wrike__log_exception = lambda *_args: None
+        return app
+
+    @staticmethod
+    def _headed_aware_client(created: list):
+        class _Client:
+            def __init__(self, *_args, **kwargs):
+                self.headless = bool(kwargs.get("headless"))
+                self.window_open = False
+                self.opened = 0
+                self.fetches = 0
+                self.close_calls = 0
+                self.closed = False
+                created.append(self)
+
+            def open_work_record_page(self):
+                self.opened += 1
+                self.window_open = True
+
+            def has_open_page(self):
+                return bool(self.window_open and not self.closed)
+
+            def fetch_schedule_period(self, *_args, **_kwargs):
+                self.fetches += 1
+                return {}
+
+            def close(self):
+                self.close_calls += 1
+                self.closed = True
+                self.window_open = False
+
+        return _Client
+
+    @staticmethod
+    def _sync_payload(*, background: bool):
+        return (
+            date(2026, 9, 28),
+            date(2026, 10, 4),
+            "E-42",
+            datetime(2026, 9, 28, 10),
+            background,
+        )
+
+    def _run_jobs(self, app: Wrike, client_cls, jobs: list) -> list:
+        responses = []
+        for kind, payload in jobs:
+            response = queue.Queue(maxsize=1)
+            responses.append(response)
+            app._Wrike__flex_browser_queue.put((kind, payload, response))
+        close_response = queue.Queue(maxsize=1)
+        app._Wrike__flex_browser_queue.put(("close", None, close_response))
+        with patch("src.apps.Wrike.FlexBrowserClient", client_cls):
+            worker = threading.Thread(target=app._Wrike__flex_browser_worker_loop)
+            worker.start()
+            worker.join(timeout=3.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(close_response.get_nowait(), (True, None))
+        return [response.get_nowait() for response in responses]
+
+    def test_background_sync_defers_while_headed_flex_window_is_open(self) -> None:
+        created = []
+        app = self._worker_app()
+
+        open_result, first_sync, second_sync = self._run_jobs(
+            app,
+            self._headed_aware_client(created),
+            [
+                ("open", None),
+                ("sync", self._sync_payload(background=True)),
+                ("sync", self._sync_payload(background=True)),
+            ],
+        )
+
+        self.assertEqual(open_result, (True, None))
+        for sync_result in (first_sync, second_sync):
+            self.assertEqual(sync_result[0], False)
+            self.assertEqual(sync_result[1][1], "login_window_open")
+        # Only the user's headed window exists; neither periodic tick closed
+        # it (the second one still found it open) nor started a headless
+        # browser on the same profile.  The one close is the final "close".
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].headless)
+        self.assertEqual(created[0].fetches, 0)
+        self.assertEqual(created[0].close_calls, 1)
+
+    def test_background_sync_resumes_after_employee_closes_flex_window(self) -> None:
+        created = []
+        client_cls = self._headed_aware_client(created)
+        original_open = client_cls.open_work_record_page
+
+        def open_then_close(client):
+            original_open(client)
+            client.window_open = False
+
+        client_cls.open_work_record_page = open_then_close
+        app = self._worker_app()
+
+        _open_result, sync_result = self._run_jobs(
+            app,
+            client_cls,
+            [("open", None), ("sync", self._sync_payload(background=True))],
+        )
+
+        self.assertEqual(sync_result, (True, {}))
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[0].closed)
+        self.assertTrue(created[1].headless)
+        self.assertEqual(created[1].fetches, 1)
+
+    def test_explicit_sync_still_replaces_open_headed_window(self) -> None:
+        created = []
+        app = self._worker_app()
+
+        _open_result, sync_result = self._run_jobs(
+            app,
+            self._headed_aware_client(created),
+            [("open", None), ("sync", self._sync_payload(background=False))],
+        )
+
+        self.assertEqual(sync_result, (True, {}))
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[0].closed)
+        self.assertTrue(created[1].headless)
+        self.assertEqual(created[1].fetches, 1)
+
+    def test_reopen_after_window_closed_starts_a_new_headed_browser(self) -> None:
+        created = []
+        client_cls = self._headed_aware_client(created)
+        original_open = client_cls.open_work_record_page
+
+        def open_then_close_first(client):
+            original_open(client)
+            if client is created[0]:
+                client.window_open = False
+
+        client_cls.open_work_record_page = open_then_close_first
+        app = self._worker_app()
+
+        first, second = self._run_jobs(
+            app,
+            client_cls,
+            [("open", None), ("open", None)],
+        )
+
+        self.assertEqual(first, (True, None))
+        self.assertEqual(second, (True, None))
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[0].closed)
+        self.assertFalse(created[1].headless)
+        self.assertEqual(created[1].opened, 1)
+
     def test_manual_sync_requests_background_mode(self) -> None:
         app = Wrike.__new__(Wrike)
         app._Wrike__flex_enabled = True
@@ -226,6 +385,70 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
 
         self.assertEqual(result, (True, None))
         request_sync.assert_called_once_with(force=True, announce=True)
+
+
+class FlexHasOpenPageTests(unittest.TestCase):
+    class _Page:
+        def __init__(self, *, closed=False, title_error=None, close_on_title=False):
+            self._closed = closed
+            self._title_error = title_error
+            self._close_on_title = close_on_title
+
+        def is_closed(self):
+            return self._closed
+
+        def title(self):
+            if self._close_on_title:
+                # The round trip delivers the employee's close event.
+                self._closed = True
+            if self._title_error is not None:
+                raise self._title_error
+            return "Flex"
+
+    class _Context:
+        def __init__(self, pages):
+            self.pages = list(pages)
+
+    def _client(self, *pages):
+        from src.apps.flex_worktime import FlexBrowserClient
+
+        client = FlexBrowserClient("C:/temp/flex-profile-test", headless=False)
+        client._context = self._Context(pages)
+        return client
+
+    def test_live_page_is_open(self) -> None:
+        self.assertTrue(self._client(self._Page()).has_open_page())
+
+    def test_close_event_flushed_by_round_trip_means_gone(self) -> None:
+        page = self._Page(
+            close_on_title=True,
+            title_error=RuntimeError("Target page, context or browser has been closed"),
+        )
+        self.assertFalse(self._client(page).has_open_page())
+
+    def test_target_closed_error_means_gone(self) -> None:
+        class TargetClosedError(Exception):
+            pass
+
+        page = self._Page(title_error=TargetClosedError("Target closed"))
+        self.assertFalse(self._client(page).has_open_page())
+
+    def test_navigation_during_round_trip_keeps_the_window(self) -> None:
+        # SSO redirects destroy the execution context mid-call on a live page.
+        page = self._Page(
+            title_error=RuntimeError(
+                "Execution context was destroyed, most likely because of a navigation"
+            )
+        )
+        self.assertTrue(self._client(page).has_open_page())
+
+    def test_no_context_or_only_closed_pages_is_not_open(self) -> None:
+        from src.apps.flex_worktime import FlexBrowserClient
+
+        self.assertFalse(
+            FlexBrowserClient("C:/temp/flex-profile-test").has_open_page()
+        )
+        self.assertFalse(self._client(self._Page(closed=True)).has_open_page())
 
 
 class FlexEmployeeNumberUiTests(unittest.TestCase):
