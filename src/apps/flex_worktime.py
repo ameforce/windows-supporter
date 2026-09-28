@@ -22,6 +22,14 @@ from zoneinfo import ZoneInfo
 # Playwright navigation time out before the schedule API/content is observed.
 FLEX_WEB_URL = "https://flex.team/time-tracking/my-work-record"
 FLEX_BROWSER_PROFILE_DIR_NAME = "flex-profile"
+# Flex's web session expires on the server side (observed: seven days after
+# the employee's login).  These browser error codes mean the employee has to
+# log in again through the explicit headed ``Flex 웹 열기`` window.
+FLEX_LOGIN_ERROR_CODES = frozenset({"login_required", "login_timeout"})
+# A background sync that found the employee's headed Flex window still open.
+# The window is user-owned (login/SSO or overtime registration), so the sync
+# is skipped instead of closing it.
+FLEX_SYNC_DEFERRED_CODE = "login_window_open"
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _BREAK_WORDS = ("휴게", "break", "rest")
@@ -1175,6 +1183,23 @@ def _parse_browser_response_payloads(
     return {}, detected_employee_number
 
 
+_TARGET_CLOSED_MARKERS = (
+    "has been closed",
+    "target closed",
+    "browser has disconnected",
+    "connection closed",
+)
+
+
+def _is_target_closed_error(exc: BaseException) -> bool:
+    """Return whether a Playwright error means the page/browser is gone."""
+
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    message = str(exc or "").casefold()
+    return any(marker in message for marker in _TARGET_CLOSED_MARKERS)
+
+
 class FlexBrowserClient:
     """Read-only Flex client backed by a persistent Playwright session.
 
@@ -1252,6 +1277,39 @@ class FlexBrowserClient:
             return not bool(page.is_closed())
         except Exception:
             return True
+
+    def has_open_page(self) -> bool:
+        """Return whether a page of this browser context is still alive.
+
+        The sync API only dispatches the browser's page/close events while a
+        call is in flight, so ``is_closed()`` alone can still report a window
+        the employee already closed.  A cheap ``title()`` round trip flushes
+        those events and fails for a page whose window or browser is gone.
+        """
+
+        context = self._context
+        if context is None:
+            return False
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+        except Exception:
+            return False
+        for page in pages:
+            if not self._page_is_open(page):
+                continue
+            try:
+                page.title()
+            except Exception as exc:
+                # A navigation committing during the call (SSO redirects)
+                # fails with "Execution context was destroyed" on a live page.
+                # Only a flushed close event or a target-closed error means
+                # the employee's window is really gone.
+                if self._page_is_open(page) and not _is_target_closed_error(exc):
+                    return True
+                continue
+            if self._page_is_open(page):
+                return True
+        return False
 
     def _get_page(self):
         context = self._ensure_context()
