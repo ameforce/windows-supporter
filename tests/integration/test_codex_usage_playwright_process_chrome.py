@@ -341,6 +341,12 @@ class CodexUsagePlaywrightProcessChromeIntegrationTest(unittest.TestCase):
                 ),
                 logs,
             )
+            # The retry relaunched Chrome inside the same worker.
+            self.assertEqual(
+                sum("browser worker spawned" in line for line in logs),
+                1,
+                logs,
+            )
         finally:
             state.release_first_probe.set()
             server.shutdown()

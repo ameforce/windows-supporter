@@ -2018,6 +2018,10 @@ class CodexUsageMonitor:
         # A background Cloudflare edge challenge with a usable cached snapshot
         # is retried on the environment backoff instead of pinning OUT.
         self.__edge_challenge_backoff = False
+        # Consecutive environmental refusals (profile lock, edge challenge).
+        # Kept apart from ``__failure_count`` so a long WAIT does not use up
+        # the transient retry budget that decides ``retry_exhausted``.
+        self.__environment_failure_streak = 0
         self.__collect_lock = threading.Lock()
 
         self.__settings_version = 1
@@ -2350,6 +2354,10 @@ class CodexUsageMonitor:
             self.__save_state()
             self.__failure_count = 0
             self.__edge_challenge_backoff = False
+            # A logged-out profile is never re-probed, so a WAIT left from
+            # before the logout would never clear.
+            self.__profile_in_use_detected = False
+            self.__environment_failure_streak = 0
             self.__manual_query_waiting_result = False
             self.__pause_background_monitor()
             return (
@@ -2601,8 +2609,9 @@ class CodexUsageMonitor:
         """
 
         base = max(30.0, float(self.__interval_sec))
-        exponent = max(0, min(int(self.__failure_count) - 1, 5))
-        return float(min(base * (2**exponent), 15 * 60))
+        exponent = max(0, min(int(self.__environment_failure_streak) - 1, 5))
+        # Never probe a refused profile more often than a healthy one.
+        return float(min(base * (2**exponent), max(15 * 60, base)))
 
     def __request_collect_cancel(self) -> None:
         try:
@@ -2930,8 +2939,13 @@ class CodexUsageMonitor:
                         post_terminal(lambda: self.__show_tooltip("조회가 취소되었습니다."))
                         return
                     self.__consume_manual_query_pending_result()
-                    if error is not None and bool(
-                        source_key == "auto_monitor" and self.__external_scheduler
+                    if (
+                        error is not None
+                        # A refused profile lock has its own backoff streak.
+                        and error != "profile_in_use"
+                        and bool(
+                            source_key == "auto_monitor" and self.__external_scheduler
+                        )
                     ):
                         self.__failure_count = min(self.__failure_count + 1, 8)
                     if error is not None:
@@ -2957,6 +2971,7 @@ class CodexUsageMonitor:
                         snapshot = merged
                         self.__profile_in_use_detected = False
                         self.__edge_challenge_backoff = False
+                        self.__environment_failure_streak = 0
                         self.__failure_count = 0
                         self.__last_error_type = UsageErrorType.NONE
                         self.__resume_background_monitor_if_needed()
@@ -3031,6 +3046,7 @@ class CodexUsageMonitor:
         self.__cancel_pending_login_poll()
         self.__profile_in_use_detected = False
         self.__edge_challenge_backoff = False
+        self.__environment_failure_streak = 0
         self.__failure_count = 0
         self.__last_error_type = UsageErrorType.NONE
         self.__set_session_state("logged_in")
@@ -4567,6 +4583,12 @@ class CodexUsageMonitor:
             return
         self.__last_error_type = normalize_usage_error_type(msg)
         self.__edge_challenge_backoff = False
+        if msg == "profile_in_use":
+            self.__environment_failure_streak = min(
+                self.__environment_failure_streak + 1, 8
+            )
+        elif msg != "cloudflare_challenge":
+            self.__environment_failure_streak = 0
         self.__log(f"collect error: {msg}")
         normalized_source = normalize_usage_value(source).lower()
         is_manual_query = self.__is_manual_collect_source(normalized_source)
@@ -4581,6 +4603,9 @@ class CodexUsageMonitor:
             # context, instead of pinning OUT until a manual login.
             self.__last_error_type = UsageErrorType.TRANSIENT
             self.__edge_challenge_backoff = True
+            self.__environment_failure_streak = min(
+                self.__environment_failure_streak + 1, 8
+            )
             self.__browser_session.close_session()
             self.__log(
                 "collect edge challenge deferred "

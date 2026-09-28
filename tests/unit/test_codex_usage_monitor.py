@@ -441,13 +441,45 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertTrue(runtime["auto_monitoring_active"])
             self.assertEqual(runtime["retry_after_sec"], 30.0)
 
-            for failure_count, expected in ((1, 30.0), (2, 60.0), (3, 120.0), (6, 900.0), (8, 900.0)):
-                monitor._CodexUsageMonitor__failure_count = failure_count
+            for streak, expected in ((1, 30.0), (2, 60.0), (3, 120.0), (6, 900.0), (8, 900.0)):
+                monitor._CodexUsageMonitor__environment_failure_streak = streak
                 self.assertEqual(
                     monitor.get_runtime_status()["retry_after_sec"],
                     expected,
-                    msg=f"failure_count={failure_count}",
+                    msg=f"streak={streak}",
                 )
+
+            # A refused profile is never probed more often than a healthy one.
+            monitor._CodexUsageMonitor__interval_sec = 1200.0
+            monitor._CodexUsageMonitor__environment_failure_streak = 4
+            self.assertEqual(monitor.get_runtime_status()["retry_after_sec"], 1200.0)
+
+    def test_logout_clears_a_profile_lock_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._BrowserSession()
+            replacement = self._BrowserSession()
+            sessions = iter((session, replacement))
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: next(sessions),
+            )
+            monitor._CodexUsageMonitor__set_session_state("logged_in")
+            monitor._CodexUsageMonitor__profile_in_use_detected = True
+            monitor._CodexUsageMonitor__environment_failure_streak = 3
+
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__clear_profile_directory",
+                return_value=(True, "로그아웃되었습니다."),
+            ):
+                ok, _message = monitor.release_profile_session()
+
+            self.assertTrue(ok)
+            runtime = monitor.get_runtime_status()
+            self.assertFalse(runtime["profile_in_use"])
+            self.assertNotEqual(runtime["monitor_state"], "paused_profile_in_use")
+            self.assertIsNone(runtime["retry_after_sec"])
 
     def test_scheduled_probe_clears_profile_lock_pause_after_lock_is_released(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -499,6 +531,17 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
             self.assertEqual(first["retry_after_sec"], 30.0)
             self.assertEqual(second["monitor_state"], "paused_profile_in_use")
             self.assertEqual(second["retry_after_sec"], 60.0)
+            # WAIT has its own streak; it must not use up the transient budget
+            # that later decides retry_exhausted for a profile without cache.
+            self.assertEqual(second["failure_count"], 0)
+            self.assertFalse(second["retry_exhausted"])
+
+            session.collect_result = BrowserOperationResult(error="collect_failed")
+            monitor.show_current_status(force_refresh=True, source="auto_monitor")
+            after_lock = monitor.get_runtime_status()
+            self.assertFalse(after_lock["profile_in_use"])
+            self.assertEqual(after_lock["failure_count"], 1)
+            self.assertFalse(after_lock["retry_exhausted"])
 
     def test_scheduled_probe_with_other_error_replaces_stale_profile_lock_pause(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

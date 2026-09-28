@@ -1927,10 +1927,17 @@ class CodexUsageMultiMonitor:
                     continue
                 session_state = str(runtime.get("session_state") or "logged_out")
                 provider_status = str(runtime.get("provider_status") or "")
+                monitor_state = str(runtime.get("monitor_state") or "")
                 if (
                     session_state == "logged_in"
                     or (
                         provider_status == "retrying"
+                        and session_state != "logged_out"
+                    )
+                    # Claude/Cursor report ``unknown`` while a refused profile
+                    # lock hides their reading; the lock still clears itself.
+                    or (
+                        monitor_state == "paused_profile_in_use"
                         and session_state != "logged_out"
                     )
                     or bool(runtime.get("collect_inflight"))

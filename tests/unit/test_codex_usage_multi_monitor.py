@@ -4712,6 +4712,34 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
 
             self.assertEqual(len(children[0].show_calls), 2)
 
+    def test_background_monitor_keeps_lock_paused_profile_without_reading(self):
+        # Claude/Cursor report ``unknown`` while the refused lock hides their
+        # reading; the profile must stay in the re-probe lane.
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, children = self._build_manager(tmp)
+            children[0].runtime.update(
+                {
+                    "session_state": "unknown",
+                    "monitor_state": "paused_profile_in_use",
+                    "provider_status": "paused",
+                    "retry_after_sec": None,
+                }
+            )
+            children[1].runtime["session_state"] = "logged_out"
+            root = _FakeRoot()
+
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=100.0):
+                manager.attach(root, event_queue=None)
+            self.assertEqual(len(root.after_calls), 1)
+            with patch("src.apps.codex_usage_multi_monitor.time.monotonic", return_value=101.5):
+                root.after_calls[0]["callback"]()
+
+            self.assertEqual(
+                children[0].show_calls,
+                [{"force_refresh": True, "source": "auto_monitor"}],
+            )
+            self.assertEqual(children[1].show_calls, [])
+
     def test_background_monitor_does_not_retry_logged_out_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, children = self._build_manager(tmp)
