@@ -4038,7 +4038,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         view._refresh_runtime_status()
 
-        self.assertEqual(view._collect_state_var.value, "프로필 사용 중 (자동 일시중지)")
+        self.assertEqual(view._collect_state_var.value, "프로필 사용 중 (잠시 후 자동 재시도)")
         self.assertEqual(view._next_collect_var.value, "-")
 
     def test_refresh_runtime_status_shows_pending_login_poll_state(self) -> None:

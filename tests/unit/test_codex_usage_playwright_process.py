@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 from src.apps.codex_usage_browser_types import (
     BrowserErrorCode,
+    BrowserOperationResult,
     BrowserRuntimeStatus,
     BrowserState,
     PlaywrightSessionConfig,
@@ -186,6 +187,131 @@ class CodexUsagePlaywrightProcessPolicyTest(unittest.TestCase):
             driver.poll_login().error,
             BrowserErrorCode.COLLECT_FAILED.value,
         )
+
+    def _lock_race_driver(
+        self,
+        outcomes: list[BrowserOperationResult],
+        *,
+        sleeper=None,
+        clock=None,
+    ):
+        sleeps: list[float] = []
+        logs: list[str] = []
+        driver = CodexUsagePlaywrightProcessDriver(
+            self.config,
+            log_sink=logs.append,
+            sleeper=sleeper or sleeps.append,
+            clock=clock,
+        )
+        driver._recycle_worker_if_needed = lambda: None
+        driver._has_live_worker = lambda: True
+        invoke = Mock(side_effect=list(outcomes))
+        driver._invoke_locked = invoke
+        return driver, invoke, sleeps, logs
+
+    def test_collect_relaunches_after_a_refused_profile_lock(self) -> None:
+        probe = {"url": "https://chatgpt.com/codex/settings/usage"}
+        driver, invoke, sleeps, logs = self._lock_race_driver(
+            [
+                BrowserOperationResult(error=BrowserErrorCode.PROFILE_IN_USE.value),
+                BrowserOperationResult(probe=probe),
+            ]
+        )
+
+        result = driver.collect()
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.probe, probe)
+        self.assertEqual(invoke.call_count, 2)
+        # The retry reuses the live worker and may never spawn a new one.
+        self.assertEqual(invoke.call_args_list[1].kwargs, {"allow_spawn": False})
+        self.assertEqual(sleeps, [2.0])
+        self.assertTrue(any("browser profile lock retry attempt=1" in line for line in logs))
+        self.assertTrue(
+            any("browser profile lock retry end attempts=1 error=none" in line for line in logs)
+        )
+
+    def test_profile_lock_retry_stops_when_worker_is_killed_during_the_wait(self) -> None:
+        refused = BrowserOperationResult(error=BrowserErrorCode.PROFILE_IN_USE.value)
+        holder: dict[str, CodexUsagePlaywrightProcessDriver] = {}
+
+        def session_deadline_during_sleep(_seconds: float) -> None:
+            driver = holder["driver"]
+            # What the session does on its collect deadline.
+            driver.force_terminate(BrowserErrorCode.COMMAND_TIMEOUT.value)
+            driver._has_live_worker = lambda: False
+
+        driver, invoke, _sleeps, _logs = self._lock_race_driver(
+            [refused, refused],
+            sleeper=session_deadline_during_sleep,
+        )
+        holder["driver"] = driver
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, BrowserErrorCode.PROFILE_IN_USE.value)
+        self.assertEqual(invoke.call_count, 1)
+
+    def test_profile_lock_retry_respects_its_time_budget(self) -> None:
+        refused = BrowserOperationResult(error=BrowserErrorCode.PROFILE_IN_USE.value)
+        ticks = iter([0.0, 0.0, 30.0, 30.0])
+        driver, invoke, sleeps, _logs = self._lock_race_driver(
+            [refused, refused, refused],
+            clock=lambda: next(ticks, 30.0),
+        )
+
+        result = driver.collect()
+
+        # First retry fits the budget; the slow relaunch used it up.
+        self.assertEqual(result.error, BrowserErrorCode.PROFILE_IN_USE.value)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(sleeps, [2.0])
+
+    def test_shutdown_wakes_the_profile_lock_retry_wait(self) -> None:
+        refused = BrowserOperationResult(error=BrowserErrorCode.PROFILE_IN_USE.value)
+        driver = CodexUsagePlaywrightProcessDriver(
+            self.config,
+            profile_lock_retry_delays_sec=(30.0,),
+        )
+        driver._recycle_worker_if_needed = lambda: None
+        driver._has_live_worker = lambda: True
+        invoke = Mock(side_effect=[refused, refused])
+        driver._invoke_locked = invoke
+        results: list[BrowserOperationResult] = []
+        collector = threading.Thread(target=lambda: results.append(driver.collect()))
+        started = time.monotonic()
+        collector.start()
+        time.sleep(0.2)
+
+        driver.shutdown()
+        collector.join(5.0)
+
+        self.assertFalse(collector.is_alive())
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(results[0].error, BrowserErrorCode.PROFILE_IN_USE.value)
+        commands = [call.args[0] for call in invoke.call_args_list]
+        self.assertEqual(commands.count("collect"), 1)
+
+    def test_collect_profile_lock_retry_is_bounded(self) -> None:
+        refused = BrowserOperationResult(error=BrowserErrorCode.PROFILE_IN_USE.value)
+        driver, invoke, sleeps, _logs = self._lock_race_driver([refused, refused, refused])
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, BrowserErrorCode.PROFILE_IN_USE.value)
+        self.assertEqual(invoke.call_count, 3)
+        self.assertEqual(sleeps, [2.0, 4.0])
+
+    def test_collect_does_not_retry_other_failures(self) -> None:
+        driver, invoke, sleeps, _logs = self._lock_race_driver(
+            [BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)]
+        )
+
+        result = driver.collect()
+
+        self.assertEqual(result.error, BrowserErrorCode.COLLECT_FAILED.value)
+        self.assertEqual(invoke.call_count, 1)
+        self.assertEqual(sleeps, [])
 
     def test_spawn_waits_until_concurrent_job_termination_is_complete(self) -> None:
         process_context = Mock()
