@@ -10,6 +10,7 @@ import queue
 import socket
 import ssl
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest.mock import MagicMock, Mock, patch
@@ -1444,7 +1445,28 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__show_tooltip = capture_tooltip
         return wrike, tooltips
 
-    def _run_flex_sync_once(self, wrike: Wrike, outcome, *, announce: bool = False):
+    @staticmethod
+    def _flex_submit(outcome, login_outcome=(True, None)) -> Mock:
+        """Browser-job stand-in: ``login`` jobs get ``login_outcome``."""
+
+        def respond(kind, payload=None, **_kwargs):
+            _ = payload
+            return login_outcome if kind == "login" else outcome
+
+        return Mock(side_effect=respond)
+
+    @staticmethod
+    def _flex_calls(submit: Mock, kind: str) -> list:
+        return [call for call in submit.call_args_list if call.args[0] == kind]
+
+    def _run_flex_sync_once(
+        self,
+        wrike: Wrike,
+        outcome,
+        *,
+        announce: bool = False,
+        login_outcome=(True, None),
+    ):
         started = []
 
         class _ArgsThread:
@@ -1456,7 +1478,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             def start(self):
                 return None
 
-        submit = Mock(return_value=outcome)
+        submit = self._flex_submit(outcome, login_outcome)
         wrike._Wrike__submit_flex_browser_job = submit
         with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
             self.assertTrue(
@@ -1468,6 +1490,41 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__drain_ui_queue()
         return submit
 
+    def _run_flex_window_event(
+        self,
+        wrike: Wrike,
+        event: str,
+        mode: str,
+        detail=None,
+        *,
+        sync_outcome=None,
+        login_outcome=(True, None),
+    ):
+        """Deliver a worker window event; run the sync it starts, if any."""
+
+        started = []
+
+        class _ArgsThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                started.append(self)
+
+            def start(self):
+                return None
+
+        submit = self._flex_submit(sync_outcome, login_outcome)
+        wrike._Wrike__submit_flex_browser_job = submit
+        with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
+            wrike._Wrike__apply_flex_window_event(event, mode, detail)
+            index = 0
+            while index < len(started):
+                thread = started[index]
+                index += 1
+                thread.target(*thread.args)
+                wrike._Wrike__drain_ui_queue()
+        return submit, started
+
     def _wrike_log_lines(self) -> list[str]:
         log_path = self.appdata / "windows-supporter" / "wrike.log"
         if not log_path.exists():
@@ -1477,18 +1534,22 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             for line in log_path.read_text(encoding="utf-8").splitlines()
         ]
 
-    def test_flex_login_expiry_is_named_in_panel_and_announced_once(self) -> None:
+    def test_flex_login_expiry_opens_the_login_window_once_per_expiry(self) -> None:
         wrike, tooltips = self._flex_ready_wrike()
-        login_required = (
-            "Flex 로그인이 필요합니다. 설정에서 'Flex 웹 열기'를 눌러 로그인한 뒤 "
-            "백그라운드 동기화를 다시 실행해 주세요.",
-            "login_required",
-        )
+        login_required = ("Flex 로그인이 필요합니다.", "login_required")
 
         submit = self._run_flex_sync_once(wrike, (False, login_required))
 
         # Periodic syncs mark themselves as background reads.
-        self.assertTrue(submit.call_args.args[1][4])
+        self.assertTrue(self._flex_calls(submit, "sync")[-1].args[1][4])
+        login_calls = self._flex_calls(submit, "login")
+        self.assertEqual(len(login_calls), 1)
+        # A background expiry opens the window without taking the foreground
+        # and without blocking the Tk thread on the browser launch.
+        self.assertEqual(
+            login_calls[0].args[1], {"source": "periodic", "activate": False}
+        )
+        self.assertFalse(login_calls[0].kwargs["wait"])
         status = wrike._Wrike__flex_status_snapshot()
         self.assertEqual(status["state"], "error")
         self.assertEqual(status["error_code"], "login_required")
@@ -1496,11 +1557,24 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIn("Flex 로그인 필요", model.sync_text)
         self.assertNotIn("Flex error", model.sync_text)
         self.assertEqual(model.sync_state, "warning")
-        self.assertEqual([item[0] for item in tooltips], ["Flex 로그인 필요"])
-        self.assertIn("Flex 웹 열기", tooltips[0][1][1][0])
+        # The notice waits for the worker to report the window.
+        self.assertEqual(tooltips, [])
 
-        # The 5-minute retry keeps failing: no second popup, no log spam.
-        self._run_flex_sync_once(wrike, (False, login_required))
+        self._run_flex_window_event(
+            wrike, "opened", "login", {"result": "opened", "source": "periodic"}
+        )
+        self.assertEqual([item[0] for item in tooltips], ["Flex 로그인 필요"])
+        self.assertIn("로그인 창을 열었습니다", tooltips[0][1][0][0])
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertTrue(status["login_window_open"])
+        self.assertIn("열린 Flex 로그인 창", status["error"])
+        self.assertIn(
+            "flex login window opened: source=periodic", self._wrike_log_lines()
+        )
+
+        # The 5-minute retry keeps failing: no second window, no log spam.
+        submit = self._run_flex_sync_once(wrike, (False, login_required))
+        self.assertEqual(self._flex_calls(submit, "login"), [])
         self.assertEqual(len(tooltips), 1)
         self.assertEqual(
             self._wrike_log_lines().count("flex sync failed: code=login_required"),
@@ -1511,6 +1585,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         status = wrike._Wrike__flex_status_snapshot()
         self.assertEqual(status["state"], "fresh")
         self.assertEqual(status["error_code"], "")
+        self.assertFalse(status["login_window_open"])
         self.assertIn(
             "flex sync recovered after code=login_required",
             self._wrike_log_lines(),
@@ -1519,21 +1594,443 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIn("Flex fresh", model.sync_text)
         self.assertNotEqual(model.sync_state, "warning")
 
-        # The next expiry is announced again.
-        self._run_flex_sync_once(wrike, (False, login_required))
-        self.assertEqual(len(tooltips), 2)
+        # The next expiry opens the window again.
+        submit = self._run_flex_sync_once(wrike, (False, login_required))
+        self.assertEqual(len(self._flex_calls(submit, "login")), 1)
 
-    def test_manual_flex_sync_reports_failure_without_extra_login_notice(self) -> None:
+    def test_manual_flex_sync_login_expiry_opens_the_login_window_in_front(self) -> None:
         wrike, tooltips = self._flex_ready_wrike()
+        login_required = (False, ("Flex 로그인이 필요합니다.", "login_required"))
+
+        submit = self._run_flex_sync_once(wrike, login_required, announce=True)
+
+        self.assertFalse(self._flex_calls(submit, "sync")[-1].args[1][4])
+        login_calls = self._flex_calls(submit, "login")
+        self.assertEqual(len(login_calls), 1)
+        self.assertEqual(
+            login_calls[0].args[1], {"source": "manual", "activate": True}
+        )
+        # "Flex 로그인 · 지금 동기화" reports the login window, not a failure.
+        self.assertEqual(tooltips, [])
+        self.assertIn(
+            "로그인 창을 여는 중", wrike._Wrike__flex_status_snapshot()["error"]
+        )
+
+        # Every explicit click opens it, even within the same expiry.
+        submit = self._run_flex_sync_once(wrike, login_required, announce=True)
+        self.assertEqual(len(self._flex_calls(submit, "login")), 1)
+        self.assertEqual(tooltips, [])
+
+    def test_flex_login_finished_in_the_window_syncs_and_announces_it(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        )
+        self._run_flex_window_event(
+            wrike, "opened", "login", {"result": "opened", "source": "periodic"}
+        )
+        schedule_day = date(2026, 4, 6)
+
+        submit, started = self._run_flex_window_event(
+            wrike,
+            "logged_in",
+            "login",
+            sync_outcome=(True, {schedule_day: object()}),
+        )
+
+        sync_calls = self._flex_calls(submit, "sync")
+        self.assertEqual(len(sync_calls), 1)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(self._flex_calls(submit, "login"), [])
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "fresh")
+        self.assertFalse(status["login_window_open"])
+        self.assertEqual(tooltips[-1][0], "Flex 로그인 완료")
+        self.assertIn("근무 일정 1일 반영", tooltips[-1][1][0][0])
+        self.assertIn(
+            "flex login finished in the app login window", self._wrike_log_lines()
+        )
+
+    def test_flex_login_window_closed_without_login_syncs_once_without_reopening(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        login_required = (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        self._run_flex_sync_once(wrike, login_required)
+        self._run_flex_window_event(
+            wrike, "opened", "login", {"result": "opened", "source": "periodic"}
+        )
+
+        submit, _started = self._run_flex_window_event(
+            wrike, "closed", "login", sync_outcome=login_required
+        )
+
+        self.assertEqual(len(self._flex_calls(submit, "sync")), 1)
+        # Closed by the employee: the same expiry does not reopen it.
+        self.assertEqual(self._flex_calls(submit, "login"), [])
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "error")
+        self.assertFalse(status["login_window_open"])
+        self.assertIn("Flex 로그인 · 지금 동기화", status["error"])
+        self.assertEqual([item[0] for item in tooltips], ["Flex 로그인 필요"])
+        self.assertIn("flex window closed: mode=login", self._wrike_log_lines())
+
+    def test_flex_login_not_kept_after_the_window_does_not_reopen_it(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        login_required = (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        self._run_flex_sync_once(wrike, login_required)
+        self._run_flex_window_event(
+            wrike, "opened", "login", {"result": "opened", "source": "periodic"}
+        )
+
+        submit, _started = self._run_flex_window_event(
+            wrike, "logged_in", "login", sync_outcome=login_required
+        )
+
+        self.assertEqual(self._flex_calls(submit, "login"), [])
+        self.assertEqual(tooltips[-1][0], "Flex 로그인 확인 실패")
+        # The fallback is the window the app never closes by itself.
+        self.assertIn("Flex 웹 열기", tooltips[-1][1][1][0])
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "error")
+        self.assertIn("Flex 웹 열기", status["error"])
+
+    def test_employee_window_close_triggers_an_immediate_background_sync(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+
+        submit, _started = self._run_flex_window_event(
+            wrike, "closed", "window", sync_outcome=(True, {})
+        )
+
+        sync_calls = self._flex_calls(submit, "sync")
+        self.assertEqual(len(sync_calls), 1)
+        self.assertTrue(sync_calls[0].args[1][4])
+        self.assertEqual(wrike._Wrike__flex_status_snapshot()["state"], "fresh")
+        # Not an announced sync: no tooltip for a routine refresh.
+        self.assertEqual(tooltips, [])
+
+    def test_window_event_during_a_running_sync_resyncs_after_it(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        started = []
+
+        class _ArgsThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                started.append(self)
+
+            def start(self):
+                return None
+
+        deferred = (
+            False,
+            ("Flex 창이 열려 있어 백그라운드 동기화를 미뤘습니다.", "login_window_open"),
+        )
+        outcomes = [deferred, (True, {})]
+
+        def respond(kind, payload=None, **_kwargs):
+            _ = payload
+            return outcomes.pop(0) if kind == "sync" else (True, None)
+
+        submit = Mock(side_effect=respond)
+        wrike._Wrike__submit_flex_browser_job = submit
+        with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
+            self.assertTrue(wrike._Wrike__request_flex_sync(force=True))
+            # The employee closes the window while that sync is in flight.
+            wrike._Wrike__apply_flex_window_event("closed", "window", None)
+            self.assertEqual(len(started), 1)
+            started[0].target(*started[0].args)
+            wrike._Wrike__drain_ui_queue()
+            self.assertEqual(len(started), 2)
+            self.assertEqual(started[1].args[3], "window_closed")
+            started[1].target(*started[1].args)
+            wrike._Wrike__drain_ui_queue()
+
+        self.assertEqual(len(self._flex_calls(submit, "sync")), 2)
+        self.assertEqual(wrike._Wrike__flex_status_snapshot()["state"], "fresh")
+
+    def test_login_pending_deferral_keeps_login_required_on_the_panel(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        )
+        pending = (
+            False,
+            (
+                "Flex 로그인 창에서 로그인을 기다리고 있어 백그라운드 동기화를 미뤘습니다.",
+                "login_pending",
+            ),
+        )
+
+        self._run_flex_sync_once(wrike, pending)
+        self._run_flex_sync_once(wrike, pending)
+
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "deferred")
+        self.assertEqual(status["error_code"], "login_pending")
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex 로그인 필요", model.sync_text)
+        self.assertNotIn("동기화 대기", model.sync_text)
+        self.assertEqual(model.sync_state, "warning")
+        self.assertEqual(
+            self._wrike_log_lines().count("flex sync deferred: waiting for Flex login"),
+            1,
+        )
+
+    def test_login_window_open_failure_gives_guidance_that_can_work(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+            login_outcome=(False, ("Flex 로그인 브라우저를 시작하지 못했습니다.", "worker_start_failed")),
+        )
+
+        self.assertEqual([item[0] for item in tooltips], ["Flex 로그인 필요"])
+        # The app's browser failed: 'Flex 웹 열기' would fail the same way.
+        guidance = tooltips[0][1][1][0]
+        self.assertIn("앱을 다시 시작한 뒤", guidance)
+        self.assertIn("'Flex 로그인 · 지금 동기화'", guidance)
+        self.assertNotIn("Flex 웹 열기", guidance)
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertFalse(status["login_window_open"])
+        self.assertIn("앱을 다시 시작한 뒤", status["error"])
+        self.assertIn(
+            "flex login window open failed: code=worker_start_failed source=periodic",
+            self._wrike_log_lines(),
+        )
+
+        # A navigation failure means Flex did not answer, not a broken browser.
+        self._run_flex_window_event(
+            wrike,
+            "open_failed",
+            "login",
+            {"code": "navigation_failed", "source": "manual"},
+        )
+        self.assertIn("네트워크를 확인한 뒤", tooltips[-1][1][1][0])
+
+    def test_manual_sync_while_the_login_window_waits_points_to_it(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        )
+        self._run_flex_window_event(
+            wrike, "opened", "login", {"result": "opened", "source": "periodic"}
+        )
 
         submit = self._run_flex_sync_once(
             wrike,
-            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+            (
+                False,
+                ("Flex 로그인 창에서 로그인을 기다리고 있어 백그라운드 동기화를 미뤘습니다.", "login_pending"),
+            ),
             announce=True,
         )
 
-        self.assertFalse(submit.call_args.args[1][4])
-        self.assertEqual([item[0] for item in tooltips], ["Flex 동기화 실패"])
+        self.assertEqual(self._flex_calls(submit, "login"), [])
+        self.assertEqual(tooltips[-1][0], "Flex 로그인 필요")
+        self.assertIn("열려 있는 Flex 로그인 창", tooltips[-1][1][0][0])
+        self.assertTrue(wrike._Wrike__flex_status_snapshot()["login_window_open"])
+
+    def test_manual_login_expiry_keeps_the_settings_view_waiting_for_the_window(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        # No "opened" event yet: the worker is still launching Chromium.
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required")), announce=True
+        )
+
+        class _Backend:
+            def get_settings_snapshot(self):
+                return {
+                    "flex_employee_number": "E-42",
+                    "flex_status": wrike._Wrike__flex_status_snapshot(),
+                }
+
+        class _Var:
+            def __init__(self):
+                self.value = ""
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class _Label:
+            def configure(self, **_kwargs):
+                return None
+
+        class _Win:
+            def __init__(self):
+                self.after_delays = []
+
+            def after(self, delay, _callback):
+                self.after_delays.append(int(delay))
+                return "after-1"
+
+        view = WrikeSettingsView(None, _Backend())
+        view._win = _Win()
+        view._status_var = _Var()
+        view._status_label = _Label()
+        view._flex_status_var = _Var()
+        view._flex_sync_feedback_active = True
+        view._flex_status_poll_started_at = time.monotonic()
+
+        view._poll_flex_status()
+
+        self.assertNotIn("실패", view._status_var.get())
+        self.assertIn("로그인 창을 여는 중", view._status_var.get())
+        self.assertTrue(view._flex_sync_feedback_active)
+        self.assertEqual(view._win.after_delays, [1500])
+
+    def test_replaced_window_logs_why_it_went_away(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+
+        self._run_flex_window_event(
+            wrike, "replaced", "window", {"reason": "window_closed"}
+        )
+        self._run_flex_window_event(
+            wrike, "replaced", "window", {"reason": "explicit_sync"}
+        )
+
+        log_lines = self._wrike_log_lines()
+        self.assertIn("flex window closed before a background sync: mode=window", log_lines)
+        self.assertIn("flex window replaced by an explicit sync: mode=window", log_lines)
+
+    def test_stopping_or_disabling_flex_closes_the_apps_login_window(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+
+        class _AliveThread:
+            def is_alive(self):
+                return True
+
+        jobs: queue.Queue = queue.Queue()
+        wrike._Wrike__flex_browser_worker_thread = _AliveThread()
+        wrike._Wrike__flex_browser_queue = jobs
+        wrike._Wrike__flex_login_window_open = True
+
+        # The dashboard background toggle stops Wrike without a shutdown.
+        wrike.stop_background()
+
+        self.assertEqual(jobs.get_nowait()[0], "close_login")
+        self.assertFalse(wrike._Wrike__flex_status_snapshot()["login_window_open"])
+
+        wrike._Wrike__background_active = True
+        wrike._Wrike__submit_flex_browser_job = self._flex_submit((True, {}))
+        ok, error = wrike.update_settings({"flex_enabled": False})
+        self.assertTrue(ok, error)
+        kinds = []
+        while not jobs.empty():
+            kinds.append(jobs.get_nowait()[0])
+        self.assertIn("close_login", kinds)
+
+    def test_login_window_opened_after_a_stop_is_closed_without_a_notice(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        )
+
+        class _AliveThread:
+            def is_alive(self):
+                return True
+
+        jobs: queue.Queue = queue.Queue()
+        wrike._Wrike__flex_browser_worker_thread = _AliveThread()
+        wrike._Wrike__flex_browser_queue = jobs
+
+        wrike.stop_background()
+
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertFalse(status["login_window_open"])
+        # No promise of a window that the stop just closed.
+        self.assertNotIn("여는 중", status["error"])
+        self.assertIn("Flex 로그인 · 지금 동기화", status["error"])
+        while not jobs.empty():
+            jobs.get_nowait()
+
+        # The login job queued before the stop still reports its window.
+        wrike._Wrike__apply_flex_window_event(
+            "opened", "login", {"result": "opened", "source": "periodic"}
+        )
+
+        self.assertEqual(tooltips, [])
+        self.assertFalse(wrike._Wrike__flex_status_snapshot()["login_window_open"])
+        self.assertEqual(jobs.get_nowait()[0], "close_login")
+        self.assertIn(
+            "flex login window opened after background stopped; closing: source=periodic",
+            self._wrike_log_lines(),
+        )
+
+    def test_close_request_never_starts_a_worker(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        self.assertIsNone(wrike._Wrike__flex_browser_worker_thread)
+
+        wrike.stop_background()
+
+        self.assertIsNone(wrike._Wrike__flex_browser_worker_thread)
+        self.assertTrue(wrike._Wrike__flex_browser_queue.empty())
+
+    def test_stop_background_drops_a_pending_window_follow_up(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        started = []
+
+        class _ArgsThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                started.append(self)
+
+            def start(self):
+                return None
+
+        wrike._Wrike__submit_flex_browser_job = self._flex_submit((True, {}))
+        with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
+            self.assertTrue(wrike._Wrike__request_flex_sync(force=True))
+            wrike._Wrike__apply_flex_window_event("closed", "window", None)
+        self.assertEqual(wrike._Wrike__flex_resync_pending, "window_closed")
+
+        wrike.stop_background()
+
+        self.assertEqual(wrike._Wrike__flex_resync_pending, "")
+
+    def test_login_expiry_with_an_open_employee_window_waits_for_that_window(self) -> None:
+        wrike, tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        )
+
+        self._run_flex_window_event(
+            wrike, "opened", "login", {"result": "already_open", "source": "periodic"}
+        )
+
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertTrue(status["login_window_open"])
+        self.assertIn("열려 있는 Flex 창", status["error"])
+        self.assertIn("열려 있는 Flex 창", tooltips[-1][1][0][0])
+        self.assertIn(
+            "flex login window already open: source=periodic",
+            self._wrike_log_lines(),
+        )
+
+        self._run_flex_window_event(
+            wrike, "closed", "window", sync_outcome=(True, {})
+        )
+        status = wrike._Wrike__flex_status_snapshot()
+        self.assertEqual(status["state"], "fresh")
+        self.assertFalse(status["login_window_open"])
+
+    def test_replaced_login_window_is_not_treated_as_an_employee_close(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        )
+        self._run_flex_window_event(
+            wrike, "opened", "login", {"result": "opened", "source": "periodic"}
+        )
+
+        submit, started = self._run_flex_window_event(wrike, "replaced", "login")
+
+        self.assertEqual(started, [])
+        self.assertEqual(submit.call_args_list, [])
+        self.assertFalse(wrike._Wrike__flex_status_snapshot()["login_window_open"])
 
     def test_other_flex_failures_keep_their_code_visible(self) -> None:
         wrike, tooltips = self._flex_ready_wrike()
@@ -1573,7 +2070,9 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         model = wrike._Wrike__build_worktime_panel_model()
         self.assertIn("Flex 창 열림 · 동기화 대기", model.sync_text)
         self.assertNotEqual(model.sync_state, "warning")
-        self.assertEqual(len(tooltips), 1)
+        # The login window was requested once; its notice comes with the
+        # worker's "opened" event, which this test does not deliver.
+        self.assertEqual(tooltips, [])
         log_lines = self._wrike_log_lines()
         self.assertEqual(
             log_lines.count("flex sync deferred: headed Flex window is open"),
@@ -1581,17 +2080,37 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(log_lines.count("flex sync failed: code=login_required"), 1)
 
-        # After the window closes the next failure is a new episode: logged,
-        # but the already-shown login notice is not repeated.
-        self._run_flex_sync_once(
+        # The deferrals read nothing, so the same failure after the window
+        # closes is the same failure: not logged again, and the same expiry
+        # does not open a second login window.
+        submit = self._run_flex_sync_once(
             wrike,
             (False, ("Flex 로그인이 필요합니다.", "login_required")),
         )
         self.assertEqual(
             self._wrike_log_lines().count("flex sync failed: code=login_required"),
-            2,
+            1,
         )
-        self.assertEqual(len(tooltips), 1)
+        self.assertEqual(self._flex_calls(submit, "login"), [])
+        self.assertEqual(tooltips, [])
+
+    def test_recovery_after_a_deferred_login_wait_is_logged(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike, (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        )
+        pending = (
+            False,
+            ("Flex 로그인 창에서 로그인을 기다리고 있어 백그라운드 동기화를 미뤘습니다.", "login_pending"),
+        )
+        self._run_flex_sync_once(wrike, pending)
+
+        self._run_flex_sync_once(wrike, (True, {}))
+
+        self.assertIn(
+            "flex sync recovered after code=login_required",
+            self._wrike_log_lines(),
+        )
 
     def test_flex_reconfiguration_logs_the_new_configurations_first_failure(self) -> None:
         wrike, _tooltips = self._flex_ready_wrike()

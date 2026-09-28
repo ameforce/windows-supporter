@@ -66,6 +66,7 @@ from src.apps.flex_worktime import (
     FLEX_BROWSER_PROFILE_DIR_NAME,
     FLEX_LOGIN_ERROR_CODES,
     FLEX_SYNC_DEFERRED_CODE,
+    FLEX_SYNC_LOGIN_PENDING_CODE,
     FLEX_WEB_URL,
     FlexBrowserClient,
     FlexBrowserError,
@@ -104,6 +105,28 @@ from src.apps.wrike_worktime_panel import (
 from src.apps.worktime_activity import (
     LastInputUnavailableError,
     WorktimeActivityWatcher,
+)
+
+
+# While a headed Flex window is open the browser worker checks it this often:
+# a closed window or a finished login in the app's login window triggers an
+# immediate sync instead of waiting for the next poll.
+FLEX_WINDOW_WATCH_INTERVAL_SEC = 1.0
+# Consecutive logged-in observations before the app closes its login window.
+# One observation can be a page that redirects to the login screen a moment
+# later.
+FLEX_LOGIN_STABLE_PROBES = 2
+# Who asked for a Flex sync.  It decides whether the result is announced and
+# whether a login expiry opens the login window.
+FLEX_SYNC_SOURCE_PERIODIC = "periodic"
+FLEX_SYNC_SOURCE_MANUAL = "manual"
+FLEX_SYNC_SOURCE_AFTER_LOGIN = "after_login"
+FLEX_SYNC_SOURCE_WINDOW_CLOSED = "window_closed"
+FLEX_SYNC_ANNOUNCED_SOURCES = frozenset(
+    {FLEX_SYNC_SOURCE_MANUAL, FLEX_SYNC_SOURCE_AFTER_LOGIN}
+)
+FLEX_SYNC_DEFERRED_CODES = frozenset(
+    {FLEX_SYNC_DEFERRED_CODE, FLEX_SYNC_LOGIN_PENDING_CODE}
 )
 
 
@@ -329,8 +352,19 @@ class Wrike:
         # (state, error, error_code) before the in-flight sync switched the
         # state to "loading"; used to log each failure/recovery only once.
         self.__flex_status_before_sync = ("unconfigured", "", "")
+        # Set when a login expiry opened (or asked to open) the login window;
+        # cleared by the next successful sync.  One window per expiry.
         self.__flex_login_notice_shown = False
-        self.__flex_sync_deferral_logged = False
+        # The deferral code already logged in the current deferral streak.
+        self.__flex_sync_deferral_logged = ""
+        # True between the worker's "opened" event for a login (its own login
+        # window or an already open Flex window) and the event that ends it
+        # ("closed", "logged_in", "replaced", "open_failed") or a successful
+        # sync.
+        self.__flex_login_window_open = False
+        # A sync requested by a window event while another sync was running;
+        # it runs as soon as that one finishes.
+        self.__flex_resync_pending = ""
         self.__flex_schedule_lock = threading.RLock()
         self.__flex_schedule_by_date: dict = {}
         self.__overtime_notice_after_id = None
@@ -781,11 +815,45 @@ class Wrike:
     def __flex_browser_worker_loop(self) -> None:
         client = None
         client_headless = None
+        # What the open headed window is watched for: ``"window"`` is a window
+        # the employee opened (report when it closes); ``"login"`` is the
+        # app's login window (also report when the login finished).
+        watch_mode = None
+        login_stable = 0
         while True:
+            watching = (
+                client is not None
+                and client_headless is False
+                and watch_mode is not None
+            )
             try:
-                kind, payload, response_queue = self.__flex_browser_queue.get()
+                if watching:
+                    item = self.__flex_browser_queue.get(
+                        timeout=max(0.01, float(FLEX_WINDOW_WATCH_INTERVAL_SEC))
+                    )
+                else:
+                    item = self.__flex_browser_queue.get()
+            except queue.Empty:
+                outcome, login_stable = self.__watch_flex_window(
+                    client,
+                    watch_mode,
+                    login_stable,
+                )
+                if outcome:
+                    finished_mode = watch_mode
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = None
+                    client_headless = None
+                    watch_mode = None
+                    login_stable = 0
+                    self.__notify_flex_window_event(outcome, finished_mode)
+                continue
             except Exception:
                 return
+            kind, payload, response_queue = item
             if kind == "close":
                 if client is not None:
                     try:
@@ -799,55 +867,141 @@ class Wrike:
                 except Exception:
                     pass
                 return
+            if kind == "close_login":
+                # Background stopped or Flex disabled: nothing will sync after
+                # the login, so the app's own login window goes away.  An
+                # employee window stays.
+                closed = False
+                if (
+                    client is not None
+                    and client_headless is False
+                    and watch_mode == "login"
+                ):
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = None
+                    client_headless = None
+                    watch_mode = None
+                    login_stable = 0
+                    closed = True
+                try:
+                    response_queue.put((True, closed))
+                except Exception:
+                    pass
+                continue
             sync_job = kind == "sync"
-            # A sync is always a background read.  The only headed browser
-            # operation is the explicit ``open`` command used for login.
+            login_job = kind == "login"
+            login_source = ""
+            login_activate = False
+            if login_job and isinstance(payload, dict):
+                login_source = str(payload.get("source") or "")
+                login_activate = bool(payload.get("activate"))
+            # A sync is always a background read.  Headed browsers are only
+            # the employee's ``open`` window and the app's ``login`` window.
             desired_headless = bool(sync_job)
             deferred = False
+            background_sync = sync_job and self.__flex_sync_payload_is_background(
+                payload
+            )
             try:
-                if (
-                    sync_job
-                    and self.__flex_sync_payload_is_background(payload)
-                    and client is not None
-                    and client_headless is False
-                    and client.has_open_page()
-                ):
-                    # The headed window is the employee's (login/SSO or
-                    # overtime registration).  A periodic sync must not close
-                    # it; the next tick after the window closes reads Flex.
-                    deferred = True
-                    response_queue.put(
-                        (
-                            False,
-                            (
-                                "Flex 창이 열려 있어 백그라운드 동기화를 미뤘습니다.",
-                                FLEX_SYNC_DEFERRED_CODE,
-                            ),
+                defer_sync = False
+                if sync_job and client is not None and client_headless is False:
+                    if background_sync:
+                        defer_sync = client.has_open_page()
+                    elif watch_mode == "login":
+                        # An explicit sync replaces an employee window, but the
+                        # app's login window may hold a login step in progress
+                        # on a session known to be expired: surface it.  With
+                        # no login step left on screen the click confirms a
+                        # finished login, so the window is replaced and read.
+                        defer_sync = (
+                            client.has_open_page() and client.login_in_progress()
                         )
-                    )
+                if defer_sync:
+                    # The headed window is in use (login/SSO or overtime
+                    # registration).  A periodic sync must not close it; the
+                    # watch below syncs as soon as it closes or logs in.
+                    deferred = True
+                    if not background_sync:
+                        try:
+                            client.focus_window()
+                        except Exception:
+                            pass
+                    if watch_mode == "login":
+                        deferral = (
+                            "Flex 로그인 창에서 로그인을 기다리고 있어 백그라운드 동기화를 미뤘습니다. "
+                            "로그인 뒤에도 창이 남아 있으면 창을 닫아 주세요.",
+                            FLEX_SYNC_LOGIN_PENDING_CODE,
+                        )
+                    else:
+                        deferral = (
+                            "Flex 창이 열려 있어 백그라운드 동기화를 미뤘습니다.",
+                            FLEX_SYNC_DEFERRED_CODE,
+                        )
+                    response_queue.put((False, deferral))
                     continue
                 if (
-                    kind == "open"
+                    kind in ("open", "login")
                     and client is not None
                     and client_headless is False
                     and not client.has_open_page()
                 ):
-                    # The employee closed the previous Flex window; reopening
-                    # must start a new headed browser instead of failing on
-                    # the closed one and falling back to the system browser.
+                    # The previous Flex window was closed; reopening must
+                    # start a new headed browser instead of failing on the
+                    # closed one and falling back to the system browser.
                     try:
                         client.close()
                     except Exception:
                         pass
                     client = None
                     client_headless = None
+                    watch_mode = None
+                    login_stable = 0
+                if login_job and client is not None and client_headless is False:
+                    # The employee already has a Flex window open.  Do not
+                    # take it over or navigate it; closing it syncs.
+                    if watch_mode is None:
+                        watch_mode = "window"
+                    if login_activate:
+                        try:
+                            client.focus_window()
+                        except Exception:
+                            pass
+                    response_queue.put((True, "already_open"))
+                    self.__notify_flex_window_event(
+                        "opened",
+                        "login",
+                        {"result": "already_open", "source": login_source},
+                    )
+                    continue
                 if client is not None and client_headless != desired_headless:
+                    replaced_mode = watch_mode
                     try:
                         client.close()
                     except Exception:
                         pass
                     client = None
                     client_headless = None
+                    watch_mode = None
+                    login_stable = 0
+                    if replaced_mode is not None:
+                        # Either an explicit sync closed an employee window or
+                        # a background sync found the window already closed
+                        # before the watch saw it.  The running sync is the
+                        # follow-up in both cases, so this is not a "closed".
+                        self.__notify_flex_window_event(
+                            "replaced",
+                            replaced_mode,
+                            {
+                                "reason": (
+                                    "window_closed"
+                                    if background_sync
+                                    else "explicit_sync"
+                                )
+                            },
+                        )
                 if client is None:
                     if not self.__ensure_playwright_ready():
                         raise FlexBrowserError(
@@ -864,6 +1018,15 @@ class Wrike:
                 if kind == "open":
                     client.open_work_record_page()
                     result = None
+                    # An explicit open is the employee's window: it stays
+                    # open after a login, even if the app opened it first.
+                    watch_mode = "window"
+                    login_stable = 0
+                elif login_job:
+                    client.open_login_page(activate=login_activate)
+                    result = "opened"
+                    watch_mode = "login"
+                    login_stable = 0
                 elif kind == "sync":
                     begin_date, end_date, employee_number, now = payload[:4]
                     result = client.fetch_schedule_period(
@@ -876,23 +1039,57 @@ class Wrike:
                 else:
                     raise FlexBrowserError("알 수 없는 Flex 브라우저 작업입니다.", code="invalid_command")
                 response_queue.put((True, result))
+                if login_job:
+                    self.__notify_flex_window_event(
+                        "opened",
+                        "login",
+                        {"result": result, "source": login_source},
+                    )
             except FlexBrowserError as exc:
+                code = str(exc.code or "browser_error")
                 try:
-                    response_queue.put((False, (str(exc), str(exc.code or "browser_error"))))
+                    response_queue.put((False, (str(exc), code)))
                 except Exception:
                     pass
+                client, client_headless, watch_mode = self.__watch_failed_flex_open(
+                    kind, client, client_headless, watch_mode
+                )
+                if login_job:
+                    client, client_headless, watch_mode, login_stable = (
+                        self.__discard_failed_flex_login_client(
+                            client, client_headless, watch_mode
+                        )
+                    )
+                    self.__notify_flex_window_event(
+                        "open_failed",
+                        "login",
+                        {"code": code, "source": login_source},
+                    )
             except Exception as exc:
                 self.__log_exception("flex browser worker failed", exc)
                 try:
                     response_queue.put((False, ("Flex 브라우저 동기화에 실패했습니다.", "unexpected_error")))
                 except Exception:
                     pass
+                client, client_headless, watch_mode = self.__watch_failed_flex_open(
+                    kind, client, client_headless, watch_mode
+                )
+                if login_job:
+                    client, client_headless, watch_mode, login_stable = (
+                        self.__discard_failed_flex_login_client(
+                            client, client_headless, watch_mode
+                        )
+                    )
+                    self.__notify_flex_window_event(
+                        "open_failed",
+                        "login",
+                        {"code": "unexpected_error", "source": login_source},
+                    )
             finally:
                 # Sync contexts are bounded and never visible.  Close them on
                 # both success and failure so a retry always starts from a
-                # clean background context.  The explicit ``open`` command is
-                # the only operation that intentionally keeps a headed page,
-                # and a deferred sync leaves that headed page untouched.
+                # clean background context.  Only ``open``/``login`` keep a
+                # headed page, and a deferred sync leaves it untouched.
                 if sync_job and client is not None and not deferred:
                     try:
                         client.close()
@@ -900,7 +1097,88 @@ class Wrike:
                         pass
                     client = None
                     client_headless = None
+                    watch_mode = None
+                    login_stable = 0
         return
+
+    @staticmethod
+    def __watch_failed_flex_open(kind, client, client_headless, watch_mode):
+        """Return ``(client, client_headless, watch_mode)`` after a failed open.
+
+        A page left up (for example after a navigation timeout) is watched
+        like any employee window, so its close syncs and ends the deferral.
+        A client without a page (the browser never launched) is dropped
+        instead of being reported as a window the employee closed.
+        """
+
+        if (
+            kind != "open"
+            or client is None
+            or client_headless is not False
+            or watch_mode is not None
+        ):
+            return client, client_headless, watch_mode
+        try:
+            has_page = bool(client.has_open_page())
+        except Exception:
+            has_page = False
+        if has_page:
+            return client, client_headless, "window"
+        try:
+            client.close()
+        except Exception:
+            pass
+        return None, None, None
+
+    @staticmethod
+    def __discard_failed_flex_login_client(client, client_headless, watch_mode):
+        """Close a login window that failed to open; keep an employee window."""
+
+        if client is not None and client_headless is False and watch_mode != "window":
+            try:
+                client.close()
+            except Exception:
+                pass
+            return None, None, None, 0
+        return client, client_headless, watch_mode, 0
+
+    def __watch_flex_window(self, client, watch_mode, login_stable: int):
+        """Return ``(outcome, login_stable)`` for one check of a headed window.
+
+        ``outcome`` is ``"closed"`` when no page is left, ``"logged_in"`` when
+        the app's login window showed a logged-in Flex page on consecutive
+        checks, and ``""`` otherwise.  Runs on the browser worker thread.
+        """
+
+        try:
+            if not client.has_open_page():
+                return "closed", 0
+            if watch_mode != "login":
+                return "", 0
+            if not client.login_completed():
+                return "", 0
+        except Exception as exc:
+            self.__log_exception("flex window watch failed", exc)
+            return "closed", 0
+        login_stable = int(login_stable) + 1
+        if login_stable >= max(1, int(FLEX_LOGIN_STABLE_PROBES)):
+            return "logged_in", 0
+        return "", login_stable
+
+    def __notify_flex_window_event(self, event: str, mode, detail=None) -> None:
+        """Hand a worker-side window event to the Tk thread (worker thread)."""
+
+        root = getattr(self, "_Wrike__root", None)
+        if root is None:
+            return
+
+        def apply_event() -> None:
+            self.__apply_flex_window_event(event, mode, detail)
+
+        try:
+            self.__ui_safe(root, apply_event)
+        except Exception:
+            pass
 
     @staticmethod
     def __flex_sync_payload_is_background(payload) -> bool:
@@ -933,6 +1211,37 @@ class Wrike:
             return response_queue.get(timeout=max(1.0, float(timeout_sec)))
         except queue.Empty:
             return False, ("Flex 브라우저 응답 시간이 초과되었습니다.", "browser_timeout")
+
+    def __close_flex_login_window(self) -> None:
+        """Close the app's own login window when nothing will sync after it.
+
+        Used when the Wrike background stops or Flex is disabled.  Never
+        starts a worker just for this, and leaves an employee window alone.
+        """
+
+        with self.__flex_schedule_lock:
+            self.__flex_login_window_open = False
+            if (
+                self.__flex_state == "error"
+                and self.__flex_last_error_code in FLEX_LOGIN_ERROR_CODES
+            ) or (
+                self.__flex_state == "deferred"
+                and self.__flex_last_error_code == FLEX_SYNC_LOGIN_PENDING_CODE
+            ):
+                # The stored text must not promise a window that is gone.
+                self.__flex_last_error = (
+                    "Flex 로그인이 필요합니다. 설정 > Wrike의 "
+                    "'Flex 로그인 · 지금 동기화'를 누르면 로그인 창을 엽니다."
+                )
+        thread = self.__flex_browser_worker_thread
+        if thread is None or not thread.is_alive():
+            return
+        try:
+            self.__flex_browser_queue.put(
+                ("close_login", None, queue.Queue(maxsize=1))
+            )
+        except Exception as exc:
+            self.__log_exception("flex login window close request failed", exc)
 
     def __close_flex_browser_worker(self) -> None:
         thread = self.__flex_browser_worker_thread
@@ -1016,13 +1325,28 @@ class Wrike:
         self.__request_flex_sync(force=True)
         self.__schedule_flex_poll()
 
+    @staticmethod
+    def __flex_sync_source(source, announce: bool) -> str:
+        value = str(source or "").strip()
+        if value in {
+            FLEX_SYNC_SOURCE_PERIODIC,
+            FLEX_SYNC_SOURCE_MANUAL,
+            FLEX_SYNC_SOURCE_AFTER_LOGIN,
+            FLEX_SYNC_SOURCE_WINDOW_CLOSED,
+        }:
+            return value
+        return FLEX_SYNC_SOURCE_MANUAL if announce else FLEX_SYNC_SOURCE_PERIODIC
+
     def __request_flex_sync(
         self,
         *,
         force: bool = False,
         announce: bool = False,
+        source: str | None = None,
     ) -> bool:
         _ = force
+        source = self.__flex_sync_source(source, announce)
+        announce = source in FLEX_SYNC_ANNOUNCED_SOURCES
         root = self.__root
         if root is None or not self.__background_active or not self.__flex_configured():
             return False
@@ -1032,7 +1356,9 @@ class Wrike:
             self.__flex_sync_generation += 1
             generation = int(self.__flex_sync_generation)
             self.__flex_sync_running = True
-            if self.__flex_state != "loading":
+            # A deferral read nothing: keep the status from before the window
+            # opened, so the failure/recovery lines compare with a real read.
+            if self.__flex_state not in {"loading", "deferred"}:
                 self.__flex_status_before_sync = (
                     str(self.__flex_state),
                     str(self.__flex_last_error or ""),
@@ -1042,7 +1368,7 @@ class Wrike:
         try:
             threading.Thread(
                 target=self.__run_flex_sync,
-                args=(generation, root, bool(announce)),
+                args=(generation, root, bool(announce), source),
                 daemon=True,
             ).start()
         except Exception:
@@ -1059,7 +1385,9 @@ class Wrike:
         generation: int,
         root,
         announce: bool = False,
+        source: str | None = None,
     ) -> None:
+        source = self.__flex_sync_source(source, announce)
         schedules = None
         detected_employee_number = ""
         error = None
@@ -1074,9 +1402,9 @@ class Wrike:
                     week_end,
                     self.__flex_employee_number,
                     now,
-                    # Periodic/startup syncs yield to an open headed window;
-                    # an explicit "지금 동기화" request keeps closing it.
-                    not bool(announce),
+                    # Only an explicit "지금 동기화" closes an open headed
+                    # window; every other sync yields to it.
+                    source != FLEX_SYNC_SOURCE_MANUAL,
                 ),
                 wait=True,
                 timeout_sec=self.__time_log_login_timeout_sec + 30.0,
@@ -1102,6 +1430,7 @@ class Wrike:
                 detected_employee_number,
                 error,
                 announce=bool(announce),
+                source=source,
             )
 
         with self.__flex_schedule_lock:
@@ -1124,22 +1453,29 @@ class Wrike:
         error: tuple[str, str] | None,
         *,
         announce: bool = False,
+        source: str | None = None,
     ) -> None:
+        source = self.__flex_sync_source(source, announce)
+        announce = source in FLEX_SYNC_ANNOUNCED_SOURCES
         error_message = ""
         error_code = ""
         deferred = False
         log_line = ""
-        notify_login_required = False
+        open_login_window = False
+        login_not_confirmed = False
+        resync_source = ""
         with self.__flex_schedule_lock:
             if generation != int(self.__flex_sync_generation):
                 return
             self.__flex_sync_running = False
+            resync_source = str(self.__flex_resync_pending or "")
+            self.__flex_resync_pending = ""
             previous_state, _previous_error, previous_code = (
                 self.__flex_status_before_sync
             )
             if error is not None:
                 error_code = self.__safe_flex_error_code(error[1] if len(error) > 1 else "")
-            if error is not None and error_code == FLEX_SYNC_DEFERRED_CODE:
+            if error is not None and error_code in FLEX_SYNC_DEFERRED_CODES:
                 # Nothing was read.  Say so explicitly instead of replaying an
                 # older status that may belong to another configuration or
                 # hide that the schedule is ageing while the window is open.
@@ -1147,27 +1483,52 @@ class Wrike:
                 self.__flex_state = "deferred"
                 self.__flex_last_error = str(error[0] or "")
                 self.__flex_last_error_code = error_code
-                if not self.__flex_sync_deferral_logged:
-                    self.__flex_sync_deferral_logged = True
-                    log_line = "flex sync deferred: headed Flex window is open"
+                if self.__flex_sync_deferral_logged != error_code:
+                    self.__flex_sync_deferral_logged = error_code
+                    log_line = (
+                        "flex sync deferred: waiting for Flex login"
+                        if error_code == FLEX_SYNC_LOGIN_PENDING_CODE
+                        else "flex sync deferred: headed Flex window is open"
+                    )
             elif error is not None:
-                self.__flex_sync_deferral_logged = False
+                self.__flex_sync_deferral_logged = ""
                 self.__flex_state = "error"
                 error_message = str(error[0] or "Flex 동기화 실패")
-                self.__flex_last_error = error_message
                 self.__flex_last_error_code = error_code
                 # One line per distinct failure, not one per 5-minute retry.
                 if previous_state != "error" or previous_code != error_code:
                     log_line = f"flex sync failed: code={error_code or 'unknown'}"
-                if (
-                    error_code in FLEX_LOGIN_ERROR_CODES
-                    and not self.__flex_login_notice_shown
-                ):
+                if error_code in FLEX_LOGIN_ERROR_CODES:
+                    if source == FLEX_SYNC_SOURCE_MANUAL:
+                        # "Flex 로그인 · 지금 동기화" asks to log in now.
+                        open_login_window = True
+                    elif source == FLEX_SYNC_SOURCE_AFTER_LOGIN:
+                        # The window looked logged in but the session is not.
+                        # Reopening here could loop; leave it to the employee.
+                        login_not_confirmed = True
+                    elif not self.__flex_login_notice_shown:
+                        # First expiry of this episode: one login window.
+                        open_login_window = True
                     self.__flex_login_notice_shown = True
-                    # A manual sync already reports its own failure below.
-                    notify_login_required = not bool(announce)
+                    if open_login_window:
+                        # The worker reports "opened"/"open_failed" seconds
+                        # later; watchers (the settings view) must already
+                        # see a login window on its way.
+                        self.__flex_login_window_open = True
+                        error_message = "Flex 로그인이 필요합니다. 로그인 창을 여는 중입니다."
+                    elif login_not_confirmed:
+                        error_message = (
+                            "Flex 로그인이 필요합니다. 설정 > Wrike의 'Flex 웹 열기'로 "
+                            "로그인한 뒤 창을 닫으면 바로 동기화합니다."
+                        )
+                    else:
+                        error_message = (
+                            "Flex 로그인이 필요합니다. 설정 > Wrike의 "
+                            "'Flex 로그인 · 지금 동기화'를 누르면 로그인 창을 엽니다."
+                        )
+                self.__flex_last_error = error_message
             else:
-                self.__flex_sync_deferral_logged = False
+                self.__flex_sync_deferral_logged = ""
                 detected_employee_number = str(
                     detected_employee_number or ""
                 ).strip()[:120]
@@ -1184,6 +1545,8 @@ class Wrike:
                 self.__flex_last_error_code = ""
                 self.__flex_state = "fresh"
                 self.__flex_login_notice_shown = False
+                # A read succeeded, so no login window is waiting any more.
+                self.__flex_login_window_open = False
                 if previous_state == "error":
                     log_line = (
                         "flex sync recovered after "
@@ -1197,52 +1560,289 @@ class Wrike:
                 panel.refresh_now()
             except Exception:
                 pass
-        if deferred:
-            return
-        if notify_login_required:
+        if not deferred:
+            self.__announce_flex_sync_result(
+                source,
+                schedules,
+                detected_employee_number,
+                error_message if error is not None else "",
+                open_login_window=open_login_window,
+                login_not_confirmed=login_not_confirmed,
+                announce=announce,
+            )
+        elif source == FLEX_SYNC_SOURCE_MANUAL and error_code == FLEX_SYNC_LOGIN_PENDING_CODE:
+            # "Flex 로그인 · 지금 동기화" while the login window is waiting:
+            # the worker brought that window to the front instead of
+            # replacing it.
             self.__show_tooltip(
                 self.__root,
                 "Flex 로그인 필요",
                 lines=[
+                    ("열려 있는 Flex 로그인 창에서 로그인해 주세요.", "#B91C1C"),
                     (
-                        "Flex 로그인이 만료되어 근무 일정을 가져오지 못했습니다.",
+                        "로그인하면 창이 닫히고 근무 일정을 바로 가져옵니다. "
+                        "창이 그대로면 닫아 주세요.",
+                        "#6B7280",
+                    ),
+                ],
+            )
+        if resync_source:
+            # A window event arrived while this sync ran; it may have read the
+            # profile before the login finished or the window closed.
+            self.__request_flex_sync(force=True, source=resync_source)
+
+    def __announce_flex_sync_result(
+        self,
+        source: str,
+        schedules: dict | None,
+        detected_employee_number: str,
+        error_message: str,
+        *,
+        open_login_window: bool,
+        login_not_confirmed: bool,
+        announce: bool,
+    ) -> None:
+        if open_login_window:
+            # The window's own "opened"/"open_failed" event carries the notice.
+            self.__request_flex_login_window(source)
+            return
+        if login_not_confirmed:
+            # "Flex 웹 열기" is never closed by the app, so a misjudged login
+            # cannot cut it short again; closing it syncs.
+            self.__show_tooltip(
+                self.__root,
+                "Flex 로그인 확인 실패",
+                lines=[
+                    (
+                        "로그인 창은 닫혔지만 Flex 로그인이 아직 필요합니다.",
                         "#B91C1C",
                     ),
                     (
-                        "설정 > Wrike 탭의 'Flex 웹 열기'로 다시 로그인한 뒤 '지금 동기화'를 눌러 주세요.",
+                        "설정 > Wrike 탭의 'Flex 웹 열기'로 로그인한 뒤 창을 닫으면 바로 동기화합니다.",
                         "#6B7280",
                     ),
                 ],
                 duration_ms=max(12000, int(self.__tooltip_duration_ms)),
             )
-        if announce:
-            if error_message:
-                self.__show_tooltip(
-                    self.__root,
-                    "Flex 동기화 실패",
-                    lines=[(error_message, "#B91C1C")],
+            return
+        if not announce:
+            return
+        if error_message:
+            self.__show_tooltip(
+                self.__root,
+                "Flex 동기화 실패",
+                lines=[(error_message, "#B91C1C")],
+            )
+            return
+        after_login = source == FLEX_SYNC_SOURCE_AFTER_LOGIN
+        lines = [
+            (
+                f"근무 일정 {len(dict(schedules or {}))}일 반영",
+                "#166534",
+            ),
+            (
+                "로그인 창을 닫고 백그라운드에서 반영했습니다."
+                if after_login
+                else "백그라운드에서 반영했습니다.",
+                "#6B7280",
+            ),
+        ]
+        if detected_employee_number:
+            lines.insert(
+                1,
+                (
+                    f"사번 {detected_employee_number} 감지 · 확인 후 저장",
+                    "#2563EB",
+                ),
+            )
+        self.__show_tooltip(
+            self.__root,
+            "Flex 로그인 완료" if after_login else "Flex 동기화 완료",
+            lines=lines,
+        )
+
+    def __request_flex_login_window(self, source: str) -> None:
+        """Ask the browser worker to open the app's Flex login window (Tk thread).
+
+        The job is not awaited: opening Chromium takes seconds.  The worker
+        reports ``opened``/``open_failed`` through the UI queue.
+        """
+
+        ok, detail = self.__submit_flex_browser_job(
+            "login",
+            {
+                "source": str(source or ""),
+                # Only an explicit request may take the foreground.
+                "activate": source == FLEX_SYNC_SOURCE_MANUAL,
+            },
+            wait=False,
+            timeout_sec=1.0,
+        )
+        if ok:
+            return
+        code = ""
+        if isinstance(detail, tuple) and len(detail) > 1:
+            code = str(detail[1] or "")
+        self.__apply_flex_window_event(
+            "open_failed",
+            "login",
+            {"code": code, "source": str(source or "")},
+        )
+
+    def __apply_flex_window_event(self, event: str, mode, detail=None) -> None:
+        """React to the browser worker's window events (Tk thread)."""
+
+        detail = detail if isinstance(detail, dict) else {}
+        source = str(detail.get("source") or "")
+        if event == "opened":
+            already_open = str(detail.get("result") or "") == "already_open"
+            if not self.__background_active or not self.__flex_configured():
+                # A login job queued just before a background stop or Flex
+                # disable: nothing will sync after the login, so the window
+                # goes away without a notice.
+                self.__log(
+                    "flex login window opened after background stopped; closing: "
+                    f"source={source or 'unknown'}"
+                )
+                if not already_open:
+                    self.__close_flex_login_window()
+                return
+            with self.__flex_schedule_lock:
+                # Either way a Flex window is waiting for the login, and its
+                # close (or finished login) is what triggers the next sync.
+                self.__flex_login_window_open = True
+                if (
+                    self.__flex_state == "error"
+                    and self.__flex_last_error_code in FLEX_LOGIN_ERROR_CODES
+                ):
+                    self.__flex_last_error = (
+                        "Flex 로그인이 필요합니다. 열려 있는 Flex 창에서 로그인한 뒤 창을 닫으면 바로 동기화합니다."
+                        if already_open
+                        else (
+                            "Flex 로그인이 필요합니다. 열린 Flex 로그인 창에서 로그인하면 바로 동기화합니다. "
+                            "로그인 뒤에도 창이 남아 있으면 창을 닫아 주세요."
+                        )
+                    )
+            self.__log(
+                "flex login window "
+                + ("already open" if already_open else "opened")
+                + f": source={source or 'unknown'}"
+            )
+            self.__refresh_worktime_panel_quietly()
+            self.__show_tooltip(
+                self.__root,
+                "Flex 로그인 필요",
+                lines=[
+                    (
+                        "Flex 로그인이 만료되었습니다. 열려 있는 Flex 창에서 로그인해 주세요."
+                        if already_open
+                        else "Flex 로그인이 만료되어 로그인 창을 열었습니다.",
+                        "#B91C1C",
+                    ),
+                    (
+                        "로그인한 뒤 창을 닫으면 근무 일정을 바로 가져옵니다."
+                        if already_open
+                        else "로그인하면 창이 닫히고 근무 일정을 바로 가져옵니다. "
+                        "창이 그대로면 닫아 주세요.",
+                        "#6B7280",
+                    ),
+                ],
+                duration_ms=max(12000, int(self.__tooltip_duration_ms)),
+            )
+            return
+        if event == "open_failed":
+            code = self.__safe_flex_error_code(detail.get("code"))
+            guidance = self.__flex_login_open_failure_guidance(code)
+            with self.__flex_schedule_lock:
+                self.__flex_login_window_open = False
+                if (
+                    self.__flex_state == "error"
+                    and self.__flex_last_error_code in FLEX_LOGIN_ERROR_CODES
+                ):
+                    self.__flex_last_error = (
+                        "Flex 로그인이 필요합니다. 로그인 창을 열지 못했습니다. " + guidance
+                    )
+            self.__log(
+                "flex login window open failed: "
+                f"code={code or 'unknown'} source={source or 'unknown'}"
+            )
+            self.__refresh_worktime_panel_quietly()
+            self.__show_tooltip(
+                self.__root,
+                "Flex 로그인 필요",
+                lines=[
+                    (
+                        "Flex 로그인이 만료되었지만 로그인 창을 열지 못했습니다.",
+                        "#B91C1C",
+                    ),
+                    (guidance, "#6B7280"),
+                ],
+                duration_ms=max(12000, int(self.__tooltip_duration_ms)),
+            )
+            return
+        if event == "replaced":
+            # The worker keeps one headed window at a time, so any of these
+            # events means no Flex window is waiting for a login any more.
+            with self.__flex_schedule_lock:
+                self.__flex_login_window_open = False
+            if str(detail.get("reason") or "") == "window_closed":
+                self.__log(
+                    f"flex window closed before a background sync: mode={mode or 'unknown'}"
                 )
             else:
-                lines = [
-                    (
-                        f"근무 일정 {len(dict(schedules or {}))}일 반영",
-                        "#166534",
-                    ),
-                    ("백그라운드에서 반영했습니다.", "#6B7280"),
-                ]
-                if detected_employee_number:
-                    lines.insert(
-                        1,
-                        (
-                            f"사번 {detected_employee_number} 감지 · 확인 후 저장",
-                            "#2563EB",
-                        ),
-                    )
-                self.__show_tooltip(
-                    self.__root,
-                    "Flex 동기화 완료",
-                    lines=lines,
+                self.__log(
+                    f"flex window replaced by an explicit sync: mode={mode or 'unknown'}"
                 )
+            return
+        if event not in {"logged_in", "closed"}:
+            return
+        with self.__flex_schedule_lock:
+            self.__flex_login_window_open = False
+        if event == "logged_in":
+            self.__log("flex login finished in the app login window")
+            follow_up = FLEX_SYNC_SOURCE_AFTER_LOGIN
+        else:
+            self.__log(f"flex window closed: mode={mode or 'unknown'}")
+            follow_up = FLEX_SYNC_SOURCE_WINDOW_CLOSED
+        if self.__request_flex_sync(force=True, source=follow_up):
+            return
+        with self.__flex_schedule_lock:
+            if not self.__flex_sync_running:
+                return
+            # Keep the login follow-up if both events race: it announces the
+            # result the employee is waiting for.
+            if (
+                follow_up == FLEX_SYNC_SOURCE_AFTER_LOGIN
+                or not self.__flex_resync_pending
+            ):
+                self.__flex_resync_pending = follow_up
+
+    @staticmethod
+    def __flex_login_open_failure_guidance(code: str) -> str:
+        """Recovery text for a login window that could not be opened."""
+
+        if code in {"navigation_failed", "browser_timeout"}:
+            # The browser works; Flex did not answer in time.
+            return (
+                "네트워크를 확인한 뒤 설정 > Wrike 탭의 "
+                "'Flex 로그인 · 지금 동기화'를 눌러 주세요."
+            )
+        # The app's browser could not start.  'Flex 웹 열기' would fail the
+        # same way and fall back to the system browser, whose login does not
+        # reach the app profile.
+        return (
+            "앱을 다시 시작한 뒤 설정 > Wrike 탭의 "
+            "'Flex 로그인 · 지금 동기화'를 눌러 주세요."
+        )
+
+    def __refresh_worktime_panel_quietly(self) -> None:
+        panel = self.__worktime_panel
+        if panel is None:
+            return
+        try:
+            panel.refresh_now()
+        except Exception:
+            pass
 
     def __flex_schedule_for_day(self, target_day) -> FlexDaySchedule | None:
         try:
@@ -1273,6 +1873,9 @@ class Wrike:
         code = self.__safe_flex_error_code(flex_status.get("error_code"))
         if state == "error" and code in FLEX_LOGIN_ERROR_CODES:
             return "Flex 로그인 필요", True
+        if state == "deferred" and code == FLEX_SYNC_LOGIN_PENDING_CODE:
+            # The app's login window is open: the login is still required.
+            return "Flex 로그인 필요", True
         if state == "error":
             return (f"Flex error · {code}" if code else "Flex error"), True
         if state == "deferred":
@@ -1290,6 +1893,7 @@ class Wrike:
                 ),
                 "error": str(self.__flex_last_error or ""),
                 "error_code": str(self.__flex_last_error_code or ""),
+                "login_window_open": bool(self.__flex_login_window_open),
                 "schedule_days": len(self.__flex_schedule_by_date),
                 "employee_number": str(self.__flex_employee_number or ""),
                 "detected_employee_number": str(
@@ -1892,6 +2496,12 @@ class Wrike:
         with self.__flex_schedule_lock:
             self.__flex_sync_generation += 1
             self.__flex_sync_running = False
+            # A follow-up for a window event of this run must not replay
+            # after a restart.
+            self.__flex_resync_pending = ""
+        # Nothing reads Flex while stopped, so the app's login window would
+        # promise a sync that never comes.
+        self.__close_flex_login_window()
         self.__cancel_overtime_notice_timer()
         self.__overtime_prompt_surfaced_day = ""
         self.__cancel_google_calendar_oauth()
@@ -7327,10 +7937,13 @@ class Wrike:
                 self.__flex_last_error = ""
                 self.__flex_last_error_code = ""
                 self.__flex_login_notice_shown = False
-                self.__flex_sync_deferral_logged = False
+                self.__flex_sync_deferral_logged = ""
+                self.__flex_resync_pending = ""
                 # The new configuration has no result yet: its first failure
                 # must be logged even if the old one failed the same way.
                 self.__flex_status_before_sync = ("unconfigured", "", "")
+            if not self.__flex_enabled:
+                self.__close_flex_login_window()
             self.__start_flex_polling()
         else:
             self.__schedule_flex_poll()
