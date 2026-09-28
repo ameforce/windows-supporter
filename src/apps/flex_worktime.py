@@ -1183,6 +1183,23 @@ def _parse_browser_response_payloads(
     return {}, detected_employee_number
 
 
+_TARGET_CLOSED_MARKERS = (
+    "has been closed",
+    "target closed",
+    "browser has disconnected",
+    "connection closed",
+)
+
+
+def _is_target_closed_error(exc: BaseException) -> bool:
+    """Return whether a Playwright error means the page/browser is gone."""
+
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    message = str(exc or "").casefold()
+    return any(marker in message for marker in _TARGET_CLOSED_MARKERS)
+
+
 class FlexBrowserClient:
     """Read-only Flex client backed by a persistent Playwright session.
 
@@ -1282,7 +1299,13 @@ class FlexBrowserClient:
                 continue
             try:
                 page.title()
-            except Exception:
+            except Exception as exc:
+                # A navigation committing during the call (SSO redirects)
+                # fails with "Execution context was destroyed" on a live page.
+                # Only a flushed close event or a target-closed error means
+                # the employee's window is really gone.
+                if self._page_is_open(page) and not _is_target_closed_error(exc):
+                    return True
                 continue
             if self._page_is_open(page):
                 return True

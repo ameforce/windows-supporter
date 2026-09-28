@@ -233,6 +233,7 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
                 self.window_open = False
                 self.opened = 0
                 self.fetches = 0
+                self.close_calls = 0
                 self.closed = False
                 created.append(self)
 
@@ -248,6 +249,7 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
                 return {}
 
             def close(self):
+                self.close_calls += 1
                 self.closed = True
                 self.window_open = False
 
@@ -283,20 +285,27 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
         created = []
         app = self._worker_app()
 
-        open_result, sync_result = self._run_jobs(
+        open_result, first_sync, second_sync = self._run_jobs(
             app,
             self._headed_aware_client(created),
-            [("open", None), ("sync", self._sync_payload(background=True))],
+            [
+                ("open", None),
+                ("sync", self._sync_payload(background=True)),
+                ("sync", self._sync_payload(background=True)),
+            ],
         )
 
         self.assertEqual(open_result, (True, None))
-        self.assertEqual(sync_result[0], False)
-        self.assertEqual(sync_result[1][1], "login_window_open")
-        # Only the user's headed window exists; the periodic tick neither
-        # closed it nor started a headless browser on the same profile.
+        for sync_result in (first_sync, second_sync):
+            self.assertEqual(sync_result[0], False)
+            self.assertEqual(sync_result[1][1], "login_window_open")
+        # Only the user's headed window exists; neither periodic tick closed
+        # it (the second one still found it open) nor started a headless
+        # browser on the same profile.  The one close is the final "close".
         self.assertEqual(len(created), 1)
         self.assertFalse(created[0].headless)
         self.assertEqual(created[0].fetches, 0)
+        self.assertEqual(created[0].close_calls, 1)
 
     def test_background_sync_resumes_after_employee_closes_flex_window(self) -> None:
         created = []
@@ -376,6 +385,70 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
 
         self.assertEqual(result, (True, None))
         request_sync.assert_called_once_with(force=True, announce=True)
+
+
+class FlexHasOpenPageTests(unittest.TestCase):
+    class _Page:
+        def __init__(self, *, closed=False, title_error=None, close_on_title=False):
+            self._closed = closed
+            self._title_error = title_error
+            self._close_on_title = close_on_title
+
+        def is_closed(self):
+            return self._closed
+
+        def title(self):
+            if self._close_on_title:
+                # The round trip delivers the employee's close event.
+                self._closed = True
+            if self._title_error is not None:
+                raise self._title_error
+            return "Flex"
+
+    class _Context:
+        def __init__(self, pages):
+            self.pages = list(pages)
+
+    def _client(self, *pages):
+        from src.apps.flex_worktime import FlexBrowserClient
+
+        client = FlexBrowserClient("C:/temp/flex-profile-test", headless=False)
+        client._context = self._Context(pages)
+        return client
+
+    def test_live_page_is_open(self) -> None:
+        self.assertTrue(self._client(self._Page()).has_open_page())
+
+    def test_close_event_flushed_by_round_trip_means_gone(self) -> None:
+        page = self._Page(
+            close_on_title=True,
+            title_error=RuntimeError("Target page, context or browser has been closed"),
+        )
+        self.assertFalse(self._client(page).has_open_page())
+
+    def test_target_closed_error_means_gone(self) -> None:
+        class TargetClosedError(Exception):
+            pass
+
+        page = self._Page(title_error=TargetClosedError("Target closed"))
+        self.assertFalse(self._client(page).has_open_page())
+
+    def test_navigation_during_round_trip_keeps_the_window(self) -> None:
+        # SSO redirects destroy the execution context mid-call on a live page.
+        page = self._Page(
+            title_error=RuntimeError(
+                "Execution context was destroyed, most likely because of a navigation"
+            )
+        )
+        self.assertTrue(self._client(page).has_open_page())
+
+    def test_no_context_or_only_closed_pages_is_not_open(self) -> None:
+        from src.apps.flex_worktime import FlexBrowserClient
+
+        self.assertFalse(
+            FlexBrowserClient("C:/temp/flex-profile-test").has_open_page()
+        )
+        self.assertFalse(self._client(self._Page(closed=True)).has_open_page())
 
 
 class FlexEmployeeNumberUiTests(unittest.TestCase):

@@ -1552,7 +1552,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             self._wrike_log_lines(),
         )
 
-    def test_deferred_flex_sync_keeps_previous_state_instead_of_loading(self) -> None:
+    def test_deferred_flex_sync_reports_open_window_instead_of_loading(self) -> None:
         wrike, tooltips = self._flex_ready_wrike()
         self._run_flex_sync_once(
             wrike,
@@ -1567,9 +1567,12 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self._run_flex_sync_once(wrike, deferred)
 
         status = wrike._Wrike__flex_status_snapshot()
-        self.assertEqual(status["state"], "error")
-        self.assertEqual(status["error_code"], "login_required")
+        self.assertEqual(status["state"], "deferred")
+        self.assertEqual(status["error_code"], "login_window_open")
         self.assertFalse(wrike._Wrike__flex_sync_running)
+        model = wrike._Wrike__build_worktime_panel_model()
+        self.assertIn("Flex 창 열림 · 동기화 대기", model.sync_text)
+        self.assertNotEqual(model.sync_state, "warning")
         self.assertEqual(len(tooltips), 1)
         log_lines = self._wrike_log_lines()
         self.assertEqual(
@@ -1577,6 +1580,72 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             1,
         )
         self.assertEqual(log_lines.count("flex sync failed: code=login_required"), 1)
+
+        # After the window closes the next failure is a new episode: logged,
+        # but the already-shown login notice is not repeated.
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+        )
+        self.assertEqual(
+            self._wrike_log_lines().count("flex sync failed: code=login_required"),
+            2,
+        )
+        self.assertEqual(len(tooltips), 1)
+
+    def test_flex_reconfiguration_logs_the_new_configurations_first_failure(self) -> None:
+        wrike, _tooltips = self._flex_ready_wrike()
+        wrike._Wrike__flex_poll_interval_sec = 300
+        login_required = (False, ("Flex 로그인이 필요합니다.", "login_required"))
+        self._run_flex_sync_once(wrike, login_required)
+        started = []
+
+        class _ArgsThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                started.append(self)
+
+            def start(self):
+                return None
+
+        wrike._Wrike__submit_flex_browser_job = Mock(return_value=login_required)
+        with patch("src.apps.Wrike.threading.Thread", _ArgsThread):
+            ok, error = wrike.update_settings({"flex_poll_interval_sec": 600})
+        self.assertTrue(ok, error)
+        flex_threads = [
+            thread
+            for thread in started
+            if "run_flex_sync" in str(getattr(thread.target, "__name__", ""))
+        ]
+        self.assertEqual(len(flex_threads), 1)
+        flex_threads[0].target(*flex_threads[0].args)
+        wrike._Wrike__drain_ui_queue()
+
+        self.assertEqual(
+            self._wrike_log_lines().count("flex sync failed: code=login_required"),
+            2,
+        )
+
+    def test_wrike_error_keeps_error_color_over_flex_warning(self) -> None:
+        from src.apps.wrike_timelog_snapshot import make_error_snapshot
+
+        wrike, _tooltips = self._flex_ready_wrike()
+        self._run_flex_sync_once(
+            wrike,
+            (False, ("Flex 로그인이 필요합니다.", "login_required")),
+        )
+        with wrike._Wrike__timelog_snapshot_lock:
+            wrike._Wrike__timelog_snapshot = make_error_snapshot(
+                generation=1,
+                error_code="request_failed",
+            )
+
+        model = wrike._Wrike__build_worktime_panel_model()
+
+        self.assertIn("error · request_failed", model.sync_text)
+        self.assertIn("Flex 로그인 필요", model.sync_text)
+        self.assertEqual(model.sync_state, "error")
 
     def test_authoritative_parser_rejects_noncanonical_identity_date_and_duration(self) -> None:
         invalid_entries = {

@@ -327,7 +327,7 @@ class Wrike:
         self.__flex_last_error_code = ""
         self.__flex_state = "unconfigured"
         # (state, error, error_code) before the in-flight sync switched the
-        # state to "loading"; restored when a background sync is deferred.
+        # state to "loading"; used to log each failure/recovery only once.
         self.__flex_status_before_sync = ("unconfigured", "", "")
         self.__flex_login_notice_shown = False
         self.__flex_sync_deferral_logged = False
@@ -1134,17 +1134,19 @@ class Wrike:
             if generation != int(self.__flex_sync_generation):
                 return
             self.__flex_sync_running = False
-            previous_state, previous_error, previous_code = (
+            previous_state, _previous_error, previous_code = (
                 self.__flex_status_before_sync
             )
             if error is not None:
                 error_code = self.__safe_flex_error_code(error[1] if len(error) > 1 else "")
             if error is not None and error_code == FLEX_SYNC_DEFERRED_CODE:
-                # Nothing was read; keep showing what the last real sync said.
+                # Nothing was read.  Say so explicitly instead of replaying an
+                # older status that may belong to another configuration or
+                # hide that the schedule is ageing while the window is open.
                 deferred = True
-                self.__flex_state = str(previous_state or "unconfigured")
-                self.__flex_last_error = str(previous_error or "")
-                self.__flex_last_error_code = str(previous_code or "")
+                self.__flex_state = "deferred"
+                self.__flex_last_error = str(error[0] or "")
+                self.__flex_last_error_code = error_code
                 if not self.__flex_sync_deferral_logged:
                     self.__flex_sync_deferral_logged = True
                     log_line = "flex sync deferred: headed Flex window is open"
@@ -1273,6 +1275,8 @@ class Wrike:
             return "Flex 로그인 필요", True
         if state == "error":
             return (f"Flex error · {code}" if code else "Flex error"), True
+        if state == "deferred":
+            return "Flex 창 열림 · 동기화 대기", False
         return f"Flex {state}", False
 
     def __flex_status_snapshot(self) -> dict:
@@ -7324,6 +7328,9 @@ class Wrike:
                 self.__flex_last_error_code = ""
                 self.__flex_login_notice_shown = False
                 self.__flex_sync_deferral_logged = False
+                # The new configuration has no result yet: its first failure
+                # must be logged even if the old one failed the same way.
+                self.__flex_status_before_sync = ("unconfigured", "", "")
             self.__start_flex_polling()
         else:
             self.__schedule_flex_poll()
