@@ -1055,6 +1055,36 @@ def _text_has_other_usage_metric(value: str, metric_key: str) -> bool:
     )
 
 
+def _usage_metric_label_keys(value: str) -> set[str]:
+    """Metrics named in ``value``, matched like card labels are classified.
+
+    Labels are classified on the separator-free token (_find_alias_in_line),
+    where "5시간 한도" matches the "5시간한도" alias; the spaced search in
+    _usage_metric_alias_occurrences misses such text. Overlaps resolve to the
+    longest alias, so a Spark label does not also count as the main limit.
+    """
+    token = _normalize_match_token(value)
+    if not token:
+        return set()
+    matches: list[tuple[int, int, str]] = []
+    for key in USAGE_METRIC_KEYS:
+        for alias in USAGE_METRIC_ALIASES.get(key, ()):
+            needle = _normalize_match_token(alias)
+            if not needle:
+                continue
+            start = token.find(needle)
+            while start >= 0:
+                matches.append((start, start + len(needle), key))
+                start = token.find(needle, start + 1)
+    matches.sort(key=lambda item: (-(item[1] - item[0]), item[0], item[2]))
+    selected: list[tuple[int, int, str]] = []
+    for start, end, key in matches:
+        if any(start < used_end and used_start < end for used_start, used_end, _ in selected):
+            continue
+        selected.append((start, end, key))
+    return {key for _, _, key in selected}
+
+
 def _scoped_reset_candidate_fragments(value: str, metric_key: str) -> list[str]:
     text = normalize_usage_value(value)
     if not text:
@@ -1202,6 +1232,43 @@ def _sanitize_snapshot_reset_payload(data: dict[str, Any] | None) -> dict[str, s
     return cleaned
 
 
+def _semantic_block_metric_key(raw_block: dict[str, Any]) -> str:
+    """Return the metric a probe block labels, or "" when it labels none.
+
+    The probe emits every short text that contains a metric alias. Text that
+    names several limits describes limits instead of labelling one limit
+    card, e.g. the reset-credit description "재설정을 사용해 5시간 한도, 주간
+    한도 또는 둘 다를 복원하세요." shown to weekly-only plans. Classifying it by
+    its longest alias invented a 5-hour limit those plans do not have.
+    """
+    label_text = raw_block.get("label_text", "")
+    if len(_usage_metric_label_keys(label_text)) > 1:
+        return ""
+    key = str(_find_metric_key_for_label(label_text) or "")
+    if not key:
+        block_text = raw_block.get("block_text", "")
+        if len(_usage_metric_label_keys(block_text)) > 1:
+            # The probe's own metric_key is the same longest-alias guess.
+            return ""
+        key = str(_find_metric_key_for_label(block_text) or "")
+    if not key:
+        key = normalize_usage_value(raw_block.get("metric_key", ""))
+    return key if key in USAGE_METRIC_KEYS else ""
+
+
+def _semantic_block_metric_value(raw_block: dict[str, Any], key: str) -> str:
+    candidates = _normalize_value_candidates(raw_block.get("value_candidates", []))
+    if not candidates:
+        block_text = normalize_usage_value(raw_block.get("block_text", ""))
+        if block_text:
+            candidates = [block_text]
+    for candidate in candidates:
+        value = _normalize_metric_candidate(key, candidate)
+        if value:
+            return value
+    return ""
+
+
 def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str]:
     if not isinstance(raw_blocks, list):
         return {}
@@ -1209,25 +1276,10 @@ def extract_usage_metrics_from_semantic_blocks(raw_blocks: Any) -> dict[str, str
     for raw_block in raw_blocks:
         if not isinstance(raw_block, dict):
             continue
-        key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
-        if not key:
-            key = str(_find_metric_key_for_label(raw_block.get("block_text", "")) or "")
-        if not key:
-            key = normalize_usage_value(raw_block.get("metric_key", ""))
-        if key not in USAGE_METRIC_KEYS:
+        key = _semantic_block_metric_key(raw_block)
+        if not key or key in parsed:
             continue
-        if key in parsed:
-            continue
-        candidates = _normalize_value_candidates(raw_block.get("value_candidates", []))
-        if not candidates:
-            block_text = normalize_usage_value(raw_block.get("block_text", ""))
-            if block_text:
-                candidates = [block_text]
-        value = ""
-        for candidate in candidates:
-            value = _normalize_metric_candidate(key, candidate)
-            if value:
-                break
+        value = _semantic_block_metric_value(raw_block, key)
         if value:
             parsed[key] = value
     return parsed
@@ -1240,12 +1292,8 @@ def extract_reported_usage_metric_keys_from_semantic_blocks(raw_blocks: Any) -> 
     for raw_block in raw_blocks:
         if not isinstance(raw_block, dict):
             continue
-        key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
-        if not key:
-            key = str(_find_metric_key_for_label(raw_block.get("block_text", "")) or "")
-        if not key:
-            key = normalize_usage_value(raw_block.get("metric_key", ""))
-        if key in USAGE_METRIC_KEYS:
+        key = _semantic_block_metric_key(raw_block)
+        if key:
             reported.add(key)
     return tuple(key for key in USAGE_METRIC_KEYS if key in reported)
 
@@ -1433,13 +1481,14 @@ def extract_usage_reset_info_from_semantic_blocks(
     for raw_block in raw_blocks:
         if not isinstance(raw_block, dict):
             continue
-        metric_key = str(_find_metric_key_for_label(raw_block.get("label_text", "")) or "")
-        if not metric_key:
-            metric_key = str(_find_metric_key_for_label(raw_block.get("block_text", "")) or "")
-        if not metric_key:
-            metric_key = normalize_usage_value(raw_block.get("metric_key", ""))
+        metric_key = _semantic_block_metric_key(raw_block)
         reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
         if not reset_key or reset_key in parsed:
+            continue
+        # A limit's value and its reset belong to the same card. A block that
+        # only names the limit collects nearby deadlines (reset-credit expiry,
+        # other cards) that are not that limit's reset.
+        if not _semantic_block_metric_value(raw_block, metric_key):
             continue
         candidates = _reset_candidate_fragments_for_metric(raw_block, metric_key)
         for candidate in candidates:
@@ -1705,7 +1754,12 @@ def merge_snapshot_with_previous(
         # A freshly observed value and its reset belong to the same window.
         # After a manual reset the page may report 100% without a deadline;
         # borrowing the previous window's deadline would fabricate freshness.
-        if not merged.get(key) and metric_key not in fresh_metric_keys:
+        # A window with no value at all has no deadline to carry either.
+        if (
+            not merged.get(key)
+            and metric_key not in fresh_metric_keys
+            and merged.get(metric_key)
+        ):
             merged[key] = prev_payload.get(key, "")
     if not merged.get("captured_at"):
         merged["captured_at"] = prev_payload.get("captured_at", "")
@@ -1768,9 +1822,16 @@ def compute_usage_limit_resets(
         previous, UsageSnapshot
     ) else None
     observation_at = current_at or now_dt
+    measured_keys = _measured_limit_metric_keys(observed)
+    previous_measured_keys = _measured_limit_metric_keys(previous)
     for metric_key in USAGE_METRIC_KEYS:
         reset_key = USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.get(metric_key, "")
         if not reset_key:
+            continue
+        if metric_key not in measured_keys:
+            # Only a window this observation measured can have reset. A
+            # deadline without the window's value may belong to anything
+            # else on the page (a reset-credit expiry on weekly-only plans).
             continue
         baseline_raw = normalize_usage_value(baseline_map.get(metric_key, ""))
         new_raw = normalize_usage_value(observed_payload.get(reset_key, ""))
@@ -1812,9 +1873,9 @@ def compute_usage_limit_resets(
         ):
             continue
 
-        scheduled_reset_raw = baseline_raw or normalize_usage_value(
-            prev_payload.get(reset_key, "")
-        )
+        scheduled_reset_raw = baseline_raw
+        if not scheduled_reset_raw and metric_key in previous_measured_keys:
+            scheduled_reset_raw = normalize_usage_value(prev_payload.get(reset_key, ""))
         scheduled_reset_at = _parse_base_reset_datetime(scheduled_reset_raw)
         scheduled_reset_elapsed = bool(
             scheduled_reset_at is not None
@@ -1850,20 +1911,49 @@ def compute_usage_limit_resets(
     return resets
 
 
+def _measured_limit_metric_keys(snapshot: UsageSnapshot | None) -> set[str]:
+    """Limit windows ``snapshot`` measured, i.e. with a remaining percentage."""
+    if not isinstance(snapshot, UsageSnapshot):
+        return set()
+    payload = snapshot.to_dict()
+    return {
+        metric_key
+        for metric_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC
+        if _parse_usage_limit_remaining_percent(metric_key, payload.get(metric_key, ""))
+        is not None
+    }
+
+
 def advance_limit_reset_baselines(
     baselines: dict[str, str],
     snapshot: UsageSnapshot,
     resets: list[UsageLimitReset] | None = None,
+    *,
+    observed_snapshot: UsageSnapshot | None = None,
+    previous_snapshot: UsageSnapshot | None = None,
 ) -> None:
     """Advance per-metric reset baselines in place after an observation.
 
     Shared by every provider that alerts on usage-limit resets so the
     baseline contract (only move forward, drop a stale deadline after a
     timestamp-less inferred reset) cannot drift between providers.
+
+    A baseline is the deadline of a window the provider measured. It is set
+    or advanced only from an observation carrying that window's value.
+    Deadlines are read from ``observed_snapshot`` when given, so a value
+    backfilled from an earlier snapshot cannot vouch for a deadline observed
+    without a value. The baseline is dropped when the page reports its
+    windows without this one and ``previous_snapshot`` (the last committed
+    snapshot) had no value for it either, so a single partial page cannot
+    erase the deadline a real reset is compared against.
     """
     if not isinstance(snapshot, UsageSnapshot) or not isinstance(baselines, dict):
         return
-    payload = snapshot.to_dict()
+    source = observed_snapshot if isinstance(observed_snapshot, UsageSnapshot) else snapshot
+    payload = source.to_dict()
+    measured_keys = _measured_limit_metric_keys(source)
+    previously_measured_keys = _measured_limit_metric_keys(previous_snapshot)
+    reported_keys = set(source.reported_metric_keys)
     inferred_reset_keys_without_timestamp = {
         item.key
         for item in (resets or [])
@@ -1877,6 +1967,19 @@ def advance_limit_reset_baselines(
         )
     }
     for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items():
+        if metric_key not in measured_keys:
+            if (
+                reported_keys
+                and metric_key not in reported_keys
+                and metric_key not in previously_measured_keys
+            ):
+                # The page lists the windows it has and this one has been
+                # gone since the last commit: no deadline is left to compare
+                # a later window against.
+                baselines.pop(metric_key, None)
+            # Otherwise (a label without a value, or one page missing the
+            # card) keep the known deadline until the window is measured.
+            continue
         new_raw = normalize_usage_value(payload.get(reset_key, ""))
         if not new_raw:
             if metric_key in inferred_reset_keys_without_timestamp:
@@ -3085,11 +3188,15 @@ class CodexUsageMonitor:
         self,
         snapshot: UsageSnapshot,
         resets: list[UsageLimitReset] | None = None,
+        observed_snapshot: UsageSnapshot | None = None,
+        previous_snapshot: UsageSnapshot | None = None,
     ) -> None:
         advance_limit_reset_baselines(
             self.__limit_reset_baselines,
             snapshot,
             resets=resets,
+            observed_snapshot=observed_snapshot,
+            previous_snapshot=previous_snapshot,
         )
         return
 
@@ -3109,7 +3216,12 @@ class CodexUsageMonitor:
             previous=previous,
             observed_snapshot=observed_snapshot,
         )
-        self.__update_limit_reset_baselines(snapshot, resets=resets)
+        self.__update_limit_reset_baselines(
+            snapshot,
+            resets=resets,
+            observed_snapshot=observed_snapshot,
+            previous_snapshot=self.__last_snapshot,
+        )
         self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
         self.__append_usage_history_sample(self.__last_snapshot)
         self.__snapshot_backfill_allowed = True
@@ -5010,12 +5122,10 @@ class CodexUsageMonitor:
                 and normalize_usage_value(value)
             }
         if not baselines:
-            snap_payload = snap.to_dict()
-            baselines = {
-                metric_key: normalize_usage_value(snap_payload.get(reset_key, ""))
-                for metric_key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items()
-                if normalize_usage_value(snap_payload.get(reset_key, ""))
-            }
+            # Seed from the restored deadlines so a reset that happened while
+            # the app was not running is still detected on the first reading;
+            # only measured windows qualify, as for every other observation.
+            advance_limit_reset_baselines(baselines, snap)
         self.__limit_reset_baselines = baselines
         self.__set_profile_name(
             data.get("profile_name", ""),
