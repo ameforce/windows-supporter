@@ -527,6 +527,61 @@ class WeeklyOnlyProfileAlertTest(unittest.TestCase):
             self.assertEqual(len(shown), 1)
             self.assertEqual(sounds, 1)
 
+    def test_logout_forgets_the_released_accounts_reset_deadlines(self) -> None:
+        # Another account may sign in after a logout; the old account's
+        # elapsed deadline must not turn its first reading into a reset.
+        class _ReleasableSession:
+            def collect(self):
+                raise AssertionError("not collected in this test")
+
+            def request_cancel(self) -> bool:
+                return True
+
+            def close_session(self) -> None:
+                return None
+
+            def shutdown(self) -> bool:
+                return True
+
+        now = datetime.now(KST).replace(microsecond=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = CodexUsageMonitor(
+                config_dir=tmp,
+                profile_dir=os.path.join(tmp, "profile"),
+                browser_session_factory=lambda _config: _ReleasableSession(),
+            )
+            monitor._CodexUsageMonitor__root = _FakeRoot()
+            self._run(
+                monitor,
+                [
+                    (
+                        [_five_hour_card("3% 남음", now - timedelta(minutes=10)), _weekly_card("64% 남음")],
+                        now - timedelta(hours=1),
+                    )
+                ],
+            )
+            with patch.object(
+                monitor,
+                "_CodexUsageMonitor__clear_profile_directory",
+                return_value=(True, "로그아웃되었습니다."),
+            ):
+                ok, message = monitor.release_profile_session()
+            self.assertTrue(ok, message)
+            self.assertEqual(monitor._CodexUsageMonitor__limit_reset_baselines, {})
+
+            shown, sounds = self._run(
+                monitor,
+                [
+                    (
+                        [_five_hour_card("40% 남음", now + timedelta(hours=3)), _weekly_card("90% 남음")],
+                        now,
+                    )
+                ],
+            )
+
+            self.assertEqual(shown, [])
+            self.assertEqual(sounds, 0)
+
     def test_limit_name_in_its_own_element_stays_silent_on_a_weekly_only_page(self) -> None:
         # If the description renders "5시간 한도" in its own element, that
         # element is a label without a value: it may keep the window listed

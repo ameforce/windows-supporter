@@ -2448,6 +2448,9 @@ class CodexUsageMonitor:
             self.__browser_session_recovery_required = False
             self.__last_snapshot = UsageSnapshot()
             self.__usage_history = []
+            # Reset deadlines belong to the released account's windows; the
+            # next login may bind another account.
+            self.__limit_reset_baselines = {}
             self.__snapshot_backfill_allowed = False
             self.__set_session_state("logged_out")
             self.__profile_name = ""
