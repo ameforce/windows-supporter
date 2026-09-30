@@ -1240,12 +1240,19 @@ def _metric_fits_badge_mode(
 ) -> bool:
     metric_dict = metric if isinstance(metric, dict) else {}
     mode = _normalized_badge_mode(badge_mode)
+    metric_key = str(metric_dict.get("metric_key") or "")
+    if metric_key == "credit":
+        # Credit draws no bar or badge; the amount itself is the text
+        # contract (spelled whole in full mode, shortest otherwise).
+        amount = _credit_value_text_for_mode(
+            str(metric_dict.get("value_text") or "--"), mode
+        )
+        return int(segment_width) >= _credit_segment_width_for_text(amount)
     detail_text, short_text = _metric_guidance_texts(metric_dict)
     badge_label = str(metric_dict.get("reset_badge_label") or "")
     badge_short_label = str(metric_dict.get("reset_badge_short_label") or "")
     has_reset_badge = bool(badge_label or badge_short_label)
     has_reset_time = bool(detail_text or short_text)
-    metric_key = str(metric_dict.get("metric_key") or "")
     reset_marker = str(metric_dict.get("reset_marker") or "")
     layout = _fit_metric_segment_layout(
         segment_width,
@@ -1267,9 +1274,6 @@ def _metric_fits_badge_mode(
         if min_progress_px is None
         else int(min_progress_px)
     )
-    if str(metric_key or "") == "credit":
-        # Credit draws no bar; only the badge/text contracts apply.
-        progress_floor = 0
     if int(layout.get("progress_width") or 0) < progress_floor:
         return False
     badge_fit = layout.get("badge_fit")
@@ -1466,7 +1470,9 @@ def _metric_countdown_min_width(metric: dict[str, Any]) -> int:
     )
     base = 14 + 3 + 0 + 3 + value_width + 2
     if _metric_slot_key(metric) == "credit":
-        return base
+        # The never-dropped minimum is the amount's shortest spelling.
+        shortest = _credit_value_spellings(str(metric.get("value_text") or "--"))[-1]
+        return max(base, _credit_segment_width_for_text(shortest))
     detail, _ = _metric_guidance_texts(metric)
     reset_part = str(detail or "").split(_METRIC_CONTEXT_SEPARATOR)[0]
     reset_width = _reset_column_width_for_text(
@@ -1647,8 +1653,9 @@ def _proportional_extra_shares(
 # Detail-funding order for the middle band: when the slot cannot fund every
 # column's countdown|guidance detail, the surplus reveals guidance one column
 # at a time instead of spreading thinly enough that none reaches it. The
-# weekly window outranks the hourly one; unlisted slots (credit carries no
-# guidance) fund last and normally take nothing.
+# weekly window outranks the hourly one; unlisted slots fund last. Credit
+# carries no guidance: the middle band grants its whole amount ahead of this
+# order, so only its padding up to the 48px column floor funds last.
 _METRIC_DETAIL_FUNDING_PRIORITY = (
     "weekly_limit",
     "five_hour_limit",
@@ -1724,9 +1731,18 @@ def _metric_rows_layout_for_overlay_width(
     required_by_slot: dict[str, int] = {}
     detail_required_by_slot: dict[str, int] = {}
     reserved_reset_by_slot: dict[str, int] = {}
+    # Width that draws every row's credit amount whole (no 48px floor).
+    credit_amount_px = 0
     for metrics in rows_metrics:
         for metric in metrics:
             key = _metric_slot_key(metric)
+            if key == "credit":
+                credit_amount_px = max(
+                    credit_amount_px,
+                    _credit_segment_width_for_text(
+                        str(metric.get("value_text") or "--")
+                    ),
+                )
             # Reserve the full badge up front: the shared grid's only honest
             # "fits" currency is a column that already budgets the richest
             # label. Degrading to the short badge stays a draw-time decision
@@ -1840,10 +1856,16 @@ def _metric_rows_layout_for_overlay_width(
     for key in slot_keys:
         for metrics in rows_metrics:
             for metric in metrics:
-                if _metric_slot_key(metric) == key:
-                    min_by_slot[key] = _metric_countdown_min_width(metric)
-                    break
-            if key in min_by_slot:
+                if _metric_slot_key(metric) != key:
+                    continue
+                minimum = _metric_countdown_min_width(metric)
+                if key not in min_by_slot:
+                    min_by_slot[key] = minimum
+                elif key == "credit":
+                    # The amount never degrades like countdown text does, so
+                    # the shared column must hold every row's amount.
+                    min_by_slot[key] = max(min_by_slot[key], minimum)
+            if key in min_by_slot and key != "credit":
                 break
     total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
     bar_floor_by_slot = {
@@ -1890,14 +1912,30 @@ def _metric_rows_layout_for_overlay_width(
         # lower-priority column's larger floor outrank the funded column and
         # hide an already-revealed guidance over a band boundary.
         extra = metrics_width - bar_funded_min
+        funded_floor_by_slot = dict(bar_floor_by_slot)
+        if "credit" in funded_floor_by_slot:
+            # The amount is not guidance, and guidance is the first text to
+            # yield: the credit column reaches its whole amount before any
+            # column's guidance. Only its padding up to the 48px column
+            # floor still funds last.
+            amount_grant = min(
+                extra,
+                max(
+                    0,
+                    min(credit_amount_px, detail_required_by_slot["credit"])
+                    - funded_floor_by_slot["credit"],
+                ),
+            )
+            funded_floor_by_slot["credit"] += amount_grant
+            extra -= amount_grant
         shares = _detail_funding_shares(
             slot_keys,
-            bar_floor_by_slot,
+            funded_floor_by_slot,
             detail_required_by_slot,
             extra,
         )
         for key in slot_keys:
-            column_width = bar_floor_by_slot[key] + shares.get(key, 0)
+            column_width = funded_floor_by_slot[key] + shares.get(key, 0)
             column_widths[key] = column_width
             column_progresses[key] = min(
                 _metric_progress_width_for_segment(
@@ -2047,6 +2085,13 @@ def _required_metric_segment_width_cached(
         badge_short_label,
         value_text,
     ) = signature
+    if str(metric_key or "") == "credit":
+        # No bar, badge or countdown: the column only has to hold the amount.
+        # A detail (full-text) request asks for the amount spelled whole.
+        amount = _credit_value_text_for_mode(
+            value_text, "full" if require_detail else badge_mode
+        )
+        return max(_CREDIT_SEGMENT_MIN_WIDTH_PX, _credit_segment_width_for_text(amount))
     has_reset_badge = bool(badge_label or badge_short_label)
     has_reset_time = bool(detail_text or short_text)
     mode = _normalized_badge_mode(badge_mode)
@@ -4689,14 +4734,16 @@ class CodexUsageTaskbarOverlay:
         if is_credit_metric:
             # Credit renders as inline "CR 665": the amount anchors left next
             # to the label instead of the percent column's right-aligned slot,
-            # which would leave a phantom gap where the bar would be.
+            # which would leave a phantom gap where the bar would be. A column
+            # too narrow for the whole amount draws a shorter spelling instead
+            # of letting the pane edge cut the digits off.
             canvas.create_text(
-                x + 18,
+                x + _credit_value_offset(),
                 center_y,
                 anchor="w",
                 fill="#f9fafb",
                 font=("Segoe UI", 7, "bold"),
-                text=value_text,
+                text=_credit_fitting_value_text(value_text, width),
             )
             return
         canvas.create_text(
@@ -8766,6 +8813,72 @@ def _value_column_width_for_text(value_text: str) -> int:
         _VALUE_COLUMN_MAX_WIDTH_PX,
         max(_VALUE_COLUMN_MIN_WIDTH_PX, int(estimated_width)),
     )
+
+
+# Credit draws "CR" and the amount inline instead of a bar and a percent
+# column, so its width follows the amount text rather than the value column.
+_CREDIT_VALUE_MIN_OFFSET_PX = 18
+_CREDIT_LABEL_TO_VALUE_GAP_PX = 3
+# Narrowest width the credit search ever returned; short amounts keep it.
+_CREDIT_SEGMENT_MIN_WIDTH_PX = 48
+
+
+def _credit_text_width(text: str) -> int:
+    value = str(text or "")
+    measured = _tk_measure_text(value, 7)
+    if measured is not None:
+        return int(measured)
+    return int((len(value) * 7 + 2) * _overlay_text_width_scale())
+
+
+def _credit_value_offset() -> int:
+    """x of the credit amount from the segment start, past the "CR" label."""
+    measured = _tk_measure_text("CR", 7)
+    label_width = (
+        int(measured) if measured is not None else int(14 * _overlay_text_width_scale())
+    )
+    return max(
+        _CREDIT_VALUE_MIN_OFFSET_PX,
+        label_width + _CREDIT_LABEL_TO_VALUE_GAP_PX,
+    )
+
+
+def _credit_segment_width_for_text(text: str) -> int:
+    return _credit_value_offset() + _credit_text_width(text) + _SEGMENT_RIGHT_PADDING_PX
+
+
+def _credit_value_spellings(value_text: str) -> tuple[str, ...]:
+    """The amount as displayed, then shorter spellings for a cramped column.
+
+    Shorter spellings keep the leading digits ("62,493" -> "62.4K" -> "62K")
+    and never round up, so a narrow pane cannot overstate the balance. They
+    are derived from the digit shape, which keeps the width search working on
+    its digit-masked signatures ("00,000" -> "00.0K" -> "00K").
+    """
+    text = str(value_text or "--")
+    digits = text.split(".", 1)[0].replace(",", "")
+    if not digits.isdigit() or len(digits) < 4:
+        return (text,)
+    exponent = min(9, 3 * ((len(digits) - 1) // 3))
+    suffix = {3: "K", 6: "M", 9: "B"}[exponent]
+    head = digits[: len(digits) - exponent]
+    tenths_digit = digits[len(head)]
+    return (text, f"{head}.{tenths_digit}{suffix}", f"{head}{suffix}")
+
+
+def _credit_value_text_for_mode(value_text: str, badge_mode: str) -> str:
+    """Amount a credit column must hold: whole when funding the full text."""
+    spellings = _credit_value_spellings(value_text)
+    return spellings[0] if _normalized_badge_mode(badge_mode) == "full" else spellings[-1]
+
+
+def _credit_fitting_value_text(value_text: str, segment_width: int) -> str:
+    """Longest spelling that fits the segment; the shortest one otherwise."""
+    spellings = _credit_value_spellings(value_text)
+    for spelling in spellings:
+        if _credit_segment_width_for_text(spelling) <= int(segment_width):
+            return spelling
+    return spellings[-1]
 
 
 def _reset_action_direction(metric_key: str, percent: int | None, seconds: int) -> str:

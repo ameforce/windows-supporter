@@ -1502,6 +1502,11 @@ class ClaudeUsageMonitor:
             except OSError:
                 pass
             captured_at = _iso_now(self._clock)
+            with self._limit_reset_lock:
+                # Reset deadlines and the last committed windows belong to
+                # the released account; the next login may bind another.
+                self._limit_reset_baselines = {}
+                self._last_committed_limit_usage = None
             self._profile_name = ""
             self._profile_name_verified = False
             self._session_used_percent = None

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from src.apps.codex_usage_browser_types import (
     BrowserOperationResult,
@@ -385,6 +386,62 @@ class ClaudeLimitResetDetectionTest(unittest.TestCase):
             self.assertIn("weekly_limit", restarted._limit_reset_baselines)
             restarted.collect(force=True)
             self.assertEqual(self.submitted, [["weekly_limit"]])
+
+    def test_release_forgets_the_released_accounts_reset_state(self) -> None:
+        # Another account may sign in after a release. Neither the old
+        # account's elapsed session deadline nor its usage may turn the new
+        # account's first reading into a reset.
+        class _ReleasableSession(_Session):
+            def close_session(self) -> None:
+                return None
+
+        now = datetime.now(timezone.utc)
+        unstarted_session = BrowserOperationResult(
+            probe={
+                "url": "https://claude.ai/settings/usage",
+                "mainText": "Current session",
+                "accountId": "org-uuid-2",
+                "metricBlocks": [
+                    {
+                        "metric_key": "claude_usage_api",
+                        "block_text": json.dumps(
+                            {
+                                "usage": {
+                                    "five_hour": {"utilization": 0.0, "resets_at": None},
+                                    "seven_day": {
+                                        "utilization": 5.0,
+                                        "resets_at": (now + timedelta(days=6)).isoformat(),
+                                    },
+                                }
+                            }
+                        ),
+                    }
+                ],
+            }
+        )
+        for label, next_reading in (
+            ("new deadline", _probe(10.0, now + timedelta(hours=3), 5.0, now + timedelta(days=6))),
+            ("unstarted session", unstarted_session),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                self.submitted = []
+                session = _ReleasableSession()
+                session.results = [
+                    _probe(60.0, now - timedelta(minutes=10), 20.0, now + timedelta(days=3)),
+                    next_reading,
+                ]
+                monitor = self._monitor(session, config_dir=tmp)
+                monitor.collect(force=True)
+
+                with patch.object(
+                    monitor, "_clear_managed_profile_directory", return_value=(True, "")
+                ):
+                    ok, message = monitor.release_profile_session()
+                self.assertTrue(ok, message)
+                self.assertEqual(monitor._limit_reset_baselines, {})
+                monitor.collect(force=True)
+
+                self.assertEqual(self.submitted, [])
 
     def test_alert_header_uses_label_provider_from_profile_manager(self) -> None:
         monitor = ClaudeUsageMonitor(
