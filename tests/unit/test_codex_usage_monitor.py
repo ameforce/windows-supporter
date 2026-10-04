@@ -827,24 +827,24 @@ class CodexUsageMonitorUnitTest(unittest.TestCase):
                 "logged_out",
             )
 
-    def test_canonicalize_codex_usage_url_promotes_legacy_usage_path_to_analytics_hash(self) -> None:
+    def test_canonicalize_codex_usage_url_promotes_legacy_usage_path_to_usage_overview(self) -> None:
         self.assertEqual(
             canonicalize_codex_usage_url("https://chatgpt.com/codex/settings/usage"),
-            "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+            "https://chatgpt.com/settings/usage?tab=overview",
         )
 
-    def test_build_codex_login_entry_url_targets_analytics_hash_path(self) -> None:
+    def test_build_codex_login_entry_url_targets_usage_overview(self) -> None:
         self.assertEqual(
             build_codex_login_entry_url("https://chatgpt.com/codex/settings/usage"),
-            "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+            "https://chatgpt.com/auth/login?next=/settings/usage%3Ftab%3Doverview",
         )
 
-    def test_build_codex_login_entry_url_preserves_analytics_fragment_for_direct_input(self) -> None:
+    def test_build_codex_login_entry_url_migrates_saved_analytics_target(self) -> None:
         self.assertEqual(
             build_codex_login_entry_url(
                 "https://chatgpt.com/codex/cloud/settings/analytics#usage"
             ),
-            "https://chatgpt.com/auth/login?next=/codex/cloud/settings/analytics%23usage",
+            "https://chatgpt.com/auth/login?next=/settings/usage%3Ftab%3Doverview",
         )
 
     def test_browser_session_receives_codex_login_entry_url(self) -> None:
