@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from src.apps.codex_usage_urls import (
+    CURRENT_CODEX_USAGE_URL,
+    canonicalize_codex_usage_url,
+    build_codex_login_entry_url,
+    is_codex_usage_url,
+    are_equivalent_codex_usage_urls,
+)
+
 from dataclasses import dataclass
 import json
 import os
@@ -10,7 +18,6 @@ import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from urllib.parse import quote, urlsplit, urlunsplit
 
 from src.apps.codex_usage_playwright_session import (
     CodexUsagePlaywrightSession,
@@ -161,15 +168,6 @@ USAGE_LIMIT_RESET_COMPLETE_PERCENT = 99.0
 USAGE_LIMIT_RESET_MIN_PERCENTAGE_POINT_JUMP = 5.0
 USAGE_LIMIT_RESET_MAX_INFERENCE_GAP_SECONDS = 15 * 60
 
-CURRENT_CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics#usage"
-CODEX_USAGE_CANONICAL_PATH = "/codex/cloud/settings/analytics"
-CODEX_USAGE_CANONICAL_FRAGMENT = "usage"
-CODEX_USAGE_PAGE_PATHS = (
-    "/codex/settings/usage",
-    "/codex/cloud/settings/usage",
-    "/codex/settings/analytics",
-    "/codex/cloud/settings/analytics",
-)
 class _RefreshableTooltipLines(list):
     def __init__(self, rows, refresh):
         super().__init__(rows)
@@ -209,7 +207,7 @@ async () => {
       'gpt-5.3 codex spark weekly usage limit',
       'gpt-5.3-codex-spark weekly limit',
     ],
-    remaining_credit: ['남은 크레딧', '잔여 크레딧', 'remaining credit', 'credits remaining'],
+    remaining_credit: ['남은 크레딧', '잔여 크레딧', '크레딧 남음', 'remaining credit', 'credits remaining'],
   };
   const scope = document.querySelector('main') || document.body;
   if (!scope) {
@@ -282,6 +280,14 @@ async () => {
   const parseKoreanResetIso = (value) => {
     const raw = normalize(value);
     if (!raw) return '';
+    // The settings overview puts the exact instant in a localized title.
+    const full = raw.match(/(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일(?:\s*[가-힣]+요일)?\s*(오전|오후)\s*(\d{1,2})시\s*(\d{1,2})분(?:\s*(\d{1,2})초)?\s*GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+    if (full) {
+      let hour = Number(full[5]) % 12 + (full[4] === '오후' ? 12 : 0);
+      const offset = (Number(full[9]) * 60 + Number(full[10] || 0)) * (full[8] === '-' ? -1 : 1);
+      return new Date(Date.UTC(Number(full[1]), Number(full[2]) - 1, Number(full[3]), hour,
+        Number(full[6]), Number(full[7] || 0)) - offset * 60000).toISOString();
+    }
     let match = raw.match(/(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(오전|오후)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?/);
     if (match) {
       return toIsoFromLocalParts(match[1], match[2], match[3], match[4], match[5], match[6], match[7] || 0);
@@ -430,7 +436,7 @@ async () => {
       add(node.innerText || node.textContent || '', allowWithoutMarker);
       if (node.getAttribute) {
         add(node.getAttribute('datetime') || '', allowWithoutMarker);
-        add(node.getAttribute('title') || '', allowWithoutMarker);
+        add(node.getAttribute('title') || '', allowWithoutMarker || resetMarkerPattern.test(node.innerText || node.textContent || ''));
         add(node.getAttribute('aria-label') || '', allowWithoutMarker);
       }
       if (!node.querySelectorAll) return;
@@ -438,7 +444,7 @@ async () => {
         add(child.innerText || child.textContent || '', allowWithoutMarker);
         if (!child.getAttribute) continue;
         add(child.getAttribute('datetime') || '', allowWithoutMarker);
-        add(child.getAttribute('title') || '', allowWithoutMarker);
+        add(child.getAttribute('title') || '', allowWithoutMarker || resetMarkerPattern.test(child.innerText || child.textContent || ''));
         add(child.getAttribute('aria-label') || '', allowWithoutMarker);
       }
     };
@@ -580,6 +586,7 @@ USAGE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     "remaining_credit": (
         "남은 크레딧",
         "잔여 크레딧",
+        "크레딧 남음",
         "remaining credit",
         "credits remaining",
     ),
@@ -920,80 +927,6 @@ def parse_usage_metrics_from_text(raw_text: str) -> dict[str, str]:
                 parsed[key] = value
 
     return parsed
-
-
-def canonicalize_codex_usage_url(value: str) -> str:
-    text = normalize_usage_value(value)
-    if not text:
-        return CURRENT_CODEX_USAGE_URL
-    try:
-        parsed = urlsplit(text)
-    except Exception:
-        return text
-    if not parsed.scheme or not parsed.netloc:
-        return text
-    path = str(parsed.path or "").rstrip("/")
-    if path in CODEX_USAGE_PAGE_PATHS:
-        path = CODEX_USAGE_CANONICAL_PATH
-    elif path == "":
-        path = str(parsed.path or "")
-    if not path:
-        path = CODEX_USAGE_CANONICAL_PATH
-    fragment = str(parsed.fragment or "").strip()
-    if path == CODEX_USAGE_CANONICAL_PATH:
-        fragment = CODEX_USAGE_CANONICAL_FRAGMENT
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, fragment))
-
-
-def build_codex_login_entry_url(usage_url: str) -> str:
-    normalized = canonicalize_codex_usage_url(usage_url)
-    try:
-        parsed = urlsplit(normalized)
-    except Exception:
-        return (
-            "https://chatgpt.com/auth/login?"
-            "next=/codex/cloud/settings/analytics%23usage"
-        )
-    path = str(parsed.path or "").rstrip("/")
-    if not path:
-        path = CODEX_USAGE_CANONICAL_PATH
-    next_target = path
-    query = str(parsed.query or "").strip()
-    if query:
-        next_target = f"{next_target}?{query}"
-    fragment = str(parsed.fragment or "").strip()
-    if fragment:
-        next_target = f"{next_target}#{fragment}"
-    return f"https://chatgpt.com/auth/login?next={quote(next_target, safe='/?=&')}"
-
-
-def is_codex_usage_url(value: str) -> bool:
-    text = normalize_usage_value(value)
-    if not text:
-        return False
-    try:
-        parsed = urlsplit(text)
-    except Exception:
-        return False
-    if str(parsed.netloc or "").lower() != "chatgpt.com":
-        return False
-    path = str(parsed.path or "").rstrip("/")
-    if path not in CODEX_USAGE_PAGE_PATHS:
-        return False
-    fragment = str(parsed.fragment or "").strip().lower()
-    if path == CODEX_USAGE_CANONICAL_PATH:
-        return fragment in ("", CODEX_USAGE_CANONICAL_FRAGMENT)
-    return True
-
-
-def are_equivalent_codex_usage_urls(left: str, right: str) -> bool:
-    left_text = normalize_usage_value(left)
-    right_text = normalize_usage_value(right)
-    if not left_text or not right_text:
-        return left_text == right_text
-    if is_codex_usage_url(left_text) and is_codex_usage_url(right_text):
-        return canonicalize_codex_usage_url(left_text) == canonicalize_codex_usage_url(right_text)
-    return left_text == right_text
 
 
 def _find_metric_key_for_label(text: str) -> str | None:
