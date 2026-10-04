@@ -185,6 +185,11 @@ async () => {
       .filter(Boolean)
       .join(' ')
       .trim();
+  // Inactive analytics panels remain mounted. Only rendered text owns current usage.
+  const isVisible = (node) => Boolean(node && node.getClientRects().length
+    && !['hidden', 'collapse'].includes(getComputedStyle(node).visibility));
+  const renderedText = (node) => !isVisible(node) ? ''
+    : (typeof node.innerText === 'string' ? node.innerText : (node.textContent || ''));
   const normalizeToken = (value) =>
     normalize(value).toLowerCase().replace(/[\s:：\-_|\t]/g, '');
   const valuePattern = /(\d+(?:\.\d+)?\s*\/\s*\d+(?:\.\d+)?)|(\d+(?:\.\d+)?\s*%)/;
@@ -192,7 +197,7 @@ async () => {
   const aliases = {
     five_hour_limit: ['5시간 사용 한도', '5시간한도', '5-hour usage limit', '5 hour usage limit', '5h usage limit'],
     weekly_limit: ['주간 사용 한도', '주간한도', 'weekly usage limit', 'weekly limit'],
-    monthly_limit: ['월간 사용 한도', '월간한도', 'monthly usage limit', 'monthly limit'],
+    monthly_limit: ['월 사용 한도', '월간 사용 한도', '월간한도', 'monthly usage limit', 'monthly limit'],
     gpt_5_3_codex_spark_five_hour_limit: [
       'gpt-5.3-codex-spark 5시간 사용 한도',
       'gpt-5.3 codex spark 5시간 사용 한도',
@@ -249,7 +254,7 @@ async () => {
     const seen = new Set();
     const nodes = [boundary, ...Array.from(boundary.querySelectorAll('*'))];
     for (const node of nodes) {
-      const text = normalize(node.innerText || node.textContent || '');
+      const text = normalize(renderedText(node));
       if (!text || text === normalize(labelText) || text.length > 80) continue;
       if (!/[0-9]/.test(text)) continue;
       if (!seen.has(text)) {
@@ -330,10 +335,10 @@ async () => {
   };
   const countMetricLabels = (node) => {
     if (!node) return 0;
-    let count = getMetricKey(node.innerText || node.textContent || '') ? 1 : 0;
+    let count = getMetricKey(renderedText(node)) ? 1 : 0;
     if (!node.querySelectorAll) return count;
     for (const child of Array.from(node.querySelectorAll('*'))) {
-      if (getMetricKey(child.innerText || child.textContent || '')) {
+      if (getMetricKey(renderedText(child))) {
         count += 1;
       }
     }
@@ -432,19 +437,20 @@ async () => {
       }
     };
     const addNodeTree = (node, allowWithoutMarker = false) => {
-      if (!node) return;
-      add(node.innerText || node.textContent || '', allowWithoutMarker);
+      if (!isVisible(node)) return;
+      add(renderedText(node), allowWithoutMarker);
       if (node.getAttribute) {
         add(node.getAttribute('datetime') || '', allowWithoutMarker);
-        add(node.getAttribute('title') || '', allowWithoutMarker || resetMarkerPattern.test(node.innerText || node.textContent || ''));
+        add(node.getAttribute('title') || '', allowWithoutMarker || resetMarkerPattern.test(renderedText(node)));
         add(node.getAttribute('aria-label') || '', allowWithoutMarker);
       }
       if (!node.querySelectorAll) return;
       for (const child of Array.from(node.querySelectorAll('*'))) {
-        add(child.innerText || child.textContent || '', allowWithoutMarker);
+        if (!isVisible(child)) continue;
+        add(renderedText(child), allowWithoutMarker);
         if (!child.getAttribute) continue;
         add(child.getAttribute('datetime') || '', allowWithoutMarker);
-        add(child.getAttribute('title') || '', allowWithoutMarker || resetMarkerPattern.test(child.innerText || child.textContent || ''));
+        add(child.getAttribute('title') || '', allowWithoutMarker || resetMarkerPattern.test(renderedText(child)));
         add(child.getAttribute('aria-label') || '', allowWithoutMarker);
       }
     };
@@ -457,7 +463,7 @@ async () => {
     for (let depth = 0; current && current !== scope && depth < 5; depth += 1) {
       const parent = current.parentElement;
       if (!parent) break;
-      const parentText = normalize(parent.innerText || parent.textContent || '');
+      const parentText = normalize(renderedText(parent));
       if (parentText && parentText.length <= 360 && countMetricLabels(parent) <= 3) {
         addNodeTree(parent, false);
       }
@@ -467,7 +473,7 @@ async () => {
       const end = Math.min(siblings.length - 1, index + 2);
       for (let i = start; i <= end; i += 1) {
         const sibling = siblings[i];
-        const text = normalize(sibling.innerText || sibling.textContent || '');
+        const text = normalize(renderedText(sibling));
         if (text && text.length <= 260 && countMetricLabels(sibling) <= 1) {
           addNodeTree(sibling, false);
         }
@@ -483,10 +489,10 @@ async () => {
     let boundary = labelEl;
     let current = labelEl;
     while (current && current !== scope) {
-      const text = normalize(current.innerText || current.textContent || '');
+      const text = normalize(renderedText(current));
       if (text && text.length <= 260 && valuePattern.test(text)) {
         const labelsInside = Array.from(current.querySelectorAll('*'))
-          .map((el) => getMetricKey(el.innerText || el.textContent || ''))
+          .map((el) => getMetricKey(renderedText(el)))
           .filter(Boolean);
         if (labelsInside.length <= 2) {
           boundary = current;
@@ -500,8 +506,8 @@ async () => {
   const findHeading = (boundary) => {
     let current = boundary;
     while (current && current !== scope) {
-      const heading = Array.from(current.children || []).find((child) => headingTags.has(child.tagName));
-      if (heading) return normalize(heading.innerText || heading.textContent || '');
+      const heading = Array.from(current.children || []).find((child) => isVisible(child) && headingTags.has(child.tagName));
+      if (heading) return normalize(renderedText(heading));
       current = current.parentElement;
     }
     return '';
@@ -510,12 +516,12 @@ async () => {
   const seen = new Set();
   const elements = [scope, ...Array.from(scope.querySelectorAll('*'))];
   for (const element of elements) {
-    const text = normalize(element.innerText || element.textContent || '');
+    const text = normalize(renderedText(element));
     if (!text || text.length > 120) continue;
     const metricKey = getMetricKey(text);
     if (!metricKey) continue;
     const boundary = findBoundary(element);
-    const blockText = normalize(boundary.innerText || boundary.textContent || '');
+    const blockText = normalize(renderedText(boundary));
     if (!blockText) continue;
     const dedupeKey = `${metricKey}::${blockText}`;
     if (seen.has(dedupeKey)) continue;
@@ -540,7 +546,7 @@ async () => {
   return {
     url: location.href,
     title: document.title,
-    mainText: normalize(scope.innerText || scope.textContent || ''),
+    mainText: normalize(renderedText(scope)),
     profileName: sessionIdentity.profileName,
     accountId: sessionIdentity.accountId,
     planType: sessionIdentity.planType,
@@ -564,6 +570,7 @@ USAGE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
         "weekly limit",
     ),
     "monthly_limit": (
+        "월 사용 한도",
         "월간 사용 한도",
         "월간한도",
         "monthly usage limit",

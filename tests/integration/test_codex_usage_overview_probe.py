@@ -50,6 +50,29 @@ class UsageOverviewProbeTest(unittest.TestCase):
         self.assertNotIn("weekly_limit", metrics)
         self.assertNotIn("five_hour_limit", metrics)
 
+    def test_monthly_plan_with_zero_remaining_is_a_valid_current_limit(self):
+        html = FIXTURE.read_text(encoding="utf-8").replace("주간 사용 한도", "월 사용 한도").replace("71% 남음", "0% 남음")
+        probe = self._probe(html)
+        metrics = extract_usage_metrics_from_semantic_blocks(probe["metricBlocks"])
+        self.assertEqual(metrics, {"monthly_limit": "0%", "remaining_credit": "62462"})
+        resets = extract_usage_reset_info_from_semantic_blocks(
+            probe["metricBlocks"], captured_at="2026-10-04T10:00:00+00:00")
+        self.assertEqual(resets.get("monthly_limit_reset_at"), "2026-10-09T22:40:04.000Z")
+
+    def test_hidden_analytics_never_creates_limits_on_the_overview(self):
+        html = FIXTURE.read_text(encoding="utf-8")
+        history = '<section style="display:none"><h2>5-hour usage limit</h2><p>66% left</p></section>'
+        probe = self._probe(html.replace("</body>", history + "</body>"))
+        metrics = extract_usage_metrics_from_semantic_blocks(probe["metricBlocks"])
+        self.assertEqual(metrics, {"weekly_limit": "71%", "remaining_credit": "62462"})
+
+    def test_loading_current_card_never_uses_hidden_history_of_same_limit(self):
+        html = FIXTURE.read_text(encoding="utf-8").replace("71% 남음", "불러오는 중")
+        history = '<section hidden><h2>주간 사용 한도</h2><p>42% 남음</p></section>'
+        probe = self._probe(html.replace("</body>", history + "</body>"))
+        metrics = extract_usage_metrics_from_semantic_blocks(probe["metricBlocks"])
+        self.assertNotIn("weekly_limit", metrics)
+
 
 if __name__ == "__main__":
     unittest.main()
