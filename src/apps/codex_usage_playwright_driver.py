@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any, TypeVar, final, override
 from urllib.parse import urlsplit, urlunsplit
 
+from src.apps.codex_usage_urls import canonicalize_codex_usage_url, is_codex_usage_url
+
 from src.apps.codex_usage_browser_types import (
     BrowserErrorCode,
     BrowserOperationResult,
@@ -52,11 +54,9 @@ def _canonical_usage_url(url: str) -> str:
     host = parts.netloc.lower()
     path = parts.path.rstrip("/").lower()
     fragment = parts.fragment.lower()
-    if host in {"chatgpt.com", "www.chatgpt.com"} and (
-        path in {"/codex/settings/usage", "/codex/cloud/settings/analytics"}
-        or fragment == "usage"
-    ):
-        return "https://chatgpt.com/codex/settings/usage"
+    # Compare observed landings without turning the history tab into a live page.
+    if is_codex_usage_url(url):
+        return canonicalize_codex_usage_url(url)
     return urlunsplit((parts.scheme.lower(), host, path, parts.query, fragment))
 
 

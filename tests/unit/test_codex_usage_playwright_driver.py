@@ -209,6 +209,23 @@ def make_driver(
 
 
 class CodexUsagePlaywrightDriverTest(unittest.TestCase):
+    def test_history_landing_navigates_to_overview_instead_of_reloading_history(self) -> None:
+        overview = "https://chatgpt.com/settings/usage?tab=overview"
+        page = FakePage(url="https://chatgpt.com/settings/usage?tab=analytics#usage",
+                        probe={**PROBE, "url": overview})
+        config = PlaywrightSessionConfig("profile", overview, "probe()")
+        driver, _chromium, _starter = make_driver([FakeContext([page])], config=config)
+        self.assertIsNotNone(driver.collect().probe)
+        self.assertEqual(page.calls, [("goto", overview)])
+
+    def test_current_overview_is_reloaded_and_accepted(self) -> None:
+        overview = "https://chatgpt.com/settings/usage?tab=overview"
+        page = FakePage(url=overview, probe={**PROBE, "url": overview})
+        config = PlaywrightSessionConfig("profile", overview, "probe()")
+        driver, _chromium, _starter = make_driver([FakeContext([page])], config=config)
+        self.assertIsNotNone(driver.collect().probe)
+        self.assertEqual(page.calls, [("reload", overview)])
+
     def test_renderer_crash_event_is_classified_without_reusing_the_context(self) -> None:
         crashed_page = FakePage(crash_on_navigate=True)
         crashed_context = FakeContext([crashed_page])
