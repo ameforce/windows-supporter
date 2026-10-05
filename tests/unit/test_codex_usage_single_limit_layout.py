@@ -10,7 +10,7 @@ from tests.unit.test_codex_usage_taskbar_credit_fit import _FakeFont, _credit, _
 def _limit(key):
     metric = _weekly(89, "04d 17h 49m 29s")
     metric.update(metric_key=key, key={
-        "five_hour_limit": "5H", "weekly_limit": "7D", "monthly_limit": "30D",
+        "five_hour_limit": "5H", "weekly_limit": "7D", "monthly_limit": "1M",
     }[key])
     if key == "five_hour_limit":
         metric.update(reset_text="02h 31m 04s", reset_short_text="02h 31m 04s")
