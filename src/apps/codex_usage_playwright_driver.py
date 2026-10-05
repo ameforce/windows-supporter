@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar, final, override
 from urllib.parse import urlsplit, urlunsplit
 
-from src.apps.codex_usage_urls import canonicalize_codex_usage_url, is_codex_usage_url
+from src.apps.codex_usage_urls import canonicalize_codex_usage_url, is_codex_usage_url, is_legacy_usage_dialog_url
 
 from src.apps.codex_usage_browser_types import (
     BrowserErrorCode,
@@ -21,6 +21,7 @@ from src.apps.codex_usage_browser_types import (
     PlaywrightStarter,
     UsageProbePayload,
     parse_usage_probe,
+    is_credit_only_usage_probe,
 )
 
 
@@ -171,6 +172,14 @@ class CodexUsagePlaywrightDriver:
                         self._page_success_count += 1
                         self._set_status(BrowserState.HEADLESS_READY)
                         return BrowserOperationResult(probe=probe)
+                    if probe is not None:
+                        blocks = probe.get("metricBlocks", [])
+                        route = "legacy_usage" if is_legacy_usage_dialog_url(str(probe.get("url", ""))) else "usage" if is_codex_usage_url(str(probe.get("url", ""))) else "other"
+                        self._log(
+                            f"usage probe not ready route={route} blocks={len(blocks)} "
+                            f"credit_blocks={sum(block.get('metric_key') == 'remaining_credit' for block in blocks)} "
+                            f"text_present={bool(probe.get('mainText'))}"
+                        )
                     raise DriverOperationError("usage probe did not become ready")
                 except (DriverOperationError, OSError, RuntimeError) as exc:
                     last_error = str(exc)
@@ -443,7 +452,7 @@ class CodexUsagePlaywrightDriver:
         return any(
             str(block.get("metric_key", "")) != "remaining_credit"
             for block in probe.get("metricBlocks", [])
-        )
+        ) or is_credit_only_usage_probe(probe)
 
     def _probe_is_login_pending(
         self,
@@ -533,6 +542,10 @@ class CodexUsagePlaywrightDriver:
         *,
         stop_on_non_usage_landing: bool = False,
     ) -> bool:
+        # Return a completed credit view even if identity lookup failed. The
+        # monitor rejects missing identity without 21 slow auth retries here.
+        if is_credit_only_usage_probe(probe, require_identity=False):
+            return True
         if any(
             str(block.get("metric_key", "")) != "remaining_credit"
             for block in probe.get("metricBlocks", [])

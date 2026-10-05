@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from enum import StrEnum, unique
 from typing import Any, TYPE_CHECKING, NotRequired, Protocol, TypedDict, TypeAlias
 
+from src.apps.codex_usage_urls import is_legacy_usage_dialog_url
+
 
 @unique
 class BrowserState(StrEnum):
@@ -50,7 +52,21 @@ class UsageProbePayload(TypedDict):
     profileName: NotRequired[str]
     accountId: NotRequired[str]
     planType: NotRequired[str]
+    creditsOnly: NotRequired[bool]
     metricBlocks: list[MetricBlockPayload]
+
+
+def is_credit_only_usage_probe(probe: UsageProbePayload | dict[str, Any], *, require_identity: bool = True) -> bool:
+    """Recognize the completed legacy credit view; accepting data also needs its account."""
+    if probe.get("creditsOnly") is not True or not is_legacy_usage_dialog_url(str(probe.get("url", ""))):
+        return False
+    blocks = probe.get("metricBlocks")
+    if not isinstance(blocks, list) or not blocks or not all(
+        isinstance(block, dict) and block.get("metric_key") == "remaining_credit" for block in blocks
+    ):
+        return False
+    account_id = probe.get("accountId")
+    return not require_identity or isinstance(account_id, str) and bool(account_id.strip())
 
 
 class PageProtocol(Protocol):
@@ -152,6 +168,8 @@ def parse_usage_probe(value: JsonValue | UsageProbePayload) -> UsageProbePayload
         field = value.get(key)
         if isinstance(field, str):
             probe[key] = field
+    if isinstance(value.get("creditsOnly"), bool):
+        probe["creditsOnly"] = value["creditsOnly"]
     return probe
 
 
