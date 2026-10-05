@@ -254,7 +254,7 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
             )
 
             self.assertEqual([item["key"] for item in metrics], ["monthly_limit"])
-            self.assertEqual(metrics[0]["short_label"], "30D")
+            self.assertEqual(metrics[0]["short_label"], "1M")
             self.assertEqual(metrics[0]["value_text"], "0%")
             self.assertEqual(metrics[0]["short_value_text"], "0%")
 

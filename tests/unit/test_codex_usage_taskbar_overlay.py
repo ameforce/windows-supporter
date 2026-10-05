@@ -334,7 +334,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                     "metrics": [
                         {
                             "key": "monthly_limit",
-                            "short_label": "30d",
+                            "short_label": "1M",
                             "percent": 37,
                             "value_text": "37% left",
                             "reset_at": "2026-08-01T00:00:00+09:00",
@@ -388,8 +388,8 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
         self.assertEqual(model["bars"][0]["provider_status"], "ready")
         first_metric = model["bars"][0]["metrics"][0]
         self.assertEqual(first_metric["metric_key"], "monthly_limit")
-        self.assertEqual(first_metric["key"], "30d")
-        self.assertEqual(first_metric["short_label"], "30d")
+        self.assertEqual(first_metric["key"], "1M")
+        self.assertEqual(first_metric["short_label"], "1M")
         self.assertEqual(first_metric["percent"], 37)
         self.assertEqual(first_metric["value_text"], "37% left")
         self.assertEqual(first_metric["reset_at"], "2026-08-01T00:00:00+09:00")
@@ -700,7 +700,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                     "metrics": [
                         {
                             "key": "monthly_limit",
-                            "short_label": "30d",
+                            "short_label": "1M",
                             "percent": 37,
                             "value_text": "37%",
                             "reset_at": "2026-08-01T00:00:00+09:00",
@@ -829,9 +829,9 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
 
         bar = model["bars"][0]
         keys = [metric["key"] for metric in bar["metrics"]]
-        self.assertIn("30d", keys)
+        self.assertIn("1M", keys)
         monthly = next(
-            metric for metric in bar["metrics"] if metric["key"] == "30d"
+            metric for metric in bar["metrics"] if metric["key"] == "1M"
         )
         self.assertEqual(monthly["metric_key"], "monthly_limit")
         self.assertEqual(monthly["value_text"], "0%")
@@ -6652,7 +6652,7 @@ class CodexUsageTaskbarOverlayUnitTest(unittest.TestCase):
                     "metrics": [
                         {
                             "key": "monthly_limit",
-                            "short_label": "30d",
+                            "short_label": "1M",
                             "percent": 37,
                             "value_text": "37%",
                             "reset_at": "2026-08-01T00:00:00+09:00",
