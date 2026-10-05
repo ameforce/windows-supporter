@@ -23,6 +23,14 @@ def _chatgpt_url(value: str):
     return parsed
 
 
+def is_legacy_usage_dialog_url(value: str) -> bool:
+    parsed = _chatgpt_url(value)
+    if parsed is None or parsed.path not in ("", "/"):
+        return False
+    tabs = [val for key, val in parse_qsl(parsed.query, keep_blank_values=True) if key == "tab"]
+    return parsed.fragment.lower() == "settings/usage" and tabs in ([], ["overview"])
+
+
 def canonicalize_codex_usage_url(value: str) -> str:
     """Migrate a saved collection target, including the old analytics redirect."""
     text = str(value or "").strip()
@@ -43,6 +51,8 @@ def is_codex_usage_url(value: str) -> bool:
     parsed = _chatgpt_url(value)
     if parsed is None:
         return False
+    if is_legacy_usage_dialog_url(value):
+        return True
     path = parsed.path.rstrip("/")
     if path == CODEX_USAGE_CANONICAL_PATH:
         tabs = [val for key, val in parse_qsl(parsed.query, keep_blank_values=True) if key == "tab"]

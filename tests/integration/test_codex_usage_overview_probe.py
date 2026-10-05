@@ -25,14 +25,55 @@ class UsageOverviewProbeTest(unittest.TestCase):
         cls.browser.close()
         cls.playwright.stop()
 
-    def _probe(self, html):
+    def _probe(self, html, url="https://chatgpt.com/settings/usage?tab=overview", session=None):
         # UTC makes an accidental dependency on the machine's Korean timezone visible.
         with self.browser.new_context(timezone_id="UTC") as context:
-            context.route("**/*", lambda route: route.fulfill(status=404, body="{}"))
+            def route_request(route):
+                if route.request.url.endswith("/api/auth/session") and session is not None:
+                    route.fulfill(json=session)
+                else:
+                    route.fulfill(status=404, body="{}")
+            context.route("**/*", route_request)
             page = context.new_page()
-            page.goto("https://chatgpt.com/settings/usage?tab=overview")
+            page.goto(url)
             page.set_content(html)
             return page.evaluate(USAGE_PAGE_PROBE_SCRIPT)
+
+    def test_legacy_credit_dialog_excludes_background_and_hidden_history(self):
+        html = FIXTURE.with_name("codex-usage-credits-dialog.html").read_text(encoding="utf-8")
+        session = {"user": {"id": "user-current", "name": "Current user"}, "account": {"id": "account-current", "planType": "free"}}
+        probe = self._probe(html, "https://chatgpt.com/?tab=overview#settings/Usage", session)
+        self.assertIs(probe.get("creditsOnly"), True)
+        self.assertEqual(probe["accountId"], "account-current")
+        self.assertEqual(extract_usage_metrics_from_semantic_blocks(probe["metricBlocks"]), {"remaining_credit": "1234"})
+        self.assertNotIn("99%", probe["mainText"])
+        self.assertNotIn("55%", probe["mainText"])
+
+    def test_legacy_credit_view_with_no_session_cannot_supply_identity(self):
+        html = FIXTURE.with_name("codex-usage-credits-dialog.html").read_text(encoding="utf-8")
+        # A dangling account object without an authenticated user is not identity proof.
+        probe = self._probe(html, "https://chatgpt.com/#settings/Usage", {"account": {"id": "account-current"}})
+        self.assertIs(probe.get("creditsOnly"), True)
+        self.assertEqual(probe.get("accountId"), "")
+
+    def test_legacy_credit_view_rejects_inactive_loading_and_other_panels(self):
+        html = FIXTURE.with_name("codex-usage-credits-dialog.html").read_text(encoding="utf-8")
+        for modified in (
+            html.replace('data-state="active"', 'data-state="inactive" hidden'),
+            html.replace('data-state="active"', 'data-state="active" aria-busy="true"'),
+            html.replace('<h3>사용량</h3>', '<h3>사용량</h3><div role="progressbar"></div>'),
+            html.replace('<h3>사용량</h3>', '<h3>사용량</h3><div aria-busy="true"></div>'),
+            html.replace('id="settings-content-Usage"', 'id="settings-content-Billing"'),
+        ):
+            probe = self._probe(modified, "https://chatgpt.com/#settings/Usage")
+            self.assertFalse(probe.get("creditsOnly", False))
+            self.assertFalse(any(block["metric_key"] != "remaining_credit" for block in probe["metricBlocks"]))
+
+    def test_legacy_zero_credit_balance_is_current_data(self):
+        html = FIXTURE.with_name("codex-usage-credits-dialog.html").read_text(encoding="utf-8").replace("1,234", "0")
+        probe = self._probe(html, "https://chatgpt.com/#settings/Usage", {"user": {"id": "user-current"}, "account": {"id": "account-current"}})
+        self.assertIs(probe.get("creditsOnly"), True)
+        self.assertEqual(extract_usage_metrics_from_semantic_blocks(probe["metricBlocks"]), {"remaining_credit": "0"})
 
     def test_nested_overview_cards_yield_current_values_and_exact_reset(self):
         probe = self._probe(FIXTURE.read_text(encoding="utf-8"))
