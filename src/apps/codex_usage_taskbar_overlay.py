@@ -1528,27 +1528,31 @@ def _metric_segment_fit_kwargs(
 
 
 def _slot_value_widths(row_layouts: list[Any]) -> dict[str, int]:
-    """Widest measured percent width per metric slot across rows.
+    """Widest measured percent width per displayed column across rows.
 
     Value/badge/countdown x positions derive from the value width, so
     per-row measured widths jitter the whole right block per row. Sharing
     one width per slot pins the grid. Credit draws inline (no value
     column) and is skipped.
     """
-    widths: dict[str, int] = {}
+    widths: dict[int, int] = {}
+    offsets: dict[str, int] = {}
     for row_layout in row_layouts:
         visible = getattr(row_layout, "visible_metrics", ())
-        for metric in tuple(visible):
+        for index, metric in enumerate(tuple(visible)):
             metric_dict = metric if isinstance(metric, dict) else {}
             key = _metric_slot_key(metric_dict)
             if key == "credit":
                 continue
+            offset = row_layout.segment_geometry(index)[0]
+            offsets[key] = offset
             measured = _value_column_width_for_text(
                 str(metric_dict.get("value_text") or "--")
             )
-            if int(measured) > int(widths.get(key, 0) or 0):
-                widths[key] = int(measured)
-    return widths
+            widths[offset] = max(int(measured), widths.get(offset, 0))
+    # Different periods can share one display column; keep the return keys
+    # semantic so the drawing and bar-fit consumers retain metric identity.
+    return {key: widths[offset] for key, offset in offsets.items()}
 
 
 def _slot_minimum_progress_widths(
@@ -1704,10 +1708,10 @@ def _metric_rows_layout_for_overlay_width(
 ) -> list[_MetricRowLayout]:
     """Shared-column layout for every visible row at one overlay width.
 
-    Columns are keyed by metric slot and shared across rows: both profiles'
-    7D segments start at the same x with the same width and the same bar
-    width, a 7D-only row leaves the 5H column blank instead of stretching,
-    and resizing one row's column resizes the same column on every row.
+    Single-limit rows share one usage column even when their periods differ.
+    If any row has multiple limits, columns remain keyed by metric identity:
+    a 7D-only row then aligns with the 7D column of a 5H+7D row. Credit always
+    keeps its own column. Metric identity is unchanged for drawing/tooltips.
     """
     overlay_width = int(width)
     rows_metrics = [
@@ -1727,6 +1731,24 @@ def _metric_rows_layout_for_overlay_width(
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
 
     slot_keys = _metric_slot_keys(rows_metrics)
+    limit_keys = [key for key in slot_keys if key != "credit"]
+    compact_single_limits = (
+        len(limit_keys) > 1
+        and all(key in {"five_hour_limit", "weekly_limit", "monthly_limit"} for key in limit_keys)
+        and all(
+            sum(_metric_slot_key(metric) != "credit" for metric in metrics) <= 1
+            for metrics in rows_metrics
+        )
+    )
+    # Alias only the layout column, never the metric's period or semantics.
+    # Use the canonical first limit so column ordering/funding stays stable.
+    aliases = {key: limit_keys[0] for key in limit_keys} if compact_single_limits else {}
+
+    def layout_slot_key(metric: dict[str, Any]) -> str:
+        key = _metric_slot_key(metric)
+        return aliases.get(key, key)
+
+    slot_keys = list(dict.fromkeys(aliases.get(key, key) for key in slot_keys))
     counts = len(slot_keys)
     required_by_slot: dict[str, int] = {}
     detail_required_by_slot: dict[str, int] = {}
@@ -1735,7 +1757,7 @@ def _metric_rows_layout_for_overlay_width(
     credit_amount_px = 0
     for metrics in rows_metrics:
         for metric in metrics:
-            key = _metric_slot_key(metric)
+            key = layout_slot_key(metric)
             if key == "credit":
                 credit_amount_px = max(
                     credit_amount_px,
@@ -1856,16 +1878,17 @@ def _metric_rows_layout_for_overlay_width(
     for key in slot_keys:
         for metrics in rows_metrics:
             for metric in metrics:
-                if _metric_slot_key(metric) != key:
+                if layout_slot_key(metric) != key:
                     continue
                 minimum = _metric_countdown_min_width(metric)
                 if key not in min_by_slot:
                     min_by_slot[key] = minimum
-                elif key == "credit":
+                elif key == "credit" or compact_single_limits:
                     # The amount never degrades like countdown text does, so
-                    # the shared column must hold every row's amount.
+                    # hold every row's amount. Mixed single-limit periods
+                    # likewise need the longest countdown, in any row order.
                     min_by_slot[key] = max(min_by_slot[key], minimum)
-            if key in min_by_slot and key != "credit":
+            if key in min_by_slot and key != "credit" and not compact_single_limits:
                 break
     total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
     bar_floor_by_slot = {
@@ -1999,10 +2022,10 @@ def _metric_rows_layout_for_overlay_width(
 
     layouts = []
     for metrics in rows_metrics:
-        row_offsets = tuple(offsets_by_slot[_metric_slot_key(metric)] for metric in metrics)
-        row_widths = tuple(column_widths[_metric_slot_key(metric)] for metric in metrics)
+        row_offsets = tuple(offsets_by_slot[layout_slot_key(metric)] for metric in metrics)
+        row_widths = tuple(column_widths[layout_slot_key(metric)] for metric in metrics)
         row_progresses = tuple(
-            column_progresses[_metric_slot_key(metric)] for metric in metrics
+            column_progresses[layout_slot_key(metric)] for metric in metrics
         )
         layouts.append(
             _MetricRowLayout(
