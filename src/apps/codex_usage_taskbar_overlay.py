@@ -102,7 +102,7 @@ _NATIVE_OWNER_CLASS_PREFIX = "WindowsSupporterOverlayOwner_"
 _TASKBAR_METRICS = (
     ("five_hour_limit", "5h"),
     ("weekly_limit", "7d"),
-    ("monthly_limit", "30d"),
+    ("monthly_limit", "1M"),
 )
 _TASKBAR_OCCUPIED_CHILD_CLASSES = {
     "Button",
