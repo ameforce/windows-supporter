@@ -27,6 +27,7 @@ from src.apps.codex_usage_browser_types import (
     BrowserOperationResult,
     BrowserRuntimeStatus,
     BrowserState,
+    is_credit_only_usage_probe,
 )
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
@@ -214,7 +215,16 @@ async () => {
     ],
     remaining_credit: ['남은 크레딧', '잔여 크레딧', '크레딧 남음', 'remaining credit', 'credits remaining'],
   };
-  const scope = document.querySelector('main') || document.body;
+  const tabs = new URLSearchParams(location.search).getAll('tab');
+  const legacyUsageRoute = location.origin === 'https://chatgpt.com'
+    && location.pathname === '/' && location.hash.toLowerCase() === '#settings/usage'
+    && (!tabs.length || (tabs.length === 1 && tabs[0] === 'overview'));
+  const legacyUsagePanel = legacyUsageRoute
+    ? Array.from(document.querySelectorAll('[role="dialog"] [role="tabpanel"][data-state="active"][id$="-content-Usage"]'))
+      .find((panel) => isVisible(panel)) : null;
+  // Legacy settings sit outside the background chat main. Never inspect that
+  // chat or another settings panel while waiting for the active usage panel.
+  const scope = legacyUsageRoute ? legacyUsagePanel : document.querySelector('main') || document.body;
   if (!scope) {
     return { url: location.href, title: document.title, mainText: '', metricBlocks: [] };
   }
@@ -378,7 +388,7 @@ async () => {
     }
   };
   const collectSessionIdentity = async () => {
-    const identity = { profileName: '', accountId: '', planType: '' };
+    const identity = { profileName: '', accountId: '', planType: '', authenticated: false };
     try {
       const result = await fetchIdentityJson('/api/auth/session');
       const session = result.data;
@@ -394,6 +404,7 @@ async () => {
         account.planType || account.plan_type || session.planType || session.plan_type || ''
       ).trim();
       const userId = typeof user.id === 'string' ? user.id.trim() : '';
+      identity.authenticated = Boolean(userId && identity.accountId);
       if (!userId || typeof session.accessToken !== 'string' || !session.accessToken) {
         return identity;
       }
@@ -539,17 +550,24 @@ async () => {
       boundary_role: boundary.getAttribute ? (boundary.getAttribute('role') || '') : '',
     });
   }
-  // Readiness retries must inspect the DOM without repeating slow identity calls.
-  // The monitor only accepts snapshots with a usage-limit block, not credits alone.
-  const sessionIdentity = metricBlocks.some((block) => block.metric_key !== 'remaining_credit')
-    ? await collectSessionIdentity() : { profileName: '', accountId: '', planType: '' };
+  const hasLimit = metricBlocks.some((block) => block.metric_key !== 'remaining_credit');
+  const creditAmount = /(?:\d[\d,.]*\s*(?:크레딧\s*남음|credits?\s*remaining))|(?:(?:남은|잔여)\s*크레딧|remaining\s*credits?)\s*:?\s*\d/i;
+  const creditsOnly = Boolean(legacyUsagePanel && !hasLimit
+    && legacyUsagePanel.getAttribute('aria-busy') !== 'true'
+    && !legacyUsagePanel.querySelector('[aria-busy="true"], [role="progressbar"]')
+    && metricBlocks.some((block) => block.metric_key === 'remaining_credit' && creditAmount.test(block.block_text)));
+  // Ordinary overview credit cards can arrive before limits. Only the exact
+  // legacy balance view is complete without a limit, and it still needs identity.
+  const sessionIdentity = hasLimit || creditsOnly
+    ? await collectSessionIdentity() : { profileName: '', accountId: '', planType: '', authenticated: false };
   return {
     url: location.href,
     title: document.title,
     mainText: normalize(renderedText(scope)),
     profileName: sessionIdentity.profileName,
-    accountId: sessionIdentity.accountId,
+    accountId: creditsOnly && !sessionIdentity.authenticated ? '' : sessionIdentity.accountId,
     planType: sessionIdentity.planType,
+    creditsOnly,
     metricBlocks,
   };
 }
@@ -4869,6 +4887,8 @@ class CodexUsageMonitor:
             return None
         if not self.__is_usage_dom_ready_from_probe(normalized_probe):
             return None
+        if is_credit_only_usage_probe(normalized_probe, require_identity=False) and not is_credit_only_usage_probe(normalized_probe):
+            return None
         if not self.__probe_identity_matches_bound_account(
             normalized_probe.get("accountId", "")
         ):
@@ -4884,7 +4904,8 @@ class CodexUsageMonitor:
             return None
         limit_keys = USAGE_LIMIT_METRIC_KEYS
         has_limit_metric = any(normalize_usage_value(metrics.get(k, "")) for k in limit_keys)
-        if not has_limit_metric:
+        credits_only = is_credit_only_usage_probe(normalized_probe)
+        if not has_limit_metric and not (credits_only and metrics.get("remaining_credit")):
             return None
         reset_info = extract_usage_reset_info_from_semantic_blocks(
             normalized_probe.get("metricBlocks", []),
@@ -4898,7 +4919,7 @@ class CodexUsageMonitor:
                 metric_blocks
             ),
         )
-        if self.__local_usage_provider is not None:
+        if self.__local_usage_provider is not None and not credits_only:
             try:
                 local_usage = self.__local_usage_provider()
             except Exception as exc:
