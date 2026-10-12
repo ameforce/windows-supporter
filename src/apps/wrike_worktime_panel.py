@@ -23,15 +23,13 @@ _MIN_IDLE_TIMEOUT_MS = 1_200
 _MIN_PANEL_WIDTH = 520
 _MIN_PANEL_HEIGHT = 330
 _COMPACT_PANEL_MAX_WIDTH = 660
-# Compact summary shows three today rows (Flex note, arrival/quit, delta),
-# so the height budget covers one more summary row than before.
-_COMPACT_PANEL_MAX_HEIGHT = 570
 _MAX_COMPACT_TODAY_LINES = 3
 # Detail text is a bounded viewport: leave enough room for the summary and
 # the first few ticket/detail rows while keeping long days scrollable.
 _DETAIL_EMPTY_TEXT_HEIGHT = 5
-_DETAIL_TEXT_HEIGHT_WITH_ROWS = 8
-_DETAIL_TEXT_MIN_HEIGHT = 3
+_DETAIL_TEXT_HEIGHT_WITH_ROWS = 12
+_DETAIL_TEXT_MIN_HEIGHT = 8
+_AUXILIARY_MIN_HEIGHT = 48
 _DETAIL_TEXT_PAD_X = 6
 _DETAIL_GROUP_LEFT_MARGIN = 12
 _DETAIL_GROUP_FONT = ("Segoe UI", 10, "bold")
@@ -795,21 +793,19 @@ class WorktimeQuickPanel:
         detail = self._detail_for_selected_date(model, self._selected_date_key)
         if detail is None or detail.state != "available" or not detail.rows:
             return _DETAIL_EMPTY_TEXT_HEIGHT
-        # Every ticket gets a heading and every record gets a nested child row,
-        # including a ticket with only one record. Eight rows leave a useful
-        # initial slice visible; Text scrolling handles unusually long days
-        # instead of making this panel grow without bound.
+        # Ticket headings and nested records need a stable reading surface.
+        # Extra controls yield space before these twelve text rows do.
         return _DETAIL_TEXT_HEIGHT_WITH_ROWS
 
     def _fit_detail_viewport(self, max_window_height: int) -> None:
-        """Protect the footer by shrinking only the scrollable detail viewport."""
+        """Fit auxiliary content to the work area before reducing reading space."""
 
         detail_text = self._widgets.get("detail_text")
-        footer = self._widgets.get("footer")
+        auxiliary = self._widgets.get("auxiliary_canvas")
+        auxiliary_content = self._widgets.get("auxiliary_content")
         window = self._window
         if (
             detail_text is None
-            or footer is None
             or window is None
             or not callable(getattr(detail_text, "configure", None))
             or not callable(getattr(detail_text, "cget", None))
@@ -821,7 +817,6 @@ class WorktimeQuickPanel:
             if self._model is not None
             else _DETAIL_TEXT_HEIGHT_WITH_ROWS
         )
-        desired_height = max(_DETAIL_TEXT_MIN_HEIGHT, desired_height)
         max_window_height = max(1, int(max_window_height))
 
         # Restore the model's preferred viewport before measuring. This lets a
@@ -829,36 +824,83 @@ class WorktimeQuickPanel:
         self._detail_text_layout_height = desired_height
         _safe_call(detail_text, "configure", height=desired_height)
         _safe_call(window, "update_idletasks")
-        footer_reqheight = _positive_int_call(footer, "winfo_reqheight", 0)
-        if footer_reqheight <= 0:
+        if auxiliary is None or auxiliary_content is None:
             return
-
-        def layout_fits() -> bool:
-            return bool(
-                _positive_int_call(window, "winfo_reqheight", 0)
-                <= max_window_height
-                and _int_call(footer, "winfo_height", 0) >= footer_reqheight
-            )
-
-        if layout_fits():
-            return
-
-        for detail_height in range(
-            desired_height - 1,
-            _DETAIL_TEXT_MIN_HEIGHT - 1,
-            -1,
-        ):
+        natural_height = _positive_int_call(auxiliary_content, "winfo_reqheight", 1)
+        # Canvas requests its viewport size, not its embedded frame's size.
+        # Measure the fixed header/detail/footer independently of the viewport.
+        minimum_height = min(desired_height, _DETAIL_TEXT_MIN_HEIGHT)
+        for detail_height in range(desired_height, minimum_height - 1, -1):
             _safe_call(detail_text, "configure", height=detail_height)
             _safe_call(window, "update_idletasks")
-            if layout_fits():
-                self._detail_text_layout_height = detail_height
-                return
-
-        # Keep the smallest readable viewport as the final fallback on an
-        # exceptionally small or heavily scaled work area.
-        self._detail_text_layout_height = _DETAIL_TEXT_MIN_HEIGHT
-        _safe_call(detail_text, "configure", height=_DETAIL_TEXT_MIN_HEIGHT)
+            fixed_height = (
+                _positive_int_call(window, "winfo_reqheight", 0)
+                - _positive_int_call(auxiliary, "winfo_reqheight", 0)
+            )
+            if fixed_height + _AUXILIARY_MIN_HEIGHT <= max_window_height:
+                break
+        self._detail_text_layout_height = detail_height
+        viewport_height = min(natural_height, max(1, max_window_height - fixed_height))
+        _safe_call(auxiliary, "configure", height=viewport_height)
+        scrollbar = self._widgets.get("auxiliary_scrollbar")
+        if viewport_height < natural_height:
+            _safe_call(scrollbar, "pack", side="right", fill="y")
+        else:
+            _safe_call(scrollbar, "pack_forget")
+            _safe_call(auxiliary, "yview_moveto", 0.0)
         _safe_call(window, "update_idletasks")
+
+    def _scroll_auxiliary(self, event: Any) -> str:
+        """Keep wheel input scoped to the auxiliary surface, not the detail text."""
+
+        canvas = self._widgets.get("auxiliary_canvas")
+        delta = int(getattr(event, "delta", 0))
+        units = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+        if getattr(event, "num", None) in (4, 5):
+            units = -1 if event.num == 4 else 1
+        self._on_pointer_activity(event)
+        _safe_call(canvas, "yview_scroll", units, "units")
+        return "break"
+
+    def _reveal_auxiliary_focus(self, event: Any) -> None:
+        """Queue only the actual focus target after Tk has settled its layout."""
+
+        canvas = self._widgets.get("auxiliary_canvas")
+        widget = getattr(event, "widget", None)
+        # Tk also emits FocusIn for ancestors of the focused Entry/Button.
+        # Their rectangles are not the keyboard target and must not scroll it.
+        if canvas is None or widget is None or _safe_call(canvas, "focus_get") is not widget:
+            return
+        _safe_call(self._root, "after_idle", lambda: self._reveal_auxiliary_widget(widget))
+
+    def _reveal_auxiliary_widget(self, widget: Any) -> None:
+        """Reveal settled focus without activating or moving the reading surface."""
+
+        canvas = self._widgets.get("auxiliary_canvas")
+        content = self._widgets.get("auxiliary_content")
+        # Focus or the rendered structure may change before the idle callback.
+        if (
+            self._destroyed or canvas is None or content is None
+            or _safe_call(canvas, "focus_get") is not widget
+        ):
+            return
+        viewport_height = _positive_int_call(canvas, "winfo_height", 0)
+        content_height = _positive_int_call(content, "winfo_height", 0)
+        if viewport_height <= 0 or content_height <= viewport_height:
+            return
+        viewport_top = _int_call(canvas, "winfo_rooty", 0)
+        widget_top = _int_call(widget, "winfo_rooty", 0)
+        widget_height = _positive_int_call(widget, "winfo_height", 0)
+        widget_bottom = widget_top + widget_height
+        if widget_top >= viewport_top and widget_bottom <= viewport_top + viewport_height:
+            return
+
+        content_top = _int_call(content, "winfo_rooty", 0)
+        if widget_top < viewport_top or widget_height >= viewport_height:
+            target_top = widget_top - content_top - 4
+        else:
+            target_top = widget_bottom - content_top - viewport_height + 4
+        _safe_call(canvas, "yview_moveto", max(0, target_top) / content_height)
 
     @staticmethod
     def _group_timelog_rows(
@@ -1602,8 +1644,41 @@ class WorktimeQuickPanel:
         )
         sync_label.pack(fill="x", padx=8 if compact else 10, pady=(0, 1 if compact else 7))
 
+        auxiliary_canvas = None
+        auxiliary_scrollbar = None
+        auxiliary_content = content
+        canvas_factory = getattr(tk, "Canvas", None)
+        if callable(canvas_factory):
+            auxiliary_shell = tk.Frame(content, bg=_BG)
+            auxiliary_shell.pack(fill="both", expand=True, pady=(0, section_gap))
+            auxiliary_canvas = canvas_factory(
+                auxiliary_shell, bg=_BG, height=1, width=1,
+                highlightthickness=0, borderwidth=0,
+            )
+            auxiliary_scrollbar = tk.Scrollbar(
+                auxiliary_shell, command=auxiliary_canvas.yview,
+            )
+            auxiliary_canvas.configure(yscrollcommand=auxiliary_scrollbar.set)
+            auxiliary_canvas.pack(side="left", fill="both", expand=True)
+            auxiliary_content = tk.Frame(auxiliary_canvas, bg=_BG)
+            auxiliary_item = auxiliary_canvas.create_window(
+                (0, 0), window=auxiliary_content, anchor="nw",
+            )
+            self._bind_additive(
+                auxiliary_canvas, "<Configure>",
+                lambda event: auxiliary_canvas.itemconfigure(
+                    auxiliary_item, width=event.width,
+                ),
+            )
+            self._bind_additive(
+                auxiliary_content, "<Configure>",
+                lambda _event: auxiliary_canvas.configure(
+                    scrollregion=auxiliary_canvas.bbox("all"),
+                ),
+            )
+
         today_card = tk.Frame(
-            content,
+            auxiliary_content,
             bg=_CARD_BG,
             highlightthickness=1,
             highlightbackground=_BORDER,
@@ -1634,7 +1709,7 @@ class WorktimeQuickPanel:
             tk.Frame(today_card, bg=_CARD_BG, height=5).pack(fill="x")
 
         week_card = tk.Frame(
-            content,
+            auxiliary_content,
             bg=_CARD_BG,
             highlightthickness=1,
             highlightbackground=_BORDER,
@@ -1724,7 +1799,9 @@ class WorktimeQuickPanel:
             highlightthickness=1,
             highlightbackground=_BORDER,
         )
-        detail_card.pack(fill="x", pady=(0, section_gap))
+        # Pack fixed surfaces before the expanding auxiliary viewport so Tk
+        # cannot allocate their space to summaries or conditional controls.
+        detail_card.pack(side="bottom", fill="x", pady=(0, section_gap), before=header)
         detail_header = tk.Frame(detail_card, bg=_CARD_BG)
         detail_header.pack(fill="x", padx=8 if compact else 10, pady=title_padding)
         detail_title = tk.Label(
@@ -1854,7 +1931,7 @@ class WorktimeQuickPanel:
             )
             detail_text.pack(fill="x", padx=10, pady=(0, 6))
         inline_editor = tk.Frame(
-            content,
+            auxiliary_content,
             bg=_CARD_BG,
             highlightthickness=1,
             highlightbackground=_HOVER_BORDER,
@@ -1903,7 +1980,7 @@ class WorktimeQuickPanel:
         self._bind_additive(inline_entry, "<Escape>", self._cancel_inline_editor_event)
 
         footer = tk.Frame(content, bg=_BG)
-        footer.pack(side="bottom", fill="x", pady=(0, 1))
+        footer.pack(side="bottom", fill="x", pady=(0, 1), before=detail_card)
         actions = tk.Frame(footer, bg=_BG)
         actions.pack(fill="x")
         refresh_button = self._button(actions, "새로고침", self._refresh_command)
@@ -1929,17 +2006,19 @@ class WorktimeQuickPanel:
         )
         countdown_label.pack(fill="x", pady=(0, section_gap))
 
+        auxiliary_lead_card = today_card
         prompt_label = None
         prompt_buttons: tuple[Any, ...] = ()
         if model.prompt is not None:
             prompt = model.prompt
             prompt_card = tk.Frame(
-                content,
+                auxiliary_content,
                 bg=_PROMPT_BG,
                 highlightthickness=1,
                 highlightbackground=_PROMPT_BORDER,
             )
-            prompt_card.pack(fill="x", before=footer)
+            prompt_card.pack(fill="x", before=today_card)
+            auxiliary_lead_card = prompt_card
             prompt_label = tk.Label(
                 prompt_card,
                 text=f"{prompt.detected_time} 활동을 출근으로 반영할까요?",
@@ -1983,12 +2062,14 @@ class WorktimeQuickPanel:
         if model.overtime_prompt is not None:
             overtime_prompt = model.overtime_prompt
             overtime_card = tk.Frame(
-                content,
+                auxiliary_content,
                 bg="#ECFDF5",
                 highlightthickness=1,
                 highlightbackground="#86EFAC",
             )
-            overtime_card.pack(fill="x", pady=(section_gap, 0), before=footer)
+            overtime_card.pack(fill="x", pady=(section_gap, 0), before=today_card)
+            if auxiliary_lead_card is today_card:
+                auxiliary_lead_card = overtime_card
             assigned_text = (
                 f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
                 if overtime_prompt.assigned_minutes > 0
@@ -2037,14 +2118,16 @@ class WorktimeQuickPanel:
         if model.overtime_state is not None:
             overtime_state = model.overtime_state
             overtime_state_card = tk.Frame(
-                content,
+                auxiliary_content,
                 bg="#EFF6FF",
                 highlightthickness=1,
                 highlightbackground="#BFDBFE",
             )
             overtime_state_card.pack(
-                fill="x", pady=(section_gap, 0), before=footer
+                fill="x", pady=(section_gap, 0), before=today_card
             )
+            if auxiliary_lead_card is today_card:
+                auxiliary_lead_card = overtime_state_card
             overtime_state_label = tk.Label(
                 overtime_state_card,
                 text=self._overtime_state_text(overtime_state),
@@ -2091,12 +2174,14 @@ class WorktimeQuickPanel:
         flex_open_button = None
         if model.flex_pending:
             pending_card = tk.Frame(
-                content,
+                auxiliary_content,
                 bg="#FFFBEB",
                 highlightthickness=1,
                 highlightbackground="#FDE68A",
             )
-            pending_card.pack(fill="x", pady=(section_gap, 0), before=footer)
+            pending_card.pack(fill="x", pady=(section_gap, 0), before=today_card)
+            if auxiliary_lead_card is today_card:
+                auxiliary_lead_card = pending_card
             pending_heading = tk.Frame(pending_card, bg="#FFFBEB")
             pending_heading.pack(fill="x", padx=8, pady=(4, 0))
             flex_pending_label = tk.Label(
@@ -2168,6 +2253,12 @@ class WorktimeQuickPanel:
                 more_label.pack(fill="x", padx=10, pady=(0, 4))
 
         self._widgets = {
+            "auxiliary_canvas": auxiliary_canvas,
+            "auxiliary_content": auxiliary_content,
+            "auxiliary_scrollbar": auxiliary_scrollbar,
+            "today_card": today_card,
+            "auxiliary_lead_card": auxiliary_lead_card,
+            "detail_card": detail_card,
             "week_range": week_range_label,
             "sync": sync_label,
             "today_lines": tuple(today_line_labels),
@@ -2203,6 +2294,14 @@ class WorktimeQuickPanel:
             "overtime_state_buttons": overtime_state_buttons,
             "overtime_idle_button": overtime_idle_button,
         }
+        if auxiliary_canvas is not None:
+            pending_widgets = [auxiliary_canvas, auxiliary_content]
+            while pending_widgets:
+                widget = pending_widgets.pop()
+                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    self._bind_additive(widget, sequence, self._scroll_auxiliary)
+                self._bind_additive(widget, "<FocusIn>", self._reveal_auxiliary_focus)
+                pending_widgets.extend(_safe_call(widget, "winfo_children") or ())
         self._update_detail_presentation(model)
         if self._inline_editor_active and self._inline_editor_kind is not None:
             initial_value = preserved_inline_value
@@ -2734,7 +2833,7 @@ class WorktimeQuickPanel:
             "pack",
             fill="x",
             pady=(0, 6),
-            before=self._widgets.get("footer"),
+            before=self._widgets.get("auxiliary_lead_card"),
         )
         _safe_call(entry, "focus_set")
         _safe_call(entry, "selection_range", 0, "end")
@@ -2743,6 +2842,9 @@ class WorktimeQuickPanel:
         self._geometry_retry_pending = not self._reconcile_geometry(
             resize_to_request=True
         )
+        # The editor is placed before the summaries. Reveal it without moving
+        # the separate detail text's reading position.
+        _safe_call(self._widgets.get("auxiliary_canvas"), "yview_moveto", 0.0)
 
     def _focus_or_show_inline_editor(
         self,
@@ -3164,18 +3266,13 @@ class WorktimeQuickPanel:
         work_width = max(1, work_right - work_left)
         work_height = max(1, work_bottom - work_top)
 
-        self._fit_detail_viewport(
-            min(_COMPACT_PANEL_MAX_HEIGHT, work_height)
-        )
+        self._fit_detail_viewport(work_height)
         _safe_call(window, "update_idletasks")
         requested_width = min(
             _COMPACT_PANEL_MAX_WIDTH,
             _positive_int_call(window, "winfo_reqwidth", 680),
         )
-        requested_height = min(
-            _COMPACT_PANEL_MAX_HEIGHT,
-            _positive_int_call(window, "winfo_reqheight", 480),
-        )
+        requested_height = _positive_int_call(window, "winfo_reqheight", 480)
 
         current_width = current[2] if current is not None else 1
         current_height = current[3] if current is not None else 1
