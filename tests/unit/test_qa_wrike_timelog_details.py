@@ -168,7 +168,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
         self.assertIn("  ◦ 02:15 · 두 번째 작업 설명", text)
         self.assertNotIn("메모:", text)
         self.assertNotIn("티켓  ", text)
-        self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 8)
+        self.assertEqual(self.panel._widgets["detail_text"].kwargs["height"], 12)
 
     def test_ticket_heading_is_single_line_and_uses_ellipsis_when_needed(self):
         long_title = (
@@ -215,7 +215,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             day_details=_details(rows=rows),
         )
         self.assertTrue(self.panel.refresh_now())
-        self.assertEqual(text.kwargs["height"], 8)
+        self.assertEqual(text.kwargs["height"], 12)
         self.assertEqual(len(window.geometry_calls), before_geometry_count + 1)
         self.assertIn("x420", window.geometry_calls[-1])
 
@@ -243,7 +243,7 @@ class IndependentDatePanelAcceptance(unittest.TestCase):
             day_details=_details(rows=(row,)),
         )
         self.assertTrue(self.panel.refresh_now())
-        self.assertEqual(text.kwargs["height"], 8)
+        self.assertEqual(text.kwargs["height"], 12)
         self.assertEqual(len(window.geometry_calls), before_geometry_count)
 
     def test_loading_and_unavailable_never_claim_empty(self):

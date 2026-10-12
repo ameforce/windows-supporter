@@ -9,7 +9,6 @@ from unittest.mock import Mock, patch
 
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
 from src.apps.wrike_worktime_panel import (
-    _COMPACT_PANEL_MAX_HEIGHT,
     _COMPACT_PANEL_MAX_WIDTH,
     WorktimeActivityPrompt,
     WorktimeFlexPendingRecord,
@@ -1631,13 +1630,13 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 prompt=WorktimeActivityPrompt("08:35"),
             )
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "660x570-1000+50")
+            self.assertEqual(window.geometry_calls[-1], "660x620-1000+50")
             self.assertEqual(work_area.call_count, 1)
 
             work_area.return_value = (-800, -100, 0, 500)
             holder["model"] = _model(actual_text="텍스트만 변경", prompt=None)
             panel.refresh_now()
-            self.assertEqual(window.geometry_calls[-1], "660x570-800-70")
+            self.assertEqual(window.geometry_calls[-1], "660x600-800-100")
             self.assertEqual(work_area.call_count, 2)
 
     def test_first_show_uses_compact_density_for_a_640_pixel_work_area(self) -> None:
@@ -1979,6 +1978,224 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(window.width, 520)
         self.assertEqual(window.height, 330)
 
+    def test_real_tk_reading_height_survives_conditional_controls(self) -> None:
+        """Auxiliary controls scroll while the reading surface and footer stay fixed."""
+
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+        except Exception as exc:
+            self.skipTest(f"Tk display is unavailable: {exc}")
+        root.withdraw()
+        root.monotonic = lambda: 100.0
+        panel = None
+        try:
+            base = _model()
+            logs = tuple(
+                TimelogDetailRow(base.rows[0].date_key, f"L{i}", f"T{i}", 15,
+                                 f"작업 {i}", f"티켓 {i}", "ready")
+                for i in range(30)
+            )
+            base = replace(base, day_details=tuple(
+                TimelogDayDetails(row.date_key, "available",
+                                  450 if row.today else 0, logs if row.today else ())
+                for row in base.rows
+            ))
+            holder = {"model": base}
+            panel, _provider, _callbacks = _make_panel(root, tk, holder)
+            with (
+                patch("src.apps.wrike_worktime_panel._show_window_without_activation",
+                      side_effect=lambda window: (window.deiconify(), True)[1]),
+                patch("src.apps.wrike_worktime_panel._work_area_for_point",
+                      return_value=(0, 0, 612, 538)),
+                patch("src.apps.wrike_worktime_panel._work_area_for_window",
+                      return_value=(0, 0, 612, 538)),
+            ):
+                self.assertTrue(panel.show(activate=False))
+                root.update()
+                initial_pixels = panel._widgets["detail_text"].winfo_height()
+                panel._widgets["detail_text"].yview_moveto(0.4)
+                root.update()
+                initial_index = panel._widgets["detail_text"].index("@0,0")
+                states = (
+                    replace(base, prompt=WorktimeActivityPrompt("08:35")),
+                    replace(base, overtime_prompt=WorktimeOvertimePrompt("18:15", "18:00", 60)),
+                    replace(base, overtime_state=WorktimeOvertimeState("active", "18:00", 15, "18:00")),
+                    replace(base, flex_pending=tuple(
+                        WorktimeFlexPendingRecord(row.date_key, row.weekday, "18:00", "19:00", 60)
+                        for row in base.rows[:4]
+                    )),
+                    replace(base, prompt=WorktimeActivityPrompt("08:35"),
+                            overtime_prompt=WorktimeOvertimePrompt("18:15", "18:00", 60),
+                            overtime_state=WorktimeOvertimeState("active", "18:00", 15, "18:00"),
+                            flex_pending=tuple(
+                                WorktimeFlexPendingRecord(row.date_key, row.weekday,
+                                                          "18:00", "19:00", 60)
+                                for row in base.rows[:4]
+                            )),
+                )
+                for state in states:
+                    with self.subTest(state=state):
+                        holder["model"] = state
+                        self.assertTrue(panel.refresh_now())
+                        root.update()
+                        detail = panel._widgets["detail_text"]
+                        self.assertEqual(int(detail.cget("height")), 12)
+                        self.assertEqual(detail.winfo_height(), initial_pixels)
+                        self.assertEqual(detail.index("@0,0"), initial_index)
+                        footer = panel._widgets["footer"]
+                        self.assertEqual(footer.winfo_height(), footer.winfo_reqheight())
+                        self.assertLessEqual(panel._window.winfo_height(), 538)
+                        self.assertLessEqual(panel._window.winfo_width(), 612)
+                        canvas = panel._widgets["auxiliary_canvas"]
+                        canvas.yview_moveto(1.0)
+                        root.update()
+                        last_row = panel._widgets["rows"][-1][0]
+                        self.assertLessEqual(last_row.winfo_rooty() + last_row.winfo_height(),
+                                             canvas.winfo_rooty() + canvas.winfo_height())
+                        canvas.yview_moveto(0.0)
+
+                panel._widgets["today_lines"][0].event_generate("<MouseWheel>", delta=-120)
+                root.update()
+                self.assertGreater(panel._widgets["auxiliary_canvas"].yview()[0], 0.0)
+                self.assertEqual(panel._widgets["detail_text"].index("@0,0"), initial_index)
+                panel._widgets["plan_button"].focus_force()
+                root.update()
+                panel._widgets["plan_button"].invoke()
+                root.update()
+                detail = panel._widgets["detail_text"]
+                self.assertEqual(int(detail.cget("height")), 12)
+                self.assertEqual(detail.winfo_height(), initial_pixels)
+                editor = panel._widgets["inline_editor"]
+                canvas = panel._widgets["auxiliary_canvas"]
+                self.assertIs(root.focus_get(), panel._widgets["inline_entry"])
+                self.assertEqual(canvas.yview()[0], 0.0)
+                with patch.object(canvas, "yview_moveto", wraps=canvas.yview_moveto) as move:
+                    # Ancestor FocusIn events accompany Entry focus. They must
+                    # never reveal the large frame instead of the actual Entry.
+                    for ancestor in (editor, panel._widgets["auxiliary_content"], canvas):
+                        panel._reveal_auxiliary_focus(SimpleNamespace(widget=ancestor))
+                    root.update()
+                    move.assert_not_called()
+                self.assertTrue(editor.winfo_ismapped())
+                self.assertGreaterEqual(editor.winfo_rooty(), canvas.winfo_rooty())
+                self.assertLessEqual(editor.winfo_rooty() + editor.winfo_height(),
+                                     canvas.winfo_rooty() + canvas.winfo_height())
+                self.assertEqual(detail.index("@0,0"), initial_index)
+                with patch("src.apps.wrike_worktime_panel._work_area_for_window",
+                           return_value=(0, 0, 1280, 960)):
+                    self.assertTrue(panel._reconcile_geometry(resize_to_request=True))
+                    root.update()
+                    self.assertGreater(panel._window.winfo_height(), 570)
+                    self.assertLessEqual(panel._window.winfo_height(), 960)
+                    self.assertEqual(detail.winfo_height(), initial_pixels)
+                    self.assertFalse(panel._widgets["auxiliary_scrollbar"].winfo_ismapped())
+
+                # At a boundary where twelve rows and one usable auxiliary
+                # strip cannot coexist, keep eight fully allocated text rows.
+                import tkinter.font as tkfont
+                line_height = tkfont.Font(root=root, font=detail.cget("font")).metrics("linespace")
+                fixed_height = panel._window.winfo_reqheight() - canvas.winfo_reqheight()
+                minimum_area = fixed_height - 4 * line_height + 48
+                with patch("src.apps.wrike_worktime_panel._work_area_for_window",
+                           return_value=(0, 0, 612, minimum_area)):
+                    self.assertTrue(panel._reconcile_geometry(resize_to_request=True))
+                    root.update()
+                    self.assertEqual(int(detail.cget("height")), 8)
+                    self.assertEqual(detail.winfo_height(), detail.winfo_reqheight())
+                    self.assertGreaterEqual(canvas.winfo_height(), 48)
+                    self.assertLessEqual(panel._window.winfo_height(), minimum_area)
+        finally:
+            if panel is not None:
+                panel.destroy()
+            root.destroy()
+
+    def test_real_tk_tab_reveals_auxiliary_controls_in_both_directions(self) -> None:
+        """Tab must never leave an auxiliary action focused outside its viewport."""
+
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+        except Exception as exc:
+            self.skipTest(f"Tk display is unavailable: {exc}")
+        root.withdraw()
+        original_scaling = float(root.tk.call("tk", "scaling"))
+        root.tk.call("tk", "scaling", original_scaling * 1.5)
+        root.monotonic = lambda: 100.0
+        panel = None
+        try:
+            base = _model(
+                prompt=WorktimeActivityPrompt("08:35"),
+                overtime_state=WorktimeOvertimeState("active", "18:00", 15, "18:00"),
+            )
+            logs = tuple(
+                TimelogDetailRow(base.rows[0].date_key, f"L{i}", f"T{i}", 15,
+                                 f"작업 {i}", f"티켓 {i}", "ready")
+                for i in range(30)
+            )
+            model = replace(base, day_details=tuple(
+                TimelogDayDetails(row.date_key, "available",
+                                  450 if row.today else 0, logs if row.today else ())
+                for row in base.rows
+            ), flex_pending=tuple(
+                WorktimeFlexPendingRecord(row.date_key, row.weekday, "18:00", "19:00", 60)
+                for row in base.rows[:4]
+            ))
+            panel, _provider, _callbacks = _make_panel(root, tk, {"model": model})
+            with (
+                patch("src.apps.wrike_worktime_panel._show_window_without_activation",
+                      side_effect=lambda window: (window.deiconify(), True)[1]),
+                patch("src.apps.wrike_worktime_panel._work_area_for_point",
+                      return_value=(0, 0, 800, 640)),
+                patch("src.apps.wrike_worktime_panel._work_area_for_window",
+                      return_value=(0, 0, 800, 640)),
+            ):
+                self.assertTrue(panel.show(activate=False))
+                panel._widgets["plan_button"].invoke()
+                root.update()
+                detail = panel._widgets["detail_text"]
+                detail.yview_moveto(0.35)
+                root.update()
+                detail_index = detail.index("@0,0")
+                detail_height = detail.winfo_height()
+                canvas = panel._widgets["auxiliary_canvas"]
+                content = panel._widgets["auxiliary_content"]
+                required = {str(panel._widgets["inline_entry"])}
+                for row in panel._widgets["flex_pending_rows"]:
+                    required.update(str(row[key]) for key in ("edit_button", "done_button"))
+
+                for sequence in ("<Tab>", "<Shift-Tab>"):
+                    with self.subTest(direction=sequence):
+                        seen = set()
+                        panel._widgets["prompt_buttons"][0].focus_force()
+                        root.update()
+                        for _step in range(64):
+                            focused = root.focus_get()
+                            self.assertIsNotNone(focused)
+                            focused.event_generate(sequence)
+                            root.update()
+                            focused = root.focus_get()
+                            ancestor = focused
+                            while ancestor is not None and ancestor is not content:
+                                ancestor = getattr(ancestor, "master", None)
+                            if ancestor is content:
+                                seen.add(str(focused))
+                                self.assertGreaterEqual(focused.winfo_rooty(), canvas.winfo_rooty())
+                                self.assertLessEqual(
+                                    focused.winfo_rooty() + focused.winfo_height(),
+                                    canvas.winfo_rooty() + canvas.winfo_height(),
+                                )
+                            self.assertEqual(detail.index("@0,0"), detail_index)
+                            self.assertEqual(detail.winfo_height(), detail_height)
+                            if required <= seen:
+                                break
+                        self.assertTrue(required <= seen, required - seen)
+        finally:
+            if panel is not None:
+                panel.destroy()
+            root.tk.call("tk", "scaling", original_scaling)
+            root.destroy()
+
     def test_real_tk_worst_case_layout_has_bounded_natural_size(self) -> None:
         """Catch Tk's natural-size override of a non-resizable panel."""
 
@@ -2052,9 +2269,10 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             window.update_idletasks()
 
             self.assertEqual(len(panel._widgets["today_lines"]), 3)
-            self.assertEqual(int(panel._widgets["detail_text"].cget("height")), 8)
+            self.assertEqual(int(panel._widgets["detail_text"].cget("height")), 12)
             self.assertLessEqual(window.winfo_reqwidth(), _COMPACT_PANEL_MAX_WIDTH)
-            self.assertLessEqual(window.winfo_reqheight(), _COMPACT_PANEL_MAX_HEIGHT)
+            panel._fit_detail_viewport(800)
+            self.assertLessEqual(window.winfo_reqheight(), 800)
         finally:
             if panel is not None:
                 panel.destroy()
@@ -2240,9 +2458,9 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             window_bottom = window.winfo_rooty() + window.winfo_height()
             footer = panel._widgets["footer"]
             self.assertGreaterEqual(footer.winfo_height(), footer.winfo_reqheight())
-            self.assertLess(
+            self.assertEqual(
                 int(panel._widgets["detail_text"].cget("height")),
-                8,
+                12,
             )
             holder["model"] = replace(
                 model,
