@@ -6,10 +6,13 @@ param(
     [string]$BootstrapCompilerPath = "gcc.exe",
     [string]$ManifestToolPath = "mt.exe",
     [switch]$SkipBuild,
-    [switch]$KeepBuildArtifacts
+    [switch]$KeepBuildArtifacts,
+    [switch]$WorkspaceChild
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "installer_workspace_process.ps1")
+if ($WorkspaceChild) { Initialize-InstallerWorkspaceChildStreams }
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $installerDefinition = Join-Path $repoRoot "installer\windows-supporter.iss"
 $compiler = (Resolve-Path -LiteralPath $CompilerPath -ErrorAction Stop).Path
@@ -91,15 +94,52 @@ $sourceExe = Join-Path $repoRoot "dist\windows-supporter.exe"
 $installerName = "WindowsSupporter-v$Version-Setup.exe"
 $installerPath = Join-Path $outputDirectory $installerName
 $sidecarPath = "$installerPath.sha256"
-$coreInstallerPath = Join-Path $outputDirectory "WindowsSupporter-v$Version-Core.exe"
-$bootstrapStubPath = Join-Path $outputDirectory "WindowsSupporter-v$Version-Bootstrap.exe"
+foreach ($finalPath in @($installerPath, $sidecarPath)) {
+    if (Test-Path -LiteralPath $finalPath) {
+        throw "Output already exists; choose a new output directory: $finalPath"
+    }
+}
+
+if (-not $WorkspaceChild) {
+    $python = Resolve-InstallerWorkspacePython -RepoRoot $repoRoot
+    $ownerArguments = @("-X", "utf8", (Join-Path $PSScriptRoot "build_workspace.py"), "--kind", "installer")
+    if ($KeepBuildArtifacts) {
+        $ownerArguments += "--keep"
+    }
+    $ownerArguments += @(
+        "--", (Get-Process -Id $PID).Path, "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", $PSCommandPath, "-WorkspaceChild", "-Version", $Version,
+        "-OutputDirectory", $outputDirectory, "-CompilerPath", $compiler,
+        "-BootstrapCompilerPath", $bootstrapCompiler, "-ManifestToolPath", $manifestTool
+    )
+    if ($SkipBuild) { $ownerArguments += "-SkipBuild" }
+    if ($KeepBuildArtifacts) { $ownerArguments += "-KeepBuildArtifacts" }
+    $ownerResult = Invoke-InstallerWorkspaceProcess -Executable $python -Arguments $ownerArguments -CaptureOutput
+    Write-InstallerWorkspaceOutput -Result $ownerResult
+    $ownerExitCode = $ownerResult.ExitCode
+    if ($ownerExitCode -ne 0) {
+        throw "Installer workspace build failed with exit code $ownerExitCode."
+    }
+    exit 0
+}
+
+if (-not $env:WINDOWS_SUPPORTER_INSTALLER_WORKSPACE -or
+    -not (Test-Path -LiteralPath $env:WINDOWS_SUPPORTER_INSTALLER_WORKSPACE -PathType Container)) {
+    throw "The installer workspace must be allocated by tools\build_workspace.py."
+}
+$scratchOutputDirectory = Join-Path $env:WINDOWS_SUPPORTER_INSTALLER_WORKSPACE "installer"
+New-Item -ItemType Directory -Path $scratchOutputDirectory -ErrorAction Stop | Out-Null
+$coreInstallerPath = Join-Path $scratchOutputDirectory "WindowsSupporter-v$Version-Core.exe"
+$bootstrapStubPath = Join-Path $scratchOutputDirectory "WindowsSupporter-v$Version-Bootstrap.exe"
 
 if (-not $SkipBuild) {
     $previousArtifactOnly = $env:WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY
     $previousStepLog = $env:WINDOWS_SUPPORTER_EMIT_STEP_LOG
+    $previousKeepArtifacts = $env:WINDOWS_SUPPORTER_KEEP_BUILD_ARTIFACTS
     try {
         $env:WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY = "1"
         $env:WINDOWS_SUPPORTER_EMIT_STEP_LOG = "1"
+        if ($KeepBuildArtifacts) { $env:WINDOWS_SUPPORTER_KEEP_BUILD_ARTIFACTS = "1" }
         Push-Location $repoRoot
         try {
             & (Join-Path $repoRoot "build.bat")
@@ -112,6 +152,12 @@ if (-not $SkipBuild) {
         }
     }
     finally {
+        if ($null -eq $previousKeepArtifacts) {
+            Remove-Item Env:WINDOWS_SUPPORTER_KEEP_BUILD_ARTIFACTS -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:WINDOWS_SUPPORTER_KEEP_BUILD_ARTIFACTS = $previousKeepArtifacts
+        }
         if ($null -eq $previousArtifactOnly) {
             Remove-Item Env:WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY -ErrorAction SilentlyContinue
         }
@@ -145,8 +191,7 @@ if ($comments -notmatch "^(?:v)?$escapedVersion(?:\.\d+)?\s+\(") {
     throw "Source executable Comments '$comments' does not identify release version $Version."
 }
 
-Remove-Item -LiteralPath $installerPath, $sidecarPath, $coreInstallerPath, $bootstrapStubPath -Force -ErrorAction SilentlyContinue
-& $compiler "/DAppVersion=$Version" "/DSourceExe=$sourceExe" "/O$outputDirectory" "/FWindowsSupporter-v$Version-Core" $installerDefinition
+& $compiler "/DAppVersion=$Version" "/DSourceExe=$sourceExe" "/O$scratchOutputDirectory" "/FWindowsSupporter-v$Version-Core" $installerDefinition
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE."
 }
@@ -188,23 +233,18 @@ finally {
     $coreStream.Dispose()
     $bootstrapStream.Dispose()
 }
-Remove-Item -LiteralPath $coreInstallerPath, $bootstrapStubPath -Force
-
 if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
     throw "Expected installer artifact was not found: $installerPath"
 }
 
 $hash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToUpperInvariant()
-Set-Content -LiteralPath $sidecarPath -Value "$hash  $installerName" -Encoding ascii
-
-if (-not $KeepBuildArtifacts) {
-    foreach ($generatedPath in @(
-        (Join-Path $repoRoot "build"),
-        (Join-Path $repoRoot "dist"),
-        (Join-Path $repoRoot "windows-supporter.spec")
-    )) {
-        Remove-Item -LiteralPath $generatedPath -Recurse -Force -ErrorAction SilentlyContinue
-    }
+$sidecarStream = [IO.File]::Open($sidecarPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+try {
+    $sidecarBytes = [Text.Encoding]::ASCII.GetBytes("$hash  $installerName`r`n")
+    $sidecarStream.Write($sidecarBytes, 0, $sidecarBytes.Length)
+}
+finally {
+    $sidecarStream.Dispose()
 }
 
 Write-Output "INSTALLER_ARTIFACT=$installerPath"

@@ -15,7 +15,8 @@
 - executable absolute path, SHA-256, size와 timestamp
 - `FileVersion`, `ProductVersion`, `Comments`
 - artifact가 가리키는 release tag와 commit
-- build/dist/spec/backup/promotion marker 잔류 여부
+- 보존한 공개 후보와 이전 build/dist/spec의 용도, backup/promotion marker 잔류 여부
+- 새 빌드 중간 자료의 사용 종료 전달 또는 실패·keep에 따른 보존 결과. 전달 성공을 실제 삭제나 회수량으로 보고하지 않는다.
 - transactional deploy JSON receipt와 exit code
 - normal build가 출력한 `WINDOWS_SUPPORTER_DEPLOY_RECEIPT` path와 JSON parse read-back
 - success receipt의 exact target, candidate/target SHA-256, readiness PID·tray HWND·heartbeat samples·startup path
