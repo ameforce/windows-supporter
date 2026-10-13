@@ -18,10 +18,13 @@ class WrikeSettingsView:
         label: provider for provider, label in _VACATION_PROVIDER_LABELS.items()
     }
 
-    def __init__(self, root: Any, wrike: Any, ui_post=None) -> None:
+    def __init__(
+        self, root: Any, wrike: Any, ui_post=None, on_monitor_enabled_changed=None,
+    ) -> None:
         self._root = root
         self._wrike = wrike
         self._ui_post = ui_post if callable(ui_post) else None
+        self._on_monitor_enabled_changed_callback = on_monitor_enabled_changed
 
         self._tk = None
         self._ttk = None
@@ -303,7 +306,7 @@ class WrikeSettingsView:
         add_entry(self._tooltip_var)
         row += 1
 
-        add_label("모니터링 활성화")
+        add_label("Wrike 자동 알림 활성화")
         tk.Checkbutton(
             content,
             variable=self._monitor_enabled_var,
@@ -2615,11 +2618,13 @@ class WrikeSettingsView:
         return
 
     def _register_autosave_traces(self) -> None:
+        tracer = getattr(self._monitor_enabled_var, "trace_add", None)
+        if callable(tracer):
+            tracer("write", lambda *_args: self._on_monitor_enabled_changed())
         for var in (
             self._token_var,
             self._daily_var,
             self._tooltip_var,
-            self._monitor_enabled_var,
             self._monitor_interval_var,
             self._flex_enabled_var,
             self._flex_employee_number_var,
@@ -2635,6 +2640,50 @@ class WrikeSettingsView:
         ):
             self._bind_autosave_var(var)
         return
+
+    def sync_monitor_enabled(self, settings=None) -> None:
+        """Refresh only the toggle; preserve other drafts and their pending save."""
+        if self._monitor_enabled_var is None:
+            return
+        try:
+            if not isinstance(settings, dict):
+                settings = self._wrike.get_settings_snapshot()
+            enabled = bool(settings["monitor_enabled"])
+        except Exception:
+            return
+        loading = self._loading_settings
+        self._loading_settings = True
+        try:
+            self._monitor_enabled_var.set(enabled)
+        finally:
+            self._loading_settings = loading
+
+    def _on_monitor_enabled_changed(self) -> None:
+        if self._loading_settings:
+            return
+        requested = bool(self._monitor_enabled_var.get())
+        ok = False
+        saved = False
+        settings = None
+        try:
+            saved, _error = self._wrike.update_settings({"monitor_enabled": requested})
+            settings = self._wrike.get_settings_snapshot()
+            ok = bool(saved) and bool(settings["monitor_enabled"]) == requested
+        except Exception:
+            ok = False
+        self.sync_monitor_enabled(settings)
+        error = "" if ok else (
+            "Wrike 설정은 저장했지만 변경 결과를 확인하지 못했습니다."
+            if saved else "Wrike 설정 저장 실패: 현재 상태를 확인해 주세요."
+        )
+        self._set_status(
+            ("Wrike 자동 알림 켜짐" if requested else "Wrike 자동 알림 꺼짐")
+            if ok else error,
+            level="ok" if ok else "error",
+        )
+        callback = self._on_monitor_enabled_changed_callback
+        if callable(callback):
+            callback(error)
 
     def _bind_autosave_var(self, var: Any) -> None:
         tracer = getattr(var, "trace_add", None)
@@ -2687,7 +2736,6 @@ class WrikeSettingsView:
         token = str(self._token_var.get() or "").strip()
         daily_text = str(self._daily_var.get() or "").strip()
         tooltip_text = str(self._tooltip_var.get() or "").strip()
-        monitor_enabled = bool(self._monitor_enabled_var.get())
         interval_text = str(self._monitor_interval_var.get() or "").strip()
         flex_enabled = (
             bool(self._flex_enabled_var.get())
@@ -2814,7 +2862,6 @@ class WrikeSettingsView:
             "api_token": token,
             "daily_target_minutes": daily_minutes,
             "tooltip_duration_ms": tooltip_ms,
-            "monitor_enabled": monitor_enabled,
             "monitor_interval_sec": interval_sec,
             "flex_enabled": flex_enabled,
             "flex_employee_number": flex_employee_number,

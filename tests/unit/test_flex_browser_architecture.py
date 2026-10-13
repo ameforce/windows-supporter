@@ -217,6 +217,10 @@ class FlexBrowserArchitectureTests(unittest.TestCase):
     @staticmethod
     def _worker_app() -> Wrike:
         app = Wrike.__new__(Wrike)
+        app._Wrike__root = object()
+        app._Wrike__background_active = True
+        app._Wrike__monitor_enabled = True
+        app._Wrike__automatic_ui_generation = 0
         app._Wrike__flex_browser_queue = queue.Queue()
         app._Wrike__flex_browser_profile_dir = "C:/temp/flex-profile-test"
         app._Wrike__time_log_login_timeout_sec = 10.0
@@ -507,7 +511,7 @@ class FlexLoginWindowWorkerTests(unittest.TestCase):
 
     @staticmethod
     def _login_payload(source="periodic", activate=False):
-        return {"source": source, "activate": activate}
+        return {"source": source, "activate": activate, "automatic_generation": 0}
 
     def test_login_job_opens_a_headed_window_without_focus_and_reports_it(self) -> None:
         self._start()
@@ -521,7 +525,9 @@ class FlexLoginWindowWorkerTests(unittest.TestCase):
         self.assertEqual(self.created[0].activate_calls, [False])
         self.assertEqual(
             self.events,
-            [("opened", "login", {"result": "opened", "source": "periodic"})],
+            [("opened", "login", {
+                "result": "opened", "source": "periodic", "automatic_generation": 0,
+            })],
         )
 
     def test_finished_login_closes_the_window_and_reports_logged_in(self) -> None:
@@ -571,7 +577,9 @@ class FlexLoginWindowWorkerTests(unittest.TestCase):
 
         client.window_open = False
         self.assertTrue(self._wait_for(lambda: "closed" in self._event_names()))
-        self.assertEqual(self.events, [("closed", "window", {})])
+        self.assertEqual(self.events, [("closed", "window", {
+            "source": "manual", "automatic_generation": None,
+        })])
 
     def test_explicit_open_turns_the_login_window_into_the_employees_window(self) -> None:
         self._start()
@@ -614,7 +622,9 @@ class FlexLoginWindowWorkerTests(unittest.TestCase):
         self.assertEqual(self.created[0].work_opens, 1)
         self.assertEqual(
             self.events,
-            [("opened", "login", {"result": "already_open", "source": "manual"})],
+            [("opened", "login", {
+                "result": "already_open", "source": "manual", "automatic_generation": 0,
+            })],
         )
 
     def test_failed_login_window_is_closed_and_reported(self) -> None:
@@ -633,7 +643,9 @@ class FlexLoginWindowWorkerTests(unittest.TestCase):
         self.assertTrue(self.created[0].closed)
         self.assertEqual(
             self.events,
-            [("open_failed", "login", {"code": "navigation_failed", "source": "periodic"})],
+            [("open_failed", "login", {
+                "code": "navigation_failed", "source": "periodic", "automatic_generation": 0,
+            })],
         )
 
     def test_explicit_sync_surfaces_the_login_window_instead_of_replacing_it(self) -> None:
@@ -761,7 +773,9 @@ class FlexLoginWindowWorkerTests(unittest.TestCase):
 
         self.created[0].window_open = False
         self.assertTrue(self._wait_for(lambda: "closed" in self._event_names()))
-        self.assertEqual(self.events, [("closed", "window", {})])
+        self.assertEqual(self.events, [("closed", "window", {
+            "source": "manual", "automatic_generation": None,
+        })])
 
     def test_failed_open_without_a_page_is_not_reported_as_a_close(self) -> None:
         from src.apps.flex_worktime import FlexBrowserError

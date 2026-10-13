@@ -199,9 +199,11 @@ if (-not (Test-Path -LiteralPath $coreInstallerPath -PathType Leaf)) {
     throw "Expected core installer artifact was not found: $coreInstallerPath"
 }
 
-& $bootstrapCompiler -O2 -s -static -mwindows -o $bootstrapStubPath $bootstrapSource -lshell32
-if ($LASTEXITCODE -ne 0) {
-    throw "Installer bootstrap compilation failed with exit code $LASTEXITCODE."
+$bootstrapExitCode = Invoke-InstallerWorkspaceProcess -Executable $bootstrapCompiler `
+    -PrependPathDirectory (Split-Path -Parent $bootstrapCompiler) `
+    -Arguments @('-O2', '-s', '-static', '-mwindows', '-o', $bootstrapStubPath, $bootstrapSource, '-lshell32')
+if ($bootstrapExitCode -ne 0) {
+    throw "Installer bootstrap compilation failed with exit code $bootstrapExitCode."
 }
 if (-not (Test-Path -LiteralPath $bootstrapStubPath -PathType Leaf)) {
     throw "Expected installer bootstrap artifact was not found: $bootstrapStubPath"

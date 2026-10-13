@@ -13,23 +13,16 @@ class PullRequestProtectionContractTest(unittest.TestCase):
     def _read_runbook(self, name: str) -> str:
         return (RUNBOOK_ROOT / name).read_text(encoding="utf-8")
 
-    def test_server_protection_keeps_pr_only_merge_and_ref_safety(self) -> None:
+    def test_server_protection_allows_direct_merge_and_keeps_ref_safety(self) -> None:
         ruleset = json.loads(
             (REPO_ROOT / ".github/pr-protection/ruleset.json").read_text(
                 encoding="utf-8"
             )
         )
         rule_types = [rule["type"] for rule in ruleset["rules"]]
-        self.assertEqual(rule_types, ["pull_request", "non_fast_forward", "deletion"])
+        self.assertEqual(rule_types, ["non_fast_forward", "deletion"])
+        self.assertNotIn("pull_request", rule_types)
         self.assertNotIn("required_status_checks", rule_types)
-        self.assertEqual(
-            ruleset["rules"][0]["parameters"]["allowed_merge_methods"], ["merge"]
-        )
-        self.assertTrue(
-            ruleset["rules"][0]["parameters"][
-                "require_extra_approval_for_unattributed_changes"
-            ]
-        )
 
     def test_review_profile_routes_transactional_deploy_surfaces(self) -> None:
         profile = json.loads(
@@ -57,8 +50,8 @@ class PullRequestProtectionContractTest(unittest.TestCase):
     def test_agents_entrypoint_keeps_stable_invariants_and_runbook_links(self) -> None:
         contract = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         for contract_id in (
-            "[INV-PR-VERSION-BASE]",
-            "[INV-PR-MERGE-PRECONDITION]",
+            "[INV-VERSION-BASE]",
+            "[INV-MERGE-PRECONDITION]",
             "[INV-PROTECTED-RULESET]",
             "[INV-NO-ACTIONS]",
             "[INV-NO-PUBLIC-REF-REWRITE]",
@@ -88,6 +81,9 @@ class PullRequestProtectionContractTest(unittest.TestCase):
                 self.assertIn(runbook, contract)
                 self.assertTrue((REPO_ROOT / runbook).is_file())
 
+        self.assertIn("PR은 필수가 아니며", contract)
+        self.assertNotIn("PR을 통해서만", contract)
+
     def test_classification_routes_only_compatible_changes_to_active_lane(self) -> None:
         agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         delivery = self._read_runbook("release-delivery.md")
@@ -102,6 +98,8 @@ class PullRequestProtectionContractTest(unittest.TestCase):
     def test_delivery_enforces_exact_pr_and_release_topology_order(self) -> None:
         delivery = self._read_runbook("release-delivery.md")
         required = (
+            "PR은 필수가 아니다",
+            "git merge --no-ff <FINAL_HEAD_SHA>",
             "hotfix는 확인된 clean `main`",
             "release는 확인된 clean `develop`",
             "PR의 base ref/SHA, head ref/SHA와 remote version tip",
@@ -151,13 +149,14 @@ class PullRequestProtectionContractTest(unittest.TestCase):
         self.assertEqual(set(schema["version_lane"]), {"ref", "tip_sha"})
         self.assertEqual(len(schema["topics"]), 1)
         topic = schema["topics"][0]
-        self.assertEqual(set(topic), {"pr", "base", "head", "worktree"})
-        self.assertEqual(set(topic["pr"]), {"number", "state", "merged_at"})
-        self.assertEqual(topic["pr"]["state"], "MERGED")
+        self.assertEqual(set(topic), {"pr", "merge_commit", "base", "head", "worktree"})
+        self.assertIsNone(topic["pr"])
+        self.assertTrue(topic["merge_commit"])
         self.assertEqual(set(topic["base"]), {"repository", "ref", "sha_before_merge"})
         self.assertEqual(set(topic["head"]), {"ref", "final_sha"})
         self.assertEqual(set(topic["worktree"]), {"path", "creation_provenance"})
-        self.assertIn("`topics`는 이번 version lane에 merge된 task PR마다 정확히 한 entry", receipt)
+        self.assertIn("`topics`는 이번 version lane에 merge된 task branch마다 정확히 한 entry", receipt)
+        self.assertIn("과거 tag를 다시 쓰지 않는다", receipt)
         self.assertIn("일부 field만 적은 요약이나 다른 schema marker를 receipt로 인정하지 않는다", receipt)
 
         policy_text = "\n".join(

@@ -4,7 +4,7 @@
 
 ## immutable cleanup receipt
 
-published annotated tag에는 아래 단일 JSON shape의 `cleanup-receipt-v1` block을 넣는다. `topics`는 이번 version lane에 merge된 task PR마다 정확히 한 entry를 가지며 PR number와 `final_sha`는 중복될 수 없다.
+published annotated tag에는 아래 JSON shape의 `cleanup-receipt-v1` block을 넣는다. `topics`는 이번 version lane에 merge된 task branch마다 정확히 한 entry를 가진다. `final_sha`는 중복될 수 없으며, PR을 사용했을 때만 `pr`에 number/state/merged_at을 기록하고 PR number도 중복하지 않는다. 직접 통합은 `pr: null`과 실제 `merge_commit`을 사용한다.
 
 ```json
 {
@@ -16,11 +16,8 @@ published annotated tag에는 아래 단일 JSON shape의 `cleanup-receipt-v1` b
   },
   "topics": [
     {
-      "pr": {
-        "number": 0,
-        "state": "MERGED",
-        "merged_at": "<iso-8601>"
-      },
+      "pr": null,
+      "merge_commit": "<task-merge-commit-sha>",
       "base": {
         "repository": "<owner/repo>",
         "ref": "<version-lane-ref>",
@@ -39,11 +36,11 @@ published annotated tag에는 아래 단일 JSON shape의 `cleanup-receipt-v1` b
 }
 ```
 
-worktree가 있었으면 `path`와 task creation evidence를 식별하는 `creation_provenance`를 모두 문자열로 기록하고, 없었으면 둘 다 `null`로 둔다. 일부 field만 적은 요약이나 다른 schema marker를 receipt로 인정하지 않는다. published annotated tag가 immutable durable receipt의 source of truth이고 final report는 mutation 결과와 보존 사유를 추가하되 receipt를 대체하지 않는다. protected version branch가 사라진 뒤 retry할 때도 이 full receipt와 `version_lane.tip_sha` commit을 사용한다.
+worktree가 있었으면 `path`와 task creation evidence를 식별하는 `creation_provenance`를 모두 문자열로 기록하고, 없었으면 둘 다 `null`로 둔다. 일부 field만 적은 요약이나 다른 schema marker를 receipt로 인정하지 않는다. 이전에 발행한 PR receipt에 `merge_commit`이 없으면 해당 PR의 검증된 merge commit으로 해석하며 과거 tag를 다시 쓰지 않는다. published annotated tag가 immutable durable receipt의 source of truth이고 final report는 mutation 결과와 보존 사유를 추가하되 receipt를 대체하지 않는다. protected version branch가 사라진 뒤 retry할 때도 이 full receipt와 `version_lane.tip_sha` commit을 사용한다.
 
 ## preflight
 
-1. PR API와 tag annotation receipt가 일치하는지 확인한다.
+1. tag annotation의 merge commit이 version tip의 ancestor이고, 두 parent가 각각 기록된 base SHA와 final head SHA인지 확인한다. PR을 사용한 경우 PR API의 MERGED/base/head/merge commit도 일치해야 한다.
 2. topic tip이 receipt의 final head SHA와 같은지 확인한다.
 3. final head가 version-tip commit, final main, final develop, release tag peeled commit의 ancestor인지 확인한다.
 4. local과 remote ref를 독립적으로 판단한다.
