@@ -7,10 +7,8 @@ set "EXE_NAME=%EXE_BASE%.exe"
 set "MAIN_SOURCE=main.py"
 set "CURRENT_DIR=%~dp0"
 set "ROOT_EXE=%CURRENT_DIR%%EXE_NAME%"
-set "BUILD_GENERATED_DIR=build\generated"
-set "BUILD_INFO_MODULE=%BUILD_GENERATED_DIR%\windows_supporter_build_info.py"
-set "VERSION_FILE=%BUILD_GENERATED_DIR%\%EXE_BASE%-version-info.txt"
 set "STEP_LOG=%TEMP%\%EXE_BASE%-build-%RANDOM%%RANDOM%.log"
+if /I "%~1"=="--workspace-child" if defined WINDOWS_SUPPORTER_BUILD_STEP_LOG set "STEP_LOG=%WINDOWS_SUPPORTER_BUILD_STEP_LOG%"
 set "ARTIFACT_ONLY=0"
 if /I "%WINDOWS_SUPPORTER_BUILD_ARTIFACT_ONLY%"=="1" set "ARTIFACT_ONLY=1"
 set "EMIT_STEP_LOG=0"
@@ -23,6 +21,8 @@ if errorlevel 1 (
   echo Failed to change working directory to "%CURRENT_DIR%"
   exit /b 1
 )
+
+if /I "%~1"=="--workspace-child" goto :workspace_child
 
 echo Build phase leaves the installed %EXE_NAME% process unchanged until candidate validation passes.
 
@@ -86,12 +86,21 @@ if errorlevel 1 (
 )
 echo [ Success !! ]
 
-REM Remove stale PyInstaller byproducts before starting a new build
-echo | set /p="Cleaning prior PyInstaller byproducts..."
-call :clear_log
-call :remove_pyinstaller_byproducts " before build"
-if errorlevel 1 exit /b 1
-echo [ Success !! ]
+REM The Python producer owns a fresh workspace until this synchronous child ends.
+set "WORKSPACE_KEEP="
+if /I "%WINDOWS_SUPPORTER_KEEP_BUILD_ARTIFACTS%"=="1" set "WORKSPACE_KEEP=--keep"
+set "WINDOWS_SUPPORTER_BUILD_STEP_LOG=%STEP_LOG%"
+".venv\Scripts\python.exe" -X utf8 "tools\build_workspace.py" --kind build %WORKSPACE_KEEP% -- "%ComSpec%" /d /c build.bat --workspace-child
+exit /b %ERRORLEVEL%
+
+:workspace_child
+if not defined WINDOWS_SUPPORTER_BUILD_WORKSPACE (
+  echo The build workspace must be allocated by tools\build_workspace.py. 1>&2
+  exit /b 1
+)
+set "BUILD_GENERATED_DIR=%WINDOWS_SUPPORTER_BUILD_WORKSPACE%\generated"
+set "BUILD_INFO_MODULE=%BUILD_GENERATED_DIR%\windows_supporter_build_info.py"
+set "VERSION_FILE=%BUILD_GENERATED_DIR%\%EXE_BASE%-version-info.txt"
 
 REM Generate build-time version metadata from Git tags and current commit
 echo | set /p="Generating version metadata..."
@@ -126,7 +135,7 @@ echo [ Success !! ]
 REM Build the executable
 echo | set /p="Building %MAIN_SOURCE% to %EXE_NAME%..."
 call :clear_log
-"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --runtime-tmpdir "%%LOCALAPPDATA%%\windows-supporter\runtime" --icon "src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "src\utils\windows_supporter.ico;src\utils" --add-data "src\apps\resources\google_desktop_oauth.json;src\apps\resources" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tcl_data;_tcl_data" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tk_data;_tk_data" "%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
+"%WINDOWS_SUPPORTER_UV_EXE%" run --locked python -m PyInstaller -n "%EXE_BASE%" --onefile --noconsole --workpath "%WINDOWS_SUPPORTER_BUILD_WORKSPACE%\work" --specpath "%WINDOWS_SUPPORTER_BUILD_WORKSPACE%\spec" --distpath "%CURRENT_DIR%dist" --runtime-tmpdir "%%LOCALAPPDATA%%\windows-supporter\runtime" --icon "%CURRENT_DIR%src\utils\windows_supporter.ico" --version-file "%VERSION_FILE%" --paths "%BUILD_GENERATED_DIR%" --hidden-import windows_supporter_build_info --collect-all playwright --add-data "%CURRENT_DIR%src\utils\windows_supporter.ico;src\utils" --add-data "%CURRENT_DIR%src\apps\resources\google_desktop_oauth.json;src\apps\resources" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tcl_data;_tcl_data" --add-data "%BUILD_GENERATED_DIR%\tcltk\_tk_data;_tk_data" "%CURRENT_DIR%%MAIN_SOURCE%" > "%STEP_LOG%" 2>&1
 if errorlevel 1 (
   echo Failure
   echo PyInstaller build failed.
@@ -225,47 +234,8 @@ if not "%DEPLOY_EXIT_CODE%"=="0" (
 if exist "%DEPLOY_DIAGNOSTIC%" del "%DEPLOY_DIAGNOSTIC%" > NUL 2>&1
 echo [ Success !! ]
 
-REM Remove build byproducts
-echo | set /p="Remove build byproducts..."
-call :clear_log
-call :remove_pyinstaller_byproducts ""
-if errorlevel 1 exit /b 1
-echo [ Success !! ]
-
 call :clear_log
 endlocal
-exit /b 0
-
-:remove_pyinstaller_byproducts
-set "FAILURE_SUFFIX=%~1"
-if exist "%EXE_BASE%.spec" (
-  call "tools\remove_path_with_retry.bat" "%EXE_BASE%.spec" 15 1 > "%STEP_LOG%" 2>&1
-  if exist "%EXE_BASE%.spec" (
-    echo Failure
-    echo Failed to remove generated spec file%FAILURE_SUFFIX%.
-    call :print_log
-    exit /b 1
-  )
-)
-if exist "build" (
-  call "tools\remove_path_with_retry.bat" "build" 15 1 >> "%STEP_LOG%" 2>&1
-  if exist "build" (
-    echo Failure
-    echo Failed to remove build directory%FAILURE_SUFFIX%.
-    call :print_log
-    exit /b 1
-  )
-)
-if exist "dist" (
-  call "tools\remove_path_with_retry.bat" "dist" 15 1 >> "%STEP_LOG%" 2>&1
-  if exist "dist" (
-    echo Failure
-    echo Failed to remove dist directory%FAILURE_SUFFIX%.
-    call :print_log
-    exit /b 1
-  )
-)
-call :clear_log
 exit /b 0
 
 :clear_log

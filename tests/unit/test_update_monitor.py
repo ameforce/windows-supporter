@@ -418,13 +418,11 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         staged_validation_index = script.index("tools\\verify_codex_usage_worker_smoke.py")
         deploy_index = script.index("tools\\deploy_runtime.py")
-        cleanup_index = script.index("Remove build byproducts")
 
         self.assertNotIn("WINDOWS_SUPPORTER_SKIP_POST_BUILD_RUN", script)
         self.assertNotIn('taskkill /f /t /im "%EXE_NAME%"', script)
         self.assertNotIn('move /Y "dist\\%EXE_NAME%" "%ROOT_EXE%"', script)
         self.assertLess(staged_validation_index, deploy_index)
-        self.assertLess(deploy_index, cleanup_index)
 
     def test_build_bat_artifact_only_mode_exits_after_candidate_validation(self) -> None:
         with open("build.bat", "r", encoding="utf-8") as fp:
@@ -455,10 +453,8 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
 
         validation_index = script.index("tools\\verify_pyinstaller_archive.py")
         deploy_index = script.index("tools\\deploy_runtime.py")
-        cleanup_index = script.index("Remove build byproducts")
 
         self.assertLess(validation_index, deploy_index)
-        self.assertLess(validation_index, cleanup_index)
         self.assertIn("playwright\\driver\\node.exe", script)
 
     def test_update_progress_snapshot_exposes_korean_copy_and_progressbar(self) -> None:
@@ -2144,8 +2140,6 @@ class UpdateMonitorCoreUnitTest(unittest.TestCase):
                 "빌드 준비 중",
                 "새 버전 배포 중",
                 "새 버전 배포 중",
-                "임시 산출물 정리 중",
-                "임시 산출물 정리 중",
                 "Windows Supporter 재실행 중",
                 "업데이트 완료",
             ],

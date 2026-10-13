@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.utils.runtime_deploy import DeployExitCode, RuntimeDeployError, deploy_runtime
 from src.utils.update_monitor import (
@@ -224,6 +224,12 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            build_sentinel = repo / "build" / "existing-intermediate.bin"
+            dist_sentinel = repo / "dist" / "existing-candidate.bin"
+            spec_sentinel = repo / "windows-supporter.spec"
+            for sentinel in (build_sentinel, dist_sentinel, spec_sentinel):
+                sentinel.parent.mkdir(exist_ok=True)
+                sentinel.write_bytes(b"existing-owned-elsewhere")
             root_executable = repo / "windows-supporter.exe"
             root_executable.write_bytes(b"old-root")
             previous_executable = Path(tmp) / "windows-supporter-updater.exe"
@@ -260,9 +266,14 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
                 deploy_calls[0][2]["base_environment"]["PYINSTALLER_RESET_ENVIRONMENT"],
                 "1",
             )
-            self.assertFalse((repo / "dist").exists())
+            self.assertEqual(
+                (repo / "dist" / "windows-supporter.exe").read_bytes(),
+                b"new-executable",
+            )
+            for sentinel in (build_sentinel, dist_sentinel, spec_sentinel):
+                self.assertEqual(sentinel.read_bytes(), b"existing-owned-elsewhere")
 
-    def test_cleanup_failure_keeps_verified_new_runtime_running(self) -> None:
+    def test_success_does_not_delete_build_outputs_or_request_cleanup_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -273,31 +284,103 @@ class UpdateHandoffRecoveryUnitTest(unittest.TestCase):
             state_path = Path(tmp) / "update_handoff.json"
             write_handoff_state(state_path, repo, previous_executable)
             restarts = []
+            deploy_calls = []
+            progress_ui = Mock()
+            progress_ui.wait_for_retry_or_close.return_value = True
+            build_subprocess = BuildSubprocess(root_executable, returncode=0)
+
+            def successful_deploy(candidate, target, **_kwargs):
+                deploy_calls.append((Path(candidate), Path(target)))
+                shutil.copy2(candidate, target)
+                return {"status": "success", "readiness": {"pid": 600}}
+
+            with (
+                patch.object(
+                    build_subprocess, "run", wraps=build_subprocess.run
+                ) as build_run,
+                patch(
+                    "src.utils.update_monitor.shutil.rmtree",
+                    side_effect=OSError("cleanup denied"),
+                ) as remove_tree,
+                patch(
+                    "src.utils.update_monitor.Path.unlink",
+                    side_effect=OSError("cleanup denied"),
+                ) as unlink,
+            ):
+                rc = run_update_handoff(
+                    state_path,
+                    subprocess_module=build_subprocess,
+                    runtime_deployer=successful_deploy,
+                    runtime_restarter=lambda *_args, **_kwargs: restarts.append(True),
+                    progress_ui_factory=lambda **_kwargs: progress_ui,
+                    max_attempts=2,
+                )
+                build_run.assert_called_once()
+                remove_tree.assert_not_called()
+                unlink.assert_not_called()
+            state = read_update_handoff_state(state_path)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(state["status"], "complete")
+            self.assertEqual(state["attempt"], 1)
+            self.assertEqual(root_executable.read_bytes(), b"new-executable")
+            self.assertEqual(len(deploy_calls), 1)
+            self.assertEqual(restarts, [])
+            progress_ui.wait_for_retry_or_close.assert_not_called()
+            progress_ui.close.assert_called_once()
+            self.assertNotIn(
+                "cleanup_build",
+                [call.args[0]["step_key"] for call in progress_ui.set_snapshot.call_args_list],
+            )
+
+    def test_completion_progress_failure_keeps_verified_new_runtime_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            root_executable = repo / "windows-supporter.exe"
+            root_executable.write_bytes(b"old-root")
+            previous_executable = Path(tmp) / "windows-supporter-updater.exe"
+            previous_executable.write_bytes(b"old-executable")
+            state_path = Path(tmp) / "update_handoff.json"
+            write_handoff_state(state_path, repo, previous_executable)
+            progress_ui = Mock()
+            completion_errors = []
+            runtime_restarter = Mock()
+
+            def publish_progress(snapshot):
+                if snapshot["step_key"] == "complete" and not completion_errors:
+                    completion_errors.append("completion progress failed")
+                    raise OSError(completion_errors[0])
 
             def successful_deploy(candidate, target, **_kwargs):
                 shutil.copy2(candidate, target)
                 return {"status": "success", "readiness": {"pid": 600}}
 
+            progress_ui.set_snapshot.side_effect = publish_progress
+            runtime_deployer = Mock(side_effect=successful_deploy)
             rc = run_update_handoff(
                 state_path,
                 subprocess_module=BuildSubprocess(root_executable, returncode=0),
-                runtime_deployer=successful_deploy,
-                runtime_restarter=lambda *_args, **_kwargs: restarts.append(True),
-                artifact_cleaner=lambda _root: (_ for _ in ()).throw(
-                    OSError("cleanup denied")
-                ),
-                progress_ui_factory=None,
+                runtime_deployer=runtime_deployer,
+                runtime_restarter=runtime_restarter,
+                progress_ui_factory=lambda **_kwargs: progress_ui,
                 max_attempts=1,
             )
             state = read_update_handoff_state(state_path)
 
+            self.assertEqual(completion_errors, ["completion progress failed"])
             self.assertEqual(rc, 1)
-            self.assertEqual(root_executable.read_bytes(), b"new-executable")
-            self.assertEqual(restarts, [])
+            self.assertEqual(state["status"], "failed")
             self.assertEqual(state["recovery_status"], "complete")
+            self.assertEqual(state["recovery_receipt"]["status"], "new-runtime-ready")
+            self.assertEqual(state["recovery_receipt"]["deployment"]["status"], "success")
+            self.assertEqual(root_executable.read_bytes(), b"new-executable")
             self.assertEqual(
-                state["recovery_receipt"]["status"], "new-runtime-ready"
+                (repo / "dist" / "windows-supporter.exe").read_bytes(),
+                b"new-executable",
             )
+            runtime_deployer.assert_called_once()
+            runtime_restarter.assert_not_called()
 
     def test_unchanged_target_deploy_failure_restarts_previous_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

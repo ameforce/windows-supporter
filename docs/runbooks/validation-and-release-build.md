@@ -65,9 +65,18 @@ UI, browser, screenshot, 앱 실행은 금지한다.
 9. `windows-supporter.exe`의 `FileVersion`, `ProductVersion`, `Comments`가 tag와 commit을 가리키는지 확인한다.
 10. runtime·packaging release는 candidate 검증 뒤 `tools/deploy_runtime.py`를 별도 호출한다. helper stdout의 단일 UTF-8 JSON success receipt를 보존하고 exact target, candidate/target SHA-256, probe token에 결합된 PID·tray HWND, heartbeat 3회 이상과 startup path를 확인한다. normal `build.bat`은 `WINDOWS_SUPPORTER_DEPLOY_RECEIPT=<path>`로 보존 위치를 알린다.
 11. helper 실패 시 rollback receipt가 이전 artifact 복원과 이전 runtime readiness를 모두 증명해야 한다. readiness 또는 rollback이 실패하면 publish·cleanup을 중단한다.
-12. helper 또는 updater 성공 후 `build`, `dist`, generated spec, backup/promotion marker가 의도치 않게 남지 않았는지 확인한다.
+12. helper 또는 updater 성공 후 backup/promotion marker 잔류 여부를 확인한다. `dist/windows-supporter.exe`는 설치기와 배포가 소비하는 공개 후보이므로 보존한다. 기존 `build`, `dist`와 spec을 이름만으로 일괄 삭제하지 않는다.
 
 `build.bat`의 normal mode도 같은 transactional deploy helper를 사용한다. candidate만 root executable로 옮기거나 실행 준비를 확인하지 않은 채 성공으로 종료하는 경로를 추가하지 않는다.
+
+## 빌드 중간 자료의 수명
+
+- `tools/build_workspace.py`가 빌드 또는 설치기 프로세스 안에서 새 작업공간을 할당하고 자식 작업이 끝날 때까지 소유한다. PyInstaller의 work/spec/generated 자료와 설치기의 Core/Bootstrap 파일만 이 경로에 둔다. 설치기는 고정된 최상위 폴더와 Inno Setup의 리소스 갱신이 충돌하지 않도록 새 `installer` 하위 폴더에 출력한다. 기존 폴더를 편입하거나 재사용하지 않는다.
+- `dist/windows-supporter.exe`, 최종 Setup.exe와 `.sha256`, 빌드 로그와 배포 영수증은 이 경로 밖에 둔다. 설치기 출력이 이미 있으면 덮어쓰지 않고 새 출력 디렉터리를 요구한다.
+- 모든 빌드·검증·내보내기 소비자가 성공으로 종료하면 `release()`를 한 번 호출한다. 실제 삭제는 기존 `CodexDisposableWorkspace` 정리기가 담당한다. 전달 성공은 삭제 완료가 아니며, 전달 실패가 빌드 성공을 실패로 바꾸지 않는다.
+- 실패·중단 시에는 중간 자료를 보존한다. `WINDOWS_SUPPORTER_KEEP_BUILD_ARTIFACTS=1` 또는 설치기의 `-KeepBuildArtifacts`도 보존을 선택하며, 설치기에서 시작한 빌드에도 적용된다.
+- 개인용 provider가 설치되지 않은 환경은 별도의 일반 임시 폴더에 생성하고 경로를 출력한 뒤 보존한다. 설치된 provider의 로딩·할당 실패는 새 빌드를 시작하기 전에 오류로 보고한다. 자동 정리를 위해 기존 자료를 다른 삭제 경로로 넘기지 않는다.
+- updater는 빌드 생산자가 수행한 사용 종료 전달을 다시 시도하지 않는다. 저장소의 이전 build/dist/spec은 소유권과 수명을 새로 확인하는 별도 정리 대상이다.
 
 ## UI/runtime smoke admission
 
