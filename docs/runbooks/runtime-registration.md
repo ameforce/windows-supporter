@@ -41,7 +41,7 @@ GUI guard로 main checkout을 바꿀 수 없는 동안에는 lane close를 remot
 - installed persistent executable이 없는 fresh 설치는 previous artifact 없는 transaction으로 설치하고, 실패하면 target 부재 상태로 되돌린다.
 - 새 runtime의 launch/readiness가 실패하면 helper는 이전 artifact를 복원하고 이전 runtime readiness까지 확인한 뒤 비영 종료 코드와 JSON rollback receipt를 반환한다.
 - marker 또는 backup이 이미 존재하면 ownership을 추정하지 않고 그대로 보존한 채 실패한다. 별도 조사 없이 덮어쓰거나 삭제하지 않는다.
-- normal `build.bat`은 helper stdout/stderr를 합치지 않고 JSON receipt를 별도 UTF-8 파일에 보존한다. updater는 배포 성공 뒤 build/dist/spec을 exact repo child로 정리한다.
+- normal `build.bat`은 helper stdout/stderr를 합치지 않고 JSON receipt를 별도 UTF-8 파일에 보존한다. 빌드 생산자가 새 중간 자료의 사용 종료를 전달하며, updater는 저장소의 기존 build/dist/spec을 일괄 삭제하지 않는다. `dist/windows-supporter.exe`는 공개 후보로 보존한다.
 - build worker boundary smoke는 UI acceptance가 아니다. 실제 앱/UI launch를 별도 검증으로 주장하지 않는다.
 - build 중단 시 task-owned cmd/PyInstaller tree가 남았는지 확인하고, exact task-owned process만 정리한다.
 
