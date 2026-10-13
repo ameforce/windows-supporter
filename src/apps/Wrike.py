@@ -999,6 +999,8 @@ class Wrike:
                 login_source = str(payload.get("source") or "")
                 login_activate = bool(payload.get("activate"))
                 login_automatic_generation = payload.get("automatic_generation")
+                if login_activate:
+                    login_source = FLEX_SYNC_SOURCE_MANUAL
             if (
                 login_job and login_source != FLEX_SYNC_SOURCE_MANUAL
                 and not self.__automatic_ui_allowed(login_automatic_generation)
@@ -1032,10 +1034,17 @@ class Wrike:
                     # watch below syncs as soon as it closes or logs in.
                     deferred = True
                     if not background_sync:
+                        # The employee has taken over this existing window.
+                        # A queued monitor-disable close no longer owns it.
+                        watch_source = FLEX_SYNC_SOURCE_MANUAL
+                        watch_automatic_generation = None
                         try:
                             client.focus_window()
                         except Exception:
                             pass
+                        self.__notify_flex_window_event(
+                            "adopted", watch_mode, {"source": FLEX_SYNC_SOURCE_MANUAL},
+                        )
                     if watch_mode == "login":
                         deferral = (
                             "Flex 로그인 창에서 로그인을 기다리고 있어 백그라운드 동기화를 미뤘습니다. "
@@ -1071,6 +1080,9 @@ class Wrike:
                     # take it over or navigate it; closing it syncs.
                     if watch_mode is None:
                         watch_mode = "window"
+                    if login_source == FLEX_SYNC_SOURCE_MANUAL:
+                        watch_source = FLEX_SYNC_SOURCE_MANUAL
+                        watch_automatic_generation = None
                     if login_activate:
                         try:
                             client.focus_window()
@@ -1129,6 +1141,12 @@ class Wrike:
                     )
                     client_headless = desired_headless
                 if kind == "open":
+                    if watch_mode == "login":
+                        self.__notify_flex_window_event(
+                            "adopted", watch_mode, {"source": FLEX_SYNC_SOURCE_MANUAL},
+                        )
+                    watch_source = FLEX_SYNC_SOURCE_MANUAL
+                    watch_automatic_generation = None
                     client.open_work_record_page()
                     result = None
                     # An explicit open is the employee's window: it stays
@@ -1396,6 +1414,13 @@ class Wrike:
         except Exception as exc:
             self.__log_exception("flex login window close request failed", exc)
 
+    def __promote_flex_login_window(self) -> None:
+        """Keep a window the employee explicitly chose to use on disable."""
+        with self.__flex_schedule_lock:
+            if self.__flex_login_window_open:
+                self.__flex_login_window_automatic = False
+                self.__flex_login_window_automatic_generation = None
+
     def __close_flex_browser_worker(self) -> None:
         thread = self.__flex_browser_worker_thread
         if thread is None or not thread.is_alive():
@@ -1509,6 +1534,8 @@ class Wrike:
         with self.__flex_schedule_lock:
             if self.__flex_sync_running:
                 return False
+            if source == FLEX_SYNC_SOURCE_MANUAL:
+                self.__promote_flex_login_window()
             self.__flex_sync_generation += 1
             generation = int(self.__flex_sync_generation)
             self.__flex_sync_running = True
@@ -1747,6 +1774,7 @@ class Wrike:
                 automatic_generation=automatic_generation,
             )
         elif source == FLEX_SYNC_SOURCE_MANUAL and error_code == FLEX_SYNC_LOGIN_PENDING_CODE:
+            self.__promote_flex_login_window()
             # "Flex 로그인 · 지금 동기화" while the login window is waiting:
             # the worker brought that window to the front instead of
             # replacing it.
@@ -1859,6 +1887,8 @@ class Wrike:
 
         if source != FLEX_SYNC_SOURCE_MANUAL and not self.__automatic_ui_allowed():
             return
+        if source == FLEX_SYNC_SOURCE_MANUAL:
+            self.__promote_flex_login_window()
         automatic_generation = self.__automatic_ui_generation
         ok, detail = self.__submit_flex_browser_job(
             "login",
@@ -1894,6 +1924,12 @@ class Wrike:
             automatic_generation = event_generation
         automatic = source != FLEX_SYNC_SOURCE_MANUAL
         automatic_allowed = self.__automatic_ui_allowed(automatic_generation)
+        if event == "adopted":
+            if self.__background_active and self.__flex_configured():
+                with self.__flex_schedule_lock:
+                    self.__flex_login_window_open = True
+                    self.__promote_flex_login_window()
+            return
         if event == "opened":
             already_open = str(detail.get("result") or "") == "already_open"
             if (
@@ -1917,10 +1953,14 @@ class Wrike:
                     )
                 return
             with self.__flex_schedule_lock:
+                manual_owned = (
+                    self.__flex_login_window_open
+                    and not self.__flex_login_window_automatic
+                )
                 # Either way a Flex window is waiting for the login, and its
                 # close (or finished login) is what triggers the next sync.
                 self.__flex_login_window_open = True
-                self.__flex_login_window_automatic = automatic and not already_open
+                self.__flex_login_window_automatic = automatic and not already_open and not manual_owned
                 self.__flex_login_window_automatic_generation = (
                     automatic_generation if self.__flex_login_window_automatic else None
                 )
@@ -2132,6 +2172,7 @@ class Wrike:
             }
 
     def __open_flex_worktime_page(self) -> bool:
+        self.__promote_flex_login_window()
         ok, _result = self.__submit_flex_browser_job(
             "open",
             wait=True,
@@ -8080,7 +8121,9 @@ class Wrike:
             self.__set_wrike_api_token_session(token)
         self.__daily_target_minutes = int(daily_minutes)
         self.__tooltip_duration_ms = int(tooltip_ms)
-        self.__monitor_enabled = bool(monitor_enabled)
+        # Keep the committed flag visible to automatic readers while the
+        # candidate is being persisted.  A failed save must never disable
+        # an already queued browser job or consume its notification state.
         self.__monitor_interval_sec = float(monitor_interval)
         self.__flex_enabled = bool(flex_enabled)
         self.__flex_employee_number = flex_employee_number
@@ -8151,11 +8194,12 @@ class Wrike:
                     else "unconfigured"
                 )
         self.__monitor_last_total_minutes = None
-        if not self.__save_settings():
+        if not self.__save_settings(monitor_enabled=monitor_enabled):
             self.__restore_settings_runtime_state(previous_runtime_state)
             if provider_changed:
                 self.__start_vacation_ical_polling()
             return False, "settings save failed"
+        self.__monitor_enabled = bool(monitor_enabled)
         self.__apply_monitor_enabled_lifecycle(previous_runtime_state["monitor_enabled"])
         self.__sync_worktime_panel_idle_timeout()
         self.__restart_monitor()
@@ -8639,9 +8683,9 @@ class Wrike:
         if self.__tooltip_duration_ms != loaded_tooltip_ms:
             needs_save = True
         try:
-            self.__monitor_enabled = bool(data.get("monitor_enabled", self.__monitor_enabled))
+            loaded_monitor_enabled = bool(data.get("monitor_enabled", self.__monitor_enabled))
         except Exception:
-            self.__monitor_enabled = False
+            loaded_monitor_enabled = False
         try:
             self.__monitor_interval_sec = float(data.get("monitor_interval_sec", self.__monitor_interval_sec))
         except Exception:
@@ -8806,9 +8850,12 @@ class Wrike:
 
         if allow_save and needs_save:
             try:
-                self.__save_settings()
+                self.__save_settings(monitor_enabled=loaded_monitor_enabled)
             except Exception:
                 pass
+        # Publish the value read from disk after parsing/normalization; its
+        # candidate must not leak to automatic readers during a repair save.
+        self.__monitor_enabled = loaded_monitor_enabled
 
         msg = None
         if reason == "empty":
@@ -8828,13 +8875,15 @@ class Wrike:
         self.__apply_settings_data(data, reason, allow_save=True)
         return
 
-    def __save_settings(self) -> bool:
+    def __save_settings(self, *, monitor_enabled: bool | None = None) -> bool:
         token = str(self.__wrike_api_token_session or "").strip()
         payload = {
             "settings_version": int(self.__settings_version),
             "daily_target_minutes": int(self.__daily_target_minutes),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
-            "monitor_enabled": bool(self.__monitor_enabled),
+            "monitor_enabled": bool(
+                self.__monitor_enabled if monitor_enabled is None else monitor_enabled
+            ),
             "monitor_interval_sec": float(self.__monitor_interval_sec),
             "monitor_folder_path": list(self.__monitor_folder_path),
             "lunch_break_enabled": bool(self.__lunch_break_enabled),

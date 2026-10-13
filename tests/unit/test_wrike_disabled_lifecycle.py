@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import queue
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -72,10 +73,15 @@ class _FlexClient:
 
     def __init__(self, *_args, **_kwargs):
         self.open_login_page = Mock()
+        self.open_work_record_page = Mock()
+        self.focus_window = Mock()
         self.close = Mock()
         self.instances.append(self)
 
     def has_open_page(self):
+        return True
+
+    def login_in_progress(self):
         return True
 
 
@@ -377,6 +383,129 @@ class WrikeDisabledLifecycleTest(unittest.TestCase):
                 self.assertEqual(stale_close.get_nowait(), (True, False))
                 self.assertEqual(current_close.get_nowait(), (True, source == "periodic"))
                 client.close.assert_called_once_with()
+
+    def test_explicit_sync_or_login_adopts_existing_automatic_flex_window(self):
+        for kind in ("sync", "login", "open"):
+            with self.subTest(kind=kind):
+                generation = self.wrike._Wrike__automatic_ui_generation
+                self.wrike._Wrike__flex_enabled = True
+                automatic_close = queue.Queue()
+                manual_payload = (
+                    (datetime(2026, 4, 6).date(), datetime(2026, 4, 12).date(), "E-42", datetime(2026, 4, 6, 9), False)
+                    if kind == "sync"
+                    else {"source": "manual", "activate": True, "automatic_generation": generation}
+                )
+                for job in (
+                    ("login", {"source": "periodic", "automatic_generation": generation}, queue.Queue()),
+                    (kind, manual_payload, queue.Queue()),
+                    ("close_login", {"automatic_only": True, "automatic_generation": generation}, automatic_close),
+                    ("close", None, queue.Queue()),
+                ):
+                    self.wrike._Wrike__flex_browser_queue.put(job)
+                with (
+                    patch("src.apps.Wrike.FlexBrowserClient", _FlexClient),
+                    patch.object(self.wrike, "_Wrike__ensure_playwright_ready", return_value=True),
+                ):
+                    self.wrike._Wrike__flex_browser_worker_loop()
+                self._drain()
+                self.assertEqual(automatic_close.get_nowait(), (True, False))
+                self.assertFalse(self.wrike._Wrike__flex_login_window_automatic)
+                self.assertIsNone(self.wrike._Wrike__flex_login_window_automatic_generation)
+                if kind != "open":
+                    _FlexClient.instances[-1].focus_window.assert_called_once_with()
+
+    def test_failed_disable_save_never_exposes_candidate_flag_to_queued_login(self):
+        generation = self.wrike._Wrike__automatic_ui_generation
+        self.wrike._Wrike__flex_enabled = True
+        self.wrike._Wrike__flex_login_notice_shown = True
+        self.wrike._Wrike__flex_login_window_open = True
+        response = queue.Queue()
+        observed = []
+
+        def failed_save(**_kwargs):
+            for job in (
+                ("login", {"source": "periodic", "automatic_generation": generation}, response),
+                ("close", None, queue.Queue()),
+            ):
+                self.wrike._Wrike__flex_browser_queue.put(job)
+
+            def consume_queued_login():
+                observed.append(self.wrike._Wrike__automatic_ui_allowed(generation))
+                self.wrike._Wrike__flex_browser_worker_loop()
+
+            worker = threading.Thread(target=consume_queued_login, daemon=True)
+            worker.start()
+            worker.join(timeout=2.0)
+            self.assertFalse(worker.is_alive(), "persistence must not deadlock the browser worker")
+            return False
+
+        with (
+            patch("src.apps.Wrike.FlexBrowserClient", _FlexClient),
+            patch.object(self.wrike, "_Wrike__ensure_playwright_ready", return_value=True),
+            patch.object(self.wrike, "_Wrike__save_settings", side_effect=failed_save),
+        ):
+            ok, error = self.wrike.update_settings({"monitor_enabled": False})
+        self.assertFalse(ok)
+        self.assertEqual(error, "settings save failed")
+        self.assertEqual(observed, [True])
+        self.assertEqual(response.get_nowait(), (True, "opened"))
+        self.assertTrue(self.wrike._Wrike__monitor_enabled)
+        self.assertTrue(self.wrike._Wrike__flex_login_notice_shown)
+        self.assertTrue(self.wrike._Wrike__flex_login_window_open)
+
+    def test_manual_adoption_cannot_be_demoted_by_older_opened_event(self):
+        generation = self.wrike._Wrike__automatic_ui_generation
+        self.wrike._Wrike__flex_enabled = True
+        self.wrike._Wrike__flex_login_window_open = True
+        self.wrike._Wrike__flex_login_window_automatic = True
+        self.wrike._Wrike__flex_login_window_automatic_generation = generation
+        with patch.object(self.wrike, "_Wrike__submit_flex_browser_job", return_value=(True, None)):
+            self.wrike._Wrike__request_flex_login_window("manual")
+        self.wrike._Wrike__apply_flex_window_event(
+            "opened", "login",
+            {"source": "periodic", "result": "opened", "automatic_generation": generation},
+        )
+        self.assertFalse(self.wrike._Wrike__flex_login_window_automatic)
+        self.assertIsNone(self.wrike._Wrike__flex_login_window_automatic_generation)
+
+    def test_successful_disable_publishes_flag_only_after_persistence(self):
+        observed = []
+        original_save = self.wrike._Wrike__save_settings
+
+        def observe_save(**kwargs):
+            observed.append((self.wrike._Wrike__monitor_enabled, self.wrike._Wrike__automatic_ui_allowed()))
+            return original_save(**kwargs)
+
+        with patch.object(self.wrike, "_Wrike__save_settings", side_effect=observe_save):
+            self._set_enabled(False)
+        self.assertEqual(observed, [(True, True)])
+        self.assertFalse(self.wrike._Wrike__monitor_enabled)
+        self.assertFalse(self.wrike._Wrike__automatic_ui_allowed())
+        stored = json.loads(Path(self.wrike._Wrike__settings_path).read_text(encoding="utf-8"))
+        self.assertIs(stored["monitor_enabled"], False)
+
+    def test_first_load_and_repair_reload_publish_saved_monitor_setting(self):
+        self._set_enabled(False)
+        with patch.dict(os.environ, {"APPDATA": str(Path(self.wrike._Wrike__settings_path).parent.parent)}, clear=False):
+            loaded = Wrike()
+        self.assertFalse(loaded._Wrike__monitor_enabled)
+        self.wrike._Wrike__monitor_enabled = True
+        path = Path(self.wrike._Wrike__settings_path)
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        stored.pop("settings_version")
+        path.write_text(json.dumps(stored), encoding="utf-8")
+        observed = []
+        original_save = self.wrike._Wrike__save_settings
+
+        def observe_save(**kwargs):
+            observed.append(self.wrike._Wrike__monitor_enabled)
+            return original_save(**kwargs)
+
+        with patch.object(self.wrike, "_Wrike__save_settings", side_effect=observe_save):
+            ok, error = self.wrike.reload_settings_from_disk()
+        self.assertTrue(ok, error)
+        self.assertEqual(observed, [True])
+        self.assertFalse(self.wrike._Wrike__monitor_enabled)
 
 
 if __name__ == "__main__":

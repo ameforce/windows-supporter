@@ -774,7 +774,7 @@ class FlexLoginWindowWorkerTests(unittest.TestCase):
         self.created[0].window_open = False
         self.assertTrue(self._wait_for(lambda: "closed" in self._event_names()))
         self.assertEqual(self.events, [("closed", "window", {
-            "source": "", "automatic_generation": None,
+            "source": "manual", "automatic_generation": None,
         })])
 
     def test_failed_open_without_a_page_is_not_reported_as_a_close(self) -> None:
