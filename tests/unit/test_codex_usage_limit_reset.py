@@ -241,21 +241,20 @@ class ComputeUsageLimitResetsTest(unittest.TestCase):
         self.assertEqual([item.key for item in resets], ["five_hour_limit"])
         self.assertEqual(resets[0].detected_by, "usage_replenished")
 
-    def test_future_schedule_blocks_rapid_replenishment_inference(self) -> None:
+    def test_future_schedule_allows_rapid_replenishment_candidate(self) -> None:
         now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         future_reset = _iso(now + timedelta(minutes=30))
         previous = _limit_snapshot("70%", now - timedelta(minutes=1), future_reset)
         current = _limit_snapshot("100%", now)
 
-        self.assertEqual(
-            compute_usage_limit_resets(
-                {"five_hour_limit": future_reset},
-                current,
-                previous=previous,
-                now=now,
-            ),
-            [],
+        resets = compute_usage_limit_resets(
+            {"five_hour_limit": future_reset},
+            current,
+            previous=previous,
+            now=now,
         )
+        self.assertEqual([item.key for item in resets], ["five_hour_limit"])
+        self.assertEqual(resets[0].detected_by, "usage_replenished")
 
     def test_invalid_schedule_blocks_rapid_replenishment_inference(self) -> None:
         now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
@@ -290,21 +289,20 @@ class ComputeUsageLimitResetsTest(unittest.TestCase):
         self.assertEqual(small_change, [])
         self.assertEqual(long_gap, [])
 
-    def test_present_reset_time_remains_authoritative(self) -> None:
+    def test_full_replenishment_can_precede_reported_schedule(self) -> None:
         now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone(timedelta(hours=9)))
         previous_at = "2026-09-18T10:30:00+09:00"
         previous = _limit_snapshot("70%", now - timedelta(minutes=1), previous_at)
         current = _limit_snapshot("100%", now, "2026-09-18T11:00:00+09:00")
 
-        self.assertEqual(
-            compute_usage_limit_resets(
-                {"five_hour_limit": previous_at},
-                current,
-                previous=previous,
-                now=now,
-            ),
-            [],
+        resets = compute_usage_limit_resets(
+            {"five_hour_limit": previous_at},
+            current,
+            previous=previous,
+            now=now,
         )
+        self.assertEqual([item.key for item in resets], ["five_hour_limit"])
+        self.assertEqual(resets[0].new_reset_at, "2026-09-18T11:00:00+09:00")
 
 
 class MonitorLimitResetNotificationTest(unittest.TestCase):
@@ -588,7 +586,7 @@ class MonitorLimitResetNotificationTest(unittest.TestCase):
             previous, current = self._rolled_reset_pair()
             gap = UsageSnapshot.from_metrics(
                 _metrics(),
-                captured_at=_iso(datetime.now(timezone.utc)),
+                captured_at=_iso(datetime.fromisoformat(current.captured_at) - timedelta(seconds=30)),
                 reset_info={},
                 reported_metric_keys=("five_hour_limit",),
             )
