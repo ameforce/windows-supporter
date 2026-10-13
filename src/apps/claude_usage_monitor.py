@@ -1209,6 +1209,7 @@ class ClaudeUsageMonitor:
         self._alert_label_provider: Callable[[], str] | None = None
         self._limit_reset_lock = threading.Lock()
         self._limit_reset_baselines: dict[str, str] = {}
+        self._limit_reset_state: dict[str, dict[str, Any]] = {}
         self._last_committed_limit_usage: dict[str, str] | None = None
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._load_settings_file()
@@ -1506,6 +1507,7 @@ class ClaudeUsageMonitor:
                 # Reset deadlines and the last committed windows belong to
                 # the released account; the next login may bind another.
                 self._limit_reset_baselines = {}
+                self._limit_reset_state = {}
                 self._last_committed_limit_usage = None
             self._profile_name = ""
             self._profile_name_verified = False
@@ -1945,6 +1947,13 @@ class ClaudeUsageMonitor:
             self._profile_name = profile_name
             self._profile_name_verified = profile_name_verified
         raw_baselines = data.get("limit_reset_baselines")
+        from src.apps.codex_usage_monitor import UsageSnapshot, normalize_limit_reset_state
+
+        self._limit_reset_state = normalize_limit_reset_state(
+            data.get("limit_reset_state"),
+            previous=UsageSnapshot.from_dict(self._limit_usage_payload())
+            if reading.is_usable and "limit_reset_state" not in data else None,
+        )
         if isinstance(raw_baselines, dict):
             self._limit_reset_baselines = {
                 str(key): str(value)
@@ -2026,8 +2035,7 @@ class ClaudeUsageMonitor:
         # Claude session/weekly window reset alerts exactly once as well.
         from src.apps.codex_usage_monitor import (
             UsageSnapshot,
-            advance_limit_reset_baselines,
-            compute_usage_limit_resets,
+            observe_usage_limit_resets,
         )
 
         current_payload = self._limit_usage_payload()
@@ -2040,16 +2048,15 @@ class ClaudeUsageMonitor:
             if isinstance(previous_payload, dict)
             else None
         )
-        resets = compute_usage_limit_resets(
+        resets = observe_usage_limit_resets(
             self._limit_reset_baselines,
             current,
+            reset_state=self._limit_reset_state,
             previous=previous,
             observed_snapshot=current,
+            now=self._clock(),
         )
-        advance_limit_reset_baselines(self._limit_reset_baselines, current, resets=resets)
         self._last_committed_limit_usage = current_payload
-        if resets:
-            self._limit_reset_alert.submit(list(resets))
         return resets
 
     def _commit_ready_reading(self, reading: AiUsageReading) -> None:
@@ -2057,8 +2064,10 @@ class ClaudeUsageMonitor:
         # different threads; observe and persist atomically so a reset is
         # neither alerted twice nor saved with half-updated baselines.
         with self._limit_reset_lock:
-            self._observe_limit_resets()
+            resets = self._observe_limit_resets()
             self._save_last_success(reading)
+        if resets:
+            self._limit_reset_alert.submit(list(resets))
 
     def _save_last_success(self, reading: AiUsageReading) -> None:
         if (
@@ -2093,6 +2102,7 @@ class ClaudeUsageMonitor:
                     "scoped_weekly_label": self._scoped_weekly_label,
                     "extra_usage_text": self._extra_usage_text,
                     "limit_reset_baselines": dict(self._limit_reset_baselines),
+                    "limit_reset_state": self._limit_reset_state,
                 },
             )
         except OSError:

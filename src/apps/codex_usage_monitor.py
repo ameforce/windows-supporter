@@ -1812,9 +1812,6 @@ def compute_usage_limit_resets(
                     )
                 )
                 continue
-        if new_raw:
-            continue
-
         if observed.reported_metric_keys and metric_key not in set(
             observed.reported_metric_keys
         ):
@@ -1835,6 +1832,12 @@ def compute_usage_limit_resets(
         if not scheduled_reset_raw and metric_key in previous_measured_keys:
             scheduled_reset_raw = normalize_usage_value(prev_payload.get(reset_key, ""))
         scheduled_reset_at = _parse_base_reset_datetime(scheduled_reset_raw)
+        # A real replenishment can precede an advertised deadline. Malformed
+        # deadlines are not evidence that the provider reset the window.
+        if (scheduled_reset_raw and scheduled_reset_at is None) or (
+            new_raw and _parse_base_reset_datetime(new_raw) is None
+        ):
+            continue
         scheduled_reset_elapsed = bool(
             scheduled_reset_at is not None
             and scheduled_reset_at <= observation_at
@@ -1853,8 +1856,8 @@ def compute_usage_limit_resets(
                 >= USAGE_LIMIT_RESET_MIN_PERCENTAGE_POINT_JUMP
             )
         if not (
-            scheduled_reset_elapsed
-            or (not scheduled_reset_raw and rapid_full_replenishment)
+            (not new_raw and scheduled_reset_elapsed)
+            or rapid_full_replenishment
         ):
             continue
         resets.append(
@@ -1862,7 +1865,7 @@ def compute_usage_limit_resets(
                 key=metric_key,
                 label=USAGE_METRIC_LABELS.get(metric_key, metric_key),
                 previous_reset_at=scheduled_reset_raw,
-                new_reset_at="",
+                new_reset_at=new_raw,
                 detected_by="usage_replenished",
             )
         )
@@ -1880,6 +1883,188 @@ def _measured_limit_metric_keys(snapshot: UsageSnapshot | None) -> set[str]:
         if _parse_usage_limit_remaining_percent(metric_key, payload.get(metric_key, ""))
         is not None
     }
+
+
+def normalize_limit_reset_state(
+    value: Any, *, previous: UsageSnapshot | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read the small, account-scoped observation state from older/newer files."""
+    if not isinstance(value, dict):
+        if not isinstance(previous, UsageSnapshot):
+            return {}
+        payload = previous.to_dict()
+        value = {
+            key: {
+                "captured_at": previous.captured_at,
+                "remaining_percent": _parse_usage_limit_remaining_percent(key, payload[key]),
+            }
+            for key in _measured_limit_metric_keys(previous)
+        }
+    result: dict[str, dict[str, Any]] = {}
+    for key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC:
+        raw = value.get(key)
+        if not isinstance(raw, dict):
+            continue
+        captured_at = _parse_base_reset_datetime(raw.get("captured_at", ""))
+        percent = raw.get("remaining_percent")
+        if (
+            captured_at is None
+            or isinstance(percent, bool)
+            or not isinstance(percent, (int, float))
+            or not 0 <= percent <= 100
+        ):
+            continue
+        item: dict[str, Any] = {
+            "captured_at": captured_at.isoformat(),
+            "remaining_percent": float(percent),
+            "latched": raw.get("latched") is True,
+            "low_samples": 1 if raw.get("low_samples") == 1 else 0,
+        }
+        pending = raw.get("pending")
+        if isinstance(pending, dict):
+            pending_at = _parse_base_reset_datetime(pending.get("captured_at", ""))
+            prior = pending.get("previous_reset_at", "")
+            if pending_at is not None and isinstance(prior, str) and (
+                not prior or _parse_base_reset_datetime(prior) is not None
+            ):
+                item["pending"] = {
+                    "captured_at": pending_at.isoformat(),
+                    "previous_reset_at": prior,
+                }
+        result[key] = item
+    return result
+
+
+def observe_usage_limit_resets(
+    baselines: dict[str, str],
+    current: UsageSnapshot,
+    *,
+    reset_state: dict[str, dict[str, Any]],
+    previous: UsageSnapshot | None = None,
+    observed_snapshot: UsageSnapshot | None = None,
+    now: datetime | None = None,
+) -> list[UsageLimitReset]:
+    """Confirm irregular replenishment and latch each observed reset once.
+
+    A scheduled rollover is already a strong signal. A percentage-only reset
+    needs a second fresh full reading; a single transient spike cannot alert.
+    Only measured values advance this state, never values backfilled for UI.
+    Two fresh depleted readings rearm it for a later independent reset.
+    """
+    observed = observed_snapshot if isinstance(observed_snapshot, UsageSnapshot) else current
+    payload = observed.to_dict()
+    observed_at = _parse_base_reset_datetime(observed.captured_at)
+    observation_at = observed_at or now or datetime.now(timezone.utc)
+    measured = _measured_limit_metric_keys(observed)
+    candidates = compute_usage_limit_resets(
+        baselines, current, previous=previous, observed_snapshot=observed, now=now
+    )
+    scheduled: dict[str, UsageLimitReset] = {}
+    for item in candidates:
+        prior_deadline = _parse_base_reset_datetime(item.previous_reset_at)
+        if item.detected_by == "reset_at" or (
+            not item.new_reset_at
+            and prior_deadline is not None
+            and prior_deadline <= observation_at
+        ):
+            scheduled[item.key] = item
+
+    resets: list[UsageLimitReset] = []
+    stale_keys: set[str] = set()
+    for key, reset_key in USAGE_LIMIT_RESET_AT_KEY_BY_METRIC.items():
+        state = reset_state.get(key, {})
+        if key not in measured:
+            state.pop("pending", None)
+            state["low_samples"] = 0
+            continue
+        percent = _parse_usage_limit_remaining_percent(key, payload.get(key, ""))
+        last_at = _parse_base_reset_datetime(state.get("captured_at", ""))
+        # Replayed/out-of-order samples cannot confirm or rearm an alert, nor
+        # move its deadline. Real collectors timestamp each successful scrape.
+        if observed_at is not None and last_at is not None and observed_at <= last_at:
+            stale_keys.add(key)
+            continue
+        gap = (observed_at - last_at).total_seconds() if observed_at and last_at else None
+        recent = gap is not None and 0 < gap <= USAGE_LIMIT_RESET_MAX_INFERENCE_GAP_SECONDS
+        full = percent is not None and percent >= USAGE_LIMIT_RESET_COMPLETE_PERCENT
+        event = scheduled.get(key)
+        if event is not None and not (
+            state.get("latched") and event.detected_by == "usage_replenished"
+        ):
+            resets.append(event)
+            state.update(latched=True, low_samples=0)
+            state.pop("pending", None)
+        elif observed_at is not None:
+            old_reset = normalize_usage_value(baselines.get(key, ""))
+            new_reset = normalize_usage_value(payload.get(reset_key, ""))
+            valid_deadlines = all(
+                not value or _parse_base_reset_datetime(value) is not None
+                for value in (old_reset, new_reset)
+            )
+            pending = state.pop("pending", None)
+            if state.get("latched"):
+                if (
+                    percent is not None
+                    and percent <= 100 - USAGE_LIMIT_RESET_MIN_PERCENTAGE_POINT_JUMP
+                ):
+                    low_samples = (int(state.get("low_samples", 0)) if recent else 0) + 1
+                    state["low_samples"] = low_samples
+                    if low_samples >= 2:
+                        state.update(latched=False, low_samples=0)
+                else:
+                    state["low_samples"] = 0
+            elif full and valid_deadlines:
+                pending_at = _parse_base_reset_datetime(
+                    pending.get("captured_at", "") if isinstance(pending, dict) else ""
+                )
+                if (
+                    pending_at is not None
+                    and 0 < (observed_at - pending_at).total_seconds()
+                    <= USAGE_LIMIT_RESET_MAX_INFERENCE_GAP_SECONDS
+                ):
+                    resets.append(UsageLimitReset(
+                        key=key,
+                        label=USAGE_METRIC_LABELS.get(key, key),
+                        previous_reset_at=pending["previous_reset_at"],
+                        new_reset_at=new_reset,
+                        detected_by="usage_replenished",
+                    ))
+                    state.update(latched=True, low_samples=0)
+                else:
+                    before = state.get("remaining_percent")
+                    if (
+                        recent
+                        and isinstance(before, (int, float))
+                        and before < USAGE_LIMIT_RESET_COMPLETE_PERCENT
+                        and percent - before >= USAGE_LIMIT_RESET_MIN_PERCENTAGE_POINT_JUMP
+                    ):
+                        state["pending"] = {
+                            "captured_at": observed_at.isoformat(),
+                            "previous_reset_at": old_reset,
+                        }
+        if observed_at is not None:
+            state.update(captured_at=observed_at.isoformat(), remaining_percent=percent)
+            reset_state[key] = state
+
+    # Existing deadline lifecycle still owns absence/retirement semantics.
+    saved_stale = {key: baselines.get(key) for key in stale_keys}
+    advance_limit_reset_baselines(
+        baselines, current, resets=resets, observed_snapshot=observed,
+        previous_snapshot=previous,
+    )
+    for key, value in saved_stale.items():
+        if value is None:
+            baselines.pop(key, None)
+        else:
+            baselines[key] = value
+    for key in list(reset_state):
+        if (
+            observed.reported_metric_keys
+            and key not in observed.reported_metric_keys
+            and key not in _measured_limit_metric_keys(previous)
+        ):
+            reset_state.pop(key, None)
+    return resets
 
 
 def advance_limit_reset_baselines(
@@ -2037,6 +2222,8 @@ class CodexUsageMonitor:
         # Pending resets whose fanfare already played while the tooltip waits.
         self.__pending_limit_reset_sounded_keys: set[str] = set()
         self.__limit_reset_baselines: dict[str, str] = {}
+        self.__limit_reset_state: dict[str, dict[str, Any]] = {}
+        self.__limit_reset_lock = threading.RLock()
         self.__pending_change_tooltip_snapshot: UsageSnapshot | None = None
         self.__pending_change_tooltip_input_tick: int | None = None
         self.__pending_change_tooltip_after_id = None
@@ -2409,6 +2596,7 @@ class CodexUsageMonitor:
             # Reset deadlines belong to the released account's windows; the
             # next login may bind another account.
             self.__limit_reset_baselines = {}
+            self.__limit_reset_state = {}
             self.__snapshot_backfill_allowed = False
             self.__set_session_state("logged_out")
             self.__profile_name = ""
@@ -3171,24 +3359,20 @@ class CodexUsageMonitor:
         # Every committed observation runs limit-reset detection. The manual
         # and multi-profile background collect path used to commit directly,
         # so its snapshots never advanced the reset baselines nor alerted.
-        resets = compute_usage_limit_resets(
-            self.__limit_reset_baselines,
-            snapshot,
-            previous=previous,
-            observed_snapshot=observed_snapshot,
-        )
-        self.__update_limit_reset_baselines(
-            snapshot,
-            resets=resets,
-            observed_snapshot=observed_snapshot,
-            previous_snapshot=self.__last_snapshot,
-        )
-        self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
-        self.__append_usage_history_sample(self.__last_snapshot)
-        self.__snapshot_backfill_allowed = True
-        self.__save_state()
-        if resets:
+        with self.__limit_reset_lock:
+            resets = observe_usage_limit_resets(
+                self.__limit_reset_baselines,
+                snapshot,
+                reset_state=self.__limit_reset_state,
+                previous=previous,
+                observed_snapshot=observed_snapshot,
+            )
+            self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
+            self.__append_usage_history_sample(self.__last_snapshot)
+            self.__snapshot_backfill_allowed = True
+            self.__save_state()
             committed = self.__last_snapshot
+        if resets:
             self.__ui_post(
                 lambda: self.__queue_limit_reset_notification_until_input(
                     list(resets),
@@ -5091,6 +5275,10 @@ class CodexUsageMonitor:
             # only measured windows qualify, as for every other observation.
             advance_limit_reset_baselines(baselines, snap)
         self.__limit_reset_baselines = baselines
+        self.__limit_reset_state = normalize_limit_reset_state(
+            data.get("limit_reset_state"),
+            previous=snap if "limit_reset_state" not in data else None,
+        )
         self.__set_profile_name(
             data.get("profile_name", ""),
             verified=data.get("profile_name_verified") is True,
@@ -5142,21 +5330,23 @@ class CodexUsageMonitor:
         return
 
     def __save_state(self) -> None:
-        payload = {
-            "snapshot_contract_version": USAGE_SNAPSHOT_CONTRACT_VERSION,
-            "session_state": str(self.__session_state or "logged_out"),
-            "profile_name": str(self.__profile_name or ""),
-            "account_id": str(self.__account_id or ""),
-            "profile_name_verified": bool(self.__profile_name_verified),
-            "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),
-            "auth_attention_required": bool(self.__auth_attention_required),
-            "auth_attention_reason": str(self.__auth_attention_reason or ""),
-            "auth_attention_source": str(self.__auth_attention_source or ""),
-            "last_snapshot": self.__last_snapshot.to_dict(),
-            "usage_history": self.__get_usage_history_snapshot(),
-            "limit_reset_baselines": dict(self.__limit_reset_baselines),
-        }
-        self.__write_json_file(self.__state_path, payload)
+        with self.__limit_reset_lock:
+            payload = {
+                "snapshot_contract_version": USAGE_SNAPSHOT_CONTRACT_VERSION,
+                "session_state": str(self.__session_state or "logged_out"),
+                "profile_name": str(self.__profile_name or ""),
+                "account_id": str(self.__account_id or ""),
+                "profile_name_verified": bool(self.__profile_name_verified),
+                "snapshot_backfill_allowed": bool(self.__snapshot_backfill_allowed),
+                "auth_attention_required": bool(self.__auth_attention_required),
+                "auth_attention_reason": str(self.__auth_attention_reason or ""),
+                "auth_attention_source": str(self.__auth_attention_source or ""),
+                "last_snapshot": self.__last_snapshot.to_dict(),
+                "usage_history": self.__get_usage_history_snapshot(),
+                "limit_reset_baselines": dict(self.__limit_reset_baselines),
+                "limit_reset_state": self.__limit_reset_state,
+            }
+            self.__write_json_file(self.__state_path, payload)
         return
 
     def __read_json_file(self, path: str) -> dict | None:
