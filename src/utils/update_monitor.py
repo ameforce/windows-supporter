@@ -470,7 +470,6 @@ UPDATE_PROGRESS_STEPS: tuple[UpdateProgressStep, ...] = (
     UpdateProgressStep("build_prepare", "빌드 준비 중", "build.bat 실행 환경을 준비합니다.", 40, 45),
     UpdateProgressStep("build", "빌드 실행 중", "build.bat를 실행합니다.", 45, 84),
     UpdateProgressStep("deploy", "새 버전 배포 중", "검증된 실행 파일을 안전하게 적용합니다.", 84, 92),
-    UpdateProgressStep("cleanup_build", "임시 산출물 정리 중", "업데이트에 사용한 임시 산출물을 정리합니다.", 92, 94),
     UpdateProgressStep("relaunch", "Windows Supporter 재실행 중", "새 실행 파일과 닫았던 Git 앱을 시작합니다.", 94),
     UpdateProgressStep("complete", "업데이트 완료", "업데이트가 완료되었습니다.", 100),
     UpdateProgressStep("failed", "업데이트 실패", "실패 단계와 로그를 확인해 주세요.", 100),
@@ -594,14 +593,6 @@ BUILD_OUTPUT_PROGRESS_RULES: tuple[BuildOutputProgressRule, ...] = (
         "검증된 후보 실행 파일을 배포 도우미에 넘길 준비를 합니다.",
         "후보 실행 파일 검증을 마쳤습니다.",
         84,
-    ),
-    BuildOutputProgressRule(
-        "Remove build byproducts",
-        "cleanup_build",
-        "임시 파일 정리 중",
-        "업데이트에 사용한 임시 빌드 파일을 정리합니다.",
-        "임시 빌드 파일을 정리했습니다.",
-        90,
     ),
     BuildOutputProgressRule(
         "Deploying verified",
@@ -1429,32 +1420,6 @@ def _verify_release_installed_artifact(
             f"expected={candidate.tag} actual={checked_metadata['comments'] or 'missing'}"
         )
     return checked_metadata
-
-
-def cleanup_update_build_artifacts(repo_root: str | os.PathLike[str]) -> list[str]:
-    root = Path(repo_root).resolve()
-    targets = (
-        root / "build",
-        root / "dist",
-        root / "windows-supporter.spec",
-    )
-    removed: list[str] = []
-    for target in targets:
-        is_link = target.is_symlink() or getattr(
-            os.path, "isjunction", lambda _path: False
-        )(target)
-        if not target.exists() and not is_link:
-            continue
-        if is_link:
-            raise UpdateHandoffError(f"refusing to remove linked build artifact: {target}")
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        if target.exists():
-            raise UpdateHandoffError(f"build artifact cleanup did not remove: {target}")
-        removed.append(str(target))
-    return removed
 
 
 def is_git_checkout_root(repo_root: str | os.PathLike[str]) -> bool:
@@ -3587,7 +3552,6 @@ def run_update_handoff(
     launch=popen_no_window,
     runtime_deployer=deploy_runtime,
     runtime_restarter=restart_runtime,
-    artifact_cleaner=cleanup_update_build_artifacts,
     progress_ui_factory=UpdateHandoffProgressUi,
     max_attempts: int = 2,
 ) -> int:
@@ -3772,30 +3736,6 @@ def run_update_handoff(
                     log_path=log_path,
                 )
             )
-            failed_step = "빌드 산출물 정리"
-            publish_handoff_progress(
-                build_update_progress_snapshot(
-                    "cleanup_build",
-                    state="running",
-                    phase_fraction=0.0,
-                    detail="업데이트에 사용한 임시 빌드 파일을 정리합니다.",
-                    log_path=log_path,
-                )
-            )
-            removed_artifacts = artifact_cleaner(repo_root)
-            append_update_log(
-                log_path,
-                f"removed build artifacts: {', '.join(removed_artifacts) or 'none'}",
-            )
-            publish_handoff_progress(
-                build_update_progress_snapshot(
-                    "cleanup_build",
-                    state="running",
-                    phase_fraction=1.0,
-                    detail="임시 빌드 파일을 정리했습니다.",
-                    log_path=log_path,
-                )
-            )
             publish_handoff_progress(
                 build_update_progress_snapshot(
                     "relaunch",
@@ -3842,7 +3782,7 @@ def run_update_handoff(
                     "status": "new-runtime-ready",
                     "deployment": deployment_receipt,
                 }
-                recovery_error = "new runtime remains ready; build artifact cleanup failed"
+                recovery_error = "new runtime remains ready; handoff completion failed"
                 append_update_log(log_path, recovery_error)
             elif isinstance(exc, RuntimeDeployError):
                 rollback = exc.receipt.get("rollback", {})
@@ -3905,7 +3845,7 @@ def run_update_handoff(
                     )
 
             if deployment_completed:
-                recovery_detail = "새 버전은 정상 실행 중이지만 빌드 산출물 정리가 필요합니다."
+                recovery_detail = "새 버전은 정상 실행 중이지만 업데이트 완료 기록에 실패했습니다."
             else:
                 recovery_detail = (
                     "이전 버전으로 안전하게 복구했습니다."
