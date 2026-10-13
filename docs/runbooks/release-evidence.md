@@ -2,7 +2,7 @@
 
 ## source와 validation identity
 
-- version lane final tip, task PR merge commits와 heads를 기록한다.
+- version lane final tip, task merge commits와 heads를 기록한다. PR을 사용했으면 PR identity도 기록한다.
 - main merge, annotated tag object/peeled commit, develop back-merge를 기록한다.
 - task validation이 적용된 source tree와 final trees가 동일한지 확인한다.
 - validation matrix에서 선택한 test/static/semantic evidence와 실행하지 않은 full suite/UI E2E의 이유를 기록한다.
@@ -49,7 +49,7 @@ reflog, fsck, unreachable object, 장식 없는 commit은 live ref가 아니다.
 ## cleanup evidence
 
 - annotated tag의 `cleanup-receipt-v1` JSON block과 tag object SHA
-- 각 topic PR/base/head/version-tip identity
+- 각 topic base/head/merge-commit/version-tip identity와 선택적으로 사용한 PR identity
 - 삭제한 local/remote topic refs와 expected/final SHA
 - 제거한 worktree와 exhaustive inventory로 승인한 ignored artifact
 - 보존한 대상의 exact path/ref/SHA, 보존 이유와 retry receipt

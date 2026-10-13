@@ -22,21 +22,21 @@
 - 진행 중인 lane에서 발견한 절차 보강은 [CLASS-INTENT-FIRST] 판정이 현재 lane과 호환될 때만 같은 lane의 별도 task branch/PR에 넣는다. 호환되지 않으면 현재 lane에 섞지 않고 completion을 중단한 뒤 올바르게 분류된 lane의 순서와 base를 결정한다.
 - 원인이나 rollback 단위가 다르면 commit을 분리한다.
 - commit message는 `fix|feat|chore|refact: ...` 형식을 사용한다.
-- main/develop에 직접 commit하지 않는다. 잘못된 경로의 commit은 version branch/task PR 흐름으로 복구한다.
+- main/develop에 직접 commit하지 않는다. 잘못된 경로의 commit은 version branch/task branch 흐름으로 복구한다.
 
-## 3. task PR merge
+## 3. task merge
 
 1. `docs/runbooks/validation-and-release-build.md`에서 task 범위에 맞는 검증을 완료한다.
-2. PR base가 exact version branch인지 확인한다.
-3. merge 직전에 PR의 base ref/SHA, head ref/SHA와 remote version tip을 다시 읽는다.
-4. base/head가 기대값일 때만 다음과 동등한 expected-head precondition으로 merge한다.
+2. PR은 필수가 아니다. 팀원 리뷰가 필요하고 사용자가 생성을 명시적으로 승인한 경우에만 PR 경로를 선택한다.
+3. 직접 통합은 merge 직전에 local/remote version base SHA와 task head SHA를 다시 읽고, clean version checkout에서 `git merge --no-ff <FINAL_HEAD_SHA>`로 통합한다. merge commit의 first parent가 직전 base, second parent가 확인한 task head인지 확인하고 version branch를 일반 fast-forward push한다. 원격이 달라졌으면 force push하지 않고 재확인한다.
+4. PR 경로에서는 base가 exact version branch인지 확인하고, merge 직전에 PR의 base ref/SHA, head ref/SHA와 remote version tip을 다시 읽는다. base/head가 기대값일 때만 다음과 동등한 expected-head precondition으로 merge한다.
    - `gh pr merge <N> --repo ameforce/windows-supporter --merge --match-head-commit <FINAL_HEAD_SHA>`
-5. 최종 확인과 merge 사이에는 같은 base의 다른 PR을 merge하지 않는다.
-6. `state=MERGED`, `mergedAt`, base branch/SHA, head SHA, merge commit을 read-back한다. closed-unmerged는 완료가 아니다.
+5. 최종 확인과 merge 사이에는 같은 base의 다른 task를 merge하지 않는다.
+6. PR 경로는 `state=MERGED`, `mergedAt`, base branch/SHA, head SHA, merge commit을 read-back한다. closed-unmerged는 완료가 아니다. 직접 통합은 remote version tip과 task merge commit을 read-back한다. 두 경로 모두 tag annotation에 base/head/merge commit을 보존한다.
 
 ## 4. main merge와 annotated tag
 
-1. 모든 task PR이 version branch에 포함됐는지 exact merge commits로 확인한다.
+1. 모든 task branch가 version branch에 포함됐는지 exact merge commits로 확인한다.
 2. main을 version branch와 `--no-ff` merge한다.
    - hotfix message: `Merge branch 'hotfix/vX.Y.Z'`
    - release message: `Merge branch 'release/vX.Y.Z'`
