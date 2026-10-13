@@ -72,6 +72,43 @@ class InstallerWorkspaceProcessTests(unittest.TestCase):
                 self.assertEqual(json.loads(result["Stdout"]), arguments)
                 self.assertEqual(result["Stderr"].strip(), "distinct stderr")
 
+    def test_child_path_is_inherited_by_helpers_without_changing_parent(self):
+        probe = "import os; print(os.environ['PATH'])"
+        child = (
+            "import json,os,subprocess,sys; "
+            f"helper=subprocess.check_output([sys.executable,'-X','utf8','-c',{probe!r}],text=True); "
+            "print(json.dumps({'Child':os.environ['PATH'],'Helper':helper.strip()})); "
+            "raise SystemExit(int(sys.argv[1]))"
+        )
+        for host in self.hosts:
+            for inherited_path in ("", r"C:\existing tools;C:\other"):
+                for exit_code in (0, 29):
+                    with self.subTest(host=host, path=inherited_path, exit_code=exit_code):
+                        with tempfile.TemporaryDirectory() as temporary:
+                            fixture = Path(temporary)
+                            compiler_directory = fixture / "compiler bin"
+                            arguments = ["-X", "utf8", "-c", child, str(exit_code)]
+                            body = (
+                                f"$env:PATH = {ps_literal(inherited_path)}\n"
+                                "$originalPath = $env:PATH\n"
+                                f"$result = Invoke-InstallerWorkspaceProcess -Executable {ps_literal(sys.executable)} "
+                                f"-PrependPathDirectory {ps_literal(compiler_directory)} -CaptureOutput "
+                                "-Arguments @(" + ", ".join(ps_literal(v) for v in arguments) + ")\n"
+                                "@{ Result=$result; ParentUnchanged=($env:PATH -ceq $originalPath) } "
+                                "| ConvertTo-Json -Compress"
+                            )
+                            result = self.invoke_host(host, body, fixture)
+                            expected_path = str(compiler_directory)
+                            if inherited_path:
+                                expected_path += os.pathsep + inherited_path
+                            self.assertTrue(result["ParentUnchanged"])
+                            self.assertEqual(result["Result"]["ExitCode"], exit_code)
+                            self.assertEqual(result["Result"]["Stderr"], "")
+                            self.assertEqual(
+                                json.loads(result["Result"]["Stdout"]),
+                                {"Child": expected_path, "Helper": expected_path},
+                            )
+
     def test_python_owner_to_powershell_child_keeps_trailing_slash(self):
         output = "C:\\installer output space\\"
         compiler = "C:\\Program Files\\compiler.exe"

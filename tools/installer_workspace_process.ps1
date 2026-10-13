@@ -11,6 +11,7 @@ function Invoke-InstallerWorkspaceProcess {
     param(
         [string]$Executable,
         [string[]]$Arguments,
+        [string]$PrependPathDirectory,
         [switch]$CaptureOutput
     )
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -19,6 +20,15 @@ function Invoke-InstallerWorkspaceProcess {
     $startInfo.Arguments = (($Arguments | ForEach-Object {
         ConvertTo-InstallerNativeArgument $_
     }) -join ' ')
+    if ($PrependPathDirectory) {
+        # Compiler helpers and DLLs need the tool directory in the child PATH.
+        # Change only this process's environment, leaving the caller untouched.
+        $inheritedPath = $startInfo.EnvironmentVariables['PATH']
+        $startInfo.EnvironmentVariables['PATH'] = if ($inheritedPath) {
+            $PrependPathDirectory + [IO.Path]::PathSeparator + $inheritedPath
+        }
+        else { $PrependPathDirectory }
+    }
     if ($CaptureOutput) {
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
