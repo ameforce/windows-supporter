@@ -1081,11 +1081,14 @@ class DashboardView:
         is_enabled = bool(data.get("monitor_enabled", False))
         token = "설정됨" if bool(data.get("api_token_configured", False)) else "미설정"
         target = data.get("daily_target_minutes", 0)
-        return is_enabled, [
+        parts = [
             self._enabled_part(is_enabled),
             (f"API 토큰: {token}", "normal"),
             (f"일 목표: {self._format_minutes(target)}", "normal"),
         ]
+        if data.get("settings_error"):
+            parts.append((str(data["settings_error"]), "disabled"))
+        return is_enabled, parts
 
     def _format_background(self, data: Any) -> tuple[bool, list[tuple[str, str]]]:
         if not isinstance(data, dict):

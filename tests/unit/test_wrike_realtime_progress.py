@@ -918,6 +918,9 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
     def test_overtime_idle_auto_pause_and_input_auto_resume(self) -> None:
         _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
         wrike = self._new_wrike()
+        wrike._Wrike__root = _FakeRoot()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__show_tooltip = Mock()
         store = wrike._Wrike__overtime_state_store
         day = date(2026, 4, 6)
         store.set_pending(
@@ -1439,7 +1442,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         wrike._Wrike__flex_employee_number = "E-42"
         tooltips: list = []
 
-        def capture_tooltip(_root, text, lines=None, duration_ms=None):
+        def capture_tooltip(_root, text, lines=None, duration_ms=None, **_kwargs):
             tooltips.append((text, list(lines or []), duration_ms))
 
         wrike._Wrike__show_tooltip = capture_tooltip
@@ -1547,7 +1550,10 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         # A background expiry opens the window without taking the foreground
         # and without blocking the Tk thread on the browser launch.
         self.assertEqual(
-            login_calls[0].args[1], {"source": "periodic", "activate": False}
+            login_calls[0].args[1], {
+                "source": "periodic", "activate": False,
+                "automatic_generation": wrike._Wrike__automatic_ui_generation,
+            }
         )
         self.assertFalse(login_calls[0].kwargs["wait"])
         status = wrike._Wrike__flex_status_snapshot()
@@ -1608,7 +1614,10 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         login_calls = self._flex_calls(submit, "login")
         self.assertEqual(len(login_calls), 1)
         self.assertEqual(
-            login_calls[0].args[1], {"source": "manual", "activate": True}
+            login_calls[0].args[1], {
+                "source": "manual", "activate": True,
+                "automatic_generation": wrike._Wrike__automatic_ui_generation,
+            }
         )
         # "Flex 로그인 · 지금 동기화" reports the login window, not a failure.
         self.assertEqual(tooltips, [])
@@ -2855,6 +2864,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
 
     def test_first_activity_conditions_snooze_accept_edit_skip_and_explicit_weekend(self) -> None:
         wrike = self._new_wrike()
+        wrike._Wrike__background_active = True
         root = _FakeRoot()
         panel = _FakePanel()
         wrike._Wrike__root = root
@@ -3089,6 +3099,7 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
 
     def test_activity_panel_surface_retries_until_show_is_mapped(self) -> None:
         wrike = self._new_wrike()
+        wrike._Wrike__background_active = True
         root = _FakeRoot()
         panel = _FakePanel()
         wrike._Wrike__root = root

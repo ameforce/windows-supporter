@@ -70,6 +70,7 @@ class WindowsSupporterMainUI:
         self._kakao_retry_after_id = None
         self._wrike_view = None
         self._wrike_built = False
+        self._wrike_settings_error = ""
         self._ai_usage_view = None
         self._ai_usage_built = False
         self._codex_view = None
@@ -1446,21 +1447,36 @@ class WindowsSupporterMainUI:
         return
 
     def _dashboard_wrike_toggle_enabled(self) -> None:
+        self._wrike_settings_error = ""
+        ok = False
+        saved = False
+        settings = None
         try:
             wrike = self._monitor.get_wrike()
-        except Exception:
-            wrike = None
-        if wrike is None:
-            return
-        try:
             settings = wrike.get_settings_snapshot()
-            if not isinstance(settings, dict):
-                settings = {}
-            settings["monitor_enabled"] = not bool(settings.get("monitor_enabled", False))
-            wrike.update_settings(settings)
+            requested = not bool(settings["monitor_enabled"])
+            settings = None
+            saved, _error = wrike.update_settings({"monitor_enabled": requested})
+            settings = wrike.get_settings_snapshot()
+            ok = bool(saved) and bool(settings["monitor_enabled"]) == requested
         except Exception:
-            pass
+            ok = False
+        if not ok:
+            self._wrike_settings_error = (
+                "Wrike 설정은 저장했지만 변경 결과를 확인하지 못했습니다."
+                if saved else "Wrike 설정 저장 실패: 현재 상태를 확인해 주세요."
+            )
+        view = self._wrike_view
+        if view is not None:
+            view.sync_monitor_enabled(settings)
+            if not ok:
+                view._set_status(self._wrike_settings_error, level="error")
+        self._refresh_dashboard_status()
         return
+
+    def _on_wrike_monitor_enabled_changed(self, error: str) -> None:
+        self._wrike_settings_error = str(error or "")
+        self._refresh_dashboard_status()
 
     def _dashboard_background_toggle_enabled(self) -> None:
         try:
@@ -1569,7 +1585,9 @@ class WindowsSupporterMainUI:
         try:
             data = wrike.get_settings_snapshot()
             if isinstance(data, dict):
-                return dict(data)
+                out = dict(data)
+                out["settings_error"] = getattr(self, "_wrike_settings_error", "")
+                return out
         except Exception:
             pass
         return {}
@@ -1703,6 +1721,7 @@ class WindowsSupporterMainUI:
                 self._root,
                 wrike,
                 ui_post=self._ui_post,
+                on_monitor_enabled_changed=self._on_wrike_monitor_enabled_changed,
             )
             self._wrike_view.mount(self._tab_wrike)
             self._wrike_built = True
