@@ -11,6 +11,7 @@ from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
 from src.apps.wrike_worktime_panel import (
     _COMPACT_PANEL_MAX_WIDTH,
     WorktimeActivityPrompt,
+    WorktimeBreakReturnPrompt,
     WorktimeFlexPendingRecord,
     WorktimePanelDayRow,
     WorktimePanelLine,
@@ -586,6 +587,9 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         "flex_open": Mock(),
         "flex_pending_edit": Mock(return_value=True),
         "flex_pending_done": Mock(),
+        "break_return_accept": Mock(),
+        "break_return_edit": Mock(return_value=True),
+        "break_return_keep": Mock(),
     }
     provider = Mock(side_effect=lambda: holder["model"])
     panel = WorktimeQuickPanel(
@@ -611,6 +615,9 @@ def _make_panel(root, fake_tk, holder, *, idle_timeout_ms: int = 6_000):
         flex_open=callbacks["flex_open"],
         flex_pending_edit=callbacks["flex_pending_edit"],
         flex_pending_done=callbacks["flex_pending_done"],
+        break_return_accept=callbacks["break_return_accept"],
+        break_return_edit=callbacks["break_return_edit"],
+        break_return_keep=callbacks["break_return_keep"],
         tk_module=fake_tk,
         idle_timeout_ms=idle_timeout_ms,
         monotonic=root.monotonic,
@@ -1273,6 +1280,87 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 elapsed_minutes=12,
                 scheduled_quit_time="18:00",
                 idle_autopause_enabled=1,
+            )
+
+    def test_break_return_prompt_routes_end_keep_and_edit(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {
+            "model": replace(
+                _model(break_active=True),
+                break_return_prompt=WorktimeBreakReturnPrompt("12:00", "12:40"),
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+
+        self.assertIn(
+            "12:40에 복귀한 것 같습니다. 12:00에 시작한 휴게를 종료할까요?",
+            fake_tk.live_label_texts(),
+        )
+        fake_tk.button("12:40에 종료").invoke()
+        callbacks["break_return_accept"].assert_called_once_with("12:40")
+        fake_tk.button("계속 휴게").invoke()
+        callbacks["break_return_keep"].assert_called_once_with()
+
+        fake_tk.button("시간 수정").invoke()
+        self.assertTrue(panel._inline_editor_active)
+        entry = panel._widgets["inline_entry"]
+        self.assertEqual(entry.get(), "12:40")
+        entry.delete(0, "end")
+        entry.insert(0, "1235")
+        fake_tk.button("저장").invoke()
+        callbacks["break_return_edit"].assert_called_once_with("12:40", "12:35")
+        self.assertFalse(panel._inline_editor_active)
+
+    def test_break_return_time_updates_in_place_and_stale_editor_closes(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        base = _model(break_active=True)
+        holder = {
+            "model": replace(
+                base,
+                break_return_prompt=WorktimeBreakReturnPrompt("12:00", "12:40"),
+            )
+        }
+        panel, _provider, callbacks = _make_panel(root, fake_tk, holder)
+        panel.show(activate=False)
+        end_button = fake_tk.button("12:40에 종료")
+        fake_tk.button("시간 수정").invoke()
+        self.assertTrue(panel._inline_editor_active)
+
+        holder["model"] = replace(
+            base,
+            break_return_prompt=WorktimeBreakReturnPrompt("12:00", "12:41"),
+        )
+        panel.refresh_now()
+
+        self.assertFalse(panel._inline_editor_active)
+        self.assertIs(fake_tk.button("12:41에 종료"), end_button)
+        callbacks["break_return_edit"].assert_not_called()
+
+        holder["model"] = base
+        panel.refresh_now()
+        self.assertTrue(end_button.destroyed)
+        self.assertNotIn(
+            "계속 휴게",
+            {button.kwargs.get("text") for button in fake_tk.live_buttons()},
+        )
+
+    def test_break_return_prompt_requires_active_break_and_hhmm(self) -> None:
+        with self.assertRaises(ValueError):
+            WorktimeBreakReturnPrompt("12:00", "24:00")
+        with self.assertRaises(ValueError):
+            WorktimeBreakReturnPrompt("1200", "12:40")
+        with self.assertRaises(ValueError):
+            replace(
+                _model(break_active=False),
+                break_return_prompt=WorktimeBreakReturnPrompt("12:00", "12:40"),
+            )
+        with self.assertRaises(TypeError):
+            replace(
+                _model(break_active=True),
+                break_return_prompt=WorktimeActivityPrompt("12:40"),  # type: ignore[arg-type]
             )
 
     def test_overtime_prompt_start_edit_uses_edit_callback(self) -> None:
@@ -2017,8 +2105,14 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 panel._widgets["detail_text"].yview_moveto(0.4)
                 root.update()
                 initial_index = panel._widgets["detail_text"].index("@0,0")
+                break_return = WorktimeBreakReturnPrompt("18:30", "08:35")
                 states = (
                     replace(base, prompt=WorktimeActivityPrompt("08:35")),
+                    replace(base, break_active=True, break_return_prompt=break_return),
+                    # A break left running overnight meets the morning
+                    # clock-in question on the first input of the day.
+                    replace(base, prompt=WorktimeActivityPrompt("08:35"),
+                            break_active=True, break_return_prompt=break_return),
                     replace(base, overtime_prompt=WorktimeOvertimePrompt("18:15", "18:00", 60)),
                     replace(base, overtime_state=WorktimeOvertimeState("active", "18:00", 15, "18:00")),
                     replace(base, flex_pending=tuple(
@@ -2229,6 +2323,8 @@ class WorktimeQuickPanelTests(unittest.TestCase):
             )
             model = replace(
                 base,
+                break_active=True,
+                break_return_prompt=WorktimeBreakReturnPrompt("12:00", "12:40"),
                 day_details=tuple(
                     TimelogDayDetails(
                         row.date_key,
