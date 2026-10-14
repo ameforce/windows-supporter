@@ -378,7 +378,7 @@ class WrikeSettingsView:
         ).grid(row=row, column=1, sticky="w", pady=6)
         row += 1
 
-        add_label("자동 일시정지까지 무입력(분)")
+        add_label("자리 비움 판단 무입력(분)")
         add_entry(self._overtime_idle_minutes_var)
         row += 1
 
@@ -2849,7 +2849,7 @@ class WrikeSettingsView:
             return
         overtime_idle_minutes, error = self._strict_positive_int(
             overtime_idle_minutes_text,
-            "자동 일시정지까지 무입력(분)",
+            "자리 비움 판단 무입력(분)",
         )
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
