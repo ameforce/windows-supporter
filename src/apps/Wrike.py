@@ -876,9 +876,15 @@ class Wrike:
         except Exception:
             return
         if self.__last_worktime_activity_at is None:
-            # Like the watcher's own idle tracking, measure an absence from
-            # the moment input could first be observed (e.g. after a restart).
-            self.__last_worktime_activity_at = self.__lib.datetime.now()
+            # Measure an absence from the moment input could first be
+            # observed. A manual break still running at start (e.g. left on
+            # over a shutdown) counts from its start, so the first input after
+            # login asks; an app restart during a present break may ask once.
+            now = self.__lib.datetime.now()
+            started_at = self.__active_manual_break_started_at(now)
+            self.__last_worktime_activity_at = (
+                started_at if started_at is not None and started_at <= now else now
+            )
         return
 
     # ------------------------------------------------------------------
@@ -4776,14 +4782,23 @@ class Wrike:
         if not (
             isinstance(pending, dict)
             and pending.get("started_at") == started_at
-        ):
-            # Keep the first unanswered return of this break. A later absence
-            # must not move the proposed end time past work already done.
+        ) or self.__break_return_was_brief(pending, absent_since):
+            # Keep the first unanswered return of this break, so a later
+            # absence cannot move the end past work already done. A "return"
+            # followed within a minute by another absence (typically the lock
+            # keystroke after idling) was not the real return.
             self.__break_return_prompt = {
                 "started_at": started_at,
                 "detected_at": detected_at,
             }
         self.__show_activity_panel()
+
+    @staticmethod
+    def __break_return_was_brief(pending, absent_since) -> bool:
+        detected_at = pending.get("detected_at") if isinstance(pending, dict) else None
+        if not isinstance(detected_at, datetime) or not isinstance(absent_since, datetime):
+            return False
+        return timedelta(0) <= absent_since - detected_at <= timedelta(seconds=60)
 
     def __maybe_prompt_break_return(self, detected_at) -> None:
         previous = self.__last_worktime_activity_at
@@ -4807,14 +4822,16 @@ class Wrike:
         previous = self.__last_worktime_activity_at
         self.__last_worktime_activity_at = now
         pending = self.__break_return_prompt
-        if isinstance(pending, dict):
-            if pending.get("started_at") == self.__active_manual_break_started_at(now):
-                self.__show_activity_panel()
-                return
+        if isinstance(pending, dict) and pending.get(
+            "started_at"
+        ) != self.__active_manual_break_started_at(now):
             self.__break_return_prompt = None
-        if not isinstance(previous, datetime):
-            return
-        if (now - previous).total_seconds() < self.__break_return_idle_seconds():
+            pending = None
+        if not isinstance(previous, datetime) or (
+            (now - previous).total_seconds() < self.__break_return_idle_seconds()
+        ):
+            if pending is not None:
+                self.__show_activity_panel()
             return
         self.__record_break_return(now, previous)
 
@@ -4888,14 +4905,28 @@ class Wrike:
             self.__show_panel_action_error("휴게 복귀 알림이 만료되었습니다.")
             return False
         try:
-            end_at = datetime.strptime(
-                f"{pending['detected_at'].date().isoformat()} {str(end_time).strip()}",
-                "%Y-%m-%d %H:%M",
-            )
+            clock = datetime.strptime(str(end_time).strip(), "%H:%M").time()
         except Exception:
             self.__show_panel_action_error("휴게 종료 시간이 올바르지 않습니다.")
             return False
-        return self.__finish_break_return(pending["started_at"], end_at)
+        started_at = pending["started_at"]
+        now = self.__lib.datetime.now()
+        # A break can cross midnight: use the most recent date on which the
+        # entered time falls between the break start and now.
+        end_at = None
+        day = now.date()
+        for _ in range(max(1, min(31, (now.date() - started_at.date()).days + 1))):
+            candidate = datetime.combine(day, clock)
+            if started_at <= candidate <= now:
+                end_at = candidate
+                break
+            day -= timedelta(days=1)
+        if end_at is None:
+            self.__show_panel_action_error(
+                "휴게 시작 이후이고 현재 이전인 시각을 입력해 주세요."
+            )
+            return False
+        return self.__finish_break_return(started_at, end_at)
 
     def __panel_break_return_keep(self) -> None:
         self.__break_return_prompt = None

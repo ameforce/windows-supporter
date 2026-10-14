@@ -332,9 +332,33 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.start_break(_at(12, 0))
         self.activity(_at(12, 0, 1))
         self.activity(_at(12, 30))
+        for minute in range(31, 41):
+            self.activity(_at(12, minute))
         self.activity(_at(13, 0))
 
         self.assertEqual(self.pending()["detected_at"], _at(12, 30))
+        self.assertEqual(self.panel.show.call_count, 2)
+
+    def test_brief_input_then_absence_moves_return_to_later_input(self):
+        # A stray input (or the lock keystroke) after idling is followed by
+        # another long absence; the later input is the real return.
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        self.activity(_at(12, 10))
+        self.activity(_at(12, 10, 30))
+        self.activity(_at(13, 0))
+
+        self.assertEqual(self.pending()["detected_at"], _at(13, 0))
+        self.assertEqual(self.visible_prompt(), WorktimeBreakReturnPrompt("12:00", "13:00"))
+
+    def test_lock_keystroke_after_idle_is_superseded_by_unlock(self):
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        self.activity(_at(12, 10))
+
+        self.unlock(_at(13, 0))
+
+        self.assertEqual(self.pending()["detected_at"], _at(13, 0))
         self.assertEqual(self.panel.show.call_count, 2)
 
     def test_manual_toggle_clears_and_stale_prompt_cannot_end_new_break(self):
@@ -408,16 +432,40 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.assertIsNone(self.pending())
         self.assertEqual(self.panel.show.call_count, 1)
 
-    def test_watcher_start_seeds_absence_after_restart(self):
-        self.start_break(_at(11, 50))
-        self.assertIsNone(self.wrike._Wrike__last_worktime_activity_at)
+    def test_watcher_start_without_break_seeds_absence_at_start(self):
         _Clock.current = _at(12, 0)
 
         self.wrike._Wrike__start_activity_watcher()
-        self.assertEqual(self.wrike._Wrike__last_worktime_activity_at, _at(12, 0))
-        self.activity(_at(12, 20))
 
-        self.assertEqual(self.visible_prompt(), WorktimeBreakReturnPrompt("11:50", "12:20"))
+        self.assertEqual(self.wrike._Wrike__last_worktime_activity_at, _at(12, 0))
+
+    def test_break_running_over_restart_asks_on_first_input(self):
+        # The break was left on before a shutdown; the app starts at login.
+        self.start_break(_at(18, 30))
+        self.assertIsNone(self.wrike._Wrike__last_worktime_activity_at)
+        next_morning = datetime(2026, 4, 7, 8, 31)
+        _Clock.current = next_morning
+
+        self.wrike._Wrike__start_activity_watcher()
+        self.assertEqual(self.wrike._Wrike__last_worktime_activity_at, _at(18, 30))
+        self.activity(datetime(2026, 4, 7, 8, 31, 5))
+
+        self.assertEqual(self.pending()["detected_at"], datetime(2026, 4, 7, 8, 31, 5))
+        self.assertEqual(self.visible_prompt(), WorktimeBreakReturnPrompt("18:30", "08:31"))
+
+    def test_edit_across_midnight_uses_latest_date_within_break(self):
+        self.start_break(_at(23, 50))
+        self.activity(_at(23, 50, 1))
+        self.activity(datetime(2026, 4, 7, 0, 30))
+        _Clock.current = datetime(2026, 4, 7, 0, 35)
+
+        self.assertFalse(self.wrike._Wrike__panel_break_return_edit("00:30", "23:45"))
+        self.assertFalse(self.wrike._Wrike__panel_break_return_edit("00:30", "00:36"))
+        self.assertIsNotNone(self.pending())
+        self.assertTrue(self.wrike._Wrike__panel_break_return_edit("00:30", "23:55"))
+
+        self.assertEqual(self.completed_breaks(), [("2026-04-06T23:50:00", "2026-04-06T23:55:00")])
+        self.assertIsNone(self.pending())
 
 
 if __name__ == "__main__":
