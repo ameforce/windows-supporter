@@ -28,6 +28,18 @@ def _day(**extra):
     return result
 
 
+def _allow_automatic_activity(app):
+    """Meet the automatic-UI precondition of activity handling.
+
+    Since v0.35.11 activity callbacks only act while the app is attached to a
+    root, its background is running and Wrike automatic notices are enabled.
+    """
+
+    app._Wrike__root = _FakeRoot()
+    app._Wrike__background_active = True
+    return app
+
+
 def _source(*, version=3, zero=True):
     start = "2026-04-06T12:00:00"
     return {"state_version": version, "days": {
@@ -240,6 +252,7 @@ class BreakActivityAndHotkeyRegressions(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         with patch.dict("os.environ", {"APPDATA": self.tmp.name}):
             self.app = Wrike()
+        _allow_automatic_activity(self.app)
         self.enterContext(patch.object(self.app, "_Wrike__plan_for_date", return_value={"explicit": True, "clock_in": None, "target_net_minutes": 480}))
         self.enterContext(patch.object(self.app, "_Wrike__vacation_result_for_date", return_value={"automatic_prompt_allowed": True, "all_day": False}))
         self.enterContext(patch.object(self.app._Wrike__worktime_state_store, "get_activity_prompt", return_value=None))
@@ -509,6 +522,7 @@ class ReviewFindingRegressions(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         with patch.dict("os.environ", {"APPDATA": temp.name}):
             app = Wrike()
+        _allow_automatic_activity(app)
         store = WorktimeStateStore(Path(temp.name) / "qa-state.json")
         app._Wrike__worktime_state_store = store
         self.enterContext(patch.object(app, "_Wrike__plan_for_date", return_value={"explicit": True, "clock_in": None, "target_net_minutes": 480}))
@@ -624,6 +638,7 @@ class ActivityRetryBoundaryRegressions(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         with patch.dict("os.environ", {"APPDATA": temp.name}):
             app = Wrike()
+        _allow_automatic_activity(app)
         path = Path(temp.name) / "qa-retry-state.json"
         store = WorktimeStateStore(path)
         app._Wrike__worktime_state_store = store
