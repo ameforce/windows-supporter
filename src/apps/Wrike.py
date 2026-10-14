@@ -93,6 +93,7 @@ from src.apps.wrike_timelog_snapshot import (
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
 from src.apps.wrike_worktime_panel import (
     WorktimeActivityPrompt,
+    WorktimeBreakReturnPrompt,
     WorktimeFlexPendingRecord,
     WorktimePanelDayRow,
     WorktimePanelLine,
@@ -246,6 +247,11 @@ class Wrike:
         self.__activity_prompt_save_detected_at = None
         self.__activity_prompt_save_retry_not_before = None
         self.__activity_prompt_save_last_failure_key = None
+        # Latest input observed by the activity watcher, and the first
+        # unanswered return from an idle manual break:
+        # {"started_at": <break start>, "detected_at": <return time>}.
+        self.__last_worktime_activity_at = None
+        self.__break_return_prompt = None
         # v10 replaces the unusable administrator-only Open API credential
         # flow with an interactive employee browser session.
         self.__settings_version = 10
@@ -704,6 +710,8 @@ class Wrike:
         self.__activity_prompt_surfaced_day = ""
         self.__overtime_prompt_surfaced_day = ""
         self.__clear_activity_prompt_save_retry()
+        self.__last_worktime_activity_at = None
+        self.__break_return_prompt = None
         watcher = self.__activity_watcher
         self.__activity_watcher = None
         if watcher is not None:
@@ -867,6 +875,16 @@ class Wrike:
             watcher.start()
         except Exception:
             return
+        if self.__last_worktime_activity_at is None:
+            # Measure an absence from the moment input could first be
+            # observed. A manual break still running at start (e.g. left on
+            # over a shutdown) counts from its start, so the first input after
+            # login asks; an app restart during a present break may ask once.
+            now = self.__lib.datetime.now()
+            started_at = self.__active_manual_break_started_at(now)
+            self.__last_worktime_activity_at = (
+                started_at if started_at is not None and started_at <= now else now
+            )
         return
 
     # ------------------------------------------------------------------
@@ -2806,6 +2824,10 @@ class Wrike:
                     self.__request_timelog_snapshot_refresh(force=False)
             except Exception:
                 pass
+        try:
+            self.__on_break_return_unlock()
+        except Exception as exc:
+            self.__log_exception("break return unlock check failed", exc)
         return
 
     def shutdown(self) -> None:
@@ -3693,6 +3715,9 @@ class Wrike:
                 flex_open=self.__panel_flex_open,
                 flex_pending_edit=self.__panel_flex_pending_edit,
                 flex_pending_done=self.__panel_flex_pending_done,
+                break_return_accept=self.__panel_break_return_accept,
+                break_return_edit=self.__panel_break_return_edit,
+                break_return_keep=self.__panel_break_return_keep,
                 idle_timeout_ms=self.__worktime_panel_idle_timeout_ms(),
             )
         except Exception:
@@ -4355,6 +4380,7 @@ class Wrike:
             overtime_prompt=overtime_prompt,
             overtime_state=overtime_state,
             flex_pending=self.__flex_pending_records(),
+            break_return_prompt=self.__visible_break_return_prompt(break_state),
         )
 
     def __panel_manual_break_rows(
@@ -4717,11 +4743,200 @@ class Wrike:
             return
         self.__start_overtime_notice_timer(show_now=True)
 
+    def __break_return_idle_seconds(self) -> int:
+        # Shares the idle minutes of overtime auto-pause but not its on/off
+        # switch: the break question must work with auto-pause turned off.
+        try:
+            minutes = int(self.__overtime_idle_pause_min)
+        except Exception:
+            minutes = 5
+        return max(1, min(120, minutes)) * 60
+
+    def __active_manual_break_started_at(self, now):
+        try:
+            state = self.__worktime_state_store.get_manual_break_state(now=now)
+        except Exception:
+            return None
+        if not isinstance(state, dict) or not state.get("active"):
+            return None
+        try:
+            started_at = datetime.fromisoformat(str(state.get("started_at") or ""))
+        except Exception:
+            return None
+        if started_at.tzinfo is not None:
+            return None
+        return started_at
+
+    def __record_break_return(self, detected_at, absent_since) -> None:
+        started_at = self.__active_manual_break_started_at(detected_at)
+        if started_at is None or detected_at < started_at:
+            return
+        if (
+            isinstance(absent_since, datetime)
+            and absent_since < started_at - timedelta(seconds=2)
+        ):
+            # The absence began before this break: the click that started it
+            # was the first input after returning, not a return from it.
+            return
+        pending = self.__break_return_prompt
+        if not (
+            isinstance(pending, dict)
+            and pending.get("started_at") == started_at
+        ) or self.__break_return_was_brief(pending, absent_since):
+            # Keep the first unanswered return of this break, so a later
+            # absence cannot move the end past work already done. A "return"
+            # followed within a minute by another absence (typically the lock
+            # keystroke after idling) was not the real return.
+            self.__break_return_prompt = {
+                "started_at": started_at,
+                "detected_at": detected_at,
+            }
+        self.__show_activity_panel()
+
+    @staticmethod
+    def __break_return_was_brief(pending, absent_since) -> bool:
+        detected_at = pending.get("detected_at") if isinstance(pending, dict) else None
+        if not isinstance(detected_at, datetime) or not isinstance(absent_since, datetime):
+            return False
+        return timedelta(0) <= absent_since - detected_at <= timedelta(seconds=60)
+
+    def __maybe_prompt_break_return(self, detected_at) -> None:
+        previous = self.__last_worktime_activity_at
+        self.__last_worktime_activity_at = detected_at
+        if not isinstance(previous, datetime):
+            return
+        try:
+            idle_seconds = (detected_at - previous).total_seconds()
+        except Exception:
+            return
+        if idle_seconds < self.__break_return_idle_seconds():
+            return
+        self.__record_break_return(detected_at, previous)
+
+    def __on_break_return_unlock(self) -> None:
+        # Unlocking re-baselines the watcher, and input typed on the lock
+        # screen may already have surfaced the panel while it was hidden.
+        if not self.__automatic_ui_allowed():
+            return
+        now = self.__lib.datetime.now()
+        previous = self.__last_worktime_activity_at
+        self.__last_worktime_activity_at = now
+        pending = self.__break_return_prompt
+        if isinstance(pending, dict) and pending.get(
+            "started_at"
+        ) != self.__active_manual_break_started_at(now):
+            self.__break_return_prompt = None
+            pending = None
+        if not isinstance(previous, datetime) or (
+            (now - previous).total_seconds() < self.__break_return_idle_seconds()
+        ):
+            if pending is not None:
+                self.__show_activity_panel()
+            return
+        self.__record_break_return(now, previous)
+
+    def __visible_break_return_prompt(self, break_state):
+        pending = self.__break_return_prompt
+        if not isinstance(pending, dict) or not isinstance(break_state, dict):
+            return None
+        if not break_state.get("active"):
+            return None
+        try:
+            started_at = datetime.fromisoformat(str(break_state.get("started_at") or ""))
+        except Exception:
+            return None
+        detected_at = pending.get("detected_at")
+        if pending.get("started_at") != started_at or not isinstance(detected_at, datetime):
+            return None
+        return WorktimeBreakReturnPrompt(
+            started_time=started_at.strftime("%H:%M"),
+            detected_time=detected_at.strftime("%H:%M"),
+        )
+
+    def __pending_break_return(self, detected_time: str):
+        pending = self.__break_return_prompt
+        if not isinstance(pending, dict):
+            return None
+        detected_at = pending.get("detected_at")
+        if (
+            not isinstance(detected_at, datetime)
+            or detected_at.strftime("%H:%M") != str(detected_time).strip()
+        ):
+            return None
+        return pending
+
+    def __finish_break_return(self, started_at, end_at) -> bool:
+        try:
+            state = self.__worktime_state_store.end_manual_break(
+                end_at,
+                expected_started_at=started_at,
+            )
+        except Exception:
+            state = {"ok": False}
+        if not bool(state.get("ok", False)):
+            if self.__active_manual_break_started_at(
+                self.__lib.datetime.now()
+            ) != started_at:
+                self.__break_return_prompt = None
+            self.__show_panel_action_error(
+                str(state.get("message") or "휴게를 종료하지 못했습니다.")
+            )
+            return False
+        self.__break_return_prompt = None
+        message = str(state.get("message") or "")
+        root = self.__root
+        if root is not None and message:
+            self.__ui_safe(
+                root,
+                lambda message=message: self.__show_tooltip(root, message),
+            )
+        return True
+
+    def __panel_break_return_accept(self, detected_time: str) -> None:
+        pending = self.__pending_break_return(detected_time)
+        if pending is None:
+            self.__show_panel_action_error("휴게 복귀 알림이 만료되었습니다.")
+            return
+        self.__finish_break_return(pending["started_at"], pending["detected_at"])
+
+    def __panel_break_return_edit(self, detected_time: str, end_time: str) -> bool:
+        pending = self.__pending_break_return(detected_time)
+        if pending is None:
+            self.__show_panel_action_error("휴게 복귀 알림이 만료되었습니다.")
+            return False
+        try:
+            clock = datetime.strptime(str(end_time).strip(), "%H:%M").time()
+        except Exception:
+            self.__show_panel_action_error("휴게 종료 시간이 올바르지 않습니다.")
+            return False
+        started_at = pending["started_at"]
+        now = self.__lib.datetime.now()
+        # A break can cross midnight: use the most recent date on which the
+        # entered time falls between the break start and now.
+        end_at = None
+        day = now.date()
+        for _ in range(max(1, min(31, (now.date() - started_at.date()).days + 1))):
+            candidate = datetime.combine(day, clock)
+            if started_at <= candidate <= now:
+                end_at = candidate
+                break
+            day -= timedelta(days=1)
+        if end_at is None:
+            self.__show_panel_action_error(
+                "휴게 시작 이후이고 현재 이전인 시각을 입력해 주세요."
+            )
+            return False
+        return self.__finish_break_return(started_at, end_at)
+
+    def __panel_break_return_keep(self) -> None:
+        self.__break_return_prompt = None
+
     def __on_worktime_activity(self, detected_at) -> None:
         if not self.__automatic_ui_allowed():
             return
         if not isinstance(detected_at, datetime) or detected_at.tzinfo is not None:
             return
+        self.__maybe_prompt_break_return(detected_at)
         self.__maybe_resume_overtime_for_activity(detected_at)
         first_detected_at = self.__activity_prompt_save_detected_at
         if (
@@ -4956,6 +5171,9 @@ class Wrike:
 
     def toggle_manual_break(self) -> dict:
         state = self.__worktime_state_store.toggle_manual_break()
+        if bool(state.get("ok", False)):
+            # Starting or ending a break by hand settles any pending return.
+            self.__break_return_prompt = None
         message = str(state.get("message") or "")
         root = self.__root
         if root is not None and message:
