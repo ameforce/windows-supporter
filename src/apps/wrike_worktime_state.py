@@ -982,3 +982,73 @@ class WorktimeStateStore:
                 message += f" · 오늘 수동 누적 {format_minutes(state['completed_minutes'])}"
             state.update({"ok": True, "message": message})
             return state
+
+    def end_manual_break(self, end_at, *, expected_started_at=None, now=None) -> dict:
+        """End only the active manual break at ``end_at``; never start one.
+
+        ``expected_started_at`` binds the request to the break it was built
+        for, so a prompt left over from an earlier break cannot end a new one.
+        """
+
+        def failed(message: str, state_now: datetime | None = None) -> dict:
+            state = (
+                self.get_manual_break_state(now=state_now)
+                if state_now is not None
+                else {
+                    "active": False,
+                    "started_at": "",
+                    "completed_minutes": 0,
+                    "ongoing_minutes": 0,
+                    "session_count": 0,
+                }
+            )
+            state.update({"ok": False, "message": message})
+            return state
+
+        try:
+            now_value = self._now(now)
+            end_value = self._now(end_at)
+        except ValueError as exc:
+            return failed(str(exc))
+
+        with self._lock:
+            if self._write_blocked_reason:
+                return failed(self._write_error_locked(), now_value)
+            _active_key, active = self._active_locked()
+            if active is None:
+                return failed("진행 중인 휴게가 없습니다.", now_value)
+            if expected_started_at is not None:
+                expected = (
+                    self._parse_iso(expected_started_at)
+                    if isinstance(expected_started_at, str)
+                    else expected_started_at
+                )
+                if not isinstance(expected, datetime) or self._format_iso(
+                    expected
+                ) != self._format_iso(active):
+                    return failed(
+                        "휴게 상태가 바뀌었습니다. 다시 확인해 주세요.",
+                        now_value,
+                    )
+            if end_value < active:
+                return failed("휴게 종료 시간이 휴게 시작 시간보다 빠릅니다.", now_value)
+            if end_value > now_value:
+                return failed("휴게 종료 시간이 현재 시간보다 늦습니다.", now_value)
+
+            previous = copy.deepcopy(self._state)
+            for entry in self._state["days"].values():
+                if isinstance(entry, dict):
+                    entry["active_break_started_at"] = None
+            self._append_completed_span_locked(active, end_value)
+            if not self._save_locked():
+                self._state = previous
+                return failed(self._write_error_locked(), now_value)
+
+            duration = int(max(0.0, (end_value - active).total_seconds()) // 60)
+            state = self.get_manual_break_state(now=now_value)
+            message = (
+                f"휴게 종료 {end_value.strftime('%H:%M')} ({duration}분)"
+                f" · 오늘 수동 누적 {format_minutes(state['completed_minutes'])}"
+            )
+            state.update({"ok": True, "message": message})
+            return state

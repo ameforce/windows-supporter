@@ -45,6 +45,7 @@ _INLINE_EDITOR_MANUAL_BREAK = "manual_break"
 _INLINE_EDITOR_OVERTIME_START = "overtime_start"
 _INLINE_EDITOR_OVERTIME_PROMPT_START = "overtime_prompt_start"
 _INLINE_EDITOR_FLEX_PENDING = "flex_pending"
+_INLINE_EDITOR_BREAK_RETURN = "break_return_end"
 _MAX_FLEX_PENDING_ROWS = 4
 
 _BG = "#F3F4F6"
@@ -145,6 +146,24 @@ class WorktimeOvertimePrompt:
             raise TypeError("assigned_minutes must be an int")
         if not 0 <= self.assigned_minutes <= 1440:
             raise ValueError("assigned_minutes must be between 0 and 1440")
+
+
+@dataclass(frozen=True, slots=True)
+class WorktimeBreakReturnPrompt:
+    """Optional prompt shown when input resumes after idling in a manual break."""
+
+    started_time: str
+    detected_time: str
+
+    def __post_init__(self) -> None:
+        if type(self.started_time) is not str or _HHMM_PATTERN.fullmatch(
+            self.started_time
+        ) is None:
+            raise ValueError("started_time must use 24-hour HH:MM format")
+        if type(self.detected_time) is not str or _HHMM_PATTERN.fullmatch(
+            self.detected_time
+        ) is None:
+            raise ValueError("detected_time must use 24-hour HH:MM format")
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +276,7 @@ class WorktimePanelModel:
     overtime_prompt: WorktimeOvertimePrompt | None = None
     overtime_state: WorktimeOvertimeState | None = None
     flex_pending: tuple[WorktimeFlexPendingRecord, ...] = ()
+    break_return_prompt: WorktimeBreakReturnPrompt | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.week_range, name="week_range")
@@ -301,6 +321,13 @@ class WorktimePanelModel:
             raise TypeError(
                 "overtime_state must be a WorktimeOvertimeState or None"
             )
+        if self.break_return_prompt is not None:
+            if not isinstance(self.break_return_prompt, WorktimeBreakReturnPrompt):
+                raise TypeError(
+                    "break_return_prompt must be a WorktimeBreakReturnPrompt or None"
+                )
+            if not self.break_active:
+                raise ValueError("break_return_prompt requires an active break")
         if not isinstance(self.flex_pending, tuple):
             raise TypeError("flex_pending must be an immutable tuple")
         if any(
@@ -381,6 +408,9 @@ class WorktimeQuickPanel:
         flex_open: Callable[[], None] | None = None,
         flex_pending_edit: Callable[[str, str, str], bool] | None = None,
         flex_pending_done: Callable[[str], None] | None = None,
+        break_return_accept: Callable[[str], None] | None = None,
+        break_return_edit: Callable[[str, str], bool] | None = None,
+        break_return_keep: Callable[[], None] | None = None,
     ) -> None:
         callbacks = {
             "model_provider": model_provider,
@@ -446,6 +476,15 @@ class WorktimeQuickPanel:
             flex_pending_done
             if flex_pending_done is not None
             else lambda _date_key: None
+        )
+        self._on_break_return_accept = (
+            break_return_accept
+            if break_return_accept is not None
+            else lambda _detected_time: None
+        )
+        self._on_break_return_edit = break_return_edit
+        self._on_break_return_keep = (
+            break_return_keep if break_return_keep is not None else lambda: None
         )
         self._monotonic = monotonic
         self._tk = tk_module
@@ -720,6 +759,12 @@ class WorktimeQuickPanel:
                 record.date_key == self._inline_editor_context
                 for record in model.flex_pending
             )
+        elif self._inline_editor_kind == _INLINE_EDITOR_BREAK_RETURN:
+            stale = (
+                model.break_return_prompt is None
+                or model.break_return_prompt.detected_time
+                != self._inline_editor_context
+            )
         if stale:
             self._close_inline_editor(reconcile=self._visible)
 
@@ -727,6 +772,7 @@ class WorktimeQuickPanel:
     def _model_structure_signature(model: WorktimePanelModel) -> tuple[Any, ...]:
         return (
             model.prompt is not None,
+            model.break_return_prompt is not None,
             model.overtime_prompt is not None,
             model.overtime_state is not None,
             tuple(
@@ -1600,6 +1646,7 @@ class WorktimeQuickPanel:
 
         compact = (
             model.prompt is not None
+            or model.break_return_prompt is not None
             or model.overtime_prompt is not None
             or model.overtime_state is not None
             or bool(model.flex_pending)
@@ -2057,6 +2104,52 @@ class WorktimeQuickPanel:
                 skip_button,
             )
 
+        break_return_label = None
+        break_return_buttons: tuple[Any, ...] = ()
+        if model.break_return_prompt is not None:
+            break_return = model.break_return_prompt
+            break_return_card = tk.Frame(
+                auxiliary_content,
+                bg=_PROMPT_BG,
+                highlightthickness=1,
+                highlightbackground=_PROMPT_BORDER,
+            )
+            break_return_card.pack(fill="x", pady=(section_gap, 0), before=today_card)
+            if auxiliary_lead_card is today_card:
+                auxiliary_lead_card = break_return_card
+            break_return_label = tk.Label(
+                break_return_card,
+                text=self._break_return_prompt_text(break_return),
+                bg=_PROMPT_BG,
+                fg="#9A3412",
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9, "bold"),
+            )
+            break_return_label.pack(fill="x", padx=10, pady=(4, 2))
+            break_return_actions = tk.Frame(break_return_card, bg=_PROMPT_BG)
+            break_return_actions.pack(fill="x", padx=8, pady=(0, 4))
+            break_return_end_button = self._button(
+                break_return_actions,
+                f"{break_return.detected_time}에 종료",
+                self._break_return_accept_current_command,
+            )
+            break_return_edit_button = self._button(
+                break_return_actions,
+                "시간 수정",
+                self._break_return_edit_command,
+            )
+            break_return_keep_button = self._button(
+                break_return_actions,
+                "계속 휴게",
+                self._break_return_keep_command,
+            )
+            break_return_buttons = (
+                break_return_end_button,
+                break_return_edit_button,
+                break_return_keep_button,
+            )
+
         overtime_prompt_label = None
         overtime_prompt_buttons: tuple[Any, ...] = ()
         if model.overtime_prompt is not None:
@@ -2285,6 +2378,8 @@ class WorktimeQuickPanel:
             "countdown": countdown_label,
             "prompt_label": prompt_label,
             "prompt_buttons": prompt_buttons,
+            "break_return_label": break_return_label,
+            "break_return_buttons": break_return_buttons,
             "overtime_prompt_label": overtime_prompt_label,
             "overtime_prompt_buttons": overtime_prompt_buttons,
             "flex_pending_label": flex_pending_label,
@@ -2394,6 +2489,18 @@ class WorktimeQuickPanel:
             )
             accept_button = widgets["prompt_buttons"][0]
             accept_button.configure(text=f"{prompt.detected_time}으로 출근")
+        if model.break_return_prompt is not None:
+            break_return = model.break_return_prompt
+            break_return_label = widgets.get("break_return_label")
+            if break_return_label is not None:
+                break_return_label.configure(
+                    text=self._break_return_prompt_text(break_return)
+                )
+            break_return_buttons = widgets.get("break_return_buttons") or ()
+            if break_return_buttons:
+                break_return_buttons[0].configure(
+                    text=f"{break_return.detected_time}에 종료"
+                )
         if model.overtime_prompt is not None:
             overtime_prompt = model.overtime_prompt
             assigned_text = (
@@ -2760,7 +2867,7 @@ class WorktimeQuickPanel:
                 f"{self._manual_break_edit.start_time} - "
                 f"{self._manual_break_edit.end_time}"
             )
-        if kind == _INLINE_EDITOR_OVERTIME_PROMPT_START:
+        if kind in {_INLINE_EDITOR_OVERTIME_PROMPT_START, _INLINE_EDITOR_BREAK_RETURN}:
             return str(context or "")
         if kind == _INLINE_EDITOR_OVERTIME_START:
             if model.overtime_state is None:
@@ -2799,6 +2906,8 @@ class WorktimeQuickPanel:
             return "초과근무 시작 시간", "예: 18 · 1830 · 18:30"
         if kind == _INLINE_EDITOR_FLEX_PENDING:
             return f"{context or '초과근무'} 기록 수정", "HH:MM - HH:MM"
+        if kind == _INLINE_EDITOR_BREAK_RETURN:
+            return "휴게 종료 시간", "예: 13 · 1305 · 13:05"
         raise ValueError(f"unsupported inline editor kind: {kind}")
 
     def _show_inline_editor(
@@ -2947,6 +3056,22 @@ class WorktimeQuickPanel:
                         failure_message = (
                             "초과근무 시작 시간을 저장하지 못했거나 요청이 만료되었습니다."
                         )
+        elif kind == _INLINE_EDITOR_BREAK_RETURN:
+            clock_value, error = self._parse_clock_time(raw_value)
+            context = self._inline_editor_context
+            if error is None and clock_value is not None:
+                if context is None:
+                    error = "수정할 휴게 복귀 알림이 만료되었습니다."
+                elif self._on_break_return_edit is None:
+                    error = "휴게 종료 시간 수정 기능을 사용할 수 없습니다."
+                else:
+                    callback = (
+                        lambda: self._on_break_return_edit(context, clock_value)
+                        is True
+                    )
+                    failure_message = (
+                        "휴게 종료 시간을 저장하지 못했거나 요청이 만료되었습니다."
+                    )
         elif kind == _INLINE_EDITOR_FLEX_PENDING:
             start_time, end_time, error = self._parse_manual_break_times(raw_value)
             context = self._inline_editor_context
@@ -3147,6 +3272,40 @@ class WorktimeQuickPanel:
 
     def _prompt_skip_command(self) -> None:
         self._run_command(self._on_prompt_skip)
+
+    @staticmethod
+    def _break_return_prompt_text(prompt: WorktimeBreakReturnPrompt) -> str:
+        return (
+            f"{prompt.detected_time}에 복귀한 것 같습니다. "
+            f"{prompt.started_time}에 시작한 휴게를 종료할까요?"
+        )
+
+    def _break_return_accept_current_command(self) -> None:
+        model = self._model
+        if model is None or model.break_return_prompt is None:
+            return
+        self._run_command(
+            self._on_break_return_accept,
+            model.break_return_prompt.detected_time,
+        )
+
+    def _break_return_edit_command(self) -> None:
+        model = self._model
+        if (
+            model is None
+            or model.break_return_prompt is None
+            or self._on_break_return_edit is None
+        ):
+            return
+        detected = model.break_return_prompt.detected_time
+        self._focus_or_show_inline_editor(
+            _INLINE_EDITOR_BREAK_RETURN,
+            detected,
+            context=detected,
+        )
+
+    def _break_return_keep_command(self) -> None:
+        self._run_command(self._on_break_return_keep)
 
     @staticmethod
     def _overtime_state_text(state: WorktimeOvertimeState) -> str:
