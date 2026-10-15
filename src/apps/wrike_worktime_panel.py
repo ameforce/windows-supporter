@@ -688,6 +688,22 @@ class WorktimeQuickPanel:
             and self._window_is_mapped(self._window)
         )
 
+    def describe_state(self) -> dict[str, Any]:
+        """Return a small read-only view of the panel for the diagnostic log."""
+
+        state: dict[str, Any] = {
+            "visible": bool(self._visible),
+            "destroyed": bool(self._destroyed),
+            "pointer_inside": bool(self._pointer_inside),
+        }
+        window = self._window
+        if window is not None and self._window_exists(window):
+            state["mapped"] = self._window_is_mapped(window)
+            rect = self._window_rect(window)
+            if rect is not None:
+                state["rect"] = list(rect)
+        return state
+
     @staticmethod
     def _clamp_idle_timeout_ms(idle_timeout_ms: int) -> int:
         if type(idle_timeout_ms) is not int:

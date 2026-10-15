@@ -839,6 +839,30 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertEqual(sum(text in _WEEKDAYS for text in texts), 7)
         self.assertIn("오늘", texts)
 
+    def test_describe_state_is_read_only_and_follows_visibility(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model()}
+        panel, provider, _callbacks = _make_panel(root, fake_tk, holder)
+
+        before = panel.describe_state()
+        self.assertFalse(before["visible"])
+        self.assertNotIn("mapped", before)  # no window has been created yet
+        self.assertEqual(fake_tk.toplevels, [])
+
+        self.assertTrue(panel.show(activate=False))
+        calls_after_show = provider.call_count
+        shown = panel.describe_state()
+        self.assertTrue(shown["visible"])
+        self.assertTrue(shown["mapped"])
+        self.assertEqual(len(shown["rect"]), 4)
+        self.assertEqual(provider.call_count, calls_after_show)
+
+        panel.hide()
+        hidden = panel.describe_state()
+        self.assertFalse(hidden["visible"])
+        self.assertFalse(hidden["mapped"])
+
     def test_equal_model_returns_before_assignment_or_any_render_path(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
