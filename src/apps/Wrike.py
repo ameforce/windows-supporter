@@ -134,9 +134,9 @@ FLEX_SYNC_DEFERRED_CODES = frozenset(
 # break-return question that was not answered must not depend on that single
 # display. It is shown again on later input, but not more often than this.
 BREAK_RETURN_RESURFACE_SECONDS = 120
-# The input watcher and a hotkey answer the same key chord. A manual open that
-# arrives this soon after the question was raised keeps the panel instead of
-# toggling it away.
+# The input watcher and a hotkey answer the same key chord. The first manual
+# open that arrives this soon after the question was raised keeps the panel
+# instead of toggling it away; later opens toggle as usual.
 BREAK_RETURN_HOTKEY_GRACE_SECONDS = 1.5
 # Shown instead of the worktime window while Wrike is switched off.
 WRIKE_DISABLED_NOTICE = (
@@ -269,8 +269,10 @@ class Wrike:
         # (BREAK_RETURN_RESURFACE_SECONDS).
         self.__last_worktime_activity_at = None
         self.__break_return_prompt = None
-        # Input time at which the question last raised the panel; a manual
-        # open right after it keeps the panel (BREAK_RETURN_HOTKEY_GRACE_SECONDS).
+        # Input time at which the question last raised the panel; the first
+        # manual open right after it keeps the panel
+        # (BREAK_RETURN_HOTKEY_GRACE_SECONDS). That open and the end of the
+        # question both drop it.
         self.__break_return_raised_at = None
         # Why the latest automatic panel request did or did not show a panel.
         self.__last_panel_surface_reason = ""
@@ -699,7 +701,11 @@ class Wrike:
         panel = self.__ensure_worktime_panel(root)
         if panel is None:
             return
-        if not self.__break_return_panel_just_raised(panel):
+        if self.__break_return_panel_just_raised(panel):
+            # The grace belongs to the one open that answers the chord which
+            # raised the question; the next open is a plain toggle.
+            self.__break_return_raised_at = None
+        else:
             panel.toggle(activate=False)
         if panel.is_visible():
             pending = self.__break_return_prompt
@@ -4900,6 +4906,7 @@ class Wrike:
         if self.__break_return_prompt is not None:
             self.__log_break_return("question cleared; " + why)
         self.__break_return_prompt = None
+        self.__break_return_raised_at = None
 
     def __record_break_return(self, detected_at, absent_since) -> None:
         started_at = self.__active_manual_break_started_at(detected_at)
@@ -5094,6 +5101,7 @@ class Wrike:
             )
             return False
         self.__break_return_prompt = None
+        self.__break_return_raised_at = None
         self.__log_break_return(
             "answered, break ended; "
             f"break_started={self.__break_return_stamp(started_at)} "

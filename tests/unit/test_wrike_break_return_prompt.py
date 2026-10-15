@@ -539,6 +539,63 @@ class BreakReturnPromptTest(unittest.TestCase):
 
         self.assertTrue(self.panel.visible)
 
+    def test_grace_covers_only_the_first_direct_open(self):
+        # The watcher and the hotkey answer one key chord, once each. A second
+        # press inside the window is the user closing the panel again.
+        self._first_return()  # raised at 12:30:00 and on screen
+
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            _Clock.current = _at(12, 30) + timedelta(milliseconds=300)
+            self.wrike.show_weekly_timelog_summary(self.root)
+            self.assertTrue(self.panel.visible)
+            self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+            refresh.assert_called_once_with(force=True)
+
+            _Clock.current = _at(12, 30) + timedelta(milliseconds=800)
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertFalse(self.panel.visible)
+        self.assertEqual(self.panel.show.call_count, 1)
+        refresh.assert_called_once_with(force=True)
+
+    def _direct_open_after(self, answer):
+        # Raise the question, answer it a moment later, then open by hand
+        # inside what used to be the grace window.
+        self._first_return()  # raised at 12:30:00 and on screen
+        _Clock.current = _at(12, 30) + timedelta(milliseconds=200)
+        answer()
+        self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+        _Clock.current = _at(12, 30) + timedelta(milliseconds=300)
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh"):
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+    def test_answer_that_keeps_the_break_leaves_no_grace(self):
+        self._direct_open_after(self.wrike._Wrike__panel_break_return_keep)
+
+        self.assertFalse(self.panel.visible)
+
+    def test_answer_that_ends_the_break_leaves_no_grace(self):
+        self._direct_open_after(
+            lambda: self.wrike._Wrike__panel_break_return_accept("12:30")
+        )
+
+        self.assertEqual(self.completed_breaks(), [("2026-04-06T12:00:00", "2026-04-06T12:30:00")])
+        self.assertFalse(self.panel.visible)
+
+    def test_break_toggled_by_hand_leaves_no_grace(self):
+        self._direct_open_after(lambda: self.start_break(_Clock.current))
+
+        self.assertFalse(self.panel.visible)
+
+    def test_disabling_drops_the_grace_marker(self):
+        self._first_return()
+        self.assertIsNotNone(self.wrike._Wrike__break_return_raised_at)
+
+        ok, error = self.wrike.update_settings({"monitor_enabled": False})
+
+        self.assertTrue(ok, error)
+        self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+
     def test_hotkey_before_the_watcher_leaves_one_open_panel(self):
         self._first_return()
         self.panel.visible = False  # closed itself unanswered
