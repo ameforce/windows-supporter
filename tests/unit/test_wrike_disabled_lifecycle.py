@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from src.apps.Wrike import Wrike
+from src.apps.Wrike import WRIKE_DISABLED_NOTICE, Wrike
 from src.apps.wrike_timelog_snapshot import TimelogSnapshotState
 
 
@@ -128,14 +128,35 @@ class WrikeDisabledLifecycleTest(unittest.TestCase):
         self.wrike._Wrike__start_vacation_ical_polling.assert_called_once_with()
         self.wrike._Wrike__start_flex_polling.assert_called_once_with()
 
-    def test_disabled_automatic_panel_does_not_block_explicit_manual_open(self):
+    def test_disabled_blocks_manual_open_and_explains_why(self):
+        # v0.36.2: the worktime window is part of the switched-off feature, so
+        # Ctrl+Alt+W neither opens it nor reads Wrike; it only says why.
         self.wrike._Wrike__monitor_enabled = False
         with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
             self.assertFalse(self.wrike._Wrike__show_activity_panel())
-            self.panel.show.assert_not_called()
             self.wrike.show_weekly_timelog_summary(self.root)
-            self.assertTrue(self.panel.is_visible())
-            refresh.assert_called_once_with(force=True)
+        self.assertFalse(self.panel.is_visible())
+        self.panel.show.assert_not_called()
+        refresh.assert_not_called()
+        self.tooltip_type.assert_called_once()
+        self.assertEqual(self.tooltip_type.call_args.args[1], WRIKE_DISABLED_NOTICE)
+        self.assertFalse(self.wrike._Wrike__active_tooltip_automatic)
+
+    def test_reenabling_restores_manual_open(self):
+        self._set_enabled(False)
+        self.wrike.show_weekly_timelog_summary(self.root)
+        self.assertFalse(self.panel.is_visible())
+        self._set_enabled(True)
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            self.wrike.show_weekly_timelog_summary(self.root)
+        self.assertTrue(self.panel.is_visible())
+        refresh.assert_called_once_with(force=True)
+
+    def test_disabled_notice_failure_does_not_open_the_window(self):
+        self.wrike._Wrike__monitor_enabled = False
+        self.tooltip_type.side_effect = RuntimeError("tooltip unavailable")
+        self.wrike.show_weekly_timelog_summary(self.root)
+        self.assertFalse(self.panel.is_visible())
 
     def test_disabled_activity_and_idle_callbacks_have_no_automatic_effect(self):
         self.wrike._Wrike__monitor_enabled = False

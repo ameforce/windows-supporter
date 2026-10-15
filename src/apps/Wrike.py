@@ -130,6 +130,11 @@ FLEX_SYNC_DEFERRED_CODES = frozenset(
     {FLEX_SYNC_DEFERRED_CODE, FLEX_SYNC_LOGIN_PENDING_CODE}
 )
 
+# Shown instead of the worktime window while Wrike is switched off.
+WRIKE_DISABLED_NOTICE = (
+    "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. 대시보드에서 Wrike를 활성화하세요."
+)
+
 
 VACATION_EXPECTED_CALENDAR_NAME = "김종인-ePapyrus"
 VACATION_ERROR_FETCH_FAILED = "calendar_fetch_failed"
@@ -659,6 +664,15 @@ class Wrike:
 
     def show_weekly_timelog_summary(self, root) -> None:
         if root is None:
+            return
+        if not self.__monitor_enabled:
+            # The worktime window belongs to the feature that is switched off:
+            # answer the request with a notice instead of opening it or
+            # reading Wrike. Re-enabling restores it.
+            try:
+                self.__show_tooltip(root, WRIKE_DISABLED_NOTICE)
+            except Exception as exc:
+                self.__log_exception("disabled notice failed", exc)
             return
         if self.__root is None:
             self.attach(root)
