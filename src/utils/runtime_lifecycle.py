@@ -37,6 +37,36 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def rotate_log_file(
+    log_path: Path | str,
+    incoming_bytes: int,
+    *,
+    max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
+    log_backups: int = DEFAULT_LOG_BACKUPS,
+) -> None:
+    """Move a log that would pass ``max_log_bytes`` to ``<log>.1`` (``.2``...).
+
+    At most ``log_backups`` older files are kept. The caller owns locking and
+    decides what a failed rotation means for the record it is about to write.
+    """
+    path = Path(log_path)
+    try:
+        current_size = path.stat().st_size
+    except FileNotFoundError:
+        return
+    if current_size + incoming_bytes <= max_log_bytes:
+        return
+    if log_backups <= 0:
+        path.unlink(missing_ok=True)
+        return
+    for index in range(log_backups, 1, -1):
+        older = Path(f"{path}.{index - 1}")
+        newer = Path(f"{path}.{index}")
+        if older.exists():
+            os.replace(older, newer)
+    os.replace(path, Path(f"{path}.1"))
+
+
 def is_main_runtime_invocation(argv: Sequence[str] | None = None) -> bool:
     values = tuple(str(value) for value in (sys.argv if argv is None else argv))
     return not any(value in _SPECIAL_MODE_ARGS for value in values[1:])
@@ -194,21 +224,12 @@ class RuntimeLifecycle:
         }
 
     def _rotate_log_if_needed(self, incoming_bytes: int) -> None:
-        try:
-            current_size = self.log_path.stat().st_size
-        except FileNotFoundError:
-            return
-        if current_size + incoming_bytes <= self.max_log_bytes:
-            return
-        if self.log_backups <= 0:
-            self.log_path.unlink(missing_ok=True)
-            return
-        for index in range(self.log_backups, 1, -1):
-            older = Path(f"{self.log_path}.{index - 1}")
-            newer = Path(f"{self.log_path}.{index}")
-            if older.exists():
-                os.replace(older, newer)
-        os.replace(self.log_path, Path(f"{self.log_path}.1"))
+        rotate_log_file(
+            self.log_path,
+            incoming_bytes,
+            max_log_bytes=self.max_log_bytes,
+            log_backups=self.log_backups,
+        )
 
     def emit(self, phase: str, **details: Any) -> bool:
         record = self._base_record(phase)

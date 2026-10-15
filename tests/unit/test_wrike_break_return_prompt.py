@@ -11,9 +11,11 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import src.apps.Wrike as wrike_module
 from src.apps.Wrike import Wrike
 from src.apps.wrike_worktime_panel import WorktimeBreakReturnPrompt
 from src.apps.wrike_worktime_state import WorktimeStateStore
+from src.utils.runtime_lifecycle import DEFAULT_MAX_LOG_BYTES
 
 
 DAY = "2026-04-06"
@@ -921,6 +923,72 @@ class BreakReturnPromptTest(unittest.TestCase):
 
         self.assertEqual(self.completed_breaks(), [("2026-04-06T23:50:00", "2026-04-06T23:55:00")])
         self.assertIsNone(self.pending())
+
+
+class WrikeLogRotationTest(unittest.TestCase):
+    """wrike.log follows the size cap and backup count of the runtime log."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.dict(os.environ, {"APPDATA": temporary.name}, clear=False):
+            self.wrike = Wrike()
+        self.log_path = Path(temporary.name) / "windows-supporter" / "wrike.log"
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def backup(self, index: int) -> Path:
+        return Path(f"{self.log_path}.{index}")
+
+    def test_line_under_the_cap_is_appended_without_rotation(self):
+        self.log_path.write_text("old line\n", encoding="utf-8")
+
+        self.wrike.log_info("next line")
+
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        self.assertEqual(lines[0], "old line")
+        self.assertRegex(lines[1], r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\] next line$")
+        self.assertFalse(self.backup(1).exists())
+
+    def test_log_that_would_pass_the_cap_moves_to_a_backup(self):
+        old = "x" * DEFAULT_MAX_LOG_BYTES
+        self.log_path.write_text(old, encoding="utf-8")
+
+        self.wrike.log_info("first line after the cap")
+
+        self.assertEqual(self.backup(1).read_text(encoding="utf-8"), old)
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertRegex(
+            lines[0], r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\] first line after the cap$"
+        )
+
+    def test_failed_rotation_does_not_cost_the_line(self):
+        self.log_path.write_text("old line\n", encoding="utf-8")
+
+        with patch("src.apps.Wrike.rotate_log_file", side_effect=PermissionError("in use")):
+            self.wrike.log_info("kept anyway")
+
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[1].endswith("] kept anyway"), lines)
+
+    def test_rotation_gets_the_line_size_while_the_log_lock_is_held(self):
+        seen = []
+
+        def spy(path, incoming_bytes):
+            seen.append((path, incoming_bytes, wrike_module._WRIKE_LOG_LOCK.locked()))
+
+        with patch("src.apps.Wrike.rotate_log_file", side_effect=spy):
+            self.wrike.log_info("한글 줄")
+
+        self.assertEqual(len(seen), 1, seen)
+        path, incoming_bytes, locked = seen[0]
+        self.assertEqual(Path(path), self.log_path)
+        self.assertTrue(locked)
+        written = self.log_path.read_text(encoding="utf-8")
+        self.assertEqual(incoming_bytes, len(written.encode("utf-8")))
+        self.assertFalse(wrike_module._WRIKE_LOG_LOCK.locked())
 
 
 if __name__ == "__main__":

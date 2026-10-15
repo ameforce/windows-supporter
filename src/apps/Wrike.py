@@ -18,6 +18,7 @@ import urllib.request
 import webbrowser
 
 from src.utils.LibConnector import LibConnector
+from src.utils.runtime_lifecycle import rotate_log_file
 from src.utils.secret_store import SecretStore
 from src.utils.subprocess_utils import build_python_module_command, is_frozen_runtime
 from src.utils.ToolTip import ToolTip
@@ -178,6 +179,10 @@ class _VacationRedirectRejected(Exception):
 
 class _VacationAuthenticationRequired(Exception):
     """Target-free marker for a redirect to an interactive login surface."""
+
+
+# A rotation renames files, so threads that write wrike.log take turns.
+_WRIKE_LOG_LOCK = threading.Lock()
 
 
 class Wrike:
@@ -10119,8 +10124,17 @@ class Wrike:
             ts = "time"
         line = f"[{ts}] {message}\n"
         try:
-            with open(self.__time_log_log_path, "a", encoding="utf-8") as fp:
-                fp.write(line)
+            with _WRIKE_LOG_LOCK:
+                try:
+                    # Same size cap and backups as runtime.jsonl. A rotation
+                    # that fails must not cost the line.
+                    rotate_log_file(
+                        self.__time_log_log_path, len(line.encode("utf-8"))
+                    )
+                except Exception:
+                    pass
+                with open(self.__time_log_log_path, "a", encoding="utf-8") as fp:
+                    fp.write(line)
         except Exception:
             return
 

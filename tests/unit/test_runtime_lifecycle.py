@@ -8,11 +8,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.utils.runtime_lifecycle import (
+    DEFAULT_LOG_BACKUPS,
+    DEFAULT_MAX_LOG_BYTES,
     PROBE_PATH_ENV,
     PROBE_TOKEN_ENV,
     RuntimeLifecycle,
     RuntimeProbeError,
     is_main_runtime_invocation,
+    rotate_log_file,
 )
 
 
@@ -218,6 +221,61 @@ class RuntimeLifecycleTest(unittest.TestCase):
             self.assertTrue(lifecycle.log_path.exists())
             self.assertTrue(lifecycle.log_path.with_suffix(".jsonl.1").exists())
             self.assertFalse(lifecycle.log_path.with_suffix(".jsonl.3").exists())
+
+
+class RotateLogFileTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "service.log"
+
+    def backup(self, index: int) -> Path:
+        return Path(f"{self.path}.{index}")
+
+    def test_defaults_match_the_runtime_log_policy(self) -> None:
+        self.assertEqual(DEFAULT_MAX_LOG_BYTES, 2 * 1024 * 1024)
+        self.assertEqual(DEFAULT_LOG_BACKUPS, 3)
+
+    def test_record_that_fits_leaves_the_log_in_place(self) -> None:
+        self.path.write_bytes(b"a" * 90)
+
+        rotate_log_file(self.path, 10, max_log_bytes=100, log_backups=2)
+
+        self.assertEqual(self.path.read_bytes(), b"a" * 90)
+        self.assertFalse(self.backup(1).exists())
+
+    def test_overflowing_record_moves_the_log_and_keeps_bounded_backups(self) -> None:
+        for generation in (b"a", b"b", b"c", b"d"):
+            self.path.write_bytes(generation * 100)
+
+            rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=2)
+
+            self.assertFalse(self.path.exists())
+        self.assertEqual(self.backup(1).read_bytes(), b"d" * 100)
+        self.assertEqual(self.backup(2).read_bytes(), b"c" * 100)
+        self.assertFalse(self.backup(3).exists())
+
+    def test_missing_log_is_not_an_error(self) -> None:
+        rotate_log_file(self.path, 10, max_log_bytes=1, log_backups=2)
+
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.backup(1).exists())
+
+    def test_zero_backups_drop_the_overflowing_log(self) -> None:
+        self.path.write_bytes(b"a" * 100)
+
+        rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=0)
+
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.backup(1).exists())
+
+    def test_string_path_and_default_limits_are_accepted(self) -> None:
+        self.path.write_bytes(b"a" * DEFAULT_MAX_LOG_BYTES)
+
+        rotate_log_file(str(self.path), 1)
+
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.backup(1).stat().st_size, DEFAULT_MAX_LOG_BYTES)
 
 
 if __name__ == "__main__":
