@@ -4949,6 +4949,18 @@ class Wrike:
             visible = bool(panel is not None and panel.is_visible())
         except Exception:
             visible = False
+        if not (visible or due):
+            return
+        if due:
+            # Once per pacing window, whether or not the panel is up: a
+            # question whose break is over must not be counted or shown.
+            started_at = self.__active_manual_break_started_at(detected_at)
+            if started_at is None or pending.get("started_at") != started_at:
+                self.__clear_break_return_prompt(
+                    f"its break {self.__break_return_stamp(pending.get('started_at'))} "
+                    "is no longer active"
+                )
+                return
         if visible:
             # The user is looking at it: count that as a display, so the
             # pacing window starts from the last moment it was on screen.
@@ -4958,15 +4970,6 @@ class Wrike:
                     "pending question already on screen, counted as shown; "
                     f"break_started={self.__break_return_stamp(pending.get('started_at'))}"
                 )
-            return
-        if not due:
-            return
-        started_at = self.__active_manual_break_started_at(detected_at)
-        if started_at is None or pending.get("started_at") != started_at:
-            self.__clear_break_return_prompt(
-                f"its break {self.__break_return_stamp(pending.get('started_at'))} "
-                "is no longer active"
-            )
             return
         self.__surface_break_return(
             detected_at,

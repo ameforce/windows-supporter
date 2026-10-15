@@ -460,6 +460,30 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.activity(_at(12, 30, 50))  # pacing restarts from the new clock
         self.assertEqual(self.panel.show.call_count, 3)
 
+    def test_input_while_on_screen_restarts_the_pacing_window(self):
+        self._first_return()  # shown at 12:30:00 and still on screen
+        self.activity(_at(12, 31, 30))  # inside the window, still on screen
+        self.assertEqual(self.pending()["surfaced_at"], _at(12, 31, 30))
+
+        self.panel.visible = False  # the user dismissed it
+        self.activity(_at(12, 32, 10))  # 130 s after the first display, 40 s after it was seen
+        self.assertEqual(self.panel.show.call_count, 1)
+        self.activity(_at(12, 33, 31))  # 121 s after it was last seen
+        self.assertEqual(self.panel.show.call_count, 2)
+
+    def test_question_of_a_finished_break_is_dropped_while_the_panel_is_on_screen(self):
+        self._first_return()  # the panel stays on screen
+        self.assertTrue(self.store.end_manual_break(_at(12, 31), now=_at(12, 31))["ok"])
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.activity(_at(12, 33))  # on screen and a pacing window has passed
+
+        self.assertIsNone(self.pending())
+        self.assertEqual(self.panel.show.call_count, 1)
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertFalse(any("counted as shown" in line for line in lines), lines)
+        self.assertTrue(any("is no longer active" in line for line in lines), lines)
+
     def test_panel_opened_by_hand_counts_as_seen(self):
         self._first_return()
         self.panel.visible = False
