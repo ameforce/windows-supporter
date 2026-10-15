@@ -130,6 +130,20 @@ FLEX_SYNC_DEFERRED_CODES = frozenset(
     {FLEX_SYNC_DEFERRED_CODE, FLEX_SYNC_LOGIN_PENDING_CODE}
 )
 
+# The automatic worktime panel closes itself after the tooltip duration, so a
+# break-return question that was not answered must not depend on that single
+# display. It is shown again on later input, but not more often than this.
+BREAK_RETURN_RESURFACE_SECONDS = 120
+# The input watcher and a hotkey answer the same key chord. A manual open that
+# arrives this soon after the question was raised keeps the panel instead of
+# toggling it away.
+BREAK_RETURN_HOTKEY_GRACE_SECONDS = 1.5
+# Shown instead of the worktime window while Wrike is switched off.
+WRIKE_DISABLED_NOTICE = (
+    "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. "
+    "대시보드나 Wrike 설정 탭에서 Wrike를 켜 주세요."
+)
+
 
 VACATION_EXPECTED_CALENDAR_NAME = "김종인-ePapyrus"
 VACATION_ERROR_FETCH_FAILED = "calendar_fetch_failed"
@@ -249,9 +263,20 @@ class Wrike:
         self.__activity_prompt_save_last_failure_key = None
         # Latest input observed by the activity watcher, and the first
         # unanswered return from an idle manual break:
-        # {"started_at": <break start>, "detected_at": <return time>}.
+        # {"started_at": <break start>, "detected_at": <return time>,
+        #  "surfaced_at": <last display attempt or None>}.
+        # ``surfaced_at`` paces the repeated display of an unanswered question
+        # (BREAK_RETURN_RESURFACE_SECONDS).
         self.__last_worktime_activity_at = None
         self.__break_return_prompt = None
+        # Input time at which the question last raised the panel; a manual
+        # open right after it keeps the panel (BREAK_RETURN_HOTKEY_GRACE_SECONDS).
+        self.__break_return_raised_at = None
+        # Why the latest automatic panel request did or did not show a panel.
+        self.__last_panel_surface_reason = ""
+        # Lifecycle generation whose dropped activity callbacks were already
+        # noted in the log, so a dead watcher is visible without log spam.
+        self.__stale_activity_logged_generation = None
         # v10 replaces the unusable administrator-only Open API credential
         # flow with an interactive employee browser session.
         self.__settings_version = 10
@@ -660,13 +685,27 @@ class Wrike:
     def show_weekly_timelog_summary(self, root) -> None:
         if root is None:
             return
+        if not self.__monitor_enabled:
+            # The worktime window belongs to the feature that is switched off:
+            # answer the request with a notice instead of opening it or
+            # reading Wrike. Re-enabling restores it.
+            try:
+                self.__show_tooltip(root, WRIKE_DISABLED_NOTICE)
+            except Exception as exc:
+                self.__log_exception("disabled notice failed", exc)
+            return
         if self.__root is None:
             self.attach(root)
         panel = self.__ensure_worktime_panel(root)
         if panel is None:
             return
-        panel.toggle(activate=False)
+        if not self.__break_return_panel_just_raised(panel):
+            panel.toggle(activate=False)
         if panel.is_visible():
+            pending = self.__break_return_prompt
+            if isinstance(pending, dict):
+                # Opened by hand: the question was in front of the user.
+                pending["surfaced_at"] = self.__lib.datetime.now()
             self.__request_timelog_snapshot_refresh(force=True)
         return
 
@@ -711,7 +750,7 @@ class Wrike:
         self.__overtime_prompt_surfaced_day = ""
         self.__clear_activity_prompt_save_retry()
         self.__last_worktime_activity_at = None
-        self.__break_return_prompt = None
+        self.__clear_break_return_prompt("automatic UI stopped")
         watcher = self.__activity_watcher
         self.__activity_watcher = None
         if watcher is not None:
@@ -853,6 +892,8 @@ class Wrike:
             def on_activity(detected_at) -> None:
                 if self.__automatic_ui_allowed(generation):
                     self.__on_worktime_activity(detected_at)
+                else:
+                    self.__note_dropped_activity(generation)
 
             def on_idle(detected_at) -> None:
                 if self.__automatic_ui_allowed(generation):
@@ -866,15 +907,25 @@ class Wrike:
                     idle_callback=on_idle,
                     idle_threshold_seconds=self.__overtime_idle_threshold_seconds,
                 )
-            except (LastInputUnavailableError, OSError, ValueError):
+            except (LastInputUnavailableError, OSError, ValueError) as exc:
+                self.__log_exception("activity watcher unavailable", exc)
                 return
-            except Exception:
+            except Exception as exc:
+                self.__log_exception("activity watcher creation failed", exc)
                 return
             self.__activity_watcher = watcher
+            self.__log(f"activity watcher created: generation={generation}")
         try:
             watcher.start()
-        except Exception:
+        except Exception as exc:
+            self.__log_exception("activity watcher start failed", exc)
             return
+        if getattr(watcher, "is_running", True) is False:
+            # start() swallows a polling schedule that Tk refused.
+            self.__log(
+                "activity watcher start failed: not running after start, "
+                f"generation={self.__automatic_ui_generation}"
+            )
         if self.__last_worktime_activity_at is None:
             # Measure an absence from the moment input could first be
             # observed. A manual break still running at start (e.g. left on
@@ -886,6 +937,20 @@ class Wrike:
                 started_at if started_at is not None and started_at <= now else now
             )
         return
+
+    def __note_dropped_activity(self, generation) -> None:
+        # A callback of an outdated lifecycle is dropped without effect. Say so
+        # once per generation, so a watcher that stopped reacting is visible.
+        if self.__stale_activity_logged_generation == generation:
+            return
+        self.__stale_activity_logged_generation = generation
+        self.__log(
+            "activity callback dropped: "
+            f"callback_generation={generation} "
+            f"current_generation={self.__automatic_ui_generation} "
+            f"background_active={self.__background_active} "
+            f"monitor_enabled={self.__monitor_enabled}"
+        )
 
     # ------------------------------------------------------------------
     # Flex browser session (read-only schedule synchronization)
@@ -4638,17 +4703,24 @@ class Wrike:
     def __show_activity_panel(self) -> bool:
         root = self.__root
         if root is None or not self.__automatic_ui_allowed():
+            self.__last_panel_surface_reason = "automatic_ui_not_allowed"
             return False
         panel = self.__ensure_worktime_panel(root)
         if panel is None:
+            self.__last_panel_surface_reason = "panel_unavailable"
             return False
         try:
             shown = panel.show(activate=False)
             mapped = panel.is_visible()
-        except Exception:
+        except Exception as exc:
+            self.__last_panel_surface_reason = f"show_raised:{type(exc).__name__}"
             return False
         if shown is not True or not mapped:
+            self.__last_panel_surface_reason = (
+                f"not_visible:show={shown!r},mapped={mapped!r}"
+            )
             return False
+        self.__last_panel_surface_reason = "shown"
         self.__request_timelog_snapshot_refresh(force=False)
         return True
 
@@ -4767,9 +4839,80 @@ class Wrike:
             return None
         return started_at
 
+    def __log_break_return(self, message: str) -> None:
+        self.__log("break return: " + message)
+
+    @staticmethod
+    def __break_return_stamp(value) -> str:
+        if not isinstance(value, datetime):
+            return "none"
+        return value.isoformat(timespec="seconds")
+
+    def __break_return_panel_state(self) -> str:
+        # Where the panel is and whether it is mapped, for the log. Never raises.
+        describe = getattr(self.__worktime_panel, "describe_state", None)
+        if not callable(describe):
+            return ""
+        try:
+            return " panel=" + json.dumps(describe(), sort_keys=True)
+        except Exception:
+            return ""
+
+    def __break_return_panel_just_raised(self, panel) -> bool:
+        # A hotkey and the input watcher react to the same key chord, in
+        # either order. When the watcher raised the question a moment ago the
+        # user is asking to see it, so a toggle would hide what was just shown.
+        raised_at = self.__break_return_raised_at
+        if not isinstance(raised_at, datetime):
+            return False
+        try:
+            elapsed = (self.__lib.datetime.now() - raised_at).total_seconds()
+            return bool(
+                0 <= elapsed < BREAK_RETURN_HOTKEY_GRACE_SECONDS
+                and panel.is_visible()
+            )
+        except Exception:
+            return False
+
+    def __surface_break_return(self, at, cause: str) -> bool:
+        # One display attempt for the pending question. The attempt time paces
+        # the repeated display whether or not a panel actually came up.
+        shown = False
+        try:
+            shown = self.__show_activity_panel()
+        except Exception as exc:
+            self.__last_panel_surface_reason = f"raised:{type(exc).__name__}"
+            raise
+        finally:
+            pending = self.__break_return_prompt
+            if isinstance(pending, dict):
+                pending["surfaced_at"] = at
+            if shown:
+                self.__break_return_raised_at = at
+            self.__log_break_return(
+                f"{cause}; panel_shown={shown} "
+                f"reason={self.__last_panel_surface_reason}"
+                f"{self.__break_return_panel_state()}"
+            )
+        return shown
+
+    def __clear_break_return_prompt(self, why: str) -> None:
+        if self.__break_return_prompt is not None:
+            self.__log_break_return("question cleared; " + why)
+        self.__break_return_prompt = None
+
     def __record_break_return(self, detected_at, absent_since) -> None:
         started_at = self.__active_manual_break_started_at(detected_at)
-        if started_at is None or detected_at < started_at:
+        facts = (
+            f"input={self.__break_return_stamp(detected_at)} "
+            f"absent_since={self.__break_return_stamp(absent_since)} "
+            f"break_started={self.__break_return_stamp(started_at)}"
+        )
+        if started_at is None:
+            self.__log_break_return("long absence, no active manual break; " + facts)
+            return
+        if detected_at < started_at:
+            self.__log_break_return("ignored, input predates the break; " + facts)
             return
         if (
             isinstance(absent_since, datetime)
@@ -4777,6 +4920,9 @@ class Wrike:
         ):
             # The absence began before this break: the click that started it
             # was the first input after returning, not a return from it.
+            self.__log_break_return(
+                "ignored, absence began before the break; " + facts
+            )
             return
         pending = self.__break_return_prompt
         if not (
@@ -4790,8 +4936,12 @@ class Wrike:
             self.__break_return_prompt = {
                 "started_at": started_at,
                 "detected_at": detected_at,
+                "surfaced_at": None,
             }
-        self.__show_activity_panel()
+            outcome = "question recorded"
+        else:
+            outcome = "first unanswered return kept"
+        self.__surface_break_return(detected_at, f"{outcome}; {facts}")
 
     @staticmethod
     def __break_return_was_brief(pending, absent_since) -> bool:
@@ -4810,8 +4960,55 @@ class Wrike:
         except Exception:
             return
         if idle_seconds < self.__break_return_idle_seconds():
+            self.__maybe_resurface_break_return(detected_at)
             return
         self.__record_break_return(detected_at, previous)
+
+    def __maybe_resurface_break_return(self, detected_at) -> None:
+        # The panel closes itself, so an unanswered question is shown again on
+        # later input. This is paced, skipped while the panel is on screen, and
+        # ends as soon as the question is answered or its break is over.
+        pending = self.__break_return_prompt
+        if not isinstance(pending, dict):
+            return
+        surfaced_at = pending.get("surfaced_at")
+        due = True
+        if isinstance(surfaced_at, datetime):
+            elapsed = (detected_at - surfaced_at).total_seconds()
+            due = not 0 <= elapsed < BREAK_RETURN_RESURFACE_SECONDS
+        panel = self.__worktime_panel
+        try:
+            visible = bool(panel is not None and panel.is_visible())
+        except Exception:
+            visible = False
+        if not (visible or due):
+            return
+        if due:
+            # Once per pacing window, whether or not the panel is up: a
+            # question whose break is over must not be counted or shown.
+            started_at = self.__active_manual_break_started_at(detected_at)
+            if started_at is None or pending.get("started_at") != started_at:
+                self.__clear_break_return_prompt(
+                    f"its break {self.__break_return_stamp(pending.get('started_at'))} "
+                    "is no longer active"
+                )
+                return
+        if visible:
+            # The user is looking at it: count that as a display, so the
+            # pacing window starts from the last moment it was on screen.
+            pending["surfaced_at"] = detected_at
+            if due:
+                self.__log_break_return(
+                    "pending question already on screen, counted as shown; "
+                    f"break_started={self.__break_return_stamp(pending.get('started_at'))}"
+                )
+            return
+        self.__surface_break_return(
+            detected_at,
+            "pending question shown again; "
+            f"break_started={self.__break_return_stamp(started_at)} "
+            f"first_return={self.__break_return_stamp(pending.get('detected_at'))}",
+        )
 
     def __on_break_return_unlock(self) -> None:
         # Unlocking re-baselines the watcher, and input typed on the lock
@@ -4821,17 +5018,25 @@ class Wrike:
         now = self.__lib.datetime.now()
         previous = self.__last_worktime_activity_at
         self.__last_worktime_activity_at = now
+        break_started_at = self.__active_manual_break_started_at(now)
         pending = self.__break_return_prompt
-        if isinstance(pending, dict) and pending.get(
-            "started_at"
-        ) != self.__active_manual_break_started_at(now):
-            self.__break_return_prompt = None
+        if isinstance(pending, dict) and pending.get("started_at") != break_started_at:
+            self.__clear_break_return_prompt("its break changed before unlock")
             pending = None
+        if break_started_at is not None or pending is not None:
+            self.__log_break_return(
+                "unlock; "
+                f"break_started={self.__break_return_stamp(break_started_at)} "
+                f"previous_input={self.__break_return_stamp(previous)} "
+                f"question_pending={pending is not None}"
+            )
         if not isinstance(previous, datetime) or (
             (now - previous).total_seconds() < self.__break_return_idle_seconds()
         ):
             if pending is not None:
-                self.__show_activity_panel()
+                self.__surface_break_return(
+                    now, "unlock showed the pending question again"
+                )
             return
         self.__record_break_return(now, previous)
 
@@ -4874,15 +5079,26 @@ class Wrike:
         except Exception:
             state = {"ok": False}
         if not bool(state.get("ok", False)):
+            self.__log_break_return(
+                "answer rejected; "
+                f"break_started={self.__break_return_stamp(started_at)} "
+                f"end_at={self.__break_return_stamp(end_at)} "
+                f"reason={state.get('message')}"
+            )
             if self.__active_manual_break_started_at(
                 self.__lib.datetime.now()
             ) != started_at:
-                self.__break_return_prompt = None
+                self.__clear_break_return_prompt("its break is no longer active")
             self.__show_panel_action_error(
                 str(state.get("message") or "휴게를 종료하지 못했습니다.")
             )
             return False
         self.__break_return_prompt = None
+        self.__log_break_return(
+            "answered, break ended; "
+            f"break_started={self.__break_return_stamp(started_at)} "
+            f"end_at={self.__break_return_stamp(end_at)}"
+        )
         message = str(state.get("message") or "")
         root = self.__root
         if root is not None and message:
@@ -4895,6 +5111,7 @@ class Wrike:
     def __panel_break_return_accept(self, detected_time: str) -> None:
         pending = self.__pending_break_return(detected_time)
         if pending is None:
+            self.__log_break_return(f"answer expired; accept {detected_time}")
             self.__show_panel_action_error("휴게 복귀 알림이 만료되었습니다.")
             return
         self.__finish_break_return(pending["started_at"], pending["detected_at"])
@@ -4902,6 +5119,7 @@ class Wrike:
     def __panel_break_return_edit(self, detected_time: str, end_time: str) -> bool:
         pending = self.__pending_break_return(detected_time)
         if pending is None:
+            self.__log_break_return(f"answer expired; edit {detected_time}")
             self.__show_panel_action_error("휴게 복귀 알림이 만료되었습니다.")
             return False
         try:
@@ -4929,7 +5147,7 @@ class Wrike:
         return self.__finish_break_return(started_at, end_at)
 
     def __panel_break_return_keep(self) -> None:
-        self.__break_return_prompt = None
+        self.__clear_break_return_prompt("answered, break kept")
 
     def __on_worktime_activity(self, detected_at) -> None:
         if not self.__automatic_ui_allowed():
@@ -5173,7 +5391,7 @@ class Wrike:
         state = self.__worktime_state_store.toggle_manual_break()
         if bool(state.get("ok", False)):
             # Starting or ending a break by hand settles any pending return.
-            self.__break_return_prompt = None
+            self.__clear_break_return_prompt("break toggled by hand")
         message = str(state.get("message") or "")
         root = self.__root
         if root is not None and message:
