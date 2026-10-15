@@ -140,6 +140,9 @@ class WrikeDisabledLifecycleTest(unittest.TestCase):
         refresh.assert_not_called()
         self.tooltip_type.assert_called_once()
         self.assertEqual(self.tooltip_type.call_args.args[1], WRIKE_DISABLED_NOTICE)
+        # The notice must say where the switch is, on both screens that have it.
+        self.assertIn("대시보드", WRIKE_DISABLED_NOTICE)
+        self.assertIn("설정 탭", WRIKE_DISABLED_NOTICE)
         self.assertFalse(self.wrike._Wrike__active_tooltip_automatic)
 
     def test_reenabling_restores_manual_open(self):

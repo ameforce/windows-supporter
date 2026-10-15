@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -63,6 +63,12 @@ class _Panel:
 
     def is_visible(self):
         return self.visible
+
+    def toggle(self, **kwargs):
+        if self.visible:
+            self._hide()
+        else:
+            self._show(**kwargs)
 
 
 class EndManualBreakStoreTest(unittest.TestCase):
@@ -417,6 +423,90 @@ class BreakReturnPromptTest(unittest.TestCase):
 
         self.activity(_at(12, 32))
         self.assertEqual(self.panel.show.call_count, 2)
+
+    def test_display_count_is_paced_with_a_panel_that_closes_itself(self):
+        # Unlike the fake that stays open, a real panel closes after a few
+        # seconds: ten minutes of steady input shows the question once per
+        # pacing window, not on every input.
+        self._first_return()
+        for step in range(1, 21):
+            self.panel.visible = False
+            self.activity(_at(12, 30) + timedelta(seconds=30 * step))
+
+        self.assertEqual(self.panel.show.call_count, 6)
+
+    def test_input_inside_the_pacing_window_writes_no_log_lines(self):
+        self._first_return()
+        self.panel.visible = False
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            for second in range(5, 100, 5):
+                self.activity(_at(12, 30) + timedelta(seconds=second))
+
+        self.assertEqual([call.args[0] for call in log.call_args_list], [])
+        self.assertEqual(self.panel.show.call_count, 1)
+
+    def test_clock_moved_back_does_not_block_the_next_display(self):
+        self._first_return()
+        self.panel.visible = False
+        self.activity(_at(12, 32, 1))
+        self.assertEqual(self.panel.show.call_count, 2)
+
+        self.panel.visible = False
+        self.activity(_at(12, 30, 40))  # the system clock was set back
+        self.assertEqual(self.panel.show.call_count, 3)
+
+        self.panel.visible = False
+        self.activity(_at(12, 30, 50))  # pacing restarts from the new clock
+        self.assertEqual(self.panel.show.call_count, 3)
+
+    def test_panel_opened_by_hand_counts_as_seen(self):
+        self._first_return()
+        self.panel.visible = False
+        _Clock.current = _at(12, 31)
+
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh"):
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertTrue(self.panel.visible)
+        self.assertEqual(self.pending()["surfaced_at"], _at(12, 31))
+        self.panel.visible = False  # the user closed it again
+        self.activity(_at(12, 32, 30))  # 150 s after the first display
+        self.assertEqual(self.panel.show.call_count, 1)
+
+    def test_on_screen_decision_is_logged_once_per_pacing_window(self):
+        self._first_return()
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            for minute in (31, 34, 35, 38):  # the panel stays on screen
+                self.activity(_at(12, minute))
+
+        lines = [call.args[0] for call in log.call_args_list]
+        on_screen = [line for line in lines if "already on screen" in line]
+        self.assertEqual(len(on_screen), 2, lines)
+        self.assertEqual(self.panel.show.call_count, 1)
+
+    def test_exception_after_display_still_records_the_attempt(self):
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+
+        with (
+            patch.object(
+                self.wrike,
+                "_Wrike__request_timelog_snapshot_refresh",
+                side_effect=RuntimeError("refresh failed"),
+            ),
+            patch.object(self.wrike, "_Wrike__log") as log,
+        ):
+            with self.assertRaises(RuntimeError):
+                self.activity(_at(12, 30))
+
+        self.assertEqual(self.pending()["surfaced_at"], _at(12, 30))
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(
+            any("panel_shown=False" in line and "reason=raised:RuntimeError" in line for line in lines),
+            lines,
+        )
 
     def test_flow_steps_are_written_to_the_log(self):
         with patch.object(self.wrike, "_Wrike__log") as log:

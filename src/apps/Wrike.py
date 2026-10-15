@@ -136,7 +136,8 @@ FLEX_SYNC_DEFERRED_CODES = frozenset(
 BREAK_RETURN_RESURFACE_SECONDS = 120
 # Shown instead of the worktime window while Wrike is switched off.
 WRIKE_DISABLED_NOTICE = (
-    "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. 대시보드에서 Wrike를 활성화하세요."
+    "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. "
+    "대시보드나 Wrike 설정 탭에서 Wrike를 켜 주세요."
 )
 
 
@@ -693,6 +694,10 @@ class Wrike:
             return
         panel.toggle(activate=False)
         if panel.is_visible():
+            pending = self.__break_return_prompt
+            if isinstance(pending, dict):
+                # Opened by hand: the question was in front of the user.
+                pending["surfaced_at"] = self.__lib.datetime.now()
             self.__request_timelog_snapshot_refresh(force=True)
         return
 
@@ -4842,15 +4847,21 @@ class Wrike:
     def __surface_break_return(self, at, cause: str) -> bool:
         # One display attempt for the pending question. The attempt time paces
         # the repeated display whether or not a panel actually came up.
-        shown = self.__show_activity_panel()
-        pending = self.__break_return_prompt
-        if isinstance(pending, dict):
-            pending["surfaced_at"] = at
-        self.__log_break_return(
-            f"{cause}; panel_shown={shown} "
-            f"reason={self.__last_panel_surface_reason}"
-            f"{self.__break_return_panel_state()}"
-        )
+        shown = False
+        try:
+            shown = self.__show_activity_panel()
+        except Exception as exc:
+            self.__last_panel_surface_reason = f"raised:{type(exc).__name__}"
+            raise
+        finally:
+            pending = self.__break_return_prompt
+            if isinstance(pending, dict):
+                pending["surfaced_at"] = at
+            self.__log_break_return(
+                f"{cause}; panel_shown={shown} "
+                f"reason={self.__last_panel_surface_reason}"
+                f"{self.__break_return_panel_state()}"
+            )
         return shown
 
     def __clear_break_return_prompt(self, why: str) -> None:
@@ -4929,25 +4940,33 @@ class Wrike:
         if not isinstance(pending, dict):
             return
         surfaced_at = pending.get("surfaced_at")
+        due = True
         if isinstance(surfaced_at, datetime):
             elapsed = (detected_at - surfaced_at).total_seconds()
-            if 0 <= elapsed < BREAK_RETURN_RESURFACE_SECONDS:
-                return
-        started_at = self.__active_manual_break_started_at(detected_at)
-        if started_at is None or pending.get("started_at") != started_at:
-            self.__clear_break_return_prompt(
-                f"its break {self.__break_return_stamp(pending.get('started_at'))} "
-                "is no longer active"
-            )
-            return
+            due = not 0 <= elapsed < BREAK_RETURN_RESURFACE_SECONDS
         panel = self.__worktime_panel
         try:
             visible = bool(panel is not None and panel.is_visible())
         except Exception:
             visible = False
         if visible:
-            # The user is looking at it: count that as a display.
+            # The user is looking at it: count that as a display, so the
+            # pacing window starts from the last moment it was on screen.
             pending["surfaced_at"] = detected_at
+            if due:
+                self.__log_break_return(
+                    "pending question already on screen, counted as shown; "
+                    f"break_started={self.__break_return_stamp(pending.get('started_at'))}"
+                )
+            return
+        if not due:
+            return
+        started_at = self.__active_manual_break_started_at(detected_at)
+        if started_at is None or pending.get("started_at") != started_at:
+            self.__clear_break_return_prompt(
+                f"its break {self.__break_return_stamp(pending.get('started_at'))} "
+                "is no longer active"
+            )
             return
         self.__surface_break_return(
             detected_at,
