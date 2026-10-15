@@ -1,4 +1,7 @@
-"""Targeted native Tk acceptance for Wrike automatic-notification disable.
+"""Targeted native Tk acceptance for the Wrike disable switch.
+
+While disabled, automatic notices stop and the manual worktime window is not
+opened (a notice is shown instead); re-enabling restores both.
 
 Uses production settings/widgets/lifecycle with temporary APPDATA, no credentials,
 no network/browser, and a synthetic last-input source. Does not test deployment.
@@ -190,13 +193,11 @@ def run(output: Path, capture: bool) -> dict:
             check("direct automatic request rejected while disabled", not wrike._Wrike__show_activity_panel())
             wrike.show_weekly_timelog_summary(root)
             pump(root)
-            check("manual panel maps while disabled", visible() and not enabled(), mapped=visible(), runtime=enabled())
-            if capture:
-                from scripts.native_window_capture import capture_window
-                result["manual_panel_capture"] = capture_window(
-                    wrike._Wrike__worktime_panel._window, output / "manual-panel-disabled.png"
-                )
-            wrike._Wrike__worktime_panel.hide()
+            check("manual open is blocked while disabled", not visible() and not enabled(), mapped=visible(), runtime=enabled())
+            notice = wrike._Wrike__active_tooltip
+            check("blocked manual open explains why and is not automatic",
+                  notice is not None and not wrike._Wrike__active_tooltip_automatic)
+            notice.hide_tooltip()
             checkbox.invoke()
             check("reenable saved immediately", enabled() and disk_enabled() and view._monitor_enabled_var.get())
             root.after(1, lambda: old_watcher.callback(now))
@@ -207,13 +208,17 @@ def run(output: Path, capture: bool) -> dict:
             new_watcher.callback(now)
             pump(root)
             check("reenable restores eligible automatic display", visible(), mapped=visible())
+            wrike._Wrike__worktime_panel.hide()
+            wrike.show_weekly_timelog_summary(root)
+            pump(root)
+            check("manual open works again after reenable", visible(), mapped=visible())
 
             with patch.object(wrike, "_Wrike__save_settings", return_value=False):
                 checkbox.invoke()
             check("failed checkbox save reverts widget runtime and disk", enabled() and disk_enabled()
                   and view._monitor_enabled_var.get(), runtime=enabled(), disk=disk_enabled(),
                   checkbox=bool(view._monitor_enabled_var.get()), status=view._status_var.get())
-            check("failed disable preserves automatic panel", visible(), mapped=visible())
+            check("failed disable preserves open panel", visible(), mapped=visible())
             check("checkbox save failure shown", "저장 실패" in view._status_var.get())
 
             # A pending invalid draft must not prevent the dashboard toggle save.
@@ -244,6 +249,7 @@ def run(output: Path, capture: bool) -> dict:
             check("dashboard save failure exposed", "저장 실패" in ui._get_wrike_dashboard_status().get("settings_error", ""))
             check("no native Tk callback errors", not result["callback_errors"])
             if capture:
+                from scripts.native_window_capture import capture_window
                 result["settings_capture"] = capture_window(root, output / "settings-disabled.png")
             wrike.shutdown()
             wrike = None
