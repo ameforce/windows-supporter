@@ -1014,22 +1014,70 @@ class WrikeLogRotationTest(unittest.TestCase):
         self.assertEqual(len(lines), 2, lines)
         self.assertTrue(lines[1].endswith("] kept anyway"), lines)
 
-    def test_rotation_gets_the_line_size_while_the_log_lock_is_held(self):
+    def test_rotation_gets_the_size_the_line_takes_on_disk_under_the_log_lock(self):
         seen = []
 
         def spy(path, incoming_bytes):
             seen.append((path, incoming_bytes, wrike_module._WRIKE_LOG_LOCK.locked()))
 
         with patch("src.apps.Wrike.rotate_log_file", side_effect=spy):
-            self.wrike.log_info("한글 줄")
+            # Multi-byte text and an embedded newline: the text-mode write
+            # turns each newline into os.linesep.
+            self.wrike.log_info("한글\n둘째 줄")
 
         self.assertEqual(len(seen), 1, seen)
         path, incoming_bytes, locked = seen[0]
         self.assertEqual(Path(path), self.log_path)
         self.assertTrue(locked)
-        written = self.log_path.read_text(encoding="utf-8")
-        self.assertEqual(incoming_bytes, len(written.encode("utf-8")))
+        self.assertEqual(incoming_bytes, self.log_path.stat().st_size)
         self.assertFalse(wrike_module._WRIKE_LOG_LOCK.locked())
+
+    def test_line_is_appended_while_the_log_lock_is_held(self):
+        # A writer that appends outside the lock keeps the file open while
+        # another thread tries to rotate it.
+        opened = []
+        real_open = open
+
+        def spy_open(path, *args, **kwargs):
+            opened.append((Path(path), wrike_module._WRIKE_LOG_LOCK.locked()))
+            return real_open(path, *args, **kwargs)
+
+        with patch("src.apps.Wrike.open", side_effect=spy_open, create=True):
+            self.wrike.log_info("appended under the lock")
+
+        self.assertEqual(opened, [(self.log_path, True)])
+        self.assertIn("appended under the lock", self.log_path.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(os.name == "nt", "an open file is only refused a rename on Windows")
+    def test_log_held_open_by_another_program_keeps_backups_and_lines(self):
+        old = "x" * DEFAULT_MAX_LOG_BYTES
+        self.log_path.write_text(old, encoding="utf-8")
+        for index in (1, 2, 3):
+            self.backup(index).write_text(f"backup {index}", encoding="utf-8")
+
+        with self.log_path.open("rb"):
+            self.wrike.log_info("first while held")
+            self.wrike.log_info("second while held")
+
+        self.assertEqual(
+            [self.backup(index).read_text(encoding="utf-8") for index in (1, 2, 3)],
+            ["backup 1", "backup 2", "backup 3"],
+        )
+        text = self.log_path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(old), "the oversized log was not moved")
+        self.assertEqual(
+            [line.split("] ", 1)[-1] for line in text[len(old):].splitlines()],
+            ["first while held", "second while held"],
+        )
+
+        self.wrike.log_info("after the handle closed")
+
+        # The first free rotation shifts every backup exactly once.
+        self.assertEqual(self.backup(1).read_text(encoding="utf-8"), text)
+        self.assertEqual(self.backup(2).read_text(encoding="utf-8"), "backup 1")
+        self.assertEqual(self.backup(3).read_text(encoding="utf-8"), "backup 2")
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual([line.split("] ", 1)[-1] for line in lines], ["after the handle closed"])
 
 
 if __name__ == "__main__":

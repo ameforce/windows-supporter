@@ -10126,10 +10126,12 @@ class Wrike:
         try:
             with _WRIKE_LOG_LOCK:
                 try:
-                    # Same size cap and backups as runtime.jsonl. A rotation
-                    # that fails must not cost the line.
+                    # Same size cap and backups as runtime.jsonl. The size is
+                    # what the text-mode write puts on disk. A rotation that
+                    # fails must not cost the line.
                     rotate_log_file(
-                        self.__time_log_log_path, len(line.encode("utf-8"))
+                        self.__time_log_log_path,
+                        len(line.replace("\n", os.linesep).encode("utf-8")),
                     )
                 except Exception:
                     pass

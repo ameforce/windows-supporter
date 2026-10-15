@@ -46,8 +46,11 @@ def rotate_log_file(
 ) -> None:
     """Move a log that would pass ``max_log_bytes`` to ``<log>.1`` (``.2``...).
 
-    At most ``log_backups`` older files are kept. The caller owns locking and
-    decides what a failed rotation means for the record it is about to write.
+    At most ``log_backups`` older files are kept. The live log is set aside
+    before the backups are shifted, so a log that cannot be renamed (another
+    program holds it open) leaves every backup in place for the next try. The
+    caller owns locking and decides what a failed rotation means for the
+    record it is about to write.
     """
     path = Path(log_path)
     try:
@@ -59,12 +62,21 @@ def rotate_log_file(
     if log_backups <= 0:
         path.unlink(missing_ok=True)
         return
-    for index in range(log_backups, 1, -1):
-        older = Path(f"{path}.{index - 1}")
-        newer = Path(f"{path}.{index}")
-        if older.exists():
-            os.replace(older, newer)
-    os.replace(path, Path(f"{path}.1"))
+    staged = Path(f"{path}.rotating")
+    os.replace(path, staged)
+    try:
+        for index in range(log_backups, 1, -1):
+            older = Path(f"{path}.{index - 1}")
+            newer = Path(f"{path}.{index}")
+            if older.exists():
+                os.replace(older, newer)
+        os.replace(staged, Path(f"{path}.1"))
+    except BaseException:
+        try:
+            os.replace(staged, path)
+        except OSError:
+            pass
+        raise
 
 
 def is_main_runtime_invocation(argv: Sequence[str] | None = None) -> bool:

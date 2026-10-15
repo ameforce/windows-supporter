@@ -269,6 +269,65 @@ class RotateLogFileTest(unittest.TestCase):
         self.assertFalse(self.path.exists())
         self.assertFalse(self.backup(1).exists())
 
+    def _seed_backups(self) -> None:
+        self.path.write_bytes(b"live" * 30)
+        for index, content in ((1, b"one"), (2, b"two"), (3, b"three")):
+            self.backup(index).write_bytes(content)
+
+    def _assert_nothing_moved(self) -> None:
+        self.assertEqual(self.path.read_bytes(), b"live" * 30)
+        self.assertEqual(
+            [self.backup(index).read_bytes() for index in (1, 2, 3)],
+            [b"one", b"two", b"three"],
+        )
+        self.assertFalse(Path(f"{self.path}.rotating").exists())
+
+    def test_log_that_cannot_be_moved_leaves_the_backups_alone(self) -> None:
+        # A failed rotation is retried with every record; the backups must not
+        # be shifted by each attempt while the live log stays where it is.
+        self._seed_backups()
+        real_replace = os.replace
+
+        def refuse_live_log(source, target):
+            if Path(source) == self.path:
+                raise PermissionError("held open")
+            return real_replace(source, target)
+
+        with patch("src.utils.runtime_lifecycle.os.replace", side_effect=refuse_live_log):
+            for _attempt in range(3):
+                with self.assertRaises(PermissionError):
+                    rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        self._assert_nothing_moved()
+
+    def test_failed_backup_shift_puts_the_live_log_back(self) -> None:
+        self._seed_backups()
+        real_replace = os.replace
+
+        def refuse_first_backup(source, target):
+            if Path(source) == self.backup(1):
+                raise PermissionError("held open")
+            return real_replace(source, target)
+
+        with patch("src.utils.runtime_lifecycle.os.replace", side_effect=refuse_first_backup):
+            with self.assertRaises(PermissionError):
+                rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=2)
+
+        self.assertEqual(self.path.read_bytes(), b"live" * 30)
+        self.assertEqual(self.backup(1).read_bytes(), b"one")
+        self.assertFalse(Path(f"{self.path}.rotating").exists())
+
+    @unittest.skipUnless(os.name == "nt", "an open file is only refused a rename on Windows")
+    def test_log_held_open_by_another_handle_leaves_the_backups_alone(self) -> None:
+        self._seed_backups()
+
+        with self.path.open("rb"):
+            for _attempt in range(2):
+                with self.assertRaises(PermissionError):
+                    rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        self._assert_nothing_moved()
+
     def test_string_path_and_default_limits_are_accepted(self) -> None:
         self.path.write_bytes(b"a" * DEFAULT_MAX_LOG_BYTES)
 
