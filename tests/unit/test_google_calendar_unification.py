@@ -259,7 +259,7 @@ class GoogleCalendarUnificationTest(unittest.TestCase):
             wrike = Wrike()
             persisted_text = settings_path.read_text(encoding="utf-8")
             persisted = json.loads(persisted_text)
-            self.assertEqual(persisted["settings_version"], 9)
+            self.assertEqual(persisted["settings_version"], 10)
             self.assertIn("google_calendar_oauth_protected", persisted)
             self.assertNotIn("vacation_google_oauth_protected", persisted)
             self.assertNotIn("legacy-vacation-calendar", persisted_text)
@@ -811,7 +811,7 @@ class GoogleCalendarUnificationTest(unittest.TestCase):
             Wrike()
             migrated = json.loads(settings_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(migrated["settings_version"], 9)
+        self.assertEqual(migrated["settings_version"], 10)
         self.assertEqual(migrated["google_calendar_oauth_protected"], opaque)
         self.assertNotIn("vacation_google_oauth_protected", migrated)
 
