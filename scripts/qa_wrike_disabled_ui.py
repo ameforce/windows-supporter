@@ -218,7 +218,7 @@ def run(output: Path, capture: bool) -> dict:
             check("failed checkbox save reverts widget runtime and disk", enabled() and disk_enabled()
                   and view._monitor_enabled_var.get(), runtime=enabled(), disk=disk_enabled(),
                   checkbox=bool(view._monitor_enabled_var.get()), status=view._status_var.get())
-            check("failed disable preserves automatic panel", visible(), mapped=visible())
+            check("failed disable preserves open panel", visible(), mapped=visible())
             check("checkbox save failure shown", "저장 실패" in view._status_var.get())
 
             # A pending invalid draft must not prevent the dashboard toggle save.

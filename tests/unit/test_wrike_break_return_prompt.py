@@ -498,6 +498,74 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.activity(_at(12, 32, 30))  # 150 s after the first display
         self.assertEqual(self.panel.show.call_count, 1)
 
+    def test_hotkey_in_the_moment_of_the_resurface_keeps_the_panel(self):
+        # The watcher raises the question for a key chord and the hotkey task
+        # of the same chord runs right after: the toggle must not hide it.
+        self._first_return()
+        self.panel.visible = False  # closed itself unanswered
+        self.activity(_at(12, 33))
+        self.assertTrue(self.panel.visible)
+        self.assertEqual(self.panel.show.call_count, 2)
+
+        _Clock.current = _at(12, 33) + timedelta(milliseconds=300)
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertTrue(self.panel.visible)
+        self.assertEqual(self.panel.show.call_count, 2)
+        self.assertEqual(self.pending()["surfaced_at"], _Clock.current)
+        refresh.assert_called_once_with(force=True)
+
+    def test_hotkey_after_the_grace_window_toggles_the_panel_away(self):
+        self._first_return()
+        self.panel.visible = False
+        self.activity(_at(12, 33))
+        self.assertTrue(self.panel.visible)
+
+        _Clock.current = _at(12, 33, 3)  # seen first, then closed by the hotkey
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertFalse(self.panel.visible)
+        refresh.assert_not_called()
+
+    def test_hotkey_inside_the_window_still_opens_a_hidden_panel(self):
+        self._first_return()  # raised at 12:30:00
+        self.panel.visible = False  # gone again
+        _Clock.current = _at(12, 30) + timedelta(milliseconds=500)
+
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh"):
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertTrue(self.panel.visible)
+
+    def test_hotkey_before_the_watcher_leaves_one_open_panel(self):
+        self._first_return()
+        self.panel.visible = False  # closed itself unanswered
+        _Clock.current = _at(12, 33)
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh"):
+            self.wrike.show_weekly_timelog_summary(self.root)
+        self.assertTrue(self.panel.visible)
+
+        self.activity(_at(12, 33))  # the watcher notices the same chord later
+
+        self.assertTrue(self.panel.visible)
+        self.assertEqual(self.panel.show.call_count, 1)
+
+    def test_steady_input_on_screen_leaves_no_card_for_a_finished_break(self):
+        # While the panel stays up and input never pauses, the pacing window
+        # keeps moving, so the stale question is only cleared later. It must
+        # not reach the screen: the card follows the break, not the question.
+        self._first_return()
+        self.assertTrue(self.store.end_manual_break(_at(12, 31), now=_at(12, 31))["ok"])
+
+        for step in range(1, 11):
+            self.activity(_at(12, 30) + timedelta(seconds=30 * step))
+
+        self.assertIsNotNone(self.pending())
+        self.assertIsNone(self.visible_prompt())
+        self.assertEqual(self.panel.show.call_count, 1)
+
     def test_on_screen_decision_is_logged_once_per_pacing_window(self):
         self._first_return()
 
@@ -602,6 +670,72 @@ class BreakReturnPromptTest(unittest.TestCase):
         lines = [call.args[0] for call in log.call_args_list]
         self.assertTrue(any("activity watcher unavailable" in line for line in lines), lines)
         self.assertIsNone(self.wrike._Wrike__activity_watcher)
+
+    def test_watcher_that_cannot_poll_after_start_is_logged(self):
+        # start() swallows a polling schedule that Tk refused and leaves the
+        # watcher not running; that is a start failure too.
+        self.watcher_type.return_value.is_running = False
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(
+            any("activity watcher start failed: not running" in line for line in lines), lines
+        )
+
+    def test_running_watcher_does_not_log_a_start_failure(self):
+        self.watcher_type.return_value.is_running = True
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertFalse(any("start failed" in line for line in lines), lines)
+
+    def test_answer_that_ends_the_break_is_logged(self):
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        self.activity(_at(12, 40))
+        _Clock.current = _at(12, 47)
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__panel_break_return_accept("12:40")
+
+        lines = [call.args[0] for call in log.call_args_list]
+        ended = [line for line in lines if "answered, break ended" in line]
+        self.assertEqual(len(ended), 1, lines)
+        self.assertIn("end_at=2026-04-06T12:40:00", ended[0])
+        self.assertIsNone(self.pending())
+
+    def test_manual_toggle_logs_why_the_question_is_cleared(self):
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        self.activity(_at(12, 30))
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.start_break(_at(12, 31))  # toggles the running break off
+
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(
+            any("question cleared; break toggled by hand" in line for line in lines), lines
+        )
+        self.assertIsNone(self.pending())
+
+    def test_disabling_logs_why_the_question_is_cleared(self):
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        self.activity(_at(12, 30))
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            ok, error = self.wrike.update_settings({"monitor_enabled": False})
+
+        self.assertTrue(ok, error)
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(
+            any("question cleared; automatic UI stopped" in line for line in lines), lines
+        )
+        self.assertIsNone(self.pending())
 
     def test_brief_input_then_absence_moves_return_to_later_input(self):
         # A stray input (or the lock keystroke) after idling is followed by

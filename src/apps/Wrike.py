@@ -134,6 +134,10 @@ FLEX_SYNC_DEFERRED_CODES = frozenset(
 # break-return question that was not answered must not depend on that single
 # display. It is shown again on later input, but not more often than this.
 BREAK_RETURN_RESURFACE_SECONDS = 120
+# The input watcher and a hotkey answer the same key chord. A manual open that
+# arrives this soon after the question was raised keeps the panel instead of
+# toggling it away.
+BREAK_RETURN_HOTKEY_GRACE_SECONDS = 1.5
 # Shown instead of the worktime window while Wrike is switched off.
 WRIKE_DISABLED_NOTICE = (
     "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. "
@@ -265,6 +269,9 @@ class Wrike:
         # (BREAK_RETURN_RESURFACE_SECONDS).
         self.__last_worktime_activity_at = None
         self.__break_return_prompt = None
+        # Input time at which the question last raised the panel; a manual
+        # open right after it keeps the panel (BREAK_RETURN_HOTKEY_GRACE_SECONDS).
+        self.__break_return_raised_at = None
         # Why the latest automatic panel request did or did not show a panel.
         self.__last_panel_surface_reason = ""
         # Lifecycle generation whose dropped activity callbacks were already
@@ -692,7 +699,8 @@ class Wrike:
         panel = self.__ensure_worktime_panel(root)
         if panel is None:
             return
-        panel.toggle(activate=False)
+        if not self.__break_return_panel_just_raised(panel):
+            panel.toggle(activate=False)
         if panel.is_visible():
             pending = self.__break_return_prompt
             if isinstance(pending, dict):
@@ -912,6 +920,12 @@ class Wrike:
         except Exception as exc:
             self.__log_exception("activity watcher start failed", exc)
             return
+        if getattr(watcher, "is_running", True) is False:
+            # start() swallows a polling schedule that Tk refused.
+            self.__log(
+                "activity watcher start failed: not running after start, "
+                f"generation={self.__automatic_ui_generation}"
+            )
         if self.__last_worktime_activity_at is None:
             # Measure an absence from the moment input could first be
             # observed. A manual break still running at start (e.g. left on
@@ -4844,6 +4858,22 @@ class Wrike:
         except Exception:
             return ""
 
+    def __break_return_panel_just_raised(self, panel) -> bool:
+        # A hotkey and the input watcher react to the same key chord, in
+        # either order. When the watcher raised the question a moment ago the
+        # user is asking to see it, so a toggle would hide what was just shown.
+        raised_at = self.__break_return_raised_at
+        if not isinstance(raised_at, datetime):
+            return False
+        try:
+            elapsed = (self.__lib.datetime.now() - raised_at).total_seconds()
+            return bool(
+                0 <= elapsed < BREAK_RETURN_HOTKEY_GRACE_SECONDS
+                and panel.is_visible()
+            )
+        except Exception:
+            return False
+
     def __surface_break_return(self, at, cause: str) -> bool:
         # One display attempt for the pending question. The attempt time paces
         # the repeated display whether or not a panel actually came up.
@@ -4857,6 +4887,8 @@ class Wrike:
             pending = self.__break_return_prompt
             if isinstance(pending, dict):
                 pending["surfaced_at"] = at
+            if shown:
+                self.__break_return_raised_at = at
             self.__log_break_return(
                 f"{cause}; panel_shown={shown} "
                 f"reason={self.__last_panel_surface_reason}"

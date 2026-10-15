@@ -863,6 +863,23 @@ class WorktimeQuickPanelTests(unittest.TestCase):
         self.assertFalse(hidden["visible"])
         self.assertFalse(hidden["mapped"])
 
+    def test_describe_state_does_not_touch_the_dismiss_timer(self) -> None:
+        root = _FakeRoot()
+        fake_tk = _FakeTk()
+        holder = {"model": _model()}
+        panel, _provider, _callbacks = _make_panel(root, fake_tk, holder)
+        self.assertTrue(panel.show(activate=False))
+        delays = root.active_delays()
+        dismiss_id = root.active_id(6_000)
+        cancels = list(root.after_cancel_calls)
+
+        panel.describe_state()
+        panel.describe_state()
+
+        self.assertEqual(root.active_delays(), delays)
+        self.assertEqual(root.active_id(6_000), dismiss_id)
+        self.assertEqual(root.after_cancel_calls, cancels)
+
     def test_equal_model_returns_before_assignment_or_any_render_path(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()
