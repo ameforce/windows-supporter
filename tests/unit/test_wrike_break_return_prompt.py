@@ -560,6 +560,18 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.assertEqual(self.panel.show.call_count, 1)
         refresh.assert_called_once_with(force=True)
 
+    def test_hotkey_with_the_clock_set_back_before_the_raise_toggles(self):
+        # A clock set back puts "now" before the raise. That is not "just
+        # after" it, so the open is a plain toggle that hides the panel.
+        self._first_return()  # raised at 12:30:00 and on screen
+        _Clock.current = _at(12, 29, 59)
+
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertFalse(self.panel.visible)
+        refresh.assert_not_called()
+
     def _direct_open_after(self, answer):
         # Raise the question, answer it a moment later, then open by hand
         # inside what used to be the grace window.
@@ -729,6 +741,35 @@ class BreakReturnPromptTest(unittest.TestCase):
         lines = [call.args[0] for call in log.call_args_list]
         self.assertTrue(any("activity watcher unavailable" in line for line in lines), lines)
         self.assertIsNone(self.wrike._Wrike__activity_watcher)
+
+    def test_unexpected_watcher_creation_failure_is_logged_once(self):
+        # Only OSError, ValueError and LastInputUnavailableError mean "no input
+        # source here"; anything else is a creation failure and is named so.
+        self.watcher_type.side_effect = RuntimeError("tk refused")
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        failed = [line for line in lines if line.startswith("activity watcher creation failed:")]
+        self.assertEqual(len(failed), 1, lines)
+        self.assertIn("RuntimeError('tk refused')", failed[0])
+        self.assertFalse(any("activity watcher unavailable" in line for line in lines), lines)
+        self.assertIsNone(self.wrike._Wrike__activity_watcher)
+        self.watcher_type.return_value.start.assert_not_called()
+
+    def test_watcher_start_exception_is_logged_once(self):
+        self.watcher_type.return_value.start.side_effect = RuntimeError("poll refused")
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        failed = [line for line in lines if line.startswith("activity watcher start failed:")]
+        self.assertEqual(len(failed), 1, lines)
+        self.assertIn("RuntimeError('poll refused')", failed[0])
+        self.assertFalse(any("not running after start" in line for line in lines), lines)
+        self.watcher_type.return_value.start.assert_called_once_with()
 
     def test_watcher_that_cannot_poll_after_start_is_logged(self):
         # start() swallows a polling schedule that Tk refused and leaves the
