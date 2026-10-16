@@ -317,6 +317,62 @@ class RotateLogFileTest(unittest.TestCase):
         self.assertEqual(self.backup(1).read_bytes(), b"one")
         self.assertFalse(Path(f"{self.path}.rotating").exists())
 
+    def test_failed_last_move_does_not_cost_another_backup_on_retry(self) -> None:
+        self._seed_backups()
+        staged = Path(f"{self.path}.rotating")
+        real_replace = os.replace
+        refusals = []
+
+        def refuse_last_move_once(source, target):
+            if Path(source) == staged and Path(target) == self.backup(1) and not refusals:
+                refusals.append(target)
+                raise PermissionError("held open")
+            return real_replace(source, target)
+
+        with patch("src.utils.runtime_lifecycle.os.replace", side_effect=refuse_last_move_once):
+            with self.assertRaises(PermissionError):
+                rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+            self.assertEqual(self.path.read_bytes(), b"live" * 30)
+            rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        # The oldest backup went out with the first attempt, as in any rotation;
+        # the retry only had to fill the free first slot.
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.backup(1).read_bytes(), b"live" * 30)
+        self.assertEqual(self.backup(2).read_bytes(), b"one")
+        self.assertEqual(self.backup(3).read_bytes(), b"two")
+        self.assertFalse(staged.exists())
+
+    def test_log_set_aside_by_an_interrupted_rotation_becomes_a_backup(self) -> None:
+        # The process ended after the live log was renamed: the file is the
+        # newest backup candidate and the next rotation must not overwrite it.
+        staged = Path(f"{self.path}.rotating")
+        staged.write_bytes(b"interrupted")
+        self.path.write_bytes(b"live" * 30)
+        self.backup(1).write_bytes(b"one")
+        self.backup(2).write_bytes(b"two")
+
+        rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        self.assertFalse(self.path.exists())
+        self.assertFalse(staged.exists())
+        self.assertEqual(self.backup(1).read_bytes(), b"live" * 30)
+        self.assertEqual(self.backup(2).read_bytes(), b"interrupted")
+        self.assertEqual(self.backup(3).read_bytes(), b"one")
+
+    def test_interrupted_rotation_without_backups_is_finished_first(self) -> None:
+        # A restore that failed leaves only the staged file; the next record
+        # creates a new live log which then grows past the cap.
+        staged = Path(f"{self.path}.rotating")
+        staged.write_bytes(b"interrupted")
+        self.path.write_bytes(b"new" * 40)
+
+        rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=2)
+
+        self.assertEqual(self.backup(1).read_bytes(), b"new" * 40)
+        self.assertEqual(self.backup(2).read_bytes(), b"interrupted")
+        self.assertFalse(staged.exists())
+
     @unittest.skipUnless(os.name == "nt", "an open file is only refused a rename on Windows")
     def test_log_held_open_by_another_handle_leaves_the_backups_alone(self) -> None:
         self._seed_backups()

@@ -37,6 +37,18 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _make_room_for_first_backup(path: Path, log_backups: int) -> None:
+    # Nothing to shift while ``.1`` is free: a retry after a failed last move
+    # must not push the remaining backups out one more time.
+    if not Path(f"{path}.1").exists():
+        return
+    for index in range(log_backups, 1, -1):
+        older = Path(f"{path}.{index - 1}")
+        newer = Path(f"{path}.{index}")
+        if older.exists():
+            os.replace(older, newer)
+
+
 def rotate_log_file(
     log_path: Path | str,
     incoming_bytes: int,
@@ -47,10 +59,12 @@ def rotate_log_file(
     """Move a log that would pass ``max_log_bytes`` to ``<log>.1`` (``.2``...).
 
     At most ``log_backups`` older files are kept. The live log is set aside
-    before the backups are shifted, so a log that cannot be renamed (another
-    program holds it open) leaves every backup in place for the next try. The
-    caller owns locking and decides what a failed rotation means for the
-    record it is about to write.
+    as ``<log>.rotating`` before the backups are shifted, so a log that cannot
+    be renamed (another program holds it open) leaves every backup in place
+    for the next try. A ``.rotating`` file that an earlier rotation left behind
+    (the process ended, or putting the log back failed) is moved into the
+    backups first instead of being overwritten. The caller owns locking and
+    decides what a failed rotation means for the record it is about to write.
     """
     path = Path(log_path)
     try:
@@ -62,15 +76,15 @@ def rotate_log_file(
     if log_backups <= 0:
         path.unlink(missing_ok=True)
         return
+    first_backup = Path(f"{path}.1")
     staged = Path(f"{path}.rotating")
+    if staged.exists():
+        _make_room_for_first_backup(path, log_backups)
+        os.replace(staged, first_backup)
     os.replace(path, staged)
     try:
-        for index in range(log_backups, 1, -1):
-            older = Path(f"{path}.{index - 1}")
-            newer = Path(f"{path}.{index}")
-            if older.exists():
-                os.replace(older, newer)
-        os.replace(staged, Path(f"{path}.1"))
+        _make_room_for_first_backup(path, log_backups)
+        os.replace(staged, first_backup)
     except BaseException:
         try:
             os.replace(staged, path)
