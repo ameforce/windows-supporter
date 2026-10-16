@@ -657,19 +657,24 @@ class BreakReturnPromptTest(unittest.TestCase):
             [call(force=True), call(force=False)],
         )
 
-    def test_unlock_display_of_an_open_panel_does_not_start_a_grace(self):
-        # Only the display that brought a hidden panel up is a raise.
+    def test_unlock_display_of_an_open_panel_leaves_the_earlier_raise_as_it_was(self):
+        # Only the display that brought a hidden panel up is a raise. Showing
+        # the question again on the open panel neither writes nor clears it.
         self.start_break(_at(12, 0))
         self.activity(_at(12, 0, 1))
-        self.unlock(_at(12, 45))
-        self.assertIsNotNone(self.wrike._Wrike__break_return_raised_at)
-        self.wrike._Wrike__break_return_raised_at = None
+        self.unlock(_at(12, 45))  # raises the question on the hidden panel
+        self.assertEqual(self.wrike._Wrike__break_return_raised_at, _at(12, 45))
         self.assertTrue(self.panel.visible)
 
         self.unlock(_at(12, 45, 1))  # shown again while it is still open
 
         self.assertEqual(self.panel.show.call_count, 2)
-        self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+        self.assertEqual(self.wrike._Wrike__break_return_raised_at, _at(12, 45))
+        # The grace belongs to the raise 1.6 s ago, which is over.
+        _Clock.current = _at(12, 45) + timedelta(milliseconds=1600)
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh"):
+            self.wrike.show_weekly_timelog_summary(self.root)
+        self.assertFalse(self.panel.visible)
 
     def test_panel_that_cannot_be_asked_is_taken_as_hidden(self):
         # A failing visibility check must not cost the grace of a real raise.

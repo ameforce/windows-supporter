@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import io
 import json
 import os
@@ -1554,16 +1554,24 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self._query_authoritative_week(wrike)
         self.assertEqual(len(self._authoritative_log_lines()), 2)
 
-    def test_authoritative_line_is_written_again_after_a_failed_refresh(self) -> None:
+    def test_authoritative_line_is_written_when_the_interval_cannot_be_computed(self) -> None:
+        # A time that cannot be compared with the last one is not "recent".
+        wrike = self._new_wrike()
+        self._query_authoritative_week(wrike)
+
+        _FrozenDateTime.current = datetime(2026, 4, 6, 9, 0, 5, tzinfo=timezone.utc)
+        self._query_authoritative_week(wrike)
+
+        self.assertEqual(len(self._authoritative_log_lines()), 2)
+
+    def _run_refresh_sequence(self, answers: list, identities: list) -> None:
+        # Four refreshes five seconds apart; Wrike answers as listed.
         wrike = self._new_wrike()
         wrike._Wrike__root = _FakeRoot()
         wrike._Wrike__background_active = True
         wrike._Wrike__wrike_api_token_session = "token"
-        wrike._Wrike__resolve_contact_identity = Mock(
-            return_value=("contact", "Integration User", None)
-        )
-        ok = {"data": [{"id": "a", "trackedDate": "2026-04-06", "hours": 1}]}
-        wrike._Wrike__api_get_json = Mock(side_effect=[ok, None, ok, ok])
+        wrike._Wrike__resolve_contact_identity = Mock(side_effect=identities)
+        wrike._Wrike__api_get_json = Mock(side_effect=answers)
 
         for step in range(4):
             _FrozenDateTime.current = datetime(2026, 4, 6, 9, 0, 5 * step)
@@ -1572,10 +1580,47 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             _FakeThread.created[-1].target()
             wrike._Wrike__drain_ui_queue()
 
-        # ok, failed, ok again right after the failure, then unchanged.
+    def test_authoritative_line_is_written_again_after_a_failed_refresh(self) -> None:
+        ok = {"data": [{"id": "a", "trackedDate": "2026-04-06", "hours": 1}]}
+        identity = ("contact", "Integration User", None)
+
+        # ok, Wrike answers with an error, ok again right after it, then unchanged.
+        self._run_refresh_sequence([ok, None, ok, ok], [identity] * 4)
+
         self.assertEqual(
             self._authoritative_log_lines(),
             ["authoritative contact timelogs: 1 entries, 1 pages"] * 2,
+        )
+
+    def test_authoritative_line_is_written_again_after_a_contact_failure(self) -> None:
+        ok = {"data": [{"id": "a", "trackedDate": "2026-04-06", "hours": 1}]}
+        identity = ("contact", "Integration User", None)
+        no_contact = (None, None, "contact_not_found")
+
+        # The second refresh finds no contact and makes no timelog request.
+        self._run_refresh_sequence([ok, ok, ok], [identity, no_contact, identity, identity])
+
+        self.assertEqual(
+            self._authoritative_log_lines(),
+            ["authoritative contact timelogs: 1 entries, 1 pages"] * 2,
+        )
+
+    def test_authoritative_line_is_written_again_after_a_refresh_that_raised(self) -> None:
+        ok = {"data": [{"id": "a", "trackedDate": "2026-04-06", "hours": 1}]}
+        identity = ("contact", "Integration User", None)
+
+        self._run_refresh_sequence(
+            [ok, RuntimeError("unreadable answer"), ok, ok],
+            [identity] * 4,
+        )
+
+        self.assertEqual(
+            self._authoritative_log_lines(),
+            ["authoritative contact timelogs: 1 entries, 1 pages"] * 2,
+        )
+        self.assertIn(
+            "authoritative timelog refresh failed: RuntimeError('unreadable answer')",
+            self._wrike_log_lines(),
         )
 
     def test_authoritative_failures_are_logged_every_time(self) -> None:
