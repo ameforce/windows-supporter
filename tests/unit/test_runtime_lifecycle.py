@@ -8,11 +8,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.utils.runtime_lifecycle import (
+    DEFAULT_LOG_BACKUPS,
+    DEFAULT_MAX_LOG_BYTES,
     PROBE_PATH_ENV,
     PROBE_TOKEN_ENV,
     RuntimeLifecycle,
     RuntimeProbeError,
     is_main_runtime_invocation,
+    rotate_log_file,
 )
 
 
@@ -218,6 +221,176 @@ class RuntimeLifecycleTest(unittest.TestCase):
             self.assertTrue(lifecycle.log_path.exists())
             self.assertTrue(lifecycle.log_path.with_suffix(".jsonl.1").exists())
             self.assertFalse(lifecycle.log_path.with_suffix(".jsonl.3").exists())
+
+
+class RotateLogFileTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "service.log"
+
+    def backup(self, index: int) -> Path:
+        return Path(f"{self.path}.{index}")
+
+    def test_defaults_match_the_runtime_log_policy(self) -> None:
+        self.assertEqual(DEFAULT_MAX_LOG_BYTES, 2 * 1024 * 1024)
+        self.assertEqual(DEFAULT_LOG_BACKUPS, 3)
+
+    def test_record_that_fits_leaves_the_log_in_place(self) -> None:
+        self.path.write_bytes(b"a" * 90)
+
+        rotate_log_file(self.path, 10, max_log_bytes=100, log_backups=2)
+
+        self.assertEqual(self.path.read_bytes(), b"a" * 90)
+        self.assertFalse(self.backup(1).exists())
+
+    def test_overflowing_record_moves_the_log_and_keeps_bounded_backups(self) -> None:
+        for generation in (b"a", b"b", b"c", b"d"):
+            self.path.write_bytes(generation * 100)
+
+            rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=2)
+
+            self.assertFalse(self.path.exists())
+        self.assertEqual(self.backup(1).read_bytes(), b"d" * 100)
+        self.assertEqual(self.backup(2).read_bytes(), b"c" * 100)
+        self.assertFalse(self.backup(3).exists())
+
+    def test_missing_log_is_not_an_error(self) -> None:
+        rotate_log_file(self.path, 10, max_log_bytes=1, log_backups=2)
+
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.backup(1).exists())
+
+    def test_zero_backups_drop_the_overflowing_log(self) -> None:
+        self.path.write_bytes(b"a" * 100)
+
+        rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=0)
+
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.backup(1).exists())
+
+    def _seed_backups(self) -> None:
+        self.path.write_bytes(b"live" * 30)
+        for index, content in ((1, b"one"), (2, b"two"), (3, b"three")):
+            self.backup(index).write_bytes(content)
+
+    def _assert_nothing_moved(self) -> None:
+        self.assertEqual(self.path.read_bytes(), b"live" * 30)
+        self.assertEqual(
+            [self.backup(index).read_bytes() for index in (1, 2, 3)],
+            [b"one", b"two", b"three"],
+        )
+        self.assertFalse(Path(f"{self.path}.rotating").exists())
+
+    def test_log_that_cannot_be_moved_leaves_the_backups_alone(self) -> None:
+        # A failed rotation is retried with every record; the backups must not
+        # be shifted by each attempt while the live log stays where it is.
+        self._seed_backups()
+        real_replace = os.replace
+
+        def refuse_live_log(source, target):
+            if Path(source) == self.path:
+                raise PermissionError("held open")
+            return real_replace(source, target)
+
+        with patch("src.utils.runtime_lifecycle.os.replace", side_effect=refuse_live_log):
+            for _attempt in range(3):
+                with self.assertRaises(PermissionError):
+                    rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        self._assert_nothing_moved()
+
+    def test_failed_backup_shift_puts_the_live_log_back(self) -> None:
+        self._seed_backups()
+        real_replace = os.replace
+
+        def refuse_first_backup(source, target):
+            if Path(source) == self.backup(1):
+                raise PermissionError("held open")
+            return real_replace(source, target)
+
+        with patch("src.utils.runtime_lifecycle.os.replace", side_effect=refuse_first_backup):
+            with self.assertRaises(PermissionError):
+                rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=2)
+
+        self.assertEqual(self.path.read_bytes(), b"live" * 30)
+        self.assertEqual(self.backup(1).read_bytes(), b"one")
+        self.assertFalse(Path(f"{self.path}.rotating").exists())
+
+    def test_failed_last_move_does_not_cost_another_backup_on_retry(self) -> None:
+        self._seed_backups()
+        staged = Path(f"{self.path}.rotating")
+        real_replace = os.replace
+        refusals = []
+
+        def refuse_last_move_once(source, target):
+            if Path(source) == staged and Path(target) == self.backup(1) and not refusals:
+                refusals.append(target)
+                raise PermissionError("held open")
+            return real_replace(source, target)
+
+        with patch("src.utils.runtime_lifecycle.os.replace", side_effect=refuse_last_move_once):
+            with self.assertRaises(PermissionError):
+                rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+            self.assertEqual(self.path.read_bytes(), b"live" * 30)
+            rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        # The oldest backup went out with the first attempt, as in any rotation;
+        # the retry only had to fill the free first slot.
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.backup(1).read_bytes(), b"live" * 30)
+        self.assertEqual(self.backup(2).read_bytes(), b"one")
+        self.assertEqual(self.backup(3).read_bytes(), b"two")
+        self.assertFalse(staged.exists())
+
+    def test_log_set_aside_by_an_interrupted_rotation_becomes_a_backup(self) -> None:
+        # The process ended after the live log was renamed: the file is the
+        # newest backup candidate and the next rotation must not overwrite it.
+        staged = Path(f"{self.path}.rotating")
+        staged.write_bytes(b"interrupted")
+        self.path.write_bytes(b"live" * 30)
+        self.backup(1).write_bytes(b"one")
+        self.backup(2).write_bytes(b"two")
+
+        rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        self.assertFalse(self.path.exists())
+        self.assertFalse(staged.exists())
+        self.assertEqual(self.backup(1).read_bytes(), b"live" * 30)
+        self.assertEqual(self.backup(2).read_bytes(), b"interrupted")
+        self.assertEqual(self.backup(3).read_bytes(), b"one")
+
+    def test_interrupted_rotation_without_backups_is_finished_first(self) -> None:
+        # A restore that failed leaves only the staged file; the next record
+        # creates a new live log which then grows past the cap.
+        staged = Path(f"{self.path}.rotating")
+        staged.write_bytes(b"interrupted")
+        self.path.write_bytes(b"new" * 40)
+
+        rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=2)
+
+        self.assertEqual(self.backup(1).read_bytes(), b"new" * 40)
+        self.assertEqual(self.backup(2).read_bytes(), b"interrupted")
+        self.assertFalse(staged.exists())
+
+    @unittest.skipUnless(os.name == "nt", "an open file is only refused a rename on Windows")
+    def test_log_held_open_by_another_handle_leaves_the_backups_alone(self) -> None:
+        self._seed_backups()
+
+        with self.path.open("rb"):
+            for _attempt in range(2):
+                with self.assertRaises(PermissionError):
+                    rotate_log_file(self.path, 1, max_log_bytes=100, log_backups=3)
+
+        self._assert_nothing_moved()
+
+    def test_string_path_and_default_limits_are_accepted(self) -> None:
+        self.path.write_bytes(b"a" * DEFAULT_MAX_LOG_BYTES)
+
+        rotate_log_file(str(self.path), 1)
+
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.backup(1).stat().st_size, DEFAULT_MAX_LOG_BYTES)
 
 
 if __name__ == "__main__":
