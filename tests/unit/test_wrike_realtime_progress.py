@@ -1434,6 +1434,180 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(snapshot.recorded_minutes_for(date(2026, 4, 6)), 0)
         self.assertEqual(get_json.call_count, 1)
 
+    def _query_authoritative_week(
+        self,
+        wrike: Wrike,
+        *,
+        entries: int = 1,
+        pages: tuple[dict, ...] | None = None,
+    ) -> None:
+        payloads = list(pages) if pages is not None else [
+            {
+                "data": [
+                    {"id": f"log-{index}", "trackedDate": "2026-04-06", "hours": 1}
+                    for index in range(entries)
+                ]
+            }
+        ]
+        with patch.object(wrike, "_Wrike__api_get_json", side_effect=payloads):
+            _items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                "token",
+                "contact",
+                self._week_datetimes(),
+            )
+        self.assertIsNone(error)
+
+    def _authoritative_log_lines(self) -> list[str]:
+        return [
+            line
+            for line in self._wrike_log_lines()
+            if line.startswith("authoritative contact timelogs:")
+        ]
+
+    def test_unchanged_authoritative_result_is_logged_once_per_repeat_interval(self) -> None:
+        # The monitor reads Wrike every 5 s; the unchanged line is a heartbeat.
+        wrike = self._new_wrike()
+        start = datetime(2026, 4, 6, 9, 0)
+        for offset in (0, 5, 10, 150, 299):
+            _FrozenDateTime.current = start + timedelta(seconds=offset)
+            self._query_authoritative_week(wrike)
+        self.assertEqual(
+            self._authoritative_log_lines(),
+            ["authoritative contact timelogs: 1 entries, 1 pages"],
+        )
+
+        _FrozenDateTime.current = start + timedelta(seconds=300)
+        self._query_authoritative_week(wrike)
+        self.assertEqual(len(self._authoritative_log_lines()), 2)
+
+        # The interval is counted from the line that was written last.
+        _FrozenDateTime.current = start + timedelta(seconds=599)
+        self._query_authoritative_week(wrike)
+        self.assertEqual(len(self._authoritative_log_lines()), 2)
+        _FrozenDateTime.current = start + timedelta(seconds=600)
+        self._query_authoritative_week(wrike)
+        self.assertEqual(len(self._authoritative_log_lines()), 3)
+
+    def test_changed_authoritative_result_is_logged_at_once(self) -> None:
+        wrike = self._new_wrike()
+        start = datetime(2026, 4, 6, 9, 0)
+        for offset, entries in ((0, 1), (5, 2), (10, 2), (15, 1)):
+            _FrozenDateTime.current = start + timedelta(seconds=offset)
+            self._query_authoritative_week(wrike, entries=entries)
+
+        # Only the latest line counts: 1 entries again differs from 2 entries.
+        self.assertEqual(
+            self._authoritative_log_lines(),
+            [
+                "authoritative contact timelogs: 1 entries, 1 pages",
+                "authoritative contact timelogs: 2 entries, 1 pages",
+                "authoritative contact timelogs: 1 entries, 1 pages",
+            ],
+        )
+
+    def test_pages_and_announced_total_are_part_of_the_authoritative_result(self) -> None:
+        wrike = self._new_wrike()
+        entry = {"id": "a", "trackedDate": "2026-04-06", "hours": 1}
+        self._query_authoritative_week(wrike, pages=({"data": [entry]},))
+        self._query_authoritative_week(
+            wrike,
+            pages=(
+                {"data": [entry], "nextPageToken": "page-2"},
+                {"data": []},
+            ),
+        )
+        self._query_authoritative_week(
+            wrike,
+            pages=(
+                {"data": [entry], "responseSize": 3, "nextPageToken": "page-2"},
+                {"data": [entry]},
+            ),
+        )
+        # Same text as the line before: unchanged, not written again.
+        self._query_authoritative_week(
+            wrike,
+            pages=(
+                {"data": [entry], "responseSize": 3, "nextPageToken": "page-2"},
+                {"data": [entry]},
+            ),
+        )
+
+        self.assertEqual(
+            self._authoritative_log_lines(),
+            [
+                "authoritative contact timelogs: 1 entries, 1 pages",
+                "authoritative contact timelogs: 1 entries, 2 pages",
+                "authoritative contact timelogs: 1 entries, 2 pages, announced 3",
+            ],
+        )
+
+    def test_authoritative_line_is_written_again_when_the_clock_was_set_back(self) -> None:
+        wrike = self._new_wrike()
+        self._query_authoritative_week(wrike)
+
+        _FrozenDateTime.current = datetime(2026, 4, 6, 8, 59, 50)
+        self._query_authoritative_week(wrike)
+        self.assertEqual(len(self._authoritative_log_lines()), 2)
+
+        # The interval restarts from the line written after the clock change.
+        _FrozenDateTime.current = datetime(2026, 4, 6, 8, 59, 55)
+        self._query_authoritative_week(wrike)
+        self.assertEqual(len(self._authoritative_log_lines()), 2)
+
+    def test_authoritative_line_is_written_again_after_a_failed_refresh(self) -> None:
+        wrike = self._new_wrike()
+        wrike._Wrike__root = _FakeRoot()
+        wrike._Wrike__background_active = True
+        wrike._Wrike__wrike_api_token_session = "token"
+        wrike._Wrike__resolve_contact_identity = Mock(
+            return_value=("contact", "Integration User", None)
+        )
+        ok = {"data": [{"id": "a", "trackedDate": "2026-04-06", "hours": 1}]}
+        wrike._Wrike__api_get_json = Mock(side_effect=[ok, None, ok, ok])
+
+        for step in range(4):
+            _FrozenDateTime.current = datetime(2026, 4, 6, 9, 0, 5 * step)
+            with patch("src.apps.Wrike.threading.Thread", _FakeThread):
+                wrike._Wrike__request_timelog_snapshot_refresh(force=True)
+            _FakeThread.created[-1].target()
+            wrike._Wrike__drain_ui_queue()
+
+        # ok, failed, ok again right after the failure, then unchanged.
+        self.assertEqual(
+            self._authoritative_log_lines(),
+            ["authoritative contact timelogs: 1 entries, 1 pages"] * 2,
+        )
+
+    def test_authoritative_failures_are_logged_every_time(self) -> None:
+        wrike = self._new_wrike()
+        self._query_authoritative_week(wrike)
+
+        def refused(*_args, **_kwargs):
+            raise urllib.error.HTTPError(
+                "https://www.wrike.com/api/v4/contacts/contact/timelogs",
+                503,
+                "Service Unavailable",
+                {},
+                io.BytesIO(b"{}"),
+            )
+
+        for _attempt in range(3):
+            with patch("src.apps.Wrike.urllib.request.urlopen", side_effect=refused):
+                items, error = wrike._Wrike__query_authoritative_timelogs_week(
+                    "token",
+                    "contact",
+                    self._week_datetimes(),
+                )
+            self.assertIsNone(items)
+            self.assertEqual(error, "request_failed")
+
+        failures = [
+            line
+            for line in self._wrike_log_lines()
+            if line.startswith("api http error: 503")
+        ]
+        self.assertEqual(len(failures), 3)
+
     def _flex_ready_wrike(self) -> tuple[Wrike, list]:
         wrike = self._new_wrike()
         wrike._Wrike__root = _FakeRoot()

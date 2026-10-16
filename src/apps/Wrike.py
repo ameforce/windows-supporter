@@ -139,6 +139,11 @@ BREAK_RETURN_RESURFACE_SECONDS = 120
 # open that arrives this soon after the question was raised keeps the panel
 # instead of toggling it away; later opens toggle as usual.
 BREAK_RETURN_HOTKEY_GRACE_SECONDS = 1.5
+# The monitor reads the authoritative timelogs on every tick. A result that did
+# not change is written to wrike.log again only after this long, so the line
+# does not push the break-return trail out of the rotated log. A changed result
+# and the first result after a failed refresh are written at once.
+AUTHORITATIVE_TIMELOG_LOG_REPEAT_SECONDS = 300
 # Shown instead of the worktime window while Wrike is switched off.
 WRIKE_DISABLED_NOTICE = (
     "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. "
@@ -311,6 +316,10 @@ class Wrike:
         self.__timelog_refresh_running = False
         self.__timelog_refresh_running_generation = None
         self.__timelog_last_refresh_requested_at = None
+        # (line, time written) of the latest "authoritative contact timelogs"
+        # line: the same line is not repeated on every refresh
+        # (AUTHORITATIVE_TIMELOG_LOG_REPEAT_SECONDS).
+        self.__authoritative_timelog_logged = None
         self.__timelog_snapshot = make_unconfigured_snapshot(generation=0)
         self.__timelog_last_good = None
         # Comments and task titles are session-only details.  The persisted
@@ -3255,6 +3264,10 @@ class Wrike:
         except Exception as exc:
             self.__log_exception("authoritative timelog refresh failed", exc)
             error_code = "request_failed"
+        if error_code is not None:
+            # The next result is written even if it equals the last one, so
+            # the log shows when reading Wrike recovered.
+            self.__authoritative_timelog_logged = None
 
         def apply_result() -> None:
             if lifecycle_generation != int(self.__lifecycle_generation):
@@ -9655,11 +9668,28 @@ class Wrike:
             if expected_total is not None and len(items) < expected_total
             else ""
         )
-        self.__log(
+        self.__log_authoritative_timelogs(
             f"authoritative contact timelogs: {len(items)} entries, {page} pages"
             f"{shortfall}"
         )
         return items, None
+
+    def __log_authoritative_timelogs(self, line: str) -> None:
+        # The query runs on every monitor tick, so the same result would fill
+        # the log. Only this line is paced; errors and stage lines are not.
+        now = self.__lib.datetime.now()
+        last = self.__authoritative_timelog_logged
+        if isinstance(last, tuple) and last[0] == line:
+            try:
+                elapsed = (now - last[1]).total_seconds()
+                # A clock set back is not "recent": the line is written again.
+                recent = 0 <= elapsed < AUTHORITATIVE_TIMELOG_LOG_REPEAT_SECONDS
+            except Exception:
+                recent = False
+            if recent:
+                return
+        self.__authoritative_timelog_logged = (line, now)
+        self.__log(line)
 
     def __query_timelogs_week(self, token: str, contact_id: str, week_dates: list) -> list[dict] | None:
         if not token or not contact_id or not week_dates:
