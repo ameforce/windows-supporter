@@ -139,6 +139,11 @@ BREAK_RETURN_RESURFACE_SECONDS = 120
 # open that arrives this soon after the question was raised keeps the panel
 # instead of toggling it away; later opens toggle as usual.
 BREAK_RETURN_HOTKEY_GRACE_SECONDS = 1.5
+# The monitor reads the authoritative timelogs on every tick. A result that did
+# not change is written to wrike.log again only after this long, so the line
+# does not push the break-return trail out of the rotated log. A changed result
+# and the first result after a failed refresh are written at once.
+AUTHORITATIVE_TIMELOG_LOG_REPEAT_SECONDS = 300
 # Shown instead of the worktime window while Wrike is switched off.
 WRIKE_DISABLED_NOTICE = (
     "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. "
@@ -274,8 +279,8 @@ class Wrike:
         # (BREAK_RETURN_RESURFACE_SECONDS).
         self.__last_worktime_activity_at = None
         self.__break_return_prompt = None
-        # Input time at which the question last raised the panel; the first
-        # manual open right after it keeps the panel
+        # Input time at which the question last brought up a hidden panel; the
+        # first manual open right after it keeps the panel
         # (BREAK_RETURN_HOTKEY_GRACE_SECONDS). That open and the end of the
         # question both drop it.
         self.__break_return_raised_at = None
@@ -311,6 +316,10 @@ class Wrike:
         self.__timelog_refresh_running = False
         self.__timelog_refresh_running_generation = None
         self.__timelog_last_refresh_requested_at = None
+        # (line, time written) of the latest "authoritative contact timelogs"
+        # line: the same line is not repeated on every refresh
+        # (AUTHORITATIVE_TIMELOG_LOG_REPEAT_SECONDS).
+        self.__authoritative_timelog_logged = None
         self.__timelog_snapshot = make_unconfigured_snapshot(generation=0)
         self.__timelog_last_good = None
         # Comments and task titles are session-only details.  The persisted
@@ -3255,6 +3264,10 @@ class Wrike:
         except Exception as exc:
             self.__log_exception("authoritative timelog refresh failed", exc)
             error_code = "request_failed"
+        if error_code is not None:
+            # The next result is written even if it equals the last one, so
+            # the log shows when reading Wrike recovered.
+            self.__authoritative_timelog_logged = None
 
         def apply_result() -> None:
             if lifecycle_generation != int(self.__lifecycle_generation):
@@ -4869,6 +4882,14 @@ class Wrike:
         except Exception:
             return ""
 
+    def __worktime_panel_on_screen(self) -> bool:
+        # Whether the panel exists and is mapped. Never raises.
+        panel = self.__worktime_panel
+        try:
+            return bool(panel is not None and panel.is_visible())
+        except Exception:
+            return False
+
     def __break_return_panel_just_raised(self, panel) -> bool:
         # A hotkey and the input watcher react to the same key chord, in
         # either order. When the watcher raised the question a moment ago the
@@ -4889,6 +4910,11 @@ class Wrike:
         # One display attempt for the pending question. The attempt time paces
         # the repeated display whether or not a panel actually came up.
         shown = False
+        # The panel answers True from show() while it is already open. Only a
+        # display that brings up a hidden panel is a raise the same key chord's
+        # direct open may keep: a hotkey that ran first has already opened it,
+        # and its next press is the user closing it.
+        was_on_screen = self.__worktime_panel_on_screen()
         try:
             shown = self.__show_activity_panel()
         except Exception as exc:
@@ -4898,7 +4924,7 @@ class Wrike:
             pending = self.__break_return_prompt
             if isinstance(pending, dict):
                 pending["surfaced_at"] = at
-            if shown:
+            if shown and not was_on_screen:
                 self.__break_return_raised_at = at
             self.__log_break_return(
                 f"{cause}; panel_shown={shown} "
@@ -4988,11 +5014,7 @@ class Wrike:
         if isinstance(surfaced_at, datetime):
             elapsed = (detected_at - surfaced_at).total_seconds()
             due = not 0 <= elapsed < BREAK_RETURN_RESURFACE_SECONDS
-        panel = self.__worktime_panel
-        try:
-            visible = bool(panel is not None and panel.is_visible())
-        except Exception:
-            visible = False
+        visible = self.__worktime_panel_on_screen()
         if not (visible or due):
             return
         if due:
@@ -9655,11 +9677,28 @@ class Wrike:
             if expected_total is not None and len(items) < expected_total
             else ""
         )
-        self.__log(
+        self.__log_authoritative_timelogs(
             f"authoritative contact timelogs: {len(items)} entries, {page} pages"
             f"{shortfall}"
         )
         return items, None
+
+    def __log_authoritative_timelogs(self, line: str) -> None:
+        # The query runs on every monitor tick, so the same result would fill
+        # the log. Only this line is paced; errors and stage lines are not.
+        now = self.__lib.datetime.now()
+        last = self.__authoritative_timelog_logged
+        if isinstance(last, tuple) and last[0] == line:
+            try:
+                elapsed = (now - last[1]).total_seconds()
+                # A clock set back is not "recent": the line is written again.
+                recent = 0 <= elapsed < AUTHORITATIVE_TIMELOG_LOG_REPEAT_SECONDS
+            except Exception:
+                recent = False
+            if recent:
+                return
+        self.__authoritative_timelog_logged = (line, now)
+        self.__log(line)
 
     def __query_timelogs_week(self, token: str, contact_id: str, week_dates: list) -> list[dict] | None:
         if not token or not contact_id or not week_dates:
