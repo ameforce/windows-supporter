@@ -150,6 +150,8 @@ class WrikeDisabledLifecycleTest(unittest.TestCase):
         self.assertIsNone(self.wrike._Wrike__active_tooltip)
         self.assertFalse(self.wrike._Wrike__active_tooltip_automatic)
         self.assertEqual(self.root.calls, [])
+        # Nothing is queued for the UI thread either (a deferred notice would be).
+        self.assertTrue(self.wrike._Wrike__ui_queue.empty())
         # The notice and its text are gone.
         self.assertFalse(hasattr(wrike_module, "WRIKE_DISABLED_NOTICE"))
 
