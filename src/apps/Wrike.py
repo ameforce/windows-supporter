@@ -18,6 +18,7 @@ import urllib.request
 import webbrowser
 
 from src.utils.LibConnector import LibConnector
+from src.utils.runtime_lifecycle import rotate_log_file
 from src.utils.secret_store import SecretStore
 from src.utils.subprocess_utils import build_python_module_command, is_frozen_runtime
 from src.utils.ToolTip import ToolTip
@@ -134,9 +135,9 @@ FLEX_SYNC_DEFERRED_CODES = frozenset(
 # break-return question that was not answered must not depend on that single
 # display. It is shown again on later input, but not more often than this.
 BREAK_RETURN_RESURFACE_SECONDS = 120
-# The input watcher and a hotkey answer the same key chord. A manual open that
-# arrives this soon after the question was raised keeps the panel instead of
-# toggling it away.
+# The input watcher and a hotkey answer the same key chord. The first manual
+# open that arrives this soon after the question was raised keeps the panel
+# instead of toggling it away; later opens toggle as usual.
 BREAK_RETURN_HOTKEY_GRACE_SECONDS = 1.5
 # Shown instead of the worktime window while Wrike is switched off.
 WRIKE_DISABLED_NOTICE = (
@@ -178,6 +179,10 @@ class _VacationRedirectRejected(Exception):
 
 class _VacationAuthenticationRequired(Exception):
     """Target-free marker for a redirect to an interactive login surface."""
+
+
+# A rotation renames files, so threads that write wrike.log take turns.
+_WRIKE_LOG_LOCK = threading.Lock()
 
 
 class Wrike:
@@ -269,8 +274,10 @@ class Wrike:
         # (BREAK_RETURN_RESURFACE_SECONDS).
         self.__last_worktime_activity_at = None
         self.__break_return_prompt = None
-        # Input time at which the question last raised the panel; a manual
-        # open right after it keeps the panel (BREAK_RETURN_HOTKEY_GRACE_SECONDS).
+        # Input time at which the question last raised the panel; the first
+        # manual open right after it keeps the panel
+        # (BREAK_RETURN_HOTKEY_GRACE_SECONDS). That open and the end of the
+        # question both drop it.
         self.__break_return_raised_at = None
         # Why the latest automatic panel request did or did not show a panel.
         self.__last_panel_surface_reason = ""
@@ -699,7 +706,11 @@ class Wrike:
         panel = self.__ensure_worktime_panel(root)
         if panel is None:
             return
-        if not self.__break_return_panel_just_raised(panel):
+        if self.__break_return_panel_just_raised(panel):
+            # The grace belongs to the one open that answers the chord which
+            # raised the question; the next open is a plain toggle.
+            self.__break_return_raised_at = None
+        else:
             panel.toggle(activate=False)
         if panel.is_visible():
             pending = self.__break_return_prompt
@@ -4900,6 +4911,7 @@ class Wrike:
         if self.__break_return_prompt is not None:
             self.__log_break_return("question cleared; " + why)
         self.__break_return_prompt = None
+        self.__break_return_raised_at = None
 
     def __record_break_return(self, detected_at, absent_since) -> None:
         started_at = self.__active_manual_break_started_at(detected_at)
@@ -5094,6 +5106,7 @@ class Wrike:
             )
             return False
         self.__break_return_prompt = None
+        self.__break_return_raised_at = None
         self.__log_break_return(
             "answered, break ended; "
             f"break_started={self.__break_return_stamp(started_at)} "
@@ -10111,8 +10124,19 @@ class Wrike:
             ts = "time"
         line = f"[{ts}] {message}\n"
         try:
-            with open(self.__time_log_log_path, "a", encoding="utf-8") as fp:
-                fp.write(line)
+            with _WRIKE_LOG_LOCK:
+                try:
+                    # Same size cap and backups as runtime.jsonl. The size is
+                    # what the text-mode write puts on disk. A rotation that
+                    # fails must not cost the line.
+                    rotate_log_file(
+                        self.__time_log_log_path,
+                        len(line.replace("\n", os.linesep).encode("utf-8")),
+                    )
+                except Exception:
+                    pass
+                with open(self.__time_log_log_path, "a", encoding="utf-8") as fp:
+                    fp.write(line)
         except Exception:
             return
 

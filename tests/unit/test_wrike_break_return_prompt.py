@@ -11,9 +11,11 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import src.apps.Wrike as wrike_module
 from src.apps.Wrike import Wrike
 from src.apps.wrike_worktime_panel import WorktimeBreakReturnPrompt
 from src.apps.wrike_worktime_state import WorktimeStateStore
+from src.utils.runtime_lifecycle import DEFAULT_MAX_LOG_BYTES
 
 
 DAY = "2026-04-06"
@@ -539,6 +541,75 @@ class BreakReturnPromptTest(unittest.TestCase):
 
         self.assertTrue(self.panel.visible)
 
+    def test_grace_covers_only_the_first_direct_open(self):
+        # The watcher and the hotkey answer one key chord, once each. A second
+        # press inside the window is the user closing the panel again.
+        self._first_return()  # raised at 12:30:00 and on screen
+
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            _Clock.current = _at(12, 30) + timedelta(milliseconds=300)
+            self.wrike.show_weekly_timelog_summary(self.root)
+            self.assertTrue(self.panel.visible)
+            self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+            refresh.assert_called_once_with(force=True)
+
+            _Clock.current = _at(12, 30) + timedelta(milliseconds=800)
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertFalse(self.panel.visible)
+        self.assertEqual(self.panel.show.call_count, 1)
+        refresh.assert_called_once_with(force=True)
+
+    def test_hotkey_with_the_clock_set_back_before_the_raise_toggles(self):
+        # A clock set back puts "now" before the raise. That is not "just
+        # after" it, so the open is a plain toggle that hides the panel.
+        self._first_return()  # raised at 12:30:00 and on screen
+        _Clock.current = _at(12, 29, 59)
+
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertFalse(self.panel.visible)
+        refresh.assert_not_called()
+
+    def _direct_open_after(self, answer):
+        # Raise the question, answer it a moment later, then open by hand
+        # inside what used to be the grace window.
+        self._first_return()  # raised at 12:30:00 and on screen
+        _Clock.current = _at(12, 30) + timedelta(milliseconds=200)
+        answer()
+        self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+        _Clock.current = _at(12, 30) + timedelta(milliseconds=300)
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh"):
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+    def test_answer_that_keeps_the_break_leaves_no_grace(self):
+        self._direct_open_after(self.wrike._Wrike__panel_break_return_keep)
+
+        self.assertFalse(self.panel.visible)
+
+    def test_answer_that_ends_the_break_leaves_no_grace(self):
+        self._direct_open_after(
+            lambda: self.wrike._Wrike__panel_break_return_accept("12:30")
+        )
+
+        self.assertEqual(self.completed_breaks(), [("2026-04-06T12:00:00", "2026-04-06T12:30:00")])
+        self.assertFalse(self.panel.visible)
+
+    def test_break_toggled_by_hand_leaves_no_grace(self):
+        self._direct_open_after(lambda: self.start_break(_Clock.current))
+
+        self.assertFalse(self.panel.visible)
+
+    def test_disabling_drops_the_grace_marker(self):
+        self._first_return()
+        self.assertIsNotNone(self.wrike._Wrike__break_return_raised_at)
+
+        ok, error = self.wrike.update_settings({"monitor_enabled": False})
+
+        self.assertTrue(ok, error)
+        self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+
     def test_hotkey_before_the_watcher_leaves_one_open_panel(self):
         self._first_return()
         self.panel.visible = False  # closed itself unanswered
@@ -670,6 +741,50 @@ class BreakReturnPromptTest(unittest.TestCase):
         lines = [call.args[0] for call in log.call_args_list]
         self.assertTrue(any("activity watcher unavailable" in line for line in lines), lines)
         self.assertIsNone(self.wrike._Wrike__activity_watcher)
+
+    def test_value_error_from_watcher_creation_is_logged_as_unavailable(self):
+        # The constructor validates its arguments with ValueError; like OSError
+        # it means "no input source here", not an unexpected failure.
+        self.watcher_type.side_effect = ValueError("idle threshold")
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        unavailable = [line for line in lines if line.startswith("activity watcher unavailable:")]
+        self.assertEqual(len(unavailable), 1, lines)
+        self.assertIn("ValueError('idle threshold')", unavailable[0])
+        self.assertFalse(any("creation failed" in line for line in lines), lines)
+        self.assertIsNone(self.wrike._Wrike__activity_watcher)
+
+    def test_unexpected_watcher_creation_failure_is_logged_once(self):
+        # Only OSError, ValueError and LastInputUnavailableError mean "no input
+        # source here"; anything else is a creation failure and is named so.
+        self.watcher_type.side_effect = RuntimeError("tk refused")
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        failed = [line for line in lines if line.startswith("activity watcher creation failed:")]
+        self.assertEqual(len(failed), 1, lines)
+        self.assertIn("RuntimeError('tk refused')", failed[0])
+        self.assertFalse(any("activity watcher unavailable" in line for line in lines), lines)
+        self.assertIsNone(self.wrike._Wrike__activity_watcher)
+        self.watcher_type.return_value.start.assert_not_called()
+
+    def test_watcher_start_exception_is_logged_once(self):
+        self.watcher_type.return_value.start.side_effect = RuntimeError("poll refused")
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        failed = [line for line in lines if line.startswith("activity watcher start failed:")]
+        self.assertEqual(len(failed), 1, lines)
+        self.assertIn("RuntimeError('poll refused')", failed[0])
+        self.assertFalse(any("not running after start" in line for line in lines), lines)
+        self.watcher_type.return_value.start.assert_called_once_with()
 
     def test_watcher_that_cannot_poll_after_start_is_logged(self):
         # start() swallows a polling schedule that Tk refused and leaves the
@@ -864,6 +979,120 @@ class BreakReturnPromptTest(unittest.TestCase):
 
         self.assertEqual(self.completed_breaks(), [("2026-04-06T23:50:00", "2026-04-06T23:55:00")])
         self.assertIsNone(self.pending())
+
+
+class WrikeLogRotationTest(unittest.TestCase):
+    """wrike.log follows the size cap and backup count of the runtime log."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.dict(os.environ, {"APPDATA": temporary.name}, clear=False):
+            self.wrike = Wrike()
+        self.log_path = Path(temporary.name) / "windows-supporter" / "wrike.log"
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def backup(self, index: int) -> Path:
+        return Path(f"{self.log_path}.{index}")
+
+    def test_line_under_the_cap_is_appended_without_rotation(self):
+        self.log_path.write_text("old line\n", encoding="utf-8")
+
+        self.wrike.log_info("next line")
+
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        self.assertEqual(lines[0], "old line")
+        self.assertRegex(lines[1], r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\] next line$")
+        self.assertFalse(self.backup(1).exists())
+
+    def test_log_that_would_pass_the_cap_moves_to_a_backup(self):
+        old = "x" * DEFAULT_MAX_LOG_BYTES
+        self.log_path.write_text(old, encoding="utf-8")
+
+        self.wrike.log_info("first line after the cap")
+
+        self.assertEqual(self.backup(1).read_text(encoding="utf-8"), old)
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertRegex(
+            lines[0], r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\] first line after the cap$"
+        )
+
+    def test_failed_rotation_does_not_cost_the_line(self):
+        self.log_path.write_text("old line\n", encoding="utf-8")
+
+        with patch("src.apps.Wrike.rotate_log_file", side_effect=PermissionError("in use")):
+            self.wrike.log_info("kept anyway")
+
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[1].endswith("] kept anyway"), lines)
+
+    def test_rotation_gets_the_size_the_line_takes_on_disk_under_the_log_lock(self):
+        seen = []
+
+        def spy(path, incoming_bytes):
+            seen.append((path, incoming_bytes, wrike_module._WRIKE_LOG_LOCK.locked()))
+
+        with patch("src.apps.Wrike.rotate_log_file", side_effect=spy):
+            # Multi-byte text and an embedded newline: the text-mode write
+            # turns each newline into os.linesep.
+            self.wrike.log_info("한글\n둘째 줄")
+
+        self.assertEqual(len(seen), 1, seen)
+        path, incoming_bytes, locked = seen[0]
+        self.assertEqual(Path(path), self.log_path)
+        self.assertTrue(locked)
+        self.assertEqual(incoming_bytes, self.log_path.stat().st_size)
+        self.assertFalse(wrike_module._WRIKE_LOG_LOCK.locked())
+
+    def test_line_is_appended_while_the_log_lock_is_held(self):
+        # A writer that appends outside the lock keeps the file open while
+        # another thread tries to rotate it.
+        opened = []
+        real_open = open
+
+        def spy_open(path, *args, **kwargs):
+            opened.append((Path(path), wrike_module._WRIKE_LOG_LOCK.locked()))
+            return real_open(path, *args, **kwargs)
+
+        with patch("src.apps.Wrike.open", side_effect=spy_open, create=True):
+            self.wrike.log_info("appended under the lock")
+
+        self.assertEqual(opened, [(self.log_path, True)])
+        self.assertIn("appended under the lock", self.log_path.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(os.name == "nt", "an open file is only refused a rename on Windows")
+    def test_log_held_open_by_another_program_keeps_backups_and_lines(self):
+        old = "x" * DEFAULT_MAX_LOG_BYTES
+        self.log_path.write_text(old, encoding="utf-8")
+        for index in (1, 2, 3):
+            self.backup(index).write_text(f"backup {index}", encoding="utf-8")
+
+        with self.log_path.open("rb"):
+            self.wrike.log_info("first while held")
+            self.wrike.log_info("second while held")
+
+        self.assertEqual(
+            [self.backup(index).read_text(encoding="utf-8") for index in (1, 2, 3)],
+            ["backup 1", "backup 2", "backup 3"],
+        )
+        text = self.log_path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(old), "the oversized log was not moved")
+        self.assertEqual(
+            [line.split("] ", 1)[-1] for line in text[len(old):].splitlines()],
+            ["first while held", "second while held"],
+        )
+
+        self.wrike.log_info("after the handle closed")
+
+        # The first free rotation shifts every backup exactly once.
+        self.assertEqual(self.backup(1).read_text(encoding="utf-8"), text)
+        self.assertEqual(self.backup(2).read_text(encoding="utf-8"), "backup 1")
+        self.assertEqual(self.backup(3).read_text(encoding="utf-8"), "backup 2")
+        lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual([line.split("] ", 1)[-1] for line in lines], ["after the handle closed"])
 
 
 if __name__ == "__main__":
