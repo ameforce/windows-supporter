@@ -144,11 +144,6 @@ BREAK_RETURN_HOTKEY_GRACE_SECONDS = 1.5
 # does not push the break-return trail out of the rotated log. A changed result
 # and the first result after a failed refresh are written at once.
 AUTHORITATIVE_TIMELOG_LOG_REPEAT_SECONDS = 300
-# Shown instead of the worktime window while Wrike is switched off.
-WRIKE_DISABLED_NOTICE = (
-    "Wrike가 꺼져 있어 근무시간 창을 열지 않습니다. "
-    "대시보드나 Wrike 설정 탭에서 Wrike를 켜 주세요."
-)
 
 
 VACATION_EXPECTED_CALENDAR_NAME = "김종인-ePapyrus"
@@ -703,12 +698,8 @@ class Wrike:
             return
         if not self.__monitor_enabled:
             # The worktime window belongs to the feature that is switched off:
-            # answer the request with a notice instead of opening it or
-            # reading Wrike. Re-enabling restores it.
-            try:
-                self.__show_tooltip(root, WRIKE_DISABLED_NOTICE)
-            except Exception as exc:
-                self.__log_exception("disabled notice failed", exc)
+            # a direct request neither opens it nor reads Wrike, and it gets no
+            # answer on screen either. Re-enabling restores it.
             return
         if self.__root is None:
             self.attach(root)
