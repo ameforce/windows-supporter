@@ -742,6 +742,21 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.assertTrue(any("activity watcher unavailable" in line for line in lines), lines)
         self.assertIsNone(self.wrike._Wrike__activity_watcher)
 
+    def test_value_error_from_watcher_creation_is_logged_as_unavailable(self):
+        # The constructor validates its arguments with ValueError; like OSError
+        # it means "no input source here", not an unexpected failure.
+        self.watcher_type.side_effect = ValueError("idle threshold")
+
+        with patch.object(self.wrike, "_Wrike__log") as log:
+            self.wrike._Wrike__start_activity_watcher()
+
+        lines = [call.args[0] for call in log.call_args_list]
+        unavailable = [line for line in lines if line.startswith("activity watcher unavailable:")]
+        self.assertEqual(len(unavailable), 1, lines)
+        self.assertIn("ValueError('idle threshold')", unavailable[0])
+        self.assertFalse(any("creation failed" in line for line in lines), lines)
+        self.assertIsNone(self.wrike._Wrike__activity_watcher)
+
     def test_unexpected_watcher_creation_failure_is_logged_once(self):
         # Only OSError, ValueError and LastInputUnavailableError mean "no input
         # source here"; anything else is a creation failure and is named so.
