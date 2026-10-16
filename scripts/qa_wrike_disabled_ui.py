@@ -1,7 +1,7 @@
 """Targeted native Tk acceptance for the Wrike disable switch.
 
 While disabled, automatic notices stop and the manual worktime window is not
-opened (a notice is shown instead); re-enabling restores both.
+opened and gives no answer on screen either; re-enabling restores both.
 
 Uses production settings/widgets/lifecycle with temporary APPDATA, no credentials,
 no network/browser, and a synthetic last-input source. Does not test deployment.
@@ -194,10 +194,9 @@ def run(output: Path, capture: bool) -> dict:
             wrike.show_weekly_timelog_summary(root)
             pump(root)
             check("manual open is blocked while disabled", not visible() and not enabled(), mapped=visible(), runtime=enabled())
-            notice = wrike._Wrike__active_tooltip
-            check("blocked manual open explains why and is not automatic",
-                  notice is not None and not wrike._Wrike__active_tooltip_automatic)
-            notice.hide_tooltip()
+            check("blocked manual open shows nothing at all",
+                  wrike._Wrike__active_tooltip is None
+                  and not wrike._Wrike__active_tooltip_automatic)
             checkbox.invoke()
             check("reenable saved immediately", enabled() and disk_enabled() and view._monitor_enabled_var.get())
             root.after(1, lambda: old_watcher.callback(now))
