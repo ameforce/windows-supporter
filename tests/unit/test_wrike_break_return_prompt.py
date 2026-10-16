@@ -694,6 +694,26 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.assertEqual(self.wrike._Wrike__break_return_raised_at, _at(12, 30))
         self.assertTrue(self.panel.visible)
 
+    def test_first_raise_before_the_panel_exists_still_starts_a_grace(self):
+        # The panel is created on first use, so the first question after the
+        # app started finds none. A missing panel is a hidden one.
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        self.wrike._Wrike__worktime_panel = None
+
+        def create_panel(_root):
+            self.wrike._Wrike__worktime_panel = self.panel
+            return self.panel
+
+        with patch.object(
+            self.wrike, "_Wrike__ensure_worktime_panel", side_effect=create_panel
+        ) as ensure:
+            self.activity(_at(12, 30))
+
+        ensure.assert_called_once_with(self.root)
+        self.assertTrue(self.panel.visible)
+        self.assertEqual(self.wrike._Wrike__break_return_raised_at, _at(12, 30))
+
     def test_steady_input_on_screen_leaves_no_card_for_a_finished_break(self):
         # While the panel stays up and input never pauses, the pacing window
         # keeps moving, so the stale question is only cleared later. It must
