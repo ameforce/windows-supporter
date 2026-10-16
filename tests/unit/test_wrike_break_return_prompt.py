@@ -9,7 +9,7 @@ from pathlib import Path
 import queue
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import src.apps.Wrike as wrike_module
 from src.apps.Wrike import Wrike
@@ -622,6 +622,72 @@ class BreakReturnPromptTest(unittest.TestCase):
 
         self.assertTrue(self.panel.visible)
         self.assertEqual(self.panel.show.call_count, 1)
+
+    def test_hotkey_first_for_the_raising_input_leaves_no_grace(self):
+        # The hotkey task of the chord that raises the question can run before
+        # the watcher notices the input. The panel is open when the question
+        # arrives, so nothing was raised that a direct open must keep: the next
+        # press of the chord is the user closing the panel.
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        _Clock.current = _at(12, 30)
+        with patch.object(self.wrike, "_Wrike__request_timelog_snapshot_refresh") as refresh:
+            self.wrike.show_weekly_timelog_summary(self.root)
+            self.assertTrue(self.panel.visible)
+            self.assertIsNone(self.pending())
+
+            noticed_at = _at(12, 30) + timedelta(milliseconds=200)
+            self.activity(noticed_at)  # the watcher notices the same chord
+
+            self.assertEqual(self.pending()["detected_at"], noticed_at)
+            self.assertEqual(self.pending()["surfaced_at"], noticed_at)
+            self.assertEqual(self.visible_prompt(), WorktimeBreakReturnPrompt("12:00", "12:30"))
+            self.assertTrue(self.panel.visible)
+            self.panel.show.assert_called_once_with(activate=False)
+            self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+
+            _Clock.current = _at(12, 30) + timedelta(milliseconds=800)
+            self.wrike.show_weekly_timelog_summary(self.root)
+
+        self.assertFalse(self.panel.visible)
+        # The hotkey's open and the watcher's display each read Wrike once; the
+        # closing press reads nothing.
+        self.assertEqual(
+            refresh.call_args_list,
+            [call(force=True), call(force=False)],
+        )
+
+    def test_unlock_display_of_an_open_panel_does_not_start_a_grace(self):
+        # Only the display that brought a hidden panel up is a raise.
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        self.unlock(_at(12, 45))
+        self.assertIsNotNone(self.wrike._Wrike__break_return_raised_at)
+        self.wrike._Wrike__break_return_raised_at = None
+        self.assertTrue(self.panel.visible)
+
+        self.unlock(_at(12, 45, 1))  # shown again while it is still open
+
+        self.assertEqual(self.panel.show.call_count, 2)
+        self.assertIsNone(self.wrike._Wrike__break_return_raised_at)
+
+    def test_panel_that_cannot_be_asked_is_taken_as_hidden(self):
+        # A failing visibility check must not cost the grace of a real raise.
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+        shown_state = self.panel.is_visible
+
+        def is_visible_after_show():
+            if not self.panel.show.called:
+                raise RuntimeError("window state unavailable")
+            return shown_state()
+
+        self.panel.is_visible = is_visible_after_show
+
+        self.activity(_at(12, 30))
+
+        self.assertEqual(self.wrike._Wrike__break_return_raised_at, _at(12, 30))
+        self.assertTrue(self.panel.visible)
 
     def test_steady_input_on_screen_leaves_no_card_for_a_finished_break(self):
         # While the panel stays up and input never pauses, the pacing window

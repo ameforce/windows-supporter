@@ -279,8 +279,8 @@ class Wrike:
         # (BREAK_RETURN_RESURFACE_SECONDS).
         self.__last_worktime_activity_at = None
         self.__break_return_prompt = None
-        # Input time at which the question last raised the panel; the first
-        # manual open right after it keeps the panel
+        # Input time at which the question last brought up a hidden panel; the
+        # first manual open right after it keeps the panel
         # (BREAK_RETURN_HOTKEY_GRACE_SECONDS). That open and the end of the
         # question both drop it.
         self.__break_return_raised_at = None
@@ -4882,6 +4882,14 @@ class Wrike:
         except Exception:
             return ""
 
+    def __worktime_panel_on_screen(self) -> bool:
+        # Whether the panel exists and is mapped. Never raises.
+        panel = self.__worktime_panel
+        try:
+            return bool(panel is not None and panel.is_visible())
+        except Exception:
+            return False
+
     def __break_return_panel_just_raised(self, panel) -> bool:
         # A hotkey and the input watcher react to the same key chord, in
         # either order. When the watcher raised the question a moment ago the
@@ -4902,6 +4910,11 @@ class Wrike:
         # One display attempt for the pending question. The attempt time paces
         # the repeated display whether or not a panel actually came up.
         shown = False
+        # The panel answers True from show() while it is already open. Only a
+        # display that brings up a hidden panel is a raise the same key chord's
+        # direct open may keep: a hotkey that ran first has already opened it,
+        # and its next press is the user closing it.
+        was_on_screen = self.__worktime_panel_on_screen()
         try:
             shown = self.__show_activity_panel()
         except Exception as exc:
@@ -4911,7 +4924,7 @@ class Wrike:
             pending = self.__break_return_prompt
             if isinstance(pending, dict):
                 pending["surfaced_at"] = at
-            if shown:
+            if shown and not was_on_screen:
                 self.__break_return_raised_at = at
             self.__log_break_return(
                 f"{cause}; panel_shown={shown} "
@@ -5001,11 +5014,7 @@ class Wrike:
         if isinstance(surfaced_at, datetime):
             elapsed = (detected_at - surfaced_at).total_seconds()
             due = not 0 <= elapsed < BREAK_RETURN_RESURFACE_SECONDS
-        panel = self.__worktime_panel
-        try:
-            visible = bool(panel is not None and panel.is_visible())
-        except Exception:
-            visible = False
+        visible = self.__worktime_panel_on_screen()
         if not (visible or due):
             return
         if due:
