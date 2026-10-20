@@ -34,6 +34,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
                 "refresh-layout-stability-wide",
                 "one-profile-125",
                 "dynamic-three-profiles",
+                "balanced-two-taskbar-profiles",
                 "four-taskbar-profiles",
                 "ten-mixed-profiles-150",
                 "long-label-narrow",
@@ -51,7 +52,7 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
             for name in harness.SCENARIO_NAMES
         ]
         self.assertEqual({fixture["phase"] for fixture in fixtures}, {"initial", "interaction", "final"})
-        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 12)
+        self.assertEqual(len({fixture["screenshot_name"] for fixture in fixtures}), 13)
         by_name = {fixture["name"]: fixture for fixture in fixtures}
         stability = by_name["refresh-layout-stability-wide"]
         self.assertEqual(stability["window_size"], [1600, 760])
@@ -66,6 +67,10 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         dynamic = by_name["dynamic-three-profiles"]
         self.assertEqual(len(dynamic["settings"]["profiles"]), 3)
         self.assertFalse(dynamic["settings"]["profiles"][2]["taskbar_selected"])
+        balanced = by_name["balanced-two-taskbar-profiles"]
+        self.assertEqual(len(balanced["settings"]["selected_profile_ids"]), 2)
+        self.assertEqual(balanced["settings"]["taskbar_pane_distribution"], "balanced")
+        self.assertEqual(balanced["runtime"]["taskbar_pane_distribution"], "balanced")
         four_taskbar_profiles = by_name["four-taskbar-profiles"]
         self.assertEqual(len(four_taskbar_profiles["settings"]["profiles"]), 4)
         self.assertEqual(
@@ -172,6 +177,41 @@ class AiUsageNativeVisualHarnessUnitTest(unittest.TestCase):
         self.assertTrue(report["git_worktree_clean"])
         self.assertEqual(persisted["git_sha"], "b" * 40)
         self.assertTrue(persisted["git_worktree_clean"])
+
+    def test_capture_report_can_target_one_changed_scenario(self) -> None:
+        harness = _load_harness_module()
+
+        def fake_capture(fixture, output_dir, *, settle_ms):
+            screenshot = output_dir / fixture["screenshot_name"]
+            screenshot.write_bytes(b"fixture")
+            return {
+                "ok": True,
+                "scenario": fixture["name"],
+                "phase": fixture["phase"],
+                "screenshot": screenshot.name,
+            }
+
+        scenario = "balanced-two-taskbar-profiles"
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "ai-usage-native"
+            with (
+                mock.patch.object(
+                    harness,
+                    "capture_provenance",
+                    return_value={"git_sha": "d" * 40, "worktree_clean": True},
+                ),
+                mock.patch.object(harness, "_enable_per_monitor_dpi_awareness", return_value="test"),
+                mock.patch.object(harness, "capture_scenario", side_effect=fake_capture),
+            ):
+                report = harness.run_capture_matrix(
+                    output_dir,
+                    scenario_names=[scenario],
+                )
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["selected_scenarios"], [scenario])
+        self.assertEqual(report["required_phases"], ["final"])
+        self.assertEqual(report["generated_pngs"], [f"{scenario}.png"])
 
     def test_capture_report_fails_closed_for_dirty_worktree(self) -> None:
         harness = _load_harness_module()

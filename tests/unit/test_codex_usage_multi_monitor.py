@@ -4381,6 +4381,27 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 manager.get_runtime_status()["taskbar_side_priority"],
                 "left",
             )
+            self.assertEqual(
+                manager.get_settings_snapshot()["taskbar_pane_distribution"],
+                "priority",
+            )
+            self.assertEqual(
+                manager.get_runtime_status()["taskbar_pane_distribution"],
+                "priority",
+            )
+
+            ok, error = manager.update_settings(
+                {"taskbar_pane_distribution": "balanced"}
+            )
+            self.assertTrue(ok, error)
+            self.assertEqual(
+                manager.get_settings_snapshot()["taskbar_pane_distribution"],
+                "balanced",
+            )
+            self.assertEqual(
+                manager.get_runtime_status()["taskbar_pane_distribution"],
+                "balanced",
+            )
 
             ok, error = manager.update_settings({"taskbar_side_priority": "right"})
             self.assertTrue(ok, error)
@@ -4401,10 +4422,24 @@ class CodexUsageMultiMonitorUnitTest(unittest.TestCase):
                 "right",
             )
 
+            ok, error = manager.update_settings(
+                {"taskbar_pane_distribution": "center"}
+            )
+            self.assertFalse(ok)
+            self.assertEqual(error, "taskbar_pane_distribution")
+            self.assertEqual(
+                manager.get_settings_snapshot()["taskbar_pane_distribution"],
+                "balanced",
+            )
+
             restarted, _children = self._build_manager(tmp)
             self.assertEqual(
                 restarted.get_settings_snapshot()["taskbar_side_priority"],
                 "right",
+            )
+            self.assertEqual(
+                restarted.get_settings_snapshot()["taskbar_pane_distribution"],
+                "balanced",
             )
 
     def test_show_current_status_refreshes_enabled_accounts_in_fixed_order(self):

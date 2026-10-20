@@ -11,7 +11,12 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Callable
 
-from src.apps.ai_usage_contracts import normalize_taskbar_side_priority
+from src.apps.ai_usage_contracts import (
+    TaskbarPaneDistribution,
+    normalize_taskbar_pane_distribution,
+    normalize_taskbar_side_priority,
+    resolve_taskbar_pane_assignment,
+)
 from src.apps.codex_usage_taskbar_targets import (
     TaskbarMonitorSnapshot,
     TaskbarOverlayTarget,
@@ -9276,6 +9281,7 @@ class AiUsageTaskbarOverlay:
         taskbar_target_getter: Callable[[], tuple[TaskbarOverlayTarget, ...]] | None = None,
     ) -> None:
         self._runtime_getter = runtime_getter
+        self._vertical_taskbar = False
         base_occupied_span_getter = (
             occupied_span_getter or _detect_horizontal_taskbar_occupied_spans
         )
@@ -9325,14 +9331,38 @@ class AiUsageTaskbarOverlay:
             priority = normalize_taskbar_side_priority(
                 runtime.get("taskbar_side_priority")
             ).value
-            offset = 0 if str(side) == priority else self._PANE_SIZE
+            distribution = normalize_taskbar_pane_distribution(
+                runtime.get("taskbar_pane_distribution")
+            )
+            profile_ids = [
+                str(profile.get("id") or f"__selected_{index}")
+                for index, profile in enumerate(selected)
+            ]
+            profile_by_id = dict(zip(profile_ids, selected))
+            assignment = resolve_taskbar_pane_assignment(
+                profile_ids,
+                profile_ids,
+                priority,
+                distribution,
+            )
+            pane_profiles = [
+                profile_by_id[profile_id]
+                for profile_id in assignment.get(str(side), [])
+                if profile_id in profile_by_id
+            ]
+            if (
+                bool(self._vertical_taskbar)
+                and distribution is TaskbarPaneDistribution.BALANCED
+                and len(selected) == 2
+            ):
+                # A vertical taskbar has one supported overlay pane. Keep both
+                # profiles visible there instead of hiding the opposite half.
+                pane_profiles = list(selected) if str(side) == _SLOT_SIDE_LEFT else []
             pane_runtime = dict(runtime)
             # Always publish a ``profiles`` list, even when the legacy source
             # was ``accounts``.  The single-pane renderer then cannot reach a
             # profile owned by its peer pane.
-            pane_runtime["profiles"] = list(
-                selected[int(offset) : int(offset) + self._PANE_SIZE]
-            )
+            pane_runtime["profiles"] = pane_profiles
             pane_runtime.pop("accounts", None)
             return pane_runtime
 
@@ -9507,17 +9537,47 @@ class AiUsageTaskbarOverlay:
             right_ok = bool(self._right_pane.refresh())
         except Exception:
             right_ok = False
-        right_model = self._right_pane._last_model
-        right_geometry = _model_geometry(right_model)
-        if not isinstance(right_geometry, dict):
-            right_geometry = {}
+        left_geometry = _model_geometry(self._left_pane._last_model)
+        if not isinstance(left_geometry, dict):
+            left_geometry = {}
+        orientation = str(left_geometry.get("orientation") or "")
+        is_vertical_taskbar = orientation not in {"bottom", "top"}
+        if is_vertical_taskbar != bool(self._vertical_taskbar):
+            self._vertical_taskbar = is_vertical_taskbar
+            if self._uses_balanced_two_profile_layout():
+                # Apply the orientation-specific mapping in this refresh cycle
+                # so neither profile stays hidden for an extra interval.
+                try:
+                    left_ok = bool(self._left_pane.refresh()) and left_ok
+                except Exception:
+                    left_ok = False
+                try:
+                    right_ok = bool(self._right_pane.refresh()) and right_ok
+                except Exception:
+                    right_ok = False
         # A vertical taskbar has no left/right horizontal slots.  Avoid
         # stacking the two panes on that unsupported orientation; the first
         # pane remains available and the second returns when the taskbar is
         # horizontal again.
-        if str(right_geometry.get("orientation") or "") not in {"bottom", "top"}:
+        if is_vertical_taskbar:
             self._right_pane.hide()
         return left_ok and right_ok
+
+    def _uses_balanced_two_profile_layout(self) -> bool:
+        try:
+            runtime = self._runtime_getter()
+        except Exception:
+            runtime = {}
+        if not isinstance(runtime, dict):
+            return False
+        selected = _selected_taskbar_profiles(_taskbar_profile_source(runtime))
+        return (
+            normalize_taskbar_pane_distribution(
+                runtime.get("taskbar_pane_distribution")
+            )
+            is TaskbarPaneDistribution.BALANCED
+            and len(selected) == 2
+        )
 
     def hide(self) -> None:
         self._clear_pane_occupancy_cache()
