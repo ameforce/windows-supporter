@@ -20,7 +20,14 @@ class TaskbarSidePriority(StrEnum):
     RIGHT = "right"
 
 
+@unique
+class TaskbarPaneDistribution(StrEnum):
+    PRIORITY = "priority"
+    BALANCED = "balanced"
+
+
 DEFAULT_TASKBAR_SIDE_PRIORITY = TaskbarSidePriority.LEFT
+DEFAULT_TASKBAR_PANE_DISTRIBUTION = TaskbarPaneDistribution.PRIORITY
 
 
 def normalize_taskbar_side_priority(value: object) -> TaskbarSidePriority:
@@ -44,6 +51,27 @@ def is_valid_taskbar_side_priority(value: object) -> bool:
     return key in {"left", "left_first", "right", "right_first"}
 
 
+def normalize_taskbar_pane_distribution(value: object) -> TaskbarPaneDistribution:
+    if isinstance(value, TaskbarPaneDistribution):
+        return value
+    key = str(value or "").strip().lower().replace("-", "_")
+    key = "_".join(key.split())
+    return {
+        "priority": TaskbarPaneDistribution.PRIORITY,
+        "priority_first": TaskbarPaneDistribution.PRIORITY,
+        "balanced": TaskbarPaneDistribution.BALANCED,
+        "balance": TaskbarPaneDistribution.BALANCED,
+    }.get(key, DEFAULT_TASKBAR_PANE_DISTRIBUTION)
+
+
+def is_valid_taskbar_pane_distribution(value: object) -> bool:
+    if isinstance(value, TaskbarPaneDistribution):
+        return True
+    key = str(value or "").strip().lower().replace("-", "_")
+    key = "_".join(key.split())
+    return key in {"priority", "priority_first", "balanced", "balance"}
+
+
 TASKBAR_PANE_SIZE = 2
 TASKBAR_SELECTED_LIMIT = 4
 
@@ -52,14 +80,14 @@ def resolve_taskbar_pane_assignment(
     order: list[str] | tuple[str, ...],
     selected_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str],
     priority: object,
+    distribution: object = DEFAULT_TASKBAR_PANE_DISTRIBUTION,
 ) -> dict[str, list[str]]:
     """Map the ordered profile list onto left/right/pool boxes.
 
-    The overlay renders the first two selected profiles on the priority
-    side pane and the next two on the opposite pane
-    (``_PANE_SIZE = 2``). This helper exposes that same mapping so the
-    settings surface can show one box per physical side plus a pool box
-    for profiles that are stored but not shown on the taskbar.
+    Priority distribution groups the first two selected profiles on the
+    priority side and the next two on the opposite side. Balanced
+    distribution alternates profiles between sides, giving an odd extra
+    slot to the priority side. This helper is shared by settings and overlay.
     """
     normalized_order = [str(item or "").strip() for item in (order or [])]
     normalized_order = [item for item in normalized_order if item]
@@ -69,7 +97,16 @@ def resolve_taskbar_pane_assignment(
         item for item in normalized_order if item in selected_set
     ][: max(0, int(TASKBAR_SELECTED_LIMIT))]
     side = normalize_taskbar_side_priority(priority).value
-    if side == TaskbarSidePriority.RIGHT.value:
+    if normalize_taskbar_pane_distribution(distribution) is TaskbarPaneDistribution.BALANCED:
+        priority_profiles = selected_in_order[::2]
+        opposite_profiles = selected_in_order[1::2]
+        if side == TaskbarSidePriority.RIGHT.value:
+            right = priority_profiles
+            left = opposite_profiles
+        else:
+            left = priority_profiles
+            right = opposite_profiles
+    elif side == TaskbarSidePriority.RIGHT.value:
         right = selected_in_order[: int(TASKBAR_PANE_SIZE)]
         left = selected_in_order[int(TASKBAR_PANE_SIZE) :]
     else:
@@ -89,6 +126,7 @@ def plan_taskbar_drop(
     target_index: int,
     *,
     target_profile_id: str | None = None,
+    distribution: object = DEFAULT_TASKBAR_PANE_DISTRIBUTION,
 ) -> dict[str, list[str]]:
     """Compute a new order/selection after a drag-and-drop gesture.
 
@@ -119,10 +157,21 @@ def plan_taskbar_drop(
     if target not in {"left", "right", "pool"}:
         raise ValueError("target side must be left, right or pool")
     assignment = resolve_taskbar_pane_assignment(
-        normalized_order, selected_ids, priority
+        normalized_order, selected_ids, priority, distribution
     )
     side = normalize_taskbar_side_priority(priority).value
-    if side == TaskbarSidePriority.RIGHT.value:
+    distribution_value = normalize_taskbar_pane_distribution(distribution)
+    opposite_side = "left" if side == "right" else "right"
+    if distribution_value is TaskbarPaneDistribution.BALANCED:
+        priority_profiles = assignment[side]
+        opposite_profiles = assignment[opposite_side]
+        selected_seq = []
+        for index in range(max(len(priority_profiles), len(opposite_profiles))):
+            if index < len(priority_profiles):
+                selected_seq.append(priority_profiles[index])
+            if index < len(opposite_profiles):
+                selected_seq.append(opposite_profiles[index])
+    elif side == TaskbarSidePriority.RIGHT.value:
         selected_seq = list(assignment["right"]) + list(assignment["left"])
     else:
         selected_seq = list(assignment["left"]) + list(assignment["right"])
@@ -169,9 +218,13 @@ def plan_taskbar_drop(
         raise ValueError("dragged profile is unknown")
     if not was_selected and len(selected_seq) >= int(TASKBAR_SELECTED_LIMIT):
         raise ValueError("taskbar-selected profiles exceed the maximum")
-    offset = 0 if target == side else int(TASKBAR_PANE_SIZE)
     index = max(0, int(target_index))
-    insert_at = min(offset + index, len(selected_seq))
+    if distribution_value is TaskbarPaneDistribution.BALANCED:
+        pane_offset = 0 if target == side else 1
+        insert_at = min(index * 2 + pane_offset, len(selected_seq))
+    else:
+        offset = 0 if target == side else int(TASKBAR_PANE_SIZE)
+        insert_at = min(offset + index, len(selected_seq))
     selected_seq.insert(insert_at, dragged)
     new_order = list(selected_seq) + [item for item in pool_seq if item != dragged]
     # Preserve previously unseen ids (defensive: callers pass full order,
