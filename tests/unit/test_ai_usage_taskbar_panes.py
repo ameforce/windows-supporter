@@ -72,6 +72,25 @@ class ResolveTaskbarPaneAssignmentTest(unittest.TestCase):
         self.assertEqual(assignment["left"], ["c", "d"])
         self.assertEqual(assignment["pool"], [])
 
+    def test_balanced_distribution_alternates_and_gives_odd_extra_to_priority_side(self) -> None:
+        two = resolve_taskbar_pane_assignment(
+            ["a", "b"], ["a", "b"], "left", "balanced"
+        )
+        self.assertEqual(two["left"], ["a"])
+        self.assertEqual(two["right"], ["b"])
+
+        three = resolve_taskbar_pane_assignment(
+            ["a", "b", "c"], ["a", "b", "c"], "right", "balanced"
+        )
+        self.assertEqual(three["right"], ["a", "c"])
+        self.assertEqual(three["left"], ["b"])
+
+        four = resolve_taskbar_pane_assignment(
+            ["a", "b", "c", "d"], ["a", "b", "c", "d"], "left", "balanced"
+        )
+        self.assertEqual(four["left"], ["a", "c"])
+        self.assertEqual(four["right"], ["b", "d"])
+
     def test_unselected_profiles_fall_into_pool_in_order(self) -> None:
         assignment = resolve_taskbar_pane_assignment(
             ["a", "b", "c"], ["b"], "left"
@@ -109,6 +128,35 @@ class PlanTaskbarDropTest(unittest.TestCase):
             ["a", "b", "c", "d"], ["a", "b", "c", "d"], "right", "c", "right", 0
         )
         self.assertEqual(plan["selected"], ["c", "a", "b", "d"])
+
+    def test_balanced_drop_uses_alternating_slot_order(self) -> None:
+        plan = plan_taskbar_drop(
+            ["a", "b", "c", "d"],
+            ["a", "b", "c", "d"],
+            "left",
+            "d",
+            "right",
+            0,
+            distribution="balanced",
+        )
+        self.assertEqual(plan["selected"], ["a", "d", "b", "c"])
+        assignment = resolve_taskbar_pane_assignment(
+            plan["order"], plan["selected"], "left", "balanced"
+        )
+        self.assertEqual(assignment["left"], ["a", "b"])
+        self.assertEqual(assignment["right"], ["d", "c"])
+
+    def test_balanced_two_profile_drop_keeps_both_profiles_on_taskbar(self) -> None:
+        plan = plan_taskbar_drop(
+            ["a", "b"], ["a", "b"], "left", "b", "left", 0,
+            distribution="balanced",
+        )
+        self.assertEqual(plan["selected"], ["b", "a"])
+        assignment = resolve_taskbar_pane_assignment(
+            plan["order"], plan["selected"], "left", "balanced"
+        )
+        self.assertEqual(assignment["left"], ["b"])
+        self.assertEqual(assignment["right"], ["a"])
 
     def test_drop_into_pool_deselects(self) -> None:
         plan = plan_taskbar_drop(
@@ -207,6 +255,21 @@ class ApplyPaneDropTest(unittest.TestCase):
         view._pane_lists = {"left": object(), "right": object(), "pool": object()}
         self.assertFalse(view._pane_assignment_rendered_stale())
         view._taskbar_side_priority_var.set("right")
+        self.assertTrue(view._pane_assignment_rendered_stale())
+
+    def test_stale_assignment_detects_distribution_flip(self) -> None:
+        view = self._build_view(
+            order=["a", "b", "c", "d"],
+            selected=["a", "b", "c", "d"],
+            priority="left",
+        )
+        view._rendered_side_priority = "left"
+        view._rendered_pane_distribution = "priority"
+        view._rendered_pane_assignment = resolve_taskbar_pane_assignment(
+            ["a", "b", "c", "d"], ["a", "b", "c", "d"], "left"
+        )
+        view._pane_lists = {"left": object(), "right": object(), "pool": object()}
+        view._taskbar_pane_distribution_var = _FakeVar("balanced")
         self.assertTrue(view._pane_assignment_rendered_stale())
 
 

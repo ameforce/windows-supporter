@@ -5,10 +5,13 @@ import unittest
 from src.apps.ai_usage_contracts import (
     AiUsageProvider,
     AiUsageReading,
+    TaskbarPaneDistribution,
     TaskbarSidePriority,
     UsageErrorType,
     UsageState,
+    is_valid_taskbar_pane_distribution,
     is_valid_taskbar_side_priority,
+    normalize_taskbar_pane_distribution,
     normalize_taskbar_side_priority,
     normalize_usage_error_type,
     normalize_usage_state,
@@ -36,6 +39,22 @@ class AiUsageContractsUnitTest(unittest.TestCase):
         )
         self.assertTrue(is_valid_taskbar_side_priority("left"))
         self.assertFalse(is_valid_taskbar_side_priority("center"))
+
+    def test_taskbar_pane_distribution_normalizes_and_defaults_to_priority(self) -> None:
+        self.assertEqual(
+            normalize_taskbar_pane_distribution("balanced"),
+            TaskbarPaneDistribution.BALANCED,
+        )
+        self.assertEqual(
+            normalize_taskbar_pane_distribution("priority-first"),
+            TaskbarPaneDistribution.PRIORITY,
+        )
+        self.assertEqual(
+            normalize_taskbar_pane_distribution("unknown"),
+            TaskbarPaneDistribution.PRIORITY,
+        )
+        self.assertTrue(is_valid_taskbar_pane_distribution("balanced"))
+        self.assertFalse(is_valid_taskbar_pane_distribution("center"))
 
     def test_runtime_failure_aliases_normalize_to_stable_states(self) -> None:
         cases = {

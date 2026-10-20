@@ -966,9 +966,10 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view.mount(_FakeWidget())
 
         self.assertEqual(view._taskbar_side_priority_var.get(), "left")
+        self.assertEqual(view._taskbar_pane_distribution_var.get(), "priority")
         self.assertEqual(
             [radio.kwargs["value"] for radio in fake_ttk.radiobuttons],
-            ["left", "right"],
+            ["left", "right", "priority", "balanced"],
         )
         # 테마 기본 회색 대신 카드 배경을 칠하는 전용 스타일을 쓴다.
         self.assertEqual(
@@ -1637,13 +1638,14 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         self.assertIn("프로필 경로: profile-2", canvas_texts)
         self.assertIn("조회 상태: -", canvas_texts)
 
-    def test_mount_renders_saved_right_priority_boxes_on_first_paint(self) -> None:
+    def test_mount_renders_saved_balanced_boxes_on_first_paint(self) -> None:
         class _FakeMonitor:
             def get_settings_snapshot(self):
                 return {
                     "enabled": True,
                     "taskbar_overlay_enabled": True,
                     "taskbar_side_priority": "right",
+                    "taskbar_pane_distribution": "balanced",
                     "interval_sec": 90,
                     "tooltip_duration_ms": 7000,
                     "usage_url": "https://example.test",
@@ -1683,11 +1685,12 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view.mount(parent)
 
         self.assertEqual(view._rendered_side_priority, "right")
+        self.assertEqual(view._rendered_pane_distribution, "balanced")
         rendered = view._rendered_pane_assignment
-        self.assertEqual(rendered["right"], ["account_1", "account_2"])
-        self.assertEqual(rendered["left"], ["account_3", "account_4"])
-        self.assertIn("1·2번 슬롯", view._scroll_canvas.itemcget(view._pane_hints["right"].item, "text"))
-        self.assertIn("3·4번 슬롯", view._scroll_canvas.itemcget(view._pane_hints["left"].item, "text"))
+        self.assertEqual(rendered["right"], ["account_1", "account_3"])
+        self.assertEqual(rendered["left"], ["account_2", "account_4"])
+        self.assertIn("1·3번 슬롯", view._scroll_canvas.itemcget(view._pane_hints["right"].item, "text"))
+        self.assertIn("2·4번 슬롯", view._scroll_canvas.itemcget(view._pane_hints["left"].item, "text"))
 
     def test_save_remounts_when_pane_assignment_goes_stale(self) -> None:
         class _FakeMonitor:
@@ -2698,6 +2701,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
         view._enabled_var = _FakeVar(value=True)
         view._taskbar_overlay_var = _FakeVar(value=False)
         view._taskbar_side_priority_var = _FakeVar(value="right")
+        view._taskbar_pane_distribution_var = _FakeVar(value="balanced")
         view._interval_var = _FakeVar(value="90")
         view._tooltip_var = _FakeVar(value="7")
         statuses = []
@@ -2708,6 +2712,7 @@ class CodexUsageUiUnitTest(unittest.TestCase):
 
         self.assertEqual(monitor.update_payloads[-1]["taskbar_overlay_enabled"], False)
         self.assertEqual(monitor.update_payloads[-1]["taskbar_side_priority"], "right")
+        self.assertEqual(monitor.update_payloads[-1]["taskbar_pane_distribution"], "balanced")
         self.assertEqual(statuses[-1], ("저장됨", "ok"))
 
     def test_save_includes_limit_reset_sound_toggles(self) -> None:
