@@ -228,6 +228,53 @@ class AiUsageTaskbarOverlayPaneTest(unittest.TestCase):
             ["Profile 1", "Profile 2"],
         )
 
+    def test_balanced_two_profiles_render_one_on_each_side(self):
+        windows = []
+        runtime = self._runtime(2)
+        runtime["taskbar_pane_distribution"] = "balanced"
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: runtime,
+            window_factory=lambda _root: windows.append(_FakeWindow()) or windows[-1],
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+
+        self.assertTrue(overlay.refresh())
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(
+            [bar["label"] for bar in windows[0].draw_calls[-1]["bars"]],
+            ["Profile 1"],
+        )
+        self.assertEqual(
+            [bar["label"] for bar in windows[1].draw_calls[-1]["bars"]],
+            ["Profile 2"],
+        )
+
+    def test_balanced_two_profiles_reflow_into_visible_pane_on_vertical_taskbar(self):
+        windows = []
+        runtime = self._runtime(2)
+        runtime["taskbar_pane_distribution"] = "balanced"
+        overlay = taskbar_overlay.AiUsageTaskbarOverlay(
+            _FakeRoot(),
+            lambda: runtime,
+            window_factory=lambda _root: windows.append(_FakeWindow()) or windows[-1],
+            work_area_getter=lambda: (0, 0, 1920, 1040),
+            occupied_span_getter=lambda *_args: [],
+        )
+        vertical_geometry = dict(taskbar_overlay._DEFAULT_GEOMETRY)
+        vertical_geometry["orientation"] = "left"
+        overlay._left_pane._calculate_geometry = lambda **_kwargs: dict(vertical_geometry)
+        overlay._right_pane._calculate_geometry = lambda **_kwargs: dict(vertical_geometry)
+
+        self.assertTrue(overlay.refresh())
+        self.assertTrue(overlay._vertical_taskbar)
+        self.assertEqual(
+            [bar["label"] for bar in windows[0].draw_calls[-1]["bars"]],
+            ["Profile 1", "Profile 2"],
+        )
+        self.assertGreater(windows[1].withdraw_calls, 0)
+
     def test_left_and_right_panes_share_one_occupancy_snapshot_per_cycle(self):
         base_calls = []
 

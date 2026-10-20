@@ -31,6 +31,7 @@ SCENARIO_NAMES = (
     "refresh-layout-stability-wide",
     "one-profile-125",
     "dynamic-three-profiles",
+    "balanced-two-taskbar-profiles",
     "four-taskbar-profiles",
     "ten-mixed-profiles-150",
     "long-label-narrow",
@@ -248,6 +249,8 @@ def build_scenario_fixture(
             _runtime_profile(third_profile, _ready_runtime(), _codex_snapshot(recent))
         )
         interaction = {"action": "mousewheel_scroll", "profile_id": ""}
+    elif scenario == "balanced-two-taskbar-profiles":
+        interaction = {"action": "none"}
     elif scenario == "four-taskbar-profiles":
         for index, provider in ((3, "codex"), (4, "cursor")):
             profile = _profile_settings(
@@ -277,6 +280,10 @@ def build_scenario_fixture(
     settings = {
         "enabled": True,
         "taskbar_overlay_enabled": True,
+        "taskbar_side_priority": "left",
+        "taskbar_pane_distribution": (
+            "balanced" if scenario == "balanced-two-taskbar-profiles" else "priority"
+        ),
         "interval_sec": 90.0,
         "tooltip_duration_ms": 7000,
         "usage_url": "https://example.invalid/ai-usage",
@@ -294,6 +301,10 @@ def build_scenario_fixture(
     }
     runtime = {
         "enabled": True,
+        "taskbar_side_priority": "left",
+        "taskbar_pane_distribution": (
+            "balanced" if scenario == "balanced-two-taskbar-profiles" else "priority"
+        ),
         "monitor_state": "mixed",
         "session_state": "mixed",
         "profiles": copy.deepcopy(runtime_profiles),
@@ -1093,15 +1104,32 @@ def capture_provenance() -> dict[str, Any]:
     }
 
 
-def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, Any]:
+def run_capture_matrix(
+    output_dir: Path,
+    *,
+    settle_ms: int = 180,
+    scenario_names: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     output_dir = validate_output_dir(output_dir)
+    selected_scenarios = tuple(
+        dict.fromkeys(SCENARIO_NAMES if scenario_names is None else scenario_names)
+    )
+    unknown_scenarios = [
+        name for name in selected_scenarios if name not in SCENARIO_NAMES
+    ]
+    if unknown_scenarios:
+        raise ValueError(f"unknown scenarios: {', '.join(unknown_scenarios)}")
     output_dir.mkdir(parents=True, exist_ok=True)
     provenance = capture_provenance()
     dpi_awareness = _enable_per_monitor_dpi_awareness()
     generated_at = datetime.now(timezone.utc)
     results: list[dict[str, Any]] = []
-    for name in SCENARIO_NAMES:
-        fixture = build_scenario_fixture(name, now=generated_at)
+    fixtures = [
+        build_scenario_fixture(name, now=generated_at)
+        for name in selected_scenarios
+    ]
+    for fixture in fixtures:
+        name = str(fixture.get("name") or "")
         try:
             results.append(
                 capture_scenario(
@@ -1123,10 +1151,13 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
 
     generated_pngs = [
         name
-        for name in (f"{scenario}.png" for scenario in SCENARIO_NAMES)
+        for name in (f"{scenario}.png" for scenario in selected_scenarios)
         if (output_dir / name).is_file()
     ]
     phases = {str(result.get("phase") or "") for result in results if result.get("ok")}
+    required_phases = sorted(
+        {str(fixture.get("phase") or "") for fixture in fixtures}
+    )
     final_provenance = capture_provenance()
     provenance_stable = provenance == final_provenance
     report = {
@@ -1138,10 +1169,10 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
             and
             provenance_stable
             and
-            len(results) == len(SCENARIO_NAMES)
+            len(results) == len(selected_scenarios)
             and all(bool(result.get("ok")) for result in results)
-            and len(generated_pngs) == len(SCENARIO_NAMES)
-            and {"initial", "interaction", "final"}.issubset(phases)
+            and len(generated_pngs) == len(selected_scenarios)
+            and set(required_phases).issubset(phases)
         ),
         "generated_at_utc": _iso(generated_at),
         "git_sha": provenance["git_sha"],
@@ -1165,7 +1196,8 @@ def run_capture_matrix(output_dir: Path, *, settle_ms: int = 180) -> dict[str, A
             "machine": platform.machine(),
             "python": platform.python_version(),
         },
-        "required_phases": ["initial", "interaction", "final"],
+        "selected_scenarios": list(selected_scenarios),
+        "required_phases": required_phases,
         "generated_pngs": generated_pngs,
         "results": results,
     }
@@ -1191,6 +1223,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=180,
         help="Short UI settle interval before each capture.",
     )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=SCENARIO_NAMES,
+        help="Capture only this scenario. Repeat to capture a small subset.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1203,6 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_capture_matrix(
             validate_output_dir(args.output_dir),
             settle_ms=max(0, min(2000, int(args.settle_ms))),
+            scenario_names=args.scenario,
         )
     except Exception as exc:
         print(f"AI usage native visual capture failed: {exc}", file=sys.stderr)

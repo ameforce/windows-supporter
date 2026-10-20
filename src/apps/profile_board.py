@@ -234,7 +234,15 @@ class CardRegion:
 
 
 class ProfileBoard:
-    def __init__(self, tk: Any, parent: Any, view: Any, assignment: dict, priority: str):
+    def __init__(
+        self,
+        tk: Any,
+        parent: Any,
+        view: Any,
+        assignment: dict,
+        priority: str,
+        distribution: str = "priority",
+    ):
         self.view = view
         self.regions: list[CardRegion] = []
         self.width = 720
@@ -253,7 +261,10 @@ class ProfileBoard:
         for side, title in (("left","왼쪽 영역"),("right","오른쪽 영역"),("pool","표시 안 함 (보관함)")):
             count = len(assignment.get(side, []))
             caption = f"{title} ({count}/2)" if side != "pool" else f"{title} ({count})"
-            slots = "1·2번" if side == priority else "3·4번"
+            if distribution == "balanced":
+                slots = "1·3번" if side == priority else "2·4번"
+            else:
+                slots = "1·2번" if side == priority else "3·4번"
             hint = f"작업표시줄 {slots} 슬롯 · 제목을 끌어 교환" if side != "pool" else "끌어다 놓으면 작업표시줄에서 제외됩니다."
             self.groups[side] = BoardGroup(self, side, caption, hint)
         self.indicators = {side:BoardIndicator(group) for side,group in self.groups.items()}

@@ -14,9 +14,12 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from src.apps.ai_usage_contracts import (
+    DEFAULT_TASKBAR_PANE_DISTRIBUTION,
     DEFAULT_TASKBAR_SIDE_PRIORITY,
+    is_valid_taskbar_pane_distribution,
     is_valid_taskbar_side_priority,
     normalize_reset_boundary,
+    normalize_taskbar_pane_distribution,
     normalize_taskbar_side_priority,
 )
 from src.apps.codex_local_usage import find_latest_windows_codex_usage
@@ -151,6 +154,7 @@ class CodexUsageMultiMonitor:
         self.__enabled = True
         self.__taskbar_overlay_enabled = True
         self.__taskbar_side_priority = DEFAULT_TASKBAR_SIDE_PRIORITY.value
+        self.__taskbar_pane_distribution = DEFAULT_TASKBAR_PANE_DISTRIBUTION.value
         self.__interval_sec = 90.0
         self.__tooltip_duration_ms = 7000
         # Reset fanfare switches shared by every profile. Profiles read them
@@ -386,6 +390,7 @@ class CodexUsageMultiMonitor:
             "enabled": bool(self.__enabled),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
             "taskbar_side_priority": str(self.__taskbar_side_priority),
+            "taskbar_pane_distribution": str(self.__taskbar_pane_distribution),
             "interval_sec": float(self.__interval_sec),
             "tooltip_duration_ms": int(self.__tooltip_duration_ms),
             "limit_reset_sound_enabled": bool(self.__limit_reset_sound_enabled),
@@ -705,6 +710,7 @@ class CodexUsageMultiMonitor:
         candidate_enabled = self.__enabled
         candidate_taskbar_overlay_enabled = self.__taskbar_overlay_enabled
         candidate_taskbar_side_priority = self.__taskbar_side_priority
+        candidate_taskbar_pane_distribution = self.__taskbar_pane_distribution
         candidate_interval_sec = self.__interval_sec
         candidate_tooltip_duration_ms = self.__tooltip_duration_ms
         candidate_limit_reset_sound_enabled = self.__limit_reset_sound_enabled
@@ -719,6 +725,14 @@ class CodexUsageMultiMonitor:
                 return False, "taskbar_side_priority"
             candidate_taskbar_side_priority = normalize_taskbar_side_priority(
                 data.get("taskbar_side_priority")
+            ).value
+        if "taskbar_pane_distribution" in data:
+            if not is_valid_taskbar_pane_distribution(
+                data.get("taskbar_pane_distribution")
+            ):
+                return False, "taskbar_pane_distribution"
+            candidate_taskbar_pane_distribution = normalize_taskbar_pane_distribution(
+                data.get("taskbar_pane_distribution")
             ).value
         if "interval_sec" in data:
             try:
@@ -820,6 +834,7 @@ class CodexUsageMultiMonitor:
                 enabled=candidate_enabled,
                 taskbar_overlay_enabled=candidate_taskbar_overlay_enabled,
                 taskbar_side_priority=candidate_taskbar_side_priority,
+                taskbar_pane_distribution=candidate_taskbar_pane_distribution,
                 interval_sec=candidate_interval_sec,
                 tooltip_duration_ms=candidate_tooltip_duration_ms,
                 limit_reset_sound_enabled=candidate_limit_reset_sound_enabled,
@@ -879,6 +894,7 @@ class CodexUsageMultiMonitor:
         self.__enabled = candidate_enabled
         self.__taskbar_overlay_enabled = candidate_taskbar_overlay_enabled
         self.__taskbar_side_priority = candidate_taskbar_side_priority
+        self.__taskbar_pane_distribution = candidate_taskbar_pane_distribution
         self.__interval_sec = candidate_interval_sec
         self.__tooltip_duration_ms = candidate_tooltip_duration_ms
         self.__limit_reset_sound_enabled = candidate_limit_reset_sound_enabled
@@ -1268,6 +1284,7 @@ class CodexUsageMultiMonitor:
             "settings_error": str(self.__settings_write_block_reason or ""),
             "taskbar_overlay_enabled": bool(self.__taskbar_overlay_enabled),
             "taskbar_side_priority": str(self.__taskbar_side_priority),
+            "taskbar_pane_distribution": str(self.__taskbar_pane_distribution),
             "monitor_state": self.__aggregate_monitor_state(runtimes),
             "session_state": self.__aggregate_session_state(runtimes),
             "auto_monitoring_active": bool(self.__should_run_background_collection()),
@@ -2466,6 +2483,10 @@ class CodexUsageMultiMonitor:
             self.__taskbar_side_priority = normalize_taskbar_side_priority(
                 data.get("taskbar_side_priority")
             ).value
+        if "taskbar_pane_distribution" in data:
+            self.__taskbar_pane_distribution = normalize_taskbar_pane_distribution(
+                data.get("taskbar_pane_distribution")
+            ).value
         try:
             self.__interval_sec = float(data.get("interval_sec", self.__interval_sec))
         except Exception:
@@ -2620,6 +2641,7 @@ class CodexUsageMultiMonitor:
         interval_sec: float | None = None,
         tooltip_duration_ms: int | None = None,
         taskbar_side_priority: str | None = None,
+        taskbar_pane_distribution: str | None = None,
         limit_reset_sound_enabled: bool | None = None,
         limit_reset_sound_while_away: bool | None = None,
         usage_url: str | None = None,
@@ -2659,6 +2681,13 @@ class CodexUsageMultiMonitor:
                 self.__taskbar_side_priority
                 if taskbar_side_priority is None
                 else normalize_taskbar_side_priority(taskbar_side_priority).value
+            ),
+            "taskbar_pane_distribution": str(
+                self.__taskbar_pane_distribution
+                if taskbar_pane_distribution is None
+                else normalize_taskbar_pane_distribution(
+                    taskbar_pane_distribution
+                ).value
             ),
             "interval_sec": float(self.__interval_sec if interval_sec is None else interval_sec),
             "tooltip_duration_ms": int(
@@ -2708,6 +2737,10 @@ class CodexUsageMultiMonitor:
         if "taskbar_side_priority" in data:
             self.__taskbar_side_priority = normalize_taskbar_side_priority(
                 data.get("taskbar_side_priority")
+            ).value
+        if "taskbar_pane_distribution" in data:
+            self.__taskbar_pane_distribution = normalize_taskbar_pane_distribution(
+                data.get("taskbar_pane_distribution")
             ).value
         if "interval_sec" in data:
             try:

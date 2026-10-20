@@ -6,8 +6,10 @@ import threading
 from typing import Any
 
 from src.apps.ai_usage_contracts import (
+    TaskbarPaneDistribution,
     TASKBAR_PANE_SIZE,
     TaskbarSidePriority,
+    normalize_taskbar_pane_distribution,
     normalize_taskbar_side_priority,
     plan_taskbar_drop,
     resolve_taskbar_pane_assignment,
@@ -72,6 +74,7 @@ class CodexUsageSettingsView:
         self._enabled_var = None
         self._taskbar_overlay_var = None
         self._taskbar_side_priority_var = None
+        self._taskbar_pane_distribution_var = None
         self._interval_var = None
         self._tooltip_var = None
         self._limit_reset_sound_var = None
@@ -114,6 +117,7 @@ class CodexUsageSettingsView:
         self._drop_indicators: dict[str, Any] = {}
         self._drag_state: dict[str, Any] | None = None
         self._rendered_side_priority: str | None = None
+        self._rendered_pane_distribution: str | None = None
         self._rendered_pane_assignment: dict[str, list[str]] | None = None
         self._profile_deletions_inflight: set[str] = set()
         self._profile_actions_inflight: set[str] = set()
@@ -234,8 +238,10 @@ class CodexUsageSettingsView:
         self._drop_indicators = {}
         self._drag_state = None
         self._rendered_side_priority = None
+        self._rendered_pane_distribution = None
         self._rendered_pane_assignment = None
         self._taskbar_side_priority_var = None
+        self._taskbar_pane_distribution_var = None
         self._runtime_value_rows = []
         self._live_spark_visible = None
         self._button_enabled_states = {}
@@ -359,6 +365,11 @@ class CodexUsageSettingsView:
         self._taskbar_side_priority_var = tk.StringVar(
             value=TaskbarSidePriority.LEFT.value
         )
+        self._taskbar_pane_distribution_var = tk.StringVar(
+            value=normalize_taskbar_pane_distribution(
+                settings.get("taskbar_pane_distribution")
+            ).value
+        )
         self._interval_var = tk.StringVar(value="")
         self._tooltip_var = tk.StringVar(value="")
         self._limit_reset_sound_var = tk.BooleanVar(value=True)
@@ -476,6 +487,52 @@ class CodexUsageSettingsView:
                 radio.pack(side="left", padx=(12, 0))
         row += 1
 
+        placement_mode = tk.Frame(body, bg=card_bg)
+        placement_mode.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 3))
+        tk.Label(
+            placement_mode,
+            text="프로필 배치",
+            bg=card_bg,
+            fg="#374151",
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+        for label, value in (
+            ("우선 쪽에 모으기", TaskbarPaneDistribution.PRIORITY.value),
+            ("좌우 균등", TaskbarPaneDistribution.BALANCED.value),
+        ):
+            radio = None
+            if radio_style and callable(getattr(ttk, "Radiobutton", None)):
+                radio = ttk.Radiobutton(
+                    placement_mode,
+                    text=label,
+                    variable=self._taskbar_pane_distribution_var,
+                    value=value,
+                    style=radio_style,
+                )
+            elif callable(getattr(tk, "Radiobutton", None)):
+                radio = tk.Radiobutton(
+                    placement_mode,
+                    text=label,
+                    variable=self._taskbar_pane_distribution_var,
+                    value=value,
+                    bg=card_bg,
+                    activebackground=card_bg,
+                    selectcolor=card_bg,
+                    fg="#111827",
+                    activeforeground="#111827",
+                    font=("Segoe UI", 9),
+                )
+            if radio is not None:
+                radio.pack(side="left", padx=(12, 0))
+        tk.Label(
+            placement_mode,
+            text="균등 배치에서 홀수 프로필은 우선 쪽에 하나 더 표시",
+            bg=card_bg,
+            fg="#6B7280",
+            font=("Segoe UI", 8),
+        ).pack(side="left", padx=(12, 0))
+        row += 1
+
         tk.Label(
             body,
             text="조회 주기(초)",
@@ -526,6 +583,11 @@ class CodexUsageSettingsView:
                 text_muted,
                 side_priority=(
                     settings.get("taskbar_side_priority")
+                    if isinstance(settings, dict)
+                    else None
+                ),
+                pane_distribution=(
+                    settings.get("taskbar_pane_distribution")
                     if isinstance(settings, dict)
                     else None
                 ),
@@ -633,6 +695,7 @@ class CodexUsageSettingsView:
         border: str,
         text_muted: str,
         side_priority: object = None,
+        pane_distribution: object = None,
     ) -> int:
         tk = self._tk
         ttk = self._ttk
@@ -698,18 +761,18 @@ class CodexUsageSettingsView:
             str(raw.get("id", "") or "").strip()
             for raw in ordered_accounts
         ]
-        # 왼쪽/오른쪽 상자는 같은 순서·표시 모델을 보여주는 창이다. 오버레이가
-        # 우선 순위에 따라 선택 1·2번을 한쪽, 3·4번을 반대쪽에 두므로, 상자도
-        # 그 매핑을 그대로 보여준다. 설정 스키마 변경은 없다.
-        # 우선순위는 mount 시점의 저장 스냅샷에서 읽는다. 화면을 그릴 때는
-        # _load_settings() 전이라 우선순위 변수가 아직 기본값이므로, 변수에서
-        # 읽으면 저장된 오른쪽 우선 첫 화면이 뒤바뀌어 보인다.
+        # Pane assignment comes from the saved mount snapshot: _load_settings()
+        # runs after this board is built, so reading the Tk variables here would
+        # briefly show the default layout instead of the persisted one.
         if side_priority is None and self._taskbar_side_priority_var is not None:
             try:
                 side_priority = self._taskbar_side_priority_var.get()
             except Exception:
                 side_priority = None
         priority_value = normalize_taskbar_side_priority(side_priority).value
+        distribution_value = normalize_taskbar_pane_distribution(
+            pane_distribution
+        ).value
         assignment = resolve_taskbar_pane_assignment(
             self._account_order,
             [
@@ -718,8 +781,10 @@ class CodexUsageSettingsView:
                 if bool(raw.get("taskbar_selected", True))
             ],
             priority_value,
+            distribution_value,
         )
         self._rendered_side_priority = priority_value
+        self._rendered_pane_distribution = distribution_value
         self._rendered_pane_assignment = {
             side: list(ids) for side, ids in assignment.items()
         }
@@ -728,7 +793,14 @@ class CodexUsageSettingsView:
             for profile_id in assignment.get(side, []):
                 box_of[str(profile_id)] = side
         row += 1
-        board = ProfileBoard(tk, body, self, assignment, priority_value)
+        board = ProfileBoard(
+            tk,
+            body,
+            self,
+            assignment,
+            priority_value,
+            distribution_value,
+        )
         self._profile_board = board
         # Per-profile actions live in one shared popup menu opened from each
         # card; cards themselves stay windowless canvas regions.
@@ -1561,7 +1633,7 @@ class CodexUsageSettingsView:
                 pass
         return
 
-    def _pane_ui_state(self) -> tuple[list[str], list[str], str]:
+    def _pane_ui_state(self) -> tuple[list[str], list[str], str, str]:
         order = [str(item or "") for item in (self._account_order or [])]
         order = [item for item in order if item]
         selected: list[str] = []
@@ -1581,20 +1653,32 @@ class CodexUsageSettingsView:
             ).value
         except Exception:
             priority = TaskbarSidePriority.LEFT.value
-        return order, selected, priority
+        try:
+            distribution = normalize_taskbar_pane_distribution(
+                self._taskbar_pane_distribution_var.get()
+                if self._taskbar_pane_distribution_var is not None
+                else None
+            ).value
+        except Exception:
+            distribution = TaskbarPaneDistribution.PRIORITY.value
+        return order, selected, priority, distribution
 
     def _pane_assignment_rendered_stale(self) -> bool:
         rendered = self._rendered_pane_assignment
         if not isinstance(rendered, dict) or not self._pane_lists:
             return False
         try:
-            order, selected, priority = self._pane_ui_state()
+            order, selected, priority, distribution = self._pane_ui_state()
         except Exception:
             return False
         if priority != (self._rendered_side_priority or priority):
             return True
+        if distribution != (self._rendered_pane_distribution or distribution):
+            return True
         try:
-            current = resolve_taskbar_pane_assignment(order, selected, priority)
+            current = resolve_taskbar_pane_assignment(
+                order, selected, priority, distribution
+            )
         except Exception:
             return False
         for side in ("left", "right", "pool"):
@@ -1606,10 +1690,12 @@ class CodexUsageSettingsView:
         """Reposition existing cards; preserve controls, focus and scroll state."""
         if self._pane_card_parent is None:
             return False
-        order, selected, priority = self._pane_ui_state()
+        order, selected, priority, distribution = self._pane_ui_state()
         if set(order) != set(self._pane_card_widgets):
             return False
-        assignment = resolve_taskbar_pane_assignment(order, selected, priority)
+        assignment = resolve_taskbar_pane_assignment(
+            order, selected, priority, distribution
+        )
         previous = self._rendered_pane_assignment or {}
         for side in ("left", "right", "pool"):
             host = self._pane_lists.get(side)
@@ -1630,13 +1716,17 @@ class CodexUsageSettingsView:
             else:
                 name = "왼쪽 영역" if side == "left" else "오른쪽 영역"
                 text = f"{name} ({len(assignment[side])}/{TASKBAR_PANE_SIZE})"
-                slots = "1·2번 슬롯" if side == priority else "3·4번 슬롯"
+                if distribution == TaskbarPaneDistribution.BALANCED.value:
+                    slots = "1·3번 슬롯" if side == priority else "2·4번 슬롯"
+                else:
+                    slots = "1·2번 슬롯" if side == priority else "3·4번 슬롯"
                 if hint is not None:
                     hint.configure(text=f"작업표시줄 {slots} · 카드 위: 교환 · 사이: 이동")
             if title is not None:
                 title.configure(text=text)
         self._rendered_pane_assignment = assignment
         self._rendered_side_priority = priority
+        self._rendered_pane_distribution = distribution
         self._refresh_move_buttons()
         return True
 
@@ -1651,9 +1741,10 @@ class CodexUsageSettingsView:
         self, dragged_id: str, target_side: str, target_index: int,
         *, target_profile_id: str | None = None,
     ) -> bool:
-        order, selected, priority = self._pane_ui_state()
+        order, selected, priority, distribution = self._pane_ui_state()
         plan = plan_taskbar_drop(order, selected, priority, dragged_id, target_side, target_index,
-                                 target_profile_id=target_profile_id)
+                                 target_profile_id=target_profile_id,
+                                 distribution=distribution)
         if plan["order"] == order and set(plan["selected"]) == set(selected):
             return True
 
@@ -2179,6 +2270,14 @@ class CodexUsageSettingsView:
             except Exception:
                 pass
             try:
+                self._taskbar_pane_distribution_var.set(
+                    normalize_taskbar_pane_distribution(
+                        settings.get("taskbar_pane_distribution")
+                    ).value
+                )
+            except Exception:
+                pass
+            try:
                 interval = float(settings.get("interval_sec", 90.0))
                 self._interval_var.set(self._format_seconds(interval))
             except Exception:
@@ -2524,6 +2623,7 @@ class CodexUsageSettingsView:
             self._enabled_var,
             self._taskbar_overlay_var,
             self._taskbar_side_priority_var,
+            self._taskbar_pane_distribution_var,
             self._interval_var,
             self._limit_reset_sound_var,
             self._limit_reset_sound_while_away_var,
@@ -2656,6 +2756,11 @@ class CodexUsageSettingsView:
             "taskbar_side_priority": normalize_taskbar_side_priority(
                 self._taskbar_side_priority_var.get()
                 if self._taskbar_side_priority_var is not None
+                else None
+            ).value,
+            "taskbar_pane_distribution": normalize_taskbar_pane_distribution(
+                self._taskbar_pane_distribution_var.get()
+                if self._taskbar_pane_distribution_var is not None
                 else None
             ).value,
             "interval_sec": interval_sec,
