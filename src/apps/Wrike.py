@@ -118,6 +118,11 @@ FLEX_WINDOW_WATCH_INTERVAL_SEC = 1.0
 # One observation can be a page that redirects to the login screen a moment
 # later.
 FLEX_LOGIN_STABLE_PROBES = 2
+
+DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC = 30
+DEFAULT_OVERTIME_IDLE_PAUSE_SEC = 30
+MIN_OVERTIME_INTERVAL_SEC = 30
+MAX_OVERTIME_INTERVAL_SEC = 120 * 60
 # Who asked for a Flex sync.  It decides whether the result is announced and
 # whether a login expiry opens the login window.
 FLEX_SYNC_SOURCE_PERIODIC = "periodic"
@@ -375,9 +380,9 @@ class Wrike:
         self.__flex_employee_number = ""
         self.__flex_detected_employee_number = ""
         self.__flex_poll_interval_sec = 300.0
-        self.__overtime_notice_interval_min = 10
+        self.__overtime_notice_interval_sec = DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC
         self.__overtime_idle_pause_enabled = True
-        self.__overtime_idle_pause_min = 5
+        self.__overtime_idle_pause_sec = DEFAULT_OVERTIME_IDLE_PAUSE_SEC
         self.__flex_browser_profile_dir = self.__lib.os.path.join(
             self.__time_log_config_dir,
             FLEX_BROWSER_PROFILE_DIR_NAME,
@@ -2554,9 +2559,15 @@ class Wrike:
         generation = int(self.__overtime_notice_generation)
         automatic_generation = self.__automatic_ui_generation
         try:
-            delay_ms = max(60_000, int(self.__overtime_notice_interval_min) * 60_000)
+            delay_ms = max(
+                MIN_OVERTIME_INTERVAL_SEC * 1000,
+                min(
+                    MAX_OVERTIME_INTERVAL_SEC * 1000,
+                    int(self.__overtime_notice_interval_sec) * 1000,
+                ),
+            )
         except Exception:
-            delay_ms = 600_000
+            delay_ms = DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC * 1000
 
         def tick() -> None:
             if (
@@ -4772,10 +4783,13 @@ class Wrike:
         if not self.__overtime_idle_pause_enabled:
             return None
         try:
-            minutes = int(self.__overtime_idle_pause_min)
+            seconds = int(self.__overtime_idle_pause_sec)
         except Exception:
             return None
-        return max(1, min(120, minutes)) * 60
+        return max(
+            MIN_OVERTIME_INTERVAL_SEC,
+            min(MAX_OVERTIME_INTERVAL_SEC, seconds),
+        )
 
     def __on_overtime_idle_input(self, detected_at) -> None:
         if not self.__automatic_ui_allowed():
@@ -4831,13 +4845,16 @@ class Wrike:
         self.__start_overtime_notice_timer(show_now=True)
 
     def __break_return_idle_seconds(self) -> int:
-        # Shares the idle minutes of overtime auto-pause but not its on/off
+        # Shares the idle seconds of overtime auto-pause but not its on/off
         # switch: the break question must work with auto-pause turned off.
         try:
-            minutes = int(self.__overtime_idle_pause_min)
+            seconds = int(self.__overtime_idle_pause_sec)
         except Exception:
-            minutes = 5
-        return max(1, min(120, minutes)) * 60
+            seconds = DEFAULT_OVERTIME_IDLE_PAUSE_SEC
+        return max(
+            MIN_OVERTIME_INTERVAL_SEC,
+            min(MAX_OVERTIME_INTERVAL_SEC, seconds),
+        )
 
     def __active_manual_break_started_at(self, now):
         try:
@@ -8306,13 +8323,19 @@ class Wrike:
                 self.__flex_detected_employee_number or ""
             ),
             "flex_status": self.__flex_status_snapshot(),
-            "overtime_notice_interval_min": int(
-                self.__overtime_notice_interval_min
+            "overtime_notice_interval_sec": int(
+                self.__overtime_notice_interval_sec
+            ),
+            "overtime_notice_interval_min": (
+                float(self.__overtime_notice_interval_sec) / 60.0
             ),
             "overtime_idle_pause_enabled": bool(
                 self.__overtime_idle_pause_enabled
             ),
-            "overtime_idle_pause_min": int(self.__overtime_idle_pause_min),
+            "overtime_idle_pause_sec": int(self.__overtime_idle_pause_sec),
+            "overtime_idle_pause_min": (
+                float(self.__overtime_idle_pause_sec) / 60.0
+            ),
         }
         return snapshot
 
@@ -8380,9 +8403,9 @@ class Wrike:
             "flex_employee_number",
             "flex_detected_employee_number",
             "flex_poll_interval_sec",
-            "overtime_notice_interval_min",
+            "overtime_notice_interval_sec",
             "overtime_idle_pause_enabled",
-            "overtime_idle_pause_min",
+            "overtime_idle_pause_sec",
         )
         with self.__timelog_snapshot_lock, self.__vacation_ical_lock:
             return {
@@ -8433,20 +8456,30 @@ class Wrike:
             "flex_poll_interval_sec",
             self.__flex_poll_interval_sec,
         )
-        overtime_notice_raw = data.get(
-            "overtime_notice_interval_min",
-            self.__overtime_notice_interval_min,
-        )
+        if "overtime_notice_interval_sec" in data:
+            overtime_notice_raw = data["overtime_notice_interval_sec"]
+            overtime_notice_multiplier = 1
+        elif "overtime_notice_interval_min" in data:
+            overtime_notice_raw = data["overtime_notice_interval_min"]
+            overtime_notice_multiplier = 60
+        else:
+            overtime_notice_raw = self.__overtime_notice_interval_sec
+            overtime_notice_multiplier = 1
         overtime_idle_pause_enabled = bool(
             data.get(
                 "overtime_idle_pause_enabled",
                 self.__overtime_idle_pause_enabled,
             )
         )
-        overtime_idle_pause_raw = data.get(
-            "overtime_idle_pause_min",
-            self.__overtime_idle_pause_min,
-        )
+        if "overtime_idle_pause_sec" in data:
+            overtime_idle_pause_raw = data["overtime_idle_pause_sec"]
+            overtime_idle_pause_multiplier = 1
+        elif "overtime_idle_pause_min" in data:
+            overtime_idle_pause_raw = data["overtime_idle_pause_min"]
+            overtime_idle_pause_multiplier = 60
+        else:
+            overtime_idle_pause_raw = self.__overtime_idle_pause_sec
+            overtime_idle_pause_multiplier = 1
         clear_ical_url = bool(data.get("clear_ical_url", False))
         ical_url_supplied = "ical_url" in data
         ical_url_value = str(data.get("ical_url", "") or "").strip()
@@ -8561,15 +8594,29 @@ class Wrike:
             return False, "flex interval"
         flex_poll_interval = max(60.0, min(21600.0, flex_poll_interval))
         try:
-            overtime_notice_interval = int(round(float(overtime_notice_raw)))
+            overtime_notice_interval_sec = int(
+                round(float(overtime_notice_raw) * overtime_notice_multiplier)
+            )
         except Exception:
             return False, "overtime interval"
-        overtime_notice_interval = max(1, min(120, overtime_notice_interval))
+        overtime_notice_interval_sec = max(
+            MIN_OVERTIME_INTERVAL_SEC,
+            min(MAX_OVERTIME_INTERVAL_SEC, overtime_notice_interval_sec),
+        )
         try:
-            overtime_idle_pause_min = int(round(float(overtime_idle_pause_raw)))
+            overtime_idle_pause_sec = int(
+                round(float(overtime_idle_pause_raw) * overtime_idle_pause_multiplier)
+            )
         except Exception:
-            return False, "overtime idle pause minutes"
-        overtime_idle_pause_min = max(1, min(120, overtime_idle_pause_min))
+            return False, "overtime idle pause interval"
+        overtime_idle_pause_sec = max(
+            MIN_OVERTIME_INTERVAL_SEC,
+            min(MAX_OVERTIME_INTERVAL_SEC, overtime_idle_pause_sec),
+        )
+
+        overtime_notice_changed = (
+            overtime_notice_interval_sec != self.__overtime_notice_interval_sec
+        )
 
         previous_flex_configuration = (
             bool(self.__flex_enabled),
@@ -8592,9 +8639,9 @@ class Wrike:
         if not self.__flex_enabled or flex_employee_number:
             self.__flex_detected_employee_number = ""
         self.__flex_poll_interval_sec = float(flex_poll_interval)
-        self.__overtime_notice_interval_min = int(overtime_notice_interval)
+        self.__overtime_notice_interval_sec = int(overtime_notice_interval_sec)
         self.__overtime_idle_pause_enabled = bool(overtime_idle_pause_enabled)
-        self.__overtime_idle_pause_min = int(overtime_idle_pause_min)
+        self.__overtime_idle_pause_sec = int(overtime_idle_pause_sec)
         self.__lunch_break_enabled = bool(lunch_enabled)
         self.__lunch_start_min = int(lunch_start_val)
         self.__lunch_end_min = int(lunch_end_val)
@@ -8663,6 +8710,15 @@ class Wrike:
             return False, "settings save failed"
         self.__monitor_enabled = bool(monitor_enabled)
         self.__apply_monitor_enabled_lifecycle(previous_runtime_state["monitor_enabled"])
+        if overtime_notice_changed:
+            self.__cancel_overtime_notice_timer()
+            active_overtime = self.__overtime_active_state()
+            if (
+                isinstance(active_overtime, dict)
+                and active_overtime.get("status") == "active"
+                and not active_overtime.get("paused_at")
+            ):
+                self.__start_overtime_notice_timer(show_now=False)
         self.__sync_worktime_panel_idle_timeout()
         self.__restart_monitor()
         self.__start_ical_polling()
@@ -8938,9 +8994,9 @@ class Wrike:
             "flex_enabled": False,
             "flex_employee_number": "",
             "flex_poll_interval_sec": 300.0,
-            "overtime_notice_interval_min": 10,
+            "overtime_notice_interval_sec": DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC,
             "overtime_idle_pause_enabled": True,
-            "overtime_idle_pause_min": 5,
+            "overtime_idle_pause_sec": DEFAULT_OVERTIME_IDLE_PAUSE_SEC,
         }
         needs_save = False
         if data is None:
@@ -8967,6 +9023,62 @@ class Wrike:
         if legacy_pending_key in data:
             data.pop(legacy_pending_key, None)
             needs_save = True
+
+        overtime_interval_migrations = (
+            (
+                "overtime_notice_interval_sec",
+                "overtime_notice_interval_min",
+                DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC,
+                10,
+            ),
+            (
+                "overtime_idle_pause_sec",
+                "overtime_idle_pause_min",
+                DEFAULT_OVERTIME_IDLE_PAUSE_SEC,
+                5,
+            ),
+        )
+        for canonical_key, legacy_key, default_seconds, legacy_default_minutes in (
+            overtime_interval_migrations
+        ):
+            if canonical_key not in data:
+                legacy_value = data.get(legacy_key)
+                if legacy_key not in data:
+                    migrated_seconds = default_seconds
+                else:
+                    try:
+                        legacy_minutes = int(legacy_value)
+                    except Exception:
+                        migrated_seconds = default_seconds
+                    else:
+                        bounded_minutes = max(1, min(120, legacy_minutes))
+                        migrated_seconds = (
+                            default_seconds
+                            if bounded_minutes == legacy_default_minutes
+                            else bounded_minutes * 60
+                        )
+                data[canonical_key] = migrated_seconds
+                needs_save = True
+            else:
+                original_seconds = data[canonical_key]
+                try:
+                    loaded_seconds = int(original_seconds)
+                except Exception:
+                    loaded_seconds = default_seconds
+                    needs_save = True
+                bounded_seconds = max(
+                    MIN_OVERTIME_INTERVAL_SEC,
+                    min(MAX_OVERTIME_INTERVAL_SEC, loaded_seconds),
+                )
+                if (
+                    bounded_seconds != loaded_seconds
+                    or original_seconds != bounded_seconds
+                ):
+                    needs_save = True
+                data[canonical_key] = bounded_seconds
+            if legacy_key in data:
+                data.pop(legacy_key, None)
+                needs_save = True
 
         for key, value in defaults.items():
             if key not in data:
@@ -9095,19 +9207,12 @@ class Wrike:
         if clamped_flex_poll != self.__flex_poll_interval_sec:
             self.__flex_poll_interval_sec = clamped_flex_poll
             needs_save = True
-        try:
-            self.__overtime_notice_interval_min = int(
-                data.get(
-                    "overtime_notice_interval_min",
-                    self.__overtime_notice_interval_min,
-                )
+        self.__overtime_notice_interval_sec = int(
+            data.get(
+                "overtime_notice_interval_sec",
+                DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC,
             )
-        except Exception:
-            self.__overtime_notice_interval_min = 10
-        clamped_overtime = max(1, min(120, self.__overtime_notice_interval_min))
-        if clamped_overtime != self.__overtime_notice_interval_min:
-            self.__overtime_notice_interval_min = clamped_overtime
-            needs_save = True
+        )
         try:
             self.__overtime_idle_pause_enabled = bool(
                 data.get(
@@ -9117,19 +9222,12 @@ class Wrike:
             )
         except Exception:
             self.__overtime_idle_pause_enabled = True
-        try:
-            self.__overtime_idle_pause_min = int(
-                data.get(
-                    "overtime_idle_pause_min",
-                    self.__overtime_idle_pause_min,
-                )
+        self.__overtime_idle_pause_sec = int(
+            data.get(
+                "overtime_idle_pause_sec",
+                DEFAULT_OVERTIME_IDLE_PAUSE_SEC,
             )
-        except Exception:
-            self.__overtime_idle_pause_min = 5
-        clamped_idle_pause = max(1, min(120, self.__overtime_idle_pause_min))
-        if clamped_idle_pause != self.__overtime_idle_pause_min:
-            self.__overtime_idle_pause_min = clamped_idle_pause
-            needs_save = True
+        )
         try:
             self.__daily_target_minutes = int(data.get("daily_target_minutes", self.__daily_target_minutes))
         except Exception:
@@ -9363,13 +9461,13 @@ class Wrike:
             "flex_enabled": bool(self.__flex_enabled),
             "flex_employee_number": str(self.__flex_employee_number or "").strip(),
             "flex_poll_interval_sec": float(self.__flex_poll_interval_sec),
-            "overtime_notice_interval_min": int(
-                self.__overtime_notice_interval_min
+            "overtime_notice_interval_sec": int(
+                self.__overtime_notice_interval_sec
             ),
             "overtime_idle_pause_enabled": bool(
                 self.__overtime_idle_pause_enabled
             ),
-            "overtime_idle_pause_min": int(self.__overtime_idle_pause_min),
+            "overtime_idle_pause_sec": int(self.__overtime_idle_pause_sec),
         }
         ical_url_now = str(self.__decode_ical_url() or "").strip()
         if ical_url_now:

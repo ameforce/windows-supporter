@@ -147,6 +147,9 @@ class BreakReturnPromptTest(unittest.TestCase):
         with patch.dict(os.environ, {"APPDATA": temporary.name}, clear=False):
             self.wrike = Wrike()
         self.wrike._Wrike__lib.datetime = _Clock
+        # Keep the existing flow scenarios on their prior five-minute
+        # threshold; the new 30-second shared default has a focused test below.
+        self.wrike._Wrike__overtime_idle_pause_sec = 5 * 60
         self.store = WorktimeStateStore(
             Path(temporary.name) / "break-return-state.json",
             now_provider=_Clock.now,
@@ -253,6 +256,17 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.assertIsNone(self.pending())
         self.panel.show.assert_not_called()
 
+    def test_30_second_shared_idle_threshold_applies_with_autopause_off(self):
+        self.wrike._Wrike__overtime_idle_pause_sec = 30
+        self.wrike._Wrike__overtime_idle_pause_enabled = False
+        self.start_break(_at(12, 0))
+        self.activity(_at(12, 0, 1))
+
+        self.activity(_at(12, 0, 31))
+
+        self.assertEqual(self.pending()["detected_at"], _at(12, 0, 31))
+        self.assertEqual(self.wrike._Wrike__break_return_idle_seconds(), 30)
+
     def test_quick_click_starting_break_after_absence_is_not_a_return(self):
         # Away without a break; the first input after coming back is a quick
         # click on "휴게 시작", seen by the watcher only after the break began.
@@ -265,9 +279,9 @@ class BreakReturnPromptTest(unittest.TestCase):
         self.activity(_at(11, 50))
         self.assertEqual(self.pending()["detected_at"], _at(11, 50))
 
-    def test_threshold_uses_idle_minutes_even_with_overtime_autopause_off(self):
+    def test_threshold_uses_shared_idle_seconds_even_with_overtime_autopause_off(self):
         self.wrike._Wrike__overtime_idle_pause_enabled = False
-        self.wrike._Wrike__overtime_idle_pause_min = 10
+        self.wrike._Wrike__overtime_idle_pause_sec = 10 * 60
         self.start_break(_at(12, 0))
         self.activity(_at(12, 0, 1))
         self.activity(_at(12, 9))
