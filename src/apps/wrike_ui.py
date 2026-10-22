@@ -44,7 +44,7 @@ class WrikeSettingsView:
         self._flex_interval_var = None
         self._overtime_interval_var = None
         self._overtime_idle_enabled_var = None
-        self._overtime_idle_minutes_var = None
+        self._overtime_idle_seconds_var = None
         self._flex_status_var = None
         self._status_var = None
         self._status_label = None
@@ -326,9 +326,9 @@ class WrikeSettingsView:
         self._flex_enabled_var = tk.BooleanVar(value=False)
         self._flex_employee_number_var = tk.StringVar(value="")
         self._flex_interval_var = tk.StringVar(value="5")
-        self._overtime_interval_var = tk.StringVar(value="10")
+        self._overtime_interval_var = tk.StringVar(value="30")
         self._overtime_idle_enabled_var = tk.BooleanVar(value=True)
-        self._overtime_idle_minutes_var = tk.StringVar(value="5")
+        self._overtime_idle_seconds_var = tk.StringVar(value="30")
         self._flex_status_var = tk.StringVar(value="미설정")
 
         tk.Label(
@@ -361,7 +361,7 @@ class WrikeSettingsView:
         add_entry(self._flex_interval_var)
         row += 1
 
-        add_label("초과근무 툴팁 주기(분)")
+        add_label("초과근무 툴팁 주기(초)")
         add_entry(self._overtime_interval_var)
         row += 1
 
@@ -378,8 +378,8 @@ class WrikeSettingsView:
         ).grid(row=row, column=1, sticky="w", pady=6)
         row += 1
 
-        add_label("자리 비움 판단 무입력(분)")
-        add_entry(self._overtime_idle_minutes_var)
+        add_label("자리 비움 판단 무입력(초)")
+        add_entry(self._overtime_idle_seconds_var)
         row += 1
 
         add_label("Flex 연동 상태")
@@ -1963,15 +1963,14 @@ class WrikeSettingsView:
                 self._overtime_idle_enabled_var.set(
                     bool(settings.get("overtime_idle_pause_enabled", True))
                 )
-            if self._overtime_idle_minutes_var is not None:
-                self._overtime_idle_minutes_var.set(
+            if self._overtime_idle_seconds_var is not None:
+                self._overtime_idle_seconds_var.set(
                     str(
-                        max(
-                            1,
-                            min(
-                                120,
-                                int(settings.get("overtime_idle_pause_min", 5)),
-                            ),
+                        self._settings_interval_seconds(
+                            settings,
+                            "overtime_idle_pause_sec",
+                            "overtime_idle_pause_min",
+                            30,
                         )
                     )
                 )
@@ -1980,6 +1979,24 @@ class WrikeSettingsView:
         finally:
             self._loading_settings = previous_loading
         return
+
+    @staticmethod
+    def _settings_interval_seconds(
+        settings: dict,
+        seconds_key: str,
+        legacy_minutes_key: str,
+        default_seconds: int,
+    ) -> int:
+        try:
+            if seconds_key in settings:
+                seconds = int(settings[seconds_key])
+            elif legacy_minutes_key in settings:
+                seconds = int(round(float(settings[legacy_minutes_key]) * 60))
+            else:
+                seconds = int(default_seconds)
+        except Exception:
+            seconds = int(default_seconds)
+        return max(30, min(7200, seconds))
 
     def _load_settings(self) -> None:
         self._loading_settings = True
@@ -2028,12 +2045,11 @@ class WrikeSettingsView:
                 if self._overtime_interval_var is not None:
                     self._overtime_interval_var.set(
                         str(
-                            max(
-                                1,
-                                min(
-                                    120,
-                                    int(settings.get("overtime_notice_interval_min", 10)),
-                                ),
+                            self._settings_interval_seconds(
+                                settings,
+                                "overtime_notice_interval_sec",
+                                "overtime_notice_interval_min",
+                                30,
                             )
                         )
                     )
@@ -2041,15 +2057,14 @@ class WrikeSettingsView:
                     self._overtime_idle_enabled_var.set(
                         bool(settings.get("overtime_idle_pause_enabled", True))
                     )
-                if self._overtime_idle_minutes_var is not None:
-                    self._overtime_idle_minutes_var.set(
+                if self._overtime_idle_seconds_var is not None:
+                    self._overtime_idle_seconds_var.set(
                         str(
-                            max(
-                                1,
-                                min(
-                                    120,
-                                    int(settings.get("overtime_idle_pause_min", 5)),
-                                ),
+                            self._settings_interval_seconds(
+                                settings,
+                                "overtime_idle_pause_sec",
+                                "overtime_idle_pause_min",
+                                30,
                             )
                         )
                     )
@@ -2631,7 +2646,7 @@ class WrikeSettingsView:
             self._flex_interval_var,
             self._overtime_interval_var,
             self._overtime_idle_enabled_var,
-            self._overtime_idle_minutes_var,
+            self._overtime_idle_seconds_var,
             self._lunch_enabled_var,
             self._lunch_start_var,
             self._lunch_end_var,
@@ -2755,17 +2770,17 @@ class WrikeSettingsView:
         overtime_interval_text = (
             str(self._overtime_interval_var.get() or "").strip()
             if self._overtime_interval_var is not None
-            else "10"
+            else "30"
         )
         overtime_idle_enabled = (
             bool(self._overtime_idle_enabled_var.get())
             if self._overtime_idle_enabled_var is not None
             else True
         )
-        overtime_idle_minutes_text = (
-            str(self._overtime_idle_minutes_var.get() or "").strip()
-            if self._overtime_idle_minutes_var is not None
-            else "5"
+        overtime_idle_seconds_text = (
+            str(self._overtime_idle_seconds_var.get() or "").strip()
+            if self._overtime_idle_seconds_var is not None
+            else "30"
         )
 
         lunch_enabled = (
@@ -2840,20 +2855,22 @@ class WrikeSettingsView:
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
             return
-        overtime_interval_minutes, error = self._strict_positive_int(
+        overtime_interval_seconds, error = self._strict_positive_int(
             overtime_interval_text,
-            "초과근무 툴팁 주기(분)",
+            "초과근무 툴팁 주기(초)",
         )
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
             return
-        overtime_idle_minutes, error = self._strict_positive_int(
-            overtime_idle_minutes_text,
-            "자리 비움 판단 무입력(분)",
+        overtime_idle_seconds, error = self._strict_positive_int(
+            overtime_idle_seconds_text,
+            "자리 비움 판단 무입력(초)",
         )
         if error:
             self._set_status(f"저장 실패: {error}", level="error")
             return
+        overtime_interval_seconds = max(30, min(7200, overtime_interval_seconds))
+        overtime_idle_seconds = max(30, min(7200, overtime_idle_seconds))
 
         daily_minutes = int(round(daily_hours * 60))
         tooltip_ms = int(round(tooltip_sec * 1000))
@@ -2866,9 +2883,9 @@ class WrikeSettingsView:
             "flex_enabled": flex_enabled,
             "flex_employee_number": flex_employee_number,
             "flex_poll_interval_sec": int(flex_interval_minutes) * 60,
-            "overtime_notice_interval_min": int(overtime_interval_minutes),
+            "overtime_notice_interval_sec": int(overtime_interval_seconds),
             "overtime_idle_pause_enabled": bool(overtime_idle_enabled),
-            "overtime_idle_pause_min": int(overtime_idle_minutes),
+            "overtime_idle_pause_sec": int(overtime_idle_seconds),
             "lunch_break_enabled": lunch_enabled,
             "lunch_start_min": int(lunch_start_min),
             "lunch_end_min": int(lunch_end_min),
@@ -2881,6 +2898,26 @@ class WrikeSettingsView:
             save_payload["vacation_ical_url"] = vacation_ical_url
 
         ok, err = self._wrike.update_settings(save_payload)
+        if ok:
+            previous_loading = self._loading_settings
+            self._loading_settings = True
+            try:
+                for variable, value in (
+                    (self._overtime_interval_var, str(overtime_interval_seconds)),
+                    (self._overtime_idle_seconds_var, str(overtime_idle_seconds)),
+                ):
+                    if variable is not None:
+                        try:
+                            variable.set(value)
+                        except Exception:
+                            pass
+                if vacation_dirty and self._vacation_ical_url_var is not None:
+                    try:
+                        self._vacation_ical_url_var.set("")
+                    except Exception:
+                        pass
+            finally:
+                self._loading_settings = previous_loading
         try:
             if ok:
                 try:
@@ -2894,11 +2931,6 @@ class WrikeSettingsView:
                 if ical_dirty:
                     self._ical_dirty = False
                 if vacation_dirty:
-                    try:
-                        if self._vacation_ical_url_var is not None:
-                            self._vacation_ical_url_var.set("")
-                    except Exception:
-                        pass
                     self._vacation_ical_dirty = False
                     if not self._refresh_vacation_status_from_backend():
                         fallback = dict(self._vacation_ical_status)

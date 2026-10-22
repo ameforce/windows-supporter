@@ -243,6 +243,33 @@ class WorktimeActivityWatcherTests(unittest.TestCase):
         root.run_next()
         self.assertEqual(idles, [datetime(2026, 4, 6, 19, 5), datetime(2026, 4, 6, 19, 16)])
 
+    def test_idle_threshold_30_seconds_uses_existing_fast_poll_cadence(self) -> None:
+        root = _FakeRoot()
+        provider = _MutableProvider(100)
+        now_box = [datetime(2026, 4, 6, 19, 0)]
+        idles = []
+        watcher = WorktimeActivityWatcher(
+            root,
+            lambda _at: None,
+            provider=provider,
+            now=lambda: now_box[0],
+            idle_callback=idles.append,
+            idle_threshold_seconds=30,
+        )
+
+        watcher.start()
+        self.assertEqual(watcher.poll_interval_ms, 500)
+        self.assertEqual(root.after_calls[0][1], 500)
+        # The first stable read seeds the idle baseline.
+        root.run_next()
+        now_box[0] = datetime(2026, 4, 6, 19, 0, 29)
+        root.run_next()
+        self.assertEqual(idles, [])
+
+        now_box[0] = datetime(2026, 4, 6, 19, 0, 30)
+        root.run_next()
+        self.assertEqual(idles, [datetime(2026, 4, 6, 19, 0, 30)])
+
     def test_idle_threshold_callable_disables_and_reenables_reporting(self) -> None:
         root = _FakeRoot()
         provider = _MutableProvider(50)

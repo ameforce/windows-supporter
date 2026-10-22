@@ -133,6 +133,21 @@ class _FakeVar:
         return self.value
 
 
+class _TraceFakeVar(_FakeVar):
+    def __init__(self, value="") -> None:
+        super().__init__(value)
+        self._write_traces = []
+
+    def trace_add(self, mode, callback):
+        if mode == "write":
+            self._write_traces.append(callback)
+
+    def set(self, value):
+        self.value = value
+        for callback in tuple(self._write_traces):
+            callback("", "", "write")
+
+
 class _FakePanel:
     instances = []
 
@@ -217,6 +232,12 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
             wrike = Wrike()
         wrike._Wrike__lib.datetime = _FrozenDateTime
         return wrike
+
+    def _write_settings_payload(self, payload: dict) -> Path:
+        settings_path = self.appdata / "windows-supporter" / "wrike_settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(payload), encoding="utf-8")
+        return settings_path
 
     @staticmethod
     def _empty_compiled_vacation() -> dict:
@@ -942,17 +963,20 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertEqual(
             store.resume(day, datetime(2026, 4, 6, 19, 11)), (True, None)
         )
-        wrike._Wrike__on_overtime_idle_input(datetime(2026, 4, 6, 19, 20))
+        wrike._Wrike__on_overtime_idle_input(datetime(2026, 4, 6, 19, 11, 30))
         entry = store.get(day)
-        self.assertEqual(entry["paused_at"], "2026-04-06T19:20:00")
+        self.assertEqual(entry["paused_at"], "2026-04-06T19:11:30")
         self.assertTrue(entry["pause_auto"])
 
         # The next input event resumes only an automatic pause.
-        wrike._Wrike__on_worktime_activity(datetime(2026, 4, 6, 19, 40))
+        wrike._Wrike__on_worktime_activity(datetime(2026, 4, 6, 19, 12))
         entry = store.get(day)
         self.assertIsNone(entry["paused_at"])
         self.assertFalse(entry["pause_auto"])
-        self.assertEqual(entry["paused_seconds"], 660 + 1200)
+        self.assertEqual(entry["paused_seconds"], 660 + 30)
+        self.assertEqual(wrike._Wrike__break_return_idle_seconds(), 30)
+        wrike._Wrike__overtime_idle_pause_enabled = False
+        self.assertEqual(wrike._Wrike__break_return_idle_seconds(), 30)
 
     def test_overtime_idle_pause_respects_disabled_setting(self) -> None:
         _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
@@ -971,10 +995,319 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertIsNone(store.get(day)["paused_at"])
 
         wrike._Wrike__overtime_idle_pause_enabled = True
-        wrike._Wrike__overtime_idle_pause_min = 15
+        wrike._Wrike__overtime_idle_pause_sec = 900
         self.assertEqual(wrike._Wrike__overtime_idle_threshold_seconds(), 900)
         wrike._Wrike__overtime_idle_pause_enabled = False
         self.assertIsNone(wrike._Wrike__overtime_idle_threshold_seconds())
+
+    def test_overtime_interval_settings_migrate_legacy_defaults_and_custom_values(self) -> None:
+        cases = (
+            ("missing", {}, 30, 30),
+            (
+                "legacy defaults",
+                {
+                    "overtime_notice_interval_min": 10,
+                    "overtime_idle_pause_min": 5,
+                },
+                30,
+                30,
+            ),
+            (
+                "legacy custom",
+                {
+                    "overtime_notice_interval_min": 15,
+                    "overtime_idle_pause_min": 20,
+                },
+                900,
+                1200,
+            ),
+        )
+        for name, payload, notice_seconds, idle_seconds in cases:
+            with self.subTest(name=name):
+                settings_path = self._write_settings_payload(payload)
+                wrike = self._new_wrike()
+                snapshot = wrike.get_settings_snapshot()
+                self.assertEqual(snapshot["overtime_notice_interval_sec"], notice_seconds)
+                self.assertEqual(snapshot["overtime_idle_pause_sec"], idle_seconds)
+                self.assertEqual(
+                    snapshot["overtime_notice_interval_min"],
+                    notice_seconds / 60.0,
+                )
+                stored = json.loads(settings_path.read_text(encoding="utf-8"))
+                self.assertEqual(stored["overtime_notice_interval_sec"], notice_seconds)
+                self.assertEqual(stored["overtime_idle_pause_sec"], idle_seconds)
+                self.assertNotIn("overtime_notice_interval_min", stored)
+                self.assertNotIn("overtime_idle_pause_min", stored)
+
+                reloaded = self._new_wrike()
+                reloaded_settings = reloaded.get_settings_snapshot()
+                self.assertEqual(
+                    reloaded_settings["overtime_notice_interval_sec"],
+                    notice_seconds,
+                )
+                self.assertEqual(
+                    reloaded_settings["overtime_idle_pause_sec"],
+                    idle_seconds,
+                )
+
+    def test_overtime_interval_migration_canonical_precedence_invalid_and_bounds(self) -> None:
+        cases = (
+            (
+                "canonical wins",
+                {
+                    "overtime_notice_interval_sec": 75,
+                    "overtime_notice_interval_min": 10,
+                    "overtime_idle_pause_sec": 45,
+                    "overtime_idle_pause_min": 5,
+                },
+                75,
+                45,
+            ),
+            (
+                "invalid canonical wins",
+                {
+                    "overtime_notice_interval_sec": "invalid",
+                    "overtime_notice_interval_min": 25,
+                    "overtime_idle_pause_sec": None,
+                    "overtime_idle_pause_min": 20,
+                },
+                30,
+                30,
+            ),
+            (
+                "invalid legacy",
+                {
+                    "overtime_notice_interval_min": "invalid",
+                    "overtime_idle_pause_min": "invalid",
+                },
+                30,
+                30,
+            ),
+        )
+        for name, payload, notice_seconds, idle_seconds in cases:
+            with self.subTest(name=name):
+                self._write_settings_payload(payload)
+                wrike = self._new_wrike()
+                snapshot = wrike.get_settings_snapshot()
+                self.assertEqual(snapshot["overtime_notice_interval_sec"], notice_seconds)
+                self.assertEqual(snapshot["overtime_idle_pause_sec"], idle_seconds)
+
+        for key in (
+            "overtime_notice_interval_sec",
+            "overtime_idle_pause_sec",
+        ):
+            for raw, expected in ((29, 30), (30, 30), (7200, 7200), (7201, 7200)):
+                with self.subTest(key=key, raw=raw):
+                    self._write_settings_payload({key: raw})
+                    wrike = self._new_wrike()
+                    self.assertEqual(wrike.get_settings_snapshot()[key], expected)
+
+        legacy_cases = (
+            (
+                "overtime_notice_interval_min",
+                ((0, 60), (1, 60), (10, 30), (11, 660), (120, 7200), (121, 7200)),
+            ),
+            (
+                "overtime_idle_pause_min",
+                ((0, 60), (1, 60), (5, 30), (6, 360), (120, 7200), (121, 7200)),
+            ),
+        )
+        for legacy_key, values in legacy_cases:
+            canonical_key = legacy_key.removesuffix("_min") + "_sec"
+            for raw, expected in values + (("invalid", 30),):
+                with self.subTest(legacy_key=legacy_key, raw=raw):
+                    self._write_settings_payload({legacy_key: raw})
+                    wrike = self._new_wrike()
+                    self.assertEqual(
+                        wrike.get_settings_snapshot()[canonical_key],
+                        expected,
+                    )
+
+    def test_overtime_interval_update_settings_compatibility_and_partial_save(self) -> None:
+        wrike = self._new_wrike()
+
+        ok, error = wrike.update_settings(
+            {
+                "overtime_notice_interval_min": 10,
+                "overtime_idle_pause_min": 5,
+            }
+        )
+        self.assertTrue(ok, error)
+        settings = wrike.get_settings_snapshot()
+        self.assertEqual(settings["overtime_notice_interval_sec"], 600)
+        self.assertEqual(settings["overtime_idle_pause_sec"], 300)
+        self.assertEqual(settings["overtime_notice_interval_min"], 10.0)
+        self.assertEqual(settings["overtime_idle_pause_min"], 5.0)
+
+        ok, error = wrike.update_settings({"monitor_interval_sec": 10})
+        self.assertTrue(ok, error)
+        payload = json.loads(
+            Path(wrike._Wrike__settings_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["overtime_notice_interval_sec"], 600)
+        self.assertEqual(payload["overtime_idle_pause_sec"], 300)
+        self.assertNotIn("overtime_notice_interval_min", payload)
+        self.assertNotIn("overtime_idle_pause_min", payload)
+
+        reloaded = self._new_wrike()
+        reloaded_settings = reloaded.get_settings_snapshot()
+        self.assertEqual(reloaded_settings["overtime_notice_interval_sec"], 600)
+        self.assertEqual(reloaded_settings["overtime_idle_pause_sec"], 300)
+
+    def test_overtime_interval_change_reschedules_only_unpaused_active_timer(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+        wrike = self._new_wrike()
+        root = _FakeRoot()
+        wrike._Wrike__root = root
+        wrike._Wrike__background_active = True
+        wrike._Wrike__show_tooltip = Mock()
+        wrike._Wrike__overtime_tooltip_lines = Mock(return_value=[("active", None)])
+        store = wrike._Wrike__overtime_state_store
+        day = date(2026, 4, 6)
+        store.set_pending(day, datetime(2026, 4, 6, 18, 5), datetime(2026, 4, 6, 18, 0))
+        store.start(day, datetime(2026, 4, 6, 18, 6))
+
+        wrike._Wrike__start_overtime_notice_timer(show_now=False)
+        first_timer_id = wrike._Wrike__overtime_notice_after_id
+        self.assertEqual(
+            next(item[1] for item in root.after_calls if item[0] == first_timer_id),
+            30_000,
+        )
+        first_callback = next(
+            item[2] for item in root.after_calls if item[0] == first_timer_id
+        )
+        first_callback()
+        recurring_timer_id = wrike._Wrike__overtime_notice_after_id
+        self.assertEqual(
+            next(item[1] for item in root.after_calls if item[0] == recurring_timer_id),
+            30_000,
+        )
+
+        ok, error = wrike.update_settings({"overtime_notice_interval_sec": 60})
+        self.assertTrue(ok, error)
+        self.assertIn(recurring_timer_id, root.cancelled)
+        updated_timer_id = wrike._Wrike__overtime_notice_after_id
+        self.assertEqual(
+            next(item[1] for item in root.after_calls if item[0] == updated_timer_id),
+            60_000,
+        )
+
+        store.pause(day, datetime(2026, 4, 6, 19, 1))
+        wrike._Wrike__cancel_overtime_notice_timer()
+        ok, error = wrike.update_settings({"overtime_notice_interval_sec": 90})
+        self.assertTrue(ok, error)
+        self.assertIsNone(wrike._Wrike__overtime_notice_after_id)
+
+    def test_overtime_notice_interval_change_keeps_paused_stopped_and_disabled_guards(self) -> None:
+        for mode in ("paused", "stopped", "disabled"):
+            with self.subTest(mode=mode):
+                _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
+                wrike = self._new_wrike()
+                root = _FakeRoot()
+                wrike._Wrike__root = root
+                wrike._Wrike__background_active = True
+                store = wrike._Wrike__overtime_state_store
+                day = date(2026, 4, 6)
+                store.set_pending(
+                    day,
+                    datetime(2026, 4, 6, 18, 5),
+                    datetime(2026, 4, 6, 18, 0),
+                )
+                store.start(day, datetime(2026, 4, 6, 18, 6))
+                wrike._Wrike__start_overtime_notice_timer(show_now=False)
+
+                payload = {"overtime_notice_interval_sec": 60}
+                if mode == "paused":
+                    store.pause(day, datetime(2026, 4, 6, 18, 59))
+                    wrike._Wrike__cancel_overtime_notice_timer()
+                elif mode == "stopped":
+                    store.complete(day, datetime(2026, 4, 6, 18, 59))
+                    wrike._Wrike__cancel_overtime_notice_timer()
+                else:
+                    payload["monitor_enabled"] = False
+
+                ok, error = wrike.update_settings(payload)
+                self.assertTrue(ok, error)
+                self.assertIsNone(wrike._Wrike__overtime_notice_after_id)
+
+    def test_overtime_interval_ui_load_and_save_uses_seconds(self) -> None:
+        backend = Mock()
+        backend.get_settings_snapshot.return_value = {
+            "overtime_notice_interval_sec": 90,
+            "overtime_idle_pause_sec": 45,
+            "overtime_idle_pause_enabled": True,
+        }
+        backend.update_settings.return_value = (True, None)
+        view = WrikeSettingsView(None, backend)
+        view._overtime_interval_var = _FakeVar()
+        view._overtime_idle_seconds_var = _FakeVar()
+        view._refresh_flex_status_from_backend = Mock()
+        view._set_status = Mock()
+        view._load_settings()
+        self.assertEqual(view._overtime_interval_var.get(), "90")
+        self.assertEqual(view._overtime_idle_seconds_var.get(), "45")
+
+        view._token_var = _FakeVar("")
+        view._daily_var = _FakeVar("8")
+        view._tooltip_var = _FakeVar("6")
+        view._monitor_interval_var = _FakeVar("5")
+        view._flex_enabled_var = _FakeVar(False)
+        view._flex_employee_number_var = _FakeVar("")
+        view._flex_interval_var = _FakeVar("5")
+        view._overtime_interval_var = _FakeVar("30")
+        view._overtime_idle_enabled_var = _FakeVar(True)
+        view._overtime_idle_seconds_var = _FakeVar("30")
+        view._lunch_enabled_var = _FakeVar(True)
+        view._lunch_start_var = _FakeVar("12:00")
+        view._lunch_end_var = _FakeVar("13:00")
+        view._ical_keywords_var = _FakeVar("")
+        view._ical_interval_var = _FakeVar("15")
+
+        view._save_settings()
+        saved = backend.update_settings.call_args.args[0]
+        self.assertEqual(saved["overtime_notice_interval_sec"], 30)
+        self.assertEqual(saved["overtime_idle_pause_sec"], 30)
+        self.assertNotIn("overtime_notice_interval_min", saved)
+        self.assertNotIn("overtime_idle_pause_min", saved)
+
+    def test_successful_settings_autosave_does_not_reschedule_from_normalization(self) -> None:
+        backend = Mock()
+        backend.update_settings.return_value = (True, None)
+        root = _FakeRoot()
+        view = WrikeSettingsView(root, backend)
+        view._win = root
+        view._token_var = _FakeVar("")
+        view._daily_var = _FakeVar("8")
+        view._tooltip_var = _FakeVar("6")
+        view._monitor_interval_var = _FakeVar("5")
+        view._flex_enabled_var = _FakeVar(False)
+        view._flex_employee_number_var = _FakeVar("")
+        view._flex_interval_var = _FakeVar("5")
+        view._overtime_interval_var = _TraceFakeVar("30")
+        view._overtime_idle_enabled_var = _FakeVar(True)
+        view._overtime_idle_seconds_var = _TraceFakeVar("30")
+        view._lunch_enabled_var = _FakeVar(True)
+        view._lunch_start_var = _FakeVar("12:00")
+        view._lunch_end_var = _FakeVar("13:00")
+        view._ical_keywords_var = _FakeVar("")
+        view._ical_interval_var = _FakeVar("15")
+        view._refresh_flex_status_from_backend = Mock()
+        view._set_status = Mock()
+        view._bind_autosave_var(view._overtime_interval_var)
+        view._bind_autosave_var(view._overtime_idle_seconds_var)
+
+        # An actual edit schedules one save; normalization writes during that
+        # save must not schedule another save, even for an unchanged value.
+        view._overtime_interval_var.set("29")
+        self.assertEqual(len(root.after_calls), 1)
+        _after_id, delay_ms, callback = root.after_calls.pop(0)
+        self.assertEqual(delay_ms, 350)
+        callback()
+
+        self.assertEqual(backend.update_settings.call_count, 1)
+        self.assertEqual(root.after_calls, [])
+        self.assertEqual(view._overtime_interval_var.get(), "30")
+        self.assertEqual(view._overtime_idle_seconds_var.get(), "30")
 
     def test_panel_idle_autopause_toggle_updates_and_persists_settings(self) -> None:
         _FrozenDateTime.current = datetime(2026, 4, 6, 19, 0)
