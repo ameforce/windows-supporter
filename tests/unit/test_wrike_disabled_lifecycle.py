@@ -260,6 +260,7 @@ class WrikeDisabledLifecycleTest(unittest.TestCase):
             patch.object(self.wrike, "_Wrike__overtime_active_state", return_value={"status": "active"}),
         ):
             self.wrike._Wrike__start_overtime_notice_timer(show_now=False)
+            self.assertEqual(self.root.calls[-1][1], 600_000)
             old_tick = self.root.calls[-1][2]
             self._set_enabled(False)
             self.wrike._Wrike__start_overtime_notice_timer(show_now=True)
