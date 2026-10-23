@@ -119,10 +119,11 @@ FLEX_WINDOW_WATCH_INTERVAL_SEC = 1.0
 # later.
 FLEX_LOGIN_STABLE_PROBES = 2
 
-DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC = 30
+DEFAULT_OVERTIME_NOTICE_INTERVAL_SEC = 600
 DEFAULT_OVERTIME_IDLE_PAUSE_SEC = 30
 MIN_OVERTIME_INTERVAL_SEC = 30
 MAX_OVERTIME_INTERVAL_SEC = 120 * 60
+OVERTIME_NOTICE_INTERVAL_DEFAULT_CHANGE_SETTINGS_VERSION = 11
 # Who asked for a Flex sync.  It decides whether the result is announced and
 # whether a login expiry opens the login window.
 FLEX_SYNC_SOURCE_PERIODIC = "periodic"
@@ -290,8 +291,9 @@ class Wrike:
         # noted in the log, so a dead watcher is visible without log spam.
         self.__stale_activity_logged_generation = None
         # v10 replaces the unusable administrator-only Open API credential
-        # flow with an interactive employee browser session.
-        self.__settings_version = 10
+        # flow with an interactive employee browser session. v11 changes the
+        # default overtime reminder cadence to ten minutes.
+        self.__settings_version = 11
         self.__playwright_checked = False
         self.__playwright_ready = False
         self.__time_log_weekday_labels = ['월', '화', '수', '목', '금', '토', '일']
@@ -2503,7 +2505,7 @@ class Wrike:
 
     def __overtime_tooltip_lines(self) -> list[tuple[str, str | None]]:
         now = self.__lib.datetime.now()
-        state = self.__overtime_active_state(now.date())
+        state = self.__overtime_active_state()
         if not isinstance(state, dict) or state.get("status") != "active":
             return []
         try:
@@ -2607,7 +2609,7 @@ class Wrike:
         if not ok:
             self.__show_panel_action_error(str(error or "초과근무를 시작하지 못했습니다."))
             return
-        self.__start_overtime_notice_timer(show_now=True)
+        self.__start_overtime_notice_timer(show_now=False)
 
     def __panel_overtime_prompt_edit(self, detected_time: str, start_time: str) -> bool:
         now = self.__lib.datetime.now()
@@ -2639,7 +2641,7 @@ class Wrike:
         if not ok:
             self.__show_panel_action_error(str(error or "초과근무를 시작하지 못했습니다."))
             return False
-        self.__start_overtime_notice_timer(show_now=True)
+        self.__start_overtime_notice_timer(show_now=False)
         return True
 
     def __panel_overtime_prompt_skip(self) -> None:
@@ -2697,7 +2699,7 @@ class Wrike:
                     str(error or "초과근무를 다시 시작하지 못했습니다.")
                 )
                 return
-            self.__start_overtime_notice_timer(show_now=True)
+            self.__start_overtime_notice_timer(show_now=False)
             return
         ok, error = self.__overtime_state_store.pause(day, now)
         if not ok:
@@ -2706,9 +2708,6 @@ class Wrike:
             )
             return
         self.__cancel_overtime_notice_timer()
-        lines = self.__overtime_tooltip_lines()
-        if self.__root is not None and lines:
-            self.__show_tooltip(self.__root, "초과근무 일시정지", lines=lines)
 
     def __panel_overtime_idle_autopause(self) -> None:
         ok, _error = self.update_settings(
@@ -4842,7 +4841,17 @@ class Wrike:
                 + str(error or "unknown")
             )
             return
-        self.__start_overtime_notice_timer(show_now=True)
+        root = self.__root
+        lines = self.__overtime_tooltip_lines()
+        if root is not None and lines:
+            self.__show_tooltip(
+                root,
+                "초과근무 자동 재개",
+                lines=lines,
+                automatic=True,
+            )
+        self.__refresh_worktime_panel_quietly()
+        self.__start_overtime_notice_timer(show_now=False)
 
     def __break_return_idle_seconds(self) -> int:
         # Shares the idle seconds of overtime auto-pause but not its on/off
@@ -9007,6 +9016,11 @@ class Wrike:
         if not had_data and reason is None:
             reason = "empty"
 
+        try:
+            version = int(data.get("settings_version", 0))
+        except Exception:
+            version = 0
+
         legacy_oauth_key = "vacation_google_oauth_protected"
         legacy_pending_key = "vacation_google_oauth_delete_pending"
         if "google_calendar_oauth_protected" not in data and legacy_oauth_key in data:
@@ -9066,6 +9080,15 @@ class Wrike:
                 except Exception:
                     loaded_seconds = default_seconds
                     needs_save = True
+                else:
+                    if (
+                        canonical_key == "overtime_notice_interval_sec"
+                        and version
+                        < OVERTIME_NOTICE_INTERVAL_DEFAULT_CHANGE_SETTINGS_VERSION
+                        and loaded_seconds == 30
+                    ):
+                        loaded_seconds = default_seconds
+                        needs_save = True
                 bounded_seconds = max(
                     MIN_OVERTIME_INTERVAL_SEC,
                     min(MAX_OVERTIME_INTERVAL_SEC, loaded_seconds),
@@ -9091,10 +9114,6 @@ class Wrike:
             data.pop("timelog_cache_token_fingerprint", None)
             needs_save = True
 
-        try:
-            version = int(data.get("settings_version", 0))
-        except Exception:
-            version = 0
         legacy_private_provider = (
             version < 9
             and str(data.get("vacation_calendar_provider", "private_ical") or "").strip()

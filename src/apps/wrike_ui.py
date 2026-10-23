@@ -326,7 +326,7 @@ class WrikeSettingsView:
         self._flex_enabled_var = tk.BooleanVar(value=False)
         self._flex_employee_number_var = tk.StringVar(value="")
         self._flex_interval_var = tk.StringVar(value="5")
-        self._overtime_interval_var = tk.StringVar(value="30")
+        self._overtime_interval_var = tk.StringVar(value="600")
         self._overtime_idle_enabled_var = tk.BooleanVar(value=True)
         self._overtime_idle_seconds_var = tk.StringVar(value="30")
         self._flex_status_var = tk.StringVar(value="미설정")
@@ -2049,7 +2049,7 @@ class WrikeSettingsView:
                                 settings,
                                 "overtime_notice_interval_sec",
                                 "overtime_notice_interval_min",
-                                30,
+                                600,
                             )
                         )
                     )
