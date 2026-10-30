@@ -1281,6 +1281,45 @@ class WorktimeQuickPanelTests(unittest.TestCase):
                 auto_paused=True,
             )
 
+    def test_overtime_duration_labels_use_hours_and_minutes(self) -> None:
+        prompt_text = WorktimeQuickPanel._overtime_prompt_text(
+            WorktimeOvertimePrompt("18:05", "18:00", assigned_minutes=65)
+        )
+        self.assertEqual(
+            prompt_text,
+            "퇴근 예정 18:00 이후 활동이 감지되었습니다. "
+            "· Flex 연장 배정 1시간 5분 초과근무를 측정할까요?",
+        )
+
+        active_text = WorktimeQuickPanel._overtime_state_text(
+            WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=309,
+                scheduled_quit_time="18:00",
+                assigned_minutes=60,
+            )
+        )
+        self.assertEqual(
+            active_text,
+            "초과근무 측정 중 · 시작 18:05 · 경과 5시간 9분 · Flex 배정 1시간",
+        )
+
+        paused_text = WorktimeQuickPanel._overtime_state_text(
+            WorktimeOvertimeState(
+                status="active",
+                start_time="18:05",
+                elapsed_minutes=309,
+                scheduled_quit_time="18:00",
+                paused=True,
+                paused_minutes=65,
+            )
+        )
+        self.assertEqual(
+            paused_text,
+            "초과근무 일시정지 중 · 시작 18:05 · 경과 5시간 9분 · 정지 1시간 5분",
+        )
+
     def test_overtime_idle_autopause_toggle_button_uses_callback(self) -> None:
         root = _FakeRoot()
         fake_tk = _FakeTk()

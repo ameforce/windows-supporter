@@ -1286,6 +1286,54 @@ class WrikeRealtimeProgressIntegrationTest(unittest.TestCase):
         self.assertTrue(ok, error)
         self.assertIsNone(wrike._Wrike__overtime_notice_after_id)
 
+    def test_overtime_tooltip_formats_duration_at_hour_boundaries(self) -> None:
+        _FrozenDateTime.current = datetime(2026, 4, 6, 23, 20)
+        wrike = self._new_wrike()
+        state = {
+            "status": "active",
+            "started_at": "2026-04-06T18:11:00",
+            "paused_at": None,
+            "pause_auto": False,
+            "assigned_minutes": 65,
+            "scheduled_quit": "2026-04-06T18:11:00",
+        }
+        wrike._Wrike__overtime_active_state = Mock(return_value=state)
+
+        for elapsed_minutes, elapsed_text in (
+            (59, "59분"),
+            (60, "1시간"),
+            (65, "1시간 5분"),
+            (309, "5시간 9분"),
+        ):
+            with self.subTest(elapsed_minutes=elapsed_minutes):
+                with patch(
+                    "src.apps.Wrike.net_elapsed_seconds",
+                    return_value=elapsed_minutes * 60,
+                ):
+                    lines = wrike._Wrike__overtime_tooltip_lines()
+
+                self.assertEqual(
+                    lines[0][0], f"초과근무 {elapsed_text} · 시작 18:11"
+                )
+                self.assertEqual(lines[2][0], "Flex 연장 배정 1시간 5분")
+
+        for paused_at, pause_auto, heading in (
+            ("2026-04-06T23:20:00", False, "초과근무 일시정지 · 경과 5시간 9분"),
+            (
+                "2026-04-06T23:20:00",
+                True,
+                "초과근무 자동 일시정지 · 경과 5시간 9분",
+            ),
+        ):
+            with self.subTest(pause_auto=pause_auto):
+                state["paused_at"] = paused_at
+                state["pause_auto"] = pause_auto
+                with patch(
+                    "src.apps.Wrike.net_elapsed_seconds", return_value=309 * 60
+                ):
+                    lines = wrike._Wrike__overtime_tooltip_lines()
+                self.assertTrue(lines[0][0].startswith(heading))
+
     def test_migrated_notice_schedules_ten_minutes_without_an_immediate_popup(self) -> None:
         self._write_settings_payload(
             {
