@@ -11,7 +11,7 @@ import unicodedata
 from typing import Any, Callable
 
 from src.apps.wrike_timelog_details import TimelogDayDetails, TimelogDetailRow
-from src.apps.wrike_worktime import normalize_hhmm_input
+from src.apps.wrike_worktime import format_minutes, normalize_hhmm_input
 
 
 _REFRESH_INTERVAL_MS = 1_000
@@ -2179,17 +2179,9 @@ class WorktimeQuickPanel:
             overtime_card.pack(fill="x", pady=(section_gap, 0), before=today_card)
             if auxiliary_lead_card is today_card:
                 auxiliary_lead_card = overtime_card
-            assigned_text = (
-                f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
-                if overtime_prompt.assigned_minutes > 0
-                else ""
-            )
             overtime_prompt_label = tk.Label(
                 overtime_card,
-                text=(
-                    f"퇴근 예정 {overtime_prompt.scheduled_quit_time} 이후 활동이 감지되었습니다."
-                    f"{assigned_text} 초과근무를 측정할까요?"
-                ),
+                text=self._overtime_prompt_text(overtime_prompt),
                 bg="#ECFDF5",
                 fg="#166534",
                 anchor="w",
@@ -2519,18 +2511,10 @@ class WorktimeQuickPanel:
                 )
         if model.overtime_prompt is not None:
             overtime_prompt = model.overtime_prompt
-            assigned_text = (
-                f" · Flex 연장 배정 {overtime_prompt.assigned_minutes}분"
-                if overtime_prompt.assigned_minutes > 0
-                else ""
-            )
             overtime_label = widgets.get("overtime_prompt_label")
             if overtime_label is not None:
                 overtime_label.configure(
-                    text=(
-                        f"퇴근 예정 {overtime_prompt.scheduled_quit_time} 이후 활동이 감지되었습니다."
-                        f"{assigned_text} 초과근무를 측정할까요?"
-                    )
+                    text=self._overtime_prompt_text(overtime_prompt)
                 )
 
     def _update_row_selection(self, model: WorktimePanelModel) -> None:
@@ -3324,6 +3308,18 @@ class WorktimeQuickPanel:
         self._run_command(self._on_break_return_keep)
 
     @staticmethod
+    def _overtime_prompt_text(prompt: WorktimeOvertimePrompt) -> str:
+        assigned = (
+            f" · Flex 연장 배정 {format_minutes(prompt.assigned_minutes)}"
+            if prompt.assigned_minutes > 0
+            else ""
+        )
+        return (
+            f"퇴근 예정 {prompt.scheduled_quit_time} 이후 활동이 감지되었습니다."
+            f"{assigned} 초과근무를 측정할까요?"
+        )
+
+    @staticmethod
     def _overtime_state_text(state: WorktimeOvertimeState) -> str:
         if state.paused:
             heading = (
@@ -3333,16 +3329,17 @@ class WorktimeQuickPanel:
             )
             return (
                 f"{heading} · 시작 {state.start_time} · "
-                f"경과 {state.elapsed_minutes}분 · 정지 {state.paused_minutes}분"
+                f"경과 {format_minutes(state.elapsed_minutes)} · "
+                f"정지 {format_minutes(state.paused_minutes)}"
             )
         assigned = (
-            f" · Flex 배정 {state.assigned_minutes}분"
+            f" · Flex 배정 {format_minutes(state.assigned_minutes)}"
             if state.assigned_minutes > 0
             else ""
         )
         return (
             f"초과근무 측정 중 · 시작 {state.start_time} · "
-            f"경과 {state.elapsed_minutes}분{assigned}"
+            f"경과 {format_minutes(state.elapsed_minutes)}{assigned}"
         )
 
     def _overtime_prompt_accept_current_command(self) -> None:
