@@ -2515,21 +2515,20 @@ class Wrike:
         paused = bool(state.get("paused_at"))
         auto_paused = paused and bool(state.get("pause_auto"))
         elapsed = net_elapsed_seconds(state, now) // 60
+        elapsed_text = self.__format_minutes(elapsed)
         assigned = int(state.get("assigned_minutes", 0))
         if auto_paused:
             heading = (
-                f"초과근무 자동 일시정지 · 경과 {elapsed}분 · "
+                f"초과근무 자동 일시정지 · 경과 {elapsed_text} · "
                 f"시작 {started.strftime('%H:%M')}"
             )
         elif paused:
             heading = (
-                f"초과근무 일시정지 · 경과 {elapsed}분 · "
+                f"초과근무 일시정지 · 경과 {elapsed_text} · "
                 f"시작 {started.strftime('%H:%M')}"
             )
         else:
-            heading = (
-                f"초과근무 {elapsed}분 · 시작 {started.strftime('%H:%M')}"
-            )
+            heading = f"초과근무 {elapsed_text} · 시작 {started.strftime('%H:%M')}"
         lines = [
             (heading, "#166534"),
             (
@@ -2538,7 +2537,9 @@ class Wrike:
             ),
         ]
         if assigned > 0:
-            lines.append((f"Flex 연장 배정 {assigned}분", "#2563EB"))
+            lines.append(
+                (f"Flex 연장 배정 {self.__format_minutes(assigned)}", "#2563EB")
+            )
         if auto_paused:
             hint = "입력이 감지되면 자동으로 다시 시작합니다."
         elif paused:
@@ -4279,7 +4280,8 @@ class Wrike:
             ),
             WorktimePanelLine(
                 (
-                    f"현재 기준 {delta_text} · 초과근무 {overtime_state.elapsed_minutes}분"
+                    f"현재 기준 {delta_text} · 초과근무 "
+                    f"{self.__format_minutes(overtime_state.elapsed_minutes)}"
                     if overtime_state is not None
                     else f"현재 기준 {delta_text}"
                 )
