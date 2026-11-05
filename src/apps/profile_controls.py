@@ -59,6 +59,7 @@ class ProfileCardMenu:
         ("query", "command", "새로고침"),
         ("login", "command", "연결"),
         ("logout", "command", "연결 해제"),
+        ("api_credit_login", "command", "API 크레딧 연결"),
         (None, "separator", ""),
         ("provider", "cascade", "제공자"),
         ("enabled", "checkbutton", "수집"),
@@ -124,6 +125,9 @@ class ProfileCardMenu:
             "query": view._account_query_buttons.get(profile_id),
             "login": view._account_login_buttons.get(profile_id),
             "logout": view._account_logout_buttons.get(profile_id),
+            "api_credit_login": getattr(
+                view, "_account_api_credit_login_buttons", {}
+            ).get(profile_id),
             "up": move[0] if move is not None else None,
             "down": move[1] if move is not None else None,
         }
@@ -156,6 +160,7 @@ class ProfileCardMenu:
             "query": lambda: view._on_account_query(profile_id),
             "login": lambda: view._on_account_login(profile_id),
             "logout": lambda: view._on_account_release_profile(profile_id),
+            "api_credit_login": lambda: view._on_account_api_credit_login(profile_id),
             "delete": lambda: view._on_delete_profile(profile_id, view._account_labels.get(profile_id, "")),
         }
         callback = callbacks.get(str(action))

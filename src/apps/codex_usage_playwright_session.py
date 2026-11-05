@@ -14,9 +14,11 @@ from src.apps.codex_usage_browser_types import (
     CloseSessionCommand,
     CollectCommand,
     LogSink,
+    OpenApiCreditLoginCommand,
     OpenLoginCommand,
     PlaywrightSessionConfig,
     PlaywrightStarter,
+    PollApiCreditLoginCommand,
     PollLoginCommand,
     ShutdownCommand,
 )
@@ -40,6 +42,8 @@ class DriverProtocol(Protocol):
     def collect(self) -> BrowserOperationResult: ...
     def open_login(self) -> BrowserOperationResult: ...
     def poll_login(self) -> BrowserOperationResult: ...
+    def open_api_credit_login(self) -> BrowserOperationResult: ...
+    def poll_api_credit_login(self) -> BrowserOperationResult: ...
     def close_session(self) -> None: ...
     def shutdown(self) -> None: ...
     def get_runtime_status(self) -> BrowserRuntimeStatus: ...
@@ -199,6 +203,12 @@ class CodexUsagePlaywrightSession:
 
     def poll_login(self) -> BrowserOperationResult:
         return self._invoke_cancellable(PollLoginCommand())
+
+    def open_api_credit_login(self) -> BrowserOperationResult:
+        return self._invoke_cancellable(OpenApiCreditLoginCommand())
+
+    def poll_api_credit_login(self) -> BrowserOperationResult:
+        return self._invoke_cancellable(PollApiCreditLoginCommand())
 
     def _invoke_cancellable(self, command: BrowserCommand) -> BrowserOperationResult:
         with self._lock:
@@ -658,6 +668,10 @@ class CodexUsagePlaywrightSession:
             return driver.open_login()
         if isinstance(command, PollLoginCommand):
             return driver.poll_login()
+        if isinstance(command, OpenApiCreditLoginCommand):
+            return driver.open_api_credit_login()
+        if isinstance(command, PollApiCreditLoginCommand):
+            return driver.poll_api_credit_login()
         if isinstance(command, CloseSessionCommand):
             driver.close_session()
             return BrowserOperationResult()

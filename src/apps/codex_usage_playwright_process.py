@@ -261,6 +261,16 @@ class CodexUsagePlaywrightProcessDriver:
             return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
         return self._invoke("poll_login")
 
+    def open_api_credit_login(self) -> BrowserOperationResult:
+        if self._shutdown:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return self._invoke("open_api_credit_login")
+
+    def poll_api_credit_login(self) -> BrowserOperationResult:
+        if self._shutdown:
+            return BrowserOperationResult(error=BrowserErrorCode.COLLECT_FAILED.value)
+        return self._invoke("poll_api_credit_login")
+
     def close_session(self) -> None:
         with self._invoke_lock:
             if not self._has_live_worker():

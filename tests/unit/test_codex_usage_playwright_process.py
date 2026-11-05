@@ -187,6 +187,14 @@ class CodexUsagePlaywrightProcessPolicyTest(unittest.TestCase):
             driver.poll_login().error,
             BrowserErrorCode.COLLECT_FAILED.value,
         )
+        self.assertEqual(
+            driver.open_api_credit_login().error,
+            BrowserErrorCode.COLLECT_FAILED.value,
+        )
+        self.assertEqual(
+            driver.poll_api_credit_login().error,
+            BrowserErrorCode.COLLECT_FAILED.value,
+        )
 
     def _lock_race_driver(
         self,

@@ -63,6 +63,21 @@ class FakeDriver:
         self._record("poll_login")
         return BrowserOperationResult(error="login_required")
 
+    def open_api_credit_login(self) -> BrowserOperationResult:
+        self._record("open_api_credit_login")
+        self.status = BrowserRuntimeStatus(BrowserState.HEADED_LOGIN, True, "")
+        return BrowserOperationResult(error="login_required")
+
+    def poll_api_credit_login(self) -> BrowserOperationResult:
+        self._record("poll_api_credit_login")
+        return BrowserOperationResult(
+            probe={
+                "url": "billing",
+                "metricBlocks": [],
+                "apiCredit": {"status": "ok", "balance": "$1.00"},
+            }
+        )
+
     def close_session(self) -> None:
         self._record("close_session")
         self.status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
@@ -243,6 +258,8 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
             ("collect", lambda session: session.collect()),
             ("open_login", lambda session: session.open_login()),
             ("poll_login", lambda session: session.poll_login()),
+            ("open_api_credit_login", lambda session: session.open_api_credit_login()),
+            ("poll_api_credit_login", lambda session: session.poll_api_credit_login()),
         )
         for expected_call, operation in operations:
             with self.subTest(operation=expected_call):
@@ -286,6 +303,28 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertEqual(len(set(factory.driver.thread_ids)), 1)
         self.assertNotEqual(factory.driver.thread_ids[0], caller_thread)
         self.assertTrue(all(factory.driver.daemon_flags))
+        session.shutdown()
+
+    def test_api_credit_login_commands_run_on_the_owner_thread(self) -> None:
+        factory = DriverFactory()
+        session = make_session(factory)
+        caller_thread = threading.get_ident()
+
+        opened = session.open_api_credit_login()
+        polled = session.poll_api_credit_login()
+
+        self.assertEqual(opened.error, "login_required")
+        self.assertIsNone(polled.error)
+        self.assertEqual(
+            (polled.probe or {}).get("apiCredit"),
+            {"status": "ok", "balance": "$1.00"},
+        )
+        self.assertEqual(
+            factory.driver.calls,
+            ["start", "open_api_credit_login", "poll_api_credit_login"],
+        )
+        self.assertEqual(len(set(factory.driver.thread_ids)), 1)
+        self.assertNotEqual(factory.driver.thread_ids[0], caller_thread)
         session.shutdown()
 
     def test_shutdown_routes_once_and_is_idempotent_after_start(self) -> None:

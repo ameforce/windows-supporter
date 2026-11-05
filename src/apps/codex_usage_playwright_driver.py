@@ -3,12 +3,21 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TypeVar, final, override
+from typing import Any, TypeVar, cast, final, override
 from urllib.parse import urlsplit, urlunsplit
 
+from src.apps.codex_api_credit import (
+    API_CREDIT_BILLING_URL,
+    API_CREDIT_HOST,
+    ApiCreditReading,
+    ApiCreditStatus,
+    describe_api_credit_shape,
+    parse_api_credit_probe,
+)
 from src.apps.codex_usage_urls import canonicalize_codex_usage_url, is_codex_usage_url, is_legacy_usage_dialog_url
 
 from src.apps.codex_usage_browser_types import (
+    ApiCreditPayload,
     BrowserErrorCode,
     BrowserOperationResult,
     BrowserRuntimeStatus,
@@ -26,6 +35,14 @@ from src.apps.codex_usage_browser_types import (
 
 
 _T = TypeVar("_T")
+
+# Time kept free after the optional API credit step so that the usage result is
+# never lost to the session's collect timeout.
+_API_CREDIT_STEP_MARGIN_SEC = 10.0
+_API_CREDIT_POLL_INTERVAL_SEC = 0.5
+# How long the sign-in window waits for the page to render on open and on each poll.
+_API_CREDIT_LOGIN_OPEN_WAIT_SEC = 8.0
+_API_CREDIT_LOGIN_POLL_WAIT_SEC = 3.0
 
 
 @final
@@ -122,11 +139,14 @@ class CodexUsagePlaywrightDriver:
         playwright_starter: PlaywrightStarter | None = None,
         sleep: Callable[[float], None] | None = None,
         initial_session_cookies: list[dict[str, Any]] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._config: PlaywrightSessionConfig = config
         self._log_sink: LogSink | None = log_sink
         self._starter: PlaywrightStarter = playwright_starter or _default_playwright_starter
         self._sleep: Callable[[float], None] = sleep or time.sleep
+        self._clock: Callable[[], float] = clock or time.monotonic
+        self._api_credit_next_due: float | None = None
         self._playwright: PlaywrightLike | None = None
         self._context: ContextLike | None = None
         self._page: PageLike | None = None
@@ -156,6 +176,7 @@ class CodexUsagePlaywrightDriver:
         return BrowserOperationResult()
 
     def collect(self) -> BrowserOperationResult:
+        collect_started_at = self._clock()
         for context_attempt in range(2):
             last_error = "usage collection failed"
             try:
@@ -171,7 +192,9 @@ class CodexUsagePlaywrightDriver:
                     if probe is not None and self._probe_is_terminal(probe):
                         self._page_success_count += 1
                         self._set_status(BrowserState.HEADLESS_READY)
-                        return BrowserOperationResult(probe=probe)
+                        return BrowserOperationResult(
+                            probe=self._attach_api_credit(probe, collect_started_at)
+                        )
                     if probe is not None:
                         blocks = probe.get("metricBlocks", [])
                         route = "legacy_usage" if is_legacy_usage_dialog_url(str(probe.get("url", ""))) else "usage" if is_codex_usage_url(str(probe.get("url", ""))) else "other"
@@ -305,6 +328,212 @@ class CodexUsagePlaywrightDriver:
             return self._fail(error, str(exc))
         self._set_status(BrowserState.HEADLESS_READY)
         return BrowserOperationResult(probe=probe)
+
+    def open_api_credit_login(self) -> BrowserOperationResult:
+        """Show the OpenAI Platform billing page in a window so the user can sign in."""
+        script = self._config.api_credit_probe_script
+        url = self._config.api_credit_url
+        if not url or not script:
+            return self._fail(
+                BrowserErrorCode.COLLECT_FAILED.value,
+                "api credit page is not configured",
+            )
+        try:
+            page = self._ensure_context(headless=False)
+            _ = self._run_stage(
+                "api_credit_login_navigation",
+                lambda: page.goto(
+                    url,
+                    timeout=self._config.navigation_timeout_ms,
+                    wait_until="domcontentloaded",
+                ),
+            )
+            reading = self._wait_for_api_credit(page, script, _API_CREDIT_LOGIN_OPEN_WAIT_SEC)
+            return self._conclude_api_credit_login(reading)
+        except (OSError, RuntimeError) as exc:
+            return self._fail(_classify_error(str(exc)), str(exc))
+        except _playwright_error_type() as exc:
+            return self._fail(_classify_error(str(exc)), str(exc))
+
+    def poll_api_credit_login(self) -> BrowserOperationResult:
+        """Check the open sign-in window once; it closes itself after a balance is read."""
+        page = self._page
+        script = self._config.api_credit_probe_script
+        if self._headless is not False or page is None or page.is_closed() or not script:
+            self._close_context()
+            return self._fail(BrowserErrorCode.LOGIN_WINDOW_CLOSED.value)
+        try:
+            reading = self._wait_for_api_credit(page, script, _API_CREDIT_LOGIN_POLL_WAIT_SEC)
+            if (
+                reading.status is ApiCreditStatus.UNAVAILABLE
+                and reading.reason == "unexpected_page"
+            ):
+                reading = self._recover_api_credit_landing(page, script, reading)
+            return self._conclude_api_credit_login(reading)
+        except (OSError, RuntimeError) as exc:
+            return self._fail_api_credit_login_poll(exc)
+        except _playwright_error_type() as exc:
+            return self._fail_api_credit_login_poll(exc)
+
+    def _fail_api_credit_login_poll(self, exc: BaseException) -> BrowserOperationResult:
+        error = _classify_error(str(exc), login_poll=True)
+        if error == BrowserErrorCode.LOGIN_WINDOW_CLOSED.value:
+            self._close_context()
+        return self._fail(error, str(exc))
+
+    def _conclude_api_credit_login(self, reading: ApiCreditReading) -> BrowserOperationResult:
+        if reading.status is not ApiCreditStatus.OK:
+            return self._fail(
+                BrowserErrorCode.LOGIN_REQUIRED.value,
+                state=BrowserState.HEADED_LOGIN,
+                login_window_open=True,
+            )
+        self._close_context()
+        _ = self._ensure_context(headless=True)
+        self._set_status(BrowserState.HEADLESS_READY)
+        # Recorded only once the headless window is back, so a failed relaunch
+        # leaves the next usage collect free to read the balance again.
+        self._api_credit_next_due = self._clock() + max(
+            1.0, float(self._config.api_credit_success_interval_sec)
+        )
+        probe: UsageProbePayload = {
+            "url": API_CREDIT_BILLING_URL,
+            "metricBlocks": [],
+            "apiCredit": cast(ApiCreditPayload, reading.to_payload()),
+        }
+        return BrowserOperationResult(probe=probe)
+
+    def _recover_api_credit_landing(
+        self,
+        page: PageLike,
+        script: str,
+        reading: ApiCreditReading,
+    ) -> ApiCreditReading:
+        """After sign-in the site may land elsewhere on the platform; go back to billing."""
+        url = self._config.api_credit_url
+        try:
+            host = urlsplit(str(page.url)).netloc.lower().split(":", 1)[0]
+        except (OSError, RuntimeError, _playwright_error_type()):
+            return reading
+        if not url or host != API_CREDIT_HOST:
+            return reading
+        _ = self._run_stage(
+            "api_credit_login_navigation",
+            lambda: page.goto(
+                url,
+                timeout=self._config.navigation_timeout_ms,
+                wait_until="domcontentloaded",
+            ),
+        )
+        return self._wait_for_api_credit(page, script, _API_CREDIT_LOGIN_POLL_WAIT_SEC)
+
+    def _attach_api_credit(
+        self,
+        probe: UsageProbePayload,
+        collect_started_at: float,
+    ) -> UsageProbePayload:
+        """Add the optional API credit reading; a failure here never touches the usage result."""
+        if not self._probe_is_usage_ready(probe):
+            return probe
+        try:
+            payload = self._collect_api_credit(collect_started_at)
+        except Exception as exc:
+            self._log(f"api credit step failed type={type(exc).__name__}")
+            return probe
+        if payload is None:
+            return probe
+        return {**probe, "apiCredit": payload}
+
+    def _collect_api_credit(self, collect_started_at: float) -> ApiCreditPayload | None:
+        config = self._config
+        if not config.api_credit_url or not config.api_credit_probe_script or self._context is None:
+            return None
+        now = self._clock()
+        if self._api_credit_next_due is not None and now < self._api_credit_next_due:
+            return None
+        limit = min(float(config.command_timeout_sec), float(config.collect_timeout_sec))
+        budget = min(
+            float(config.api_credit_step_max_sec),
+            limit - (now - collect_started_at) - _API_CREDIT_STEP_MARGIN_SEC,
+        )
+        if budget < float(config.api_credit_step_min_sec):
+            self._log("api credit step skipped reason=budget")
+            return None
+        reading = self._read_api_credit(budget)
+        if reading.status is ApiCreditStatus.OK:
+            interval = config.api_credit_success_interval_sec
+        elif reading.status is ApiCreditStatus.LOGIN_REQUIRED:
+            interval = config.api_credit_login_required_interval_sec
+        else:
+            interval = config.api_credit_retry_interval_sec
+        self._api_credit_next_due = self._clock() + max(1.0, float(interval))
+        self._log(
+            f"api credit step end status={reading.status.value} reason={reading.reason or '-'}"
+        )
+        return cast(ApiCreditPayload, reading.to_payload())
+
+    def _read_api_credit(self, budget_sec: float) -> ApiCreditReading:
+        """Read the billing page in a throwaway tab so the usage page stays untouched."""
+        context = self._context
+        url = self._config.api_credit_url
+        script = self._config.api_credit_probe_script
+        if context is None or not url:
+            return ApiCreditReading(ApiCreditStatus.UNAVAILABLE, reason="no_context")
+        started_at = self._clock()
+        page: PageLike | None = None
+        try:
+            page = context.new_page()
+            tab = page
+            navigation_ms = int(
+                max(1_000.0, min(float(self._config.navigation_timeout_ms), budget_sec * 600.0))
+            )
+            _ = self._run_stage(
+                "api_credit_navigation",
+                lambda: tab.goto(url, timeout=navigation_ms, wait_until="domcontentloaded"),
+            )
+            wait_sec = max(1.0, budget_sec - (self._clock() - started_at))
+            return self._wait_for_api_credit(page, script, wait_sec)
+        except (DriverOperationError, OSError, RuntimeError, _playwright_error_type()) as exc:
+            return ApiCreditReading(
+                ApiCreditStatus.UNAVAILABLE,
+                reason=_classify_error(str(exc)),
+            )
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except (OSError, RuntimeError, _playwright_error_type()):
+                    self._log("api credit page close failed")
+
+    def _wait_for_api_credit(
+        self,
+        page: PageLike,
+        script: str,
+        wait_sec: float,
+    ) -> ApiCreditReading:
+        deadline = self._clock() + max(0.0, float(wait_sec))
+        attempts = int(max(0.0, float(wait_sec)) / _API_CREDIT_POLL_INTERVAL_SEC) + 2
+        reading = ApiCreditReading(ApiCreditStatus.UNAVAILABLE, reason="loading")
+        raw: object = None
+        for attempt in range(attempts):
+            try:
+                raw = page.evaluate(script)
+            except (OSError, RuntimeError, _playwright_error_type()) as exc:
+                lowered = str(exc).lower()
+                if "closed" in lowered or "crashed" in lowered:
+                    raise
+                # A navigation in flight destroys the page context; look again.
+                raw = None
+            reading = parse_api_credit_probe(raw)
+            if reading.is_final or self._clock() >= deadline or attempt + 1 >= attempts:
+                break
+            self._sleep(_API_CREDIT_POLL_INTERVAL_SEC)
+        if reading.status is ApiCreditStatus.UNAVAILABLE:
+            self._log(
+                f"api credit page not parsed reason={reading.reason} "
+                f"{describe_api_credit_shape(raw)}"
+            )
+        return reading
 
     def close_session(self) -> None:
         self._close_context()

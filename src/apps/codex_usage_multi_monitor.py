@@ -1363,6 +1363,21 @@ class CodexUsageMultiMonitor:
         self.show_account_status(account_id, force_refresh=True, source="manual_login")
         return
 
+    def login_api_credit_account(self, account_id: str) -> bool:
+        """Open the OpenAI Platform sign-in window for one Codex profile.
+
+        Only Codex profiles read the API credit balance, and a profile that is
+        being released or deleted refuses the request like any other refresh.
+        """
+        child = self.__begin_profile_refresh(account_id)
+        if child is None:
+            return False
+        try:
+            login = getattr(child, "login_api_credit", None)
+            return bool(login()) if callable(login) else False
+        finally:
+            self.__end_profile_refresh(account_id)
+
     def release_account_profile_session(self, account_id: str) -> tuple[bool, str]:
         if bool(self.__closing):
             return False, "shutdown"
