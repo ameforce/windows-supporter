@@ -14,6 +14,7 @@ from src.apps.ai_usage_contracts import (
     plan_taskbar_drop,
     resolve_taskbar_pane_assignment,
 )
+from src.apps.codex_api_credit import format_api_credit_text
 from src.apps.codex_usage_multi_monitor import TASKBAR_PROFILE_LIMIT
 from src.apps.codex_usage_taskbar_overlay import draw_provider_mark
 from src.apps.profile_detail_canvas import ProfileDetailCanvas
@@ -93,6 +94,7 @@ class CodexUsageSettingsView:
         self._account_query_buttons = {}
         self._account_move_buttons = {}
         self._account_login_buttons = {}
+        self._account_api_credit_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_labels: dict[str, str] = {}
         self._account_label_vars = {}
@@ -173,6 +175,8 @@ class CodexUsageSettingsView:
         self._live_spark_weekly_var = None
         self._live_spark_weekly_reset_var = None
         self._live_credit_var = None
+        self._live_api_credit_var = None
+        self._live_api_credit_time_var = None
         self._status_colors = {
             "info": "#6B7280",
             "ok": "#10B981",
@@ -215,6 +219,7 @@ class CodexUsageSettingsView:
         self._account_query_buttons = {}
         self._account_move_buttons = {}
         self._account_login_buttons = {}
+        self._account_api_credit_login_buttons = {}
         self._account_logout_buttons = {}
         self._account_labels = {}
         self._account_label_vars = {}
@@ -388,6 +393,8 @@ class CodexUsageSettingsView:
         self._live_spark_weekly_var = tk.StringVar(value="-")
         self._live_spark_weekly_reset_var = tk.StringVar(value="-")
         self._live_credit_var = tk.StringVar(value="-")
+        self._live_api_credit_var = tk.StringVar(value="-")
+        self._live_api_credit_time_var = tk.StringVar(value="-")
         self._live_spark_cells: list[Any] = []
 
         row = 0
@@ -878,6 +885,7 @@ class CodexUsageSettingsView:
                 self._set_button_enabled(down, index < len(ordered_accounts)-1)
             self._account_query_buttons[account_id] = ProfileActionBinding()
             self._account_login_buttons[account_id] = ProfileActionBinding()
+            self._account_api_credit_login_buttons[account_id] = ProfileActionBinding()
             self._account_logout_buttons[account_id] = ProfileActionBinding()
             status_var = tk.StringVar(value="조회 상태: -")
             snapshot_var = tk.StringVar(value="값 상태: -")
@@ -968,6 +976,10 @@ class CodexUsageSettingsView:
                 ("남은 크레딧", self._live_credit_var),
             ),
             (
+                ("API 크레딧 잔액", self._live_api_credit_var),
+                ("API 잔액 확인", self._live_api_credit_time_var),
+            ),
+            (
                 ("5시간 사용 한도", self._live_five_hour_var),
                 ("5시간 한도 초기화", self._live_five_hour_reset_var),
             ),
@@ -1000,7 +1012,9 @@ class CodexUsageSettingsView:
                     column=pair_index * 2,
                 )
                 self._runtime_value_rows.append(cells)
-                if runtime_row >= 4 and cells is not None:
+                # Monthly and Spark rows (everything after the weekly pair) are
+                # hidden together when the page never reports them.
+                if runtime_row >= 5 and cells is not None:
                     self._live_spark_cells.extend(cells)
         try:
             runtime_grid.bind(
@@ -2102,6 +2116,7 @@ class CodexUsageSettingsView:
                     ("gpt_5_3_codex_spark_weekly_limit", "Spark 주간 한도"),
                     ("gpt_5_3_codex_spark_weekly_limit_reset_at", "Spark 주간 초기화"),
                 ),
+                (("api_credit_balance", "API 크레딧 잔액"), ("api_credit_captured_at", "API 잔액 확인")),
             )
         metric_vars: dict[str, Any] = {}
         display_vars: dict[str, Any] = {}
@@ -2399,6 +2414,42 @@ class CodexUsageSettingsView:
                 self._set_status("연결 요청 중 오류가 발생했습니다.", level="error")
             return
         self._set_status("프로필별 연결 기능을 사용할 수 없습니다.", level="error")
+        return
+
+    def _on_account_api_credit_login(self, account_id: str) -> None:
+        if self._profile_settings_mutation_blocked():
+            return
+        account_label = self._account_display_label(account_id)
+        try:
+            runtime = self._safe_get_runtime()
+            entry = self._find_account_runtime_entry(runtime, account_id)
+            if entry is not None and not self._account_api_credit_login_permission(entry):
+                self._set_status(
+                    "현재 상태에서는 API 크레딧 연결을 시작할 수 없습니다.",
+                    level="info",
+                )
+                return
+        except Exception:
+            pass
+        login = getattr(self._codex, "login_api_credit_account", None)
+        if not callable(login):
+            self._set_status("API 크레딧 연결 기능을 사용할 수 없습니다.", level="error")
+            return
+        try:
+            started = bool(login(str(account_id)))
+        except Exception:
+            self._set_status("API 크레딧 연결 요청 중 오류가 발생했습니다.", level="error")
+            return
+        if started:
+            self._set_status(
+                f"{account_label} API 크레딧 로그인 창을 여는 중입니다...",
+                level="info",
+            )
+        else:
+            self._set_status(
+                "현재 상태에서는 API 크레딧 연결을 시작할 수 없습니다.",
+                level="info",
+            )
         return
 
     def _on_account_query(self, account_id: str) -> None:
@@ -3721,6 +3772,8 @@ class CodexUsageSettingsView:
         provider_state = str(runtime.get("provider_state") or runtime.get("state") or "")
         if logout_in_progress or monitor_state == "cancelling":
             return "연결 해제 중"
+        if inflight and source == "api_credit_login":
+            return "API 크레딧 로그인 대기 중"
         if provider_state in {"rate_limited", "rate_limit"} or monitor_state == "rate_limited":
             try:
                 retry_after = int(float(runtime.get("next_collect_in_sec")))
@@ -3906,9 +3959,12 @@ class CodexUsageSettingsView:
 
     def _format_account_metric_value(self, key: str, payload: dict[str, Any]) -> str:
         raw = str(payload.get(key, "") or "").strip()
+        if key == "api_credit_balance":
+            # A failed read has no balance of its own: the status text stands in.
+            return format_api_credit_text(raw, payload.get("api_credit_status")) or "-"
         if not raw:
             return "-"
-        if key == "captured_at":
+        if key in ("captured_at", "api_credit_captured_at"):
             return self._format_captured_at_value(raw)
         if key.endswith("_reset_at"):
             try:
@@ -4278,6 +4334,18 @@ class CodexUsageSettingsView:
                     _fmt_reset("gpt_5_3_codex_spark_weekly_limit_reset_at"),
                 )
             self._set_var_if_changed(self._live_credit_var, _val("remaining_credit"))
+            self._set_var_if_changed(
+                self._live_api_credit_var,
+                format_api_credit_text(
+                    payload.get("api_credit_balance"),
+                    payload.get("api_credit_status"),
+                )
+                or "-",
+            )
+            self._set_var_if_changed(
+                self._live_api_credit_time_var,
+                _fmt_time(_val("api_credit_captured_at")),
+            )
             self._apply_live_spark_visibility(payload)
         except Exception:
             pass
@@ -4316,6 +4384,12 @@ class CodexUsageSettingsView:
             entry = runtime_entries.get(str(account_id or ""))
             _account_can_login, account_can_logout = self._account_action_permissions(entry)
             self._set_button_enabled(button, account_can_logout and not actions_blocked)
+        for account_id, button in self._account_api_credit_login_buttons.items():
+            entry = runtime_entries.get(str(account_id or ""))
+            self._set_button_enabled(
+                button,
+                self._account_api_credit_login_permission(entry) and not actions_blocked,
+            )
         return
 
     def _runtime_profile_map(self, runtime: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -4399,6 +4473,19 @@ class CodexUsageSettingsView:
             else session_state == "logged_in"
         )
         return can_login, can_logout
+
+    def _account_api_credit_login_permission(self, entry: dict[str, Any] | None) -> bool:
+        """Only an enabled Codex profile that is idle can open the platform sign-in."""
+        if not isinstance(entry, dict):
+            return False
+        if not bool(entry.get("enabled", True)):
+            return False
+        if str(entry.get("provider") or "codex").strip().lower() != "codex":
+            return False
+        runtime = entry.get("runtime", {})
+        if not isinstance(runtime, dict):
+            return False
+        return bool(runtime.get("can_login_api_credit", False))
 
     def _account_query_permission(self, entry: dict[str, Any] | None) -> bool:
         if not isinstance(entry, dict):
