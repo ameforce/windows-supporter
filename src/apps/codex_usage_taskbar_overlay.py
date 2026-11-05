@@ -17,6 +17,7 @@ from src.apps.ai_usage_contracts import (
     normalize_taskbar_side_priority,
     resolve_taskbar_pane_assignment,
 )
+from src.apps.codex_api_credit import format_api_credit_text
 from src.apps.codex_usage_taskbar_targets import (
     TaskbarMonitorSnapshot,
     TaskbarOverlayTarget,
@@ -410,6 +411,8 @@ _METRIC_RENDER_SIGNATURE_KEYS = (
     "reset_badge_fill",
     "reset_badge_outline",
     "reset_badge_text_color",
+    # Hover-tooltip data: a changed balance must replace the hit rect metrics.
+    "api_credit_text",
 )
 
 
@@ -554,6 +557,19 @@ def build_codex_usage_taskbar_overlay_model(
             # usage limit's slot order. Unreported "--" placeholders do not
             # consume the credit slot.
             metrics.append(credit_metric)
+        api_credit_text = (
+            format_api_credit_text(
+                snapshot.get("api_credit_balance"),
+                snapshot.get("api_credit_status"),
+            )
+            if provider == "codex"
+            else ""
+        )
+        if api_credit_text:
+            # Tooltip only: the compact row layout has no slot for a dollar
+            # balance, so every segment of the profile row carries it.
+            for metric in metrics:
+                metric["api_credit_text"] = api_credit_text
         primary_metric = next(
             (m for m in metrics if _is_reported(m)),
             metrics[0]
@@ -1446,6 +1462,9 @@ def _build_metric_tooltip_text(metric: dict[str, Any], profile_label: str = "") 
     guidance = str(metric_dict.get("normal_guidance_text") or "")
     if guidance:
         lines.append(f"정상 범위 {guidance}")
+    api_credit = str(metric_dict.get("api_credit_text") or "").strip()
+    if api_credit:
+        lines.append(f"API 크레딧 {api_credit}")
     profile = str(profile_label or "").strip()
     if profile:
         lines.append(f"프로필: {profile}")

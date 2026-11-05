@@ -77,6 +77,10 @@ def run_playwright_worker(connection: Connection) -> None:
                 result = driver.open_login()
             elif command == "poll_login":
                 result = driver.poll_login()
+            elif command == "open_api_credit_login":
+                result = driver.open_api_credit_login()
+            elif command == "poll_api_credit_login":
+                result = driver.poll_api_credit_login()
             elif command == "close_session":
                 driver.close_session()
                 result = BrowserOperationResult()

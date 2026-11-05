@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from queue import Queue
 import threading
 from typing import Any, Protocol, final
@@ -14,9 +15,11 @@ from src.apps.codex_usage_browser_types import (
     CloseSessionCommand,
     CollectCommand,
     LogSink,
+    OpenApiCreditLoginCommand,
     OpenLoginCommand,
     PlaywrightSessionConfig,
     PlaywrightStarter,
+    PollApiCreditLoginCommand,
     PollLoginCommand,
     ShutdownCommand,
 )
@@ -40,6 +43,8 @@ class DriverProtocol(Protocol):
     def collect(self) -> BrowserOperationResult: ...
     def open_login(self) -> BrowserOperationResult: ...
     def poll_login(self) -> BrowserOperationResult: ...
+    def open_api_credit_login(self) -> BrowserOperationResult: ...
+    def poll_api_credit_login(self) -> BrowserOperationResult: ...
     def close_session(self) -> None: ...
     def shutdown(self) -> None: ...
     def get_runtime_status(self) -> BrowserRuntimeStatus: ...
@@ -101,6 +106,8 @@ class CodexUsagePlaywrightSession:
         self._lock: threading.Lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._driver: DriverProtocol | None = None
+        # Recovery discards a killed driver, so the session carries this to the next one.
+        self._driver_was_killed: bool = False
         self._worker_generation: int = 0
         self._worker_poisoned: bool = False
         self._worker_recovery_exhausted: bool = False
@@ -199,6 +206,12 @@ class CodexUsagePlaywrightSession:
 
     def poll_login(self) -> BrowserOperationResult:
         return self._invoke_cancellable(PollLoginCommand())
+
+    def open_api_credit_login(self) -> BrowserOperationResult:
+        return self._invoke_cancellable(OpenApiCreditLoginCommand())
+
+    def poll_api_credit_login(self) -> BrowserOperationResult:
+        return self._invoke_cancellable(PollApiCreditLoginCommand())
 
     def _invoke_cancellable(self, command: BrowserCommand) -> BrowserOperationResult:
         with self._lock:
@@ -441,7 +454,11 @@ class CodexUsagePlaywrightSession:
             return queue, self._thread, generation
 
     def _run(self, queue: Queue[_CommandEnvelope], generation: int) -> None:
-        driver = self._driver_factory(self._config, self._log_sink, self._playwright_starter)
+        config = self._config
+        if self._driver_was_killed:
+            self._driver_was_killed = False
+            config = replace(config, api_credit_skip_new_worker_collect=True)
+        driver = self._driver_factory(config, self._log_sink, self._playwright_starter)
         self._restore_session_cookies(driver)
         with self._lock:
             if generation == self._worker_generation:
@@ -594,6 +611,7 @@ class CodexUsagePlaywrightSession:
         terminate = getattr(driver, "force_terminate", None)
         if not callable(terminate):
             return False
+        self._driver_was_killed = True
         try:
             terminated = bool(terminate(reason))
         except Exception as exc:
@@ -658,6 +676,10 @@ class CodexUsagePlaywrightSession:
             return driver.open_login()
         if isinstance(command, PollLoginCommand):
             return driver.poll_login()
+        if isinstance(command, OpenApiCreditLoginCommand):
+            return driver.open_api_credit_login()
+        if isinstance(command, PollApiCreditLoginCommand):
+            return driver.poll_api_credit_login()
         if isinstance(command, CloseSessionCommand):
             driver.close_session()
             return BrowserOperationResult()
