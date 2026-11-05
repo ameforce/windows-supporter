@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from collections.abc import Callable
+from multiprocessing import Pipe
 from typing import Any
+from unittest.mock import patch
 
 from src.apps.codex_api_credit import API_CREDIT_BILLING_URL as BILLING
 from src.apps.codex_usage_browser_types import (
     BrowserErrorCode,
+    BrowserOperationResult,
+    BrowserRuntimeStatus,
     BrowserState,
     PlaywrightSessionConfig,
 )
 from src.apps.codex_usage_playwright_driver import CodexUsagePlaywrightDriver
+from src.apps.codex_usage_playwright_worker import run_playwright_worker
 from tests.unit.test_codex_usage_playwright_driver import (
     LOGIN_URL,
     PROBE,
@@ -549,6 +555,59 @@ class ApiCreditLoginTest(unittest.TestCase):
         self.assertEqual(opened.error, BrowserErrorCode.PROFILE_IN_USE.value)
         self.assertIsNone(driver._api_credit_next_due)  # noqa: SLF001
         _ = clock
+
+
+class _WorkerDriver:
+    calls: list[str] = []
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    def open_api_credit_login(self) -> BrowserOperationResult:
+        self.calls.append("open_api_credit_login")
+        return BrowserOperationResult(error="login_required")
+
+    def poll_api_credit_login(self) -> BrowserOperationResult:
+        self.calls.append("poll_api_credit_login")
+        return BrowserOperationResult(error="login_window_closed")
+
+    def shutdown(self) -> None:
+        self.calls.append("shutdown")
+
+    def get_runtime_status(self) -> BrowserRuntimeStatus:
+        return BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
+
+    def export_session_cookies(self) -> list[dict[str, Any]]:
+        return []
+
+
+class WorkerApiCreditCommandTest(unittest.TestCase):
+    def test_sign_in_commands_reach_the_driver_and_answer(self) -> None:
+        _WorkerDriver.calls = []
+        parent, child = Pipe()
+        with patch(
+            "src.apps.codex_usage_playwright_worker.CodexUsagePlaywrightDriver", _WorkerDriver
+        ):
+            worker = threading.Thread(target=run_playwright_worker, args=(child,), daemon=True)
+            worker.start()
+            parent.send(("bootstrap", PlaywrightSessionConfig("profile", "url", "probe"), 1, []))
+            self.assertEqual(parent.recv()[0], "ready")
+            answers = []
+            for request_id, command in enumerate(
+                ("open_api_credit_login", "poll_api_credit_login", "shutdown")
+            ):
+                parent.send(("command", request_id, command))
+                answers.append(parent.recv())
+            worker.join(5.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            _WorkerDriver.calls,
+            ["open_api_credit_login", "poll_api_credit_login", "shutdown"],
+        )
+        self.assertEqual(answers[0][0:2], ("result", 0))
+        self.assertEqual(answers[0][2].error, "login_required")
+        self.assertEqual(answers[1][2].error, "login_window_closed")
 
 
 if __name__ == "__main__":
