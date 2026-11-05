@@ -210,8 +210,8 @@ class PlaywrightSessionConfig:
     api_credit_login_required_interval_sec: float = 1_800.0
     api_credit_step_max_sec: float = 15.0
     api_credit_step_min_sec: float = 6.0
-    # A new worker is the one retrying after a stuck or killed collect, and its first
-    # collect has the least time left: the usage result comes first there.
+    # Set by the process driver for the worker that replaces a killed one: if the page
+    # is what stalled, the retry must get the usage result before touching it again.
     api_credit_skip_new_worker_collect: bool = False
 
 

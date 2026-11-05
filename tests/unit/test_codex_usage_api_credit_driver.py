@@ -540,6 +540,51 @@ class ApiCreditLoginTest(unittest.TestCase):
         assert polled.probe is not None
         self.assertEqual(polled.probe["apiCredit"]["balance"], "$4.00")
 
+    def test_changing_query_strings_do_not_lift_the_return_limit(self) -> None:
+        driver, _chromium, _headed, page, _headless = self._pending_login()
+        _ = driver.open_api_credit_login()
+        page.redirects = {}
+        page.routes[BILLING] = home_probe()
+        page.default = home_probe()
+        for step in range(8):
+            page.url = f"https://platform.openai.com/onboarding?state={step}"
+            _ = driver.poll_api_credit_login()
+
+        self.assertEqual(page.calls.count(("goto", BILLING)), 1 + 2, "the open and two returns")
+
+    def test_returns_across_many_paths_stop_at_the_total(self) -> None:
+        driver, _chromium, _headed, page, _headless = self._pending_login()
+        _ = driver.open_api_credit_login()
+        page.redirects = {}
+        page.routes[BILLING] = home_probe()
+        page.default = home_probe()
+        for step in range(12):
+            page.url = f"https://platform.openai.com/step{step}"
+            _ = driver.poll_api_credit_login()
+
+        self.assertEqual(page.calls.count(("goto", BILLING)), 1 + 6)
+
+    def test_network_error_during_a_landing_return_is_not_a_closed_window(self) -> None:
+        driver, _chromium, headed, page, _headless = self._pending_login()
+        _ = driver.open_api_credit_login()
+        page.url = PLATFORM_HOME
+        page.goto_error = RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED at https://platform")
+
+        polled = driver.poll_api_credit_login()
+
+        self.assertEqual(polled.error, BrowserErrorCode.LOGIN_REQUIRED.value)
+        self.assertFalse(headed.closed)
+
+    def test_failed_headless_restart_after_sign_in_is_not_a_closed_window(self) -> None:
+        billing = BillingPage({BILLING: ok_probe("$4.00")})
+        driver, _chromium, _clock, _logs = make_driver(
+            [FakeContext([billing]), OSError("Target page, context or browser has been closed")]
+        )
+
+        result = driver.open_api_credit_login()
+
+        self.assertEqual(result.error, BrowserErrorCode.COLLECT_FAILED.value)
+
     def test_failed_landing_return_keeps_the_window_and_tries_again(self) -> None:
         driver, _chromium, headed, page, _headless = self._pending_login()
         _ = driver.open_api_credit_login()

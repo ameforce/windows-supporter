@@ -49,9 +49,10 @@ _API_CREDIT_LOGIN_POLL_WAIT_SEC = 3.0
 # Signed in, billing page rendered, still no balance after this many reads in a row:
 # waiting cannot help, so the window closes instead of holding the profile for 10 min.
 _API_CREDIT_LOGIN_UNREADABLE_READS = 4
-# Per address: a page the user must complete is left alone after this, while a later
+# Per path, within a total: a page the user must complete is left alone after this, while a later
 # landing elsewhere still returns to the billing page.
 _API_CREDIT_LOGIN_LANDING_RECOVERIES = 2
+_API_CREDIT_LOGIN_LANDING_RECOVERIES_TOTAL = 6
 
 
 @final
@@ -85,6 +86,13 @@ def _canonical_usage_url(url: str) -> str:
     if is_codex_usage_url(url):
         return canonicalize_codex_usage_url(url)
     return urlunsplit((parts.scheme.lower(), host, path, parts.query, fragment))
+
+
+def _names_closed_target(lowered: str) -> bool:
+    # net::ERR_CONNECTION_CLOSED is a network failure, the window is still there.
+    return "net::err" not in lowered and any(
+        token in lowered for token in ("closed", "target page", "browser has been closed")
+    )
 
 
 def _classify_error(message: str, *, login_poll: bool = False) -> str:
@@ -123,7 +131,7 @@ def _classify_error(message: str, *, login_poll: bool = False) -> str:
         return BrowserErrorCode.BROWSER_CHANNEL_UNAVAILABLE.value
     if any(token in lowered for token in ("playwright unavailable", "no module named 'playwright'", "playwright not installed")):
         return BrowserErrorCode.PLAYWRIGHT_UNAVAILABLE.value
-    if login_poll and any(token in lowered for token in ("closed", "target page", "browser has been closed")):
+    if login_poll and _names_closed_target(lowered):
         return BrowserErrorCode.LOGIN_WINDOW_CLOSED.value
     if any(
         token in lowered
@@ -421,7 +429,11 @@ class CodexUsagePlaywrightDriver:
                 login_window_open=True,
             )
         self._close_context()
-        _ = self._ensure_context(headless=True)
+        try:
+            _ = self._ensure_context(headless=True)
+        except (OSError, RuntimeError, _playwright_error_type()) as exc:
+            # The sign-in itself worked: not a closed sign-in window.
+            return self._fail(_classify_error(str(exc)), str(exc))
         self._set_status(BrowserState.HEADLESS_READY)
         # Recorded only once the headless window is back, so a failed relaunch
         # leaves the next usage collect free to read the balance again.
@@ -450,17 +462,20 @@ class CodexUsagePlaywrightDriver:
             current_url = str(page.url)
         except (OSError, RuntimeError, _playwright_error_type()):
             return reading
-        host = urlsplit(current_url).netloc.lower().split(":", 1)[0]
-        returns = self._api_credit_landing_recoveries.get(current_url, 0)
+        parts = urlsplit(current_url)
+        host = parts.netloc.lower().split(":", 1)[0]
+        returns = self._api_credit_landing_recoveries.get(parts.path, 0)
         # Bounded: a platform page the user must complete (creating an organization,
         # accepting terms) would otherwise be reloaded away on every poll.
         if (
             not url
             or host != API_CREDIT_HOST
             or returns >= _API_CREDIT_LOGIN_LANDING_RECOVERIES
+            or sum(self._api_credit_landing_recoveries.values())
+            >= _API_CREDIT_LOGIN_LANDING_RECOVERIES_TOTAL
         ):
             return reading
-        self._api_credit_landing_recoveries[current_url] = returns + 1
+        self._api_credit_landing_recoveries[parts.path] = returns + 1
         try:
             _ = self._run_stage(
                 "api_credit_login_navigation",
@@ -472,7 +487,7 @@ class CodexUsagePlaywrightDriver:
             )
         except (OSError, RuntimeError, _playwright_error_type()) as exc:
             lowered = str(exc).lower()
-            if "closed" in lowered or "crashed" in lowered:
+            if _names_closed_target(lowered) or "crashed" in lowered:
                 raise
             # The site may be navigating by itself right after sign-in: look again later.
             self._log("api credit landing return failed")

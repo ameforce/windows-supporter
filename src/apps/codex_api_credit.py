@@ -96,20 +96,22 @@ _AMOUNT_ONLY_LINE = re.compile(
 _AMOUNT_AFTER_LABEL = re.compile(
     # A dash separates only when a space follows; "-$5.00" keeps its sign. Nothing
     # number-like may follow the amount, so "$1,23" is unreadable rather than "$1".
-    rf"^\s*(?:[:：]|[\-–]\s)?\s*(?:{_AMOUNT_LEADING}|{_AMOUNT_TRAILING})(?![\d.,])", re.IGNORECASE
+    rf"^\s*(?:[:：]|[\-–]\s)?\s*(?:{_AMOUNT_LEADING}|{_AMOUNT_TRAILING})(?!\d|[.,]\d)", re.IGNORECASE
 )
 _LEADING_SYMBOLS = re.compile(r"^[\W_]+")
 _LABEL_SEPARATORS = " :：-–"
 # Action buttons sit between a card title and its amount ("Add to credit balance").
+# A closed list of whole lines: the amount under anything else (a budget, a recharge
+# threshold) is not the balance, and an unknown button only leaves the balance unread.
 _ACTION_LINE = re.compile(
-    r"^(?:(?:add|buy|purchase|top[\s-]?up|modify|edit|manage|enable|disable|set\s?up|recharge)\b"
-    r"|.*(?:충전|추가|구매|수정|관리|변경|설정)(?:하기)?$)",
-    re.IGNORECASE,
-)
-_ACTION_LINE_MAX_LENGTH = 48
-# Sentences about another amount are not buttons, whatever verb they start with.
-_NOT_ACTION_WORDS = re.compile(
-    r"\b(?:below|budget|limit|threshold|when|minimum|at least)\b|한도|예산|미만|이하|최소",
+    r"(?:"
+    r"(?:add|buy|purchase|top[\s-]?up|recharge)"
+    r"(?:(?:\s+to)?(?:\s+(?:your|more|credit|credits|balance|funds)){1,3})?"
+    r"|(?:modify|edit|manage|enable|disable|set\s?up|turn\s+(?:on|off))"
+    r"(?:\s+your)?\s+(?:auto[\s-]?recharge|recharge|billing|credits?|balance|payment\s+methods?)"
+    r"|(?:(?:API\s*)?크레딧|잔액|자동\s*충전|결제(?:\s*(?:수단|정보))?)?\s*"
+    r"(?:충전|추가|구매|수정|관리|변경|설정)(?:하기)?"
+    r")[\W_]*",
     re.IGNORECASE,
 )
 _ACTION_LINES_BEFORE_AMOUNT = 2
@@ -222,11 +224,7 @@ def _split_label(line: str) -> tuple[str, str] | None:
 
 
 def _is_action_line(line: str) -> bool:
-    return (
-        len(line) <= _ACTION_LINE_MAX_LENGTH
-        and _NOT_ACTION_WORDS.search(line) is None
-        and _ACTION_LINE.match(_LEADING_SYMBOLS.sub("", line)) is not None
-    )
+    return _ACTION_LINE.fullmatch(_LEADING_SYMBOLS.sub("", line)) is not None
 
 
 def extract_credit_balance(lines: list[str], *, allow_synonyms: bool = True) -> str:

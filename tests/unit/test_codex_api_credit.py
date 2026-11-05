@@ -165,6 +165,46 @@ class ApiCreditBalanceParsingTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(parse_api_credit_probe(page(text)).balance, "")
 
+    def test_sentence_punctuation_after_the_amount_is_not_part_of_it(self) -> None:
+        for text, expected in (
+            ("Credit balance $12.34.", "$12.34"),
+            ("Credit balance $3.00, renews", "$3.00"),
+            ("Credit balance $5,000.00.", "$5,000.00"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_api_credit_probe(page(text)).balance, expected)
+
+    def test_only_known_button_wording_is_stepped_over(self) -> None:
+        for line in (
+            "Manage budgets",
+            "Edit limits",
+            "Add thresholds",
+            "Set up auto recharge at",
+            "Top up to",
+            "Recharge to",
+            "Add credits under",
+            "Add budget설정",
+            "자동 충전 기준 변경",
+            "월 사용 상한 변경",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(
+                    parse_api_credit_probe(page(f"Credit balance\n{line}\n$5.00")).balance, ""
+                )
+        for line in (
+            "+ Add to credit balance",
+            "Add credits →",
+            "Buy credits",
+            "Top up",
+            "Set up auto-recharge",
+            "자동 충전 설정",
+            "크레딧 충전하기",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(
+                    parse_api_credit_probe(page(f"Credit balance\n{line}\n$5.00")).balance, "$5.00"
+                )
+
     def test_inline_button_right_after_the_amount_still_reads(self) -> None:
         self.assertEqual(
             parse_api_credit_probe(page("Credit balance$3.00Add to credit balance")).balance,

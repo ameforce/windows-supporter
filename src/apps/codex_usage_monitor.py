@@ -2582,7 +2582,6 @@ class CodexUsageMonitor:
             login_url=build_codex_login_entry_url(str(self.__usage_url)),
             api_credit_url=API_CREDIT_BILLING_URL,
             api_credit_probe_script=API_CREDIT_PAGE_PROBE_SCRIPT,
-            api_credit_skip_new_worker_collect=True,
         )
         factory = self.__browser_session_factory
         if factory is not None:

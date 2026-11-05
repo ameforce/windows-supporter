@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from src.apps.codex_usage_browser_types import (
     BrowserErrorCode,
@@ -139,6 +139,36 @@ class CodexUsagePlaywrightProcessPolicyTest(unittest.TestCase):
             ),
             "headed_login_emergency_rss",
         )
+
+    def test_only_the_worker_replacing_a_killed_one_skips_its_first_balance_read(self) -> None:
+        driver = CodexUsagePlaywrightProcessDriver(self.config)
+        self.assertFalse(driver._next_worker_config().api_credit_skip_new_worker_collect)
+
+        driver._graceful_stop("planned_max_age")
+        self.assertFalse(driver._next_worker_config().api_credit_skip_new_worker_collect)
+
+        driver.force_terminate(BrowserErrorCode.COMMAND_TIMEOUT.value)
+        self.assertTrue(driver._next_worker_config().api_credit_skip_new_worker_collect)
+        self.assertFalse(
+            driver._next_worker_config().api_credit_skip_new_worker_collect,
+            "only the next worker",
+        )
+
+    def test_new_worker_receives_the_skip_after_a_kill(self) -> None:
+        parent = Mock()
+        parent.poll.return_value = False
+        context = Mock()
+        context.Pipe.return_value = (parent, Mock())
+        context.Process.return_value = Mock(pid=77, sentinel=1)
+        driver = CodexUsagePlaywrightProcessDriver(self.config, process_context=context)
+        driver.force_terminate(BrowserErrorCode.COMMAND_TIMEOUT.value)
+
+        with patch("src.apps.codex_usage_playwright_process.WindowsJobBoundary"):
+            driver._ensure_worker()
+
+        bootstrap = parent.send.call_args.args[0]
+        self.assertEqual(bootstrap[0], "bootstrap")
+        self.assertTrue(bootstrap[1].api_credit_skip_new_worker_collect)
 
     def test_hard_cancel_requires_both_worker_exit_and_empty_job(self) -> None:
         driver = CodexUsagePlaywrightProcessDriver(self.config)

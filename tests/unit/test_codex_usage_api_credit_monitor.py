@@ -437,7 +437,6 @@ class ApiCreditProbeTest(unittest.TestCase):
 
         self.assertEqual(configs[0].api_credit_url, API_CREDIT_BILLING_URL)
         self.assertEqual(configs[0].api_credit_probe_script, API_CREDIT_PAGE_PROBE_SCRIPT)
-        self.assertTrue(configs[0].api_credit_skip_new_worker_collect)
 
 
 class ApiCreditLoginFlowTest(unittest.TestCase):

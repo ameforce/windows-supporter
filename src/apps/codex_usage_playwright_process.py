@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from multiprocessing.connection import Connection
 from typing import Any, final
 
@@ -177,6 +178,7 @@ class CodexUsagePlaywrightProcessDriver:
         self._last_failure_signal: str = ""
         self._session_cookies: list[dict[str, Any]] = []
         self._boundary_failed: bool = False
+        self._replacing_killed_worker: bool = False
         self._shutdown: bool = False
         self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
 
@@ -306,6 +308,7 @@ class CodexUsagePlaywrightProcessDriver:
 
     def force_terminate(self, reason: str) -> bool:
         self._retry_wake.set()
+        self._replacing_killed_worker = True
         effective_reason = (
             self._last_failure_signal
             if reason == BrowserErrorCode.COMMAND_TIMEOUT.value
@@ -470,7 +473,7 @@ class CodexUsagePlaywrightProcessDriver:
             parent_connection.send(
                 (
                     "bootstrap",
-                    self._config,
+                    self._next_worker_config(),
                     generation,
                     [dict(cookie) for cookie in self._session_cookies],
                 )
@@ -497,6 +500,12 @@ class CodexUsagePlaywrightProcessDriver:
             f"generation={generation} pid={self._worker_pid}"
         )
         return None
+
+    def _next_worker_config(self) -> PlaywrightSessionConfig:
+        """Planned recycles keep reading the balance; only a kill's replacement waits once."""
+        skip = self._replacing_killed_worker
+        self._replacing_killed_worker = False
+        return replace(self._config, api_credit_skip_new_worker_collect=skip)
 
     def _recycle_worker_if_needed(self) -> None:
         with self._state_lock:
