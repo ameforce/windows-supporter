@@ -63,6 +63,21 @@ class FakeDriver:
         self._record("poll_login")
         return BrowserOperationResult(error="login_required")
 
+    def open_api_credit_login(self) -> BrowserOperationResult:
+        self._record("open_api_credit_login")
+        self.status = BrowserRuntimeStatus(BrowserState.HEADED_LOGIN, True, "")
+        return BrowserOperationResult(error="login_required")
+
+    def poll_api_credit_login(self) -> BrowserOperationResult:
+        self._record("poll_api_credit_login")
+        return BrowserOperationResult(
+            probe={
+                "url": "billing",
+                "metricBlocks": [],
+                "apiCredit": {"status": "ok", "balance": "$1.00"},
+            }
+        )
+
     def close_session(self) -> None:
         self._record("close_session")
         self.status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
@@ -243,6 +258,8 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
             ("collect", lambda session: session.collect()),
             ("open_login", lambda session: session.open_login()),
             ("poll_login", lambda session: session.poll_login()),
+            ("open_api_credit_login", lambda session: session.open_api_credit_login()),
+            ("poll_api_credit_login", lambda session: session.poll_api_credit_login()),
         )
         for expected_call, operation in operations:
             with self.subTest(operation=expected_call):
@@ -286,6 +303,28 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         self.assertEqual(len(set(factory.driver.thread_ids)), 1)
         self.assertNotEqual(factory.driver.thread_ids[0], caller_thread)
         self.assertTrue(all(factory.driver.daemon_flags))
+        session.shutdown()
+
+    def test_api_credit_login_commands_run_on_the_owner_thread(self) -> None:
+        factory = DriverFactory()
+        session = make_session(factory)
+        caller_thread = threading.get_ident()
+
+        opened = session.open_api_credit_login()
+        polled = session.poll_api_credit_login()
+
+        self.assertEqual(opened.error, "login_required")
+        self.assertIsNone(polled.error)
+        self.assertEqual(
+            (polled.probe or {}).get("apiCredit"),
+            {"status": "ok", "balance": "$1.00"},
+        )
+        self.assertEqual(
+            factory.driver.calls,
+            ["start", "open_api_credit_login", "poll_api_credit_login"],
+        )
+        self.assertEqual(len(set(factory.driver.thread_ids)), 1)
+        self.assertNotEqual(factory.driver.thread_ids[0], caller_thread)
         session.shutdown()
 
     def test_shutdown_routes_once_and_is_idempotent_after_start(self) -> None:
@@ -351,6 +390,35 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
             self.assertEqual(factory.calls, 2)
             self.assertIn("shutdown", first.calls)
             self.assertEqual(second.calls[:2], ["start", "collect"])
+        finally:
+            release.set()
+            session.shutdown()
+
+    def test_driver_replacing_a_killed_one_skips_its_first_balance_read(self) -> None:
+        release = threading.Event()
+        first = TerminableBlockingDriver(release)
+        second = FakeDriver()
+        third = FakeDriver()
+        inner = SequenceDriverFactory([first, second, third])
+        skips: list[bool] = []
+
+        def factory(
+            config: PlaywrightSessionConfig,
+            log_sink: LogSink | None,
+            starter: PlaywrightStarter | None,
+        ) -> FakeDriver:
+            skips.append(config.api_credit_skip_new_worker_collect)
+            return inner(config, log_sink, starter)
+
+        session = make_session(factory, command_timeout_sec=0.05)
+        session._timeout_retry_delays_sec = (0.0,)
+        session._timeout_recovery_grace_sec = 0.2
+        session._sleep = lambda _delay: None
+
+        try:
+            self.assertIsNotNone(session.collect().probe)
+            self.assertEqual(skips, [False, True])
+            self.assertFalse(session._driver_was_killed, "only the next driver")
         finally:
             release.set()
             session.shutdown()

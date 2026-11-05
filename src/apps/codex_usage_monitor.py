@@ -8,7 +8,7 @@ from src.apps.codex_usage_urls import (
     are_equivalent_codex_usage_urls,
 )
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 import re
@@ -32,6 +32,17 @@ from src.apps.codex_usage_browser_types import (
 from src.utils.LibConnector import LibConnector
 from src.utils.ToolTip import ToolTip
 from src.apps.codex_local_usage import LocalCodexUsageSnapshot
+from src.apps.codex_api_credit import (
+    API_CREDIT_BILLING_URL,
+    API_CREDIT_PAGE_PROBE_SCRIPT,
+    API_CREDIT_UNREADABLE_REASON,
+    ApiCreditReading,
+    ApiCreditStatus,
+    format_api_credit_text,
+    normalize_api_credit_balance,
+    normalize_api_credit_status,
+    reading_from_payload,
+)
 from src.apps.ai_usage_contracts import (
     UsageErrorType,
     normalize_usage_error_type,
@@ -109,6 +120,14 @@ USAGE_SNAPSHOT_META_KEYS = (
     "gpt_5_3_codex_spark_five_hour_limit_reset_at",
     "gpt_5_3_codex_spark_weekly_limit_reset_at",
     "monthly_limit_reset_at",
+)
+
+# The OpenAI Platform API credit balance travels with the snapshot but is not a
+# usage metric: it never feeds history, change alerts or the usable-cache check.
+USAGE_SNAPSHOT_API_CREDIT_KEYS = (
+    "api_credit_balance",
+    "api_credit_captured_at",
+    "api_credit_status",
 )
 
 USAGE_LIMIT_RESET_AT_KEY_BY_METRIC: dict[str, str] = {
@@ -1476,6 +1495,9 @@ class UsageSnapshot:
     gpt_5_3_codex_spark_weekly_limit_reset_at: str = ""
     monthly_limit_reset_at: str = ""
     reported_metric_keys: tuple[str, ...] = ()
+    api_credit_balance: str = ""
+    api_credit_captured_at: str = ""
+    api_credit_status: str = ""
 
     @classmethod
     def from_metrics(
@@ -1501,6 +1523,7 @@ class UsageSnapshot:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UsageSnapshot":
         payload = _sanitize_snapshot_reset_payload(data)
+        raw = data if isinstance(data, dict) else {}
         return cls(
             five_hour_limit=_normalize_metric_candidate(
                 "five_hour_limit", payload.get("five_hour_limit", "")
@@ -1536,6 +1559,15 @@ class UsageSnapshot:
             monthly_limit_reset_at=normalize_usage_value(
                 payload.get("monthly_limit_reset_at", "")
             ),
+            api_credit_balance=normalize_api_credit_balance(
+                raw.get("api_credit_balance", "")
+            ),
+            api_credit_captured_at=normalize_usage_value(
+                raw.get("api_credit_captured_at", "")
+            ),
+            api_credit_status=normalize_api_credit_status(
+                raw.get("api_credit_status", "")
+            ),
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -1564,16 +1596,50 @@ class UsageSnapshot:
             "monthly_limit_reset_at": normalize_usage_value(
                 self.monthly_limit_reset_at
             ),
+            "api_credit_balance": normalize_api_credit_balance(
+                self.api_credit_balance
+            ),
+            "api_credit_captured_at": normalize_usage_value(
+                self.api_credit_captured_at
+            ),
+            "api_credit_status": normalize_api_credit_status(self.api_credit_status),
         }
 
     def metrics(self) -> dict[str, str]:
         payload = self.to_dict()
-        for key in USAGE_SNAPSHOT_META_KEYS:
+        for key in (*USAGE_SNAPSHOT_META_KEYS, *USAGE_SNAPSHOT_API_CREDIT_KEYS):
             payload.pop(key, None)
         return payload
 
     def has_any_metric(self) -> bool:
         return any(bool(v) for v in self.metrics().values())
+
+    def with_api_credit(
+        self,
+        reading: ApiCreditReading,
+        *,
+        captured_at: str,
+    ) -> "UsageSnapshot":
+        """Copy carrying this read of the API credit page.
+
+        A failed read has no balance of its own: the merge keeps the last known
+        one beside the new status.
+        """
+        succeeded = reading.status is ApiCreditStatus.OK
+        return replace(
+            self,
+            api_credit_balance=reading.balance if succeeded else "",
+            api_credit_captured_at=normalize_usage_value(captured_at) if succeeded else "",
+            api_credit_status=reading.status.value,
+        )
+
+    def with_api_credit_of(self, other: "UsageSnapshot") -> "UsageSnapshot":
+        return replace(
+            self,
+            api_credit_balance=other.api_credit_balance,
+            api_credit_captured_at=other.api_credit_captured_at,
+            api_credit_status=other.api_credit_status,
+        )
 
 
 def reconcile_snapshot_with_local_codex_usage(
@@ -1656,7 +1722,7 @@ def reconcile_snapshot_with_local_codex_usage(
         captured_at=local.captured_at,
         reset_info=reset_info,
         reported_metric_keys=reported,
-    )
+    ).with_api_credit_of(current)
 
 
 @dataclass
@@ -1723,7 +1789,54 @@ def merge_snapshot_with_previous(
         merged["captured_at"] = prev_payload.get("captured_at", "")
     snapshot = UsageSnapshot.from_dict(merged)
     snapshot.reported_metric_keys = reported_metric_keys
+    (
+        snapshot.api_credit_balance,
+        snapshot.api_credit_captured_at,
+        snapshot.api_credit_status,
+    ) = _merged_api_credit(current, prev)
     return snapshot
+
+
+def _merged_api_credit(
+    current: UsageSnapshot,
+    previous: UsageSnapshot,
+) -> tuple[str, str, str]:
+    """Balance, read time and status after folding a collect into the last snapshot.
+
+    The balance is read on its own, slower cadence, so most collects carry no
+    reading: the last answer is kept as it was. A read that failed keeps the last
+    known balance (with its own read time) beside the new status.
+    """
+    if not current.api_credit_status:
+        return (
+            previous.api_credit_balance,
+            previous.api_credit_captured_at,
+            previous.api_credit_status,
+        )
+    if current.api_credit_status != ApiCreditStatus.OK.value:
+        return (
+            previous.api_credit_balance,
+            previous.api_credit_captured_at,
+            current.api_credit_status,
+        )
+    return (
+        current.api_credit_balance,
+        current.api_credit_captured_at,
+        current.api_credit_status,
+    )
+
+
+def _with_kept_api_credit(
+    current: UsageSnapshot,
+    previous: UsageSnapshot,
+) -> UsageSnapshot:
+    balance, captured_at, status = _merged_api_credit(current, previous)
+    return replace(
+        current,
+        api_credit_balance=balance,
+        api_credit_captured_at=captured_at,
+        api_credit_status=status,
+    )
 
 
 def compute_usage_changes(
@@ -2271,6 +2384,11 @@ class CodexUsageMonitor:
         # the transient retry budget that decides ``retry_exhausted``.
         self.__environment_failure_streak = 0
         self.__collect_lock = threading.Lock()
+        # The OpenAI Platform sign-in window holds the collect lock like a login.
+        self.__api_credit_login_active = False
+        self.__api_credit_login_thread: threading.Thread | None = None
+        self.__api_credit_login_window_sec = 600.0
+        self.__api_credit_login_poll_interval_sec = 3.0
 
         self.__settings_version = 1
         self.__enabled = True
@@ -2349,6 +2467,9 @@ class CodexUsageMonitor:
             getattr(self.__browser_session, "request_cancel", None)
         )
         cancelled = self.request_collect_cancel()
+        # The cancel ends the sign-in wait at once. Let its last log line and state
+        # write finish before a deleted profile's folder is renamed away.
+        self.__join_api_credit_login(5.0)
         shutdown_succeeded = bool(cancelled)
         if bool(supports_cancel or not cancelled):
             shutdown_succeeded = self.__browser_session.shutdown() is True
@@ -2459,6 +2580,8 @@ class CodexUsageMonitor:
             navigation_timeout_ms=int(self.__navigation_timeout_ms),
             command_timeout_sec=max(45.0, float(self.__login_timeout_sec) + 15.0),
             login_url=build_codex_login_entry_url(str(self.__usage_url)),
+            api_credit_url=API_CREDIT_BILLING_URL,
+            api_credit_probe_script=API_CREDIT_PAGE_PROBE_SCRIPT,
         )
         factory = self.__browser_session_factory
         if factory is not None:
@@ -3031,6 +3154,14 @@ class CodexUsageMonitor:
             )
             and not self.__logout_in_progress
         )
+        can_login_api_credit = bool(
+            self.__enabled
+            and not self.__logout_in_progress
+            and not self.__collect_inflight
+            and not self.__profile_in_use_detected
+            and not login_window_open
+            and not pending_login_active
+        )
         return {
             "enabled": bool(self.__enabled),
             "collect_inflight": bool(self.__collect_inflight),
@@ -3094,6 +3225,8 @@ class CodexUsageMonitor:
             "auto_monitoring_active": bool(self.__should_run_background_collection()),
             "can_login": can_login,
             "can_logout": can_logout,
+            "api_credit_login_active": bool(self.__api_credit_login_active),
+            "can_login_api_credit": can_login_api_credit,
             "usage_history": self.__get_usage_history_snapshot(),
         }
     def format_captured_at_for_display(self, value: str) -> str:
@@ -3220,7 +3353,8 @@ class CodexUsageMonitor:
                             previous=previous,
                             observed_snapshot=refreshed,
                         )
-                        snapshot = merged
+                        # The committed copy also holds a balance kept across sign-in.
+                        snapshot = self.get_last_snapshot()
                         self.__profile_in_use_detected = False
                         self.__edge_challenge_backoff = False
                         self.__environment_failure_streak = 0
@@ -3279,6 +3413,185 @@ class CodexUsageMonitor:
                 )
             )
         return
+
+    def login_api_credit(self) -> bool:
+        """Open the OpenAI Platform sign-in window to read the API credit balance.
+
+        Returns False when the request cannot start now. The window closes itself
+        once the balance is visible; progress is reported through tooltips.
+        """
+        if (
+            self.__root is None
+            or self.__is_collect_cancel_requested()
+            or self.__is_pending_login_poll_active()
+        ):
+            return False
+        worker_epoch = int(self.__worker_epoch)
+        try:
+            thread = threading.Thread(
+                target=self.__api_credit_login_worker,
+                args=(worker_epoch,),
+                daemon=True,
+                name="codex-api-credit-login",
+            )
+            self.__api_credit_login_thread = thread
+            thread.start()
+        except Exception as exc:
+            self.__log_exception("api credit login thread start failed", exc)
+            return False
+        return True
+
+    def __is_pending_login_poll_active(self) -> bool:
+        """The ChatGPT sign-in window may be open and being polled for its own result."""
+        if self.__pending_login_after_id is not None:
+            return True
+        until_ts = float(self.__pending_login_poll_until_ts or 0.0)
+        return until_ts > 0.0 and until_ts > float(self.__lib.time.monotonic())
+
+    def __join_api_credit_login(self, timeout_sec: float) -> None:
+        thread = self.__api_credit_login_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        try:
+            thread.join(timeout_sec)
+        except (AttributeError, RuntimeError):
+            return
+        return
+
+    def __api_credit_login_worker(self, worker_epoch: int) -> None:
+        if not self.__acquire_collect_lock_non_blocking():
+            self.__log("api credit login skip reason=busy")
+            self.__ui_post(
+                lambda: self.__show_tooltip(
+                    "조회가 진행 중입니다. 끝난 뒤 API 크레딧 연결을 다시 시도해 주세요."
+                )
+            )
+            return
+        outcome: tuple[str, ApiCreditReading | None] = ("failed", None)
+        try:
+            self.__collect_inflight = True
+            self.__collect_inflight_source = "api_credit_login"
+            self.__api_credit_login_active = True
+            self.__set_monitor_state("running")
+            self.__log("api credit login start")
+            self.__ui_post(
+                lambda: self.__show_tooltip(
+                    "OpenAI Platform 로그인 창을 엽니다. 로그인하면 잔액을 확인한 뒤 창이 자동으로 닫힙니다."
+                )
+            )
+            outcome = self.__run_api_credit_login(worker_epoch)
+        except Exception as exc:
+            self.__log_exception("api credit login failed", exc)
+        finally:
+            self.__api_credit_login_active = False
+            self.__collect_inflight = False
+            self.__collect_inflight_source = ""
+            if not bool(self.__logout_in_progress):
+                self.__set_monitor_state("idle")
+            try:
+                self.__collect_lock.release()
+            except Exception:
+                pass
+        self.__report_api_credit_login(outcome, worker_epoch)
+        return
+
+    def __run_api_credit_login(
+        self,
+        worker_epoch: int,
+    ) -> tuple[str, ApiCreditReading | None]:
+        session = self.__browser_session
+        interval = max(0.5, float(self.__api_credit_login_poll_interval_sec))
+        deadline = float(self.__lib.time.monotonic()) + float(
+            self.__api_credit_login_window_sec
+        )
+        result = session.open_api_credit_login()
+        while True:
+            error = normalize_usage_value(result.error).lower()
+            probe = result.probe if isinstance(result.probe, dict) else {}
+            reading = reading_from_payload(probe.get("apiCredit"))
+            if self.__is_collect_cancel_requested():
+                return "cancelled", None
+            if not error and reading is not None:
+                if reading.status is ApiCreditStatus.OK:
+                    return "connected", reading
+                if reading.reason == API_CREDIT_UNREADABLE_REASON:
+                    return "unreadable", reading
+            if error == "profile_in_use":
+                return "profile_in_use", None
+            if error == "login_window_closed":
+                return "window_closed", None
+            if error and error != "login_required":
+                self.__close_api_credit_login_window()
+                return "failed", None
+            if not self.__is_worker_epoch_current(worker_epoch):
+                self.__close_api_credit_login_window()
+                return "cancelled", None
+            if float(self.__lib.time.monotonic()) >= deadline:
+                self.__close_api_credit_login_window()
+                return "timeout", None
+            if self.__collect_cancel_event.wait(interval):
+                return "cancelled", None
+            result = session.poll_api_credit_login()
+
+    def __close_api_credit_login_window(self) -> None:
+        try:
+            self.__browser_session.close_session()
+        except Exception as exc:
+            self.__log_exception("api credit login window close failed", exc)
+        return
+
+    def __report_api_credit_login(
+        self,
+        outcome: tuple[str, ApiCreditReading | None],
+        worker_epoch: int,
+    ) -> None:
+        kind, reading = outcome
+        self.__log(f"api credit login end outcome={kind}")
+        if self.__is_collect_cancel_requested() or not self.__is_worker_epoch_current(
+            worker_epoch
+        ):
+            return
+        message = ""
+        if kind == "connected" and reading is not None:
+            self.__commit_api_credit_reading(reading)
+            message = f"API 크레딧 잔액을 확인했습니다: {reading.balance}"
+        elif kind == "unreadable" and reading is not None:
+            self.__commit_api_credit_reading(reading)
+            message = "로그인은 되었지만 결제 개요 화면에서 API 크레딧 잔액을 찾지 못했습니다."
+        elif kind == "window_closed":
+            message = "로그인 창이 닫혀 API 크레딧 연결을 마치지 못했습니다."
+        elif kind == "timeout":
+            message = "API 크레딧 로그인 대기 시간이 지났습니다. 다시 연결해 주세요."
+        elif kind == "profile_in_use":
+            message = "다른 Chrome 세션에서 프로필을 사용 중이라 API 크레딧 연결 창을 열지 못했습니다."
+        elif kind != "cancelled":
+            message = "API 크레딧 연결 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+        if message:
+            self.__ui_post(lambda text=message: self.__show_tooltip(text))
+        return
+
+    def __commit_api_credit_reading(self, reading: ApiCreditReading) -> None:
+        captured_at = self.__now_iso()
+        with self.__limit_reset_lock:
+            self.__last_snapshot = _with_kept_api_credit(
+                self.__last_snapshot.with_api_credit(reading, captured_at=captured_at),
+                self.__last_snapshot,
+            )
+            self.__save_state()
+        return
+
+    def __attach_api_credit_reading(
+        self,
+        snapshot: UsageSnapshot,
+        raw: Any,
+        captured_at: str,
+    ) -> UsageSnapshot:
+        reading = reading_from_payload(raw)
+        if reading is None:
+            return snapshot
+        reason = f" reason={reading.reason}" if reading.reason else ""
+        self.__log(f"api credit read status={reading.status.value}{reason}")
+        return snapshot.with_api_credit(reading, captured_at=captured_at)
 
     def handle_snapshot(
         self,
@@ -3367,7 +3680,13 @@ class CodexUsageMonitor:
                 previous=previous,
                 observed_snapshot=observed_snapshot,
             )
-            self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
+            # The balance has its own lifetime: a commit without usage backfill
+            # (sign-in, no usable earlier metrics) must not erase it. Only releasing
+            # the profile clears it.
+            self.__last_snapshot = _with_kept_api_credit(
+                UsageSnapshot.from_dict(snapshot.to_dict()),
+                self.__last_snapshot,
+            )
             self.__append_usage_history_sample(self.__last_snapshot)
             self.__snapshot_backfill_allowed = True
             self.__save_state()
@@ -4571,6 +4890,12 @@ class CodexUsageMonitor:
             lines.append((f"{label}: {value}", line_color))
             if reset_display:
                 lines.append((f"{USAGE_RESET_TOOLTIP_INDENT}{reset_display}", None))
+        api_credit_text = format_api_credit_text(
+            payload.get("api_credit_balance", ""),
+            payload.get("api_credit_status", ""),
+        )
+        if api_credit_text:
+            lines.append((f"API 크레딧 잔액: {api_credit_text}", None))
         captured_at = normalize_usage_value(payload.get("captured_at", ""))
         if captured_at:
             lines.append((f"확인: {self.__format_timestamp_display(captured_at)}", None))
@@ -5115,6 +5440,11 @@ class CodexUsageMonitor:
                 web_account_id=normalized_probe.get("accountId", ""),
                 web_plan_type=normalized_probe.get("planType", ""),
             )
+        snapshot = self.__attach_api_credit_reading(
+            snapshot,
+            normalized_probe.get("apiCredit"),
+            captured_at,
+        )
         if not snapshot.has_any_metric():
             return None
         return snapshot

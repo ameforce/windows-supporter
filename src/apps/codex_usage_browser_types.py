@@ -45,6 +45,12 @@ class MetricBlockPayload(TypedDict):
     boundary_role: NotRequired[str]
 
 
+class ApiCreditPayload(TypedDict):
+    status: str
+    balance: NotRequired[str]
+    reason: NotRequired[str]
+
+
 class UsageProbePayload(TypedDict):
     url: str
     title: NotRequired[str]
@@ -54,6 +60,9 @@ class UsageProbePayload(TypedDict):
     planType: NotRequired[str]
     creditsOnly: NotRequired[bool]
     metricBlocks: list[MetricBlockPayload]
+    # Attached by the driver after a usage probe or an API credit sign-in; the
+    # page itself never returns it.
+    apiCredit: NotRequired[ApiCreditPayload]
 
 
 def is_credit_only_usage_probe(probe: UsageProbePayload | dict[str, Any], *, require_identity: bool = True) -> bool:
@@ -192,6 +201,18 @@ class PlaywrightSessionConfig:
     worker_cleanup_timeout_sec: float = 5.0
     worker_bootstrap_timeout_sec: float = 15.0
     login_url: str | None = None
+    # Optional OpenAI Platform API credit balance read in a second tab after a
+    # usage probe. Disabled while ``api_credit_url`` is empty.
+    api_credit_url: str | None = None
+    api_credit_probe_script: str = ""
+    api_credit_success_interval_sec: float = 600.0
+    api_credit_retry_interval_sec: float = 300.0
+    api_credit_login_required_interval_sec: float = 1_800.0
+    api_credit_step_max_sec: float = 15.0
+    api_credit_step_min_sec: float = 6.0
+    # Set by the process driver for the worker that replaces a killed one: if the page
+    # is what stalled, the retry must get the usage result before touching it again.
+    api_credit_skip_new_worker_collect: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +246,16 @@ class PollLoginCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenApiCreditLoginCommand:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PollApiCreditLoginCommand:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class CloseSessionCommand:
     pass
 
@@ -238,6 +269,8 @@ BrowserCommand: TypeAlias = (
     CollectCommand
     | OpenLoginCommand
     | PollLoginCommand
+    | OpenApiCreditLoginCommand
+    | PollApiCreditLoginCommand
     | CloseSessionCommand
     | ShutdownCommand
 )

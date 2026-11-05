@@ -111,6 +111,22 @@ class ProfileBoardNativeTest(unittest.TestCase):
         self.assertEqual(str(menu.entrycget(card_menu.indexes["down"], "state")), "normal")
         self.assertEqual(str(menu.entrycget(card_menu.indexes["login"], "state")), "normal")
 
+    def test_card_menu_api_credit_entry_follows_its_action_state_and_routes(self):
+        first, second = self.view._account_order[:2]
+        self.view._account_api_credit_login_buttons[second].state(["disabled"])
+        self.view._account_api_credit_login_buttons[first].state(["!disabled"])
+        card_menu = self.view._profile_menu
+        card_menu.bind_to(second)
+        menu = card_menu.menu
+        index = card_menu.indexes["api_credit_login"]
+        self.assertEqual(menu.entrycget(index, "label"), "API 크레딧 연결")
+        self.assertEqual(str(menu.entrycget(index, "state")), "disabled")
+        card_menu.bind_to(first)
+        self.assertEqual(str(menu.entrycget(index, "state")), "normal")
+        self.view._on_account_api_credit_login = Mock()
+        menu.invoke(index)
+        self.view._on_account_api_credit_login.assert_called_once_with(first)
+
     def test_selection_highlight_and_keyboard_navigation_without_inspector(self):
         first, second, third = self.view._account_order[:3]
         self.assertTrue(self.view._select_profile(second))
