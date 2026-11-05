@@ -418,6 +418,7 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
         try:
             self.assertIsNotNone(session.collect().probe)
             self.assertEqual(skips, [False, True])
+            self.assertFalse(session._driver_was_killed, "only the next driver")
         finally:
             release.set()
             session.shutdown()
