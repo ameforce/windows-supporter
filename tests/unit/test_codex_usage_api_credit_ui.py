@@ -83,6 +83,21 @@ class ApiCreditRowsTest(unittest.TestCase):
         )
         self.assertEqual(view._format_account_metric_value("api_credit_captured_at", {}), "-")
 
+    def test_state_text_names_the_sign_in_wait(self) -> None:
+        view = CodexUsageSettingsView(root=None, codex_monitor=None)
+
+        self.assertEqual(
+            view._runtime_state_text(
+                {
+                    "session_state": "logged_in",
+                    "monitor_state": "running",
+                    "collect_inflight": True,
+                    "collect_source": "api_credit_login",
+                }
+            ),
+            "API 크레딧 로그인 대기 중",
+        )
+
     def test_runtime_refresh_fills_the_api_rows_of_a_card(self) -> None:
         view = CodexUsageSettingsView(root=None, codex_monitor=None)
         view._account_rendered_providers = {"account_1": "codex"}

@@ -49,6 +49,8 @@ _API_CREDIT_LOGIN_POLL_WAIT_SEC = 3.0
 # Signed in, billing page rendered, still no balance after this many reads in a row:
 # waiting cannot help, so the window closes instead of holding the profile for 10 min.
 _API_CREDIT_LOGIN_UNREADABLE_READS = 4
+# Per address: a page the user must complete is left alone after this, while a later
+# landing elsewhere still returns to the billing page.
 _API_CREDIT_LOGIN_LANDING_RECOVERIES = 2
 
 
@@ -155,7 +157,8 @@ class CodexUsagePlaywrightDriver:
         self._clock: Callable[[], float] = clock or time.monotonic
         self._api_credit_next_due: float | None = None
         self._api_credit_unreadable_reads: int = 0
-        self._api_credit_landing_recoveries: int = 0
+        self._api_credit_landing_recoveries: dict[str, int] = {}
+        self._api_credit_new_worker_collect_passed: bool = False
         self._playwright: PlaywrightLike | None = None
         self._context: ContextLike | None = None
         self._page: PageLike | None = None
@@ -348,9 +351,14 @@ class CodexUsagePlaywrightDriver:
                 "api credit page is not configured",
             )
         self._api_credit_unreadable_reads = 0
-        self._api_credit_landing_recoveries = 0
+        self._api_credit_landing_recoveries = {}
         try:
             page = self._ensure_context(headless=False)
+        except (OSError, RuntimeError) as exc:
+            return self._fail(_classify_error(str(exc)), str(exc))
+        except _playwright_error_type() as exc:
+            return self._fail(_classify_error(str(exc)), str(exc))
+        try:
             _ = self._run_stage(
                 "api_credit_login_navigation",
                 lambda: page.goto(
@@ -439,26 +447,36 @@ class CodexUsagePlaywrightDriver:
         """After sign-in the site may land elsewhere on the platform; go back to billing."""
         url = self._config.api_credit_url
         try:
-            host = urlsplit(str(page.url)).netloc.lower().split(":", 1)[0]
+            current_url = str(page.url)
         except (OSError, RuntimeError, _playwright_error_type()):
             return reading
+        host = urlsplit(current_url).netloc.lower().split(":", 1)[0]
+        returns = self._api_credit_landing_recoveries.get(current_url, 0)
         # Bounded: a platform page the user must complete (creating an organization,
         # accepting terms) would otherwise be reloaded away on every poll.
         if (
             not url
             or host != API_CREDIT_HOST
-            or self._api_credit_landing_recoveries >= _API_CREDIT_LOGIN_LANDING_RECOVERIES
+            or returns >= _API_CREDIT_LOGIN_LANDING_RECOVERIES
         ):
             return reading
-        self._api_credit_landing_recoveries += 1
-        _ = self._run_stage(
-            "api_credit_login_navigation",
-            lambda: page.goto(
-                url,
-                timeout=self._config.navigation_timeout_ms,
-                wait_until="domcontentloaded",
-            ),
-        )
+        self._api_credit_landing_recoveries[current_url] = returns + 1
+        try:
+            _ = self._run_stage(
+                "api_credit_login_navigation",
+                lambda: page.goto(
+                    url,
+                    timeout=self._config.navigation_timeout_ms,
+                    wait_until="domcontentloaded",
+                ),
+            )
+        except (OSError, RuntimeError, _playwright_error_type()) as exc:
+            lowered = str(exc).lower()
+            if "closed" in lowered or "crashed" in lowered:
+                raise
+            # The site may be navigating by itself right after sign-in: look again later.
+            self._log("api credit landing return failed")
+            return reading
         return self._wait_for_api_credit(page, script, _API_CREDIT_LOGIN_POLL_WAIT_SEC)
 
     def _attach_api_credit(
@@ -481,6 +499,9 @@ class CodexUsagePlaywrightDriver:
     def _collect_api_credit(self, collect_started_at: float) -> ApiCreditPayload | None:
         config = self._config
         if not config.api_credit_url or not config.api_credit_probe_script or self._context is None:
+            return None
+        if config.api_credit_skip_new_worker_collect and not self._api_credit_new_worker_collect_passed:
+            self._api_credit_new_worker_collect_passed = True
             return None
         now = self._clock()
         if self._api_credit_next_due is not None and now < self._api_credit_next_due:

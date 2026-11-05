@@ -24,6 +24,7 @@ from src.apps.codex_usage_browser_types import (
     BrowserRuntimeStatus,
     BrowserState,
 )
+from src.apps.codex_api_credit import reading_from_payload
 from src.apps.codex_usage_monitor import (
     CodexUsageMonitor,
     UsageSnapshot,
@@ -436,6 +437,7 @@ class ApiCreditProbeTest(unittest.TestCase):
 
         self.assertEqual(configs[0].api_credit_url, API_CREDIT_BILLING_URL)
         self.assertEqual(configs[0].api_credit_probe_script, API_CREDIT_PAGE_PROBE_SCRIPT)
+        self.assertTrue(configs[0].api_credit_skip_new_worker_collect)
 
 
 class ApiCreditLoginFlowTest(unittest.TestCase):
@@ -616,6 +618,61 @@ class ApiCreditLoginFlowTest(unittest.TestCase):
 
         self.assertEqual(session.calls, ["open_api_credit_login"])
         self.assertEqual(len(texts), 1, "only the opening notice")
+
+    def test_result_that_arrives_after_a_cancel_is_not_stored(self) -> None:
+        for payload in (OK_CREDIT, {"status": "unavailable", "reason": "balance_unreadable"}):
+            with self.subTest(payload=payload):
+
+                def setup(monitor: CodexUsageMonitor, session: ApiCreditSession) -> None:
+                    session.on_open = monitor._CodexUsageMonitor__request_collect_cancel
+
+                monitor, _session, texts, _started = self._run([credit_probe(payload)], setup)
+
+                snapshot = monitor.get_last_snapshot()
+                self.assertEqual((snapshot.api_credit_balance, snapshot.api_credit_status), ("", ""))
+                self.assertEqual(len(texts), 1, "only the opening notice")
+
+    def test_cancel_just_before_the_report_also_drops_the_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = new_monitor(tmp, ApiCreditSession([PENDING]))
+            monitor.attach(object(), queue.Queue(), start_monitor=False)
+            epoch = int(monitor._CodexUsageMonitor__worker_epoch)
+            monitor._CodexUsageMonitor__request_collect_cancel()
+
+            monitor._CodexUsageMonitor__report_api_credit_login(
+                ("connected", reading_from_payload(OK_CREDIT)), epoch
+            )
+
+            self.assertEqual(monitor.get_last_snapshot().api_credit_balance, "")
+
+    def test_usage_tooltip_shows_the_balance_kept_across_sign_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = new_monitor(tmp, ApiCreditSession([PENDING]))
+            monitor.attach(object(), queue.Queue(), start_monitor=False)
+            monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot(
+                api_credit_balance="$12.34", api_credit_status="ok"
+            )
+            refreshed = build(monitor, usage_probe())
+            shown: list[UsageSnapshot] = []
+            with (
+                patch.object(
+                    monitor,
+                    "_CodexUsageMonitor__collect_snapshot_guarded",
+                    return_value=(refreshed, None),
+                ),
+                patch.object(
+                    monitor, "_CodexUsageMonitor__ui_post", side_effect=lambda fn: fn()
+                ),
+                patch.object(
+                    monitor,
+                    "_CodexUsageMonitor__show_snapshot_tooltip",
+                    side_effect=lambda snapshot, title="": shown.append(snapshot),
+                ),
+                patch("src.apps.codex_usage_monitor.threading.Thread", InlineThread),
+            ):
+                monitor.show_current_status(force_refresh=True, source="manual_login")
+
+            self.assertEqual([item.api_credit_balance for item in shown], ["$12.34"])
 
     def test_flow_refuses_while_the_chatgpt_sign_in_is_being_polled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

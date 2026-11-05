@@ -94,7 +94,9 @@ _AMOUNT_ONLY_LINE = re.compile(
     rf"^\s*(?:{_AMOUNT_LEADING}|{_AMOUNT_TRAILING})\s*(?:USD)?\s*$", re.IGNORECASE
 )
 _AMOUNT_AFTER_LABEL = re.compile(
-    rf"^\s*[:：\-–]?\s*(?:{_AMOUNT_LEADING}|{_AMOUNT_TRAILING})", re.IGNORECASE
+    # A dash separates only when a space follows; "-$5.00" keeps its sign. Nothing
+    # number-like may follow the amount, so "$1,23" is unreadable rather than "$1".
+    rf"^\s*(?:[:：]|[\-–]\s)?\s*(?:{_AMOUNT_LEADING}|{_AMOUNT_TRAILING})(?![\d.,])", re.IGNORECASE
 )
 _LEADING_SYMBOLS = re.compile(r"^[\W_]+")
 _LABEL_SEPARATORS = " :：-–"
@@ -105,6 +107,11 @@ _ACTION_LINE = re.compile(
     re.IGNORECASE,
 )
 _ACTION_LINE_MAX_LENGTH = 48
+# Sentences about another amount are not buttons, whatever verb they start with.
+_NOT_ACTION_WORDS = re.compile(
+    r"\b(?:below|budget|limit|threshold|when|minimum|at least)\b|한도|예산|미만|이하|최소",
+    re.IGNORECASE,
+)
 _ACTION_LINES_BEFORE_AMOUNT = 2
 
 _LOGIN_PATHS = ("/login", "/log-in", "/signup", "/sign-up", "/auth")
@@ -215,12 +222,14 @@ def _split_label(line: str) -> tuple[str, str] | None:
 
 
 def _is_action_line(line: str) -> bool:
-    return len(line) <= _ACTION_LINE_MAX_LENGTH and bool(
-        _ACTION_LINE.match(_LEADING_SYMBOLS.sub("", line))
+    return (
+        len(line) <= _ACTION_LINE_MAX_LENGTH
+        and _NOT_ACTION_WORDS.search(line) is None
+        and _ACTION_LINE.match(_LEADING_SYMBOLS.sub("", line)) is not None
     )
 
 
-def extract_credit_balance(lines: list[str]) -> str:
+def extract_credit_balance(lines: list[str], *, allow_synonyms: bool = True) -> str:
     """The amount printed on the label line or right below it.
 
     A wrong balance misleads more than a missing one, so only a label at the start
@@ -235,7 +244,9 @@ def extract_credit_balance(lines: list[str]) -> str:
         for index, split in ((index, _split_label(line)) for index, line in enumerate(lines))
         if split is not None
     ]
-    if any(split[0] in _PRIMARY_BALANCE_LABELS for _index, split in labelled):
+    if not allow_synonyms or any(
+        split[0] in _PRIMARY_BALANCE_LABELS for _index, split in labelled
+    ):
         labelled = [item for item in labelled if item[1][0] in _PRIMARY_BALANCE_LABELS]
     for index, split in labelled:
         remainder = split[1]
@@ -280,7 +291,11 @@ def parse_api_credit_probe(raw: Any) -> ApiCreditReading:
     lines = _lines(_text(raw.get("text")))
     login_page = _is_login_page(host, path)
     if host == API_CREDIT_HOST and not login_page:
-        balance = extract_credit_balance(lines)
+        # Other platform pages may print other credit figures under a synonym.
+        balance = extract_credit_balance(
+            lines,
+            allow_synonyms=path == _API_CREDIT_BILLING_PATH,
+        )
         if balance:
             return ApiCreditReading(ApiCreditStatus.OK, balance=balance)
     if login_page:
@@ -316,6 +331,10 @@ def reading_from_payload(raw: Any) -> ApiCreditReading | None:
     return ApiCreditReading(status, balance=balance, reason=reason)
 
 
+def _mask_shape_line(line: str) -> str:
+    return re.sub(r"\d", "#", re.sub(r"\S*@\S*", "<email>", line))[:48]
+
+
 def describe_api_credit_shape(raw: Any) -> str:
     """Amount-free shape of a page that was reached but yielded no balance.
 
@@ -340,6 +359,6 @@ def describe_api_credit_shape(raw: Any) -> str:
         f"lines={len(lines)} label_line={label_index}"
     )
     if label_index >= 0:
-        window = lines[max(0, label_index - 1): label_index + 3]
-        shape += " around_label=" + " | ".join(re.sub(r"\d", "#", line)[:48] for line in window)
+        window = lines[label_index: label_index + 3]
+        shape += " around_label=" + " | ".join(_mask_shape_line(line) for line in window)
     return shape

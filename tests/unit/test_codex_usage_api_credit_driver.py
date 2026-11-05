@@ -313,6 +313,20 @@ class ApiCreditCollectTest(unittest.TestCase):
         self.assertGreaterEqual(clock.now - started_at, 14.0)
         self.assertLessEqual(clock.now - started_at, 15.5)
 
+    def test_new_worker_reads_the_balance_only_from_its_second_collect(self) -> None:
+        billing = BillingPage({BILLING: ok_probe("$12.34")})
+        driver, _chromium, _clock, _logs = make_driver(
+            [FakeContext([FakePage(), billing])],
+            config=api_config(api_credit_skip_new_worker_collect=True),
+        )
+
+        first = driver.collect().probe
+        second = driver.collect().probe
+
+        assert first is not None and second is not None
+        self.assertNotIn("apiCredit", first)
+        self.assertEqual(second["apiCredit"]["balance"], "$12.34")
+
     def test_step_is_off_unless_the_page_is_configured(self) -> None:
         billing = BillingPage({BILLING: ok_probe("$12.34")})
         config = PlaywrightSessionConfig("profile", USAGE_URL, "probe()", login_url=LOGIN_URL)
@@ -507,6 +521,61 @@ class ApiCreditLoginTest(unittest.TestCase):
 
         self.assertEqual(opened.error, BrowserErrorCode.LOGIN_WINDOW_CLOSED.value)
         self.assertTrue(headed.closed)
+
+    def test_landing_elsewhere_after_a_completed_page_still_returns_to_billing(self) -> None:
+        driver, _chromium, _headed, page, _headless = self._pending_login()
+        onboarding = "https://platform.openai.com/onboarding"
+        page.routes[onboarding] = {"url": onboarding, "title": "Setup", "text": "Create organization"}
+        _ = driver.open_api_credit_login()
+        page.redirects = {BILLING: onboarding}
+        page.url = onboarding
+        for _ in range(3):
+            _ = driver.poll_api_credit_login()
+        page.redirects = {}
+        page.routes[BILLING] = ok_probe("$4.00")
+        page.url = PLATFORM_HOME
+
+        polled = driver.poll_api_credit_login()
+
+        assert polled.probe is not None
+        self.assertEqual(polled.probe["apiCredit"]["balance"], "$4.00")
+
+    def test_failed_landing_return_keeps_the_window_and_tries_again(self) -> None:
+        driver, _chromium, headed, page, _headless = self._pending_login()
+        _ = driver.open_api_credit_login()
+        page.redirects = {}
+        page.url = PLATFORM_HOME
+        page.goto_error = RuntimeError("Navigation is interrupted by another navigation")
+
+        failed = driver.poll_api_credit_login()
+
+        self.assertEqual(failed.error, BrowserErrorCode.LOGIN_REQUIRED.value)
+        self.assertFalse(headed.closed)
+        page.goto_error = None
+        page.routes[BILLING] = ok_probe("$4.00")
+        recovered = driver.poll_api_credit_login()
+        assert recovered.probe is not None
+        self.assertEqual(recovered.probe["apiCredit"]["balance"], "$4.00")
+
+    def test_closed_window_during_a_landing_return_ends_the_wait(self) -> None:
+        driver, _chromium, headed, page, _headless = self._pending_login()
+        _ = driver.open_api_credit_login()
+        page.url = PLATFORM_HOME
+        page.goto_error = RuntimeError("Target page, context or browser has been closed")
+
+        polled = driver.poll_api_credit_login()
+
+        self.assertEqual(polled.error, BrowserErrorCode.LOGIN_WINDOW_CLOSED.value)
+        self.assertTrue(headed.closed)
+
+    def test_browser_start_failure_is_not_reported_as_a_closed_window(self) -> None:
+        driver, _chromium, _clock, _logs = make_driver(
+            [OSError("BrowserType.launch_persistent_context: browser has been closed")]
+        )
+
+        opened = driver.open_api_credit_login()
+
+        self.assertEqual(opened.error, BrowserErrorCode.COLLECT_FAILED.value)
 
     def test_closing_the_window_ends_the_wait(self) -> None:
         driver, _chromium, headed, page, _headless = self._pending_login()

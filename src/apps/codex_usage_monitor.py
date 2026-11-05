@@ -2582,6 +2582,7 @@ class CodexUsageMonitor:
             login_url=build_codex_login_entry_url(str(self.__usage_url)),
             api_credit_url=API_CREDIT_BILLING_URL,
             api_credit_probe_script=API_CREDIT_PAGE_PROBE_SCRIPT,
+            api_credit_skip_new_worker_collect=True,
         )
         factory = self.__browser_session_factory
         if factory is not None:
@@ -3353,7 +3354,8 @@ class CodexUsageMonitor:
                             previous=previous,
                             observed_snapshot=refreshed,
                         )
-                        snapshot = merged
+                        # The committed copy also holds a balance kept across sign-in.
+                        snapshot = self.get_last_snapshot()
                         self.__profile_in_use_detected = False
                         self.__edge_challenge_backoff = False
                         self.__environment_failure_streak = 0
@@ -3508,13 +3510,13 @@ class CodexUsageMonitor:
             error = normalize_usage_value(result.error).lower()
             probe = result.probe if isinstance(result.probe, dict) else {}
             reading = reading_from_payload(probe.get("apiCredit"))
+            if self.__is_collect_cancel_requested():
+                return "cancelled", None
             if not error and reading is not None:
                 if reading.status is ApiCreditStatus.OK:
                     return "connected", reading
                 if reading.reason == API_CREDIT_UNREADABLE_REASON:
                     return "unreadable", reading
-            if self.__is_collect_cancel_requested():
-                return "cancelled", None
             if error == "profile_in_use":
                 return "profile_in_use", None
             if error == "login_window_closed":
@@ -3546,7 +3548,7 @@ class CodexUsageMonitor:
     ) -> None:
         kind, reading = outcome
         self.__log(f"api credit login end outcome={kind}")
-        if bool(self.__logout_in_progress) or not self.__is_worker_epoch_current(
+        if self.__is_collect_cancel_requested() or not self.__is_worker_epoch_current(
             worker_epoch
         ):
             return

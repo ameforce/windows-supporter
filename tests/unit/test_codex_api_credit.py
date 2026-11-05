@@ -149,6 +149,46 @@ class ApiCreditBalanceParsingTest(unittest.TestCase):
     def test_synonym_counts_on_a_page_without_the_title(self) -> None:
         self.assertEqual(parse_api_credit_probe(page("Available credits\n$9.99")).balance, "$9.99")
 
+    def test_negative_amount_on_the_label_line_keeps_its_sign(self) -> None:
+        for text, expected in (
+            ("Credit balance -$5.00", "-$5.00"),
+            ("Credit balance –$5.00", "-$5.00"),
+            ("Credit balance: -$5.00", "-$5.00"),
+            ("Credit balance - $5.00", "$5.00"),
+            ("Credit balance\n-$5.00", "-$5.00"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_api_credit_probe(page(text)).balance, expected)
+
+    def test_amount_followed_by_more_digits_is_not_cut_short(self) -> None:
+        for text in ("Credit balance $1,23", "Credit balance $12.34.56", "Credit balance $1.234,56"):
+            with self.subTest(text=text):
+                self.assertEqual(parse_api_credit_probe(page(text)).balance, "")
+
+    def test_inline_button_right_after_the_amount_still_reads(self) -> None:
+        self.assertEqual(
+            parse_api_credit_probe(page("Credit balance$3.00Add to credit balance")).balance,
+            "$3.00",
+        )
+
+    def test_sentences_about_other_amounts_are_not_buttons(self) -> None:
+        for text in (
+            "Credit balance\nEnable auto recharge when balance falls below\n$5.00",
+            "Credit balance\nManage budget limit\n$500.00",
+            "크레딧 잔액\n월 예산 설정\n$500.00",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_api_credit_probe(page(text)).reason, "balance_not_found")
+
+    def test_synonyms_count_only_on_the_billing_page(self) -> None:
+        usage = "https://platform.openai.com/usage"
+
+        self.assertNotEqual(
+            parse_api_credit_probe(page("Remaining credits\n$5.00", url=usage)).status,
+            ApiCreditStatus.OK,
+        )
+        self.assertEqual(parse_api_credit_probe(page("Credit balance\n$5.00", url=usage)).balance, "$5.00")
+
     def test_longer_label_wins_over_its_prefix(self) -> None:
         self.assertEqual(
             extract_credit_balance(["Available credits $9.99"]),
@@ -287,6 +327,15 @@ class ApiCreditDiagnosticsTest(unittest.TestCase):
         self.assertEqual(tenant, "host=other")
         self.assertIn("path=/settings/#/limits", project)
         self.assertNotIn("ab12", project)
+
+    def test_shape_description_leaves_out_neighbours_and_addresses(self) -> None:
+        shape = describe_api_credit_shape(
+            page("Acme Corp\nCredit balance\nowner admin@acme.com\nCard ending 4242")
+        )
+
+        self.assertNotIn("Acme", shape)
+        self.assertNotIn("admin@acme.com", shape)
+        self.assertIn("<email>", shape)
 
     def test_shape_description_survives_malformed_input(self) -> None:
         self.assertEqual(describe_api_credit_shape(None), "probe=invalid")

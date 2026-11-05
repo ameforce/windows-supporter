@@ -3772,6 +3772,8 @@ class CodexUsageSettingsView:
         provider_state = str(runtime.get("provider_state") or runtime.get("state") or "")
         if logout_in_progress or monitor_state == "cancelling":
             return "연결 해제 중"
+        if inflight and source == "api_credit_login":
+            return "API 크레딧 로그인 대기 중"
         if provider_state in {"rate_limited", "rate_limit"} or monitor_state == "rate_limited":
             try:
                 retry_after = int(float(runtime.get("next_collect_in_sec")))
