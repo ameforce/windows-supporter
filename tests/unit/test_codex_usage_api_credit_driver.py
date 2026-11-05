@@ -247,6 +247,66 @@ class ApiCreditCollectTest(unittest.TestCase):
         self.assertEqual(billing.calls, [])
         self.assertIn("api credit step skipped reason=budget", logs)
 
+    def _slow_usage_driver(
+        self, usage_seconds: float, billing: BillingPage
+    ) -> tuple[CodexUsagePlaywrightDriver, FakeClock, list[str]]:
+        clock = FakeClock()
+        usage = FakePage()
+        original_evaluate = usage.evaluate
+
+        def slow_evaluate(expression: str) -> Any:
+            if expression != "() => navigator.userAgent":
+                clock.sleep(usage_seconds)
+            return original_evaluate(expression)
+
+        usage.evaluate = slow_evaluate  # type: ignore[method-assign]
+        driver, _chromium, _clock, logs = make_driver(
+            [FakeContext([usage, billing])],
+            config=api_config(command_timeout_sec=195.0),
+            clock=clock,
+        )
+        return driver, clock, logs
+
+    def test_time_already_spent_on_usage_skips_the_step(self) -> None:
+        billing = BillingPage({BILLING: ok_probe("$12.34")})
+        driver, _clock, logs = self._slow_usage_driver(55.0, billing)
+
+        result = driver.collect()
+
+        assert result.probe is not None
+        self.assertNotIn("apiCredit", result.probe)
+        self.assertEqual(billing.calls, [])
+        self.assertIn("api credit step skipped reason=budget", logs)
+
+    def test_time_already_spent_on_usage_shortens_the_step(self) -> None:
+        billing = BillingPage(
+            {PLATFORM_HOME: home_probe()}, redirects={BILLING: PLATFORM_HOME}
+        )
+        driver, clock, _logs = self._slow_usage_driver(50.0, billing)
+
+        started_at = clock.now
+        result = driver.collect()
+
+        assert result.probe is not None
+        self.assertEqual(result.probe["apiCredit"]["reason"], "unexpected_page")
+        # Limit 90 s, margin 30 s, 50 s spent: only 10 s are left of the 15 s step.
+        self.assertLessEqual(clock.now - started_at, 60.5)
+
+    def test_step_never_exceeds_its_maximum_when_time_is_plentiful(self) -> None:
+        billing = BillingPage(
+            {PLATFORM_HOME: home_probe()}, redirects={BILLING: PLATFORM_HOME}
+        )
+        driver, _chromium, clock, _logs = make_driver(
+            [FakeContext([FakePage(), billing])],
+            config=api_config(command_timeout_sec=195.0),
+        )
+
+        started_at = clock.now
+        _ = driver.collect()
+
+        self.assertGreaterEqual(clock.now - started_at, 14.0)
+        self.assertLessEqual(clock.now - started_at, 15.5)
+
     def test_step_is_off_unless_the_page_is_configured(self) -> None:
         billing = BillingPage({BILLING: ok_probe("$12.34")})
         config = PlaywrightSessionConfig("profile", USAGE_URL, "probe()", login_url=LOGIN_URL)
@@ -369,6 +429,78 @@ class ApiCreditLoginTest(unittest.TestCase):
         self.assertEqual(polled.error, BrowserErrorCode.LOGIN_REQUIRED.value)
         self.assertEqual(page.calls, [("goto", BILLING)])
         self.assertFalse(headed.closed)
+
+    def _signed_in_without_a_balance(
+        self,
+    ) -> tuple[CodexUsagePlaywrightDriver, FakeChromium, FakeContext, BillingPage]:
+        page = BillingPage(
+            {BILLING: {"url": BILLING, "title": "Billing", "text": "Billing\nCurrent balance\n$1.00"}}
+        )
+        headed = FakeContext([page])
+        driver, chromium, _clock, _logs = make_driver([headed, FakeContext([FakePage()])])
+        return driver, chromium, headed, page
+
+    def test_unreadable_billing_page_ends_the_wait_after_a_few_reads(self) -> None:
+        driver, chromium, headed, _page = self._signed_in_without_a_balance()
+
+        results = [driver.open_api_credit_login()]
+        results += [driver.poll_api_credit_login() for _ in range(3)]
+
+        self.assertEqual(
+            [result.error for result in results[:3]],
+            [BrowserErrorCode.LOGIN_REQUIRED.value] * 3,
+        )
+        self.assertIsNone(results[3].error)
+        assert results[3].probe is not None
+        self.assertEqual(
+            results[3].probe["apiCredit"],
+            {"status": "unavailable", "reason": "balance_unreadable"},
+        )
+        self.assertTrue(headed.closed)
+        self.assertEqual([call["headless"] for call in chromium.calls], [False, True])
+        self.assertEqual(driver.get_runtime_status().state, BrowserState.HEADLESS_READY)
+
+    def test_login_screen_between_reads_restarts_the_unreadable_count(self) -> None:
+        driver, _chromium, headed, page = self._signed_in_without_a_balance()
+        billing = page.routes[BILLING]
+
+        _ = driver.open_api_credit_login()
+        _ = driver.poll_api_credit_login()
+        _ = driver.poll_api_credit_login()
+        page.routes[BILLING] = login_probe()
+        _ = driver.poll_api_credit_login()
+        page.routes[BILLING] = billing
+        result = driver.poll_api_credit_login()
+
+        self.assertEqual(result.error, BrowserErrorCode.LOGIN_REQUIRED.value)
+        self.assertFalse(headed.closed)
+
+    def test_landing_recovery_gives_up_after_two_returns(self) -> None:
+        driver, _chromium, _headed, page, _headless = self._pending_login()
+        onboarding = "https://platform.openai.com/onboarding"
+        onboarding_probe = {"url": onboarding, "title": "Setup", "text": "Create organization"}
+        page.routes[onboarding] = onboarding_probe
+        _ = driver.open_api_credit_login()
+        page.redirects = {BILLING: onboarding}
+        page.url = onboarding
+
+        for _ in range(4):
+            _ = driver.poll_api_credit_login()
+
+        self.assertEqual(page.calls.count(("goto", BILLING)), 3, "open + two returns")
+
+    def test_window_closed_during_the_first_wait_is_classified_as_closed(self) -> None:
+        driver, _chromium, headed, page, _headless = self._pending_login()
+
+        def closed(_expression: str) -> Any:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+        page.evaluate = closed  # type: ignore[method-assign]
+
+        opened = driver.open_api_credit_login()
+
+        self.assertEqual(opened.error, BrowserErrorCode.LOGIN_WINDOW_CLOSED.value)
+        self.assertTrue(headed.closed)
 
     def test_closing_the_window_ends_the_wait(self) -> None:
         driver, _chromium, headed, page, _headless = self._pending_login()

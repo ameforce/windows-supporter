@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 from src.apps.codex_api_credit import (
     API_CREDIT_BILLING_URL,
     API_CREDIT_HOST,
+    API_CREDIT_UNREADABLE_REASON,
     ApiCreditReading,
     ApiCreditStatus,
     describe_api_credit_shape,
@@ -37,12 +38,18 @@ from src.apps.codex_usage_browser_types import (
 _T = TypeVar("_T")
 
 # Time kept free after the optional API credit step so that the usage result is
-# never lost to the session's collect timeout.
-_API_CREDIT_STEP_MARGIN_SEC = 10.0
+# never lost to the session's collect timeout. The session clock starts before this
+# process sees the command: worker recycle, spawn, bootstrap (15 s) and profile-lock
+# retries are invisible here, so the margin has to cover them as well.
+_API_CREDIT_STEP_MARGIN_SEC = 30.0
 _API_CREDIT_POLL_INTERVAL_SEC = 0.5
 # How long the sign-in window waits for the page to render on open and on each poll.
 _API_CREDIT_LOGIN_OPEN_WAIT_SEC = 8.0
 _API_CREDIT_LOGIN_POLL_WAIT_SEC = 3.0
+# Signed in, billing page rendered, still no balance after this many reads in a row:
+# waiting cannot help, so the window closes instead of holding the profile for 10 min.
+_API_CREDIT_LOGIN_UNREADABLE_READS = 4
+_API_CREDIT_LOGIN_LANDING_RECOVERIES = 2
 
 
 @final
@@ -147,6 +154,8 @@ class CodexUsagePlaywrightDriver:
         self._sleep: Callable[[float], None] = sleep or time.sleep
         self._clock: Callable[[], float] = clock or time.monotonic
         self._api_credit_next_due: float | None = None
+        self._api_credit_unreadable_reads: int = 0
+        self._api_credit_landing_recoveries: int = 0
         self._playwright: PlaywrightLike | None = None
         self._context: ContextLike | None = None
         self._page: PageLike | None = None
@@ -338,6 +347,8 @@ class CodexUsagePlaywrightDriver:
                 BrowserErrorCode.COLLECT_FAILED.value,
                 "api credit page is not configured",
             )
+        self._api_credit_unreadable_reads = 0
+        self._api_credit_landing_recoveries = 0
         try:
             page = self._ensure_context(headless=False)
             _ = self._run_stage(
@@ -351,9 +362,9 @@ class CodexUsagePlaywrightDriver:
             reading = self._wait_for_api_credit(page, script, _API_CREDIT_LOGIN_OPEN_WAIT_SEC)
             return self._conclude_api_credit_login(reading)
         except (OSError, RuntimeError) as exc:
-            return self._fail(_classify_error(str(exc)), str(exc))
+            return self._fail_api_credit_login_poll(exc)
         except _playwright_error_type() as exc:
-            return self._fail(_classify_error(str(exc)), str(exc))
+            return self._fail_api_credit_login_poll(exc)
 
     def poll_api_credit_login(self) -> BrowserOperationResult:
         """Check the open sign-in window once; it closes itself after a balance is read."""
@@ -382,7 +393,20 @@ class CodexUsagePlaywrightDriver:
         return self._fail(error, str(exc))
 
     def _conclude_api_credit_login(self, reading: ApiCreditReading) -> BrowserOperationResult:
-        if reading.status is not ApiCreditStatus.OK:
+        if (
+            reading.status is ApiCreditStatus.UNAVAILABLE
+            and reading.reason == "balance_not_found"
+        ):
+            self._api_credit_unreadable_reads += 1
+            if self._api_credit_unreadable_reads >= _API_CREDIT_LOGIN_UNREADABLE_READS:
+                reading = ApiCreditReading(
+                    ApiCreditStatus.UNAVAILABLE,
+                    reason=API_CREDIT_UNREADABLE_REASON,
+                )
+        else:
+            self._api_credit_unreadable_reads = 0
+        unreadable = reading.reason == API_CREDIT_UNREADABLE_REASON
+        if reading.status is not ApiCreditStatus.OK and not unreadable:
             return self._fail(
                 BrowserErrorCode.LOGIN_REQUIRED.value,
                 state=BrowserState.HEADED_LOGIN,
@@ -393,9 +417,12 @@ class CodexUsagePlaywrightDriver:
         self._set_status(BrowserState.HEADLESS_READY)
         # Recorded only once the headless window is back, so a failed relaunch
         # leaves the next usage collect free to read the balance again.
-        self._api_credit_next_due = self._clock() + max(
-            1.0, float(self._config.api_credit_success_interval_sec)
+        interval = (
+            self._config.api_credit_retry_interval_sec
+            if unreadable
+            else self._config.api_credit_success_interval_sec
         )
+        self._api_credit_next_due = self._clock() + max(1.0, float(interval))
         probe: UsageProbePayload = {
             "url": API_CREDIT_BILLING_URL,
             "metricBlocks": [],
@@ -415,8 +442,15 @@ class CodexUsagePlaywrightDriver:
             host = urlsplit(str(page.url)).netloc.lower().split(":", 1)[0]
         except (OSError, RuntimeError, _playwright_error_type()):
             return reading
-        if not url or host != API_CREDIT_HOST:
+        # Bounded: a platform page the user must complete (creating an organization,
+        # accepting terms) would otherwise be reloaded away on every poll.
+        if (
+            not url
+            or host != API_CREDIT_HOST
+            or self._api_credit_landing_recoveries >= _API_CREDIT_LOGIN_LANDING_RECOVERIES
+        ):
             return reading
+        self._api_credit_landing_recoveries += 1
         _ = self._run_stage(
             "api_credit_login_navigation",
             lambda: page.goto(

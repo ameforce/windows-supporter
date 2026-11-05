@@ -131,6 +131,24 @@ class ApiCreditBalanceParsingTest(unittest.TestCase):
                     "balance_not_found",
                 )
 
+    def test_the_page_title_outranks_every_synonym(self) -> None:
+        for text, expected in (
+            ("Remaining credits\n$5.00\nCredit balance\n$20.00", "$20.00"),
+            ("Available credit\n$100.00\n크레딧 잔액\n$7.00", "$7.00"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_api_credit_probe(page(text)).balance, expected)
+
+    def test_a_title_still_loading_never_falls_back_to_a_synonym(self) -> None:
+        reading = parse_api_credit_probe(
+            page("Credit balance\nAvailable credit\n$100.00\nPay as you go")
+        )
+
+        self.assertEqual(reading.reason, "balance_not_found")
+
+    def test_synonym_counts_on_a_page_without_the_title(self) -> None:
+        self.assertEqual(parse_api_credit_probe(page("Available credits\n$9.99")).balance, "$9.99")
+
     def test_longer_label_wins_over_its_prefix(self) -> None:
         self.assertEqual(
             extract_credit_balance(["Available credits $9.99"]),
@@ -254,6 +272,21 @@ class ApiCreditDiagnosticsTest(unittest.TestCase):
         self.assertIn("label_line=1", shape)
         self.assertIn("$###.##", shape)
         self.assertNotIn("123", shape)
+
+    def test_shape_description_never_names_other_hosts_or_identifiers(self) -> None:
+        tenant = describe_api_credit_shape(
+            page(
+                "Sign in",
+                url="https://acme-corp.okta.com/app/acmecorp_openai_1/exk1abc234xyz/sso/saml",
+            )
+        )
+        project = describe_api_credit_shape(
+            page("Limits", url="https://platform.openai.com/settings/proj_ab12cd34ef56/limits")
+        )
+
+        self.assertEqual(tenant, "host=other")
+        self.assertIn("path=/settings/#/limits", project)
+        self.assertNotIn("ab12", project)
 
     def test_shape_description_survives_malformed_input(self) -> None:
         self.assertEqual(describe_api_credit_shape(None), "probe=invalid")

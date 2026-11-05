@@ -6,6 +6,7 @@ import os
 import queue
 import tempfile
 import unittest
+import threading
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -353,6 +354,53 @@ class ApiCreditProbeTest(unittest.TestCase):
                 ("$12.34", read_at, "login_required"),
             )
 
+    def test_commits_without_usage_backfill_keep_the_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = new_monitor(tmp)
+            monitor.handle_snapshot(build(monitor, usage_probe(apiCredit=OK_CREDIT)))
+            read_at = monitor.get_last_snapshot().api_credit_captured_at
+
+            monitor.handle_snapshot(build(monitor, usage_probe()), allow_previous_backfill=False)
+            kept = monitor.get_last_snapshot()
+            self.assertEqual(
+                (kept.api_credit_balance, kept.api_credit_captured_at, kept.api_credit_status),
+                ("$12.34", read_at, "ok"),
+            )
+
+            monitor.handle_snapshot(
+                build(monitor, usage_probe(apiCredit=LOGIN_CREDIT)),
+                allow_previous_backfill=False,
+            )
+            failed = monitor.get_last_snapshot()
+            self.assertEqual(
+                (failed.api_credit_balance, failed.api_credit_captured_at, failed.api_credit_status),
+                ("$12.34", read_at, "login_required"),
+            )
+
+    def test_snapshot_without_usage_metrics_keeps_a_stored_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = new_monitor(tmp)
+            monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot(
+                api_credit_balance="$12.34",
+                api_credit_captured_at="2026-11-05T01:00:00Z",
+                api_credit_status="ok",
+            )
+
+            monitor.handle_snapshot(build(monitor, usage_probe()))
+
+            kept = monitor.get_last_snapshot()
+            self.assertTrue(kept.has_any_metric())
+            self.assertEqual(kept.api_credit_balance, "$12.34")
+
+    def test_an_empty_last_snapshot_gives_nothing_to_keep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = new_monitor(tmp)
+            monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot()
+
+            monitor.handle_snapshot(build(monitor, usage_probe()), allow_previous_backfill=False)
+
+            self.assertEqual(monitor.get_last_snapshot().api_credit_balance, "")
+
     def test_tooltip_lines_show_the_balance_and_qualify_a_stale_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             monitor = new_monitor(tmp)
@@ -537,6 +585,66 @@ class ApiCreditLoginFlowTest(unittest.TestCase):
         monitor, _session, _texts, _started = self._run([credit_probe(OK_CREDIT)], setup)
 
         self.assertEqual(monitor.get_last_snapshot().api_credit_balance, "")
+
+    def test_unreadable_page_ends_the_flow_with_its_own_notice_and_status(self) -> None:
+        unreadable = credit_probe({"status": "unavailable", "reason": "balance_unreadable"})
+
+        def setup(monitor: CodexUsageMonitor, _session: ApiCreditSession) -> None:
+            monitor._CodexUsageMonitor__last_snapshot = UsageSnapshot(
+                api_credit_balance="$12.34",
+                api_credit_captured_at="2026-11-05T01:00:00Z",
+                api_credit_status="ok",
+            )
+
+        monitor, session, texts, _started = self._run([unreadable], setup)
+
+        self.assertEqual(session.calls, ["open_api_credit_login"])
+        self.assertIn("찾지 못했습니다", texts[-1])
+        snapshot = monitor.get_last_snapshot()
+        self.assertEqual(
+            (snapshot.api_credit_balance, snapshot.api_credit_status),
+            ("$12.34", "unavailable"),
+        )
+
+    def test_cancel_outranks_an_error_from_the_cancelled_command(self) -> None:
+        def setup(monitor: CodexUsageMonitor, session: ApiCreditSession) -> None:
+            session.on_open = monitor._CodexUsageMonitor__request_collect_cancel
+
+        _monitor, session, texts, _started = self._run(
+            [BrowserOperationResult(error="command_timeout")], setup
+        )
+
+        self.assertEqual(session.calls, ["open_api_credit_login"])
+        self.assertEqual(len(texts), 1, "only the opening notice")
+
+    def test_flow_refuses_while_the_chatgpt_sign_in_is_being_polled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = ApiCreditSession([PENDING])
+            monitor = new_monitor(tmp, session)
+            monitor.attach(object(), queue.Queue(), start_monitor=False)
+            monitor._CodexUsageMonitor__pending_login_after_id = "poll-timer"
+
+            self.assertFalse(monitor.login_api_credit())
+            self.assertEqual(session.calls, [])
+            self.assertFalse(monitor.get_runtime_status()["can_login_api_credit"])
+            monitor._CodexUsageMonitor__pending_login_after_id = None
+            monitor._CodexUsageMonitor__pending_login_poll_until_ts = float("inf")
+            self.assertFalse(monitor.get_runtime_status()["can_login_api_credit"])
+
+    def test_shutdown_waits_for_the_cancelled_flow_to_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = ApiCreditSession([PENDING])
+            opened = threading.Event()
+            session.on_open = opened.set
+            monitor = new_monitor(tmp, session)
+            monitor.attach(object(), queue.Queue(), start_monitor=False)
+            self.assertTrue(monitor.login_api_credit())
+            self.assertTrue(opened.wait(5.0))
+            thread = monitor._CodexUsageMonitor__api_credit_login_thread
+
+            monitor.shutdown()
+
+            self.assertFalse(thread.is_alive())
 
     def test_flow_does_not_start_without_a_ui_root_or_after_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

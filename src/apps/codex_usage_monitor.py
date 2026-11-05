@@ -35,6 +35,7 @@ from src.apps.codex_local_usage import LocalCodexUsageSnapshot
 from src.apps.codex_api_credit import (
     API_CREDIT_BILLING_URL,
     API_CREDIT_PAGE_PROBE_SCRIPT,
+    API_CREDIT_UNREADABLE_REASON,
     ApiCreditReading,
     ApiCreditStatus,
     format_api_credit_text,
@@ -1825,6 +1826,19 @@ def _merged_api_credit(
     )
 
 
+def _with_kept_api_credit(
+    current: UsageSnapshot,
+    previous: UsageSnapshot,
+) -> UsageSnapshot:
+    balance, captured_at, status = _merged_api_credit(current, previous)
+    return replace(
+        current,
+        api_credit_balance=balance,
+        api_credit_captured_at=captured_at,
+        api_credit_status=status,
+    )
+
+
 def compute_usage_changes(
     previous: UsageSnapshot | None,
     current: UsageSnapshot,
@@ -2372,6 +2386,7 @@ class CodexUsageMonitor:
         self.__collect_lock = threading.Lock()
         # The OpenAI Platform sign-in window holds the collect lock like a login.
         self.__api_credit_login_active = False
+        self.__api_credit_login_thread: threading.Thread | None = None
         self.__api_credit_login_window_sec = 600.0
         self.__api_credit_login_poll_interval_sec = 3.0
 
@@ -2452,6 +2467,9 @@ class CodexUsageMonitor:
             getattr(self.__browser_session, "request_cancel", None)
         )
         cancelled = self.request_collect_cancel()
+        # The cancel ends the sign-in wait at once. Let its last log line and state
+        # write finish before a deleted profile's folder is renamed away.
+        self.__join_api_credit_login(5.0)
         shutdown_succeeded = bool(cancelled)
         if bool(supports_cancel or not cancelled):
             shutdown_succeeded = self.__browser_session.shutdown() is True
@@ -3142,6 +3160,7 @@ class CodexUsageMonitor:
             and not self.__collect_inflight
             and not self.__profile_in_use_detected
             and not login_window_open
+            and not pending_login_active
         )
         return {
             "enabled": bool(self.__enabled),
@@ -3400,20 +3419,43 @@ class CodexUsageMonitor:
         Returns False when the request cannot start now. The window closes itself
         once the balance is visible; progress is reported through tooltips.
         """
-        if self.__root is None or self.__is_collect_cancel_requested():
+        if (
+            self.__root is None
+            or self.__is_collect_cancel_requested()
+            or self.__is_pending_login_poll_active()
+        ):
             return False
         worker_epoch = int(self.__worker_epoch)
         try:
-            threading.Thread(
+            thread = threading.Thread(
                 target=self.__api_credit_login_worker,
                 args=(worker_epoch,),
                 daemon=True,
                 name="codex-api-credit-login",
-            ).start()
+            )
+            self.__api_credit_login_thread = thread
+            thread.start()
         except Exception as exc:
             self.__log_exception("api credit login thread start failed", exc)
             return False
         return True
+
+    def __is_pending_login_poll_active(self) -> bool:
+        """The ChatGPT sign-in window may be open and being polled for its own result."""
+        if self.__pending_login_after_id is not None:
+            return True
+        until_ts = float(self.__pending_login_poll_until_ts or 0.0)
+        return until_ts > 0.0 and until_ts > float(self.__lib.time.monotonic())
+
+    def __join_api_credit_login(self, timeout_sec: float) -> None:
+        thread = self.__api_credit_login_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        try:
+            thread.join(timeout_sec)
+        except (AttributeError, RuntimeError):
+            return
+        return
 
     def __api_credit_login_worker(self, worker_epoch: int) -> None:
         if not self.__acquire_collect_lock_non_blocking():
@@ -3466,8 +3508,13 @@ class CodexUsageMonitor:
             error = normalize_usage_value(result.error).lower()
             probe = result.probe if isinstance(result.probe, dict) else {}
             reading = reading_from_payload(probe.get("apiCredit"))
-            if not error and reading is not None and reading.status is ApiCreditStatus.OK:
-                return "connected", reading
+            if not error and reading is not None:
+                if reading.status is ApiCreditStatus.OK:
+                    return "connected", reading
+                if reading.reason == API_CREDIT_UNREADABLE_REASON:
+                    return "unreadable", reading
+            if self.__is_collect_cancel_requested():
+                return "cancelled", None
             if error == "profile_in_use":
                 return "profile_in_use", None
             if error == "login_window_closed":
@@ -3475,8 +3522,6 @@ class CodexUsageMonitor:
             if error and error != "login_required":
                 self.__close_api_credit_login_window()
                 return "failed", None
-            if self.__is_collect_cancel_requested():
-                return "cancelled", None
             if not self.__is_worker_epoch_current(worker_epoch):
                 self.__close_api_credit_login_window()
                 return "cancelled", None
@@ -3509,6 +3554,9 @@ class CodexUsageMonitor:
         if kind == "connected" and reading is not None:
             self.__commit_api_credit_reading(reading)
             message = f"API 크레딧 잔액을 확인했습니다: {reading.balance}"
+        elif kind == "unreadable" and reading is not None:
+            self.__commit_api_credit_reading(reading)
+            message = "로그인은 되었지만 결제 개요 화면에서 API 크레딧 잔액을 찾지 못했습니다."
         elif kind == "window_closed":
             message = "로그인 창이 닫혀 API 크레딧 연결을 마치지 못했습니다."
         elif kind == "timeout":
@@ -3524,9 +3572,9 @@ class CodexUsageMonitor:
     def __commit_api_credit_reading(self, reading: ApiCreditReading) -> None:
         captured_at = self.__now_iso()
         with self.__limit_reset_lock:
-            self.__last_snapshot = self.__last_snapshot.with_api_credit(
-                reading,
-                captured_at=captured_at,
+            self.__last_snapshot = _with_kept_api_credit(
+                self.__last_snapshot.with_api_credit(reading, captured_at=captured_at),
+                self.__last_snapshot,
             )
             self.__save_state()
         return
@@ -3631,7 +3679,13 @@ class CodexUsageMonitor:
                 previous=previous,
                 observed_snapshot=observed_snapshot,
             )
-            self.__last_snapshot = UsageSnapshot.from_dict(snapshot.to_dict())
+            # The balance has its own lifetime: a commit without usage backfill
+            # (sign-in, no usable earlier metrics) must not erase it. Only releasing
+            # the profile clears it.
+            self.__last_snapshot = _with_kept_api_credit(
+                UsageSnapshot.from_dict(snapshot.to_dict()),
+                self.__last_snapshot,
+            )
             self.__append_usage_history_sample(self.__last_snapshot)
             self.__snapshot_backfill_allowed = True
             self.__save_state()

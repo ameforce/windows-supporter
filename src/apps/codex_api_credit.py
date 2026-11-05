@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 API_CREDIT_BILLING_URL = "https://platform.openai.com/settings/organization/billing/overview"
 API_CREDIT_HOST = "platform.openai.com"
 _API_CREDIT_BILLING_PATH = "/settings/organization/billing/overview"
+# Signed in on the billing page, but the balance stayed unreadable across several reads.
+API_CREDIT_UNREADABLE_REASON = "balance_unreadable"
 
 # The page hosts a single-page app: the text is read from the rendered body only,
 # so hidden panels and unrendered templates never count as the current balance.
@@ -57,20 +59,22 @@ _TRANSIENT_REASONS = frozenset(
     {"loading", "balance_not_found", "unexpected_page", "challenge", "probe_invalid"}
 )
 
+# The page's own title. When it is present, the synonyms below are ignored so a
+# grant or another credit figure printed earlier can never pass as the balance.
+_PRIMARY_BALANCE_LABELS = frozenset(
+    {"credit balance", "credits balance", "크레딧 잔액", "크레딧 잔고"}
+)
 # Longest first: "available credits" must win over its prefix "available credit".
 _BALANCE_LABELS = tuple(
     sorted(
         (
-            "credit balance",
-            "credits balance",
+            *_PRIMARY_BALANCE_LABELS,
             "available credit",
             "available credits",
             "credit available",
             "remaining credit",
             "remaining credits",
             "prepaid balance",
-            "크레딧 잔액",
-            "크레딧 잔고",
             "사용 가능한 크레딧",
             "남은 크레딧",
             "잔여 크레딧",
@@ -223,12 +227,17 @@ def extract_credit_balance(lines: list[str]) -> str:
     of a line counts, and the amount must sit on the same line or be an entire line
     that follows the label directly or after at most two action-button lines such as
     "Add to credit balance". Amounts elsewhere on the page (budgets, thresholds,
-    prices) and amounts above the label never qualify.
+    prices) and amounts above the label never qualify. Synonym labels count only on
+    a page without the primary "Credit balance" title.
     """
-    for index, line in enumerate(lines):
-        split = _split_label(line)
-        if split is None:
-            continue
+    labelled = [
+        (index, split)
+        for index, split in ((index, _split_label(line)) for index, line in enumerate(lines))
+        if split is not None
+    ]
+    if any(split[0] in _PRIMARY_BALANCE_LABELS for _index, split in labelled):
+        labelled = [item for item in labelled if item[1][0] in _PRIMARY_BALANCE_LABELS]
+    for index, split in labelled:
         remainder = split[1]
         same_line = _AMOUNT_AFTER_LABEL.match(remainder)
         if same_line is not None:
@@ -312,15 +321,22 @@ def describe_api_credit_shape(raw: Any) -> str:
 
     Digits are masked and only a few lines around the label are kept, so a log line
     helps repair a changed page layout without recording what the account holds.
+    Other hosts (company sign-in tenants among them) are never named, and path parts
+    holding digits (project ids) are masked.
     """
     if not isinstance(raw, dict):
         return "probe=invalid"
     parts = urlsplit(_text(raw.get("url")).strip())
+    if parts.netloc.lower().split(":", 1)[0] != API_CREDIT_HOST:
+        return "host=other"
+    path = "/".join(
+        "#" if re.search(r"\d", part) else part
+        for part in parts.path.lower().rstrip("/").split("/")
+    )
     lines = _lines(_text(raw.get("text")))
     label_index = next((i for i, line in enumerate(lines) if _split_label(line)), -1)
     shape = (
-        f"host={parts.netloc.lower().split(':', 1)[0] or '-'} "
-        f"path={parts.path.lower().rstrip('/') or '/'} "
+        f"host=platform path={path or '/'} "
         f"lines={len(lines)} label_line={label_index}"
     )
     if label_index >= 0:

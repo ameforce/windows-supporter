@@ -208,7 +208,7 @@ class PlaywrightSessionConfig:
     api_credit_success_interval_sec: float = 600.0
     api_credit_retry_interval_sec: float = 300.0
     api_credit_login_required_interval_sec: float = 1_800.0
-    api_credit_step_max_sec: float = 20.0
+    api_credit_step_max_sec: float = 15.0
     api_credit_step_min_sec: float = 6.0
 
 
