@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import threading
 import time
 import unittest
@@ -153,6 +154,14 @@ class CodexUsagePlaywrightProcessPolicyTest(unittest.TestCase):
             driver._next_worker_config().api_credit_skip_new_worker_collect,
             "only the next worker",
         )
+
+    def test_driver_built_after_a_kill_skips_only_for_its_first_worker(self) -> None:
+        driver = CodexUsagePlaywrightProcessDriver(
+            replace(self.config, api_credit_skip_new_worker_collect=True)
+        )
+
+        self.assertTrue(driver._next_worker_config().api_credit_skip_new_worker_collect)
+        self.assertFalse(driver._next_worker_config().api_credit_skip_new_worker_collect)
 
     def test_new_worker_receives_the_skip_after_a_kill(self) -> None:
         parent = Mock()

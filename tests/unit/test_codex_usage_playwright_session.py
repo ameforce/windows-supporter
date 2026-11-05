@@ -394,6 +394,34 @@ class CodexUsagePlaywrightSessionTest(unittest.TestCase):
             release.set()
             session.shutdown()
 
+    def test_driver_replacing_a_killed_one_skips_its_first_balance_read(self) -> None:
+        release = threading.Event()
+        first = TerminableBlockingDriver(release)
+        second = FakeDriver()
+        third = FakeDriver()
+        inner = SequenceDriverFactory([first, second, third])
+        skips: list[bool] = []
+
+        def factory(
+            config: PlaywrightSessionConfig,
+            log_sink: LogSink | None,
+            starter: PlaywrightStarter | None,
+        ) -> FakeDriver:
+            skips.append(config.api_credit_skip_new_worker_collect)
+            return inner(config, log_sink, starter)
+
+        session = make_session(factory, command_timeout_sec=0.05)
+        session._timeout_retry_delays_sec = (0.0,)
+        session._timeout_recovery_grace_sec = 0.2
+        session._sleep = lambda _delay: None
+
+        try:
+            self.assertIsNotNone(session.collect().probe)
+            self.assertEqual(skips, [False, True])
+        finally:
+            release.set()
+            session.shutdown()
+
     def test_driver_timeout_result_is_automatically_retried(self) -> None:
         driver = TimeoutThenSuccessDriver()
         factory = SequenceDriverFactory([driver])

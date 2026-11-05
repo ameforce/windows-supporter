@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from queue import Queue
 import threading
 from typing import Any, Protocol, final
@@ -105,6 +106,8 @@ class CodexUsagePlaywrightSession:
         self._lock: threading.Lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._driver: DriverProtocol | None = None
+        # Recovery discards a killed driver, so the session carries this to the next one.
+        self._driver_was_killed: bool = False
         self._worker_generation: int = 0
         self._worker_poisoned: bool = False
         self._worker_recovery_exhausted: bool = False
@@ -451,7 +454,11 @@ class CodexUsagePlaywrightSession:
             return queue, self._thread, generation
 
     def _run(self, queue: Queue[_CommandEnvelope], generation: int) -> None:
-        driver = self._driver_factory(self._config, self._log_sink, self._playwright_starter)
+        config = self._config
+        if self._driver_was_killed:
+            self._driver_was_killed = False
+            config = replace(config, api_credit_skip_new_worker_collect=True)
+        driver = self._driver_factory(config, self._log_sink, self._playwright_starter)
         self._restore_session_cookies(driver)
         with self._lock:
             if generation == self._worker_generation:
@@ -604,6 +611,7 @@ class CodexUsagePlaywrightSession:
         terminate = getattr(driver, "force_terminate", None)
         if not callable(terminate):
             return False
+        self._driver_was_killed = True
         try:
             terminated = bool(terminate(reason))
         except Exception as exc:

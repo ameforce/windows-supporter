@@ -178,7 +178,7 @@ class CodexUsagePlaywrightProcessDriver:
         self._last_failure_signal: str = ""
         self._session_cookies: list[dict[str, Any]] = []
         self._boundary_failed: bool = False
-        self._replacing_killed_worker: bool = False
+        self._replacing_killed_worker: bool = bool(config.api_credit_skip_new_worker_collect)
         self._shutdown: bool = False
         self._status = BrowserRuntimeStatus(BrowserState.STOPPED, False, "")
 
