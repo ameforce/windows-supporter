@@ -89,12 +89,34 @@ class ApiCreditSlotModelTest(unittest.TestCase):
         self.assertEqual([m.get("key") for m in metrics].count("API"), 0)
         self.assertEqual([m.get("key") for m in metrics if m.get("metric_key") == "credit"], ["CR"])
 
+    def test_described_metrics_with_a_free_slot_still_get_one_amount_slot(self) -> None:
+        codex = profile(remaining_credit="227", api_credit_balance="$12.34", api_credit_status="ok")
+        codex["metrics"] = [
+            {"key": "weekly_limit", "short_label": "7d", "percent": 52, "value_text": "52%", "state": "ready"}
+        ]
+
+        credit_keys = [m.get("key") for m in metrics_of(codex) if m.get("metric_key") == "credit"]
+        self.assertEqual(credit_keys, ["CR"])
+
     def test_three_reported_limits_leave_no_slot(self) -> None:
         metrics = metrics_of(
             profile(monthly_limit="80%", api_credit_balance="$12.34", api_credit_status="ok")
         )
 
         self.assertEqual([m.get("key") for m in metrics], ["5h", "7d", "1M"])
+
+    def test_no_slot_beyond_the_three_drawn_segments(self) -> None:
+        metrics = metrics_of(
+            profile(
+                five_hour_limit="",
+                monthly_limit="80%",
+                api_credit_balance="$12.34",
+                api_credit_status="ok",
+            )
+        )
+
+        self.assertEqual([m.get("key") for m in metrics], ["5h", "7d", "1M"])
+        self.assertEqual({m.get("api_credit_text") for m in metrics}, {"$12.34"})
 
     def test_other_providers_never_get_the_slot(self) -> None:
         cursor = profile("cursor", api_credit_balance="$12.34", api_credit_status="ok")

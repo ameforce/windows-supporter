@@ -576,10 +576,12 @@ def build_codex_usage_taskbar_overlay_model(
         if (
             api_credit_metric is not None
             and not any(_metric_slot_key(m) == "credit" for m in metrics)
-            and sum(1 for m in metrics if _is_reported(m)) < 3
+            and len(metrics) < 3
         ):
             # The API balance takes the row's one amount slot when the ChatGPT
-            # credit does not already hold it, under the same three-slot rule.
+            # credit does not already hold it and one of the three drawn slots
+            # (_visible_metrics_for_taskbar_bar) is still free: a fourth
+            # segment would never be drawn.
             metrics.append(api_credit_metric)
         if api_credit_text:
             # Every other segment of the profile row names the balance in its
