@@ -17,7 +17,12 @@ from src.apps.ai_usage_contracts import (
     normalize_taskbar_side_priority,
     resolve_taskbar_pane_assignment,
 )
-from src.apps.codex_api_credit import format_api_credit_text
+from src.apps.codex_api_credit import (
+    ApiCreditStatus,
+    format_api_credit_text,
+    normalize_api_credit_balance,
+    normalize_api_credit_status,
+)
 from src.apps.codex_usage_taskbar_targets import (
     TaskbarMonitorSnapshot,
     TaskbarOverlayTarget,
@@ -565,11 +570,25 @@ def build_codex_usage_taskbar_overlay_model(
             if provider == "codex"
             else ""
         )
+        api_credit_metric = (
+            _api_credit_metric_descriptor(snapshot) if provider == "codex" else None
+        )
+        if (
+            api_credit_metric is not None
+            and not any(_metric_slot_key(m) == "credit" for m in metrics)
+            and len(metrics) < 3
+        ):
+            # The API balance takes the row's one amount slot when the ChatGPT
+            # credit does not already hold it and one of the three drawn slots
+            # (_visible_metrics_for_taskbar_bar) is still free: a fourth
+            # segment would never be drawn.
+            metrics.append(api_credit_metric)
         if api_credit_text:
-            # Tooltip only: the compact row layout has no slot for a dollar
-            # balance, so every segment of the profile row carries it.
+            # Every other segment of the profile row names the balance in its
+            # hover tooltip, so a balance without a slot is still visible.
             for metric in metrics:
-                metric["api_credit_text"] = api_credit_text
+                if metric is not api_credit_metric:
+                    metric["api_credit_text"] = api_credit_text
         primary_metric = next(
             (m for m in metrics if _is_reported(m)),
             metrics[0]
@@ -1450,7 +1469,9 @@ def _build_metric_tooltip_text(metric: dict[str, Any], profile_label: str = "") 
     column."""
     metric_dict = metric if isinstance(metric, dict) else {}
     key = _metric_slot_key(metric_dict)
-    name = _METRIC_TOOLTIP_NAMES.get(key, str(metric_dict.get("key") or key))
+    name = str(metric_dict.get("tooltip_name") or "") or _METRIC_TOOLTIP_NAMES.get(
+        key, str(metric_dict.get("key") or key)
+    )
     head = f"{name} {metric_dict.get('value_text') or '--'}"
     state = str(metric_dict.get("reset_badge_label") or "")
     if state:
@@ -4785,7 +4806,7 @@ class CodexUsageTaskbarOverlay:
             # too narrow for the whole amount draws a shorter spelling instead
             # of letting the pane edge cut the digits off.
             canvas.create_text(
-                x + _credit_value_offset(),
+                x + _credit_value_offset(value_text),
                 center_y,
                 anchor="w",
                 fill="#f9fafb",
@@ -7803,6 +7824,34 @@ def _descriptor_percent(descriptor: dict[str, Any]) -> int | None:
     return _parse_percent(value)
 
 
+_API_CREDIT_LABEL = "API"
+
+
+def _api_credit_metric_descriptor(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """The OpenAI Platform API balance as an amount slot, from a successful read only.
+
+    A balance kept from an earlier read while the latest one failed is not
+    current: it stays in the other segments' tooltips with its qualifier
+    instead of standing in the row as if it were.
+    """
+    amount = normalize_api_credit_balance(snapshot.get("api_credit_balance"))
+    status = normalize_api_credit_status(snapshot.get("api_credit_status"))
+    if not amount or status not in ("", ApiCreditStatus.OK.value):
+        return None
+    return {
+        "metric_key": "credit",
+        "key": _API_CREDIT_LABEL,
+        "short_label": _API_CREDIT_LABEL,
+        "tooltip_name": "API 크레딧",
+        "percent": None,
+        "value_text": amount,
+        "short_value_text": amount,
+        "reset_at": "",
+        "reset_precision": "",
+        "state": "ready",
+    }
+
+
 def _credit_metric_descriptor(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     """Build the taskbar credit metric when the account reports a usable credit.
 
@@ -8878,11 +8927,31 @@ def _credit_text_width(text: str) -> int:
     return int((len(value) * 7 + 2) * _overlay_text_width_scale())
 
 
-def _credit_value_offset() -> int:
-    """x of the credit amount from the segment start, past the "CR" label."""
-    measured = _tk_measure_text("CR", 7)
+def _credit_label_for_value(value_text: str) -> str:
+    """The amount slot's label: a dollar amount is the API balance, else "CR"."""
+    return _API_CREDIT_LABEL if _credit_amount_prefix(value_text) else "CR"
+
+
+def _credit_amount_prefix(value_text: str) -> str:
+    text = str(value_text or "")
+    for prefix in ("-$", "$"):
+        if text.startswith(prefix):
+            return prefix
+    return ""
+
+
+def _credit_value_offset(value_text: str = "") -> int:
+    """x of the credit amount from the segment start, past its label.
+
+    The label is derived from the amount itself so the width search, which
+    only sees digit-masked value texts, reserves the same offset it draws.
+    """
+    label = _credit_label_for_value(value_text)
+    measured = _tk_measure_text(label, 7)
     label_width = (
-        int(measured) if measured is not None else int(14 * _overlay_text_width_scale())
+        int(measured)
+        if measured is not None
+        else int(7 * len(label) * _overlay_text_width_scale())
     )
     return max(
         _CREDIT_VALUE_MIN_OFFSET_PX,
@@ -8891,7 +8960,7 @@ def _credit_value_offset() -> int:
 
 
 def _credit_segment_width_for_text(text: str) -> int:
-    return _credit_value_offset() + _credit_text_width(text) + _SEGMENT_RIGHT_PADDING_PX
+    return _credit_value_offset(text) + _credit_text_width(text) + _SEGMENT_RIGHT_PADDING_PX
 
 
 def _credit_value_spellings(value_text: str) -> tuple[str, ...]:
@@ -8903,14 +8972,20 @@ def _credit_value_spellings(value_text: str) -> tuple[str, ...]:
     its digit-masked signatures ("00,000" -> "00.0K" -> "00K").
     """
     text = str(value_text or "--")
-    digits = text.split(".", 1)[0].replace(",", "")
+    # A dollar amount ("$1,234.56", "-$1,234.56") keeps its sign and symbol.
+    prefix = _credit_amount_prefix(text)
+    digits = text[len(prefix):].split(".", 1)[0].replace(",", "")
     if not digits.isdigit() or len(digits) < 4:
         return (text,)
     exponent = min(9, 3 * ((len(digits) - 1) // 3))
     suffix = {3: "K", 6: "M", 9: "B"}[exponent]
     head = digits[: len(digits) - exponent]
     tenths_digit = digits[len(head)]
-    return (text, f"{head}.{tenths_digit}{suffix}", f"{head}{suffix}")
+    return (
+        text,
+        f"{prefix}{head}.{tenths_digit}{suffix}",
+        f"{prefix}{head}{suffix}",
+    )
 
 
 def _credit_value_text_for_mode(value_text: str, badge_mode: str) -> str:
