@@ -1,4 +1,4 @@
-"""The API credit balance takes the compact row's amount slot (hotfix v0.37.1)."""
+"""The API credit balance has its own amount slot in the compact row (v0.37.1, v0.37.2)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from tests.unit.test_codex_usage_taskbar_credit_fit import (
     _FakeRoot,
     _TextCanvas,
     _weekly,
+    _weekly_with_guidance,
 )
 
 
@@ -37,7 +38,14 @@ def metrics_of(*profiles: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def api(value_text: str) -> dict[str, Any]:
-    return {"key": "API", "metric_key": "credit", "percent": None, "value_text": value_text}
+    return {"key": "API", "metric_key": "api_credit", "percent": None, "value_text": value_text}
+
+
+def cr(value_text: str) -> dict[str, Any]:
+    return {"key": "CR", "metric_key": "credit", "percent": None, "value_text": value_text}
+
+
+AMOUNT_KEYS = ("credit", "api_credit")
 
 
 class ApiCreditSlotModelTest(unittest.TestCase):
@@ -46,7 +54,7 @@ class ApiCreditSlotModelTest(unittest.TestCase):
 
         self.assertEqual([m.get("key") for m in metrics], ["5h", "7d", "API"])
         slot = metrics[-1]
-        self.assertEqual((slot["metric_key"], slot["value_text"], slot["percent"]), ("credit", "$12.34", None))
+        self.assertEqual((slot["metric_key"], slot["value_text"], slot["percent"]), ("api_credit", "$12.34", None))
         self.assertNotIn("api_credit_text", slot)
         self.assertEqual({m.get("api_credit_text") for m in metrics[:2]}, {"$12.34"})
 
@@ -68,7 +76,7 @@ class ApiCreditSlotModelTest(unittest.TestCase):
                 keys = [m.get("key") for m in metrics_of(profile(**snapshot))]
                 self.assertEqual(keys, ["5h", "7d"])
 
-    def test_the_chatgpt_credit_keeps_its_slot(self) -> None:
+    def test_no_room_when_the_three_drawn_slots_are_taken(self) -> None:
         metrics = metrics_of(
             profile(remaining_credit="227", api_credit_balance="$12.34", api_credit_status="ok")
         )
@@ -76,7 +84,7 @@ class ApiCreditSlotModelTest(unittest.TestCase):
         self.assertEqual([m.get("key") for m in metrics], ["5h", "7d", "CR"])
         self.assertEqual({m.get("api_credit_text") for m in metrics}, {"$12.34"})
 
-    def test_one_amount_slot_per_row_even_with_a_free_slot(self) -> None:
+    def test_an_unreported_limit_still_takes_a_drawn_slot(self) -> None:
         metrics = metrics_of(
             profile(
                 five_hour_limit="",
@@ -86,17 +94,23 @@ class ApiCreditSlotModelTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual([m.get("key") for m in metrics].count("API"), 0)
-        self.assertEqual([m.get("key") for m in metrics if m.get("metric_key") == "credit"], ["CR"])
+        self.assertEqual([m.get("key") for m in metrics], ["5h", "7d", "CR"])
 
-    def test_described_metrics_with_a_free_slot_still_get_one_amount_slot(self) -> None:
-        codex = profile(remaining_credit="227", api_credit_balance="$12.34", api_credit_status="ok")
+    def test_api_slot_sits_next_to_the_chatgpt_credit(self) -> None:
+        # The live runtime passes reported metrics as descriptors: a weekly-only
+        # account with ChatGPT credit leaves the third drawn slot free.
+        codex = profile(remaining_credit="66585", api_credit_balance="$140.00", api_credit_status="ok")
         codex["metrics"] = [
-            {"key": "weekly_limit", "short_label": "7d", "percent": 52, "value_text": "52%", "state": "ready"}
+            {"key": "weekly_limit", "short_label": "7d", "percent": 68, "value_text": "68%", "state": "ready"}
         ]
 
-        credit_keys = [m.get("key") for m in metrics_of(codex) if m.get("metric_key") == "credit"]
-        self.assertEqual(credit_keys, ["CR"])
+        metrics = metrics_of(codex)
+
+        self.assertEqual(
+            [(m.get("key"), m.get("metric_key")) for m in metrics],
+            [("7d", "weekly_limit"), ("CR", "credit"), ("API", "api_credit")],
+        )
+        self.assertEqual(metrics[-1]["value_text"], "$140.00")
 
     def test_three_reported_limits_leave_no_slot(self) -> None:
         metrics = metrics_of(
@@ -220,10 +234,90 @@ class ApiCreditSlotLayoutTest(unittest.TestCase):
                 preferred, rows, profile_labels=labels
             )
             for index, metric in enumerate(layout.visible_metrics)
-            if metric.get("metric_key") == "credit"
+            if metric.get("metric_key") in AMOUNT_KEYS
         ]
         self.assertTrue(segments)
         self.assertTrue(all(segment >= self._need("$1,234.56", "API") for segment in segments))
+
+    def _amount_segments(self, width: int, rows, labels) -> list[tuple[str, str, int, int]]:
+        """(label, drawn amount, amount right edge, segment width) per amount segment."""
+        overlay = CodexUsageTaskbarOverlay(_FakeRoot(), lambda: {"enabled": True, "profiles": []})
+        drawn = []
+        for layout in taskbar_overlay._metric_rows_layout_for_overlay_width(width, rows, profile_labels=labels):
+            for index, metric in enumerate(layout.visible_metrics):
+                if metric.get("metric_key") not in AMOUNT_KEYS:
+                    continue
+                _offset, segment, _progress = layout.segment_geometry(index)
+                canvas = _TextCanvas()
+                overlay._draw_metric_segment(canvas, metric, 0, 0, int(segment), 15)
+                texts = canvas.texts()
+                (x, _y), text = texts[-1]
+                drawn.append((texts[0][1], text, x + _FakeFont().measure(text) + 2, int(segment)))
+        return drawn
+
+    def test_cr_and_api_columns_both_draw_their_whole_amounts(self) -> None:
+        rows = [
+            (_weekly(68, "5d 06h 00m"), cr("66,585"), api("$140.00")),
+            (_weekly(12, "2d 11h 02m"), cr("775")),
+        ]
+        signature = tuple(
+            tuple(taskbar_overlay._metric_width_signature(metric) for metric in row) for row in rows
+        )
+        labels = ("Daeng - enmsoftware", "Codex 2")
+        preferred = taskbar_overlay._preferred_width_for_rows_cached(
+            signature, labels, require_status_text=True, require_detail=True
+        )
+
+        drawn = self._amount_segments(preferred, rows, labels)
+
+        self.assertEqual(
+            sorted((label, text) for label, text, _right, _segment in drawn),
+            [("API", "$140.00"), ("CR", "66,585"), ("CR", "775")],
+        )
+        for label, text, right, segment in drawn:
+            with self.subTest(label=label, amount=text):
+                self.assertLessEqual(right, segment)
+
+    def test_cr_column_comes_before_api_whatever_the_row_order(self) -> None:
+        rows = [(_weekly(12, "2d 11h 02m"), api("$140.00")), (_weekly(68, "5d 06h 00m"), cr("775"))]
+
+        self.assertEqual(
+            taskbar_overlay._metric_slot_keys([tuple(row) for row in rows]),
+            ["weekly_limit", "credit", "api_credit"],
+        )
+
+    def test_from_the_compact_width_up_both_amounts_draw_whole(self) -> None:
+        # The middle band grants each amount column its whole amount before any
+        # guidance, so neither the CR nor the API amount is shortened there.
+        rows = [
+            (_weekly_with_guidance(7, "3d 18h 53m"), cr("62,493"), api("$1,234.56")),
+            (_weekly_with_guidance(0, "3d 11h 02m"),),
+        ]
+        signature = tuple(
+            tuple(taskbar_overlay._metric_width_signature(metric) for metric in row) for row in rows
+        )
+        labels = ("Codex 8", "Codex 1")
+        compact = taskbar_overlay._compact_preferred_width_for_rows_cached(signature, labels)
+        preferred = taskbar_overlay._preferred_width_for_rows_cached(
+            signature, labels, require_status_text=True, require_detail=True
+        )
+        self.assertLess(compact, preferred)
+        for width in range(compact, preferred + 40, 2):
+            for label, text, right, segment in self._amount_segments(width, rows, labels):
+                with self.subTest(width=width, label=label):
+                    self.assertIn(text, ("62,493", "$1,234.56"))
+                    self.assertLessEqual(right, segment)
+
+    def test_two_amount_columns_keep_their_own_slot_keys(self) -> None:
+        rows = [(_weekly(68, "5d 06h 00m"), cr("66,585"), api("$140.00"))]
+
+        self.assertEqual(
+            taskbar_overlay._metric_slot_keys([tuple(rows[0])]),
+            ["weekly_limit", "credit", "api_credit"],
+        )
+        layout = taskbar_overlay._metric_rows_layout_for_overlay_width(520, rows)[0]
+        offsets = [layout.segment_geometry(index)[0] for index in range(3)]
+        self.assertEqual(offsets, sorted(set(offsets)), "three distinct columns")
 
     def test_cr_rows_keep_their_offset(self) -> None:
         self.assertEqual(

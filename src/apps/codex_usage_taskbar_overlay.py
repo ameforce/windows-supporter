@@ -282,10 +282,20 @@ _METRIC_PROGRESS_TEXT_PRIORITY_MIN_WIDTH_PX = 14
 _METRIC_REQUIRED_PROGRESS_FLOOR_PX = _METRIC_PROGRESS_PREFERRED_WIDTH_PX
 
 
+# Amount slots draw a label and an amount, never a bar or a countdown: the
+# ChatGPT credit ("CR") and the OpenAI Platform API balance ("API") each own
+# one column.
+_AMOUNT_SLOT_KEYS = ("credit", "api_credit")
+
+
+def _is_amount_slot(key: Any) -> bool:
+    return str(key or "") in _AMOUNT_SLOT_KEYS
+
+
 def _metric_required_progress_floor(metric_key: str) -> int:
     # Credit never draws a progress bar, so reserving bar width for it would
     # only inflate its segment and starve the metrics that do render one.
-    if str(metric_key or "") == "credit":
+    if _is_amount_slot(metric_key):
         return 0
     return _METRIC_REQUIRED_PROGRESS_FLOOR_PX
 # Below this equal-split segment width, per-metric reservation is impossible;
@@ -573,14 +583,10 @@ def build_codex_usage_taskbar_overlay_model(
         api_credit_metric = (
             _api_credit_metric_descriptor(snapshot) if provider == "codex" else None
         )
-        if (
-            api_credit_metric is not None
-            and not any(_metric_slot_key(m) == "credit" for m in metrics)
-            and len(metrics) < 3
-        ):
-            # The API balance takes the row's one amount slot when the ChatGPT
-            # credit does not already hold it and one of the three drawn slots
-            # (_visible_metrics_for_taskbar_bar) is still free: a fourth
+        if api_credit_metric is not None and len(metrics) < 3:
+            # The API balance has its own slot, next to the ChatGPT credit,
+            # while one of the three drawn slots
+            # (`_visible_metrics_for_taskbar_bar`) is still free: a fourth
             # segment would never be drawn.
             metrics.append(api_credit_metric)
         if api_credit_text:
@@ -1281,7 +1287,7 @@ def _metric_fits_badge_mode(
     metric_dict = metric if isinstance(metric, dict) else {}
     mode = _normalized_badge_mode(badge_mode)
     metric_key = str(metric_dict.get("metric_key") or "")
-    if metric_key == "credit":
+    if _is_amount_slot(metric_key):
         # Credit draws no bar or badge; the amount itself is the text
         # contract (spelled whole in full mode, shortest otherwise).
         amount = _credit_value_text_for_mode(
@@ -1514,7 +1520,7 @@ def _metric_countdown_min_width(metric: dict[str, Any]) -> int:
         str(metric.get("value_text") or "--")
     )
     base = 14 + 3 + 0 + 3 + value_width + 2
-    if _metric_slot_key(metric) == "credit":
+    if _is_amount_slot(_metric_slot_key(metric)):
         # The never-dropped minimum is the amount's shortest spelling.
         shortest = _credit_value_spellings(str(metric.get("value_text") or "--"))[-1]
         return max(base, _credit_segment_width_for_text(shortest))
@@ -1587,7 +1593,7 @@ def _slot_value_widths(row_layouts: list[Any]) -> dict[str, int]:
         for index, metric in enumerate(tuple(visible)):
             metric_dict = metric if isinstance(metric, dict) else {}
             key = _metric_slot_key(metric_dict)
-            if key == "credit":
+            if _is_amount_slot(key):
                 continue
             offset = row_layout.segment_geometry(index)[0]
             offsets[key] = offset
@@ -1622,7 +1628,7 @@ def _slot_minimum_progress_widths(
         visible = getattr(row_layout, "visible_metrics", ())
         for index, metric in enumerate(tuple(visible)):
             metric_dict = metric if isinstance(metric, dict) else {}
-            if _metric_slot_key(metric_dict) == "credit":
+            if _is_amount_slot(_metric_slot_key(metric_dict)):
                 continue
             try:
                 _offset, segment_width, segment_progress = row_layout.segment_geometry(
@@ -1776,12 +1782,12 @@ def _metric_rows_layout_for_overlay_width(
     segment_gap = _metric_segment_gap_for_overlay_width(overlay_width)
 
     slot_keys = _metric_slot_keys(rows_metrics)
-    limit_keys = [key for key in slot_keys if key != "credit"]
+    limit_keys = [key for key in slot_keys if not _is_amount_slot(key)]
     compact_single_limits = (
         len(limit_keys) > 1
         and all(key in {"five_hour_limit", "weekly_limit", "monthly_limit"} for key in limit_keys)
         and all(
-            sum(_metric_slot_key(metric) != "credit" for metric in metrics) <= 1
+            sum(not _is_amount_slot(_metric_slot_key(metric)) for metric in metrics) <= 1
             for metrics in rows_metrics
         )
     )
@@ -1798,14 +1804,14 @@ def _metric_rows_layout_for_overlay_width(
     required_by_slot: dict[str, int] = {}
     detail_required_by_slot: dict[str, int] = {}
     reserved_reset_by_slot: dict[str, int] = {}
-    # Width that draws every row's credit amount whole (no 48px floor).
-    credit_amount_px = 0
+    # Width that draws every row's amount whole, per amount column (no 48px floor).
+    amount_px_by_slot: dict[str, int] = {}
     for metrics in rows_metrics:
         for metric in metrics:
             key = layout_slot_key(metric)
-            if key == "credit":
-                credit_amount_px = max(
-                    credit_amount_px,
+            if _is_amount_slot(key):
+                amount_px_by_slot[key] = max(
+                    amount_px_by_slot.get(key, 0),
                     _credit_segment_width_for_text(
                         str(metric.get("value_text") or "--")
                     ),
@@ -1928,17 +1934,17 @@ def _metric_rows_layout_for_overlay_width(
                 minimum = _metric_countdown_min_width(metric)
                 if key not in min_by_slot:
                     min_by_slot[key] = minimum
-                elif key == "credit" or compact_single_limits:
+                elif _is_amount_slot(key) or compact_single_limits:
                     # The amount never degrades like countdown text does, so
                     # hold every row's amount. Mixed single-limit periods
                     # likewise need the longest countdown, in any row order.
                     min_by_slot[key] = max(min_by_slot[key], minimum)
-            if key in min_by_slot and key != "credit" and not compact_single_limits:
+            if key in min_by_slot and not _is_amount_slot(key) and not compact_single_limits:
                 break
     total_min = sum(min_by_slot.values()) + segment_gap * max(0, counts - 1)
     bar_floor_by_slot = {
         key: min_by_slot[key]
-        + (0 if key == "credit" else _METRIC_PROGRESS_MIN_WIDTH_PX)
+        + (0 if _is_amount_slot(key) else _METRIC_PROGRESS_MIN_WIDTH_PX)
         for key in slot_keys
     }
     bar_funded_min = (
@@ -1954,7 +1960,7 @@ def _metric_rows_layout_for_overlay_width(
         # converge instead of leaving dead space beside cramped ones.
         extra = metrics_width - detail_need
         shares = _proportional_extra_shares(
-            slot_keys, detail_required_by_slot, extra, skip=("credit",)
+            slot_keys, detail_required_by_slot, extra, skip=_AMOUNT_SLOT_KEYS
         )
         for key in slot_keys:
             column_width = detail_required_by_slot[key] + shares.get(key, 0)
@@ -1981,20 +1987,25 @@ def _metric_rows_layout_for_overlay_width(
         # hide an already-revealed guidance over a band boundary.
         extra = metrics_width - bar_funded_min
         funded_floor_by_slot = dict(bar_floor_by_slot)
-        if "credit" in funded_floor_by_slot:
+        for amount_key in _AMOUNT_SLOT_KEYS:
+            if amount_key not in funded_floor_by_slot:
+                continue
             # The amount is not guidance, and guidance is the first text to
-            # yield: the credit column reaches its whole amount before any
+            # yield: each amount column reaches its whole amount before any
             # column's guidance. Only its padding up to the 48px column
             # floor still funds last.
             amount_grant = min(
                 extra,
                 max(
                     0,
-                    min(credit_amount_px, detail_required_by_slot["credit"])
-                    - funded_floor_by_slot["credit"],
+                    min(
+                        amount_px_by_slot.get(amount_key, 0),
+                        detail_required_by_slot[amount_key],
+                    )
+                    - funded_floor_by_slot[amount_key],
                 ),
             )
-            funded_floor_by_slot["credit"] += amount_grant
+            funded_floor_by_slot[amount_key] += amount_grant
             extra -= amount_grant
         shares = _detail_funding_shares(
             slot_keys,
@@ -2016,7 +2027,7 @@ def _metric_rows_layout_for_overlay_width(
     elif counts and total_min <= metrics_width:
         extra = metrics_width - total_min
         shares = _proportional_extra_shares(
-            slot_keys, min_by_slot, extra, skip=("credit",)
+            slot_keys, min_by_slot, extra, skip=_AMOUNT_SLOT_KEYS
         )
         for key in slot_keys:
             column_width = min_by_slot[key] + shares.get(key, 0)
@@ -2153,7 +2164,7 @@ def _required_metric_segment_width_cached(
         badge_short_label,
         value_text,
     ) = signature
-    if str(metric_key or "") == "credit":
+    if _is_amount_slot(metric_key):
         # No bar, badge or countdown: the column only has to hold the amount.
         # A detail (full-text) request asks for the amount spelled whole.
         amount = _credit_value_text_for_mode(
@@ -4735,7 +4746,7 @@ class CodexUsageTaskbarOverlay:
         color = str(metric.get("color") or "#6b7280")
         flash = bool(metric.get("flash"))
         flash_phase = bool(metric.get("flash_phase"))
-        is_credit_metric = metric_key == "credit" and metric.get("percent") is None
+        is_credit_metric = _is_amount_slot(metric_key) and metric.get("percent") is None
         # Fit inputs come from the shared helper so the slot-minimum
         # pre-pass reproduces draw-time behavior exactly. A locked override
         # renders that width exactly instead of searching downward.
@@ -7839,7 +7850,7 @@ def _api_credit_metric_descriptor(snapshot: dict[str, Any]) -> dict[str, Any] | 
     if not amount or status not in ("", ApiCreditStatus.OK.value):
         return None
     return {
-        "metric_key": "credit",
+        "metric_key": "api_credit",
         "key": _API_CREDIT_LABEL,
         "short_label": _API_CREDIT_LABEL,
         "tooltip_name": "API 크레딧",
@@ -8829,7 +8840,7 @@ def _metric_reset_reserved_px(
     inside the column. Reserve the badge block plus the metric's own fixed
     countdown shape (placeholder when nothing renders there at all).
     """
-    if str(metric_key or "") == "credit":
+    if _is_amount_slot(metric_key):
         return 0
     badge_width = _reset_badge_width_for_label(str(badge_label or ""))
     badge_block = (
