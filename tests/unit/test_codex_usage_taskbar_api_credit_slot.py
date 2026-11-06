@@ -286,6 +286,18 @@ class ApiCreditSlotLayoutTest(unittest.TestCase):
             ["weekly_limit", "credit", "api_credit"],
         )
 
+    def test_api_column_stays_before_other_provider_columns(self) -> None:
+        codex = (_weekly(12, "2d 11h 02m"), cr("775"), api("$140.00"))
+        cursor = (
+            {"key": "INC", "metric_key": "included_usage", "percent": 40, "value_text": "40%"},
+            {"key": "OD", "metric_key": "on_demand", "percent": 10, "value_text": "10%"},
+        )
+        expected = ["weekly_limit", "credit", "api_credit", "included_usage", "on_demand"]
+
+        for rows in ([codex, cursor], [cursor, codex]):
+            with self.subTest(first=rows[0][0]["key"]):
+                self.assertEqual(taskbar_overlay._metric_slot_keys([tuple(row) for row in rows]), expected)
+
     def test_from_the_compact_width_up_both_amounts_draw_whole(self) -> None:
         # The middle band grants each amount column its whole amount before any
         # guidance, so neither the CR nor the API amount is shortened there.

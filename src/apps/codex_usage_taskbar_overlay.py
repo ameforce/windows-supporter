@@ -1453,6 +1453,8 @@ _METRIC_SLOT_ORDER_RANKS = {
     "weekly_limit": 1,
     "monthly_limit": 2,
     "credit": 3,
+    # Ranked so unknown provider columns (Cursor, Claude) always follow it.
+    "api_credit": 4,
 }
 
 
