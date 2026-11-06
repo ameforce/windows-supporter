@@ -61,8 +61,17 @@ _TRANSIENT_REASONS = frozenset(
 
 # The page's own title. When it is present, the synonyms below are ignored so a
 # grant or another credit figure printed earlier can never pass as the balance.
+# The live page (2026-11) titles the card "API credit balance".
 _PRIMARY_BALANCE_LABELS = frozenset(
-    {"credit balance", "credits balance", "크레딧 잔액", "크레딧 잔고"}
+    {
+        "api credit balance",
+        "api credits balance",
+        "credit balance",
+        "credits balance",
+        "api 크레딧 잔액",
+        "크레딧 잔액",
+        "크레딧 잔고",
+    }
 )
 # Longest first: "available credits" must win over its prefix "available credit".
 _BALANCE_LABELS = tuple(
