@@ -149,6 +149,38 @@ class ApiCreditBalanceParsingTest(unittest.TestCase):
     def test_synonym_counts_on_a_page_without_the_title(self) -> None:
         self.assertEqual(parse_api_credit_probe(page("Available credits\n$9.99")).balance, "$9.99")
 
+    def test_live_billing_card_titled_api_credit_balance(self) -> None:
+        # Text order of the live overview page (2026-11), as the probe reads it.
+        text = "\n".join(
+            (
+                "Billing",
+                "Overview",
+                "Payment methods",
+                "Billing history",
+                "Credit grants",
+                "Free trial",
+                "API credit balance",
+                "$140.00",
+                "다음 만료 예정: US$140.00 (2026년 11월 20일).",
+                "크레딧 지급 내역 보기",
+                "사용량 및 비용 보기",
+                "가용 API 크레딧은 결제 수단 없이도 사용할 수 있습니다.",
+                "Add payment details",
+                "View usage",
+            )
+        )
+
+        reading = parse_api_credit_probe(page(text))
+
+        self.assertEqual((reading.status, reading.balance), (ApiCreditStatus.OK, "$140.00"))
+        self.assertEqual(parse_api_credit_probe(page("API 크레딧 잔액\n$3.50")).balance, "$3.50")
+        self.assertEqual(parse_api_credit_probe(page("API credit balance $7.25")).balance, "$7.25")
+
+    def test_a_sentence_about_the_api_balance_is_still_not_a_label(self) -> None:
+        reading = parse_api_credit_probe(page("Your API credit balance is low\n$5.00"))
+
+        self.assertNotEqual(reading.status, ApiCreditStatus.OK)
+
     def test_negative_amount_on_the_label_line_keeps_its_sign(self) -> None:
         for text, expected in (
             ("Credit balance -$5.00", "-$5.00"),
